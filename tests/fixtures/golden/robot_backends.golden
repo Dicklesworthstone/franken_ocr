@@ -1,0 +1,9 @@
+{
+  "logical_cpus": "[cpus]",
+  "schema_version": 1,
+  "simd_tiers": {
+    "available": [],
+    "selected": null,
+    "status": "runtime detection lands in Phase 3 (plan §6.2)"
+  }
+}

@@ -1,0 +1,134 @@
+# franken_ocr — Cross-architecture release distribution (the `focr` binary).
+#
+# Builds the optimized `focr` binary for every target arch in the mission
+# (AGENTS.md "Project Mission" + Toolchain), one artifact per (target, feature)
+# variant. CPU is the priority — these variants enable the int8-matmul paths the
+# whole project is built around:
+#
+#   Apple Silicon / ARM64 (aarch64-apple-darwin)
+#     NEON (baseline on Apple Silicon) + FEAT_DotProd (SDOT) + FEAT_MATMUL_INT8
+#     (SMMLA / i8mm). The stdarch dotprod/i8mm intrinsics are NIGHTLY-only — this
+#     is one reason the toolchain is pinned to nightly (Toolchain note). Apple M-
+#     series ship dotprod+i8mm, so we target-cpu=apple-m1 to light them up.
+#
+#   Intel / AMD x86-64 (x86_64-unknown-linux-gnu), THREE feature variants, since
+#   the int8 GEMM kernel dispatches on the widest VNNI available at runtime but we
+#   want a build that can be -C target-feature compiled for each tier:
+#     • avx2        — AVX2 baseline (no VNNI; SDOT-equivalent emulated). Widest
+#                     portability floor for older/cloud hosts.
+#     • avx-vnni    — AVX-VNNI (VPDPBUSD on 256-bit, Alder Lake+ / Zen4+). The
+#                     mainstream int8 dot-product path.
+#     • avx512-vnni — AVX-512-VNNI (512-bit VPDPBUSD, server Ice Lake+/Zen4+).
+#                     Highest-throughput int8 accumulation tier.
+#
+# Branch policy (AGENTS.md): release builds run on `main` ONLY. `master` is never
+# referenced. Tag pushes (v*) cut a versioned set of artifacts.
+#
+# This workflow BUILDS and uploads artifacts; it does not publish a GitHub Release
+# (that is a separate, gated step). Nightly is selected via `rust-toolchain.toml`.
+
+name: dist
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # Allow a manual cross-arch build from the Actions tab (main only).
+  workflow_dispatch:
+
+concurrency:
+  group: dist-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dist:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Apple Silicon / ARM64 ──────────────────────────────────────────
+          # NEON+SDOT+SMMLA via target-cpu=apple-m1 (dotprod + i8mm). Built on a
+          # native arm64 macOS runner (macos-14), so no cross-linking needed.
+          - name: aarch64-apple-darwin (neon+sdot+i8mm)
+            os: macos-14
+            target: aarch64-apple-darwin
+            rustflags: "-C target-cpu=apple-m1"
+
+          # ── x86-64 / AVX2 baseline ─────────────────────────────────────────
+          # Portability floor: AVX2 + FMA, no VNNI. Runs on the broadest set of
+          # x86 hosts (incl. older cloud instances).
+          - name: x86_64-linux (avx2)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rustflags: "-C target-feature=+avx2,+fma"
+
+          # ── x86-64 / AVX-VNNI ──────────────────────────────────────────────
+          # 256-bit VPDPBUSD int8 dot product (Alder Lake+ / Zen4+). The
+          # mainstream int8 path. avxvnni implies avx2; name fma explicitly.
+          - name: x86_64-linux (avx-vnni)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rustflags: "-C target-feature=+avx2,+fma,+avxvnni"
+
+          # ── x86-64 / AVX-512-VNNI ──────────────────────────────────────────
+          # 512-bit VPDPBUSD (server Ice Lake+ / Zen4+). Highest int8 throughput
+          # tier. avx512vnni pulls in avx512f/bw/dq; list them so the binary's
+          # required-feature set is explicit and auditable.
+          - name: x86_64-linux (avx512-vnni)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rustflags: "-C target-feature=+avx2,+fma,+avx512f,+avx512bw,+avx512dq,+avx512vnni"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Honor the pinned nightly from `rust-toolchain.toml` (REQUIRED for the
+      # stdarch i8mm/dotprod intrinsics). Add the explicit compile target.
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Cache keyed per variant so feature-divergent artifacts never collide.
+          key: ${{ matrix.target }}-${{ matrix.rustflags }}
+
+      # Release build of ONLY the `focr` binary for this target+feature variant.
+      # RUSTFLAGS carries the arch-feature rationale documented in the matrix.
+      - name: Build focr (release)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --bin focr --target ${{ matrix.target }}
+
+      # Stage the binary under a per-variant name so artifacts are unambiguous.
+      # The variant tag (everything after the first space in matrix.name, minus
+      # parens) distinguishes same-target x86 feature builds.
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          variant="$(echo '${{ matrix.name }}' | sed -E 's/[^(]*\(([^)]*)\)/\1/; s/[^a-zA-Z0-9._-]+/-/g')"
+          out="focr-${{ matrix.target }}-${variant}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/focr" "dist/${out}"
+          ( cd dist && shasum -a 256 "${out}" > "${out}.sha256" )
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: focr-${{ matrix.target }}-${{ strategy.job-index }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

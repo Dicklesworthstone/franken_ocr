@@ -1,0 +1,86 @@
+# franken_ocr — Continuous Integration
+#
+# The SINGLE test job is `scripts/check.sh` (the one-command gate). We invoke the
+# script rather than re-listing its steps so it stays the single source of truth
+# (AGENTS.md "Mandatory Checks": fmt --check → check --all-targets →
+# clippy -D warnings → test, preceded by the Python ledger/format self-tests). If
+# the gate sequence ever changes, it changes in ONE place — the script — and CI
+# follows automatically.
+#
+# Toolchain: the pinned nightly is declared in `rust-toolchain.toml` (nightly is
+# REQUIRED for stdarch i8mm/dotprod intrinsics + portable_simd — Toolchain note).
+# We do NOT pass an explicit toolchain to `dtolnay/rust-toolchain`; we let the
+# repo's `rust-toolchain.toml` select it so CI and local builds are bit-identical.
+#
+# Model gating: CI runs WITHOUT the 6.67 GB weights. The model-gated e2e/parity
+# tests resolve `FOCR_MODEL_PATH` (default `models/unlimited-ocr.focrq`, absent
+# here) and skip-with-SUCCESS — they print a SUCCESS line and pass rather than
+# fail. So a green CI run exercises everything that does NOT require weights; the
+# weighted parity ladder (L3–L5) is proven out-of-band against the oracle.
+#
+# Branch policy (AGENTS.md): primary branch is `main`; `master` is never used.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# One in-flight run per ref; a newer push cancels the older one.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: CI only needs to read the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Surface full backtraces if a test panics, so failures are self-diagnosing.
+  RUST_BACKTRACE: 1
+
+jobs:
+  gate:
+    name: gate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # macOS-14 is Apple Silicon (aarch64) — exercises the NEON/SDOT/SMMLA
+        # scalar-fallback compile path; ubuntu-latest is x86_64 (AVX2/VNNI).
+        # Both must stay green: the kernels carry per-arch scalar fallbacks.
+        os: [macos-14, ubuntu-latest]
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
+      # `scripts/check.sh` runs first (stdlib only — no pip install required).
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Honor `rust-toolchain.toml` — DO NOT pin a channel here. clippy + rustfmt
+      # components are declared in the toolchain file; install them too.
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache per OS so the aarch64 and x86_64 artifacts never mix.
+          key: ${{ matrix.os }}
+          # The script builds --all-targets (lib, both bins, tests); cache them.
+          cache-all-crates: true
+
+      # The one and only test step: the same gate humans run locally. We do NOT
+      # duplicate its commands here — the script is the single source of truth.
+      - name: Run the gate (scripts/check.sh)
+        run: ./scripts/check.sh
