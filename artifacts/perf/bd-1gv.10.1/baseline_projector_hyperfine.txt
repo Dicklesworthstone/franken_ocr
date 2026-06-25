@@ -1,0 +1,4 @@
+Benchmark 1: RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 /Volumes/USBNVME16TB/temp_agent_space/focr_projector_bench_target/release-perf/focr_projector_bench --iters 16
+  Time (mean ± σ):     187.9 ms ±   4.2 ms    [User: 501.2 ms, System: 18.6 ms]
+  Range (min … max):   184.1 ms … 197.6 ms    9 runs
+ 

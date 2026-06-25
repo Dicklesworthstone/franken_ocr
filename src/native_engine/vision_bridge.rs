@@ -173,12 +173,10 @@ pub fn project(x: &Mat, w: &Mat, bias: Option<&[f32]>) -> FocrResult<Mat> {
 fn transpose(m: &Mat) -> Mat {
     let (r, c) = (m.rows, m.cols);
     let mut out = Mat::zeros(c, r);
-    for i in 0..r {
-        let src = m.row(i);
-        // indexed loop: spatial kernel offset
-        #[allow(clippy::needless_range_loop)]
-        for j in 0..c {
-            out.data[j * r + i] = src[j];
+    for j in 0..c {
+        let dst = &mut out.data[j * r..(j + 1) * r];
+        for (i, slot) in dst.iter_mut().enumerate() {
+            *slot = m.data[i * c + j];
         }
     }
     out

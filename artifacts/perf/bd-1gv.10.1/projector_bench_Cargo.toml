@@ -1,0 +1,18 @@
+[package]
+name = "focr_projector_bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+franken_ocr = { path = "/Users/jemanuel/projects/franken_ocr" }
+
+[patch.crates-io]
+asupersync = { path = "/dp/asupersync" }
+
+[profile.release-perf]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+strip = false

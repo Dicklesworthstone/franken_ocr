@@ -198,9 +198,31 @@ them.
 
 ## franken_ocr measurements
 
-_None yet. No franken_ocr lever has been measured. This section stays empty until
-a real head-to-head ratio with a correctness proof exists — no fabricated
-results._
+No `PERF_LEDGER.md` head-to-head row exists yet: there is still no certified
+Phase -1 CPU-reference ratio for this path. The entry below is a local,
+synthetic before/after microbench that retires one bad loop order and preserves
+the raw artifact bundle for gauntlet follow-up; it is not a G2 claim.
+
+2026-06-25 | NEGATIVE(reverted) | strided-destination projector transpose in `src/native_engine/vision_bridge.rs::transpose`
+  claim_id: CLAIM-bd-1gv.10.1-projector-transpose-store-order   evidence_id: artifacts/perf/bd-1gv.10.1/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    config.json sha256 27246d03fd670904ec9601b1cb0861fbb79ec076830771daa8d943d6229946f9 (SOURCE_HASHES.md)
+    synthetic projector fixture: artifacts/perf/bd-1gv.10.1/projector_bench_main.rs sha256 999973e4948e232ec955ae0691ce2dfcc2b362e2ddfc759b4122cc7aa58144ee (SHA256SUMS)
+  CPU feature string: arm64 Apple M4, dotprod=1, i8mm=1; projector path is f32, no SIMD tier override
+  exact command + env:
+    hyperfine --warmup 2 --runs 9 --export-json artifacts/perf/bd-1gv.10.1/{baseline,after}_projector_hyperfine.json
+    RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 /Volumes/USBNVME16TB/temp_agent_space/focr_projector_bench_target/release-perf/focr_projector_bench --iters 16
+  fallback / kill-switch state: no FOCR_* performance kill-switches set; allocator=system; harness calls the real `vision_bridge::project`
+  measured before -> after vs reference:
+    local focr-only projector microbench (no reference ratio): 187.9 ms +/- 4.2 ms -> 132.5 ms +/- 11.0 ms for 16 calls, mean speedup 1.419x; PERF_LEDGER ineligible until the gauntlet has a pinned CPU reference row
+  bit-exact correctness proof:
+    smoke checksum unchanged for 4 calls (-0.039779253 before and after); `CARGO_TARGET_DIR=/Volumes/USBNVME16TB/temp_agent_space/focr_verify_target_whitecave TMPDIR=/Volumes/USBNVME16TB/temp_agent_space/tmp cargo test --lib native_engine::vision_bridge -- --nocapture` -> 13 passed, 0 failed
+  disposition: REVERT
+  do-not-retry: "do not return to output-strided transpose stores for projector weights unless a new head-to-head gauntlet row proves a different packed/projector path wins on the pinned fixture"
+  per-lever tally: W 0 / L 1 / N 0
+  agent: WhiteCave
+  evidence dir: artifacts/perf/bd-1gv.10.1/
 
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`
