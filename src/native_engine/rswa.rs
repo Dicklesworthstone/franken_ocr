@@ -569,6 +569,8 @@ mod tests {
         let mut scores = vec![0.0f32; m];
         for (r, sc) in scores.iter_mut().enumerate() {
             let mut d0 = 0.0f32;
+            // `d` indexes both `q` and the borrowed `ref_k_row` slice (two buffers).
+            #[allow(clippy::needless_range_loop)]
             for d in 0..HEAD_DIM {
                 d0 += q[d] * cache.ref_k_row(0, r)[d];
             }
@@ -579,6 +581,8 @@ mod tests {
         let den: f32 = exps.iter().sum();
         // Reconstruct expected output dim 0 for head 0.
         let mut expect0 = 0.0f32;
+        // `r` indexes `exps` and is also passed to `ref_v_row` (row selector).
+        #[allow(clippy::needless_range_loop)]
         for r in 0..m {
             expect0 += (exps[r] / den) * cache.ref_v_row(0, r)[0];
         }

@@ -119,6 +119,7 @@ struct PendingTensor {
 }
 
 impl PendingTensor {
+    #[allow(dead_code)]
     fn numel(&self) -> usize {
         self.shape.iter().product()
     }
@@ -260,6 +261,8 @@ impl FocrqBuilder {
     /// # Errors
     /// [`FocrError::FormatMismatch`] on a duplicate name, a non-quantized dtype,
     /// or a `data` length that disagrees with `shape × dtype`.
+    // kernel signature: args are tensor dims/scales
+    #[allow(clippy::too_many_arguments)]
     pub fn add_quantized(
         &mut self,
         name: impl Into<String>,
@@ -282,6 +285,8 @@ impl FocrqBuilder {
 
     /// Insert with a byte-length sanity check matching the reader's
     /// `validate_directory` rule (`byte_len == shape × dtype`).
+    // kernel signature: args are tensor dims/scales
+    #[allow(clippy::too_many_arguments)]
     fn insert_checked(
         &mut self,
         name: String,

@@ -134,7 +134,10 @@ impl RopeTable {
     /// Panics if `head_dim` is not even.
     #[must_use]
     pub fn build(position_ids: &[usize], head_dim: usize, theta: f32) -> Self {
-        assert!(head_dim % 2 == 0, "RopeTable: head_dim must be even");
+        assert!(
+            head_dim.is_multiple_of(2),
+            "RopeTable: head_dim must be even"
+        );
         let half = head_dim / 2;
         // inv_freq[i] = theta^(-2i/head_dim) = theta^(-(i/half)).  Computed in
         // f64 then narrowed — matches the HF float32 rotary embedding closely.
@@ -177,7 +180,7 @@ impl RopeTable {
 /// `x.rows != positions`, …).
 pub fn apply_rope(x: &mut Mat, rope: &RopeTable) -> FocrResult<()> {
     let head_dim = rope.head_dim;
-    if head_dim == 0 || x.cols % head_dim != 0 {
+    if head_dim == 0 || !x.cols.is_multiple_of(head_dim) {
         return Err(FocrError::Other(anyhow::anyhow!(
             "apply_rope: cols {} not a multiple of head_dim {head_dim}",
             x.cols
@@ -414,6 +417,8 @@ pub fn attn_output_proj(
 ///
 /// # Errors
 /// Propagates any sub-step error.
+// decoder forward: args are model state + tensors
+#[allow(clippy::too_many_arguments)]
 pub fn layer_forward<A, M>(
     x: &Mat,
     lw: &LayerWeights<'_>,

@@ -1,3 +1,4 @@
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 //! `nn_facade` — micro-benchmarks of the STABLE committed `nn.rs` facade kernels
 //! at the SHAPES THIS MODEL ACTUALLY USES.
 //!

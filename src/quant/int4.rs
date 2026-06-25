@@ -145,9 +145,9 @@ pub fn pack_int4_f32(weights: &[f32], n: usize, k: usize, group_size: usize) -> 
         VALID_GROUP_SIZES.contains(&group_size),
         "pack_int4_f32: group_size {group_size} must be 16 or 32"
     );
-    assert!(k % 2 == 0, "pack_int4_f32: k {k} must be even");
+    assert!(k.is_multiple_of(2), "pack_int4_f32: k {k} must be even");
     assert!(
-        k % group_size == 0,
+        k.is_multiple_of(group_size),
         "pack_int4_f32: group_size {group_size} must divide k {k} (reader requires exact division)"
     );
 
@@ -341,7 +341,7 @@ mod tests {
         assert_eq!(q.groups_per_row(), 2);
         // group_size 32 -> 1 group/row, 2 scales.
         let q32 = pack_int4_f32(&w, 2, 32, 32);
-        assert_eq!(q32.scales.len(), 2 * 1);
+        assert_eq!(q32.scales.len(), 2);
     }
 
     #[test]
@@ -417,11 +417,11 @@ mod tests {
     fn multi_row_packing_indexes_rows_correctly() {
         // n=2, k=16: row 0 all 7s (scale 1), row 1 all -8s (scale 8/7).
         let mut w = vec![0.0f32; 2 * 16];
-        for i in 0..16 {
-            w[i] = 7.0;
+        for elem in w[0..16].iter_mut() {
+            *elem = 7.0;
         }
-        for i in 16..32 {
-            w[i] = -8.0;
+        for elem in w[16..32].iter_mut() {
+            *elem = -8.0;
         }
         let q = pack_int4_f32(&w, 2, 16, 16);
         let codes = unpack_int4_to_i8(&q);
@@ -434,19 +434,19 @@ mod tests {
     #[test]
     #[should_panic(expected = "must be 16 or 32")]
     fn rejects_bad_group_size() {
-        let _ = pack_int4_f32(&vec![0.0; 16], 1, 16, 8);
+        let _ = pack_int4_f32(&[0.0; 16], 1, 16, 8);
     }
 
     #[test]
     #[should_panic(expected = "must divide k")]
     fn rejects_group_size_not_dividing_k() {
         // k=16 with group 32 does not divide.
-        let _ = pack_int4_f32(&vec![0.0; 16], 1, 16, 32);
+        let _ = pack_int4_f32(&[0.0; 16], 1, 16, 32);
     }
 
     #[test]
     #[should_panic(expected = "weights len")]
     fn rejects_shape_mismatch() {
-        let _ = pack_int4_f32(&vec![0.0; 10], 1, 16, 16);
+        let _ = pack_int4_f32(&[0.0; 10], 1, 16, 16);
     }
 }

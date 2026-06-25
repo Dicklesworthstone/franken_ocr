@@ -333,11 +333,15 @@ mod aarch64_impl {
                     // (the register-blocking win).
                     let mut av = [vdupq_n_s32(0).into_i8(); 4];
                     let mut bv = [vdupq_n_s32(0).into_i8(); 4];
+                    // indexed loop mirrors SIMD lane layout
+                    #[allow(clippy::needless_range_loop)]
                     for i in 0..mr {
                         // SAFETY: t+16 <= k16 <= k, and (r+i)<m, so
                         // (r+i)*k + t + 16 <= (r+i+1)*k <= m*k = a.len().
                         av[i] = load16(a, (r + i) * k + t);
                     }
+                    // indexed loop mirrors SIMD lane layout
+                    #[allow(clippy::needless_range_loop)]
                     for j in 0..nr {
                         // SAFETY: same bound for the weight matrix (b.len = n*k).
                         bv[j] = load16(b, (c + j) * k + t);
@@ -356,11 +360,15 @@ mod aarch64_impl {
                     let valid = k - k16;
                     let mut av = [vdupq_n_s32(0).into_i8(); 4];
                     let mut bv = [vdupq_n_s32(0).into_i8(); 4];
+                    // indexed loop mirrors SIMD lane layout
+                    #[allow(clippy::needless_range_loop)]
                     for i in 0..mr {
                         // SAFETY: load16_tail reads only s[off..off+valid] into a
                         // local 16-byte buffer; off+valid = (r+i)*k + k <= a.len.
                         av[i] = load16_tail(a, (r + i) * k + k16, valid);
                     }
+                    // indexed loop mirrors SIMD lane layout
+                    #[allow(clippy::needless_range_loop)]
                     for j in 0..nr {
                         bv[j] = load16_tail(b, (c + j) * k + k16, valid);
                     }

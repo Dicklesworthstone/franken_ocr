@@ -114,10 +114,10 @@ impl OcrEngine {
     /// once a path *does* resolve — the `.focrq` reader is Phase 2).
     fn model_at(&self, path: &Path) -> FocrResult<Arc<OcrModel>> {
         let mut guard = self.model.lock().expect("OcrEngine model mutex poisoned");
-        if let Some(m) = guard.as_ref() {
-            if m.path() == path {
-                return Ok(Arc::clone(m));
-            }
+        if let Some(m) = guard.as_ref()
+            && m.path() == path
+        {
+            return Ok(Arc::clone(m));
         }
         let m = OcrModel::load(path)?;
         *guard = Some(Arc::clone(&m));

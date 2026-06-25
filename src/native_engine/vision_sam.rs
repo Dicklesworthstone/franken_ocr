@@ -221,7 +221,7 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
             win
         )));
     }
-    if h % PATCH != 0 || win % PATCH != 0 {
+    if !h.is_multiple_of(PATCH) || !win.is_multiple_of(PATCH) {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_sam: spatial dims ({h},{win}) must be multiples of patch {PATCH}"
         )));
@@ -727,8 +727,12 @@ fn bicubic_sample(
     let wy = cubic_weights(fy);
     let wx = cubic_weights(fx);
     let mut acc = 0.0f32;
+    // indexed loop: spatial kernel offset
+    #[allow(clippy::needless_range_loop)]
     for m in 0..4 {
         let yy = clamp_idx(iy as isize - 1 + m as isize, src_h);
+        // indexed loop: spatial kernel offset
+        #[allow(clippy::needless_range_loop)]
         for n in 0..4 {
             let xx = clamp_idx(ix as isize - 1 + n as isize, src_w);
             let val = pos[(yy * src_w + xx) * dim + c];

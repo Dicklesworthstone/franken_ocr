@@ -1,3 +1,4 @@
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 //! OQ-16 — Tokenizer conformance harness (token-id-EXACT vs HF
 //! `LlamaTokenizerFast`).
 //!
@@ -639,10 +640,9 @@ impl ToyBpe {
                 if let Some(&rank) = self
                     .ranks
                     .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                    && best.is_none_or(|(br, _)| rank < br)
                 {
-                    if best.is_none_or(|(br, _)| rank < br) {
-                        best = Some((rank, i));
-                    }
+                    best = Some((rank, i));
                 }
             }
             let Some((_, pos)) = best else { break };

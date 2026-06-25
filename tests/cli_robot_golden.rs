@@ -1083,7 +1083,7 @@ fn actual_outputs_are_gitignored() {
     let lines: Vec<&str> = body.lines().map(str::trim).collect();
     // A pattern counts as covered if a line exactly matches it, or a broader glob
     // does (e.g. `*.actual` covers our `tests/fixtures/golden/*.actual`).
-    let covers = |pat: &str| lines.iter().any(|l| *l == pat);
+    let covers = |pat: &str| lines.contains(&pat);
     let actual_ok = covers("*.actual");
     let snapnew_ok = covers("*.snap.new") || covers("*.new");
 

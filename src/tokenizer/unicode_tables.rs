@@ -10,6 +10,7 @@
 
 /// The Unicode Character Database version these tables were generated from
 /// (recorded so a batch-verify can reconcile against the regex-engine UCD).
+#[allow(dead_code)]
 pub const UCD_VERSION: &str = "16.0.0";
 
 /// `\p{L}` — Unicode general category Letter (major), 677 ranges.

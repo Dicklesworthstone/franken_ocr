@@ -1,3 +1,4 @@
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 //! `e2e_recognize` — the **model-gated** end-to-end harness (Testing Policy;
 //! `docs/testing/LOGGING_AND_E2E.md` §4, bead `bd-29wv`; AGENTS.md "Testing
 //! Policy").
@@ -179,6 +180,9 @@ fn push_chunk(out: &mut Vec<u8>, chunk_type: &[u8; 4], data: &[u8]) {
 fn tiny_png(w: u32, h: u32) -> Vec<u8> {
     // Raw scanlines: each row is a filter byte (0 = None) + w*3 pixel bytes.
     let mut raw = Vec::with_capacity((h * (1 + w * 3)) as usize);
+    // The pushed filter byte is interleaved with per-row pixel data, so it cannot
+    // be hoisted into a bulk fill — order (filter byte, then w*3 pixels) matters.
+    #[allow(clippy::same_item_push)]
     for _ in 0..h {
         raw.push(0u8); // filter: None
         for _ in 0..w {

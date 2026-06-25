@@ -302,10 +302,8 @@ fn down_proj_6848_specifically_breaks_frankensearch_1536_bound() {
     const WORST_K: usize = 6848;
 
     // We are *beyond* the inherited bound — that is the whole point.
-    assert!(
-        WORST_K > FRANKENSEARCH_K_BOUND,
-        "K=6848 must exceed the frankensearch bound {FRANKENSEARCH_K_BOUND} to be a real test"
-    );
+    // K=6848 must exceed the frankensearch bound (1536) to be a real test.
+    const _: () = assert!(WORST_K > FRANKENSEARCH_K_BOUND);
     println!(
         "WORST_K=6848 is {}x the frankensearch bound {FRANKENSEARCH_K_BOUND}; \
          we DO NOT inherit it.",
@@ -339,7 +337,7 @@ fn down_proj_6848_specifically_breaks_frankensearch_1536_bound() {
     let b127 = vec![127i8; WORST_K];
     let s_i32 = dot_s8s8_i32(&a127, &b127);
     assert_eq!(i64::from(s_i32), 110_451_392);
-    assert!(110_451_392 < I32_MAX_I64);
+    const _: () = assert!(110_451_392 < I32_MAX_I64);
     log_row(
         "S8S8",
         WORST_K,

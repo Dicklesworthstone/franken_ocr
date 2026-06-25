@@ -825,7 +825,7 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
     match dtype {
         DType::F32 => decode_f32_le(data),
         DType::F16 => {
-            if data.len() % 2 != 0 {
+            if !data.len().is_multiple_of(2) {
                 return Err(FocrError::FormatMismatch(format!(
                     "F16 byte len {} is not a multiple of 2",
                     data.len()
@@ -837,7 +837,7 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
                 .collect())
         }
         DType::BF16 => {
-            if data.len() % 2 != 0 {
+            if !data.len().is_multiple_of(2) {
                 return Err(FocrError::FormatMismatch(format!(
                     "BF16 byte len {} is not a multiple of 2",
                     data.len()
@@ -858,7 +858,7 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
 
 /// Decode a little-endian f32 byte buffer.
 fn decode_f32_le(data: &[u8]) -> FocrResult<Vec<f32>> {
-    if data.len() % 4 != 0 {
+    if !data.len().is_multiple_of(4) {
         return Err(FocrError::FormatMismatch(format!(
             "F32 byte len {} is not a multiple of 4",
             data.len()

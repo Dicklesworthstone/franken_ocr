@@ -51,6 +51,13 @@ fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 # Image decode/resize/normalize/pad/tile — the preprocess front end (plan §6.2).
 image = "0.25"
 
+# Currently-unwired opt-in: declaring the feature makes `#[cfg(feature =
+# "mimalloc")]` in benches/support/perf_harness.rs a KNOWN cfg (no unexpected-cfg
+# warning). Empty on purpose — no dependency is pulled in until the allocator is
+# actually wired behind `--features mimalloc`.
+[features]
+mimalloc = []
+
 # The `>=0.3.5,<0.4` asupersync the engine needs is not yet on crates.io (the
 # index tops out at 0.3.4); it lives as the local sibling crate `/dp/asupersync`
 # (version 0.3.5). Patch crates-io to that path so the whole dependency graph —

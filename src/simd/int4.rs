@@ -122,7 +122,7 @@ pub fn unpack_byte(b: u8) -> (i8, i8) {
 #[must_use]
 pub fn unpack_to_i8(b_packed: &[u8], n: usize, k: usize) -> Vec<i8> {
     assert!(
-        k % 2 == 0,
+        k.is_multiple_of(2),
         "unpack_to_i8: k {k} must be even (two nibbles/byte)"
     );
     assert_eq!(
@@ -161,6 +161,8 @@ pub fn unpack_to_i8(b_packed: &[u8], n: usize, k: usize) -> Vec<i8> {
 /// # Panics
 /// Panics on any shape contract violation (`k` odd, `group` not dividing `k`, or
 /// a buffer length disagreeing with `m/k/n/group`).
+// kernel signature: m/k/n dims + scales
+#[allow(clippy::too_many_arguments)]
 pub fn igemm_s4s8(
     a: &[i8],
     b_packed: &[u8],
@@ -171,9 +173,9 @@ pub fn igemm_s4s8(
     n: usize,
     out: &mut [f32],
 ) {
-    assert!(k % 2 == 0, "igemm_s4s8: k {k} must be even");
+    assert!(k.is_multiple_of(2), "igemm_s4s8: k {k} must be even");
     assert!(
-        group != 0 && k % group == 0,
+        group != 0 && k.is_multiple_of(group),
         "igemm_s4s8: group {group} must divide k {k}"
     );
     let groups = k / group;
@@ -218,6 +220,8 @@ pub fn igemm_s4s8(
 /// public [`igemm_s4s8`] and by the tests' "unpack then scalar int8 GEMM" oracle
 /// (so the two cannot drift). `b_i8` is the dense row-major `[n, k]` int8
 /// (`[-8, 7]`) produced by [`unpack_to_i8`].
+// kernel signature: m/k/n dims + scales
+#[allow(clippy::too_many_arguments)]
 fn igemm_s4s8_unpacked(
     a: &[i8],
     b_i8: &[i8],

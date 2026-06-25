@@ -107,14 +107,14 @@ pub fn linear_int8_dynamic(x: &Mat, w: &QInt8, bias: Option<&[f32]>) -> FocrResu
             w.k
         )));
     }
-    if let Some(b) = bias {
-        if b.len() != w.n {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "linear_int8_dynamic: bias len {} != n {}",
-                b.len(),
-                w.n
-            )));
-        }
+    if let Some(b) = bias
+        && b.len() != w.n
+    {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "linear_int8_dynamic: bias len {} != n {}",
+            b.len(),
+            w.n
+        )));
     }
     let (m, k, n) = (x.rows, x.cols, w.n);
     let data = ft_kernel_cpu::linear_int8_dynamic_f32(&x.data, m, k, &w.w, &w.scales, n, bias);
@@ -187,14 +187,14 @@ pub fn sdpa(
 /// Returns [`FocrError::Other`] if `weight` is present but its length isn't
 /// `x.cols`.
 pub fn rms_norm(x: &Mat, weight: Option<&[f32]>, eps: f32) -> FocrResult<Mat> {
-    if let Some(w) = weight {
-        if w.len() != x.cols {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "rms_norm: weight len {} != cols {}",
-                w.len(),
-                x.cols
-            )));
-        }
+    if let Some(w) = weight
+        && w.len() != x.cols
+    {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rms_norm: weight len {} != cols {}",
+            w.len(),
+            x.cols
+        )));
     }
     let data = ft_kernel_cpu::rms_norm_forward_f32(&x.data, weight, x.rows, x.cols, eps);
     Ok(Mat::from_vec(x.rows, x.cols, data))
@@ -215,23 +215,23 @@ pub fn layer_norm(
     bias: Option<&[f32]>,
     eps: f32,
 ) -> FocrResult<Mat> {
-    if let Some(w) = weight {
-        if w.len() != x.cols {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "layer_norm: weight len {} != cols {}",
-                w.len(),
-                x.cols
-            )));
-        }
+    if let Some(w) = weight
+        && w.len() != x.cols
+    {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "layer_norm: weight len {} != cols {}",
+            w.len(),
+            x.cols
+        )));
     }
-    if let Some(b) = bias {
-        if b.len() != x.cols {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "layer_norm: bias len {} != cols {}",
-                b.len(),
-                x.cols
-            )));
-        }
+    if let Some(b) = bias
+        && b.len() != x.cols
+    {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "layer_norm: bias len {} != cols {}",
+            b.len(),
+            x.cols
+        )));
     }
     let data = ft_kernel_cpu::layer_norm_forward_f32(&x.data, weight, bias, x.rows, x.cols, eps);
     Ok(Mat::from_vec(x.rows, x.cols, data))

@@ -1,3 +1,4 @@
+#![allow(clippy::doc_overindented_list_items, clippy::doc_lazy_continuation)]
 //! Shared parity-ladder comparator infrastructure (pure infra — compiles and
 //! self-tests **without** the 6.67 GB weights or any oracle fixture).
 //!

@@ -724,7 +724,10 @@ mod tests {
         assert!((pos.data[0] - 99.0).abs() < 1e-6);
         // Interpolated values are convex-ish combinations within source range.
         for &v in &pos.data[1..] {
-            assert!(v >= 0.5 && v <= 10.0, "interp out of expected range: {v}");
+            assert!(
+                (0.5..=10.0).contains(&v),
+                "interp out of expected range: {v}"
+            );
         }
     }
 

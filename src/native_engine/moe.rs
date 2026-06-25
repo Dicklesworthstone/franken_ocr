@@ -738,7 +738,7 @@ mod tests {
         assert_eq!(config::DENSE_INTERMEDIATE_SIZE, 6848);
         assert_eq!(config::HIDDEN_SIZE, 1280);
         assert_eq!(config::FIRST_K_DENSE_REPLACE, 1);
-        assert!(!config::NORM_TOPK_PROB);
+        const _: () = assert!(!config::NORM_TOPK_PROB);
         assert_eq!(config::ROUTED_SCALING_FACTOR, 1.0);
     }
 

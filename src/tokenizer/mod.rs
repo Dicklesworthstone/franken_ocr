@@ -159,6 +159,7 @@ pub struct Tokenizer {
 struct AddedToken {
     content: String,
     id: u32,
+    #[allow(dead_code)]
     special: bool,
 }
 

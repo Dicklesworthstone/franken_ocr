@@ -242,14 +242,14 @@ impl Preprocessed {
         let q_base = num_queries(self.mode.base_size());
         // Global: 16 rows of (16 patches + 1 newline) + 1 view separator.
         let mut total = (q_base + 1) * q_base + 1;
-        if let PreprocessMode::Gundam { tile_size, .. } = self.mode {
-            if self.crop_grid.is_tiled() {
-                let q_local = num_queries(tile_size);
-                let w = self.crop_grid.width_crop_num;
-                let h = self.crop_grid.height_crop_num;
-                // Local: (q_local*W patches + 1 newline) per (q_local*H) rows.
-                total += (q_local * w + 1) * (q_local * h);
-            }
+        if let PreprocessMode::Gundam { tile_size, .. } = self.mode
+            && self.crop_grid.is_tiled()
+        {
+            let q_local = num_queries(tile_size);
+            let w = self.crop_grid.width_crop_num;
+            let h = self.crop_grid.height_crop_num;
+            // Local: (q_local*W patches + 1 newline) per (q_local*H) rows.
+            total += (q_local * w + 1) * (q_local * h);
         }
         total
     }

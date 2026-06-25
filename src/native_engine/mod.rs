@@ -79,8 +79,10 @@ pub struct OcrModel {
 /// [`Arc<OcrModel>`] handle is dropped, the weight blob is freed; a subsequent
 /// [`OcrModel::load`] of the same path re-reads it. While at least one handle is
 /// live, repeat loads of the same path hand back a cheap `Arc::clone`.
-fn model_cache() -> &'static Mutex<Option<(PathBuf, Weak<OcrModel>)>> {
-    static CACHE: OnceLock<Mutex<Option<(PathBuf, Weak<OcrModel>)>>> = OnceLock::new();
+type ModelCache = Mutex<Option<(PathBuf, Weak<OcrModel>)>>;
+
+fn model_cache() -> &'static ModelCache {
+    static CACHE: OnceLock<ModelCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
@@ -118,12 +120,11 @@ impl OcrModel {
 
         let cache = model_cache();
         let mut guard = cache.lock().expect("model cache mutex poisoned");
-        if let Some((cached_path, weak)) = guard.as_ref() {
-            if *cached_path == resolved {
-                if let Some(strong) = weak.upgrade() {
-                    return Ok(strong);
-                }
-            }
+        if let Some((cached_path, weak)) = guard.as_ref()
+            && *cached_path == resolved
+            && let Some(strong) = weak.upgrade()
+        {
+            return Ok(strong);
         }
 
         let weights = Weights::load(&resolved)?;
@@ -183,8 +184,10 @@ impl OcrModel {
     /// image front end is bd-1gv.2/3), surfaced through the typed pipeline.
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
         // ── 1. preprocess ────────────────────────────────────────────────────
-        let pre =
-            preprocess::preprocess_image(image_path, preprocess::PreprocessMode::Base { base_size: 1024 })?;
+        let pre = preprocess::preprocess_image(
+            image_path,
+            preprocess::PreprocessMode::Base { base_size: 1024 },
+        )?;
         let (image_w, image_h) = Self::image_dims(&pre);
 
         // ── 2. vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ─────────
@@ -378,8 +381,8 @@ impl OcrModel {
             // step through the ring-cache'd decoder. The Weights-backed driver is
             // NotImplemented until the reader lands; the loop body is the wired
             // shape (one token in -> one hidden row out).
-            let mut step_embed = self.embed_prompt(&[step.token])?;
-            hidden = decoder::forward(&self.weights, &mut step_embed)?;
+            let step_embed = self.embed_prompt(&[step.token])?;
+            hidden = decoder::forward(&self.weights, &step_embed)?;
         }
         Ok(emitted)
     }

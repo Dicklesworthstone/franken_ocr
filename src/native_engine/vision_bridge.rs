@@ -141,13 +141,13 @@ pub fn project(x: &Mat, w: &Mat, bias: Option<&[f32]>) -> FocrResult<Mat> {
             w.cols
         )));
     }
-    if let Some(b) = bias {
-        if b.len() != PROJ_OUT {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "vision_bridge::project: bias len {} != {PROJ_OUT}",
-                b.len()
-            )));
-        }
+    if let Some(b) = bias
+        && b.len() != PROJ_OUT
+    {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_bridge::project: bias len {} != {PROJ_OUT}",
+            b.len()
+        )));
     }
 
     // PyTorch Linear stores weight as [out, in] and computes x @ w^T. The GEMM
@@ -175,6 +175,8 @@ fn transpose(m: &Mat) -> Mat {
     let mut out = Mat::zeros(c, r);
     for i in 0..r {
         let src = m.row(i);
+        // indexed loop: spatial kernel offset
+        #[allow(clippy::needless_range_loop)]
         for j in 0..c {
             out.data[j * r + i] = src[j];
         }

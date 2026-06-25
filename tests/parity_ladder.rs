@@ -260,7 +260,7 @@ fn l2_per_layer_cosine_and_ledger() {
             continue;
         };
         let doc_stem = golden.doc_stem_or(&stem);
-        for (stage, _e) in &golden.activations {
+        for stage in golden.activations.keys() {
             if let Ok(oracle) = loader.load_activation(&doc_stem, stage) {
                 let c = cosine(&oracle.data, &oracle.data);
                 let mad = max_abs_diff(&oracle.data, &oracle.data);

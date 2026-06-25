@@ -251,15 +251,15 @@ fn match_word(chars: &[char], i: usize) -> Option<usize> {
     let at = |k: usize| -> Option<char> { chars.get(k).copied() };
 
     // Alt 1: [ascii-punct][A-Za-z]+
-    if let Some(c0) = at(i) {
-        if is_ascii_punct_lead(c0) {
-            let mut j = i + 1;
-            while j < n && chars[j].is_ascii_alphabetic() {
-                j += 1;
-            }
-            if j > i + 1 {
-                return Some(j - i);
-            }
+    if let Some(c0) = at(i)
+        && is_ascii_punct_lead(c0)
+    {
+        let mut j = i + 1;
+        while j < n && chars[j].is_ascii_alphabetic() {
+            j += 1;
+        }
+        if j > i + 1 {
+            return Some(j - i);
         }
     }
 
@@ -267,14 +267,18 @@ fn match_word(chars: &[char], i: usize) -> Option<usize> {
     {
         let mut j = i;
         // optional single leading char that is NOT CR/LF/L/P/S
-        if let Some(c) = at(j) {
-            if c != '\r' && c != '\n' && !is_l(c) && !is_p(c) && !is_s(c) {
-                // tentatively consume it, but only if followed by ≥1 (L|M)
-                if let Some(c1) = at(j + 1) {
-                    if is_l(c1) || is_m(c1) {
-                        j += 1;
-                    }
-                }
+        if let Some(c) = at(j)
+            && c != '\r'
+            && c != '\n'
+            && !is_l(c)
+            && !is_p(c)
+            && !is_s(c)
+        {
+            // tentatively consume it, but only if followed by ≥1 (L|M)
+            if let Some(c1) = at(j + 1)
+                && (is_l(c1) || is_m(c1))
+            {
+                j += 1;
             }
         }
         let start_lm = j;

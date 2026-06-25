@@ -92,6 +92,10 @@ impl DecodeParams {
     /// Whether sampling is greedy (`do_sample = temperature > 0`, [SPEC-100]).
     #[must_use]
     pub fn is_greedy(&self) -> bool {
+        // Negation is intentional: `do_sample = temperature > 0`, so greedy is its
+        // exact logical negation. This also maps a NaN `temperature` to greedy
+        // (`!(NaN > 0.0)` == true), which `temperature <= 0.0` would not preserve.
+        #[allow(clippy::neg_cmp_op_on_partial_ord)]
         !(self.temperature > 0.0)
     }
 
