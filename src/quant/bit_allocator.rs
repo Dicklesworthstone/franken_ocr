@@ -63,6 +63,13 @@ pub const DEFAULT_OPTION_BITS: &[(&str, f64)] = &[
 /// Numerical tie-break epsilon, matching the Python's `1e-18`.
 const EPS: f64 = 1e-18;
 
+/// No-gain threshold (layer-output cosine-drop): a precision tier whose total
+/// distortion reduction over the next-cheaper kept tier is at or below this
+/// calibration-noise floor buys *nothing*. Such a tier is pruned from a tensor's
+/// operational hull so a FLAT tensor (where more bits yield no measurable gain)
+/// stays at its cheapest tier instead of being awarded bits it cannot use.
+const NO_GAIN_DISTORTION: f64 = 1e-6;
+
 /// An allocation error: malformed input or an infeasible budget. Mirrors the
 /// Python `AllocatorError`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,7 +155,9 @@ pub struct TensorCurve {
     pub numel: u64,
     /// `None`, or `Some("bf16")` to force high precision.
     pub pin: Option<String>,
-    /// `None`, or e.g. `Some("int8")` (§6.3 `_M` discipline: never below this).
+    /// `None`, or e.g. `Some("int8")` (§6.3 `_M` discipline: pin to exactly this
+    /// tier — the deliberate target for a sensitive tensor; cheaper *and* pricier
+    /// tiers are dropped).
     pub tier_floor: Option<String>,
     /// The raw `option -> {bits, distortion}` curve.
     pub curve: Vec<CurveOption>,
@@ -262,8 +271,10 @@ fn monotone_repair(points: &[Point]) -> Vec<Point> {
     repaired
 }
 
-/// Keep only the lower convex hull of the `(bytes, distortion)` points. Mirrors
-/// the Python `_convex_hull_prune`.
+/// Keep only the lower convex hull of the `(bytes, distortion)` points, then
+/// drop trailing tiers whose marginal gain is below the no-gain floor (so a flat
+/// tensor collapses to its cheapest tier). Extends the Python `_convex_hull_prune`
+/// with the explicit no-gain guard.
 fn convex_hull_prune(points: &[Point]) -> Vec<Point> {
     // De-duplicate identical byte sizes, keeping the lowest distortion (then
     // highest precision). Insertion order follows the byte-ascending input.
@@ -284,24 +295,40 @@ fn convex_hull_prune(points: &[Point]) -> Vec<Point> {
     }
     // BTreeMap over u64 keys => byte-ascending.
     let uniq: Vec<Point> = by_bytes.into_values().collect();
-    if uniq.len() <= 2 {
-        return uniq;
-    }
-    let mut hull: Vec<Point> = Vec::new();
-    for p in uniq {
-        while hull.len() >= 2 {
-            let a = &hull[hull.len() - 2];
-            let b = &hull[hull.len() - 1];
-            // cross of (b-a) x (p-a) in (bytes, distortion) space; <= 0 => b not below.
-            let cross = (b.rate_bytes as f64 - a.rate_bytes as f64) * (p.distortion - a.distortion)
-                - (b.distortion - a.distortion) * (p.rate_bytes as f64 - a.rate_bytes as f64);
-            if cross <= 0.0 {
-                hull.pop();
-            } else {
-                break;
+    let mut hull: Vec<Point> = if uniq.len() <= 2 {
+        uniq
+    } else {
+        let mut hull: Vec<Point> = Vec::new();
+        for p in uniq {
+            while hull.len() >= 2 {
+                let a = &hull[hull.len() - 2];
+                let b = &hull[hull.len() - 1];
+                // cross of (b-a) x (p-a) in (bytes, distortion) space; <= 0 => b not below.
+                let cross = (b.rate_bytes as f64 - a.rate_bytes as f64)
+                    * (p.distortion - a.distortion)
+                    - (b.distortion - a.distortion) * (p.rate_bytes as f64 - a.rate_bytes as f64);
+                if cross <= 0.0 {
+                    hull.pop();
+                } else {
+                    break;
+                }
             }
+            hull.push(p);
         }
-        hull.push(p);
+        hull
+    };
+    // No-gain prune: drop trailing tiers whose marginal distortion reduction over
+    // the previous kept tier is at/below the calibration-noise floor. On a FLAT
+    // curve every extra bit buys nothing, so the pricier tier must be dropped —
+    // otherwise water-filling awards it bits (and it leaks into the uniform
+    // baseline). Steep tiers (real gains ≫ noise) are untouched.
+    while hull.len() >= 2 {
+        let marginal_gain = hull[hull.len() - 2].distortion - hull[hull.len() - 1].distortion;
+        if marginal_gain <= NO_GAIN_DISTORTION {
+            hull.pop();
+        } else {
+            break;
+        }
     }
     hull
 }
@@ -317,8 +344,14 @@ fn lt_tuple(a: (f64, i64), b: (f64, i64)) -> bool {
     a.1 < b.1
 }
 
-/// Restrict the option set per a bf16 pin and/or a tier floor. Mirrors the
-/// Python `_apply_pins_and_floors`.
+/// Restrict the option set per a bf16 pin and/or a tier floor.
+///
+/// The §6.3 `_M` discipline pins a sensitive tensor (e.g. `v_proj` / `down_proj`)
+/// to *exactly* its tier — int8 — neither dropping below it (the floor) nor
+/// spending bits to climb above it: that tier is the deliberate target, so the
+/// option set is reduced to just the floor tier. Hence the tier-floor comparison
+/// keeps only options *at* `floor_rank` (both cheaper and pricier tiers fall
+/// away), so a tier-floored tensor's costliest == its floor tier.
 fn apply_pins_and_floors(
     name: &str,
     points: Vec<Point>,
@@ -338,7 +371,7 @@ fn apply_pins_and_floors(
         let floor_rank = option_rank(floor);
         let kept: Vec<Point> = points
             .into_iter()
-            .filter(|p| option_rank(&p.option) <= floor_rank)
+            .filter(|p| option_rank(&p.option) == floor_rank)
             .collect();
         if kept.is_empty() {
             return Err(AllocatorError(format!(

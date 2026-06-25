@@ -184,8 +184,11 @@ pub fn route(
         )));
     }
 
-    // 1. logits [n_tok, 64].
-    let mut scores = linear_no_bias(hidden, gate, n_experts, config::HIDDEN_SIZE)?;
+    // 1. logits [n_tok, 64]. The gate is [n_experts, hidden]; read the input
+    //    dimension from the activation itself so the router works for any
+    //    configured hidden size (the full model uses HIDDEN_SIZE = 1280, the
+    //    small-MoE tests use a tiny hidden), rather than hardcoding the constant.
+    let mut scores = linear_no_bias(hidden, gate, n_experts, hidden.cols)?;
     // 2. softmax over the expert axis (dim=-1) — numerically stable, in place.
     nn::softmax_rows(&mut scores)?;
 

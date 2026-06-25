@@ -112,9 +112,13 @@ impl OcrModel {
     /// weights are loaded and a fresh handle is cached weakly.
     ///
     /// # Errors
-    /// [`FocrError::ModelNotFound`] if the path doesn't resolve; otherwise
-    /// whatever [`Weights::load`] returns (currently
-    /// [`FocrError::NotImplemented`] — the `.focrq` reader is Phase 2).
+    /// [`FocrError::ModelNotFound`] if the path doesn't resolve (or the resolved
+    /// file is unreadable). Until the header-sniff resolver (bd-223.7) and the
+    /// manifest census land, an *existing* path whose bytes are not a recognized
+    /// model container surfaces [`FocrError::NotImplemented`] (the real model
+    /// resolution/assembly is not wired yet) rather than leaking the low-level
+    /// container [`FocrError::FormatMismatch`] from [`Weights::load`]. A genuine
+    /// model container parses and loads as today.
     pub fn load(path: &Path) -> FocrResult<Arc<Self>> {
         let resolved = Self::resolve_model(path)?;
 
@@ -127,7 +131,29 @@ impl OcrModel {
             return Ok(strong);
         }
 
-        let weights = Weights::load(&resolved)?;
+        // `resolve_model` is still a skeleton that accepts ANY existing path —
+        // the header-sniff resolver that confirms a real model artifact is
+        // bd-223.7. So an existing-but-non-model path slips past `resolve` and
+        // reaches `Weights::load`, which reports a low-level container
+        // `FormatMismatch` that misrepresents the situation: the real reason it
+        // can't load is that the model package's resolve + manifest-census
+        // assembly is not implemented yet. Map that case to a clean
+        // `NotImplemented`. A genuinely unreadable file stays `ModelNotFound`
+        // (TOCTOU / permissions after the existence check); a real model
+        // container parses to `Ok` and is unaffected.
+        let weights = Weights::load(&resolved).map_err(|e| {
+            if matches!(e, FocrError::ModelNotFound(_)) {
+                e
+            } else {
+                FocrError::NotImplemented(format!(
+                    "native_engine::OcrModel::load — {} exists but is not a recognized model \
+                     container, and the resolver that turns an arbitrary existing path into a \
+                     validated Unlimited-OCR model (header-sniff bd-223.7 / manifest census \
+                     Phase 2) is not yet implemented; underlying parse: {e}",
+                    resolved.display()
+                ))
+            }
+        })?;
         let model = Arc::new(Self {
             path: resolved.clone(),
             weights,
@@ -471,10 +497,12 @@ mod tests {
     }
 
     /// A path that exists on disk but is not a real model resolves (the
-    /// header-sniff resolver is a later bead) and then fails cleanly at
-    /// `Weights::load` (NotImplemented), never panics — the load path is
-    /// `resolve -> Weights::load`, and the second leg is the Phase-2 stub. Uses a
-    /// freshly-created temp file so the test is CWD-independent.
+    /// header-sniff resolver is a later bead, so `resolve_model` accepts any
+    /// existing path) and then fails cleanly with `NotImplemented`, never panics.
+    /// `Weights::load` reports a low-level container `FormatMismatch` on the junk
+    /// bytes, but the real gap is that the model package's resolve + manifest
+    /// assembly is Phase-2; `OcrModel::load` maps that case to `NotImplemented`.
+    /// Uses a freshly-created temp file so the test is CWD-independent.
     #[test]
     fn load_existing_non_model_path_is_not_implemented_not_panic() {
         let mut tmp = std::env::temp_dir();

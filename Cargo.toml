@@ -64,8 +64,15 @@ mimalloc = []
 # franken_ocr's direct dep AND the fsqlite/frankentorch path-deps that pin
 # `0.3.4` — unifies on the single local 0.3.5 (which satisfies both ^0.3.4 and
 # >=0.3.5,<0.4). One asupersync in the tree; no version skew.
+#
+# The path is spelled `/dp/asupersync` (not the `../asupersync` symlink) to match
+# fsqlite's direct path-dep spelling byte-for-byte. `[patch.crates-io]` only
+# rewrites the crates.io deps; fsqlite path-deps `/dp/asupersync` directly, so the
+# patch must use the IDENTICAL string or cargo records two distinct packages
+# (`.../projects/asupersync` vs `/dp/asupersync`) and aborts re-resolution with a
+# "package collision in the lockfile" error even though both symlink to one dir.
 [patch.crates-io]
-asupersync = { path = "../asupersync" }
+asupersync = { path = "/dp/asupersync" }
 
 [lints.rust]
 unsafe_code = "deny"

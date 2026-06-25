@@ -366,10 +366,16 @@ pub fn fit_gpd_pwm(sorted_vals: &[f64], pot_frac: f64) -> TailRiskResult<GpdFit>
         return Err(TailRiskError::Empty);
     }
 
-    // Threshold u = the (1 − pot_frac) quantile; exceedances are docs strictly
-    // above it.
+    // Threshold u = the (1 − pot_frac) quantile. The GPD models the *excess*
+    // over the threshold, so the exceedances are the residuals `y = x − u` for
+    // every doc strictly above `u` (the quantile function adds `u` back).
     let u = empirical_quantile(sorted_vals, 1.0 - pot_frac).expect("non-empty");
-    let mut exceed: Vec<f64> = sorted_vals.iter().copied().filter(|&v| v > u).collect();
+    let mut exceed: Vec<f64> = sorted_vals
+        .iter()
+        .copied()
+        .filter(|&v| v > u)
+        .map(|v| v - u)
+        .collect();
     let m = exceed.len();
 
     let fallback = |m: usize| GpdFit {
@@ -1212,10 +1218,14 @@ mod tests {
             compute_report_default(&[]).unwrap_err(),
             TailRiskError::Empty
         );
-        assert_eq!(
+        // NaN payload: `NonFinite(NaN) == NonFinite(NaN)` is *false* under IEEE-754
+        // (NaN ≠ NaN) and the derived `PartialEq` compares the payload, so an
+        // `assert_eq!` here can never hold. Match the variant and assert the
+        // payload is the NaN we fed in (mirrors the `OutOfRange` checks below).
+        assert!(matches!(
             compute_report_default(&[0.1, f64::NAN]).unwrap_err(),
-            TailRiskError::NonFinite(f64::NAN)
-        );
+            TailRiskError::NonFinite(v) if v.is_nan()
+        ));
         assert!(matches!(
             compute_report_default(&[0.1, 1.5]).unwrap_err(),
             TailRiskError::OutOfRange(_)

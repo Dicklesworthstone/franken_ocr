@@ -752,23 +752,57 @@ impl SpeculativeGuard {
                 emitted_token: full_token,
             }
         } else {
-            // ACCEPT_DRAFT: the guard holds — skip the verify, emit the draft.
-            // This branch is ONLY reached when speculation is active (cal Some,
-            // not tripped) AND margin ≥ threshold AND cadence not yet due.
+            // The guard's confidence policy WOULD skip the verify here (cal Some,
+            // not tripped, margin ≥ threshold, cadence not yet due). But output
+            // identity (AF-3 proof obligation 3: ON == OFF under greedy/argmax)
+            // forbids ever emitting a token that differs from the full decode, so
+            // the skip is only *safe* — and the draft only *provably* equals the
+            // full token — when `draft_token == full_token`. We confirm that
+            // directly against the authoritative full token, which is the real
+            // acceptance criterion for greedy speculative decoding (draft ==
+            // argmax(target)); the margin/e-value statistic only decides WHEN to
+            // try to skip, never WHAT to emit.
             self.since_audit += 1;
             let e_value = self.eprocess.as_ref().map_or(1.0, EProcess::e_value);
-            self.ledger.push(DecisionRecord {
-                step,
-                action: Action::AcceptDraft,
-                margin,
-                audited: false,
-                agree: None,
-                e_value,
-                emitted_token: draft_token,
-            });
-            Decision {
-                action: Action::AcceptDraft,
-                emitted_token: draft_token,
+            if draft_token == full_token {
+                // ACCEPT_DRAFT: the skip is provably output-identical to full
+                // decode (draft argmax == full argmax). Emit the cheap draft.
+                self.ledger.push(DecisionRecord {
+                    step,
+                    action: Action::AcceptDraft,
+                    margin,
+                    audited: false,
+                    agree: None,
+                    e_value,
+                    emitted_token: draft_token,
+                });
+                Decision {
+                    action: Action::AcceptDraft,
+                    emitted_token: draft_token,
+                }
+            } else {
+                // SAFETY FALL_BACK: the confidence policy mis-rated this draft
+                // (high margin yet WRONG argmax). Emitting the disagreeing draft
+                // would violate output identity, so we emit the authoritative
+                // full token instead. This caught disagreement is not part of the
+                // unbiased audit sample, so it is not folded into the e-process
+                // (keeps `measured_disagreement_rate` representative); the
+                // deterministic cadence counter advanced above remains the
+                // monitoring mechanism that trips on a sustained disagreement
+                // burst (e.g. an adversarial draft).
+                self.ledger.push(DecisionRecord {
+                    step,
+                    action: Action::FallBack,
+                    margin,
+                    audited: false,
+                    agree: None,
+                    e_value,
+                    emitted_token: full_token,
+                });
+                Decision {
+                    action: Action::FallBack,
+                    emitted_token: full_token,
+                }
             }
         }
     }
