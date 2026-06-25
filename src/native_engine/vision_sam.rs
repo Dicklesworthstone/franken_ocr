@@ -69,13 +69,33 @@ pub struct Linear {
 impl Linear {
     /// `y[m,out] = x[m,in] @ w^T + b`. `x.cols` must equal `self.in_`.
     fn apply(&self, x: &Mat) -> FocrResult<Mat> {
-        debug_assert_eq!(self.w.len(), self.out * self.in_);
+        if x.cols != self.in_ {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam linear: input cols {} != expected in_features {}",
+                x.cols,
+                self.in_
+            )));
+        }
+        if self.w.len() != self.out * self.in_ {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam linear: weight len {} != out*in {}*{}",
+                self.w.len(),
+                self.out,
+                self.in_
+            )));
+        }
+        if !self.b.is_empty() && self.b.len() != self.out {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam linear: bias len {} != out_features {}",
+                self.b.len(),
+                self.out
+            )));
+        }
         // w is [out, in]; transpose to [in, out] so matmul([m,in],[in,out]).
         let wt = transpose(&self.w, self.out, self.in_);
         let wt_mat = Mat::from_vec(self.in_, self.out, wt);
         let mut y = nn::matmul(x, &wt_mat)?;
         if !self.b.is_empty() {
-            debug_assert_eq!(self.b.len(), self.out);
             for r in 0..y.rows {
                 let row = y.row_mut(r);
                 for (c, v) in row.iter_mut().enumerate() {
@@ -357,6 +377,7 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     } else {
         attention(&blk.attn, &normed, gh, gw)?
     };
+    ensure_same_shape("vision_sam block attention residual", &attn_out, x)?;
 
     // residual 1: x = shortcut + attn
     let mut h1 = x.clone();
@@ -369,6 +390,7 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     let mut mlp = blk.lin1.apply(&normed2)?;
     nn::gelu(&mut mlp);
     let mlp = blk.lin2.apply(&mlp)?;
+    ensure_same_shape("vision_sam block mlp residual", &mlp, &h1)?;
     for (a, b) in h1.data.iter_mut().zip(mlp.data.iter()) {
         *a += *b;
     }
@@ -382,14 +404,47 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
 /// shaped `[gh*gw, dim]`.
 fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     let n = gh * gw;
-    debug_assert_eq!(x.rows, n);
+    if x.rows != n {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: input rows {} != gh*gw {}*{}",
+            x.rows,
+            gh,
+            gw
+        )));
+    }
     let dim = x.cols;
     let nh = NUM_HEADS;
+    if dim == 0 || !dim.is_multiple_of(nh) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: dim {} must be non-zero and divisible by heads {}",
+            dim,
+            nh
+        )));
+    }
+    if p.qkv.in_ != dim || p.qkv.out != 3 * dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: qkv shape out/in {}x{} incompatible with dim {}",
+            p.qkv.out,
+            p.qkv.in_,
+            dim
+        )));
+    }
+    if p.proj.in_ != dim || p.proj.out != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: proj shape out/in {}x{} incompatible with dim {}",
+            p.proj.out,
+            p.proj.in_,
+            dim
+        )));
+    }
     let hd = dim / nh;
+    ensure_rel_pos_len("rel_pos_h", p.size_h, hd, p.rel_pos_h.len())?;
+    ensure_rel_pos_len("rel_pos_w", p.size_w, hd, p.rel_pos_w.len())?;
     let scale = (hd as f32).powf(-0.5);
 
     // qkv: [n, 3*dim].
     let qkv = p.qkv.apply(x)?;
+    ensure_mat_shape(&qkv, n, 3 * dim, "vision_sam attention qkv output")?;
     // Split into per-head q,k,v: layout [n, 3, nh, hd] (PyTorch reshape order).
     // qkv row r: [3*dim] = for s in 0..3 { for head in 0..nh { hd } }.
     // We build flat per-head buffers [nh][n, hd] for q,k,v.
@@ -456,7 +511,53 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
         }
     }
     let ctx_mat = Mat::from_vec(n, dim, ctx);
-    p.proj.apply(&ctx_mat)
+    let y = p.proj.apply(&ctx_mat)?;
+    ensure_mat_shape(&y, n, dim, "vision_sam attention projection output")?;
+    Ok(y)
+}
+
+fn ensure_mat_shape(mat: &Mat, rows: usize, cols: usize, context: &str) -> FocrResult<()> {
+    if mat.rows == rows && mat.cols == cols {
+        return Ok(());
+    }
+    Err(FocrError::Other(anyhow::anyhow!(
+        "{context}: shape {:?} != expected ({rows}, {cols})",
+        mat.shape()
+    )))
+}
+
+fn ensure_same_shape(context: &str, actual: &Mat, expected: &Mat) -> FocrResult<()> {
+    if actual.shape() == expected.shape() {
+        return Ok(());
+    }
+    Err(FocrError::Other(anyhow::anyhow!(
+        "{context}: shape {:?} != expected {:?}",
+        actual.shape(),
+        expected.shape()
+    )))
+}
+
+fn ensure_rel_pos_len(name: &str, size: usize, hd: usize, actual_len: usize) -> FocrResult<()> {
+    let rows = size
+        .checked_mul(2)
+        .and_then(|n| n.checked_sub(1))
+        .ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "vision_sam attention: {name} size {size} is invalid"
+            ))
+        })?;
+    let expected_len = rows.checked_mul(hd).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: {name} size {size} overflows for head_dim {hd}"
+        ))
+    })?;
+    if actual_len == expected_len {
+        return Ok(());
+    }
+    Err(FocrError::Other(anyhow::anyhow!(
+        "vision_sam attention: {name} len {actual_len} != expected {expected_len} \
+         for size {size} and head_dim {hd}"
+    )))
 }
 
 fn decomposed_rel_pos_bias(
@@ -835,6 +936,15 @@ mod tests {
         }
     }
 
+    fn assert_err_contains<T: std::fmt::Debug>(res: FocrResult<T>, needle: &str) {
+        let err = res.expect_err("expected vision_sam shape error");
+        let message = err.to_string();
+        assert!(
+            message.contains(needle),
+            "error {message:?} did not contain {needle:?}"
+        );
+    }
+
     #[test]
     fn transpose_roundtrips() {
         let m = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2,3]
@@ -857,6 +967,42 @@ mod tests {
         assert_eq!(y.shape(), (1, 2));
         assert!((y.data[0] - 16.0).abs() < 1e-5);
         assert!((y.data[1] - 35.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn linear_rejects_malformed_shapes_without_panic() {
+        let x = Mat::from_vec(1, 3, vec![1.0, 2.0, 3.0]);
+        assert_err_contains(
+            Linear {
+                w: vec![1.0; 5],
+                b: vec![],
+                out: 2,
+                in_: 3,
+            }
+            .apply(&x),
+            "weight len",
+        );
+        assert_err_contains(
+            Linear {
+                w: vec![1.0; 6],
+                b: vec![0.0],
+                out: 2,
+                in_: 3,
+            }
+            .apply(&x),
+            "bias len",
+        );
+        let bad_x = Mat::from_vec(1, 2, vec![1.0, 2.0]);
+        assert_err_contains(
+            Linear {
+                w: vec![1.0; 6],
+                b: vec![],
+                out: 2,
+                in_: 3,
+            }
+            .apply(&bad_x),
+            "input cols",
+        );
     }
 
     #[test]
@@ -1190,6 +1336,24 @@ mod tests {
     }
 
     #[test]
+    fn attention_rejects_malformed_qkv_and_projection_shapes() {
+        let dim = EMBED_DIM;
+        let x = Mat::from_vec(4, dim, vec![0.0; 4 * dim]);
+
+        let mut bad_qkv = tiny_block(0).attn;
+        bad_qkv.qkv.out = 3 * dim - 1;
+        bad_qkv.qkv.w = vec![0.0; bad_qkv.qkv.out * bad_qkv.qkv.in_];
+        bad_qkv.qkv.b = vec![0.0; bad_qkv.qkv.out];
+        assert_err_contains(attention(&bad_qkv, &x, 2, 2), "qkv shape");
+
+        let mut bad_proj = tiny_block(0).attn;
+        bad_proj.proj.out = dim - 1;
+        bad_proj.proj.w = vec![0.0; bad_proj.proj.out * bad_proj.proj.in_];
+        bad_proj.proj.b = vec![0.0; bad_proj.proj.out];
+        assert_err_contains(attention(&bad_proj, &x, 2, 2), "proj shape");
+    }
+
+    #[test]
     fn block_forward_preserves_shape_global() {
         // global block (window=0) on a 2x2 grid; zero MLP + zero rel-pos so
         // output = x + attn(LN(x)) with proj/qkv identity. We only assert shape
@@ -1217,6 +1381,23 @@ mod tests {
         let x = Mat::from_vec(n, dim, data);
         let out = block_forward(&blk, &x, 2, 2).unwrap();
         assert_eq!(out.shape(), (n, dim));
+    }
+
+    #[test]
+    fn block_forward_rejects_mlp_residual_shape_mismatch() {
+        let mut blk = tiny_block(0);
+        blk.lin2.out = EMBED_DIM - 1;
+        blk.lin2.w = vec![0.0; blk.lin2.out * blk.lin2.in_];
+        blk.lin2.b = vec![0.0; blk.lin2.out];
+        let n = 4;
+        let dim = EMBED_DIM;
+        let data: Vec<f32> = (0..n * dim).map(|i| (i as f32 % 5.0) * 0.01).collect();
+        let x = Mat::from_vec(n, dim, data);
+
+        assert_err_contains(
+            block_forward(&blk, &x, 2, 2),
+            "vision_sam block mlp residual",
+        );
     }
 
     #[test]
