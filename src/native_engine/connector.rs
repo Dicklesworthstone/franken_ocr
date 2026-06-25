@@ -30,6 +30,34 @@ use crate::error::{FocrError, FocrResult};
 /// Vision embedding dim (`n_embed`) — the connector currency ([SPEC-060]).
 pub const N_EMBED: usize = 1280;
 
+fn checked_add(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_add(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} + {rhs})"
+        ))
+    })
+}
+
+fn checked_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} * {rhs})"
+        ))
+    })
+}
+
+fn zeros_checked(context: &str, rows: usize, cols: usize) -> FocrResult<Mat> {
+    let len = checked_mul(context, rows, cols, "rows*cols")?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(len).map_err(|err| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: could not allocate matrix [{rows}, {cols}] ({len} f32 values): {err}"
+        ))
+    })?;
+    data.resize(len, 0.0);
+    Ok(Mat { rows, cols, data })
+}
+
 /// Append `newline` (length `dim`) as one extra trailing column to every row of
 /// a `(h, w, dim)` grid laid out row-major as `[h*w, dim]`.
 ///
@@ -44,11 +72,12 @@ pub const N_EMBED: usize = 1280;
 /// length isn't `dim`.
 fn append_newline_column(grid: &Mat, h: usize, w: usize, newline: &[f32]) -> FocrResult<Mat> {
     let dim = grid.cols;
-    if grid.rows != h * w {
+    let expected_rows = checked_mul("append_newline_column", h, w, "h*w")?;
+    if grid.rows != expected_rows {
         return Err(FocrError::Other(anyhow::anyhow!(
             "append_newline_column: grid rows {} != h*w {}",
             grid.rows,
-            h * w
+            expected_rows
         )));
     }
     if newline.len() != dim {
@@ -58,17 +87,18 @@ fn append_newline_column(grid: &Mat, h: usize, w: usize, newline: &[f32]) -> Foc
             dim
         )));
     }
-    let out_rows = h * (w + 1);
-    let mut out = Mat::zeros(out_rows, dim);
+    let out_width = checked_add("append_newline_column", w, 1, "w+1")?;
+    let out_rows = checked_mul("append_newline_column", h, out_width, "h*(w+1)")?;
+    let mut out = zeros_checked("append_newline_column", out_rows, dim)?;
     for r in 0..h {
         // Copy the w real patch embeddings for this row.
         for c in 0..w {
             let src = grid.row(r * w + c);
-            let dst_row = r * (w + 1) + c;
+            let dst_row = r * out_width + c;
             out.row_mut(dst_row).copy_from_slice(src);
         }
         // Trailing newline column.
-        let nl_row = r * (w + 1) + w;
+        let nl_row = r * out_width + w;
         out.row_mut(nl_row).copy_from_slice(newline);
     }
     Ok(out)
@@ -80,9 +110,7 @@ fn append_newline_column(grid: &Mat, h: usize, w: usize, newline: &[f32]) -> Foc
 /// # Errors
 /// Returns [`FocrError::Other`] if the blocks disagree on `dim`.
 fn vstack(blocks: &[&Mat], dim: usize) -> FocrResult<Mat> {
-    let total_rows: usize = blocks.iter().map(|b| b.rows).sum();
-    let mut out = Mat::zeros(total_rows, dim);
-    let mut cursor = 0usize;
+    let mut total_rows = 0usize;
     for b in blocks {
         if b.cols != dim {
             return Err(FocrError::Other(anyhow::anyhow!(
@@ -91,9 +119,17 @@ fn vstack(blocks: &[&Mat], dim: usize) -> FocrResult<Mat> {
                 dim
             )));
         }
-        let n = b.rows * dim;
-        out.data[cursor * dim..cursor * dim + n].copy_from_slice(&b.data);
-        cursor += b.rows;
+        total_rows = checked_add("vstack", total_rows, b.rows, "sum_rows")?;
+    }
+
+    let mut out = zeros_checked("vstack", total_rows, dim)?;
+    let mut cursor = 0usize;
+    for b in blocks {
+        let n = checked_mul("vstack", b.rows, dim, "block_rows*dim")?;
+        let start = checked_mul("vstack", cursor, dim, "cursor*dim")?;
+        let end = checked_add("vstack", start, n, "copy range end")?;
+        out.data[start..end].copy_from_slice(&b.data);
+        cursor = checked_add("vstack", cursor, b.rows, "cursor+block_rows")?;
     }
     Ok(out)
 }
@@ -318,6 +354,69 @@ mod tests {
     fn append_newline_rejects_bad_grid_shape() {
         let g = Mat::zeros(5, 2); // 5 != 2*3
         assert!(append_newline_column(&g, 2, 3, &[0.0, 0.0]).is_err());
+    }
+
+    #[test]
+    fn append_newline_rejects_geometry_overflow_without_allocating() {
+        let g = Mat::zeros(0, 1);
+        assert!(matches!(
+            append_newline_column(&g, usize::MAX, 2, &[0.0]),
+            Err(err) if err.to_string().contains("overflow")
+        ));
+    }
+
+    #[test]
+    fn append_newline_rejects_output_width_overflow_without_allocating() {
+        let g = Mat::zeros(0, 1);
+        assert!(matches!(
+            append_newline_column(&g, 0, usize::MAX, &[0.0]),
+            Err(err) if err.to_string().contains("w+1")
+        ));
+    }
+
+    #[test]
+    fn append_newline_rejects_output_rows_overflow_without_allocating() {
+        let h = usize::MAX / 2 + 1;
+        let g = Mat {
+            rows: h,
+            cols: 1,
+            data: Vec::new(),
+        };
+        assert!(matches!(
+            append_newline_column(&g, h, 1, &[0.0]),
+            Err(err) if err.to_string().contains("h*(w+1)")
+        ));
+    }
+
+    #[test]
+    fn vstack_rejects_total_rows_overflow_without_allocating() {
+        let huge = Mat {
+            rows: usize::MAX,
+            cols: 1,
+            data: Vec::new(),
+        };
+        let one = Mat {
+            rows: 1,
+            cols: 1,
+            data: Vec::new(),
+        };
+        assert!(matches!(
+            vstack(&[&huge, &one], 1),
+            Err(err) if err.to_string().contains("sum_rows")
+        ));
+    }
+
+    #[test]
+    fn vstack_rejects_element_count_overflow_without_allocating() {
+        let huge = Mat {
+            rows: usize::MAX,
+            cols: 2,
+            data: Vec::new(),
+        };
+        assert!(matches!(
+            vstack(&[&huge], 2),
+            Err(err) if err.to_string().contains("rows*cols")
+        ));
     }
 
     /// The base-1024 invariant: a 16x16 hybrid grid + per-row newline + 1
