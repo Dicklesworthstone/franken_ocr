@@ -10,9 +10,11 @@
 //! [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`]: ../COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md
 #![forbid(unsafe_code)]
 
+pub mod cli;
 pub mod error;
 pub mod robot;
 
+pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
 
 /// The OCR engine handle.

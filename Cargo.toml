@@ -6,16 +6,20 @@ license = "MIT"
 description = "Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model (single-binary CLI: focr)"
 readme = "README.md"
 
-# Two binaries from one entrypoint: the long name + the short `focr` alias that
-# agents and humans actually type. Listing them explicitly disables the implicit
-# package-named bin, so both are declared here.
+# Two binaries from one ENTRYPOINT (the shared `franken_ocr::cli_main` in the
+# lib), but each from its OWN thin shim file so no source is shared across build
+# targets (a file in two `[[bin]]` paths trips a cargo "present in multiple build
+# targets" warning). The long name builds from `src/main.rs`; the short `focr`
+# alias — the name agents and humans actually type — builds from
+# `src/bin/focr.rs`. Both are one-line shims that just call `cli_main()`.
+# Declaring them explicitly also disables the implicit package-named bin.
 [[bin]]
 name = "franken_ocr"
 path = "src/main.rs"
 
 [[bin]]
 name = "focr"
-path = "src/main.rs"
+path = "src/bin/focr.rs"
 
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }

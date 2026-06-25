@@ -40,13 +40,17 @@ code; the `focr` binary builds and its diagnostic subcommands work, but `ocr`,
 
 **Crate skeleton**
 
-- A single-crate Rust 2024 (nightly) package with two binaries from one entrypoint,
-  `franken_ocr` and the short `focr` alias, `#![forbid(unsafe_code)]`, and the
-  separate `release-perf` profiling profile.
-- A synchronous CLI shell (`src/main.rs`, `src/cli.rs`) with the planned subcommand
-  surface stubbed: working `robot schema` / `robot health` / `robot backends`
-  diagnostics, and clear "not yet implemented" results for `ocr`, `convert`,
-  `doctor`.
+- A single-crate Rust 2024 (nightly) package with two binaries from one shared
+  entrypoint, `franken_ocr` and the short `focr` alias, `#![forbid(unsafe_code)]`,
+  and the separate `release-perf` profiling profile. The dispatch lives in the
+  library as `franken_ocr::cli_main()` (`src/cli.rs`); each binary is a thin
+  one-line shim — `src/main.rs` (`franken_ocr`) and `src/bin/focr.rs` (`focr`) —
+  so each `[[bin]]` has its own source file and cargo emits no "present in
+  multiple build targets" warning.
+- A synchronous CLI shell (`src/cli.rs` + the two shims) with the planned
+  subcommand surface stubbed: working `robot schema` / `robot health` / `robot
+  backends` diagnostics, and clear "not yet implemented" results for `ocr`,
+  `convert`, `doctor`.
 - The stable error type with documented process exit codes (`src/error.rs`) and the
   versioned robot-event schema seed (`src/robot.rs`), both unit-tested.
 - The library handle `OcrEngine` (`src/lib.rs`), construction only; `recognize`
@@ -60,6 +64,10 @@ code; the `focr` binary builds and its diagnostic subcommands work, but `ocr`,
   `rust-toolchain.toml` nightly pin.
 - Out-of-band script stubs: `scripts/fetch_model.sh` and
   `scripts/gen_reference_fixtures.py`.
+- `scripts/check.sh`, the one-command mandatory-check gate (fmt → check
+  `--all-targets` → clippy → `cargo test`), stopping on first failure — the repo's
+  stand-in for a CI `test` target until CI exists. `cargo test` is a hard
+  green-bar gate before any handoff (see AGENTS.md).
 
 ### Methodology / evidence
 

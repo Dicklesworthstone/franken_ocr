@@ -115,6 +115,14 @@ The robot NDJSON stream carries one JSON object per line, each tagged with a `sc
 cargo build --release
 ```
 
+This produces two interchangeable binaries from one shared entrypoint: `focr` (the short name agents and humans type) and `franken_ocr` (the long name). Both are thin shims over `franken_ocr::cli_main()`; they behave identically.
+
+Run the test gate (formatting, `cargo check --all-targets`, clippy, and `cargo test`) with the convenience wrapper before handing off changes:
+
+```bash
+scripts/check.sh
+```
+
 Model weights are not bundled and are never downloaded at inference time. Fetch them out of band with [`scripts/fetch_model.sh`](./scripts/fetch_model.sh), which documents how to obtain the Unlimited-OCR safetensors shard, `tokenizer.json`, and `config.json` into `$FOCR_MODEL_DIR`, then run `focr convert` to produce the quantized `.focrq` artifact the engine loads.
 
 ## Roadmap

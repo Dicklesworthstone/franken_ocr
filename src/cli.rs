@@ -4,9 +4,33 @@
 //! schema/health/backends`) work today; the real work (`ocr`, `convert`,
 //! `doctor`) returns a clear `NotImplemented` pointing at the plan phase that
 //! lands it. PDF input is intentionally absent — v1 is image-only (plan §7.7).
+//!
+//! This module lives in the **library** so the single CLI entrypoint
+//! ([`cli_main`]) is shared by both binaries (`focr` and `franken_ocr`) without
+//! either `src/main.rs` appearing in two build targets — each `[[bin]]` now
+//! points at its own thin shim that just calls [`cli_main`]. See AGENTS.md
+//! doctrine #9.
 
+use crate::{FocrError, FocrResult, robot};
 use clap::{Parser, Subcommand, ValueEnum};
-use franken_ocr::{FocrError, FocrResult, robot};
+use std::process::ExitCode;
+
+/// The shared process entrypoint for both binaries (`focr` and `franken_ocr`).
+///
+/// `fn main()` in each shim is **synchronous by design** (plan §3.3, §7.1): the
+/// asupersync runtime is owned BELOW here, inside `OcrEngine`, never spanning
+/// the whole process. This parses, dispatches, and maps errors to the stable
+/// exit codes documented in [`crate::error`].
+pub fn cli_main() -> ExitCode {
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("focr: {err}");
+            ExitCode::from(err.exit_code() as u8)
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(

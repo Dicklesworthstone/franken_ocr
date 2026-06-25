@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Generate reference (golden) fixtures for franken_ocr from the PyTorch oracle.
 
-STATUS: SKELETON / TODO. This script does NOT yet run the model. It defines the
-argparse surface and documents exactly what the finished version WILL do; the
-actual torch / transformers calls are stubbed with `raise NotImplementedError`.
+This is the COMPLETE, runnable, offline fixture generator. It is OFFLINE TOOLING
+ONLY: franken_ocr's Rust engine NEVER invokes this script and NEVER unpickles
+anything. This is a deliberate, human-run, out-of-band step whose only job is to
+freeze the reference model's behavior into files the Rust conformance tests
+compare against.
 
-OFFLINE TOOLING ONLY. franken_ocr's Rust engine NEVER invokes this script and
-NEVER unpickles anything. This is a deliberate, human-run, out-of-band step whose
-only job is to freeze the reference model's behavior into files the Rust
-conformance tests compare against.
+It CANNOT run on a machine without a CUDA GPU and the 6.67 GB weights — per
+plan OQ-17 (docs/truth-pack/oq/preprocess-infer.md) the official `model.infer()`
+path hard-codes `.cuda()` + `torch.autocast("cuda", dtype=bfloat16)`, so the
+CORRECTNESS oracle is GPU-only. A CPU-patched run is a SEPARATE step that must
+first be PROVEN to reproduce the GPU oracle's tokens within the nondeterminism
+floor; the golden fixtures (correctness) never depend on CPU HF.
 
-WHAT THE FINISHED VERSION WILL DO
----------------------------------
+WHAT THIS DOES
+--------------
 1. Pin the exact reference stack the Unlimited-OCR README specifies:
        torch == 2.10.0
        transformers == 4.57.1
@@ -19,57 +23,114 @@ WHAT THE FINISHED VERSION WILL DO
    — fixtures generated against a different stack are not comparable).
 
 2. Load the Baidu Unlimited-OCR model + tokenizer from $FOCR_MODEL_DIR
-   (see scripts/fetch_model.sh) in bf16, eval mode, deterministic /
-   no-sampling generation config matching what `focr` will replicate.
-   NOTE (plan OQ-17, §8.1): the official model.infer() path is CUDA-oriented
-   (.cuda() + CUDA autocast), so the CORRECTNESS oracle runs on a CUDA host
-   (device='cuda'); a CPU-patched run (device='cpu', autocast off) is a SEPARATE
-   step that must first be PROVEN to reproduce the GPU oracle's tokens within the
-   nondeterminism floor. The golden fixtures (correctness) never depend on CPU HF.
+   (see scripts/fetch_model.sh) in bf16, eval mode, on device='cuda'.
 
 3. For each input document in the fixture corpus:
      a. Run model.infer() (the reference end-to-end path) and dump the
-        END-TO-END golden output (parsed text / markdown + structured JSON) to
-        tests/fixtures/native/<doc>_reference.json — the bar `focr ocr --json`
-        must match (after canonicalization: strip timing, sort bboxes).
-     b. With forward hooks, capture PER-LAYER / per-stage activations at the
-        seams the Rust engine is unit-tested against — DeepEncoder (SAM out,
-        CLIP out, fused-2048, projector-1280), decoder per-layer hidden states,
-        router logits / top-6 selections, lm_head logits — and dump each as a
-        .npy under tests/fixtures/native/activations/<doc>/<stage>.npy for
+        END-TO-END golden output (decoded text / markdown + structured JSON) to
+        <out>/<doc>_reference.json — the bar `focr ocr --json` must match (after
+        canonicalization: strip timing, sort bboxes).
+     b. With forward hooks, capture PER-STAGE activations at the seams the Rust
+        engine is unit-tested against — DeepEncoder (SAM out, CLIP out,
+        projector-1280), decoder per-layer hidden states, and lm_head logits —
+        and dump each as a .npy under <out>/activations/<doc>/<stage>.npy for
         bit-/tolerance-level differential tests.
 
-4. Record provenance alongside every artifact: model sha256, torch/transformers
-   versions, generation config, and a timestamp, so a fixture is auditable and a
-   stale one is detectable.
+4. Record provenance alongside every artifact: model sha256, the pinned HF
+   commit, torch/transformers versions, generation config, and a timestamp, so a
+   fixture is auditable and a stale one is detectable.
 
 These fixtures are the reference oracle for docs/DISCREPANCIES.md (measured
-divergence) and the int8/int4 accuracy curves — they are the source of truth the
-quantized engine is held against.
+divergence) and the int8/int4 accuracy curves — the source of truth the quantized
+engine is held against.
 
-Requires (when implemented): python3, torch==2.10.0, transformers==4.57.1,
-numpy, safetensors. Install into an isolated venv; this never runs in CI inference.
+Requires: python3, torch==2.10.0, transformers==4.57.1, numpy, safetensors,
+Pillow. Install into an isolated venv; this never runs in CI inference.
 
-Usage (skeleton):
-    python3 gen_reference_fixtures.py --model-dir DIR --corpus DIR --out DIR
+Usage:
+    FOCR_MODEL_DIR=/path/to/model \\
+        python3 gen_reference_fixtures.py --corpus tests/fixtures/corpus \\
+                                          --out tests/fixtures/native --activations
+
+    # Establish the oracle nondeterminism floor (plan §8.1) by running twice and
+    # diffing — pass --run-tag to keep both runs side by side:
+    python3 gen_reference_fixtures.py ... --run-tag a
+    python3 gen_reference_fixtures.py ... --run-tag b
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import os
+import platform
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Callable
 
+# ─────────────────────────────────────────────────────────────────────────────
 # Pins the finished version MUST assert against (Unlimited-OCR README runtime).
+# Source: docs/truth-pack/PINNED_SOURCES.md (the README runtime pin, NOT the
+# config.json export tag transformers_version=4.46.3).
+# ─────────────────────────────────────────────────────────────────────────────
 PIN_TORCH = "2.10.0"
 PIN_TRANSFORMERS = "4.57.1"
 
+# The HF repo + the immutable commit the whole truth-pack is pinned to.
+HF_REPO = "baidu/Unlimited-OCR"
+HF_COMMIT = "3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5"
 
+# Canonical filenames inside $FOCR_MODEL_DIR (see scripts/fetch_model.sh).
+WEIGHTS_FILE = "model-00001-of-000001.safetensors"
+INDEX_FILE = "model.safetensors.index.json"
+TOKENIZER_FILE = "tokenizer.json"
+CONFIG_FILE = "config.json"
+
+# Recommended per-mode generation config (docs/truth-pack EXISTING_..._STRUCTURE.md
+# §8 SPEC-100..103, OQ-18). Greedy (temperature=0 -> do_sample=False), the sliding
+# window no-repeat-ngram blocker on, max_length 32768.
+MODE_PRESETS: dict[str, dict[str, Any]] = {
+    # Single image, Gundam tiling (base_size=1024, image_size=640, crop_mode=True).
+    "gundam": dict(
+        base_size=1024,
+        image_size=640,
+        crop_mode=True,
+        no_repeat_ngram_size=35,
+        ngram_window=128,
+    ),
+    # Single image, base (no crop): base_size=1024, image_size=1024, crop_mode=False.
+    "base": dict(
+        base_size=1024,
+        image_size=1024,
+        crop_mode=False,
+        no_repeat_ngram_size=35,
+        ngram_window=128,
+    ),
+}
+
+# Default prompt per mode (the de-facto document-parsing prompt; OQ-8).
+DEFAULT_PROMPT = "<image>document parsing."
+
+# Image suffixes we treat as corpus documents (v1 is image-only; PDFs are
+# rasterized out-of-band and dropped here as separate images).
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+
+# Stop string appended by the tokenizer at the end of the decoded output.
+EOS_STOP_STRING = "<｜end▁of▁sentence｜>"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Argument parsing
+# ─────────────────────────────────────────────────────────────────────────────
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="gen_reference_fixtures.py",
         description="Dump Unlimited-OCR reference fixtures (golden outputs + "
-        "per-layer activations) for franken_ocr conformance tests. SKELETON.",
+        "per-stage activations) for franken_ocr conformance tests.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
         "--model-dir",
@@ -82,8 +143,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--corpus",
         type=Path,
         default=Path("tests/fixtures/corpus"),
-        help="Dir of input document images to run through the oracle. PDF fixtures "
-        "must be rasterized explicitly and kept separate from v1 native image tests.",
+        help="Dir of input document images to run through the oracle. PDF "
+        "fixtures must be rasterized explicitly and kept separate from v1 native "
+        "image tests.",
     )
     p.add_argument(
         "--out",
@@ -92,55 +154,651 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Output dir for golden outputs (.json) and activations (.npy).",
     )
     p.add_argument(
+        "--mode",
+        choices=sorted(MODE_PRESETS.keys()),
+        default="gundam",
+        help="Inference mode preset (geometry + generation config).",
+    )
+    p.add_argument(
+        "--prompt",
+        type=str,
+        default=DEFAULT_PROMPT,
+        help="Free-text prompt passed to model.infer() (must contain <image>).",
+    )
+    p.add_argument(
         "--activations",
         action="store_true",
-        help="Also dump per-layer/per-stage activations (.npy), not just the "
-        "end-to-end golden output.",
+        help="Also dump per-stage activations (.npy), not just the end-to-end "
+        "golden output. Adds forward hooks (SAM/CLIP/projector/per-layer/"
+        "lm_head) captured on the prefill pass.",
+    )
+    p.add_argument(
+        "--max-length",
+        type=int,
+        default=32768,
+        help="Generation cap (matches the reference max_length).",
+    )
+    p.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Process at most N corpus documents (0 = no limit). Useful to "
+        "establish the nondeterminism floor cheaply.",
+    )
+    p.add_argument(
+        "--run-tag",
+        type=str,
+        default="",
+        help="Optional suffix on the run-provenance file so two runs (e.g. for "
+        "the nondeterminism floor) do not clobber each other.",
+    )
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Torch device for the oracle. Per OQ-17 the correctness oracle is "
+        "CUDA-only; a non-cuda value is allowed ONLY for the separate, "
+        "must-be-proven CPU-equivalence experiment, never for golden fixtures.",
     )
     return p.parse_args(argv)
 
 
-def _assert_pinned_stack() -> None:
-    """Fail loudly unless torch/transformers match the pinned reference stack.
+# ─────────────────────────────────────────────────────────────────────────────
+# Stack assertions
+# ─────────────────────────────────────────────────────────────────────────────
+def _assert_pinned_stack() -> tuple[Any, Any]:
+    """Import + assert torch/transformers match the pinned reference stack.
 
-    Fixtures generated against a different stack are not comparable, so the
-    finished version refuses to proceed on a version mismatch.
+    Fixtures generated against a different stack are NOT comparable, so we refuse
+    to proceed on a version mismatch. Returns the imported torch + transformers
+    modules so callers do not re-import.
     """
-    raise NotImplementedError(
-        f"TODO: import torch / transformers and assert torch=={PIN_TORCH}, "
-        f"transformers=={PIN_TRANSFORMERS} before generating any fixtures."
+    try:
+        import torch  # noqa: WPS433 (deliberate late import — offline tool)
+        import transformers  # noqa: WPS433
+    except ImportError as exc:  # pragma: no cover - environment-dependent
+        raise SystemExit(
+            "gen_reference_fixtures: torch / transformers are not installed. "
+            f"Install the pinned oracle stack (torch=={PIN_TORCH}, "
+            f"transformers=={PIN_TRANSFORMERS}) into an isolated venv. "
+            f"Underlying import error: {exc}"
+        )
+
+    torch_v = torch.__version__.split("+", 1)[0]  # drop "+cu128" build tag
+    tf_v = transformers.__version__
+    problems = []
+    if torch_v != PIN_TORCH:
+        problems.append(f"torch=={torch_v} (need {PIN_TORCH})")
+    if tf_v != PIN_TRANSFORMERS:
+        problems.append(f"transformers=={tf_v} (need {PIN_TRANSFORMERS})")
+    if problems:
+        raise SystemExit(
+            "gen_reference_fixtures: pinned-stack mismatch — fixtures generated "
+            "against a different stack are not comparable. Found: "
+            + ", ".join(problems)
+            + ". Recreate the venv with the exact pins from "
+            "docs/truth-pack/PINNED_SOURCES.md."
+        )
+    return torch, transformers
+
+
+def _resolve_model_dir(cli_dir: Path | None) -> Path:
+    raw = cli_dir or os.environ.get("FOCR_MODEL_DIR")
+    if not raw:
+        raise SystemExit(
+            "gen_reference_fixtures: no model dir. Pass --model-dir or set "
+            "$FOCR_MODEL_DIR (see scripts/fetch_model.sh)."
+        )
+    model_dir = Path(raw).expanduser()
+    if not model_dir.is_dir():
+        raise SystemExit(f"gen_reference_fixtures: model dir not found: {model_dir}")
+    missing = [
+        name
+        for name in (WEIGHTS_FILE, TOKENIZER_FILE, CONFIG_FILE)
+        if not (model_dir / name).is_file()
+    ]
+    if missing:
+        raise SystemExit(
+            f"gen_reference_fixtures: model dir {model_dir} is missing "
+            f"{', '.join(missing)}. Run scripts/fetch_model.sh first."
+        )
+    return model_dir
+
+
+def _sha256_file(path: Path, chunk: int = 1 << 22) -> str:
+    """Streaming SHA-256 — never loads the 6.67 GB shard into memory."""
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for block in iter(lambda: fh.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Model loading
+# ─────────────────────────────────────────────────────────────────────────────
+def _load_model_and_tokenizer(torch: Any, model_dir: Path, device: str):
+    """Load Unlimited-OCR + tokenizer in bf16, eval, on `device`.
+
+    Mirrors the README runtime (trust_remote_code=True, use_safetensors=True,
+    torch_dtype=bfloat16, .eval().cuda()). trust_remote_code is required because
+    the model class (UnlimitedOCRForCausalLM) lives in the repo's
+    modeling_unlimitedocr.py — this is offline tooling the human runs knowingly.
+    """
+    from transformers import AutoModel, AutoTokenizer  # noqa: WPS433
+
+    print(f"[fixtures] loading tokenizer from {model_dir} ...", file=sys.stderr)
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_dir), trust_remote_code=True
     )
 
+    print(
+        f"[fixtures] loading model from {model_dir} (bf16, {device}) ...",
+        file=sys.stderr,
+    )
+    model = AutoModel.from_pretrained(
+        str(model_dir),
+        trust_remote_code=True,
+        use_safetensors=True,
+        torch_dtype=torch.bfloat16,
+    )
+    model = model.eval()
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit(
+                "gen_reference_fixtures: --device cuda but no CUDA device is "
+                "available. The correctness oracle is GPU-only (OQ-17). Run on a "
+                "CUDA host, or use --device cpu ONLY for the separate "
+                "CPU-equivalence experiment (never for golden fixtures)."
+            )
+        model = model.cuda()
+    else:
+        model = model.to(device)
+    return model, tokenizer
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Activation hooks
+# ─────────────────────────────────────────────────────────────────────────────
+class ActivationCapture:
+    """Register forward hooks that capture per-stage activations on the PREFILL
+    pass only, then save them as .npy.
+
+    The seams (docs/truth-pack EXISTING_UNLIMITED_OCR_STRUCTURE.md):
+      - model.sam_model     -> SAM ViT-B output  (SPEC-040..046)
+      - model.vision_model  -> CLIP-L output     (SPEC-047..050)
+      - model.projector     -> 2048->1280 linear (SPEC-051..052)
+      - model.layers[i]     -> per-decoder-layer hidden states (SPEC-070..072)
+      - lm_head             -> logits            (SPEC-081)
+
+    `infer()` calls `generate()`, which runs many forward passes (one prefill +
+    one per generated token). We only want the prefill activations (the seam the
+    Rust unit tests target), so every hook records the FIRST call whose primary
+    output has sequence length > 1 (prefill) and ignores subsequent single-token
+    decode calls. SAM/CLIP/projector run once per image inside the prefill, so we
+    keep their first invocation. lm_head additionally has its full prefill logits
+    recorded (all positions), the load-bearing seam for L4 (logits parity).
+    """
+
+    def __init__(self, torch: Any, model: Any):
+        self.torch = torch
+        self.model = model
+        self._handles: list[Any] = []
+        self._captured: dict[str, "Any"] = {}  # stage -> numpy array
+        self._seen_prefill = False
+
+    # --- helpers ---------------------------------------------------------------
+    def _to_numpy(self, t: Any) -> Any:
+        import numpy as np  # noqa: WPS433
+
+        # bf16 has no numpy dtype; upcast to float32 for storage + comparison.
+        t = t.detach()
+        if t.dtype == self.torch.bfloat16:
+            t = t.to(self.torch.float32)
+        return t.to("cpu").numpy().astype(np.float32, copy=False)
+
+    @staticmethod
+    def _primary_tensor(out: Any) -> Any | None:
+        """Pull the load-bearing tensor out of a hook's `output`."""
+        import torch as _t  # local alias only for isinstance checks
+
+        if isinstance(out, _t.Tensor):
+            return out
+        if isinstance(out, (tuple, list)) and out:
+            head = out[0]
+            if isinstance(head, _t.Tensor):
+                return head
+        # transformers ModelOutput-like (has last_hidden_state)
+        lhs = getattr(out, "last_hidden_state", None)
+        if isinstance(lhs, _t.Tensor):
+            return lhs
+        return None
+
+    def _store_once(self, stage: str, tensor: Any) -> None:
+        if stage in self._captured:
+            return
+        self._captured[stage] = self._to_numpy(tensor)
+
+    # --- hook factories --------------------------------------------------------
+    def _make_stage_hook(self, stage: str) -> Callable[..., None]:
+        def hook(_module: Any, _inp: Any, out: Any) -> None:
+            t = self._primary_tensor(out)
+            if t is None:
+                return
+            # SAM/CLIP/projector run on image tensors (no causal seq dim concept);
+            # record the first invocation only.
+            self._store_once(stage, t)
+
+        return hook
+
+    def _make_layer_hook(self, idx: int) -> Callable[..., None]:
+        stage = f"decoder_layer_{idx:02d}_hidden"
+
+        def hook(_module: Any, _inp: Any, out: Any) -> None:
+            t = self._primary_tensor(out)
+            if t is None:
+                return
+            # Only the prefill pass (seq_len > 1). Decode steps have seq_len == 1.
+            if t.dim() >= 2 and t.shape[-2] > 1:
+                self._store_once(stage, t)
+
+        return hook
+
+    def _make_lm_head_hook(self) -> Callable[..., None]:
+        def hook(_module: Any, _inp: Any, out: Any) -> None:
+            t = self._primary_tensor(out)
+            if t is None:
+                return
+            # Prefill logits over all positions (seq_len > 1).
+            if t.dim() >= 2 and t.shape[-2] > 1:
+                self._store_once("lm_head_logits", t)
+                self._seen_prefill = True
+
+        return hook
+
+    # --- public API ------------------------------------------------------------
+    def register(self) -> None:
+        m = self.model
+        # The decoder/vision submodules hang off `model.model` (UnlimitedOCRModel),
+        # the lm_head off the top-level CausalLM. Resolve defensively.
+        inner = getattr(m, "model", m)
+
+        sam = getattr(inner, "sam_model", None)
+        if sam is not None:
+            self._handles.append(
+                sam.register_forward_hook(self._make_stage_hook("sam_output"))
+            )
+        clip = getattr(inner, "vision_model", None)
+        if clip is not None:
+            self._handles.append(
+                clip.register_forward_hook(self._make_stage_hook("clip_output"))
+            )
+        projector = getattr(inner, "projector", None)
+        if projector is not None:
+            self._handles.append(
+                projector.register_forward_hook(
+                    self._make_stage_hook("projector_output")
+                )
+            )
+        layers = getattr(inner, "layers", None)
+        if layers is not None:
+            for idx, layer in enumerate(layers):
+                self._handles.append(
+                    layer.register_forward_hook(self._make_layer_hook(idx))
+                )
+        lm_head = getattr(m, "lm_head", None)
+        if lm_head is not None:
+            self._handles.append(
+                lm_head.register_forward_hook(self._make_lm_head_hook())
+            )
+
+    def remove(self) -> None:
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+    def dump(self, out_dir: Path) -> dict[str, dict[str, Any]]:
+        """Write every captured activation as <out_dir>/<stage>.npy.
+
+        Returns a manifest {stage: {shape, dtype, sha256, file}} for provenance.
+        """
+        import numpy as np  # noqa: WPS433
+
+        out_dir.mkdir(parents=True, exist_ok=True)
+        manifest: dict[str, dict[str, Any]] = {}
+        for stage, arr in sorted(self._captured.items()):
+            fpath = out_dir / f"{stage}.npy"
+            np.save(fpath, arr, allow_pickle=False)
+            manifest[stage] = {
+                "file": fpath.name,
+                "shape": list(arr.shape),
+                "dtype": str(arr.dtype),
+                "sha256": hashlib.sha256(arr.tobytes()).hexdigest(),
+            }
+        return manifest
+
+    def __enter__(self) -> "ActivationCapture":
+        self.register()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.remove()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-document oracle run
+# ─────────────────────────────────────────────────────────────────────────────
+def _list_corpus(corpus: Path) -> list[Path]:
+    if not corpus.is_dir():
+        raise SystemExit(
+            f"gen_reference_fixtures: corpus dir not found: {corpus}. Populate it "
+            "with document images (see tests/fixtures/corpus)."
+        )
+    docs = sorted(
+        p
+        for p in corpus.iterdir()
+        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+    )
+    if not docs:
+        raise SystemExit(
+            f"gen_reference_fixtures: no images ({', '.join(sorted(IMAGE_SUFFIXES))}) "
+            f"found in corpus dir {corpus}."
+        )
+    return docs
+
+
+def _image_meta(doc: Path) -> dict[str, Any]:
+    try:
+        from PIL import Image, ImageOps  # noqa: WPS433
+
+        with Image.open(doc) as im:
+            im = ImageOps.exif_transpose(im)  # match the model's load_image
+            width, height = im.size
+            pil_mode = im.mode
+        return {"width": width, "height": height, "pil_mode": pil_mode}
+    except Exception as exc:  # noqa: BLE001 - metadata is best-effort
+        return {"error": f"could not read image dims: {exc}"}
+
+
+def _run_one(
+    *,
+    torch: Any,
+    model: Any,
+    tokenizer: Any,
+    doc: Path,
+    out_dir: Path,
+    prompt: str,
+    preset: dict[str, Any],
+    max_length: int,
+    want_activations: bool,
+    provenance: dict[str, Any],
+) -> dict[str, Any]:
+    """Run model.infer() on one document, dump golden JSON + (optional)
+    activations, return a per-doc summary record."""
+    stem = doc.stem
+    doc_out_path = out_dir / "_infer_out" / stem  # save_results artifacts land here
+    doc_out_path.mkdir(parents=True, exist_ok=True)
+
+    capture: ActivationCapture | None = None
+    if want_activations:
+        capture = ActivationCapture(torch, model)
+        capture.register()
+
+    t0 = time.time()
+    try:
+        # model.infer() runs the full reference end-to-end path (preprocess ->
+        # tile -> vision tower -> connector -> R-SWA decoder -> greedy generate ->
+        # postprocess) and returns the decoded markdown/text. save_results=True
+        # also writes result.md / result_with_boxes.jpg / images/ under
+        # output_path, which we keep as golden side-artifacts.
+        decoded = model.infer(
+            tokenizer,
+            prompt=prompt,
+            image_file=str(doc),
+            output_path=str(doc_out_path),
+            base_size=preset["base_size"],
+            image_size=preset["image_size"],
+            crop_mode=preset["crop_mode"],
+            max_length=max_length,
+            no_repeat_ngram_size=preset["no_repeat_ngram_size"],
+            ngram_window=preset["ngram_window"],
+            temperature=0.0,  # greedy / deterministic oracle
+            save_results=True,
+        )
+    finally:
+        if capture is not None:
+            capture.remove()
+    elapsed = time.time() - t0
+
+    # `infer` may return None (it primarily writes files). Capture decoded text
+    # both from its return value and from the written result.md, preferring the
+    # explicit return.
+    decoded_text = decoded if isinstance(decoded, str) else None
+    result_md = doc_out_path / "result.md"
+    md_text = result_md.read_text(encoding="utf-8") if result_md.is_file() else None
+    if decoded_text is None:
+        decoded_text = md_text
+
+    activations_manifest: dict[str, Any] = {}
+    if capture is not None:
+        act_dir = out_dir / "activations" / stem
+        activations_manifest = capture.dump(act_dir)
+
+    golden = {
+        "schema_version": 1,
+        "doc": doc.name,
+        "image": _image_meta(doc),
+        "mode": preset,
+        "prompt": prompt,
+        "generation": {
+            "temperature": 0.0,
+            "do_sample": False,
+            "max_length": max_length,
+            "no_repeat_ngram_size": preset["no_repeat_ngram_size"],
+            "ngram_window": preset["ngram_window"],
+            "eos_stop_string": EOS_STOP_STRING,
+        },
+        # The END-TO-END golden text the Rust `focr ocr --json` must match after
+        # canonicalization (strip timing; sort bboxes). Timing is intentionally
+        # NOT part of the comparison surface.
+        "decoded_text": decoded_text,
+        "decoded_text_sha256": (
+            hashlib.sha256(decoded_text.encode("utf-8")).hexdigest()
+            if decoded_text is not None
+            else None
+        ),
+        "result_md_present": md_text is not None,
+        "activations": activations_manifest,
+        "non_comparable": {
+            # Excluded from parity comparison; recorded for human audit only.
+            "elapsed_seconds": round(elapsed, 4),
+        },
+        "provenance": provenance,
+    }
+
+    golden_path = out_dir / f"{stem}_reference.json"
+    golden_path.write_text(
+        json.dumps(golden, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"[fixtures]   {doc.name}: {len(decoded_text or '')} chars, "
+        f"{len(activations_manifest)} activations, {elapsed:.1f}s "
+        f"-> {golden_path}",
+        file=sys.stderr,
+    )
+    return {
+        "doc": doc.name,
+        "golden": golden_path.name,
+        "decoded_text_sha256": golden["decoded_text_sha256"],
+        "n_activations": len(activations_manifest),
+        "elapsed_seconds": round(elapsed, 4),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provenance
+# ─────────────────────────────────────────────────────────────────────────────
+def _build_provenance(
+    *,
+    torch: Any,
+    transformers: Any,
+    model_dir: Path,
+    preset: dict[str, Any],
+    prompt: str,
+    mode: str,
+    device: str,
+    max_length: int,
+) -> dict[str, Any]:
+    """Audit record written into every fixture. The expensive bit (the model
+    sha256) streams the 6.67 GB shard once."""
+    weights = model_dir / WEIGHTS_FILE
+    print(
+        f"[fixtures] hashing {weights.name} (this reads the full 6.67 GB once) ...",
+        file=sys.stderr,
+    )
+    model_sha = _sha256_file(weights)
+
+    # Expected total_size from the index for a cross-check (no download).
+    index_total: int | None = None
+    index_path = model_dir / INDEX_FILE
+    if index_path.is_file():
+        try:
+            index_total = int(
+                json.loads(index_path.read_text(encoding="utf-8"))["metadata"][
+                    "total_size"
+                ]
+            )
+        except (KeyError, ValueError, json.JSONDecodeError):
+            index_total = None
+
+    cuda_info: dict[str, Any] = {"available": bool(torch.cuda.is_available())}
+    if cuda_info["available"]:
+        try:
+            cuda_info["device_name"] = torch.cuda.get_device_name(0)
+            cuda_info["capability"] = list(torch.cuda.get_device_capability(0))
+            cuda_info["cuda_runtime"] = torch.version.cuda
+        except Exception:  # noqa: BLE001 - diagnostics only
+            pass
+
+    return {
+        "generator": "scripts/gen_reference_fixtures.py",
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "hf_repo": HF_REPO,
+        "hf_commit": HF_COMMIT,
+        "model_dir": str(model_dir),
+        "model_weights_file": WEIGHTS_FILE,
+        "model_weights_sha256": model_sha,
+        "model_weights_bytes": weights.stat().st_size,
+        "model_index_total_size": index_total,
+        "device": device,
+        "cuda": cuda_info,
+        "torch_version": torch.__version__,
+        "transformers_version": transformers.__version__,
+        "pinned_torch": PIN_TORCH,
+        "pinned_transformers": PIN_TRANSFORMERS,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "generation_config": {
+            "mode": mode,
+            "prompt": prompt,
+            "max_length": max_length,
+            "temperature": 0.0,
+            "do_sample": False,
+            **preset,
+        },
+        # OQ-17: the correctness oracle is GPU/bf16; a non-cuda device is the
+        # separate, must-be-proven experiment and its fixtures are NOT golden.
+        "oracle_is_correctness_golden": device == "cuda",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    # --- SKELETON: nothing below is implemented yet. ---
-    print("gen_reference_fixtures.py — SKELETON / TODO; no fixtures generated.",
-          file=sys.stderr)
-    print(f"  would assert: torch=={PIN_TORCH}, transformers=={PIN_TRANSFORMERS}",
-          file=sys.stderr)
-    print(f"  model-dir:    {args.model_dir or '$FOCR_MODEL_DIR'}", file=sys.stderr)
-    print(f"  corpus:       {args.corpus}", file=sys.stderr)
-    print(f"  out:          {args.out}", file=sys.stderr)
-    print(f"  activations:  {args.activations}", file=sys.stderr)
-    print(file=sys.stderr)
-    print("TODO:", file=sys.stderr)
-    print("  1. _assert_pinned_stack()", file=sys.stderr)
-    print("  2. load model + tokenizer (bf16, eval, deterministic; oracle device=cuda — CPU run is a separate, proven step, OQ-17)", file=sys.stderr)
-    print("  3. per doc: model.infer() -> <doc>_reference.json (end-to-end golden)",
-          file=sys.stderr)
-    print("  4. forward hooks -> per-stage activations/<doc>/<stage>.npy", file=sys.stderr)
-    print("  5. write provenance (model sha256, versions, gen config, timestamp)",
-          file=sys.stderr)
+    # 1. Assert the pinned oracle stack BEFORE touching anything expensive.
+    torch, transformers = _assert_pinned_stack()
 
-    # Make the skeleton's assertion path reachable/visible without running torch.
+    # 2. Resolve + validate the model dir and corpus.
+    model_dir = _resolve_model_dir(args.model_dir)
+    docs = _list_corpus(args.corpus)
+    if args.limit > 0:
+        docs = docs[: args.limit]
+
+    preset = MODE_PRESETS[args.mode]
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"[fixtures] mode={args.mode} prompt={args.prompt!r} "
+        f"device={args.device} docs={len(docs)} "
+        f"activations={'on' if args.activations else 'off'}",
+        file=sys.stderr,
+    )
+
+    # 3. Provenance (hashes the weights once, shared by every fixture this run).
+    provenance = _build_provenance(
+        torch=torch,
+        transformers=transformers,
+        model_dir=model_dir,
+        preset=preset,
+        prompt=args.prompt,
+        mode=args.mode,
+        device=args.device,
+        max_length=args.max_length,
+    )
+
+    # 4. Load the model + tokenizer (bf16, eval, device).
+    model, tokenizer = _load_model_and_tokenizer(torch, model_dir, args.device)
+
+    # Make generation as deterministic as the runtime allows (the oracle's own
+    # nondeterminism floor is established by running this script twice — plan §8.1
+    # — NOT by pretending bf16 CUDA matmul is bitwise reproducible).
     try:
-        _assert_pinned_stack()
-    except NotImplementedError as e:
-        print(f"\nnot implemented: {e}", file=sys.stderr)
+        transformers.set_seed(0)
+    except Exception:  # noqa: BLE001 - older/newer API shape
+        torch.manual_seed(0)
 
-    return 1  # non-zero: the skeleton did not produce fixtures.
+    # 5. Per-document oracle runs.
+    records: list[dict[str, Any]] = []
+    for doc in docs:
+        with torch.no_grad():
+            rec = _run_one(
+                torch=torch,
+                model=model,
+                tokenizer=tokenizer,
+                doc=doc,
+                out_dir=args.out,
+                prompt=args.prompt,
+                preset=preset,
+                max_length=args.max_length,
+                want_activations=args.activations,
+                provenance=provenance,
+            )
+        records.append(rec)
+
+    # 6. Run-level provenance manifest (one per run; --run-tag keeps two side by
+    # side for the nondeterminism floor).
+    tag = f"_{args.run_tag}" if args.run_tag else ""
+    run_manifest = {
+        "schema_version": 1,
+        "provenance": provenance,
+        "documents": records,
+        "n_documents": len(records),
+    }
+    manifest_path = args.out / f"PROVENANCE{tag}.json"
+    manifest_path.write_text(
+        json.dumps(run_manifest, indent=2, ensure_ascii=False, sort_keys=True)
+        + "\n",
+        encoding="utf-8",
+    )
+    print(
+        f"[fixtures] wrote {len(records)} fixtures + {manifest_path}",
+        file=sys.stderr,
+    )
+    return 0
 
 
 if __name__ == "__main__":

@@ -101,7 +101,7 @@ These are the load-bearing, non-negotiable rules distilled from the plan and fro
 
 8. **Honest, measured everything.** Every accepted numeric divergence → `docs/DISCREPANCIES.md` (reference behavior, our impl, **measured** impact, kill-switch env var, review date). Every rejected optimization → `docs/NEGATIVE_EVIDENCE.md` (the 5-pass loop: claim+baseline → one lever + bit-exact proof → rebench + Score → keep/revert → next hotspot). The head-to-head gauntlet (plan §9.3) uses thread/allocator/precision fairness controls — never benchmark torch at @64. No silent numerics changes, ever.
 
-9. **Two binaries from one entrypoint:** `focr` (short) + `franken_ocr` (long), both → `src/main.rs`, declared explicitly in `Cargo.toml [[bin]]` to disable the implicit package-named bin.
+9. **Two binaries from one entrypoint:** `focr` (short) + `franken_ocr` (long). The shared dispatch lives in the library as `pub fn cli_main() -> ExitCode` (`src/cli.rs`); each binary is a **thin one-line shim** that just calls it — `src/main.rs` (the `franken_ocr` bin) and `src/bin/focr.rs` (the `focr` bin). They are declared explicitly in `Cargo.toml [[bin]]` (which also disables the implicit package-named bin), but **each `[[bin]]` points at its own shim file** — never the same `path` in two targets, which trips cargo's "present in multiple build targets" warning. Keep both shims byte-for-byte equivalent: `fn main() -> std::process::ExitCode { franken_ocr::cli_main() }`.
 
 ---
 
@@ -152,6 +152,23 @@ ubs $(git diff --name-only)
 ```
 
 If any check fails, fix root causes before handing off.
+
+### The `cargo test` gate (green-bar requirement)
+
+`cargo test` is a **hard gate**: it MUST exit `0` before any change is handed off
+or a bead is closed. There is no Makefile/justfile/CI in the repo yet, so the gate
+is the bare command above plus the convenience wrapper `scripts/check.sh`
+(`scripts/check.sh` runs `cargo fmt --check`, `cargo check --all-targets`,
+`cargo clippy --all-targets -- -D warnings`, and `cargo test` in order and stops
+on the first failure). When CI is added, this same sequence is the required job —
+wire `scripts/check.sh` as the CI test step rather than duplicating the commands.
+
+Note on the build surface: both binaries (`focr`, `franken_ocr`) compile from thin
+shims over the shared `cli_main()` in the lib (doctrine #9). `cargo check
+--all-targets` MUST be free of the "`src/main.rs` … present in multiple build
+targets" warning — each `[[bin]]` points at its own shim file. (The only warnings
+permitted from `cargo check` are environmental, e.g. the incremental-cache
+hard-link notice when the target dir lives on a filesystem without hard links.)
 
 ---
 

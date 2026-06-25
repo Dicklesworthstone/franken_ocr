@@ -1,22 +1,13 @@
-//! `focr` / `franken_ocr` CLI entrypoint.
+//! `franken_ocr` (long-name) CLI binary — a thin shim over the shared
+//! entrypoint in the library.
 //!
-//! `fn main()` is **synchronous by design** (plan §3.3, §7.1): the asupersync
-//! runtime is owned BELOW main, inside `OcrEngine`, never spanning the whole
-//! process. main parses, dispatches, and maps errors to stable exit codes.
+//! The real dispatch lives in `franken_ocr::cli_main` (`src/cli.rs`). This
+//! binary and its short alias `src/bin/focr.rs` are byte-for-byte equivalent
+//! one-line shims; keeping the logic in the lib means neither `src/main.rs` nor
+//! `src/bin/focr.rs` is shared across build targets (no "present in multiple
+//! build targets" warning). See AGENTS.md doctrine #9.
 #![forbid(unsafe_code)]
 
-mod cli;
-
-use clap::Parser;
-use std::process::ExitCode;
-
-fn main() -> ExitCode {
-    let cli = cli::Cli::parse();
-    match cli::run(cli) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("focr: {err}");
-            ExitCode::from(err.exit_code() as u8)
-        }
-    }
+fn main() -> std::process::ExitCode {
+    franken_ocr::cli_main()
 }
