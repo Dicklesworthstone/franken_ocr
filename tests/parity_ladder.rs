@@ -96,8 +96,14 @@ fn l0_preprocess_exact() {
     const NORM_HI: f32 = 1.0; // (1-0.5)/0.5
     const SLOTS_PER_1024_VIEW: usize = (16 + 1) * 16 + 1; // 273 [SPEC-028], CENSUS (c)
     log.assertion("gray pad == int(0.5*255) == 127", GRAY_PAD == 127);
-    log.assertion("normalize maps to [-1,1]", NORM_LO == -1.0 && NORM_HI == 1.0);
-    log.assertion("image-token slots per 1024-view == 273", SLOTS_PER_1024_VIEW == 273);
+    log.assertion(
+        "normalize maps to [-1,1]",
+        NORM_LO == -1.0 && NORM_HI == 1.0,
+    );
+    log.assertion(
+        "image-token slots per 1024-view == 273",
+        SLOTS_PER_1024_VIEW == 273,
+    );
 
     if !fixtures_present() || !model_present() {
         log.skip_no_model(
@@ -228,7 +234,10 @@ fn l2_per_layer_cosine_and_ledger() {
         "decoder layer count == 12 (SPEC-070..072)",
         expected_decoder_layers == 12,
     );
-    log.assertion("vision seams == [sam, clip, projector]", vision_seams.len() == 3);
+    log.assertion(
+        "vision seams == [sam, clip, projector]",
+        vision_seams.len() == 3,
+    );
 
     if !fixtures_present() || !model_present() {
         log.skip_no_model(
@@ -247,7 +256,9 @@ fn l2_per_layer_cosine_and_ledger() {
     let loader = FixtureLoader::new();
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
-        let Ok(golden) = loader.load_golden(&gpath) else { continue };
+        let Ok(golden) = loader.load_golden(&gpath) else {
+            continue;
+        };
         let doc_stem = golden.doc_stem_or(&stem);
         for (stage, _e) in &golden.activations {
             if let Ok(oracle) = loader.load_activation(&doc_stem, stage) {
@@ -323,7 +334,9 @@ fn l3_logits_measured_budget_and_argmax() {
     let loader = FixtureLoader::new();
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
-        let Ok(golden) = loader.load_golden(&gpath) else { continue };
+        let Ok(golden) = loader.load_golden(&gpath) else {
+            continue;
+        };
         let doc_stem = golden.doc_stem_or(&stem);
         if let Ok(logits) = loader.load_activation(&doc_stem, "lm_head_logits") {
             let report = ulp_compare(&logits.data, &logits.data, OpFamily::MatmulF32);
@@ -362,7 +375,10 @@ fn l4_token_exact_prefix() {
     let subject_tokens = [5u32, 6, 7, 8, 9];
     let prefix = 4usize; // suppose the oracle floor only reproduces 4 tokens
     let exact_over_prefix = oracle_tokens[..prefix] == subject_tokens[..prefix];
-    log.assertion("L4 EXACT only over the §2 reproducible prefix", exact_over_prefix);
+    log.assertion(
+        "L4 EXACT only over the §2 reproducible prefix",
+        exact_over_prefix,
+    );
 
     if !fixtures_present() || !model_present() {
         log.skip_no_model(
@@ -410,7 +426,10 @@ fn l5_end_to_end_cer_budget() {
     let cer_identical = char_error_rate("# Invoice\nTotal: 42", "# Invoice\nTotal: 42");
     let cer_one_edit = char_error_rate("hello", "hallo");
     log.assertion("CER(identical) == 0", cer_identical == 0.0);
-    log.assertion("CER(1 substitution / 5) == 0.2", (cer_one_edit - 0.2).abs() < 1e-9);
+    log.assertion(
+        "CER(1 substitution / 5) == 0.2",
+        (cer_one_edit - 0.2).abs() < 1e-9,
+    );
 
     if !fixtures_present() || !model_present() {
         log.skip_no_model(
@@ -431,7 +450,9 @@ fn l5_end_to_end_cer_budget() {
     // weights exist.
     let loader = FixtureLoader::new();
     for gpath in loader.list_goldens().unwrap_or_default() {
-        let Ok(golden) = loader.load_golden(&gpath) else { continue };
+        let Ok(golden) = loader.load_golden(&gpath) else {
+            continue;
+        };
         let bar = golden.decoded_text.clone().unwrap_or_default();
         // Self-compare the bar to itself (CER 0) to prove the read + metric path.
         let cer = char_error_rate(&bar, &bar);
@@ -536,7 +557,10 @@ fn surface_error_exit_codes_are_stable() {
         }
     }
     log.result(if all { "pass" } else { "fail" }, t0.elapsed().as_micros());
-    assert!(all, "stable exit-code contract drifted (see structured log)");
+    assert!(
+        all,
+        "stable exit-code contract drifted (see structured log)"
+    );
 }
 
 #[test]
@@ -559,9 +583,16 @@ fn surface_robot_schema_self_describes() {
     let scrubbed = scrub_volatile(&event);
     let scrub_ok = scrubbed["elapsed_ms"] == json!("[ms]")
         && scrubbed.as_object().unwrap().contains_key("elapsed_ms");
-    log.assertion("scrubber masks elapsed_ms but keeps the field present", scrub_ok);
+    log.assertion(
+        "scrubber masks elapsed_ms but keeps the field present",
+        scrub_ok,
+    );
     log.result(
-        if version_ok && events_ok && scrub_ok { "pass" } else { "fail" },
+        if version_ok && events_ok && scrub_ok {
+            "pass"
+        } else {
+            "fail"
+        },
         t0.elapsed().as_micros(),
     );
     assert!(version_ok && events_ok && scrub_ok);
@@ -578,7 +609,10 @@ fn comparator_normalizes_before_numeric_compare() {
     let subject = NormalizedValue::from_f32(TensorSpec::new([2, 3], DType::F32), vec![0.0; 6]);
     let oracle = NormalizedValue::from_f32(TensorSpec::new([3, 2], DType::F32), vec![0.0; 6]);
     let mismatch = subject.spec.check_against(&oracle.spec);
-    log.assertion("shape mismatch rejected before numeric compare", mismatch.is_err());
+    log.assertion(
+        "shape mismatch rejected before numeric compare",
+        mismatch.is_err(),
+    );
     log.result("pass", t0.elapsed().as_micros());
     assert!(mismatch.is_err(), "{:?}", mismatch);
 }

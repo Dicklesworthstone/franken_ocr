@@ -60,11 +60,26 @@ struct KCase {
 }
 
 const MODEL_KS: &[KCase] = &[
-    KCase { k: 896, note: "narrow expert / projector-adjacent GEMM" },
-    KCase { k: 1280, note: "decoder hidden size (q/k/v/o, gate/up at hidden width)" },
-    KCase { k: 2048, note: "projector input width (2048 -> 1280)" },
-    KCase { k: 4096, note: "wide intermediate contraction" },
-    KCase { k: 6848, note: "DENSE LAYER-0 down_proj — GLOBAL WORST CASE (doctrine #6)" },
+    KCase {
+        k: 896,
+        note: "narrow expert / projector-adjacent GEMM",
+    },
+    KCase {
+        k: 1280,
+        note: "decoder hidden size (q/k/v/o, gate/up at hidden width)",
+    },
+    KCase {
+        k: 2048,
+        note: "projector input width (2048 -> 1280)",
+    },
+    KCase {
+        k: 4096,
+        note: "wide intermediate contraction",
+    },
+    KCase {
+        k: 6848,
+        note: "DENSE LAYER-0 down_proj — GLOBAL WORST CASE (doctrine #6)",
+    },
 ];
 
 /// The frankensearch bound we must NOT inherit. Kept as a named constant so the
@@ -165,14 +180,23 @@ fn worst_case_accumulators_fit_i32_closed_form() {
     // The two headline numbers at the global worst-case K = 6848.
     let s8s8_6848 = 6848i64 * S8S8_TERM;
     let u8s8_6848 = 6848i64 * U8S8_TERM;
-    assert_eq!(s8s8_6848, 110_451_392, "S8S8 worst at K=6848 must be exactly 6848*16129");
-    assert_eq!(u8s8_6848, 221_772_480, "U8S8 worst at K=6848 must be exactly 6848*32385");
+    assert_eq!(
+        s8s8_6848, 110_451_392,
+        "S8S8 worst at K=6848 must be exactly 6848*16129"
+    );
+    assert_eq!(
+        u8s8_6848, 221_772_480,
+        "U8S8 worst at K=6848 must be exactly 6848*32385"
+    );
     assert!(s8s8_6848 < I32_MAX_I64, "S8S8 @6848 overflows i32!");
     assert!(u8s8_6848 < I32_MAX_I64, "U8S8 @6848 overflows i32!");
     // Even the most extreme per-term S8S8 (-128*-128) all-positive fits.
     let s8s8_6848_neg128 = 6848i64 * S8S8_TERM_NEG128;
     assert_eq!(s8s8_6848_neg128, 112_197_632);
-    assert!(s8s8_6848_neg128 < I32_MAX_I64, "S8S8(-128) @6848 overflows i32!");
+    assert!(
+        s8s8_6848_neg128 < I32_MAX_I64,
+        "S8S8(-128) @6848 overflows i32!"
+    );
 
     println!("\n-- full per-K headroom table --");
     for case in MODEL_KS {
@@ -189,8 +213,11 @@ fn worst_case_accumulators_fit_i32_closed_form() {
     // reason int16 accumulation would NOT be safe (255*127 already needs > 15
     // bits at K=2 with sign).
     let pct = (u8s8_6848 as f64) / (I32_MAX_I64 as f64) * 100.0;
-    println!("\nU8S8 @ worst-case K=6848 uses {pct:.3}% of i32::MAX (headroom {} of {})",
-        I32_MAX_I64 - u8s8_6848, I32_MAX_I64);
+    println!(
+        "\nU8S8 @ worst-case K=6848 uses {pct:.3}% of i32::MAX (headroom {} of {})",
+        I32_MAX_I64 - u8s8_6848,
+        I32_MAX_I64
+    );
     assert!(pct < 100.0);
 }
 
@@ -211,7 +238,11 @@ fn live_i32_accumulator_matches_i64_oracle_at_every_model_k() {
         let b127 = vec![127i8; k];
         let acc_i32 = dot_s8s8_i32(&a127, &b127);
         let acc_i64 = dot_s8s8_i64(&a127, &b127);
-        assert_eq!(i64::from(acc_i32), acc_i64, "S8S8(+127) i32 wrapped at K={k}");
+        assert_eq!(
+            i64::from(acc_i32),
+            acc_i64,
+            "S8S8(+127) i32 wrapped at K={k}"
+        );
         assert_eq!(acc_i64, k as i64 * S8S8_TERM);
         log_row("S8S8", k, "all +127", acc_i64);
 
@@ -220,7 +251,11 @@ fn live_i32_accumulator_matches_i64_oracle_at_every_model_k() {
         let bm128 = vec![-128i8; k];
         let acc_i32_n = dot_s8s8_i32(&am128, &bm128);
         let acc_i64_n = dot_s8s8_i64(&am128, &bm128);
-        assert_eq!(i64::from(acc_i32_n), acc_i64_n, "S8S8(-128) i32 wrapped at K={k}");
+        assert_eq!(
+            i64::from(acc_i32_n),
+            acc_i64_n,
+            "S8S8(-128) i32 wrapped at K={k}"
+        );
         assert_eq!(acc_i64_n, k as i64 * S8S8_TERM_NEG128);
         log_row("S8S8", k, "all -128 (max |product|)", acc_i64_n);
 
@@ -237,10 +272,17 @@ fn live_i32_accumulator_matches_i64_oracle_at_every_model_k() {
         let bn = vec![-128i8; k];
         let acc_i32_un = dot_u8s8_i32(&au, &bn);
         let acc_i64_un = dot_u8s8_i64(&au, &bn);
-        assert_eq!(i64::from(acc_i32_un), acc_i64_un, "U8S8(neg) i32 wrapped at K={k}");
+        assert_eq!(
+            i64::from(acc_i32_un),
+            acc_i64_un,
+            "U8S8(neg) i32 wrapped at K={k}"
+        );
         assert_eq!(acc_i64_un, k as i64 * 255 * -128);
         // Negative headroom is against i32::MIN.
-        assert!(acc_i64_un > i32::MIN as i64, "U8S8(neg) underflows i32 at K={k}");
+        assert!(
+            acc_i64_un > i32::MIN as i64,
+            "U8S8(neg) underflows i32 at K={k}"
+        );
         println!(
             "[PASS] U8S8  K={k:<6} worst_neg_acc={acc_i64_un:>14} \
              i32::MIN headroom={:>14}  // 255 * -128",
@@ -278,10 +320,19 @@ fn down_proj_6848_specifically_breaks_frankensearch_1536_bound() {
     let bu = vec![127i8; WORST_K];
     let acc_i32 = dot_u8s8_i32(&au, &bu);
     let acc_i64 = dot_u8s8_i64(&au, &bu);
-    assert_eq!(i64::from(acc_i32), acc_i64, "U8S8 i32 wrapped at the worst-case K=6848");
+    assert_eq!(
+        i64::from(acc_i32),
+        acc_i64,
+        "U8S8 i32 wrapped at the worst-case K=6848"
+    );
     assert_eq!(acc_i64, 221_772_480);
     assert!(acc_i64 < I32_MAX_I64);
-    log_row("U8S8", WORST_K, "down_proj — proven safe past frankensearch", acc_i64);
+    log_row(
+        "U8S8",
+        WORST_K,
+        "down_proj — proven safe past frankensearch",
+        acc_i64,
+    );
 
     // Same for S8S8 at 6848.
     let a127 = vec![127i8; WORST_K];
@@ -289,7 +340,12 @@ fn down_proj_6848_specifically_breaks_frankensearch_1536_bound() {
     let s_i32 = dot_s8s8_i32(&a127, &b127);
     assert_eq!(i64::from(s_i32), 110_451_392);
     assert!(110_451_392 < I32_MAX_I64);
-    log_row("S8S8", WORST_K, "down_proj — proven safe past frankensearch", 110_451_392);
+    log_row(
+        "S8S8",
+        WORST_K,
+        "down_proj — proven safe past frankensearch",
+        110_451_392,
+    );
 }
 
 // ── PROOF 4: the actual i32 boundary — where overflow WOULD begin ────────────
@@ -307,7 +363,10 @@ fn stress_k_at_the_i32_boundary() {
     let one_past = (max_safe_k_u8s8 as i64 + 1) * U8S8_TERM;
     assert_eq!(max_safe_k_u8s8, 66_311);
     assert!(at_boundary < I32_MAX_I64, "boundary K must still fit");
-    assert!(one_past > I32_MAX_I64, "K just past boundary must overflow i32");
+    assert!(
+        one_past > I32_MAX_I64,
+        "K just past boundary must overflow i32"
+    );
     println!(
         "[PASS] U8S8 boundary: max safe K = {max_safe_k_u8s8} (acc={at_boundary}, \
          headroom={}); K+1={} overflows (acc={one_past} > {})",
@@ -332,7 +391,10 @@ fn stress_k_at_the_i32_boundary() {
         "Real worst-case K=6848 sits {margin_factor:.2}x below the U8S8 i32 cliff \
          (cliff K={max_safe_k_u8s8})."
     );
-    assert!(margin_factor > 9.0, "expected >9x headroom below the i32 cliff");
+    assert!(
+        margin_factor > 9.0,
+        "expected >9x headroom below the i32 cliff"
+    );
 
     // Run the live kernel exactly AT the boundary to prove the i32 path itself
     // (not just the closed form) survives the largest safe contraction.
@@ -340,7 +402,11 @@ fn stress_k_at_the_i32_boundary() {
     let bu = vec![127i8; max_safe_k_u8s8];
     let acc_i32 = dot_u8s8_i32(&au, &bu);
     let acc_i64 = dot_u8s8_i64(&au, &bu);
-    assert_eq!(i64::from(acc_i32), acc_i64, "i32 path wrapped AT the boundary K");
+    assert_eq!(
+        i64::from(acc_i32),
+        acc_i64,
+        "i32 path wrapped AT the boundary K"
+    );
     assert_eq!(acc_i64, at_boundary);
     println!("[PASS] live i32 kernel survives boundary K={max_safe_k_u8s8} (acc={acc_i32})");
 }

@@ -217,7 +217,9 @@ where
 /// is the same source `robot backends` uses for `logical_cpus` (src/cli.rs), so
 /// the watchdog and the diagnostics agree on the number.
 fn detected_pool() -> usize {
-    thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Pages to issue: `pages ≫ pool`, floored at `MIN_PAGES`.
@@ -248,7 +250,12 @@ fn many_sequential_pages_complete_within_budget() {
     // Heavy vs no-weights branch selection, logged either way.
     let heavy = heavy_model_path();
     let (model_path, budget, native_path_ran, fallback_target) = match &heavy {
-        Some(p) => (p.clone(), WATCHDOG_BUDGET_HEAVY, true, p.display().to_string()),
+        Some(p) => (
+            p.clone(),
+            WATCHDOG_BUDGET_HEAVY,
+            true,
+            p.display().to_string(),
+        ),
         None => (
             PathBuf::from(ABSENT_MODEL),
             WATCHDOG_BUDGET,
@@ -264,7 +271,11 @@ fn many_sequential_pages_complete_within_budget() {
         &format!(
             r#""seed":0,"pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{budget},"mode":"{mode}","model_path":{mp},"pages_multiplier":{PAGES_MULTIPLIER},"native_path_ran":{native_path_ran},"fallback_target":"{fallback_target}""#,
             budget = budget.as_secs(),
-            mode = if heavy.is_some() { "heavy_forward" } else { "no_weights_orchestration" },
+            mode = if heavy.is_some() {
+                "heavy_forward"
+            } else {
+                "no_weights_orchestration"
+            },
             mp = json_str(&model_path.display().to_string()),
         ),
     );
@@ -548,7 +559,10 @@ fn watchdog_detects_a_real_hang() {
         case,
         "setup",
         "pass",
-        &format!(r#""seed":0,"timeout_budget_secs":0,"budget_ms":{}"#, tiny.as_millis()),
+        &format!(
+            r#""seed":0,"timeout_budget_secs":0,"budget_ms":{}"#,
+            tiny.as_millis()
+        ),
     );
 
     let started = Instant::now();

@@ -69,10 +69,19 @@ const ENV_REFERENCE_PYTHON: &str = "FOCR_REFERENCE_PYTHON";
 /// (NEVER @64 — plan §9.3 oversubscription trap).
 const ENV_THREADS: &str = "FOCR_THREADS";
 
-/// Where the persisted `.bench-history` high-water mark lives.
-fn history_path() -> PathBuf {
-    // Co-located with the other gauntlet artifacts under reports/.
-    PathBuf::from("reports/bench/latest.json")
+/// Opt-in path for the persisted `.bench-history` high-water mark.
+///
+/// Exploratory `cargo bench` runs should not dirty a shared checkout by writing
+/// `reports/bench/latest.json`. CI/perf lanes that intend to update the monotone
+/// ratchet floor set this explicitly, usually to `reports/bench/latest.json`.
+const ENV_BENCH_HISTORY: &str = "FOCR_BENCH_HISTORY";
+
+fn history_path() -> Option<PathBuf> {
+    history_path_from_env(std::env::var_os(ENV_BENCH_HISTORY))
+}
+
+fn history_path_from_env(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.filter(|path| !path.is_empty()).map(PathBuf::from)
 }
 
 /// The primary bench whose p50 carries the strictest (−3 %) ratchet gate
@@ -497,42 +506,49 @@ fn run_gauntlet(budget: BenchBudget) -> Vec<BenchRecord> {
     // Only keep-eligible (cv_pct ≤ 5) rows participate. This is the pass-over-pass
     // gate; the honest-bar assertions live here as ratchet checks, NOT numbers.
     let ratchet = Ratchet::new(PRIMARY_BENCH);
-    let path = history_path();
-    match History::read_or_empty(&path) {
-        Ok(baseline) => {
-            let verdict = ratchet.compare(&records, &baseline);
-            for g in &verdict.gates {
-                log_line(&format!(
-                    "{{\"event\":\"ratchet_gate\",\"gate\":\"{}\",\"observed_regression\":{:.6},\
-                     \"allowed\":{:.6},\"pass\":{}}}",
-                    g.gate, g.observed_regression, g.allowed, g.pass
-                ));
-            }
-            log_line(&format!(
-                "{{\"event\":\"ratchet_verdict\",\"decision\":\"{}\",\"reason\":{}}}",
-                verdict.decision,
-                json_escape(&verdict.reason),
-            ));
-            // On Allow, advance the monotone high-water mark. A Block is logged
-            // but does NOT panic here (the bench would abort the whole run); the
-            // CI guardrail job parses the `ratchet_verdict` line and fails the
-            // FLAG-only job (LOGGING_AND_E2E §6.3 — flag-only first, hard later).
-            if verdict.allowed() {
-                let advanced = ratchet.advance(&records, &baseline);
-                if let Err(e) = advanced.write(&path) {
+    if let Some(path) = history_path() {
+        match History::read_or_empty(&path) {
+            Ok(baseline) => {
+                let verdict = ratchet.compare(&records, &baseline);
+                for g in &verdict.gates {
                     log_line(&format!(
-                        "{{\"event\":\"ratchet_persist_error\",\"error\":{}}}",
-                        json_escape(&e)
+                        "{{\"event\":\"ratchet_gate\",\"gate\":\"{}\",\"observed_regression\":{:.6},\
+                     \"allowed\":{:.6},\"pass\":{}}}",
+                        g.gate, g.observed_regression, g.allowed, g.pass
                     ));
                 }
+                log_line(&format!(
+                    "{{\"event\":\"ratchet_verdict\",\"decision\":\"{}\",\"reason\":{}}}",
+                    verdict.decision,
+                    json_escape(&verdict.reason),
+                ));
+                // On Allow, advance the monotone high-water mark. A Block is logged
+                // but does NOT panic here (the bench would abort the whole run); the
+                // CI guardrail job parses the `ratchet_verdict` line and fails the
+                // FLAG-only job (LOGGING_AND_E2E §6.3 — flag-only first, hard later).
+                if verdict.allowed() {
+                    let advanced = ratchet.advance(&records, &baseline);
+                    if let Err(e) = advanced.write(&path) {
+                        log_line(&format!(
+                            "{{\"event\":\"ratchet_persist_error\",\"error\":{}}}",
+                            json_escape(&e)
+                        ));
+                    }
+                }
+            }
+            Err(e) => {
+                log_line(&format!(
+                    "{{\"event\":\"ratchet_history_error\",\"error\":{}}}",
+                    json_escape(&e)
+                ));
             }
         }
-        Err(e) => {
-            log_line(&format!(
-                "{{\"event\":\"ratchet_history_error\",\"error\":{}}}",
-                json_escape(&e)
-            ));
-        }
+    } else {
+        log_line(&format!(
+            "{{\"event\":\"ratchet_history_disabled\",\"result\":\"skip_no_history_path\",\
+             \"env\":\"{}\"}}",
+            ENV_BENCH_HISTORY
+        ));
     }
 
     // ── (5) Emit every measured record as one NDJSON line (the evidence). ───
@@ -706,6 +722,22 @@ mod tests {
         };
         assert!(g4.head_to_head_ready());
         assert_eq!(g4.skip_reason(), "ready");
+    }
+
+    /// Ratchet persistence is opt-in so smoke benches/tests do not leave
+    /// generated files in a shared checkout. CI/perf lanes opt in by setting
+    /// `FOCR_BENCH_HISTORY=reports/bench/latest.json`.
+    #[test]
+    fn history_path_is_opt_in() {
+        assert_eq!(history_path_from_env(None), None);
+        assert_eq!(
+            history_path_from_env(Some(std::ffi::OsString::from(""))),
+            None
+        );
+        assert_eq!(
+            history_path_from_env(Some(std::ffi::OsString::from("reports/bench/latest.json"))),
+            Some(PathBuf::from("reports/bench/latest.json"))
+        );
     }
 
     /// The honest-bar gate is encoded as a RATCHET assertion, not a number: a

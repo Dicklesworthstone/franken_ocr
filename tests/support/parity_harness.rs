@@ -113,12 +113,18 @@ pub struct TensorSpec {
 impl TensorSpec {
     /// Construct a spec; `shape` is C-order.
     pub fn new(shape: impl Into<Vec<usize>>, dtype: DType) -> Self {
-        Self { shape: shape.into(), dtype }
+        Self {
+            shape: shape.into(),
+            dtype,
+        }
     }
 
     /// Flattened element count (product of the shape; empty shape ⇒ scalar = 1).
     pub fn numel(&self) -> usize {
-        self.shape.iter().product::<usize>().max(usize::from(self.shape.is_empty()))
+        self.shape
+            .iter()
+            .product::<usize>()
+            .max(usize::from(self.shape.is_empty()))
     }
 
     /// Reject a shape/dtype mismatch with a self-diagnosing message naming BOTH
@@ -188,7 +194,13 @@ pub const COSINE_F32_THRESHOLD: f64 = 0.9999;
 /// vector is treated as identical (`1.0`) — two all-zero activations agree; a
 /// zero-norm vs a non-zero vector is maximally dissimilar (`0.0`).
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
-    assert_eq!(a.len(), b.len(), "cosine: length mismatch {} != {}", a.len(), b.len());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "cosine: length mismatch {} != {}",
+        a.len(),
+        b.len()
+    );
     let mut dot = 0.0f64;
     let mut na = 0.0f64;
     let mut nb = 0.0f64;
@@ -274,7 +286,11 @@ pub fn ulp_distance(a: f32, b: f32) -> u32 {
     // negatives, set the sign bit for positives. Adjacent floats then differ by 1.
     let ord = |x: f32| -> i64 {
         let bits = x.to_bits() as i32;
-        let ordinal = if bits < 0 { i32::MIN.wrapping_sub(bits) } else { bits };
+        let ordinal = if bits < 0 {
+            i32::MIN.wrapping_sub(bits)
+        } else {
+            bits
+        };
         i64::from(ordinal)
     };
     (ord(a) - ord(b)).unsigned_abs() as u32
@@ -456,7 +472,9 @@ pub struct FixtureLoader {
 impl FixtureLoader {
     /// Construct against the resolved [`fixtures_root`].
     pub fn new() -> Self {
-        Self { root: fixtures_root() }
+        Self {
+            root: fixtures_root(),
+        }
     }
 
     /// Construct against an explicit root (tests that synthesize a fixture tree).
@@ -499,8 +517,8 @@ impl FixtureLoader {
 
     /// Load + parse one golden JSON into a [`ReferenceGolden`].
     pub fn load_golden(&self, path: &Path) -> Result<ReferenceGolden, String> {
-        let text = fs::read_to_string(path)
-            .map_err(|e| format!("read golden {}: {e}", path.display()))?;
+        let text =
+            fs::read_to_string(path).map_err(|e| format!("read golden {}: {e}", path.display()))?;
         let raw: Value = serde_json::from_str(&text)
             .map_err(|e| format!("parse golden {}: {e}", path.display()))?;
         Self::golden_from_value(raw)
@@ -548,11 +566,26 @@ impl FixtureLoader {
                     .get("sha256")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                activations.insert(stage.clone(), ActivationEntry { file, shape, dtype, sha256 });
+                activations.insert(
+                    stage.clone(),
+                    ActivationEntry {
+                        file,
+                        shape,
+                        dtype,
+                        sha256,
+                    },
+                );
             }
         }
         let provenance = raw.get("provenance").cloned().unwrap_or(Value::Null);
-        Ok(ReferenceGolden { doc, decoded_text, decoded_text_sha256, activations, provenance, raw })
+        Ok(ReferenceGolden {
+            doc,
+            decoded_text,
+            decoded_text_sha256,
+            activations,
+            provenance,
+            raw,
+        })
     }
 
     /// Assert a golden's provenance resolves to the pinned model (§8: a fixture
@@ -574,16 +607,19 @@ impl FixtureLoader {
     /// Load one activation `.npy` for a doc+stage into a [`NormalizedValue`].
     /// The oracle writes C-order little-endian `<f4` arrays (`np.save(..,
     /// astype(np.float32))`), so [`read_npy_f32`] handles exactly that subset.
-    pub fn load_activation(
-        &self,
-        doc: &str,
-        stage: &str,
-    ) -> Result<NormalizedValue, String> {
-        let path = self.root.join("activations").join(doc).join(format!("{stage}.npy"));
+    pub fn load_activation(&self, doc: &str, stage: &str) -> Result<NormalizedValue, String> {
+        let path = self
+            .root
+            .join("activations")
+            .join(doc)
+            .join(format!("{stage}.npy"));
         let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let (shape, data) = read_npy_f32(&bytes)
-            .map_err(|e| format!("parse npy {}: {e}", path.display()))?;
-        Ok(NormalizedValue::from_f32(TensorSpec::new(shape, DType::F32), data))
+        let (shape, data) =
+            read_npy_f32(&bytes).map_err(|e| format!("parse npy {}: {e}", path.display()))?;
+        Ok(NormalizedValue::from_f32(
+            TensorSpec::new(shape, DType::F32),
+            data,
+        ))
     }
 }
 
@@ -619,17 +655,22 @@ pub fn read_npy_f32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<f32>), String> {
     if bytes.len() < header_end {
         return Err("truncated header".into());
     }
-    let header = std::str::from_utf8(&bytes[header_start..header_end])
-        .map_err(|_| "non-utf8 npy header")?;
+    let header =
+        std::str::from_utf8(&bytes[header_start..header_end]).map_err(|_| "non-utf8 npy header")?;
     // The header is a Python-dict literal: {'descr':'<f4','fortran_order':False,'shape':(.. ,)}.
     if !(header.contains("<f4") || header.contains("|f4") || header.contains("'<f4'")) {
-        return Err(format!("unsupported descr (need little-endian <f4): {header}"));
+        return Err(format!(
+            "unsupported descr (need little-endian <f4): {header}"
+        ));
     }
     if header.contains("'fortran_order': True") || header.contains("'fortran_order':True") {
         return Err("fortran_order True unsupported (need C-order)".into());
     }
     let shape = parse_npy_shape(header)?;
-    let numel: usize = shape.iter().product::<usize>().max(usize::from(shape.is_empty()));
+    let numel: usize = shape
+        .iter()
+        .product::<usize>()
+        .max(usize::from(shape.is_empty()));
     let data_bytes = &bytes[header_end..];
     if data_bytes.len() < numel * 4 {
         return Err(format!(
@@ -756,7 +797,11 @@ pub fn establish_floor(
         first_div = Some(total);
         prefix = total;
     }
-    let rate = if total == 0 { 0.0 } else { diverged as f64 / total as f64 };
+    let rate = if total == 0 {
+        0.0
+    } else {
+        diverged as f64 / total as f64
+    };
     OracleFloor {
         per_logit_max_abs_spread: spread,
         reproducible_prefix_len: prefix,
@@ -776,7 +821,10 @@ pub fn establish_floor(
 /// to rewrite a committed golden (GOLDEN.md §4 rule 1). CI never sets it (§4 rule
 /// 3) — a contract test in the golden suite asserts that.
 pub fn update_goldens() -> bool {
-    matches!(std::env::var("UPDATE_GOLDENS").ok().as_deref(), Some("1") | Some("true"))
+    matches!(
+        std::env::var("UPDATE_GOLDENS").ok().as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 /// Compare `actual` against the committed golden file at `golden_path`.
@@ -790,7 +838,9 @@ pub fn update_goldens() -> bool {
 pub fn golden_diff(golden_path: &Path, actual: &str) -> Result<(), String> {
     let actual = actual.replace("\r\n", "\n");
     let actual_path = actual_sidecar(golden_path);
-    let existing = fs::read_to_string(golden_path).ok().map(|s| s.replace("\r\n", "\n"));
+    let existing = fs::read_to_string(golden_path)
+        .ok()
+        .map(|s| s.replace("\r\n", "\n"));
     match existing {
         Some(ref committed) if committed == &actual => {
             let _ = fs::remove_file(&actual_path);
@@ -874,7 +924,11 @@ impl Logger {
     /// Begin a structured-log scope for `test` (the rung, e.g. `"L0_preprocess"`)
     /// and `case` (the corpus entry, e.g. `"doc01"` or `"synthetic"`).
     pub fn new(test: &str, case: &str) -> Self {
-        Self { test: test.to_string(), case: case.to_string(), seq: 0 }
+        Self {
+            test: test.to_string(),
+            case: case.to_string(),
+            seq: 0,
+        }
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -964,7 +1018,11 @@ impl Logger {
     /// `result` event — the rung's terminal line. `elapsed_us` is required;
     /// scrubbed in goldens.
     pub fn result(&mut self, outcome: &str, elapsed_us: u128) {
-        self.emit("result", outcome, map(&[("elapsed_us", json!(elapsed_us as u64))]));
+        self.emit(
+            "result",
+            outcome,
+            map(&[("elapsed_us", json!(elapsed_us as u64))]),
+        );
     }
 
     /// `error` event — a self-diagnosing failure line carrying the `diag` block
@@ -986,7 +1044,10 @@ impl Logger {
 }
 
 fn map(pairs: &[(&str, Value)]) -> serde_json::Map<String, Value> {
-    pairs.iter().map(|(k, v)| ((*k).to_string(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), v.clone()))
+        .collect()
 }
 
 fn now_micros() -> u64 {
@@ -1022,9 +1083,15 @@ pub fn validate_event(schema: &Value, event: &Value) -> Result<(), String> {
             return Err(format!("event missing required_common field {key:?}"));
         }
     }
-    let event_kind = obj.get("event").and_then(Value::as_str).ok_or("event has no `event` kind")?;
+    let event_kind = obj
+        .get("event")
+        .and_then(Value::as_str)
+        .ok_or("event has no `event` kind")?;
     // Validate the `event` value is an allowed enum member.
-    if let Some(enums) = schema.get("enums").and_then(|e| e.get("event")).and_then(Value::as_array)
+    if let Some(enums) = schema
+        .get("enums")
+        .and_then(|e| e.get("event"))
+        .and_then(Value::as_array)
     {
         let allowed: Vec<&str> = enums.iter().filter_map(Value::as_str).collect();
         if !allowed.contains(&event_kind) {
@@ -1039,7 +1106,9 @@ pub fn validate_event(schema: &Value, event: &Value) -> Result<(), String> {
         for f in per {
             let key = f.as_str().unwrap_or_default();
             if !obj.contains_key(key) {
-                return Err(format!("`{event_kind}` event missing required field {key:?}"));
+                return Err(format!(
+                    "`{event_kind}` event missing required field {key:?}"
+                ));
             }
         }
     }
@@ -1059,7 +1128,10 @@ mod tests {
     #[test]
     fn cosine_identical_is_one() {
         let v = [1.0f32, 2.0, 3.0, -4.0];
-        assert!((cosine(&v, &v) - 1.0).abs() < 1e-12, "identical vectors ⇒ cosine 1.0");
+        assert!(
+            (cosine(&v, &v) - 1.0).abs() < 1e-12,
+            "identical vectors ⇒ cosine 1.0"
+        );
     }
 
     #[test]
@@ -1075,7 +1147,10 @@ mod tests {
         let a: Vec<f32> = (0..128).map(|i| (i as f32).sin()).collect();
         let b: Vec<f32> = a.iter().map(|&x| x * (1.0 + 1e-5)).collect();
         let c = cosine(&a, &b);
-        assert!(c >= COSINE_F32_THRESHOLD, "cosine {c} below {COSINE_F32_THRESHOLD}");
+        assert!(
+            c >= COSINE_F32_THRESHOLD,
+            "cosine {c} below {COSINE_F32_THRESHOLD}"
+        );
     }
 
     #[test]
@@ -1109,7 +1184,11 @@ mod tests {
 
     #[test]
     fn ulp_table_matches_methodology() {
-        assert_eq!(ulp_table(OpFamily::MatmulF32), 4, "matmul 4 ULP (METHODOLOGY §1.3)");
+        assert_eq!(
+            ulp_table(OpFamily::MatmulF32),
+            4,
+            "matmul 4 ULP (METHODOLOGY §1.3)"
+        );
         assert_eq!(ulp_table(OpFamily::Elementwise), 2, "elementwise 2 ULP");
         assert_eq!(ulp_table(OpFamily::Reduction), 8);
         assert_eq!(ulp_table(OpFamily::Transcendental), 8);
@@ -1119,12 +1198,18 @@ mod tests {
     fn ulp_compare_passes_within_budget_fails_outside() {
         let oracle: Vec<f32> = (0..64).map(|i| 0.5 + i as f32).collect();
         // Within budget: every element +1 ULP ⇒ ≤ 4 (matmul) passes.
-        let near: Vec<f32> = oracle.iter().map(|&x| f32::from_bits(x.to_bits() + 1)).collect();
+        let near: Vec<f32> = oracle
+            .iter()
+            .map(|&x| f32::from_bits(x.to_bits() + 1))
+            .collect();
         let r = ulp_compare(&near, &oracle, OpFamily::MatmulF32);
         assert!(r.pass, "1 ULP within 4-ULP matmul budget; report {r:?}");
         assert_eq!(r.max_ulp, 1);
         // Outside elementwise budget (2 ULP): +5 ULP fails and names the index.
-        let far: Vec<f32> = oracle.iter().map(|&x| f32::from_bits(x.to_bits() + 5)).collect();
+        let far: Vec<f32> = oracle
+            .iter()
+            .map(|&x| f32::from_bits(x.to_bits() + 5))
+            .collect();
         let r2 = ulp_compare(&far, &oracle, OpFamily::Elementwise);
         assert!(!r2.pass, "5 ULP exceeds 2-ULP elementwise budget");
         assert_eq!(r2.max_ulp, 5);
@@ -1173,9 +1258,16 @@ mod tests {
         let ta = [10u32, 11, 12, 13, 14, 99];
         let tb = [10u32, 11, 12, 13, 14, 77];
         let floor = establish_floor(&la, &lb, &ta, &tb);
-        assert_eq!(floor.reproducible_prefix_len, 5, "prefix is the agreeing run");
+        assert_eq!(
+            floor.reproducible_prefix_len, 5,
+            "prefix is the agreeing run"
+        );
         assert_eq!(floor.first_divergence_pos, Some(5));
-        assert!((floor.l3_logit_tolerance() - 0.03).abs() < 1e-6, "spread {}", floor.l3_logit_tolerance());
+        assert!(
+            (floor.l3_logit_tolerance() - 0.03).abs() < 1e-6,
+            "spread {}",
+            floor.l3_logit_tolerance()
+        );
         assert!(floor.per_token_divergence_rate > 0.0);
     }
 
@@ -1185,7 +1277,10 @@ mod tests {
         let ta = [1u32, 2, 3];
         let floor = establish_floor(&la, &la, &ta, &ta);
         assert_eq!(floor.reproducible_prefix_len, 3);
-        assert_eq!(floor.first_divergence_pos, None, "identical ⇒ no divergence");
+        assert_eq!(
+            floor.first_divergence_pos, None,
+            "identical ⇒ no divergence"
+        );
         assert_eq!(floor.l3_logit_tolerance(), 0.0);
     }
 
@@ -1235,7 +1330,10 @@ mod tests {
         assert_eq!(g.doc, "doc01.png");
         assert_eq!(g.decoded_text.as_deref(), Some("# Title\nbody"));
         assert_eq!(g.activations["sam_output"].shape, vec![1, 256, 1280]);
-        assert!(FixtureLoader::check_provenance(&g).is_ok(), "pinned provenance resolves");
+        assert!(
+            FixtureLoader::check_provenance(&g).is_ok(),
+            "pinned provenance resolves"
+        );
     }
 
     #[test]
@@ -1244,7 +1342,11 @@ mod tests {
             "doc": "x", "provenance": { "hf_commit": "wrong", "pinned_torch": PIN_TORCH }
         });
         let g = FixtureLoader::golden_from_value(raw).unwrap();
-        assert!(FixtureLoader::check_provenance(&g).unwrap_err().contains("hf_commit"));
+        assert!(
+            FixtureLoader::check_provenance(&g)
+                .unwrap_err()
+                .contains("hf_commit")
+        );
     }
 
     #[test]
@@ -1289,6 +1391,9 @@ mod tests {
         // fixture's own schema_version so all three agree.
         let schema = load_log_schema().expect("schema");
         assert_eq!(schema["schema_version"].as_u64(), Some(LOG_SCHEMA_VERSION));
-        assert_eq!(franken_ocr::robot::ROBOT_SCHEMA_VERSION as u64, LOG_SCHEMA_VERSION);
+        assert_eq!(
+            franken_ocr::robot::ROBOT_SCHEMA_VERSION as u64,
+            LOG_SCHEMA_VERSION
+        );
     }
 }

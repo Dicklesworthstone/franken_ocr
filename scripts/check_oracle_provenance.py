@@ -54,6 +54,10 @@ def is_json_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
 
+def is_non_empty_string_list(value: object) -> bool:
+    return isinstance(value, list) and bool(value) and all(isinstance(arg, str) and arg for arg in value)
+
+
 def load_json(path: Path, failures: list[str]) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -118,7 +122,7 @@ def validate_provenance(path: Path, value: dict[str, Any], failures: list[str]) 
 
     command_argv = provenance.get("command_argv")
     exact_command = provenance.get("exact_command")
-    ok_argv = isinstance(command_argv, list) and all(isinstance(arg, str) and arg for arg in command_argv)
+    ok_argv = is_non_empty_string_list(command_argv)
     emit("oracle-command-argv", ok_argv, file=str(path.relative_to(ROOT)), argc=len(command_argv) if isinstance(command_argv, list) else None)
     if not ok_argv:
         failures.append(f"{path}: command_argv must be a non-empty list of strings")
@@ -224,10 +228,10 @@ def validate_deterministic_replay(
             failures.append(f"{path}: deterministic_replay.{field} mismatch")
 
     replay_argv = replay.get("replay_command_argv")
-    argv_ok = isinstance(replay_argv, list) and any("gen_reference_fixtures.py" in str(arg) for arg in replay_argv)
+    argv_ok = is_non_empty_string_list(replay_argv) and any("gen_reference_fixtures.py" in arg for arg in replay_argv)
     emit("oracle-replay-command", argv_ok, file=str(path.relative_to(ROOT)), argc=len(replay_argv) if isinstance(replay_argv, list) else None)
     if not argv_ok:
-        failures.append(f"{path}: deterministic_replay.replay_command_argv must name gen_reference_fixtures.py")
+        failures.append(f"{path}: deterministic_replay.replay_command_argv must be a non-empty list of strings naming gen_reference_fixtures.py")
 
     provenance = value.get("provenance")
     if isinstance(provenance, dict):
@@ -450,6 +454,10 @@ def self_test() -> int:
             lambda record: record["provenance"]["determinism"].update({"seed": True}),
         ),
         (
+            "empty-provenance-command-argv",
+            lambda record: record["provenance"].update({"command_argv": []}),
+        ),
+        (
             "bool-replay-schema",
             lambda record: record["deterministic_replay"].update({"schema_version": True}),
         ),
@@ -487,6 +495,16 @@ def self_test() -> int:
             "replay-command-missing-generator",
             lambda record: record["deterministic_replay"].update(
                 {"replay_command_argv": ["python3", "other.py"]}
+            ),
+        ),
+        (
+            "empty-replay-command-argv",
+            lambda record: record["deterministic_replay"].update({"replay_command_argv": []}),
+        ),
+        (
+            "non-string-replay-command-argv",
+            lambda record: record["deterministic_replay"].update(
+                {"replay_command_argv": [sys.executable, {"script": "gen_reference_fixtures.py"}]}
             ),
         ),
         (

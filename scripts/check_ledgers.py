@@ -12,11 +12,20 @@ from __future__ import annotations
 import json
 import re
 import sys
+import tempfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCS = ROOT / "docs"
+EVIDENCE_MANIFEST_NAMES = {
+    "SHA256SUMS",
+    "SHA256SUMS.txt",
+    "sha256sums.txt",
+    "sha256.txt",
+    "manifest.sha256",
+    "manifest.json",
+}
 
 
 def emit(check: str, ok: bool, **fields: object) -> None:
@@ -67,6 +76,18 @@ def undefined_kill_switches(kill_line: str, src_text: str) -> list[str]:
     return [var for var in kill_switch_env_vars(kill_line) if var not in src_text]
 
 
+def has_sha256_manifest(evidence_path: Path) -> bool:
+    if not evidence_path.is_dir():
+        return False
+    for child in evidence_path.iterdir():
+        if not child.is_file():
+            continue
+        name = child.name.lower()
+        if child.name in EVIDENCE_MANIFEST_NAMES or ("sha256" in name and "manifest" in name):
+            return True
+    return False
+
+
 def self_test_kill_switch_validation(failures: list[str]) -> None:
     kill_line = "- Fallback / kill-switch state: FOCR_LEDGER_ONLY=1 restores reference behavior"
 
@@ -82,6 +103,47 @@ def self_test_kill_switch_validation(failures: list[str]) -> None:
     emit("ledger-self-test-kill-switch-defined", defined_ok, undefined=defined)
     if not defined_ok:
         failures.append("self-test: source-defined FOCR_* var must be accepted")
+
+
+def self_test_evidence_manifest_validation(failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory(prefix="focr-ledger-self-test-") as tmp:
+        evidence_dir = Path(tmp) / "artifacts" / "perf" / "bd-self-test"
+        evidence_dir.mkdir(parents=True)
+
+        missing_ok = not has_sha256_manifest(evidence_dir)
+        emit("ledger-self-test-evidence-manifest-missing", missing_ok)
+        if not missing_ok:
+            failures.append("self-test: evidence dir without a sha256 manifest must fail")
+
+        (evidence_dir / "SHA256SUMS").write_text(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  baseline.log\n",
+            encoding="utf-8",
+        )
+        present_ok = has_sha256_manifest(evidence_dir)
+        emit("ledger-self-test-evidence-manifest-present", present_ok)
+        if not present_ok:
+            failures.append("self-test: evidence dir with SHA256SUMS must pass")
+
+
+def require_evidence_manifest(
+    ledger: Path,
+    context: str,
+    evidence_path: Path,
+    evidence_id: str,
+    failures: list[str],
+) -> None:
+    has_manifest = has_sha256_manifest(evidence_path)
+    emit(
+        "evidence-sha256-manifest",
+        has_manifest,
+        context=context,
+        evidence_id=evidence_id,
+    )
+    if not has_manifest:
+        failures.append(
+            f"{ledger}: {context} evidence dir {evidence_id} must contain a SHA-256 manifest "
+            f"({', '.join(sorted(EVIDENCE_MANIFEST_NAMES))})"
+        )
 
 
 def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
@@ -144,6 +206,8 @@ def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
         emit("perf-evidence-dir", exists, line=line_no, evidence_id=evidence_id)
         if not exists:
             failures.append(f"{path}:{line_no}: missing evidence dir {evidence_id}")
+        else:
+            require_evidence_manifest(path, f"line {line_no}", evidence_path, evidence_id, failures)
 
         for column in (
             "command/env",
@@ -207,6 +271,8 @@ def check_negative_evidence(path: Path, text: str, failures: list[str]) -> None:
             emit("negative-evidence-dir", exists, entry=title, evidence_id=evidence_id)
             if not exists:
                 failures.append(f"{path}: {title} missing evidence dir {evidence_id}")
+            else:
+                require_evidence_manifest(path, title, evidence_path, evidence_id, failures)
 
         disposition_ok = bool(re.search(r"disposition:\s*(KEEP|REVERT)\b", section))
         emit("negative-disposition", disposition_ok, entry=title)
@@ -283,6 +349,7 @@ def main() -> int:
         return 1
 
     self_test_kill_switch_validation(failures)
+    self_test_evidence_manifest_validation(failures)
 
     negative = files["negative"].read_text(encoding="utf-8")
     perf = files["perf"].read_text(encoding="utf-8")

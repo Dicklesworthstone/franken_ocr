@@ -207,6 +207,11 @@ The first real entry MUST carry **full truth-pack provenance** (model commit
 hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a
 **template**, not a measurement — note the empty number fields):
 
+The evidence dir must include a hash manifest named `SHA256SUMS`,
+`SHA256SUMS.txt`, `sha256sums.txt`, `sha256.txt`, `manifest.sha256`, or
+`manifest.json`; `scripts/check_ledgers.py` rejects real entries whose evidence
+dirs exist but are not hash-anchored.
+
 ```
 2026-MM-DD | <WIN|NEGATIVE(reverted)> | <lever, file:fn>
   claim_id: <e.g. CLAIM-int8-expert-ffn-decode>   evidence_id: artifacts/perf/<bead>/

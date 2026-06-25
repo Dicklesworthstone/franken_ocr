@@ -101,7 +101,9 @@ fn filler(n: usize, seed: u64) -> Vec<f32> {
     let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
-        s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         // map high bits to ~[-1, 1)
         let u = (s >> 40) as f32 / (1u64 << 23) as f32;
         out.push(u - 1.0);
@@ -257,7 +259,10 @@ fn linear_int8_dense0_down_decode(b: &mut Bencher) {
     let ref_f32 = nn::matmul(&x, &Mat::from_vec(DENSE_INTER, HIDDEN, wt)).unwrap();
     let got = nn::linear_int8_dynamic(&x, &w, None).unwrap();
     let cos = cosine(&got.data, &ref_f32.data);
-    assert!(cos >= 0.99, "int8 dense0-down cosine {cos} < 0.99 — kernel drift");
+    assert!(
+        cos >= 0.99,
+        "int8 dense0-down cosine {cos} < 0.99 — kernel drift"
+    );
 
     b.iter(|| black_box(nn::linear_int8_dynamic(black_box(&x), black_box(&w), None).unwrap()));
 }
@@ -483,7 +488,15 @@ fn layer_norm_sam_768(b: &mut Bencher) {
     let w = filler(SAM_W, 55);
     let bias = filler(SAM_W, 56);
     b.iter(|| {
-        black_box(nn::layer_norm(black_box(&x), Some(black_box(&w)), Some(black_box(&bias)), LN_EPS).unwrap())
+        black_box(
+            nn::layer_norm(
+                black_box(&x),
+                Some(black_box(&w)),
+                Some(black_box(&bias)),
+                LN_EPS,
+            )
+            .unwrap(),
+        )
     });
 }
 
@@ -494,7 +507,15 @@ fn layer_norm_clip_1024(b: &mut Bencher) {
     let w = filler(CLIP_W, 58);
     let bias = filler(CLIP_W, 59);
     b.iter(|| {
-        black_box(nn::layer_norm(black_box(&x), Some(black_box(&w)), Some(black_box(&bias)), LN_EPS).unwrap())
+        black_box(
+            nn::layer_norm(
+                black_box(&x),
+                Some(black_box(&w)),
+                Some(black_box(&bias)),
+                LN_EPS,
+            )
+            .unwrap(),
+        )
     });
 }
 

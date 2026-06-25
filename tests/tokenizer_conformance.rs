@@ -196,20 +196,40 @@ fn load_fixture(path: &Path) -> Result<Fixture, String> {
         let text = v
             .get("text")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| format!("{}:{}: record missing string \"text\"", path.display(), lineno + 1))?
+            .ok_or_else(|| {
+                format!(
+                    "{}:{}: record missing string \"text\"",
+                    path.display(),
+                    lineno + 1
+                )
+            })?
             .to_string();
 
         let ids_val = v
             .get("ids")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| format!("{}:{}: record missing array \"ids\"", path.display(), lineno + 1))?;
+            .ok_or_else(|| {
+                format!(
+                    "{}:{}: record missing array \"ids\"",
+                    path.display(),
+                    lineno + 1
+                )
+            })?;
         let mut ids = Vec::with_capacity(ids_val.len());
         for (i, idv) in ids_val.iter().enumerate() {
             let id = idv.as_u64().ok_or_else(|| {
-                format!("{}:{}: ids[{i}] is not a non-negative integer", path.display(), lineno + 1)
+                format!(
+                    "{}:{}: ids[{i}] is not a non-negative integer",
+                    path.display(),
+                    lineno + 1
+                )
             })?;
             let id = u32::try_from(id).map_err(|_| {
-                format!("{}:{}: ids[{i}] = {id} overflows u32", path.display(), lineno + 1)
+                format!(
+                    "{}:{}: ids[{i}] = {id} overflows u32",
+                    path.display(),
+                    lineno + 1
+                )
             })?;
             ids.push(id);
         }
@@ -218,12 +238,21 @@ fn load_fixture(path: &Path) -> Result<Fixture, String> {
             .get("decoded")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| {
-                format!("{}:{}: record missing string \"decoded\"", path.display(), lineno + 1)
+                format!(
+                    "{}:{}: record missing string \"decoded\"",
+                    path.display(),
+                    lineno + 1
+                )
             })?
             .to_string();
 
         record_index += 1;
-        cases.push(Case { index: record_index, text, ids, decoded });
+        cases.push(Case {
+            index: record_index,
+            text,
+            ids,
+            decoded,
+        });
     }
 
     if cases.is_empty() {
@@ -234,7 +263,10 @@ fn load_fixture(path: &Path) -> Result<Fixture, String> {
         ));
     }
 
-    Ok(Fixture { meta_summary, cases })
+    Ok(Fixture {
+        meta_summary,
+        cases,
+    })
 }
 
 /// Detect the Phase-1 stub: `load`/`encode`/`decode` all return
@@ -324,7 +356,10 @@ fn tokenizer_conformance_vs_reference() {
                     fixture.meta_summary
                 ),
             );
-            logline("SUCCESS", "XFAIL recorded (impl-gated): tokenizer stub not yet implemented.");
+            logline(
+                "SUCCESS",
+                "XFAIL recorded (impl-gated): tokenizer stub not yet implemented.",
+            );
             return;
         }
         Err(e) => panic!(
@@ -377,11 +412,20 @@ fn tokenizer_conformance_vs_reference() {
             let div = first_divergence(&case.ids, &actual_ids);
             let div_detail = match div {
                 Some(i) => {
-                    let exp = case.ids.get(i).map(|v| v.to_string()).unwrap_or_else(|| "<none>".into());
-                    let act = actual_ids.get(i).map(|v| v.to_string()).unwrap_or_else(|| "<none>".into());
+                    let exp = case
+                        .ids
+                        .get(i)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "<none>".into());
+                    let act = actual_ids
+                        .get(i)
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "<none>".into());
                     format!("first divergence at index {i}: expected id {exp}, got {act}")
                 }
-                None => "lengths/content differ but no scalar divergence found (unreachable)".into(),
+                None => {
+                    "lengths/content differ but no scalar divergence found (unreachable)".into()
+                }
             };
             failures.push(format!(
                 "ENCODE MISMATCH case #{} text={}\n      expected ids ({}): {:?}\n      \
@@ -434,7 +478,10 @@ fn tokenizer_conformance_vs_reference() {
                  Gate is fixture-ready over {total} cases; goes live when bd-1gv.1 lands."
             ),
         );
-        logline("SUCCESS", "XFAIL recorded (impl-gated): encode/decode stub not yet implemented.");
+        logline(
+            "SUCCESS",
+            "XFAIL recorded (impl-gated): encode/decode stub not yet implemented.",
+        );
         return;
     }
 
@@ -477,7 +524,11 @@ fn tokenizer_conformance_vs_reference() {
         report.push('\n');
     }
     if failures.len() > shown {
-        report.push_str(&format!("\n  ... and {} more (see {})\n", failures.len() - shown, dump_path.display()));
+        report.push_str(&format!(
+            "\n  ... and {} more (see {})\n",
+            failures.len() - shown,
+            dump_path.display()
+        ));
     }
     panic!("{report}");
 }
@@ -523,7 +574,10 @@ fn assert_special_ids_match(tokenizer: &Tokenizer) {
             ),
         }
     }
-    logline("INFO", "special-token id cross-check passed (bos/eos/image/ref/det/grounding/user/assistant).");
+    logline(
+        "INFO",
+        "special-token id cross-check passed (bos/eos/image/ref/det/grounding/user/assistant).",
+    );
 }
 
 // ===========================================================================
@@ -582,7 +636,10 @@ impl ToyBpe {
             // Find the adjacent pair with the lowest rank.
             let mut best: Option<(usize, usize)> = None; // (rank, position)
             for i in 0..symbols.len().saturating_sub(1) {
-                if let Some(&rank) = self.ranks.get(&(symbols[i].clone(), symbols[i + 1].clone())) {
+                if let Some(&rank) = self
+                    .ranks
+                    .get(&(symbols[i].clone(), symbols[i + 1].clone()))
+                {
                     if best.is_none_or(|(br, _)| rank < br) {
                         best = Some((rank, i));
                     }
@@ -594,13 +651,23 @@ impl ToyBpe {
         }
         symbols
             .iter()
-            .map(|s| *self.vocab.get(s).unwrap_or_else(|| panic!("toy vocab miss: {s:?}")))
+            .map(|s| {
+                *self
+                    .vocab
+                    .get(s)
+                    .unwrap_or_else(|| panic!("toy vocab miss: {s:?}"))
+            })
             .collect()
     }
 
     fn decode(&self, ids: &[u32]) -> String {
         ids.iter()
-            .map(|id| self.inv.get(id).cloned().unwrap_or_else(|| panic!("toy id miss: {id}")))
+            .map(|id| {
+                self.inv
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("toy id miss: {id}"))
+            })
             .collect()
     }
 }
@@ -611,14 +678,21 @@ fn synthetic_bpe_encode_is_greedy_lowest_rank() {
     // "abc": (a,b)->ab rank0 applies first → [ab, c]; then (ab,c)->abc rank1 → [abc] = [5].
     assert_eq!(t.encode("abc"), vec![5], "greedy merge to 'abc'");
     // "abcd": → abc + d ... (c,d) can't fire after c is consumed by abc; so [abc, d] = [5,3].
-    assert_eq!(t.encode("abcd"), vec![5, 3], "abc consumes c before cd can merge");
+    assert_eq!(
+        t.encode("abcd"),
+        vec![5, 3],
+        "abc consumes c before cd can merge"
+    );
     // "cd": only (c,d)->cd rank2 fires → [6].
     assert_eq!(t.encode("cd"), vec![6], "cd merge");
     // "ab": (a,b)->ab → [4].
     assert_eq!(t.encode("ab"), vec![4]);
     // empty → empty (matches add_special_tokens=false on "").
     assert_eq!(t.encode(""), Vec::<u32>::new(), "empty encodes to empty");
-    logline("SUCCESS", "synthetic BPE encode is greedy-lowest-rank (machinery covered).");
+    logline(
+        "SUCCESS",
+        "synthetic BPE encode is greedy-lowest-rank (machinery covered).",
+    );
 }
 
 #[test]
@@ -627,9 +701,15 @@ fn synthetic_bpe_round_trips() {
     for s in ["abc", "abcd", "cd", "ab", "a", "dcba", "abccd", ""] {
         let ids = t.encode(s);
         let back = t.decode(&ids);
-        assert_eq!(back, s, "round-trip failed for {s:?}: ids={ids:?} -> {back:?}");
+        assert_eq!(
+            back, s,
+            "round-trip failed for {s:?}: ids={ids:?} -> {back:?}"
+        );
     }
-    logline("SUCCESS", "synthetic BPE round-trips on the toy corpus (machinery covered).");
+    logline(
+        "SUCCESS",
+        "synthetic BPE round-trips on the toy corpus (machinery covered).",
+    );
 }
 
 #[test]
@@ -647,7 +727,10 @@ fn first_divergence_locates_the_exact_index() {
     assert_eq!(first_divergence(&[], &[]), None);
     // One empty.
     assert_eq!(first_divergence(&[], &[7]), Some(0));
-    logline("SUCCESS", "first_divergence pinpoints the exact divergent index (diagnostic covered).");
+    logline(
+        "SUCCESS",
+        "first_divergence pinpoints the exact divergent index (diagnostic covered).",
+    );
 }
 
 #[test]
@@ -663,7 +746,10 @@ fn escape_for_log_is_single_line_and_lossless_for_control_chars() {
     // stays one line and is quoted.
     let cjk = escape_for_log("你好");
     assert!(cjk.starts_with('"') && cjk.ends_with('"') && !cjk.contains('\n'));
-    logline("SUCCESS", "escape_for_log keeps diagnostics single-line and control-char-safe.");
+    logline(
+        "SUCCESS",
+        "escape_for_log keeps diagnostics single-line and control-char-safe.",
+    );
 }
 
 #[test]
@@ -680,5 +766,8 @@ fn special_id_constants_are_the_oq16_pinned_values() {
     assert_eq!(special::GROUNDING, 128820, "<|grounding|> id");
     assert_eq!(special::USER, 128825, "<|User|> id");
     assert_eq!(special::ASSISTANT, 128826, "<|Assistant|> id");
-    logline("SUCCESS", "special-id constants match the OQ-16-pinned values.");
+    logline(
+        "SUCCESS",
+        "special-id constants match the OQ-16-pinned values.",
+    );
 }

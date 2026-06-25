@@ -19,7 +19,7 @@
 |------|------|
 | `benches/gauntlet_harness.rs` | The nightly `#[bench]` runner: drives the microbenches, the gated head-to-head stages, the scaffolded future-kernel slots, and the ratchet. |
 | `benches/support/perf_harness.rs` | Pure infra (no `franken_ocr` dep, no serde): the `BenchRecord` result row, hand-rolled JSON, the `SampleStats` (p50/p90/CoV), the five-gate `Ratchet`, the `Fairness` knobs. Unit-tested standalone. |
-| `reports/bench/latest.json` | The persisted `.bench-history` high-water mark the ratchet reads/writes (git-tracked once baselines settle). |
+| `reports/bench/latest.json` | The persisted `.bench-history` high-water mark the ratchet reads/writes when `FOCR_BENCH_HISTORY=reports/bench/latest.json` is set (git-tracked once baselines settle). |
 | `docs/gauntlet/BENCH_HARNESS.md` | This document. |
 
 The bench target is **auto-discovered on nightly** via `#![feature(test)]` +
@@ -189,6 +189,7 @@ Mirrors `scripts/oracle_bridge.py` and plan §9.3 verbatim:
 | `FOCR_REFERENCE_CMD` | The Phase −1 proven CPU reference command shelled out per stage. | unset ⇒ skip-with-SUCCESS |
 | `FOCR_REFERENCE_PYTHON` | Which reference backend the command speaks (`onnx` \| `hf` \| `gguf`) — the precision column. | unset |
 | `FOCR_THREADS` | focr's thread budget; the reference is pinned to the SAME N. | `8` (NEVER 64) |
+| `FOCR_BENCH_HISTORY` | Opt-in path for the monotone `.bench-history` ratchet, usually `reports/bench/latest.json`. | unset ⇒ log `ratchet_history_disabled`; do not write history |
 
 If CPU-patched HF cannot be proven equivalent to the CUDA correctness oracle
 (OQ-17), the perf baseline is llama.cpp GGUF / ONNX Runtime / MLAS and is
@@ -220,7 +221,12 @@ tolerance*, not by dropping precision.
 
 ```bash
 # Always-green default (no weights, no baseline): self-relative microbenches +
-# scaffold/skip logging + ratchet against reports/bench/latest.json.
+# scaffold/skip logging. Does not write a bench-history file.
+cargo +nightly bench --bench gauntlet_harness
+
+# Opt into the monotone bench-history ratchet when the perf lane intends to
+# update or compare the high-water mark.
+FOCR_BENCH_HISTORY=reports/bench/latest.json \
 cargo +nightly bench --bench gauntlet_harness
 
 # Head-to-head (self-hosted model-FULL lane, weights + reference present):
@@ -228,6 +234,7 @@ FOCR_MODEL_DIR=~/.cache/franken_ocr/model \
 FOCR_REFERENCE_CMD="python3 scripts/oracle_bridge.py --perf" \
 FOCR_REFERENCE_PYTHON=onnx \
 FOCR_THREADS=8 \
+FOCR_BENCH_HISTORY=reports/bench/latest.json \
 OMP_NUM_THREADS=8 RAYON_NUM_THREADS=8 \
 cargo +nightly bench --bench gauntlet_harness
 
@@ -242,8 +249,9 @@ cargo +nightly test --bench gauntlet_harness
 
 Every measured row, every skip, every scaffold, every ratchet gate, and the final
 verdict is emitted as **one NDJSON object per line** (data-only on stdout, the
-robot/agent style — TL2). On `Allow`, the new high-water mark is written to
-`reports/bench/latest.json`.
+robot/agent style — TL2). With no `FOCR_BENCH_HISTORY`, the harness emits
+`ratchet_history_disabled` and leaves the checkout untouched. When
+`FOCR_BENCH_HISTORY` is set, `Allow` writes the new high-water mark to that path.
 
 ---
 
@@ -251,7 +259,9 @@ robot/agent style — TL2). On `Allow`, the new high-water mark is written to
 
 - `reports/bench/latest.json` is the committed, **monotone** high-water mark
   (`artifact: "franken_ocr.bench-history.v1"`). It is read at the start of every
-  round and rewritten only on `Allow`, keeping the best value per bench.
+  opted-in round (`FOCR_BENCH_HISTORY=reports/bench/latest.json`) and rewritten
+  only on `Allow`, keeping the best value per bench. The default no-env run does
+  not create or mutate generated benchmark artifacts in the working tree.
 - The JSON is **hand-rolled and byte-stable** (sorted keys via `BTreeMap`, a fixed
   key order, shortest-round-trippable f64 formatting) so the git diff of the
   history file is meaningful and never flickers — the same cross-arch-determinism

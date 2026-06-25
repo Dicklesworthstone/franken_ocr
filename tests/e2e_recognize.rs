@@ -104,7 +104,10 @@ fn log_xfail(test: &str, case: &str, observed: &str, expected_target: &str) {
 fn searched_dirs() -> Vec<String> {
     let mut dirs = Vec::new();
     if let Some(env) = std::env::var_os(MODEL_PATH_ENV) {
-        dirs.push(format!("${MODEL_PATH_ENV}={}", PathBuf::from(env).display()));
+        dirs.push(format!(
+            "${MODEL_PATH_ENV}={}",
+            PathBuf::from(env).display()
+        ));
     } else {
         dirs.push(format!("${MODEL_PATH_ENV}=<unset>"));
     }
@@ -246,7 +249,10 @@ fn focr_bin() -> Option<PathBuf> {
     // Fallback: scan the conventional target dirs relative to CARGO_MANIFEST_DIR.
     let manifest = env!("CARGO_MANIFEST_DIR");
     for profile in ["debug", "release"] {
-        let cand = Path::new(manifest).join("target").join(profile).join("focr");
+        let cand = Path::new(manifest)
+            .join("target")
+            .join(profile)
+            .join("focr");
         if cand.exists() {
             return Some(cand);
         }
@@ -413,7 +419,10 @@ fn cli_ocr_nonexistent_model_exits_model_not_found() {
         case,
         "setup",
         "pass",
-        &format!("bin={} args=[ocr {img} --model {model}] expect_exit=3", bin.display()),
+        &format!(
+            "bin={} args=[ocr {img} --model {model}] expect_exit=3",
+            bin.display()
+        ),
     );
 
     let out = run_focr(&bin, &["ocr", img, "--model", model]);
@@ -471,7 +480,9 @@ fn cli_ocr_nonexistent_model_exits_model_not_found() {
                     "diag={{\"error_kind\":\"unexpected_exit\",\"focr_exit_code\":{},\
                      \"message\":\"focr ocr --model /nonexistent neither exited 3 (target) nor \
                      1/2 (documented skeleton)\"}} stdout={:?} stderr={:?}",
-                    other.map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    other
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "signal".into()),
                     out.stdout,
                     out.stderr
                 ),
@@ -769,7 +780,10 @@ fn robot_schema_pipe_smoke_is_one_json_object_exit_zero() {
         case,
         "setup",
         "pass",
-        &format!("bin={} args=[robot schema] expect_exit=0 expect=one_json_object", bin.display()),
+        &format!(
+            "bin={} args=[robot schema] expect_exit=0 expect=one_json_object",
+            bin.display()
+        ),
     );
 
     let out = run_focr(&bin, &["robot", "schema"]);
@@ -782,7 +796,11 @@ fn robot_schema_pipe_smoke_is_one_json_object_exit_zero() {
     );
 
     // Data-only on stdout: exactly one non-empty JSON line.
-    let lines: Vec<&str> = out.stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    let lines: Vec<&str> = out
+        .stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     assert_eq!(
         lines.len(),
         1,
@@ -797,9 +815,15 @@ fn robot_schema_pipe_smoke_is_one_json_object_exit_zero() {
             case,
             "result",
             "fail",
-            &format!("diag={{\"error_kind\":\"unparseable_json\",\"message\":{:?}}}", e.to_string()),
+            &format!(
+                "diag={{\"error_kind\":\"unparseable_json\",\"message\":{:?}}}",
+                e.to_string()
+            ),
         );
-        panic!("`focr robot schema` stdout is not valid JSON: {e}; line={:?}", lines[0]);
+        panic!(
+            "`focr robot schema` stdout is not valid JSON: {e}; line={:?}",
+            lines[0]
+        );
     });
 
     // The committed contract: schema_version is a number, events is a non-empty
@@ -866,6 +890,9 @@ fn tiny_png_fixture_is_structurally_valid() {
         case,
         "result",
         "pass",
-        &format!("png_bytes={} dims={w}x{h} chunks=IHDR,IDAT,IEND magic=ok", png.len()),
+        &format!(
+            "png_bytes={} dims={w}x{h} chunks=IHDR,IDAT,IEND magic=ok",
+            png.len()
+        ),
     );
 }

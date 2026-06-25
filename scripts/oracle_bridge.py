@@ -37,8 +37,8 @@ ULP_TOLERANCE_BY_OP = {
 
 
 class EngineIdentity(str, enum.Enum):
-    SUBJECT = "subject"
-    ORACLE = "oracle"
+    SUBJECT = "franken_ocr"
+    ORACLE = "unlimited-ocr-oracle"
 
 
 def emit(check: str, ok: bool, **fields: object) -> None:
@@ -52,6 +52,13 @@ def json_response(result: str, **fields: object) -> dict[str, object]:
 
 def assert_distinct_identities() -> bool:
     return EngineIdentity.SUBJECT.value != EngineIdentity.ORACLE.value
+
+
+def identities_are_canonical() -> bool:
+    return (
+        EngineIdentity.SUBJECT.value == "franken_ocr"
+        and EngineIdentity.ORACLE.value == "unlimited-ocr-oracle"
+    )
 
 
 def reference_env(seed: int = DEFAULT_SEED, threads: int = DEFAULT_THREADS) -> dict[str, str]:
@@ -254,6 +261,7 @@ def self_test() -> int:
             failures.append(name)
 
     check("engine-identities-distinct", assert_distinct_identities())
+    check("engine-identities-canonical", identities_are_canonical())
     check("ulp-tolerance-matmul", ULP_TOLERANCE_BY_OP["matmul_f32"] == 4)
     check("ulp-tolerance-elementwise", ULP_TOLERANCE_BY_OP["elementwise_f32"] == 2)
     check("ulp-tolerance-rmsnorm", ULP_TOLERANCE_BY_OP["rmsnorm_f32"] == 2)

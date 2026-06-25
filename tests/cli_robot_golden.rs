@@ -384,8 +384,7 @@ fn unified_diff(expected: &str, actual: &str) -> String {
 /// `robot::ROBOT_SCHEMA_VERSION`.
 const EXPECTED_SCHEMA_VERSION: u64 = 1;
 /// `robot::EVENT_KINDS` — every kind MUST appear in the advertised `events`.
-const EXPECTED_EVENT_KINDS: &[&str] =
-    &["run_start", "stage", "page", "run_complete", "run_error"];
+const EXPECTED_EVENT_KINDS: &[&str] = &["run_start", "stage", "page", "run_complete", "run_error"];
 
 // ════════════════════════════════════════════════════════════════════════════
 // [R1]–[R4] ROBOT-SCHEMA CONTRACT TEST (the agent-ergonomics contract — bd-zc1o)
@@ -452,8 +451,12 @@ fn robot_schema_matches_frozen_contract_fixture() {
         return;
     }
 
-    let frozen_raw = std::fs::read_to_string(&fixture_path)
-        .unwrap_or_else(|e| panic!("cannot read frozen contract fixture {}: {e}", fixture_path.display()));
+    let frozen_raw = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read frozen contract fixture {}: {e}",
+            fixture_path.display()
+        )
+    });
     // canonicalize the FIXTURE too, so whitespace/key-order in the committed file
     // is irrelevant — the comparison is on canonical bytes (byte-for-byte after
     // canonicalization, GOLDEN.md §2E).
@@ -495,7 +498,10 @@ fn robot_schema_matches_frozen_contract_fixture() {
 fn robot_schema_advertises_version_and_all_events() {
     let test = "robot_schema_advertises_version_and_all_events";
     let out = stdout_of(&["robot", "schema"]);
-    let line = out.lines().find(|l| !l.trim().is_empty()).expect("schema line");
+    let line = out
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("schema line");
     let v = parse_json_line(line, "robot schema");
 
     // schema_version
@@ -556,7 +562,10 @@ fn robot_schema_advertises_version_and_all_events() {
 fn robot_health_golden() {
     let test = "robot_health_golden";
     let raw = stdout_of(&["robot", "health"]);
-    let line = raw.lines().find(|l| !l.trim().is_empty()).expect("health line");
+    let line = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("health line");
     let v = parse_json_line(line, "robot health");
     assert_eq!(
         v["schema_version"].as_u64(),
@@ -584,7 +593,10 @@ fn robot_health_golden() {
 fn robot_backends_golden() {
     let test = "robot_backends_golden";
     let raw = stdout_of(&["robot", "backends"]);
-    let line = raw.lines().find(|l| !l.trim().is_empty()).expect("backends line");
+    let line = raw
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("backends line");
     let v = parse_json_line(line, "robot backends");
     assert_eq!(
         v["schema_version"].as_u64(),
@@ -746,7 +758,11 @@ fn assert_not_implemented_golden(test: &str, name: &str, argv: &[&str]) {
         "result": if code == Some(1) && says_not_impl { "pass" } else { "fail" },
         "detail": "NotImplemented maps to exit code 1 (src/error.rs)",
     );
-    assert_eq!(code, Some(1), "{argv:?} must exit 1 (NotImplemented); stderr:\n{scrubbed}");
+    assert_eq!(
+        code,
+        Some(1),
+        "{argv:?} must exit 1 (NotImplemented); stderr:\n{scrubbed}"
+    );
     assert!(
         says_not_impl,
         "{argv:?} stderr must say `not yet implemented`; got:\n{scrubbed}"
@@ -811,23 +827,101 @@ fn exit_code_conformance() {
     let test = "exit_code_conformance";
     let rows: &[ExitRow] = &[
         // [E0] success surfaces -> 0
-        ExitRow { label: "robot schema -> 0", argv: &["robot", "schema"], expect: 0, clause: "E0", xfail: None },
-        ExitRow { label: "robot health -> 0", argv: &["robot", "health"], expect: 0, clause: "E0", xfail: None },
-        ExitRow { label: "robot backends -> 0", argv: &["robot", "backends"], expect: 0, clause: "E0", xfail: None },
-        ExitRow { label: "--help -> 0", argv: &["--help"], expect: 0, clause: "E0", xfail: None },
-        ExitRow { label: "--version -> 0", argv: &["--version"], expect: 0, clause: "E0", xfail: None },
+        ExitRow {
+            label: "robot schema -> 0",
+            argv: &["robot", "schema"],
+            expect: 0,
+            clause: "E0",
+            xfail: None,
+        },
+        ExitRow {
+            label: "robot health -> 0",
+            argv: &["robot", "health"],
+            expect: 0,
+            clause: "E0",
+            xfail: None,
+        },
+        ExitRow {
+            label: "robot backends -> 0",
+            argv: &["robot", "backends"],
+            expect: 0,
+            clause: "E0",
+            xfail: None,
+        },
+        ExitRow {
+            label: "--help -> 0",
+            argv: &["--help"],
+            expect: 0,
+            clause: "E0",
+            xfail: None,
+        },
+        ExitRow {
+            label: "--version -> 0",
+            argv: &["--version"],
+            expect: 0,
+            clause: "E0",
+            xfail: None,
+        },
         // [E2] usage error -> 2 (clap argument errors map through cli_main? No:
         // clap exits 2 itself for parse errors — which is exactly the documented
         // Usage code. We assert the binary's effective exit code is 2.)
-        ExitRow { label: "no subcommand -> 2", argv: &[], expect: 2, clause: "E2", xfail: None },
-        ExitRow { label: "unknown subcommand -> 2", argv: &["frobnicate"], expect: 2, clause: "E2", xfail: None },
-        ExitRow { label: "unknown flag -> 2", argv: &["--nope"], expect: 2, clause: "E2", xfail: None },
-        ExitRow { label: "ocr missing required arg -> 2", argv: &["ocr"], expect: 2, clause: "E2", xfail: None },
-        ExitRow { label: "robot unknown subcmd -> 2", argv: &["robot", "frobnicate"], expect: 2, clause: "E2", xfail: None },
+        ExitRow {
+            label: "no subcommand -> 2",
+            argv: &[],
+            expect: 2,
+            clause: "E2",
+            xfail: None,
+        },
+        ExitRow {
+            label: "unknown subcommand -> 2",
+            argv: &["frobnicate"],
+            expect: 2,
+            clause: "E2",
+            xfail: None,
+        },
+        ExitRow {
+            label: "unknown flag -> 2",
+            argv: &["--nope"],
+            expect: 2,
+            clause: "E2",
+            xfail: None,
+        },
+        ExitRow {
+            label: "ocr missing required arg -> 2",
+            argv: &["ocr"],
+            expect: 2,
+            clause: "E2",
+            xfail: None,
+        },
+        ExitRow {
+            label: "robot unknown subcmd -> 2",
+            argv: &["robot", "frobnicate"],
+            expect: 2,
+            clause: "E2",
+            xfail: None,
+        },
         // [E1] not-implemented -> 1
-        ExitRow { label: "ocr -> 1 (NotImplemented)", argv: &["ocr", "/some/document.png"], expect: 1, clause: "E1", xfail: None },
-        ExitRow { label: "convert -> 1 (NotImplemented)", argv: &["convert", "in.safetensors", "-o", "out.focrq"], expect: 1, clause: "E1", xfail: None },
-        ExitRow { label: "doctor -> 1 (NotImplemented)", argv: &["doctor"], expect: 1, clause: "E1", xfail: None },
+        ExitRow {
+            label: "ocr -> 1 (NotImplemented)",
+            argv: &["ocr", "/some/document.png"],
+            expect: 1,
+            clause: "E1",
+            xfail: None,
+        },
+        ExitRow {
+            label: "convert -> 1 (NotImplemented)",
+            argv: &["convert", "in.safetensors", "-o", "out.focrq"],
+            expect: 1,
+            clause: "E1",
+            xfail: None,
+        },
+        ExitRow {
+            label: "doctor -> 1 (NotImplemented)",
+            argv: &["doctor"],
+            expect: 1,
+            clause: "E1",
+            xfail: None,
+        },
         // [E3] model-not-found -> 3: documented + asserted at the FocrError
         // boundary in src/lib.rs, but the CLI `ocr` path returns NotImplemented
         // BEFORE it reaches model resolution in this phase, so the CLI cannot yet
@@ -841,7 +935,7 @@ fn exit_code_conformance() {
                 "CLI `ocr` returns NotImplemented(exit 1) before model resolution in \
                  this phase; code 3 is proven at the FocrError boundary in src/lib.rs's \
                  unit tests (recognize_missing_model_is_clean_model_not_found). Wires up \
-                 when the Phase-1 forward lands."
+                 when the Phase-1 forward lands.",
             ),
         },
         // The remaining documented codes (4 input-decode, 5 timeout, 6 cancelled,
@@ -853,28 +947,36 @@ fn exit_code_conformance() {
             argv: &["ocr", "/some/document.png"],
             expect: 4,
             clause: "E4",
-            xfail: Some("InputDecode(exit 4) is reachable only after the Phase-1 ocr forward decodes an image; today `ocr` short-circuits to NotImplemented."),
+            xfail: Some(
+                "InputDecode(exit 4) is reachable only after the Phase-1 ocr forward decodes an image; today `ocr` short-circuits to NotImplemented.",
+            ),
         },
         ExitRow {
             label: "timeout -> 5",
             argv: &["ocr", "/some/document.png"],
             expect: 5,
             clause: "E5",
-            xfail: Some("Timeout(exit 5) is a per-stage budget breach inside the forward; unreachable from the CLI until the forward lands."),
+            xfail: Some(
+                "Timeout(exit 5) is a per-stage budget breach inside the forward; unreachable from the CLI until the forward lands.",
+            ),
         },
         ExitRow {
             label: "cancelled -> 6",
             argv: &["ocr", "/some/document.png"],
             expect: 6,
             clause: "E6",
-            xfail: Some("Cancelled(exit 6) requires a running forward to cancel (Ctrl+C / cooperative); unreachable until the forward lands."),
+            xfail: Some(
+                "Cancelled(exit 6) requires a running forward to cancel (Ctrl+C / cooperative); unreachable until the forward lands.",
+            ),
         },
         ExitRow {
             label: "format-mismatch -> 7",
             argv: &["convert", "in.safetensors", "-o", "out.focrq"],
             expect: 7,
             clause: "E7",
-            xfail: Some("FormatMismatch(exit 7) is raised by the .focrq reader/converter; today `convert` short-circuits to NotImplemented."),
+            xfail: Some(
+                "FormatMismatch(exit 7) is raised by the .focrq reader/converter; today `convert` short-circuits to NotImplemented.",
+            ),
         },
     ];
 
@@ -923,7 +1025,11 @@ fn exit_code_conformance() {
         if !pass {
             failures.push(format!(
                 "[{}] {:?}: expected exit {}, got {:?}\n   stderr: {}",
-                row.clause, row.argv, row.expect, code, stderr.trim()
+                row.clause,
+                row.argv,
+                row.expect,
+                code,
+                stderr.trim()
             ));
         }
     }
@@ -1045,7 +1151,11 @@ fn golden_fixtures_have_provenance() {
         "pass": exists && resolves,
         "result": if exists && resolves { "pass" } else { "fail" },
     );
-    assert!(exists, "missing {} — every golden set needs provenance (GOLDEN.md)", prov.display());
+    assert!(
+        exists,
+        "missing {} — every golden set needs provenance (GOLDEN.md)",
+        prov.display()
+    );
     assert!(
         resolves,
         "{} must resolve the binary + surface source (focr, src/cli.rs, robot_schema_v1.json)",
@@ -1054,8 +1164,12 @@ fn golden_fixtures_have_provenance() {
 
     // the frozen contract fixture itself must exist and be valid JSON.
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/robot_schema_v1.json");
-    let frozen = std::fs::read_to_string(&fixture)
-        .unwrap_or_else(|e| panic!("frozen contract fixture {} unreadable: {e}", fixture.display()));
+    let frozen = std::fs::read_to_string(&fixture).unwrap_or_else(|e| {
+        panic!(
+            "frozen contract fixture {} unreadable: {e}",
+            fixture.display()
+        )
+    });
     let v: serde_json::Value = serde_json::from_str(&frozen)
         .unwrap_or_else(|e| panic!("frozen contract fixture is not valid JSON: {e}"));
     assert_eq!(
