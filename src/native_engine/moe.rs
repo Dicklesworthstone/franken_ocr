@@ -207,14 +207,7 @@ pub fn route(
         let mut chosen_w = [0.0f32; K];
         let mut taken = [false; config::N_ROUTED_EXPERTS];
         for slot in 0..K {
-            let mut best = usize::MAX;
-            let mut best_v = f32::NEG_INFINITY;
-            for (e, &v) in row.iter().enumerate() {
-                if !taken[e] && v > best_v {
-                    best_v = v;
-                    best = e;
-                }
-            }
+            let (best, best_v) = next_router_expert(row, &taken, t, slot)?;
             taken[best] = true;
             chosen_idx[slot] = best;
             chosen_w[slot] = best_v;
@@ -237,6 +230,29 @@ pub fn route(
     }
 
     Ok(Routing { indices, weights })
+}
+
+fn next_router_expert(
+    row: &[f32],
+    taken: &[bool; config::N_ROUTED_EXPERTS],
+    token_idx: usize,
+    slot: usize,
+) -> FocrResult<(usize, f32)> {
+    let mut best: Option<(usize, f32)> = None;
+    for (e, &v) in row.iter().enumerate() {
+        if taken[e] || v.is_nan() {
+            continue;
+        }
+        match best {
+            Some((_, best_v)) if v <= best_v => {}
+            _ => best = Some((e, v)),
+        }
+    }
+    best.ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "moe::route: no finite router score for token {token_idx} top-k slot {slot}"
+        ))
+    })
 }
 
 /// [`route`] with the pinned-config defaults (`norm_topk_prob = false`,
@@ -551,6 +567,22 @@ mod tests {
         for k in 1..config::NUM_EXPERTS_PER_TOK {
             assert!(r.weights[0][k] <= r.weights[0][k - 1]);
         }
+    }
+
+    #[test]
+    fn route_rejects_nan_router_scores_without_panicking() {
+        let h = config::HIDDEN_SIZE;
+        let n = config::N_ROUTED_EXPERTS;
+        let mut hid = vec![0.0f32; h];
+        hid[0] = f32::NAN;
+        let hidden = Mat::from_vec(1, h, hid);
+        let gate = vec![0.0f32; n * h];
+
+        let err = route(&hidden, &gate, false, 1.0).unwrap_err();
+        assert!(
+            err.to_string().contains("no finite router score"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]
