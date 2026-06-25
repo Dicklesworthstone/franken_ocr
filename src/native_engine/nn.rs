@@ -251,8 +251,8 @@ pub fn softmax_rows(x: &mut Mat) -> FocrResult<()> {
         return Ok(());
     }
     let meta = meta_2d(x.rows, x.cols);
-    let out = ft_kernel_cpu::softmax_dim_tensor_contiguous_f32(&x.data, &meta, 1)
-        .map_err(kernel_err)?;
+    let out =
+        ft_kernel_cpu::softmax_dim_tensor_contiguous_f32(&x.data, &meta, 1).map_err(kernel_err)?;
     x.data.copy_from_slice(&out);
     Ok(())
 }

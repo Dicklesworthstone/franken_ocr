@@ -410,8 +410,7 @@ impl Weights {
                 bytes.len()
             )));
         }
-        let header_len =
-            u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")) as usize;
+        let header_len = u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")) as usize;
         let header_end = 8usize
             .checked_add(header_len)
             .ok_or_else(|| FocrError::FormatMismatch("safetensors header_len overflows".into()))?;
@@ -802,9 +801,12 @@ fn validate_directory(
                 rec.byte_len, expected, rec.dtype, rec.shape
             )));
         }
-        let scales_end = rec.scales_offset.checked_add(rec.scales_len).ok_or_else(|| {
-            FocrError::FormatMismatch(format!("tensor {name:?} scales range overflows"))
-        })?;
+        let scales_end = rec
+            .scales_offset
+            .checked_add(rec.scales_len)
+            .ok_or_else(|| {
+                FocrError::FormatMismatch(format!("tensor {name:?} scales range overflows"))
+            })?;
         if scales_end > payload_len {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?} scales end at {scales_end} but payload is {payload_len} bytes"
@@ -1155,7 +1157,8 @@ mod tests {
     #[test]
     fn safetensors_header_parses_and_widens_bf16() {
         let vals = [1.0f32, -2.0, 0.5, 3.0];
-        let blob = build_safetensors(&[("model.norm.weight", "BF16", vec![4], bf16_le_bytes(&vals))]);
+        let blob =
+            build_safetensors(&[("model.norm.weight", "BF16", vec![4], bf16_le_bytes(&vals))]);
         let w = Weights::from_bytes(blob).unwrap();
         assert!(!w.is_focrq());
         assert_eq!(w.len(), 1);
@@ -1170,7 +1173,8 @@ mod tests {
         // The connector params (image_newline / view_seperator) are 1-D [1280]
         // BF16 in the real model; here a tiny [3].
         let vals = [0.25f32, -0.5, 1.0];
-        let blob = build_safetensors(&[("model.image_newline", "BF16", vec![3], bf16_le_bytes(&vals))]);
+        let blob =
+            build_safetensors(&[("model.image_newline", "BF16", vec![3], bf16_le_bytes(&vals))]);
         let w = Weights::from_bytes(blob).unwrap();
         let v = w.vec("model.image_newline").unwrap();
         assert_eq!(v, vals);

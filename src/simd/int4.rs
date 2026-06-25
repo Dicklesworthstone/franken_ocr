@@ -75,7 +75,7 @@
 //!
 //! ## Safety
 //!
-//! The crate root is `#![forbid(unsafe_code)]`; the only `unsafe` here lives in
+//! The crate root is `#![deny(unsafe_code)]`; the only `unsafe` here lives in
 //! the [`accel`] island behind `#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]`,
 //! every intrinsic load carrying a `// SAFETY:` note, each accelerated unpack
 //! guarded by a runtime feature check with a **bit-identical scalar fallback**
@@ -121,7 +121,10 @@ pub fn unpack_byte(b: u8) -> (i8, i8) {
 /// Panics if `k` is odd or `b_packed.len() != n * (k / 2)`.
 #[must_use]
 pub fn unpack_to_i8(b_packed: &[u8], n: usize, k: usize) -> Vec<i8> {
-    assert!(k % 2 == 0, "unpack_to_i8: k {k} must be even (two nibbles/byte)");
+    assert!(
+        k % 2 == 0,
+        "unpack_to_i8: k {k} must be even (two nibbles/byte)"
+    );
     assert_eq!(
         b_packed.len(),
         n * (k / 2),
@@ -169,9 +172,18 @@ pub fn igemm_s4s8(
     out: &mut [f32],
 ) {
     assert!(k % 2 == 0, "igemm_s4s8: k {k} must be even");
-    assert!(group != 0 && k % group == 0, "igemm_s4s8: group {group} must divide k {k}");
+    assert!(
+        group != 0 && k % group == 0,
+        "igemm_s4s8: group {group} must divide k {k}"
+    );
     let groups = k / group;
-    assert_eq!(a.len(), m * k, "igemm_s4s8: a len {} != m*k {}", a.len(), m * k);
+    assert_eq!(
+        a.len(),
+        m * k,
+        "igemm_s4s8: a len {} != m*k {}",
+        a.len(),
+        m * k
+    );
     assert_eq!(
         b_packed.len(),
         n * (k / 2),
@@ -186,7 +198,13 @@ pub fn igemm_s4s8(
         scales.len(),
         n * groups
     );
-    assert_eq!(out.len(), m * n, "igemm_s4s8: out len {} != m*n {}", out.len(), m * n);
+    assert_eq!(
+        out.len(),
+        m * n,
+        "igemm_s4s8: out len {} != m*n {}",
+        out.len(),
+        m * n
+    );
 
     // Unpack the whole B once (the bandwidth win is the *stored/streamed* bytes;
     // the in-register int8 the MAC consumes is the same either way). `b_i8` is
@@ -498,7 +516,9 @@ mod tests {
         let mut rng = Rng(0x1234_5678_9abc_def0);
         // Lengths chosen to hit < block, == block, block+tail, many blocks for
         // both the 16-byte (NEON) and 32-byte (AVX2) block sizes.
-        for &len in &[0usize, 1, 7, 15, 16, 17, 31, 32, 33, 48, 63, 64, 100, 257, 1000] {
+        for &len in &[
+            0usize, 1, 7, 15, 16, 17, 31, 32, 33, 48, 63, 64, 100, 257, 1000,
+        ] {
             let src: Vec<u8> = (0..len).map(|_| rng.byte()).collect();
             let mut got = vec![0i8; len * 2];
             let mut want = vec![0i8; len * 2];
@@ -595,7 +615,10 @@ mod tests {
             let mut out = vec![0f32; m * n];
             igemm_s4s8(&a, &b_packed, &scales, group, m, k, n, &mut out);
             let want = reference_s4s8(&a, &b_packed, &scales, group, m, k, n);
-            assert_eq!(out, want, "igemm_s4s8 != reference for (m={m},k={k},n={n},g={group})");
+            assert_eq!(
+                out, want,
+                "igemm_s4s8 != reference for (m={m},k={k},n={n},g={group})"
+            );
         }
     }
 
@@ -626,7 +649,10 @@ mod tests {
         // 8 * (-8*127) + 8 * (-8*-127) = 8*(-1016) + 8*(1016) = 0. With unit
         // scales over 2 groups, the whole cell is 0.0 — and crucially no panic /
         // overflow occurred building those i32 group sums.
-        assert!(out.iter().all(|&v| v == 0.0), "expected 0.0 cells for ±127 cancel");
+        assert!(
+            out.iter().all(|&v| v == 0.0),
+            "expected 0.0 cells for ±127 cancel"
+        );
 
         // Now an all-positive variant to actually exercise a large i32 group sum:
         // weights -8, activations all -127 → term +1016 each, group sum 16*1016 =
@@ -637,7 +663,10 @@ mod tests {
         let want2 = reference_s4s8(&a_pos, &b_packed, &scales, group, m, k, n);
         assert_eq!(out2, want2);
         // Per cell: 2 groups * 16_256 = 32_512.
-        assert!(out2.iter().all(|&v| (v - 32_512.0).abs() < 1e-3), "group-sum value wrong");
+        assert!(
+            out2.iter().all(|&v| (v - 32_512.0).abs() < 1e-3),
+            "group-sum value wrong"
+        );
     }
 
     /// The int4 GEMM equals the int8 GEMM when the int8 weights are the

@@ -474,7 +474,10 @@ mod tests {
     #[test]
     fn load_existing_non_model_path_is_not_implemented_not_panic() {
         let mut tmp = std::env::temp_dir();
-        tmp.push(format!("franken_ocr_load_test_{}.focrq", std::process::id()));
+        tmp.push(format!(
+            "franken_ocr_load_test_{}.focrq",
+            std::process::id()
+        ));
         std::fs::write(&tmp, b"not a real model blob").expect("write temp file");
         let r = OcrModel::load(&tmp);
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup (not a delete of source)
@@ -492,7 +495,10 @@ mod tests {
         let p = DecodeParams::single_image();
         assert!(p.is_greedy());
         assert_eq!(p.eos_token_id, sampler::DEFAULT_EOS_TOKEN_ID);
-        assert_eq!(p.no_repeat_ngram_size, sampler::DEFAULT_NO_REPEAT_NGRAM_SIZE);
+        assert_eq!(
+            p.no_repeat_ngram_size,
+            sampler::DEFAULT_NO_REPEAT_NGRAM_SIZE
+        );
         assert_eq!(p.ngram_window, sampler::NGRAM_WINDOW_SINGLE);
         assert!(p.max_length > 0, "max_length must bound the decode loop");
     }

@@ -127,7 +127,11 @@ pub struct Sample {
 impl Sample {
     /// Construct a sample with zero CV (the common test/programmatic case).
     pub fn new(n: u32, throughput: f64) -> Self {
-        Self { n, throughput, cv_pct: 0.0 }
+        Self {
+            n,
+            throughput,
+            cv_pct: 0.0,
+        }
     }
 }
 
@@ -232,7 +236,10 @@ impl std::fmt::Display for UslError {
                 write!(f, "need at least two N>1 samples to fit USL")
             }
             UslError::SingularSystem => {
-                write!(f, "degenerate normal-equation system (collinear regressors)")
+                write!(
+                    f,
+                    "degenerate normal-equation system (collinear regressors)"
+                )
             }
             UslError::NonPositiveBase => write!(f, "base-N throughput must be positive"),
         }
@@ -438,7 +445,11 @@ fn r2_rmse(points: &[(f64, f64)], alpha: f64, beta: f64) -> (f64, f64) {
     let mean = ys.iter().sum::<f64>() / ys.len() as f64;
     let ss_tot: f64 = ys.iter().map(|c| (c - mean) * (c - mean)).sum();
     let ss_res = nonlinear_sse(points, alpha, beta);
-    let r2 = if ss_tot > 0.0 { 1.0 - ss_res / ss_tot } else { 1.0 };
+    let r2 = if ss_tot > 0.0 {
+        1.0 - ss_res / ss_tot
+    } else {
+        1.0
+    };
     let rmse = (ss_res / points.len() as f64).sqrt();
     (r2, rmse)
 }
@@ -678,8 +689,7 @@ pub fn decide(sweep: &Sweep, fit: &UslFit) -> PoolDecision {
         // Loss matrix: throughput lost in each mis-sizing direction vs the peak.
         let over = (fit.speedup_at_peak - fit.speedup_at_num_cpus).max(0.0);
         let half = (fit.peak_n as f64 / 2.0).floor().max(1.0);
-        let under =
-            (fit.speedup_at_peak - usl_speedup(half, fit.alpha, fit.beta)).max(0.0);
+        let under = (fit.speedup_at_peak - usl_speedup(half, fit.alpha, fit.beta)).max(0.0);
         loss_matrix = Some(LossMatrix {
             oversubscribe_loss: round_opt(over, 4).unwrap_or(0.0),
             underutilize_loss: round_opt(under, 4).unwrap_or(0.0),
@@ -753,18 +763,33 @@ mod tests {
         let fit = fit_sweep(&sweep, DEFAULT_CV_MAX, true);
         let expected_peak = usl_peak_real(ta, tb); // ~ sqrt(0.96/0.002) ~ 21.9
 
-        assert!((fit.alpha - ta).abs() < 5e-3, "alpha={} not within 5e-3 of {ta}", fit.alpha);
-        assert!((fit.beta - tb).abs() < 5e-4, "beta={} not within 5e-4 of {tb}", fit.beta);
+        assert!(
+            (fit.alpha - ta).abs() < 5e-3,
+            "alpha={} not within 5e-3 of {ta}",
+            fit.alpha
+        );
+        assert!(
+            (fit.beta - tb).abs() < 5e-4,
+            "beta={} not within 5e-4 of {tb}",
+            fit.beta
+        );
         assert!(
             (fit.peak_n_real - expected_peak).abs() < 1.5,
             "peak_n_real={} not within 1.5 of {expected_peak}",
             fit.peak_n_real
         );
-        assert!(fit.peak_n < sweep.num_cpus, "peak_n={} should cap below num_cpus", fit.peak_n);
+        assert!(
+            fit.peak_n < sweep.num_cpus,
+            "peak_n={} should cap below num_cpus",
+            fit.peak_n
+        );
         assert!(fit.r2 > 0.999, "r2={} should exceed 0.999", fit.r2);
 
         let row = decide(&sweep, &fit);
-        assert!(row.cap_is_win, "cap_is_win must be true on decode-shaped data");
+        assert!(
+            row.cap_is_win,
+            "cap_is_win must be true on decode-shaped data"
+        );
         assert!(!row.fallback_used, "clean decode fit must not fall back");
         assert_eq!(row.decision, "cap-at-usl-peak");
         assert_eq!(row.chosen_pool_n, fit.peak_n);
@@ -864,7 +889,10 @@ mod tests {
 
         assert!(fit.degenerate, "beta~0 prefill must be degenerate (Amdahl)");
         assert!(row.fallback_used);
-        assert_eq!(row.chosen_pool_n, 64, "compute-bound prefill -> all physical cores");
+        assert_eq!(
+            row.chosen_pool_n, 64,
+            "compute-bound prefill -> all physical cores"
+        );
     }
 
     /// DETERMINISTIC FALLBACK — too few samples (one N>1 point). Cannot fit two
@@ -905,8 +933,10 @@ mod tests {
     /// byte-identical decision (determinism is part of the contract).
     #[test]
     fn fallback_is_deterministic() {
-        let samples: Vec<Sample> =
-            [1u32, 2, 4, 8, 16].iter().map(|&n| Sample::new(n, 1.0)).collect();
+        let samples: Vec<Sample> = [1u32, 2, 4, 8, 16]
+            .iter()
+            .map(|&n| Sample::new(n, 1.0))
+            .collect();
         let sweep = Sweep::new("d", "decode_gemv", 32, 16, samples);
         let a = fit_and_decide(&sweep);
         let b = fit_and_decide(&sweep);
@@ -956,7 +986,10 @@ mod tests {
         assert!(row.peak_n < 64, "must cap below num_cpus");
         assert!(row.noisy, "cv_pct 6.2 > 5 -> noisy/advisory");
         assert!(row.cap_is_win, "speedup(peak) >= speedup(64)");
-        assert!(row.loss_matrix.is_some(), "non-degenerate fit emits a loss matrix");
+        assert!(
+            row.loss_matrix.is_some(),
+            "non-degenerate fit emits a loss matrix"
+        );
         assert!(row.loss_matrix.unwrap().oversubscribe_loss > 0.0);
     }
 

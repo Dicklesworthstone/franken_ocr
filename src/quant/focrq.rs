@@ -378,8 +378,7 @@ impl FocrqBuilder {
         let header_bytes = header.into_bytes();
 
         // ── Pass 3: assemble preamble + header + payload. ──
-        let mut blob =
-            Vec::with_capacity(51 + header_bytes.len() + payload.len());
+        let mut blob = Vec::with_capacity(51 + header_bytes.len() + payload.len());
         blob.extend_from_slice(FOCRQ_MAGIC);
         blob.extend_from_slice(&FOCRQ_FORMAT_VERSION.to_le_bytes());
         blob.push(self.arch_target);
@@ -397,10 +396,7 @@ impl FocrqBuilder {
     pub fn write(&self, path: &Path) -> FocrResult<()> {
         let blob = self.build();
         std::fs::write(path, &blob).map_err(|e| {
-            FocrError::Other(anyhow::anyhow!(
-                "writing .focrq to {}: {e}",
-                path.display()
-            ))
+            FocrError::Other(anyhow::anyhow!("writing .focrq to {}: {e}", path.display()))
         })
     }
 
@@ -690,7 +686,8 @@ mod tests {
 
     #[test]
     fn license_notice_survives_roundtrip() {
-        let mut b = FocrqBuilder::new().with_license_notice("Copyright (c) 2026 Baidu. MIT License.");
+        let mut b =
+            FocrqBuilder::new().with_license_notice("Copyright (c) 2026 Baidu. MIT License.");
         b.add_tensor("x", WriteDType::Bf16, vec![1], bf16_le(&[1.0]))
             .unwrap();
         let w = Weights::from_bytes(b.build()).unwrap();

@@ -346,12 +346,24 @@ pub fn decode_attention(cache: &RingCache, q: &[f32]) -> FocrResult<Mat> {
         // --- streaming fold of the (large) reference block ---
         for r in 0..prefill_len {
             let score = dot(qh, cache.ref_k_row(h, r)) * s;
-            fold(&mut run_max, &mut run_den, &mut acc, score, cache.ref_v_row(h, r));
+            fold(
+                &mut run_max,
+                &mut run_den,
+                &mut acc,
+                score,
+                cache.ref_v_row(h, r),
+            );
         }
         // --- fold of the ring tail (<= W keys) ---
         for r in 0..ring_len {
             let score = dot(qh, cache.ring_k_row(h, r)) * s;
-            fold(&mut run_max, &mut run_den, &mut acc, score, cache.ring_v_row(h, r));
+            fold(
+                &mut run_max,
+                &mut run_den,
+                &mut acc,
+                score,
+                cache.ring_v_row(h, r),
+            );
         }
 
         // Normalize: out_h = acc / run_den.
@@ -544,7 +556,9 @@ mod tests {
         let mut cache = RingCache::new(16);
         let m = 5usize;
         // Distinct keys/values so weights are non-uniform.
-        let k = fill_head_major(m, |r, d| ((r + 1) as f32) * (if d == 0 { 1.0 } else { 0.0 }));
+        let k = fill_head_major(m, |r, d| {
+            ((r + 1) as f32) * (if d == 0 { 1.0 } else { 0.0 })
+        });
         let v = fill_head_major(m, |r, d| (r as f32) + (d as f32) * 0.01);
         cache.record_prefill(&k, &v, m).unwrap();
         let q = one_token(|_, d| if d == 0 { 0.5 } else { 0.0 });
@@ -568,7 +582,12 @@ mod tests {
         for r in 0..m {
             expect0 += (exps[r] / den) * cache.ref_v_row(0, r)[0];
         }
-        assert!((out.data[0] - expect0).abs() < 1e-4, "online {} naive {}", out.data[0], expect0);
+        assert!(
+            (out.data[0] - expect0).abs() < 1e-4,
+            "online {} naive {}",
+            out.data[0],
+            expect0
+        );
     }
 
     /// Warm-up: the first W decode steps append without eviction; ring_len grows,
@@ -655,8 +674,16 @@ mod tests {
         let v = fill_head_major(1, |_, _| 1.0);
         cache.record_prefill(&k, &v, 1).unwrap();
 
-        let q = Mat::from_vec(1, NUM_HEADS * HEAD_DIM, one_token(|_, d| if d == 0 { 10.0 } else { 0.0 }));
-        let kt = Mat::from_vec(1, NUM_HEADS * HEAD_DIM, one_token(|_, d| if d == 0 { 1.0 } else { 0.0 }));
+        let q = Mat::from_vec(
+            1,
+            NUM_HEADS * HEAD_DIM,
+            one_token(|_, d| if d == 0 { 10.0 } else { 0.0 }),
+        );
+        let kt = Mat::from_vec(
+            1,
+            NUM_HEADS * HEAD_DIM,
+            one_token(|_, d| if d == 0 { 1.0 } else { 0.0 }),
+        );
         let vt = Mat::from_vec(1, NUM_HEADS * HEAD_DIM, one_token(|_, _| 5.0));
         let out = attention(&mut cache, &q, &kt, &vt, &[42]).unwrap();
         assert_eq!(out.shape(), (1, NUM_HEADS * HEAD_DIM));

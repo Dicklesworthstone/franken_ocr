@@ -253,14 +253,7 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
     let mut x = nchw_to_nhwc_rows(&conv_out, dim, gh, gw);
 
     // ── abs pos-embed (added once before the blocks; bicubic-interp if needed).
-    let pos = abs_pos(
-        &w.pos_embed,
-        w.pos_grid_h,
-        w.pos_grid_w,
-        dim,
-        gh,
-        gw,
-    );
+    let pos = abs_pos(&w.pos_embed, w.pos_grid_h, w.pos_grid_w, dim, gh, gw);
     debug_assert_eq!(pos.len(), x.data.len());
     for (xv, pv) in x.data.iter_mut().zip(pos.iter()) {
         *xv += *pv;
@@ -326,8 +319,7 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
                         let dst = ((widx * ws + ly) * ws + lx) * dim;
                         if gy < gh && gxx < gw {
                             let src = (gy * gw + gxx) * dim;
-                            windows[dst..dst + dim]
-                                .copy_from_slice(&normed.data[src..src + dim]);
+                            windows[dst..dst + dim].copy_from_slice(&normed.data[src..src + dim]);
                         }
                     }
                 }
@@ -693,14 +685,7 @@ fn transpose(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 /// learned `[src_h, src_w, dim]` table, bicubic-interpolating if the runtime
 /// grid differs (matches `get_abs_pos_sam`). Returns NHWC token-row order
 /// `[gh*gw, dim]` flattened.
-fn abs_pos(
-    pos: &[f32],
-    src_h: usize,
-    src_w: usize,
-    dim: usize,
-    gh: usize,
-    gw: usize,
-) -> Vec<f32> {
+fn abs_pos(pos: &[f32], src_h: usize, src_w: usize, dim: usize, gh: usize, gw: usize) -> Vec<f32> {
     if src_h == gh && src_w == gw {
         return pos.to_vec(); // already [gh*gw, dim] NHWC rows
     }
@@ -762,7 +747,12 @@ fn cubic_weights(t: f32) -> [f32; 4] {
     let d1 = t;
     let d2 = 1.0 - t;
     let d3 = 2.0 - t;
-    [cubic_k(d0, a), cubic_k(d1, a), cubic_k(d2, a), cubic_k(d3, a)]
+    [
+        cubic_k(d0, a),
+        cubic_k(d1, a),
+        cubic_k(d2, a),
+        cubic_k(d3, a),
+    ]
 }
 
 /// Keys cubic kernel `W(x)` with parameter `a`.
@@ -1097,14 +1087,21 @@ mod tests {
 
         let blocks: Vec<BlockP> = (0..DEPTH)
             .map(|i| {
-                let window = if GLOBAL_BLOCKS.contains(&i) { 0 } else { WINDOW };
+                let window = if GLOBAL_BLOCKS.contains(&i) {
+                    0
+                } else {
+                    WINDOW
+                };
                 // rel-pos tables must be sized to either the window or the grid.
                 let size = if window == 0 { gh } else { window };
                 let rel_rows = 2 * size - 1;
                 let dim = EMBED_DIM;
                 let hd = HEAD_DIM;
                 BlockP {
-                    norm1: LayerNormP { w: vec![1.0; dim], b: vec![0.0; dim] },
+                    norm1: LayerNormP {
+                        w: vec![1.0; dim],
+                        b: vec![0.0; dim],
+                    },
                     attn: AttnP {
                         qkv: Linear {
                             w: vec![0.0; 3 * dim * dim],
@@ -1123,7 +1120,10 @@ mod tests {
                         size_h: size,
                         size_w: size,
                     },
-                    norm2: LayerNormP { w: vec![1.0; dim], b: vec![0.0; dim] },
+                    norm2: LayerNormP {
+                        w: vec![1.0; dim],
+                        b: vec![0.0; dim],
+                    },
                     lin1: Linear {
                         w: vec![0.0; MLP_HIDDEN * dim],
                         b: vec![0.0; MLP_HIDDEN],
@@ -1155,7 +1155,10 @@ mod tests {
                 kh: 1,
                 kw: 1,
             },
-            neck_ln1: LayerNormP { w: vec![1.0; NECK_CH], b: vec![0.0; NECK_CH] },
+            neck_ln1: LayerNormP {
+                w: vec![1.0; NECK_CH],
+                b: vec![0.0; NECK_CH],
+            },
             neck_conv2: Conv {
                 w: vec![0.0; NECK_CH * NECK_CH * 9],
                 b: None,
@@ -1164,7 +1167,10 @@ mod tests {
                 kh: 3,
                 kw: 3,
             },
-            neck_ln2: LayerNormP { w: vec![1.0; NECK_CH], b: vec![0.0; NECK_CH] },
+            neck_ln2: LayerNormP {
+                w: vec![1.0; NECK_CH],
+                b: vec![0.0; NECK_CH],
+            },
             net2: Conv {
                 w: vec![0.0; NET2_CH * NECK_CH * 9],
                 b: None,
@@ -1212,40 +1218,111 @@ mod tests {
         let gh = 2;
         let blocks: Vec<BlockP> = (0..DEPTH)
             .map(|i| {
-                let window = if GLOBAL_BLOCKS.contains(&i) { 0 } else { WINDOW };
+                let window = if GLOBAL_BLOCKS.contains(&i) {
+                    0
+                } else {
+                    WINDOW
+                };
                 let size = if window == 0 { gh } else { window };
                 let rel_rows = 2 * size - 1;
                 let dim = EMBED_DIM;
                 let hd = HEAD_DIM;
                 BlockP {
-                    norm1: LayerNormP { w: vec![1.0; dim], b: vec![0.0; dim] },
+                    norm1: LayerNormP {
+                        w: vec![1.0; dim],
+                        b: vec![0.0; dim],
+                    },
                     attn: AttnP {
-                        qkv: Linear { w: vec![0.0; 3 * dim * dim], b: vec![0.0; 3 * dim], out: 3 * dim, in_: dim },
-                        proj: Linear { w: vec![0.0; dim * dim], b: vec![0.0; dim], out: dim, in_: dim },
+                        qkv: Linear {
+                            w: vec![0.0; 3 * dim * dim],
+                            b: vec![0.0; 3 * dim],
+                            out: 3 * dim,
+                            in_: dim,
+                        },
+                        proj: Linear {
+                            w: vec![0.0; dim * dim],
+                            b: vec![0.0; dim],
+                            out: dim,
+                            in_: dim,
+                        },
                         rel_pos_h: vec![0.0; rel_rows * hd],
                         rel_pos_w: vec![0.0; rel_rows * hd],
                         size_h: size,
                         size_w: size,
                     },
-                    norm2: LayerNormP { w: vec![1.0; dim], b: vec![0.0; dim] },
-                    lin1: Linear { w: vec![0.0; MLP_HIDDEN * dim], b: vec![0.0; MLP_HIDDEN], out: MLP_HIDDEN, in_: dim },
-                    lin2: Linear { w: vec![0.0; dim * MLP_HIDDEN], b: vec![0.0; dim], out: dim, in_: MLP_HIDDEN },
+                    norm2: LayerNormP {
+                        w: vec![1.0; dim],
+                        b: vec![0.0; dim],
+                    },
+                    lin1: Linear {
+                        w: vec![0.0; MLP_HIDDEN * dim],
+                        b: vec![0.0; MLP_HIDDEN],
+                        out: MLP_HIDDEN,
+                        in_: dim,
+                    },
+                    lin2: Linear {
+                        w: vec![0.0; dim * MLP_HIDDEN],
+                        b: vec![0.0; dim],
+                        out: dim,
+                        in_: MLP_HIDDEN,
+                    },
                     window,
                 }
             })
             .collect();
         SamWeights {
-            patch_embed: Conv { w: vec![0.0; EMBED_DIM * 3 * PATCH * PATCH], b: Some(vec![0.0; EMBED_DIM]), out_ch: EMBED_DIM, in_ch: 3, kh: PATCH, kw: PATCH },
+            patch_embed: Conv {
+                w: vec![0.0; EMBED_DIM * 3 * PATCH * PATCH],
+                b: Some(vec![0.0; EMBED_DIM]),
+                out_ch: EMBED_DIM,
+                in_ch: 3,
+                kh: PATCH,
+                kw: PATCH,
+            },
             pos_embed: vec![0.0; gh * gh * EMBED_DIM],
             pos_grid_h: gh,
             pos_grid_w: gh,
             blocks,
-            neck_conv1: Conv { w: vec![0.0; NECK_CH * EMBED_DIM], b: None, out_ch: NECK_CH, in_ch: EMBED_DIM, kh: 1, kw: 1 },
-            neck_ln1: LayerNormP { w: vec![1.0; NECK_CH], b: vec![0.0; NECK_CH] },
-            neck_conv2: Conv { w: vec![0.0; NECK_CH * NECK_CH * 9], b: None, out_ch: NECK_CH, in_ch: NECK_CH, kh: 3, kw: 3 },
-            neck_ln2: LayerNormP { w: vec![1.0; NECK_CH], b: vec![0.0; NECK_CH] },
-            net2: Conv { w: vec![0.0; NET2_CH * NECK_CH * 9], b: None, out_ch: NET2_CH, in_ch: NECK_CH, kh: 3, kw: 3 },
-            net3: Conv { w: vec![0.0; OUT_CH * NET2_CH * 9], b: None, out_ch: OUT_CH, in_ch: NET2_CH, kh: 3, kw: 3 },
+            neck_conv1: Conv {
+                w: vec![0.0; NECK_CH * EMBED_DIM],
+                b: None,
+                out_ch: NECK_CH,
+                in_ch: EMBED_DIM,
+                kh: 1,
+                kw: 1,
+            },
+            neck_ln1: LayerNormP {
+                w: vec![1.0; NECK_CH],
+                b: vec![0.0; NECK_CH],
+            },
+            neck_conv2: Conv {
+                w: vec![0.0; NECK_CH * NECK_CH * 9],
+                b: None,
+                out_ch: NECK_CH,
+                in_ch: NECK_CH,
+                kh: 3,
+                kw: 3,
+            },
+            neck_ln2: LayerNormP {
+                w: vec![1.0; NECK_CH],
+                b: vec![0.0; NECK_CH],
+            },
+            net2: Conv {
+                w: vec![0.0; NET2_CH * NECK_CH * 9],
+                b: None,
+                out_ch: NET2_CH,
+                in_ch: NECK_CH,
+                kh: 3,
+                kw: 3,
+            },
+            net3: Conv {
+                w: vec![0.0; OUT_CH * NET2_CH * 9],
+                b: None,
+                out_ch: OUT_CH,
+                in_ch: NET2_CH,
+                kh: 3,
+                kw: 3,
+            },
         }
     }
 }

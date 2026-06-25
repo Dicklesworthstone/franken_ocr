@@ -285,9 +285,7 @@ fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Pre
 
     let (tiles, crop_grid) = match mode {
         PreprocessMode::Base { .. } => (Vec::new(), CropGrid::single()),
-        PreprocessMode::Gundam { tile_size, .. } => {
-            build_gundam_tiles(&img, tile_size as u32)
-        }
+        PreprocessMode::Gundam { tile_size, .. } => build_gundam_tiles(&img, tile_size as u32),
     };
 
     Ok(Preprocessed {
@@ -386,8 +384,7 @@ fn build_gundam_tiles(img: &DynamicImage, tile: u32) -> (Vec<ViewTensor>, CropGr
     }
 
     let ratios = candidate_ratios(MIN_NUM, MAX_NUM);
-    let (wc, hc) =
-        find_closest_aspect_ratio(w as f64 / h as f64, &ratios, w, h, tile);
+    let (wc, hc) = find_closest_aspect_ratio(w as f64 / h as f64, &ratios, w, h, tile);
 
     // Resize to (tile*W, tile*H), then crop a row-major W×H grid of tiles.
     let target_w = tile * wc as u32;
@@ -469,9 +466,7 @@ pub fn find_closest_aspect_ratio(
         if diff < best_diff {
             best_diff = diff;
             best = (i, j);
-        } else if diff == best_diff
-            && area > 0.5 * tile_f * tile_f * (i as f64) * (j as f64)
-        {
+        } else if diff == best_diff && area > 0.5 * tile_f * tile_f * (i as f64) * (j as f64) {
             best = (i, j);
         }
     }

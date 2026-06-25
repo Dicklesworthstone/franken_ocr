@@ -201,12 +201,7 @@ pub fn forward_with(
     // Prepend the class token, then add the (interpolated) abs-pos embedding.
     let mut x = prepend_class_token(&weights.class_embedding, sam_features);
     let seq = x.rows; // num_patches + 1
-    let pos = abs_pos_for_len(
-        &weights.position_embedding,
-        weights.num_positions,
-        dim,
-        seq,
-    )?;
+    let pos = abs_pos_for_len(&weights.position_embedding, weights.num_positions, dim, seq)?;
     add_in_place(&mut x, &pos)?;
 
     // ── pre_layrnorm ([SPEC-049], deepencoder.py:470-473) ──────────────────
@@ -226,11 +221,7 @@ pub fn forward_with(
 
 /// One `NoTPTransformerBlock` ([SPEC-049], `deepencoder.py:392-396`):
 /// `h = x + attn(LN1(x)); out = h + mlp(LN2(h))`.
-fn transformer_block(
-    cfg: &ClipConfig,
-    w: &ClipBlockWeights,
-    x: &Mat,
-) -> FocrResult<Mat> {
+fn transformer_block(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult<Mat> {
     // h = x + self_attn(layer_norm1(x))
     let normed = nn::layer_norm(
         x,
@@ -258,11 +249,7 @@ fn transformer_block(
 /// `[num_heads, seq, head_dim]` (head-major, the layout `nn::sdpa` consumes);
 /// SDPA with `scale = 1/sqrt(head_dim)` and no causal mask; repack
 /// `[seq, dim]`; `out_proj`.
-fn self_attention(
-    cfg: &ClipConfig,
-    w: &ClipBlockWeights,
-    x: &Mat,
-) -> FocrResult<Mat> {
+fn self_attention(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult<Mat> {
     let dim = cfg.hidden_size;
     let heads = cfg.num_heads;
     let hd = cfg.head_dim();
@@ -395,12 +382,7 @@ fn prepend_class_token(class_embedding: &[f32], patches: &Mat) -> Mat {
 /// table is returned as-is; otherwise the patch rows are bicubically
 /// interpolated from `src×src` to `tgt×tgt`, the CLS row passing through
 /// unchanged.
-fn abs_pos_for_len(
-    table: &[f32],
-    num_positions: usize,
-    dim: usize,
-    seq: usize,
-) -> FocrResult<Mat> {
+fn abs_pos_for_len(table: &[f32], num_positions: usize, dim: usize, seq: usize) -> FocrResult<Mat> {
     if table.len() != num_positions * dim {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_clip abs_pos: table len {} != num_positions*dim {}",
@@ -812,7 +794,9 @@ mod tests {
         let out = self_attention(&cfg, &block, &x).unwrap();
         for c in 0..4 {
             let col_min = (0..3).map(|r| x.get(r, c)).fold(f32::INFINITY, f32::min);
-            let col_max = (0..3).map(|r| x.get(r, c)).fold(f32::NEG_INFINITY, f32::max);
+            let col_max = (0..3)
+                .map(|r| x.get(r, c))
+                .fold(f32::NEG_INFINITY, f32::max);
             for r in 0..3 {
                 let v = out.get(r, c);
                 assert!(

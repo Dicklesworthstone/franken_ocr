@@ -512,7 +512,10 @@ mod tests {
 
     #[test]
     fn refuses_connector_params() {
-        assert_eq!(classify("model.image_newline").policy, QuantPolicy::KeepBf16);
+        assert_eq!(
+            classify("model.image_newline").policy,
+            QuantPolicy::KeepBf16
+        );
         assert_eq!(
             classify("model.view_seperator").policy,
             QuantPolicy::KeepBf16
@@ -597,9 +600,15 @@ mod tests {
                 "{n}"
             );
             // Default (switch off) => KEEP_BF16.
-            assert_eq!(resolve_with(classify(&n).policy, false, false), ResolvedPolicy::KeepBf16);
+            assert_eq!(
+                resolve_with(classify(&n).policy, false, false),
+                ResolvedPolicy::KeepBf16
+            );
             // Switch on => Int8.
-            assert_eq!(resolve_with(classify(&n).policy, true, false), ResolvedPolicy::Int8);
+            assert_eq!(
+                resolve_with(classify(&n).policy, true, false),
+                ResolvedPolicy::Int8
+            );
         }
     }
 
@@ -607,10 +616,19 @@ mod tests {
     fn lm_head_is_gated_default_off() {
         let n = "lm_head.weight";
         assert_eq!(classify(n).policy, QuantPolicy::Gated(GatedKind::LmHead));
-        assert_eq!(resolve_with(classify(n).policy, false, false), ResolvedPolicy::KeepBf16);
-        assert_eq!(resolve_with(classify(n).policy, false, true), ResolvedPolicy::Int8);
+        assert_eq!(
+            resolve_with(classify(n).policy, false, false),
+            ResolvedPolicy::KeepBf16
+        );
+        assert_eq!(
+            resolve_with(classify(n).policy, false, true),
+            ResolvedPolicy::Int8
+        );
         // The attn switch does NOT enable lm_head.
-        assert_eq!(resolve_with(classify(n).policy, true, false), ResolvedPolicy::KeepBf16);
+        assert_eq!(
+            resolve_with(classify(n).policy, true, false),
+            ResolvedPolicy::KeepBf16
+        );
     }
 
     #[test]
@@ -655,7 +673,9 @@ mod tests {
         assert!(r.is_quantized("lm_head.weight"));
         // KEEP_BF16 set is unaffected by the switches.
         assert!(!r.is_quantized("model.norm.weight"));
-        assert!(!r.is_quantized("model.vision_model.transformer.layers.0.self_attn.qkv_proj.weight"));
+        assert!(
+            !r.is_quantized("model.vision_model.transformer.layers.0.self_attn.qkv_proj.weight")
+        );
     }
 
     #[test]
@@ -693,7 +713,10 @@ mod tests {
         let m = r.resolve_manifest(names);
         // BTreeMap => sorted keys.
         let keys: Vec<&String> = m.keys().collect();
-        assert_eq!(keys, vec!["lm_head.weight", "model.norm.weight", "zzz.unknown"]);
+        assert_eq!(
+            keys,
+            vec!["lm_head.weight", "model.norm.weight", "zzz.unknown"]
+        );
         // Unknown tensor => conservative KEEP_BF16.
         assert_eq!(m["zzz.unknown"], ResolvedPolicy::KeepBf16);
     }

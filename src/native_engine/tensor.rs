@@ -155,7 +155,13 @@ impl QInt8 {
     #[must_use]
     pub fn new(w: Vec<i8>, scales: Vec<f32>, n: usize, k: usize) -> Self {
         assert_eq!(w.len(), n * k, "QInt8: w len {} != n*k {}", w.len(), n * k);
-        assert_eq!(scales.len(), n, "QInt8: scales len {} != n {}", scales.len(), n);
+        assert_eq!(
+            scales.len(),
+            n,
+            "QInt8: scales len {} != n {}",
+            scales.len(),
+            n
+        );
         Self { w, scales, n, k }
     }
 }

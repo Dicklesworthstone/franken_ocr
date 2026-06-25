@@ -59,7 +59,7 @@
 //! assumptions on the caller's slices.
 
 // This module is the named, audited SIMD island. `unsafe` is permitted ONLY
-// here (the crate root is `#![forbid(unsafe_code)]`); every intrinsic call is
+// here (the crate root is `#![deny(unsafe_code)]`); every intrinsic call is
 // annotated with a `// SAFETY:` note and is reachable only after the dispatcher
 // has confirmed the corresponding CPU feature via `is_x86_feature_detected!`.
 #![allow(unsafe_code, unsafe_op_in_unsafe_fn)]

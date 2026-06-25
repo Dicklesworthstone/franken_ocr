@@ -15,8 +15,8 @@
 //! * [`arm`] — aarch64 NEON kernels: SMMLA/i8mm (the register-blocked wedge) and
 //!   SDOT/dotprod. Compiled only on `target_arch = "aarch64"`; the audited
 //!   `unsafe` intrinsic island lives there.
-//! * [`x86`] — x86-64 kernels: AMX, AVX-512-VNNI, AVX-VNNI, AVX2. Compiled only
-//!   on `target_arch = "x86_64"`.
+//! * [`x86`] — x86-64 kernels: AVX-512-VNNI, AVX-VNNI, AVX2. Compiled only on
+//!   `target_arch = "x86_64"`.
 //! * [`int4`] — int4 (2 nibbles/byte, per-group scales) unpack-to-int8 path; the
 //!   decode-bandwidth wedge (doctrine #4). Portable (the unpack is scalar; it
 //!   feeds the same dispatched int8 GEMM), so it is built on every target.
@@ -40,9 +40,10 @@
 //! i32 buffer of length `m*n`. Accumulation is i32; the worst-case-K overflow
 //! proof is doctrine #6 (`tests/int32_overflow_proof.rs` + the `scalar` tests).
 //!
-//! Crate-root `#![forbid(unsafe_code)]` holds: only the named `arm`/`x86`
-//! islands relax it behind `#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]`, each
-//! with `// SAFETY:` notes and a bit-identical scalar fallback.
+//! Crate-root `#![deny(unsafe_code)]` holds by default; only the named
+//! `arm`/`x86` islands relax it behind
+//! `#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]`, each with `// SAFETY:` notes
+//! and a bit-identical scalar fallback.
 
 pub mod dispatch;
 pub mod int4;

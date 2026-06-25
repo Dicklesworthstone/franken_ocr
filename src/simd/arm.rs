@@ -106,9 +106,9 @@ pub fn detect_tier() -> ArmTier {
     }
 }
 
-/// `out[M,N] = A[M,K] (i8, row-major) · B[N,K] (i8, output-channel-major)`,
-/// accumulating in i32 and **overwriting** `out` (the kernels write each cell
-/// exactly once; this is `=`, not `+=`, matching the scalar oracle's contract).
+/// `out[M,N] += A[M,K] (i8, row-major) · B[N,K] (i8, output-channel-major)`,
+/// accumulating in i32 and adding into the caller-provided `out` buffer,
+/// matching the scalar oracle's contract.
 ///
 /// Picks the best available ARM tier (SMMLA > SDOT > scalar) and produces output
 /// bit-identical to [`scalar::igemm_s8s8`].
@@ -118,9 +118,27 @@ pub fn detect_tier() -> ArmTier {
 /// shape/contract violation is a programming error, caught early — matches the
 /// scalar reference's asserts).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    assert_eq!(a.len(), m * k, "igemm_s8s8: a.len {} != m*k {}", a.len(), m * k);
-    assert_eq!(b.len(), n * k, "igemm_s8s8: b.len {} != n*k {}", b.len(), n * k);
-    assert_eq!(out.len(), m * n, "igemm_s8s8: out.len {} != m*n {}", out.len(), m * n);
+    assert_eq!(
+        a.len(),
+        m * k,
+        "igemm_s8s8: a.len {} != m*k {}",
+        a.len(),
+        m * k
+    );
+    assert_eq!(
+        b.len(),
+        n * k,
+        "igemm_s8s8: b.len {} != n*k {}",
+        b.len(),
+        n * k
+    );
+    assert_eq!(
+        out.len(),
+        m * n,
+        "igemm_s8s8: out.len {} != m*n {}",
+        out.len(),
+        m * n
+    );
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -152,9 +170,27 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// As [`igemm_s8s8`].
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    assert_eq!(a.len(), m * k, "igemm_u8s8: a.len {} != m*k {}", a.len(), m * k);
-    assert_eq!(b.len(), n * k, "igemm_u8s8: b.len {} != n*k {}", b.len(), n * k);
-    assert_eq!(out.len(), m * n, "igemm_u8s8: out.len {} != m*n {}", out.len(), m * n);
+    assert_eq!(
+        a.len(),
+        m * k,
+        "igemm_u8s8: a.len {} != m*k {}",
+        a.len(),
+        m * k
+    );
+    assert_eq!(
+        b.len(),
+        n * k,
+        "igemm_u8s8: b.len {} != n*k {}",
+        b.len(),
+        n * k
+    );
+    assert_eq!(
+        out.len(),
+        m * n,
+        "igemm_u8s8: out.len {} != m*n {}",
+        out.len(),
+        m * n
+    );
 
     #[cfg(target_arch = "aarch64")]
     {
@@ -204,7 +240,7 @@ pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 // The audited unsafe SIMD island.
 //
 // Everything that touches a raw NEON intrinsic lives here. The crate root is
-// `#![forbid(unsafe_code)]`; this island re-enables it locally with an explicit
+// `#![deny(unsafe_code)]`; this island re-enables it locally with an explicit
 // allow + per-load SAFETY notes (AGENTS.md Toolchain rule).
 // ─────────────────────────────────────────────────────────────────────────────
 #[cfg(target_arch = "aarch64")]
@@ -337,7 +373,7 @@ mod aarch64_impl {
                 for i in 0..mr {
                     for j in 0..nr {
                         // SAFETY: vaddvq_s32 is a register-only horizontal add.
-                        out[(r + i) * n + (c + j)] = vaddvq_s32(acc[i][j]);
+                        out[(r + i) * n + (c + j)] += vaddvq_s32(acc[i][j]);
                     }
                 }
 
@@ -372,9 +408,13 @@ mod aarch64_impl {
     ///
     /// Returns `(packed, row_pairs, kb)` where `row_pairs = ceil(rows/2)` and
     /// `kb = ceil(k/8)`; `packed.len() == row_pairs * kb * 16`.
-    fn pack_panels(src: &[i8], base_row: usize, rows: usize, k: usize, src_k: usize)
-        -> (Vec<i8>, usize, usize)
-    {
+    fn pack_panels(
+        src: &[i8],
+        base_row: usize,
+        rows: usize,
+        k: usize,
+        src_k: usize,
+    ) -> (Vec<i8>, usize, usize) {
         let row_pairs = rows.div_ceil(2);
         let kb = k.div_ceil(8);
         let mut packed = vec![0i8; row_pairs * kb * 16];
@@ -458,16 +498,16 @@ mod aarch64_impl {
                         let bc0 = 2 * q;
                         let bc1 = 2 * q + 1;
                         if ar0 < mr && bc0 < nr {
-                            out[(r + ar0) * n + (c + bc0)] = tile[0];
+                            out[(r + ar0) * n + (c + bc0)] += tile[0];
                         }
                         if ar0 < mr && bc1 < nr {
-                            out[(r + ar0) * n + (c + bc1)] = tile[1];
+                            out[(r + ar0) * n + (c + bc1)] += tile[1];
                         }
                         if ar1 < mr && bc0 < nr {
-                            out[(r + ar1) * n + (c + bc0)] = tile[2];
+                            out[(r + ar1) * n + (c + bc0)] += tile[2];
                         }
                         if ar1 < mr && bc1 < nr {
-                            out[(r + ar1) * n + (c + bc1)] = tile[3];
+                            out[(r + ar1) * n + (c + bc1)] += tile[3];
                         }
                     }
                 }
@@ -640,6 +680,61 @@ mod tests {
     }
 
     #[test]
+    fn accelerated_paths_add_into_seeded_out() {
+        let (m, k, n) = (2usize, 17usize, 3usize);
+        let a = vec![
+            1i8, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 17, -3, 4, -5, 6, -7,
+            8, -9, 10, -11, 12, -13, 14, -15, 16, -17, 18, -19,
+        ];
+        let au = a
+            .iter()
+            .map(|&x| x.wrapping_add(128) as u8)
+            .collect::<Vec<_>>();
+        let b = vec![
+            2i8, 1, -1, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, -2, 3, -4, 5, -6, 7, -8,
+            9, -10, 11, -12, 13, -14, 15, -16, 17, 1, -3, 5, -7, 9, -11, 13, -15, 17, -19, 21, -23,
+            25, -27, 29, -31, 33, -35,
+        ];
+        let seed = (0..m * n)
+            .map(|idx| (idx as i32 * 17) - 41)
+            .collect::<Vec<_>>();
+
+        let mut want_s8 = seed.clone();
+        for (cell, dot) in want_s8.iter_mut().zip(oracle_s8s8(&a, &b, m, k, n)) {
+            *cell += dot;
+        }
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            let mut got = seed.clone();
+            // SAFETY: feature just checked.
+            unsafe { aarch64_impl::igemm_s8s8_sdot(&a, &b, m, k, n, &mut got) };
+            assert_eq!(got, want_s8, "SDOT must add into seeded out");
+        }
+        if std::arch::is_aarch64_feature_detected!("i8mm") {
+            let mut got = seed.clone();
+            // SAFETY: feature just checked.
+            unsafe { aarch64_impl::igemm_s8s8_smmla(&a, &b, m, k, n, &mut got) };
+            assert_eq!(got, want_s8, "SMMLA must add into seeded out");
+        }
+        let mut got = seed.clone();
+        igemm_s8s8(&a, &b, m, k, n, &mut got);
+        assert_eq!(
+            got, want_s8,
+            "public S8S8 dispatch must add into seeded out"
+        );
+
+        let mut want_u8 = seed.clone();
+        for (cell, dot) in want_u8.iter_mut().zip(oracle_u8s8(&au, &b, m, k, n)) {
+            *cell += dot;
+        }
+        let mut got = seed;
+        igemm_u8s8(&au, &b, m, k, n, &mut got);
+        assert_eq!(
+            got, want_u8,
+            "public U8S8 dispatch must add into seeded out"
+        );
+    }
+
+    #[test]
     fn s8s8_adversarial_all_max_at_worst_case_k() {
         // Doctrine #6 worst case K plus the adversarial all-127 / all-(-128)
         // operands. These maximize the i32 accumulator (110.4M / 112.2M) and are
@@ -652,7 +747,11 @@ mod tests {
             let b = vec![fill; n * k];
             let want = oracle_s8s8(&a, &b, m, k, n);
             // Spot-check the headline value.
-            let expect = if fill == 127 { 110_451_392 } else { 112_197_632 };
+            let expect = if fill == 127 {
+                110_451_392
+            } else {
+                112_197_632
+            };
             assert_eq!(want[0], expect, "oracle value at fill {fill}");
             if let Some(got) = run_sdot_s8s8(&a, &b, m, k, n) {
                 assert_eq!(got, want, "SDOT all-{fill} @K=6848");

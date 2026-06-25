@@ -314,8 +314,11 @@ mod tests {
     #[test]
     fn exact_int4_values_roundtrip_with_unit_scale() {
         // Group of 16 with max_abs 7 -> scale exactly 1.0, every value exact.
+        // (No -8 here: -8 would make max_abs 8 and scale 8/7, breaking unit
+        // scale; the full -8..=7 range is exercised by `unpack_is_exact_inverse_
+        // of_pack_nibbles` and `sign_extension_is_correct_for_all_16_nibbles`.)
         let vals: Vec<f32> = vec![
-            7.0, -8.0, 0.0, 1.0, -1.0, 3.0, -3.0, 6.0, -6.0, 2.0, -2.0, 4.0, -4.0, 5.0, -5.0, 7.0,
+            7.0, -7.0, 0.0, 1.0, -1.0, 3.0, -3.0, 6.0, -6.0, 2.0, -2.0, 4.0, -4.0, 5.0, -5.0, 7.0,
         ];
         let q = pack_int4_f32(&vals, 1, 16, 16);
         assert_eq!(q.scales.len(), 1);

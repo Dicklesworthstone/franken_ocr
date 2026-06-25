@@ -69,8 +69,20 @@ fn acc_add(acc: i32, prod: i32) -> i32 {
 /// Panics on a length-contract violation: `a.len() != m*k`, `b.len() != n*k`,
 /// or `out.len() != m*n` (a programming error, caught early like `Mat`).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    assert_eq!(a.len(), m * k, "igemm_s8s8: a.len {} != m*k {}", a.len(), m * k);
-    assert_eq!(b.len(), n * k, "igemm_s8s8: b.len {} != n*k {}", b.len(), n * k);
+    assert_eq!(
+        a.len(),
+        m * k,
+        "igemm_s8s8: a.len {} != m*k {}",
+        a.len(),
+        m * k
+    );
+    assert_eq!(
+        b.len(),
+        n * k,
+        "igemm_s8s8: b.len {} != n*k {}",
+        b.len(),
+        n * k
+    );
     assert_eq!(
         out.len(),
         m * n,
@@ -105,8 +117,20 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// As [`igemm_s8s8`] (length-contract violations).
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    assert_eq!(a.len(), m * k, "igemm_u8s8: a.len {} != m*k {}", a.len(), m * k);
-    assert_eq!(b.len(), n * k, "igemm_u8s8: b.len {} != n*k {}", b.len(), n * k);
+    assert_eq!(
+        a.len(),
+        m * k,
+        "igemm_u8s8: a.len {} != m*k {}",
+        a.len(),
+        m * k
+    );
+    assert_eq!(
+        b.len(),
+        n * k,
+        "igemm_u8s8: b.len {} != n*k {}",
+        b.len(),
+        n * k
+    );
     assert_eq!(
         out.len(),
         m * n,
@@ -284,7 +308,9 @@ mod tests {
 
     fn pseudo_i8(len: usize, seed: u32) -> Vec<i8> {
         let mut s = seed | 1;
-        (0..len).map(|_| (xorshift(&mut s) & 0xff) as u8 as i8).collect()
+        (0..len)
+            .map(|_| (xorshift(&mut s) & 0xff) as u8 as i8)
+            .collect()
     }
 
     fn pseudo_u8(len: usize, seed: u32) -> Vec<u8> {

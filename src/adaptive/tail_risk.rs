@@ -433,11 +433,7 @@ pub fn fit_gpd_pwm(sorted_vals: &[f64], pot_frac: f64) -> TailRiskResult<GpdFit>
 ///
 /// # Errors
 /// [`TailRiskError::Empty`] on an empty slice.
-pub fn evt_quantile(
-    sorted_vals: &[f64],
-    q: f64,
-    pot_frac: f64,
-) -> TailRiskResult<(f64, GpdFit)> {
+pub fn evt_quantile(sorted_vals: &[f64], q: f64, pot_frac: f64) -> TailRiskResult<(f64, GpdFit)> {
     let n = sorted_vals.len();
     if n == 0 {
         return Err(TailRiskError::Empty);
@@ -606,7 +602,10 @@ impl TailReport {
         if sorted_vals.is_empty() {
             return 0.0;
         }
-        let at_or_below = sorted_vals.iter().filter(|&&v| v <= self.evt_quantile).count();
+        let at_or_below = sorted_vals
+            .iter()
+            .filter(|&&v| v <= self.evt_quantile)
+            .count();
         at_or_below as f64 / sorted_vals.len() as f64
     }
 
@@ -848,7 +847,11 @@ mod tests {
     fn cvar_matches_python_reference_value() {
         // Reproduces the Python: --values 0.0 0.0 0.5 0.9 --alpha 0.5 → cvar 0.7.
         let v = [0.0, 0.0, 0.5, 0.9];
-        assert!(approx(cvar(&v, 0.5).unwrap(), 0.7, TOL), "{}", cvar(&v, 0.5).unwrap());
+        assert!(
+            approx(cvar(&v, 0.5).unwrap(), 0.7, TOL),
+            "{}",
+            cvar(&v, 0.5).unwrap()
+        );
     }
 
     #[test]
@@ -874,7 +877,9 @@ mod tests {
         // Reproduces the captured Python `pwm` fit (60-sample mild tail):
         //   shape ≈ 0.1530800545, scale ≈ 0.1041241022, threshold ≈ 0.0815,
         //   n_exceed = 9, evt_p999 ≈ 0.8660067126.
-        let mut vals: Vec<f64> = (0..48).map(|i| (0.001 * i as f64 * 10000.0).round() / 10000.0).collect();
+        let mut vals: Vec<f64> = (0..48)
+            .map(|i| (0.001 * i as f64 * 10000.0).round() / 10000.0)
+            .collect();
         vals.extend_from_slice(&[
             0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.13, 0.16, 0.20, 0.26, 0.34, 0.45,
         ]);
@@ -883,9 +888,21 @@ mod tests {
         let fit = fit_gpd_pwm(&s, 0.15).unwrap();
         assert_eq!(fit.method, GpdMethod::Pwm);
         assert_eq!(fit.n_exceed, 9);
-        assert!(approx(fit.shape, 0.1530800545257287, 1e-9), "shape {}", fit.shape);
-        assert!(approx(fit.scale, 0.10412410218525352, 1e-9), "scale {}", fit.scale);
-        assert!(approx(fit.threshold, 0.08149999999999999, 1e-9), "thr {}", fit.threshold);
+        assert!(
+            approx(fit.shape, 0.1530800545257287, 1e-9),
+            "shape {}",
+            fit.shape
+        );
+        assert!(
+            approx(fit.scale, 0.10412410218525352, 1e-9),
+            "scale {}",
+            fit.scale
+        );
+        assert!(
+            approx(fit.threshold, 0.08149999999999999, 1e-9),
+            "thr {}",
+            fit.threshold
+        );
         let (evt, _) = evt_quantile(&s, 0.999, 0.15).unwrap();
         assert!(approx(evt, 0.8660067126095988, 1e-8), "evt {evt}");
     }
@@ -912,30 +929,54 @@ mod tests {
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let u = empirical_quantile(&s, 1.0 - DEFAULT_POT_FRAC).unwrap();
-        let mut exc: Vec<f64> = s.iter().copied().filter(|&v| v > u).map(|v| v - u).collect();
+        let mut exc: Vec<f64> = s
+            .iter()
+            .copied()
+            .filter(|&v| v > u)
+            .map(|v| v - u)
+            .collect();
         exc.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let m = exc.len();
-        assert!(m >= MIN_EXCEEDANCES, "need a real tail for this guard, m={m}");
+        assert!(
+            m >= MIN_EXCEEDANCES,
+            "need a real tail for this guard, m={m}"
+        );
         let mf = m as f64;
         let a0 = fsum(exc.iter().copied()) / mf;
 
         // CORRECT plotting-position weight (what fit_gpd_pwm uses).
-        let a1_corr =
-            fsum(exc.iter().enumerate().map(|(j, &y)| (1.0 - (((j + 1) as f64) - 0.35) / mf) * y))
-                / mf;
+        let a1_corr = fsum(
+            exc.iter()
+                .enumerate()
+                .map(|(j, &y)| (1.0 - (((j + 1) as f64) - 0.35) / mf) * y),
+        ) / mf;
         let denom_corr = a0 - 2.0 * a1_corr;
         let scale_corr = 2.0 * a0 * a1_corr / denom_corr;
 
         // BUGGED unbiased rank weight (j-1)/(m-1) (0-indexed j → j/(m-1)).
-        let a1_bug = fsum(exc.iter().enumerate().map(|(j, &y)| ((j as f64) / (mf - 1.0)) * y)) / mf;
+        let a1_bug = fsum(
+            exc.iter()
+                .enumerate()
+                .map(|(j, &y)| ((j as f64) / (mf - 1.0)) * y),
+        ) / mf;
         let denom_bug = a0 - 2.0 * a1_bug;
         let scale_bug = 2.0 * a0 * a1_bug / denom_bug;
 
         // (1) The correct weight is the one fit_gpd_pwm actually uses → valid pwm.
         let fit = fit_gpd_pwm(&s, DEFAULT_POT_FRAC).unwrap();
-        assert_eq!(fit.method, GpdMethod::Pwm, "plotting-position must give a real fit");
-        assert!(scale_corr > 0.0, "correct scale must be positive, got {scale_corr}");
-        assert!(approx(fit.scale, scale_corr, 1e-9), "fit uses the correct weight");
+        assert_eq!(
+            fit.method,
+            GpdMethod::Pwm,
+            "plotting-position must give a real fit"
+        );
+        assert!(
+            scale_corr > 0.0,
+            "correct scale must be positive, got {scale_corr}"
+        );
+        assert!(
+            approx(fit.scale, scale_corr, 1e-9),
+            "fit uses the correct weight"
+        );
 
         // (2) The bugged weight flips the denom sign and yields a NEGATIVE scale —
         // exactly the collapse the prototype fixed; that fit would fall back.
@@ -943,7 +984,10 @@ mod tests {
             (denom_corr > 0.0) != (denom_bug > 0.0),
             "bugged weight must flip denom sign: corr={denom_corr} bug={denom_bug}"
         );
-        assert!(scale_bug < 0.0, "bugged weight must drive scale negative, got {scale_bug}");
+        assert!(
+            scale_bug < 0.0,
+            "bugged weight must drive scale negative, got {scale_bug}"
+        );
     }
 
     // ----- Deterministic fallback: < MIN_EXCEEDANCES samples ------------------
@@ -954,14 +998,29 @@ mod tests {
         // MIN_EXCEEDANCES=8 trigger → empirical-fallback, NO invented bound.
         let v = [0.0, 0.1, 0.2, 0.3, 0.5];
         let report = compute_report_default(&v).unwrap();
-        assert!(report.used_fallback(), "too-few-samples must trigger fallback");
+        assert!(
+            report.used_fallback(),
+            "too-few-samples must trigger fallback"
+        );
         assert_eq!(report.fit.method, GpdMethod::EmpiricalFallback);
         assert_eq!(report.fit.scale, 0.0);
         assert_eq!(report.fit.shape, 0.0);
         // Reproduces the Python: evt_p999 = empirical p999 = 0.4992, cvar = 0.5.
-        assert!(approx(report.evt_quantile, 0.4992, 1e-9), "evt {}", report.evt_quantile);
-        assert!(approx(report.cvar_alpha, 0.5, TOL), "cvar {}", report.cvar_alpha);
-        assert!(approx(report.fit.threshold, 0.38, TOL), "thr {}", report.fit.threshold);
+        assert!(
+            approx(report.evt_quantile, 0.4992, 1e-9),
+            "evt {}",
+            report.evt_quantile
+        );
+        assert!(
+            approx(report.cvar_alpha, 0.5, TOL),
+            "cvar {}",
+            report.cvar_alpha
+        );
+        assert!(
+            approx(report.fit.threshold, 0.38, TOL),
+            "thr {}",
+            report.fit.threshold
+        );
     }
 
     #[test]
@@ -1032,10 +1091,22 @@ mod tests {
         let report = compute_report_default(&v).unwrap();
         assert_eq!(report.fit.method, GpdMethod::Pwm);
         assert_eq!(report.n, 50);
-        assert!(approx(report.evt_quantile, 1.0, TOL), "evt {}", report.evt_quantile);
-        assert!(approx(report.cvar_alpha, 0.9259999999999999, 1e-9), "cvar {}", report.cvar_alpha);
+        assert!(
+            approx(report.evt_quantile, 1.0, TOL),
+            "evt {}",
+            report.evt_quantile
+        );
+        assert!(
+            approx(report.cvar_alpha, 0.9259999999999999, 1e-9),
+            "cvar {}",
+            report.cvar_alpha
+        );
         assert!(approx(report.mean, 0.1966, 1e-9), "mean {}", report.mean);
-        assert!(approx(report.var_alpha, 0.7100000000000002, 1e-9), "var {}", report.var_alpha);
+        assert!(
+            approx(report.var_alpha, 0.7100000000000002, 1e-9),
+            "var {}",
+            report.var_alpha
+        );
         assert!(approx(report.fit.shape, -1.0695172023219603, 1e-9));
         assert!(approx(report.fit.scale, 0.7010489522865643, 1e-9));
         assert_eq!(report.fit.n_exceed, 8);
@@ -1044,12 +1115,18 @@ mod tests {
     #[test]
     fn evt_never_under_states_empirical_quantile() {
         // For any corpus the reported bound ≥ the empirical p999 (calibration).
-        let v = [0.0, 0.0, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 0.9, 0.95, 1.0];
+        let v = [
+            0.0, 0.0, 0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 0.9, 0.95, 1.0,
+        ];
         let report = compute_report_default(&v).unwrap();
         let mut s = v.to_vec();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let emp = empirical_quantile(&s, 0.999).unwrap().clamp(0.0, 1.0);
-        assert!(report.evt_quantile >= emp - TOL, "bound {} >= emp {emp}", report.evt_quantile);
+        assert!(
+            report.evt_quantile >= emp - TOL,
+            "bound {} >= emp {emp}",
+            report.evt_quantile
+        );
     }
 
     // ----- Calibration: coverage floor ≥ nominal ------------------------------
@@ -1058,13 +1135,18 @@ mod tests {
     fn coverage_floor_is_at_least_nominal_for_trusted_fit() {
         // The reported bound covers ≥ evt_q of the corpus (conservative).
         let mut v: Vec<f64> = (0..48).map(|i| 0.001 * i as f64).collect();
-        v.extend_from_slice(&[0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.13, 0.16, 0.20, 0.26, 0.34, 0.45]);
+        v.extend_from_slice(&[
+            0.06, 0.07, 0.08, 0.09, 0.10, 0.11, 0.13, 0.16, 0.20, 0.26, 0.34, 0.45,
+        ]);
         let report = compute_report_default(&v).unwrap();
         let mut s = v.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let cov = report.coverage_floor(&s);
-        assert!(cov >= report.evt_q - 1e-9 || cov >= (s.len() - 1) as f64 / s.len() as f64,
-            "coverage {cov} should be conservative vs q {}", report.evt_q);
+        assert!(
+            cov >= report.evt_q - 1e-9 || cov >= (s.len() - 1) as f64 / s.len() as f64,
+            "coverage {cov} should be conservative vs q {}",
+            report.evt_q
+        );
     }
 
     // ----- Gate: pass / fail / no-baseline + exit semantics -------------------
@@ -1113,7 +1195,11 @@ mod tests {
         let gate = apply_gate(&report, Some(10.0), Some(0.0), 0.0);
         assert_eq!(gate.checks.len(), 2);
         assert_eq!(gate.verdict, GateVerdict::Fail);
-        let evt_check = gate.checks.iter().find(|c| c.name.starts_with("evt_")).unwrap();
+        let evt_check = gate
+            .checks
+            .iter()
+            .find(|c| c.name.starts_with("evt_"))
+            .unwrap();
         assert!(!evt_check.pass);
         assert_eq!(evt_check.name, "evt_p999");
     }
@@ -1122,7 +1208,10 @@ mod tests {
 
     #[test]
     fn rejects_non_finite_and_out_of_range() {
-        assert_eq!(compute_report_default(&[]).unwrap_err(), TailRiskError::Empty);
+        assert_eq!(
+            compute_report_default(&[]).unwrap_err(),
+            TailRiskError::Empty
+        );
         assert_eq!(
             compute_report_default(&[0.1, f64::NAN]).unwrap_err(),
             TailRiskError::NonFinite(f64::NAN)
@@ -1140,9 +1229,18 @@ mod tests {
     #[test]
     fn rejects_bad_parameters() {
         let v = [0.1, 0.2, 0.3];
-        assert!(matches!(compute_report(&v, 0.0, 0.999, 0.15).unwrap_err(), TailRiskError::BadAlpha(_)));
-        assert!(matches!(compute_report(&v, 0.1, 1.0, 0.15).unwrap_err(), TailRiskError::BadEvtQ(_)));
-        assert!(matches!(compute_report(&v, 0.1, 0.999, 1.0).unwrap_err(), TailRiskError::BadPotFrac(_)));
+        assert!(matches!(
+            compute_report(&v, 0.0, 0.999, 0.15).unwrap_err(),
+            TailRiskError::BadAlpha(_)
+        ));
+        assert!(matches!(
+            compute_report(&v, 0.1, 1.0, 0.15).unwrap_err(),
+            TailRiskError::BadEvtQ(_)
+        ));
+        assert!(matches!(
+            compute_report(&v, 0.1, 0.999, 1.0).unwrap_err(),
+            TailRiskError::BadPotFrac(_)
+        ));
     }
 
     // ----- Field-name formatting (stable NDJSON keys) -------------------------

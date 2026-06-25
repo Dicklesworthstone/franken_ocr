@@ -505,7 +505,10 @@ mod tests {
 
     #[test]
     fn parse_boxes_single_quad() {
-        assert_eq!(parse_boxes("[100, 200, 300, 400]"), vec![[100, 200, 300, 400]]);
+        assert_eq!(
+            parse_boxes("[100, 200, 300, 400]"),
+            vec![[100, 200, 300, 400]]
+        );
     }
 
     #[test]
@@ -536,7 +539,8 @@ mod tests {
 
     #[test]
     fn re_match_non_greedy_two_spans() {
-        let text = "<|ref|>a<|/ref|><|det|>[1,2,3,4]<|/det|>X<|ref|>b<|/ref|><|det|>[5,6,7,8]<|/det|>";
+        let text =
+            "<|ref|>a<|/ref|><|det|>[1,2,3,4]<|/det|>X<|ref|>b<|/ref|><|det|>[5,6,7,8]<|/det|>";
         let ms = scan_ref_spans(text);
         assert_eq!(ms.len(), 2);
         assert_eq!(ms[0].label, "a");
@@ -582,9 +586,8 @@ mod tests {
 
     #[test]
     fn finalize_strips_other_spans_and_keeps_text() {
-        let raw = format!(
-            "Heading\n<|ref|>title<|/ref|><|det|>[1,2,3,4]<|/det|>\nBody text{EOS_MARKER}"
-        );
+        let raw =
+            format!("Heading\n<|ref|>title<|/ref|><|det|>[1,2,3,4]<|/det|>\nBody text{EOS_MARKER}");
         let md = finalize(&raw, 1000, 1000).unwrap();
         // the title (other) span is removed; surrounding text remains
         assert!(md.contains("Heading"));
@@ -624,9 +627,7 @@ mod tests {
     #[test]
     fn finalize_multi_splits_and_rejoins_pages() {
         // leading text before first <PAGE> is dropped; two pages rejoined.
-        let raw = format!(
-            "preamble<PAGE>page one text<PAGE>page two text{EOS_MARKER}"
-        );
+        let raw = format!("preamble<PAGE>page one text<PAGE>page two text{EOS_MARKER}");
         let md = finalize_multi(&raw, 2).unwrap();
         assert!(md.starts_with("<PAGE>\n"));
         assert!(md.contains("page one text"));
@@ -662,9 +663,7 @@ mod tests {
 
     #[test]
     fn parse_layout_rescales_boxes() {
-        let raw = format!(
-            "<|ref|>title<|/ref|><|det|>[0, 0, 999, 999]<|/det|>{EOS_MARKER}"
-        );
+        let raw = format!("<|ref|>title<|/ref|><|det|>[0, 0, 999, 999]<|/det|>{EOS_MARKER}");
         let layout = parse_layout(&raw, 1920, 1080);
         // first entry is the full ref/det span labelled "title"
         let (label, boxes) = layout

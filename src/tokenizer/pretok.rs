@@ -121,7 +121,9 @@ fn is_ascii_punct_lead(c: char) -> bool {
 #[inline]
 fn is_cjk_kana(c: char) -> bool {
     let cp = c as u32;
-    (0x4E00..=0x9FA5).contains(&cp) || (0x3040..=0x309F).contains(&cp) || (0x30A0..=0x30FF).contains(&cp)
+    (0x4E00..=0x9FA5).contains(&cp)
+        || (0x3040..=0x309F).contains(&cp)
+        || (0x30A0..=0x30FF).contains(&cp)
 }
 
 /// Pre-tokenize `text` into the byte-level pieces fed to BPE.
@@ -378,7 +380,8 @@ fn byte_to_char(b: u8) -> char {
     // Printable set: '!'..='~' (0x21..=0x7E), '¡'..='¬' (0xA1..=0xAC),
     // '®'..='ÿ' (0xAE..=0xFF). These map to themselves. Every other byte n maps
     // to U+0100 + (its index among the non-printable bytes, in ascending order).
-    let printable = (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
+    let printable =
+        (0x21..=0x7E).contains(&b) || (0xA1..=0xAC).contains(&b) || (0xAE..=0xFF).contains(&b);
     if printable {
         // Safe: all these are valid scalar values < 0x100.
         char::from_u32(b as u32).expect("printable byte is a valid codepoint")
@@ -386,8 +389,9 @@ fn byte_to_char(b: u8) -> char {
         // Count how many non-printable bytes precede `b` to get its offset.
         let mut offset = 0u32;
         for x in 0u8..b {
-            let x_printable =
-                (0x21..=0x7E).contains(&x) || (0xA1..=0xAC).contains(&x) || (0xAE..=0xFF).contains(&x);
+            let x_printable = (0x21..=0x7E).contains(&x)
+                || (0xA1..=0xAC).contains(&x)
+                || (0xAE..=0xFF).contains(&x);
             if !x_printable {
                 offset += 1;
             }
@@ -415,8 +419,9 @@ pub fn char_to_byte(c: char) -> Option<u8> {
         let target = cp - 0x100;
         let mut offset = 0u32;
         for x in 0u8..=0xFF {
-            let x_printable =
-                (0x21..=0x7E).contains(&x) || (0xA1..=0xAC).contains(&x) || (0xAE..=0xFF).contains(&x);
+            let x_printable = (0x21..=0x7E).contains(&x)
+                || (0xA1..=0xAC).contains(&x)
+                || (0xAE..=0xFF).contains(&x);
             if !x_printable {
                 if offset == target {
                     return Some(x);

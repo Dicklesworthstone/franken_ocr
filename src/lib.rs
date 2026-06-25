@@ -12,13 +12,16 @@
 //! output (doctrine #1).
 //!
 //! [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`]: ../COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+pub mod adaptive;
 pub mod cli;
 pub mod error;
 pub mod native_engine;
 pub mod preprocess;
+pub mod quant;
 pub mod robot;
+pub mod simd;
 pub mod tokenizer;
 
 pub use cli::cli_main;
@@ -150,11 +153,7 @@ impl OcrEngine {
     ///
     /// # Errors
     /// As [`OcrEngine::recognize`].
-    pub fn recognize_with_model(
-        &self,
-        model_path: &Path,
-        image_path: &Path,
-    ) -> FocrResult<String> {
+    pub fn recognize_with_model(&self, model_path: &Path, image_path: &Path) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
         let image_path = image_path.to_path_buf();
         // One owned runtime; the per-page forward is the only blocking work and
@@ -184,7 +183,7 @@ mod tests {
     /// `ModelNotFound` (exit code 3) — NOT a panic, NOT NotImplemented. This is
     /// the path the model-gated e2e tests pin (point the fallback at
     /// `/nonexistent`). We use the path-explicit form so the test never mutates
-    /// the process environment (the crate root `#![forbid(unsafe_code)]` rules out
+    /// the process environment (the crate root `#![deny(unsafe_code)]` rules out
     /// the `unsafe` `std::env::set_var`).
     #[test]
     fn recognize_missing_model_is_clean_model_not_found() {
@@ -223,7 +222,7 @@ mod tests {
     }
 
     /// The model-path resolver falls back to the documented default when the env
-    /// override is unset (read-only check; no env mutation under `forbid(unsafe)`).
+    /// override is unset (read-only check; no env mutation under `deny(unsafe)`).
     #[test]
     fn model_path_falls_back_to_default_when_env_unset() {
         if std::env::var_os(MODEL_PATH_ENV).is_none() {

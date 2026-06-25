@@ -33,10 +33,10 @@
 //! accumulator provably non-overflowing. The global worst case is the dense
 //! layer-0 `down_proj` at **K = 6848**:
 //!
-//! * S8S8 monotone bound: `6848 · 127 · 127 = 110_438_912 < i32::MAX`
+//! * S8S8 monotone bound: `6848 · 127 · 127 = 110_451_392 < i32::MAX`
 //!   (`2_147_483_647`) — ~19× headroom.
 //! * U8S8 monotone bound (asymmetric u8 activation × s8 weight):
-//!   `6848 · 255 · 127 = 221_713_920 < i32::MAX` — ~9.7× headroom.
+//!   `6848 · 255 · 127 = 221_772_480 < i32::MAX` — ~9.7× headroom.
 //!
 //! Both fit i32 with room to spare; this module's clamp is the *source* of the
 //! `127` factor that proof depends on. We deliberately do NOT inherit
@@ -374,12 +374,12 @@ mod tests {
             acc += i64::from(x) * i64::from(w);
         }
         assert_eq!(acc, (K as i64) * 127 * 127);
-        assert_eq!(acc, 110_438_912);
+        assert_eq!(acc, 110_451_392);
         assert!(acc < i64::from(i32::MAX), "S8S8 K=6848 must fit i32");
 
         // U8S8 worst case: u8=255 activation x s8=127 weight.
         let u8s8: i64 = (K as i64) * 255 * 127;
-        assert_eq!(u8s8, 221_713_920);
+        assert_eq!(u8s8, 221_772_480);
         assert!(u8s8 < i64::from(i32::MAX), "U8S8 K=6848 must fit i32");
     }
 

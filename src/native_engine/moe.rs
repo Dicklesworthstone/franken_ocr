@@ -520,7 +520,10 @@ mod tests {
         }
         // Unnormalized: the 6 weights do NOT sum to 1.
         let s: f32 = r.weights[0].iter().sum();
-        assert!(s < 0.9999, "top-6 should not sum to 1 when unnormalized: {s}");
+        assert!(
+            s < 0.9999,
+            "top-6 should not sum to 1 when unnormalized: {s}"
+        );
     }
 
     #[test]
@@ -537,7 +540,10 @@ mod tests {
         // norm_topk_prob = true, scaling = 1.0 -> the 6 weights sum to 1.
         let r = route(&hidden, &gate, true, 1.0).unwrap();
         let s: f32 = r.weights[0].iter().sum();
-        assert!((s - 1.0).abs() < 1e-5, "renormalized top-6 must sum to 1: {s}");
+        assert!(
+            (s - 1.0).abs() < 1e-5,
+            "renormalized top-6 must sum to 1: {s}"
+        );
         // And descending order preserved.
         for k in 1..config::NUM_EXPERTS_PER_TOK {
             assert!(r.weights[0][k] <= r.weights[0][k - 1]);
@@ -659,8 +665,16 @@ mod tests {
         let silu1 = 1.0f32 / (1.0 + (-1.0f32).exp());
         let w_each = 1.0f32 / config::N_ROUTED_EXPERTS as f32;
         let expect = 6.0 * w_each * silu1;
-        assert!((y.data[0] - expect).abs() < 1e-5, "{} != {expect}", y.data[0]);
-        assert!((y.data[1] - expect).abs() < 1e-5, "{} != {expect}", y.data[1]);
+        assert!(
+            (y.data[0] - expect).abs() < 1e-5,
+            "{} != {expect}",
+            y.data[0]
+        );
+        assert!(
+            (y.data[1] - expect).abs() < 1e-5,
+            "{} != {expect}",
+            y.data[1]
+        );
     }
 
     #[test]
@@ -732,10 +746,7 @@ mod tests {
     fn forward_shims_are_not_implemented_until_reader_lands() {
         let w = Weights::default();
         let x = Mat::from_vec(1, config::HIDDEN_SIZE, vec![0.0; config::HIDDEN_SIZE]);
-        assert!(matches!(
-            forward(&w, &x),
-            Err(FocrError::NotImplemented(_))
-        ));
+        assert!(matches!(forward(&w, &x), Err(FocrError::NotImplemented(_))));
         assert!(matches!(
             dense_forward(&w, &x),
             Err(FocrError::NotImplemented(_))

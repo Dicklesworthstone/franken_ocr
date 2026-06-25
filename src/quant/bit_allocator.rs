@@ -84,12 +84,7 @@ pub type AllocResult<T> = Result<T, AllocatorError>;
 /// Canonical option ordering (index 0 = highest precision). Used for
 /// deterministic tie-breaks (prefer higher precision on equal RD-cost) and for
 /// the tier-floor comparison. Matches the Python `OPTION_ORDER`.
-const OPTION_ORDER: &[(&str, i64)] = &[
-    ("bf16", 0),
-    ("int8", 1),
-    ("int4-g16", 2),
-    ("int4-g32", 3),
-];
+const OPTION_ORDER: &[(&str, i64)] = &[("bf16", 0), ("int8", 1), ("int4-g16", 2), ("int4-g32", 3)];
 
 /// Deterministic precision rank; unknown options sort after known ones by name
 /// (sum of char codes). Mirrors the Python `_option_rank`.
@@ -298,8 +293,7 @@ fn convex_hull_prune(points: &[Point]) -> Vec<Point> {
             let a = &hull[hull.len() - 2];
             let b = &hull[hull.len() - 1];
             // cross of (b-a) x (p-a) in (bytes, distortion) space; <= 0 => b not below.
-            let cross = (b.rate_bytes as f64 - a.rate_bytes as f64)
-                * (p.distortion - a.distortion)
+            let cross = (b.rate_bytes as f64 - a.rate_bytes as f64) * (p.distortion - a.distortion)
                 - (b.distortion - a.distortion) * (p.rate_bytes as f64 - a.rate_bytes as f64);
             if cross <= 0.0 {
                 hull.pop();
@@ -488,9 +482,8 @@ fn greedy_topup(tensors: &mut [Tensor], budget: u64) {
                 let drop = cur.distortion - cand.distortion; // >= 0 by monotonicity
                 let gain_per_byte = drop / added as f64;
                 let strictly_better = gain_per_byte > best_gain_per_byte + EPS;
-                let tie_better = (gain_per_byte - best_gain_per_byte).abs() <= EPS
-                    && best_ti.is_some()
-                    && {
+                let tie_better =
+                    (gain_per_byte - best_gain_per_byte).abs() <= EPS && best_ti.is_some() && {
                         let bt = &tensors[best_ti.unwrap()];
                         let bo = &bt.points[best_to_idx].option;
                         (t.name.as_str(), cand.option.as_str()) < (bt.name.as_str(), bo.as_str())
@@ -706,7 +699,12 @@ pub fn allocate_uniform(
         }
     }
     let eff_budget = budget.unwrap_or_else(|| footprint(tensors));
-    finish(tensors, eff_budget, &format!("uniform-{uniform_option}"), None)
+    finish(
+        tensors,
+        eff_budget,
+        &format!("uniform-{uniform_option}"),
+        None,
+    )
 }
 
 // ── result assembly + evidence ledger ────────────────────────────────────────
@@ -753,10 +751,7 @@ fn uniform_equal_footprint(tensors: &[Tensor], target_bytes: u64) -> UniformBase
                             .unwrap()
                     })
             } else {
-                t.points
-                    .iter()
-                    .min_by_key(|p| p.rate_bytes)
-                    .unwrap()
+                t.points.iter().min_by_key(|p| p.rate_bytes).unwrap()
             };
             fp += p.rate_bytes;
             dd += p.distortion;
@@ -783,11 +778,23 @@ fn uniform_equal_footprint(tensors: &[Tensor], target_bytes: u64) -> UniformBase
         let option = ordered[0].0.clone();
         let fp: u64 = tensors
             .iter()
-            .map(|t| t.points.iter().min_by_key(|p| p.rate_bytes).unwrap().rate_bytes)
+            .map(|t| {
+                t.points
+                    .iter()
+                    .min_by_key(|p| p.rate_bytes)
+                    .unwrap()
+                    .rate_bytes
+            })
             .sum();
         let dd: f64 = tensors
             .iter()
-            .map(|t| t.points.iter().min_by_key(|p| p.rate_bytes).unwrap().distortion)
+            .map(|t| {
+                t.points
+                    .iter()
+                    .min_by_key(|p| p.rate_bytes)
+                    .unwrap()
+                    .distortion
+            })
             .sum();
         UniformBaseline {
             option,
@@ -875,7 +882,10 @@ impl AllocationTable {
         let mut s = String::new();
         s.push_str("{\n");
         s.push_str(&format!("  \"budget_bytes\": {},\n", self.budget_bytes));
-        s.push_str(&format!("  \"generator\": {},\n", json_str(&self.generator)));
+        s.push_str(&format!(
+            "  \"generator\": {},\n",
+            json_str(&self.generator)
+        ));
         s.push_str(&format!(
             "  \"lambda_star\": {},\n",
             match self.lambda_star {
@@ -928,7 +938,10 @@ impl AllocationTable {
                 fmt_float(a.bits_per_weight)
             ));
             s.push_str(&format!("      \"bytes\": {},\n", a.bytes));
-            s.push_str(&format!("      \"distortion\": {},\n", fmt_float(a.distortion)));
+            s.push_str(&format!(
+                "      \"distortion\": {},\n",
+                fmt_float(a.distortion)
+            ));
             s.push_str(&format!(
                 "      \"marginal_dpb\": {},\n",
                 fmt_float(a.marginal_dpb)
@@ -1319,10 +1332,10 @@ pub fn selftest() -> AllocResult<SelftestResult> {
     }
 
     // Invariant 4: steep tensors get >= the precision of every flat one.
-    let worst_steep_rank = option_rank(&by_name["steep.a"].option)
-        .max(option_rank(&by_name["steep.b"].option));
-    let best_flat_rank = option_rank(&by_name["flat.a"].option)
-        .min(option_rank(&by_name["flat.b"].option));
+    let worst_steep_rank =
+        option_rank(&by_name["steep.a"].option).max(option_rank(&by_name["steep.b"].option));
+    let best_flat_rank =
+        option_rank(&by_name["flat.a"].option).min(option_rank(&by_name["flat.b"].option));
     if worst_steep_rank > best_flat_rank {
         failures.push(format!(
             "water-filling starved a steep tensor (rank {worst_steep_rank}) below a flat one (rank {best_flat_rank})"
@@ -1356,7 +1369,9 @@ pub fn selftest() -> AllocResult<SelftestResult> {
     let mut fb_tensors = load_tensors(&doc, &empty)?;
     let fb = allocate_uniform(&mut fb_tensors, "int4-g32", Some(budget));
     if fb.totals.distortion + 1e-12 < table.totals.distortion {
-        failures.push("uniform fallback beat the allocator (impossible at equal/looser footprint)".into());
+        failures.push(
+            "uniform fallback beat the allocator (impossible at equal/looser footprint)".into(),
+        );
     }
 
     Ok(SelftestResult {
@@ -1427,8 +1442,11 @@ mod tests {
 
         let mut tensors = load_tensors(&doc, &empty_bits()).unwrap();
         let table = allocate_waterfill(&mut tensors, budget).unwrap();
-        let by: BTreeMap<&str, &AllocationRecord> =
-            table.allocation.iter().map(|a| (a.tensor.as_str(), a)).collect();
+        let by: BTreeMap<&str, &AllocationRecord> = table
+            .allocation
+            .iter()
+            .map(|a| (a.tensor.as_str(), a))
+            .collect();
         // Steep tensors at least as precise as flat ones.
         let ws = option_rank(&by["steep.a"].option).max(option_rank(&by["steep.b"].option));
         let bf = option_rank(&by["flat.a"].option).min(option_rank(&by["flat.b"].option));
@@ -1523,8 +1541,12 @@ mod tests {
         .unwrap();
         assert!(out.fallback_fired);
         // Every quantizable tensor is int8 (or higher where pinned/floored).
-        let by: BTreeMap<&str, &AllocationRecord> =
-            out.table.allocation.iter().map(|a| (a.tensor.as_str(), a)).collect();
+        let by: BTreeMap<&str, &AllocationRecord> = out
+            .table
+            .allocation
+            .iter()
+            .map(|a| (a.tensor.as_str(), a))
+            .collect();
         // router.gate pinned bf16; others at int8 (their floor / the uniform option).
         assert_eq!(by["router.gate"].option, "bf16");
         for name in ["steep.a", "steep.b", "flat.a", "flat.b", "attn.v"] {
@@ -1545,13 +1567,37 @@ mod tests {
         // table. This documents that a flat distortion landscape produces a sane
         // (cheapest-precision) allocation rather than thrashing.
         let flat_curve = vec![
-            CurveOption { option: "bf16".into(), bits: Some(16.0), distortion: 0.0 },
-            CurveOption { option: "int8".into(), bits: Some(8.0), distortion: 1e-9 },
-            CurveOption { option: "int4-g32".into(), bits: Some(5.0), distortion: 1e-9 },
+            CurveOption {
+                option: "bf16".into(),
+                bits: Some(16.0),
+                distortion: 0.0,
+            },
+            CurveOption {
+                option: "int8".into(),
+                bits: Some(8.0),
+                distortion: 1e-9,
+            },
+            CurveOption {
+                option: "int4-g32".into(),
+                bits: Some(5.0),
+                distortion: 1e-9,
+            },
         ];
         let doc = vec![
-            TensorCurve { name: "a".into(), numel: 1024, pin: None, tier_floor: None, curve: flat_curve.clone() },
-            TensorCurve { name: "b".into(), numel: 1024, pin: None, tier_floor: None, curve: flat_curve },
+            TensorCurve {
+                name: "a".into(),
+                numel: 1024,
+                pin: None,
+                tier_floor: None,
+                curve: flat_curve.clone(),
+            },
+            TensorCurve {
+                name: "b".into(),
+                numel: 1024,
+                pin: None,
+                tier_floor: None,
+                curve: flat_curve,
+            },
         ];
         let cheapest: u64 = load_tensors(&doc, &empty_bits())
             .unwrap()
@@ -1559,12 +1605,24 @@ mod tests {
             .map(|t| t.cheapest().rate_bytes)
             .sum();
         // Loose budget: optimizer runs, surrogate passes -> no fallback.
-        let out = allocate(&doc, &empty_bits(), Method::Waterfill, Some(cheapest * 4), "int4-g32", false).unwrap();
+        let out = allocate(
+            &doc,
+            &empty_bits(),
+            Method::Waterfill,
+            Some(cheapest * 4),
+            "int4-g32",
+            false,
+        )
+        .unwrap();
         assert!(!out.fallback_fired);
         assert!(out.table.totals.surrogate_precheck_pass);
         // Flat curves => bits buy nothing => starved to the cheapest option.
         for a in &out.table.allocation {
-            assert_eq!(a.option, "int4-g32", "flat tensor {} should starve to cheapest", a.tensor);
+            assert_eq!(
+                a.option, "int4-g32",
+                "flat tensor {} should starve to cheapest",
+                a.tensor
+            );
         }
     }
 
@@ -1597,8 +1655,16 @@ mod tests {
             pin: None,
             tier_floor: None,
             curve: vec![
-                CurveOption { option: "bf16".into(), bits: Some(16.0), distortion: 0.01 },
-                CurveOption { option: "int8".into(), bits: Some(8.0), distortion: 0.02 },
+                CurveOption {
+                    option: "bf16".into(),
+                    bits: Some(16.0),
+                    distortion: 0.01,
+                },
+                CurveOption {
+                    option: "int8".into(),
+                    bits: Some(8.0),
+                    distortion: 0.02,
+                },
             ],
         }];
         let err = load_tensors(&doc, &empty_bits()).unwrap_err();
@@ -1612,7 +1678,11 @@ mod tests {
             numel: 100,
             pin: None,
             tier_floor: None,
-            curve: vec![CurveOption { option: "int8".into(), bits: Some(8.0), distortion: -0.1 }],
+            curve: vec![CurveOption {
+                option: "int8".into(),
+                bits: Some(8.0),
+                distortion: -0.1,
+            }],
         }];
         assert!(load_tensors(&doc, &empty_bits()).is_err());
     }
@@ -1624,7 +1694,11 @@ mod tests {
             numel: 100,
             pin: None,
             tier_floor: None,
-            curve: vec![CurveOption { option: "int8".into(), bits: Some(8.0), distortion: 0.0001 }],
+            curve: vec![CurveOption {
+                option: "int8".into(),
+                bits: Some(8.0),
+                distortion: 0.0001,
+            }],
         };
         let doc = vec![one(), one()];
         let err = load_tensors(&doc, &empty_bits()).unwrap_err();
@@ -1638,7 +1712,11 @@ mod tests {
             numel: 100,
             pin: Some("bf16".into()),
             tier_floor: None,
-            curve: vec![CurveOption { option: "int8".into(), bits: Some(8.0), distortion: 0.0001 }],
+            curve: vec![CurveOption {
+                option: "int8".into(),
+                bits: Some(8.0),
+                distortion: 0.0001,
+            }],
         }];
         let err = load_tensors(&doc, &empty_bits()).unwrap_err();
         assert!(err.0.contains("pin"), "{}", err.0);
@@ -1652,9 +1730,21 @@ mod tests {
             pin: None,
             tier_floor: Some("int8".into()),
             curve: vec![
-                CurveOption { option: "bf16".into(), bits: Some(16.0), distortion: 0.0 },
-                CurveOption { option: "int8".into(), bits: Some(8.0), distortion: 0.001 },
-                CurveOption { option: "int4-g32".into(), bits: Some(5.0), distortion: 0.01 },
+                CurveOption {
+                    option: "bf16".into(),
+                    bits: Some(16.0),
+                    distortion: 0.0,
+                },
+                CurveOption {
+                    option: "int8".into(),
+                    bits: Some(8.0),
+                    distortion: 0.001,
+                },
+                CurveOption {
+                    option: "int4-g32".into(),
+                    bits: Some(5.0),
+                    distortion: 0.01,
+                },
             ],
         }];
         let tensors = load_tensors(&doc, &empty_bits()).unwrap();
@@ -1669,9 +1759,24 @@ mod tests {
         // int4-g32 (cheaper) has LOWER distortion than int8 (pricier) — noise.
         // After cummin, the pricier int8 must be clamped to <= the cheaper's.
         let pts = vec![
-            Point { option: "int4-g32".into(), bits: 5.0, distortion: 0.001, rate_bytes: 5 },
-            Point { option: "int8".into(), bits: 8.0, distortion: 0.005, rate_bytes: 8 },
-            Point { option: "bf16".into(), bits: 16.0, distortion: 0.0, rate_bytes: 16 },
+            Point {
+                option: "int4-g32".into(),
+                bits: 5.0,
+                distortion: 0.001,
+                rate_bytes: 5,
+            },
+            Point {
+                option: "int8".into(),
+                bits: 8.0,
+                distortion: 0.005,
+                rate_bytes: 8,
+            },
+            Point {
+                option: "bf16".into(),
+                bits: 16.0,
+                distortion: 0.0,
+                rate_bytes: 16,
+            },
         ];
         let repaired = monotone_repair(&pts);
         // distortion non-increasing as bytes increase.
@@ -1684,9 +1789,24 @@ mod tests {
     fn convex_hull_drops_dominated_interior_point() {
         // 3 points on a straight line: the middle is not strictly below -> dropped.
         let pts = vec![
-            Point { option: "a".into(), bits: 4.0, distortion: 0.004, rate_bytes: 4 },
-            Point { option: "b".into(), bits: 8.0, distortion: 0.002, rate_bytes: 8 },
-            Point { option: "c".into(), bits: 12.0, distortion: 0.0, rate_bytes: 12 },
+            Point {
+                option: "a".into(),
+                bits: 4.0,
+                distortion: 0.004,
+                rate_bytes: 4,
+            },
+            Point {
+                option: "b".into(),
+                bits: 8.0,
+                distortion: 0.002,
+                rate_bytes: 8,
+            },
+            Point {
+                option: "c".into(),
+                bits: 12.0,
+                distortion: 0.0,
+                rate_bytes: 12,
+            },
         ];
         let hull = convex_hull_prune(&pts);
         // Collinear middle is dropped (cross == 0 => popped).

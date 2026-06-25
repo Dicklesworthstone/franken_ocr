@@ -267,7 +267,13 @@ pub fn fuse_no_crop(
     let dim = inputs_embeds.cols;
     let mut blocks: Vec<Mat> = Vec::with_capacity(globals.len());
     for g in globals {
-        blocks.push(assemble_global_block(g, h, w, image_newline, view_seperator)?);
+        blocks.push(assemble_global_block(
+            g,
+            h,
+            w,
+            image_newline,
+            view_seperator,
+        )?);
     }
     let refs: Vec<&Mat> = blocks.iter().collect();
     let features = vstack(&refs, dim)?;
