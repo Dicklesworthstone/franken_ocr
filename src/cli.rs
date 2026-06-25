@@ -93,11 +93,15 @@ pub enum QuantTarget {
 /// Dispatch a parsed CLI invocation.
 pub fn run(cli: Cli) -> FocrResult<()> {
     match cli.command {
-        Command::Robot { cmd: RobotCmd::Schema } => {
+        Command::Robot {
+            cmd: RobotCmd::Schema,
+        } => {
             emit(&robot::robot_schema());
             Ok(())
         }
-        Command::Robot { cmd: RobotCmd::Health } => {
+        Command::Robot {
+            cmd: RobotCmd::Health,
+        } => {
             // Phase 0: minimal health. The full report (model resolution, arch
             // features, thread budget) lands in Phase 5 (plan §7.3).
             emit(&serde_json::json!({
@@ -109,7 +113,9 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             }));
             Ok(())
         }
-        Command::Robot { cmd: RobotCmd::Backends } => {
+        Command::Robot {
+            cmd: RobotCmd::Backends,
+        } => {
             // Real runtime SIMD-tier detection lands in Phase 3 (plan §6.2).
             emit(&serde_json::json!({
                 "schema_version": robot::ROBOT_SCHEMA_VERSION,
@@ -122,9 +128,11 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             }));
             Ok(())
         }
-        Command::Ocr { .. } => Err(FocrError::NotImplemented(
-            "focr ocr — the model forward lands in Phase 1 (see COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md §10)".into(),
-        )),
+        Command::Ocr { robot: true, .. } => {
+            emit(&robot::run_start_event("ocr"));
+            Err(ocr_not_implemented())
+        }
+        Command::Ocr { .. } => Err(ocr_not_implemented()),
         Command::Convert { .. } => Err(FocrError::NotImplemented(
             "focr convert — the weight transformer lands in Phase 2 (see plan §5)".into(),
         )),
@@ -132,6 +140,12 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             "focr doctor — lands in Phase 5 (see plan §7)".into(),
         )),
     }
+}
+
+fn ocr_not_implemented() -> FocrError {
+    FocrError::NotImplemented(
+        "focr ocr — the model forward lands in Phase 1 (see COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md §10)".into(),
+    )
 }
 
 fn emit(value: &serde_json::Value) {

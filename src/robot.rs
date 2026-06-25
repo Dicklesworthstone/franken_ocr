@@ -20,7 +20,20 @@ pub fn robot_schema() -> Value {
         "schema_version": ROBOT_SCHEMA_VERSION,
         "events": EVENT_KINDS,
         "exit_codes": EXIT_CODE_TABLE,
-        "status": "skeleton — run_error is wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+        "status": "skeleton — run_start/run_error are wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+    })
+}
+
+/// Build the robot-mode `run_start` event for the current command.
+///
+/// The full Phase-1+ pipeline will attach run IDs, model identity, and resolved
+/// options. Phase 0 still emits the event so the stream shape is stable before a
+/// terminal `run_error`.
+pub fn run_start_event(command: &str) -> Value {
+    json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "run_start",
+        "command": command,
     })
 }
 
@@ -88,5 +101,13 @@ mod tests {
             assert_eq!(event["code"], err.exit_code());
             assert_eq!(event["message"], err.to_string());
         }
+    }
+
+    #[test]
+    fn run_start_event_carries_schema_and_command() {
+        let event = run_start_event("ocr");
+        assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
+        assert_eq!(event["event"], "run_start");
+        assert_eq!(event["command"], "ocr");
     }
 }

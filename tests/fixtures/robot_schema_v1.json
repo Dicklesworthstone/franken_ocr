@@ -49,5 +49,5 @@
     }
   ],
   "schema_version": 1,
-  "status": "skeleton — run_error is wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+  "status": "skeleton — run_start/run_error are wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
 }
