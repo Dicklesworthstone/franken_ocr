@@ -29,6 +29,22 @@ use super::tensor::Mat;
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
 
+fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} * {rhs})"
+        ))
+    })
+}
+
+fn checked_shape_sub(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_sub(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize underflow computing {expression} ({lhs} - {rhs})"
+        ))
+    })
+}
+
 /// CLIP-L/14 build parameters ([SPEC-047], `deepencoder.py:514-532`).
 #[derive(Debug, Clone, Copy)]
 pub struct ClipConfig {
@@ -367,11 +383,17 @@ fn linear(w: &LinearParams, x: &Mat) -> FocrResult<Mat> {
             w.in_features
         )));
     }
-    if w.weight.len() != w.out_features * w.in_features {
+    let expected_weight_len = checked_shape_mul(
+        "vision_clip linear",
+        w.out_features,
+        w.in_features,
+        "out*in",
+    )?;
+    if w.weight.len() != expected_weight_len {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_clip linear: weight len {} != out*in {}",
             w.weight.len(),
-            w.out_features * w.in_features
+            expected_weight_len
         )));
     }
     let wt = transpose(&w.weight, w.out_features, w.in_features);
@@ -426,29 +448,46 @@ fn prepend_class_token(class_embedding: &[f32], patches: &Mat) -> Mat {
 /// interpolated from `src×src` to `tgt×tgt`, the CLS row passing through
 /// unchanged.
 fn abs_pos_for_len(table: &[f32], num_positions: usize, dim: usize, seq: usize) -> FocrResult<Mat> {
-    if table.len() != num_positions * dim {
+    let expected_table_len = checked_shape_mul(
+        "vision_clip abs_pos",
+        num_positions,
+        dim,
+        "num_positions*dim",
+    )?;
+    if table.len() != expected_table_len {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_clip abs_pos: table len {} != num_positions*dim {}",
             table.len(),
-            num_positions * dim
+            expected_table_len
+        )));
+    }
+    if num_positions == 0 || seq == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip abs_pos: num_positions ({num_positions}) and seq ({seq}) must be non-zero"
         )));
     }
     if seq == num_positions {
         return Ok(Mat::from_vec(seq, dim, table.to_vec()));
     }
-    let src = isqrt(num_positions - 1);
-    let tgt = isqrt(seq - 1);
-    if src * src != num_positions - 1 || tgt * tgt != seq - 1 {
+    let num_patches =
+        checked_shape_sub("vision_clip abs_pos", num_positions, 1, "num_positions-1")?;
+    let runtime_patches = checked_shape_sub("vision_clip abs_pos", seq, 1, "seq-1")?;
+    let src = isqrt(num_patches);
+    let tgt = isqrt(runtime_patches);
+    let src_square = checked_shape_mul("vision_clip abs_pos", src, src, "src*src")?;
+    let tgt_square = checked_shape_mul("vision_clip abs_pos", tgt, tgt, "tgt*tgt")?;
+    if src_square != num_patches || tgt_square != runtime_patches {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_clip abs_pos: non-square grids (src²={}, num_patches={}, tgt²={}, runtime_patches={})",
-            src * src,
-            num_positions - 1,
-            tgt * tgt,
-            seq - 1
+            src_square,
+            num_patches,
+            tgt_square,
+            runtime_patches
         )));
     }
 
-    let mut out = vec![0.0f32; seq * dim];
+    let out_len = checked_shape_mul("vision_clip abs_pos", seq, dim, "seq*dim")?;
+    let mut out = vec![0.0f32; out_len];
     // CLS row passes through.
     out[..dim].copy_from_slice(&table[..dim]);
 
@@ -736,6 +775,18 @@ mod tests {
         assert!(linear(&w, &x).is_err());
     }
 
+    #[test]
+    fn linear_rejects_weight_shape_product_overflow_without_panic() {
+        let w = LinearParams {
+            weight: Vec::new(),
+            bias: None,
+            out_features: usize::MAX,
+            in_features: 2,
+        };
+        let x = Mat::zeros(1, 2);
+        assert_err_contains(linear(&w, &x), "out*in");
+    }
+
     // ── class token + abs pos ──────────────────────────────────────────────
 
     #[test]
@@ -788,6 +839,19 @@ mod tests {
         // num_positions-1 = 3 is not a perfect square.
         let table = vec![0.0f32; 4 * 2];
         assert!(abs_pos_for_len(&table, 4, 2, 5).is_err());
+    }
+
+    #[test]
+    fn abs_pos_rejects_shape_product_overflow_without_panic() {
+        assert_err_contains(abs_pos_for_len(&[], usize::MAX, 2, 1), "num_positions*dim");
+    }
+
+    #[test]
+    fn abs_pos_rejects_zero_lengths_without_underflow() {
+        assert_err_contains(abs_pos_for_len(&[], 0, 2, 1), "non-zero");
+
+        let table = vec![0.0f32; 2];
+        assert_err_contains(abs_pos_for_len(&table, 1, 2, 0), "non-zero");
     }
 
     // ── bicubic kernel sanity ──────────────────────────────────────────────
