@@ -49,6 +49,14 @@ pub const LN_EPS: f32 = 1e-6;
 /// MLP hidden = `dim * mlp_ratio` (`mlp_ratio = 4`).
 pub const MLP_HIDDEN: usize = EMBED_DIM * 4;
 
+fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} * {rhs})"
+        ))
+    })
+}
+
 // ── parameter bundles ──────────────────────────────────────────────────────
 
 /// A `nn.Linear` parameter pair (`[out, in]` row-major weight + length-`out`
@@ -233,12 +241,19 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
             image.rows
         )));
     }
-    if image.cols != h * win {
+    if h == 0 || win == 0 {
         return Err(FocrError::Other(anyhow::anyhow!(
-            "vision_sam: image.cols {} != H*W {}*{}",
+            "vision_sam: spatial dims ({h},{win}) must be non-zero"
+        )));
+    }
+    let expected_cols = checked_shape_mul("vision_sam", h, win, "H*W")?;
+    if image.cols != expected_cols {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam: image.cols {} != H*W {}*{} ({})",
             image.cols,
             h,
-            win
+            win,
+            expected_cols
         )));
     }
     if !h.is_multiple_of(PATCH) || !win.is_multiple_of(PATCH) {
@@ -1652,6 +1667,26 @@ mod tests {
         // 20 is not a multiple of PATCH(16)
         let img = Mat::from_vec(3, 20 * 20, vec![0.0; 3 * 20 * 20]);
         assert!(forward_with(&w, &img, 20, 20).is_err());
+    }
+
+    #[test]
+    fn forward_with_rejects_zero_spatial_dims_before_conv() {
+        let w = tiny_weights_minimal();
+        let img = Mat::from_vec(3, 0, Vec::new());
+        assert!(matches!(
+            forward_with(&w, &img, 0, 0),
+            Err(err) if err.to_string().contains("non-zero")
+        ));
+    }
+
+    #[test]
+    fn forward_with_rejects_spatial_product_overflow_before_conv() {
+        let w = tiny_weights_minimal();
+        let img = Mat::from_vec(3, 0, Vec::new());
+        assert!(matches!(
+            forward_with(&w, &img, usize::MAX, 2),
+            Err(err) if err.to_string().contains("H*W")
+        ));
     }
 
     /// A structurally-valid all-zero SamWeights for negative-path tests
