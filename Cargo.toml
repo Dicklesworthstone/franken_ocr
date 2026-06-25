@@ -28,24 +28,37 @@ serde_json = "1"
 thiserror = "2"
 anyhow = "1"
 
-# ── Phase 1+ dependencies (wired as the engine lands; see COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md §4.1, bead p0). ──
-# Kept commented so the Phase-0 skeleton builds with a minimal surface and a fast,
-# reliable `cargo check`. Uncomment per the roadmap — these are the REAL intended deps,
-# mirroring the proven franken_whisper wiring.
+# ── Phase 1+ engine substrate (bd-223.1 + engine wiring). ──
+# These mirror the PROVEN franken_whisper dep block (they are PROVEN to compile
+# together there). See PROPOSED_ARCHITECTURE.md §2/§5 and the truth-pack spec.
 #
-# asupersync         = { version = ">=0.3.5, <0.4", default-features = false }  # engine-owns-runtime (plan §3.3); local /dp/asupersync = 0.3.5
-# ft-kernel-cpu      = { path = "../frankentorch/crates/ft-kernel-cpu" }   # int8 dot (SDOT/VNNI), GEMM, conv2d, sdpa, rmsnorm...
-# ft-core            = { path = "../frankentorch/crates/ft-core" }         # TensorMeta / DType / Device / Float16
-# ft-serialize       = { path = "../frankentorch/crates/ft-serialize" }    # safetensors BF16 load (the converter, Phase 2)
-# half               = { version = "2", features = ["std"] }               # f16/bf16 storage types
-# fsqlite            = { path = "../frankensqlite/crates/fsqlite" }         # run state + telemetry (NEVER rusqlite)
-# fsqlite-types      = { path = "../frankensqlite/crates/fsqlite-types" }
-# image              = "0.25"                                              # image decode/resize/normalize (preprocess front end)
-# ctrlc              = "3.4"                                               # ShutdownController (sync main, plan §3.3)
-# tracing            = "0.1"
-# tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-# uuid               = { version = "1", features = ["serde", "v4"] }
-# sha2               = "0.10"                                              # .focrq provenance + model version tag
+# asupersync: orchestration/cancellation/IO only — the engine owns exactly one
+# Runtime below the sync public API (plan §3.3). default-features=false keeps the
+# surface minimal. Local /dp/asupersync = 0.3.5 satisfies ">=0.3.5,<0.4".
+asupersync = { version = ">=0.3.5, <0.4", default-features = false }
+# FrankenTorch compute kernels for the in-process native OCR engine: int8 dynamic
+# linear (SDOT/VNNI), GEMM/sgemm, conv2d (im2col), sdpa, rms_norm, layer_norm.
+ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu" }
+# TensorMeta / DType / Device / Float16 — the meta types the kernel entrypoints take.
+ft-core = { path = "../frankentorch/crates/ft-core" }
+# Direct dep on `half` (the same crate ft-core re-exports as `Float16`) for its
+# SIMD bulk f16->f32 dequant; `std` enables the runtime aarch64 fp16 / x86 f16c
+# vector paths. Pinned to ft-core's major version.
+half = { version = "2", features = ["std"] }
+# Durable run state + telemetry on frankensqlite — NEVER rusqlite (plan §10).
+fsqlite = { path = "../frankensqlite/crates/fsqlite" }
+fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
+# Image decode/resize/normalize/pad/tile — the preprocess front end (plan §6.2).
+image = "0.25"
+
+# The `>=0.3.5,<0.4` asupersync the engine needs is not yet on crates.io (the
+# index tops out at 0.3.4); it lives as the local sibling crate `/dp/asupersync`
+# (version 0.3.5). Patch crates-io to that path so the whole dependency graph —
+# franken_ocr's direct dep AND the fsqlite/frankentorch path-deps that pin
+# `0.3.4` — unifies on the single local 0.3.5 (which satisfies both ^0.3.4 and
+# >=0.3.5,<0.4). One asupersync in the tree; no version skew.
+[patch.crates-io]
+asupersync = { path = "../asupersync" }
 
 [lints.rust]
 unsafe_code = "deny"

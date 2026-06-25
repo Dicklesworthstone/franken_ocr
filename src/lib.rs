@@ -12,7 +12,10 @@
 
 pub mod cli;
 pub mod error;
+pub mod native_engine;
+pub mod preprocess;
 pub mod robot;
+pub mod tokenizer;
 
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
