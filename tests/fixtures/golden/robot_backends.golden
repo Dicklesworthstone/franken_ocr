@@ -2,8 +2,15 @@
   "logical_cpus": "[cpus]",
   "schema_version": 1,
   "simd_tiers": {
-    "available": [],
-    "selected": null,
-    "status": "runtime detection lands in Phase 3 (plan §6.2)"
+    "available": [
+      {
+        "feature": "[simd-feature]",
+        "tag": "[simd-tier]"
+      }
+    ],
+    "override_env": "FOCR_FORCE_ARCH",
+    "selected": "[simd-tier]",
+    "selected_feature": "[simd-feature]",
+    "status": "runtime detection active"
   }
 }

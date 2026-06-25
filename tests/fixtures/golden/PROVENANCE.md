@@ -37,8 +37,10 @@ on all 5 release targets:
 - the package **version** string (e.g. `0.0.0`) → `[version]` (so a `Cargo.toml`
   version bump does not flap `--help` / `--version`);
 - `logical_cpus` value in `robot backends` → `[cpus]` (host core count);
-- the SIMD-tier `available`/`selected`/`status` host-specific fields are matched
-  structurally, not byte-exact, until `FOCR_FORCE_ARCH` pins them (plan §6.2);
+- the SIMD-tier `available`/`selected`/`selected_feature` fields in `robot
+  backends` are asserted structurally, then scrubbed to `[simd-tier]` /
+  `[simd-feature]` because they vary by host (AMX/VNNI/SDOT/SMMLA/scalar);
+  `FOCR_FORCE_ARCH` is the advertised override for pinned perf runs (plan §6.2);
 - absolute paths → `[path]`.
 
 `*.golden` files here are the committed baseline; `*.actual` are the transient

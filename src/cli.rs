@@ -11,7 +11,7 @@
 //! points at its own thin shim that just calls [`cli_main`]. See AGENTS.md
 //! doctrine #9.
 
-use crate::{FocrError, FocrResult, robot};
+use crate::{FocrError, FocrResult, robot, simd};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::process::ExitCode;
 
@@ -116,16 +116,7 @@ pub fn run(cli: Cli) -> FocrResult<()> {
         Command::Robot {
             cmd: RobotCmd::Backends,
         } => {
-            // Real runtime SIMD-tier detection lands in Phase 3 (plan §6.2).
-            emit(&serde_json::json!({
-                "schema_version": robot::ROBOT_SCHEMA_VERSION,
-                "simd_tiers": {
-                    "selected": null,
-                    "available": [],
-                    "status": "runtime detection lands in Phase 3 (plan §6.2)"
-                },
-                "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
-            }));
+            emit(&robot_backends_payload());
             Ok(())
         }
         Command::Ocr { robot: true, .. } => {
@@ -154,6 +145,30 @@ fn emit(value: &serde_json::Value) {
         "{}",
         serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
     );
+}
+
+fn robot_backends_payload() -> serde_json::Value {
+    let available: Vec<_> = simd::available_tiers()
+        .iter()
+        .map(|tier| {
+            serde_json::json!({
+                "tag": tier.tag(),
+                "feature": tier.feature_string(),
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "schema_version": robot::ROBOT_SCHEMA_VERSION,
+        "simd_tiers": {
+            "selected": simd::detected_tier().tag(),
+            "selected_feature": simd::tier_string(),
+            "available": available,
+            "override_env": "FOCR_FORCE_ARCH",
+            "status": "runtime detection active"
+        },
+        "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -224,5 +239,24 @@ mod tests {
             },
         };
         assert_eq!(ErrorMode::from_cli(&cli), ErrorMode::Robot);
+    }
+
+    #[test]
+    fn robot_backends_reflects_simd_dispatch_snapshot() {
+        let payload = robot_backends_payload();
+        let tiers = &payload["simd_tiers"];
+        assert_eq!(payload["schema_version"], robot::ROBOT_SCHEMA_VERSION);
+        assert_eq!(tiers["selected"], simd::detected_tier().tag());
+        assert_eq!(tiers["selected_feature"], simd::tier_string());
+        assert_eq!(tiers["override_env"], "FOCR_FORCE_ARCH");
+
+        assert!(
+            tiers["available"].as_array().is_some_and(|available| {
+                !available.is_empty()
+                    && available.last().and_then(|v| v["tag"].as_str())
+                        == Some(simd::IsaTier::Scalar.tag())
+            }),
+            "available tiers must be a non-empty array ending with the scalar floor"
+        );
     }
 }

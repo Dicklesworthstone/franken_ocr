@@ -23,7 +23,7 @@
 //!   [R4] every `EVENT_KIND` (`run_start,stage,page,run_complete,run_error`)
 //!        is present in the advertised `events`.                                -> robot_schema_advertises_version_and_all_events
 //!   [R5] `robot health` is a single JSON line carrying `schema_version`.       -> robot_health_golden
-//!   [R6] `robot backends` is a single JSON line; host `logical_cpus` scrubbed. -> robot_backends_golden
+//!   [R6] `robot backends` is a single JSON line; host CPU/SIMD fields scrubbed. -> robot_backends_golden
 //!   [R7] robot mode is data-only on stdout (no human decoration mixed in).    -> robot_*_stdout_is_pure_json
 //!   [R8] `ocr --robot` errors emit run_start then run_error.code from
 //!        FocrError::exit_code.                                                -> ocr_robot_error_stream_matches_exit_code
@@ -166,6 +166,76 @@ fn scrub_json_int_field(s: &str, name: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+/// Assert the live `robot backends` SIMD block is structurally valid, then scrub
+/// host-specific tier values so one golden covers x86, ARM, and scalar-only CI.
+fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
+    assert!(
+        v.get("simd_tiers")
+            .and_then(serde_json::Value::as_object)
+            .is_some(),
+        "robot backends simd_tiers must be an object"
+    );
+    let Some(tiers) = v
+        .get_mut("simd_tiers")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return;
+    };
+
+    assert_nonempty_string(tiers.get("selected"), "simd_tiers.selected");
+    assert_nonempty_string(tiers.get("selected_feature"), "simd_tiers.selected_feature");
+    assert_eq!(
+        tiers
+            .get("override_env")
+            .and_then(serde_json::Value::as_str),
+        Some("FOCR_FORCE_ARCH"),
+        "robot backends must advertise the supported tier override env var"
+    );
+    assert_eq!(
+        tiers.get("status").and_then(serde_json::Value::as_str),
+        Some("runtime detection active"),
+        "robot backends must not regress to the stale Phase-3 placeholder"
+    );
+
+    let available = tiers.get("available").and_then(serde_json::Value::as_array);
+    assert!(
+        available.is_some_and(|tiers| !tiers.is_empty()),
+        "simd_tiers.available must include at least the scalar floor"
+    );
+    let Some(available) = available else {
+        return;
+    };
+    for (idx, tier) in available.iter().enumerate() {
+        assert_nonempty_string(tier.get("tag"), &format!("simd_tiers.available[{idx}].tag"));
+        assert_nonempty_string(
+            tier.get("feature"),
+            &format!("simd_tiers.available[{idx}].feature"),
+        );
+    }
+
+    tiers.insert("selected".into(), serde_json::json!("[simd-tier]"));
+    tiers.insert(
+        "selected_feature".into(),
+        serde_json::json!("[simd-feature]"),
+    );
+    tiers.insert(
+        "available".into(),
+        serde_json::json!([{
+            "tag": "[simd-tier]",
+            "feature": "[simd-feature]"
+        }]),
+    );
+}
+
+fn assert_nonempty_string(value: Option<&serde_json::Value>, field: &str) {
+    assert!(
+        value
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty()),
+        "{field} must be a non-empty string"
+    );
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -592,10 +662,9 @@ fn robot_health_golden() {
     assert_golden(test, "robot_health", &format!("{canon}\n"));
 }
 
-/// [R6] `robot backends` golden. `logical_cpus` is host-dependent and the
-/// `simd_tiers` block is a Phase-0 scaffold; we scrub `logical_cpus` and freeze
-/// the rest (the per-host SIMD tier becomes deterministic once `FOCR_FORCE_ARCH`
-/// is honored in Phase 3 — until then the scaffold payload is constant).
+/// [R6] `robot backends` golden. `logical_cpus` and the selected/available SIMD
+/// tiers are host-dependent; the test asserts the live shape, then scrubs those
+/// values before freezing the contract.
 #[test]
 fn robot_backends_golden() {
     let test = "robot_backends_golden";
@@ -610,8 +679,10 @@ fn robot_backends_golden() {
         Some(EXPECTED_SCHEMA_VERSION),
         "robot backends must carry schema_version; line: {line}"
     );
+    let mut scrubbed_v = v;
+    scrub_robot_backend_tiers(&mut scrubbed_v);
     // canonicalize, then scrub the host cpu count to [cpus].
-    let canon = canonical_json(&v);
+    let canon = canonical_json(&scrubbed_v);
     let scrubbed = scrub(&canon);
     tlog!(test,
         "case": "robot_backends",
@@ -619,7 +690,7 @@ fn robot_backends_golden() {
         "stage": "robot_backends",
         "inputs": {"argv": ["robot", "backends"]},
         "result": "pass",
-        "detail": "freezing canonical robot-backends payload; logical_cpus scrubbed to [cpus]",
+        "detail": "freezing canonical robot-backends payload; host CPU/SIMD fields scrubbed",
     );
     // belt-and-suspenders: the scrub must have removed the raw host count.
     assert!(
