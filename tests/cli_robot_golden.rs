@@ -135,10 +135,13 @@ fn scrub(s: &str) -> String {
 }
 
 /// Replace the integer value of a top-level-ish JSON field `"<name>": <int>` with
-/// `"<name>": "[<name>]"` so a host-dependent count does not flap a golden. A
-/// tiny hand-rolled stand-in for an insta redaction (no `regex` dep).
+/// the stable token `"[<placeholder>]"` so a host-dependent count does not flap a
+/// golden. A tiny hand-rolled stand-in for an insta redaction (no `regex` dep).
+/// The canonical scrub token can differ from the field name because the frozen
+/// goldens/PROVENANCE pin short semantic tokens (`logical_cpus` -> `[cpus]`).
 fn scrub_json_int_field(s: &str, name: &str) -> String {
     let needle = format!("\"{name}\":");
+    let placeholder = if name == "logical_cpus" { "cpus" } else { name };
     let mut result = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(pos) = rest.find(&needle) {
@@ -154,7 +157,7 @@ fn scrub_json_int_field(s: &str, name: &str) -> String {
             .take_while(|&(i, c)| c.is_ascii_digit() || (i == 0 && c == '-'))
             .count();
         if digits_end > 0 {
-            result.push_str(&format!("\"[{name}]\""));
+            result.push_str(&format!("\"[{placeholder}]\""));
             rest = &trimmed[digits_end..];
         } else {
             // not an integer here (e.g. already scrubbed); leave as-is

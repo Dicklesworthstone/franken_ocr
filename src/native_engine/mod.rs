@@ -86,6 +86,48 @@ fn model_cache() -> &'static ModelCache {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
+fn looks_like_safetensors_container(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 {
+        return false;
+    }
+    let Ok(header_len_bytes) = bytes[..8].try_into() else {
+        return false;
+    };
+    let header_len = u64::from_le_bytes(header_len_bytes) as usize;
+    let Some(header_end) = 8usize.checked_add(header_len) else {
+        return false;
+    };
+    if header_len == 0 || header_end > bytes.len() {
+        return false;
+    }
+    bytes[8..header_end]
+        .iter()
+        .copied()
+        .find(|b| !b.is_ascii_whitespace())
+        == Some(b'{')
+}
+
+fn looks_like_weight_container(bytes: &[u8]) -> bool {
+    bytes.starts_with(weights::FOCRQ_MAGIC) || looks_like_safetensors_container(bytes)
+}
+
+fn load_weights_from_resolved_model(resolved: &Path, bytes: Vec<u8>) -> FocrResult<Weights> {
+    let recognized_container = looks_like_weight_container(&bytes);
+    Weights::from_bytes(bytes).map_err(|e| {
+        if recognized_container {
+            e
+        } else {
+            FocrError::NotImplemented(format!(
+                "native_engine::OcrModel::load — {} exists but is not a recognized model \
+                 container, and the resolver that turns an arbitrary existing path into a \
+                 validated Unlimited-OCR model (header-sniff bd-223.7 / manifest census \
+                 Phase 2) is not yet implemented; underlying parse: {e}",
+                resolved.display()
+            ))
+        }
+    })
+}
+
 impl OcrModel {
     /// Resolve `path` to a concrete model artifact (`.focrq` blob or a
     /// safetensors directory) — the header-sniff / search-path logic
@@ -116,14 +158,16 @@ impl OcrModel {
     /// file is unreadable). Until the header-sniff resolver (bd-223.7) and the
     /// manifest census land, an *existing* path whose bytes are not a recognized
     /// model container surfaces [`FocrError::NotImplemented`] (the real model
-    /// resolution/assembly is not wired yet) rather than leaking the low-level
-    /// container [`FocrError::FormatMismatch`] from [`Weights::load`]. A genuine
-    /// model container parses and loads as today.
+    /// resolution/assembly is not wired yet). Recognized `.focrq` / safetensors
+    /// containers preserve structural [`FocrError::FormatMismatch`] errors so the
+    /// public format/version exit-code contract remains intact.
     pub fn load(path: &Path) -> FocrResult<Arc<Self>> {
         let resolved = Self::resolve_model(path)?;
 
         let cache = model_cache();
-        let mut guard = cache.lock().expect("model cache mutex poisoned");
+        let mut guard = cache
+            .lock()
+            .map_err(|_| FocrError::Other(anyhow::anyhow!("model cache mutex poisoned")))?;
         if let Some((cached_path, weak)) = guard.as_ref()
             && *cached_path == resolved
             && let Some(strong) = weak.upgrade()
@@ -131,29 +175,18 @@ impl OcrModel {
             return Ok(strong);
         }
 
-        // `resolve_model` is still a skeleton that accepts ANY existing path —
-        // the header-sniff resolver that confirms a real model artifact is
-        // bd-223.7. So an existing-but-non-model path slips past `resolve` and
-        // reaches `Weights::load`, which reports a low-level container
-        // `FormatMismatch` that misrepresents the situation: the real reason it
-        // can't load is that the model package's resolve + manifest-census
-        // assembly is not implemented yet. Map that case to a clean
-        // `NotImplemented`. A genuinely unreadable file stays `ModelNotFound`
-        // (TOCTOU / permissions after the existence check); a real model
-        // container parses to `Ok` and is unaffected.
-        let weights = Weights::load(&resolved).map_err(|e| {
-            if matches!(e, FocrError::ModelNotFound(_)) {
-                e
-            } else {
-                FocrError::NotImplemented(format!(
-                    "native_engine::OcrModel::load — {} exists but is not a recognized model \
-                     container, and the resolver that turns an arbitrary existing path into a \
-                     validated Unlimited-OCR model (header-sniff bd-223.7 / manifest census \
-                     Phase 2) is not yet implemented; underlying parse: {e}",
-                    resolved.display()
-                ))
-            }
+        // `resolve_model` is still a skeleton that accepts ANY existing path. A
+        // random non-model file therefore reaches the byte parser; keep that as
+        // the friendlier "resolver not implemented" category, but do not hide
+        // true structural errors once the bytes identify themselves as `.focrq`
+        // or safetensors (future `.focrq` versions must remain exit code 7).
+        let bytes = std::fs::read(&resolved).map_err(|e| {
+            FocrError::ModelNotFound(format!(
+                "cannot read weights at {}: {e}",
+                resolved.display()
+            ))
         })?;
+        let weights = load_weights_from_resolved_model(&resolved, bytes)?;
         let model = Arc::new(Self {
             path: resolved.clone(),
             weights,
@@ -515,6 +548,43 @@ mod tests {
         let _ = std::fs::remove_file(&tmp); // best-effort cleanup (not a delete of source)
         // resolve_model accepts an existing path; Weights::load is the stub.
         assert!(matches!(r, Err(FocrError::NotImplemented(_))));
+    }
+
+    fn minimal_focrq_blob(version: u32, header_json: &str, payload: &[u8]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(weights::FOCRQ_MAGIC);
+        blob.extend_from_slice(&version.to_le_bytes());
+        blob.push(0);
+        blob.extend_from_slice(&[0u8; 32]);
+        blob.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+        blob.extend_from_slice(header_json.as_bytes());
+        blob.extend_from_slice(payload);
+        blob
+    }
+
+    #[test]
+    fn load_future_focrq_version_preserves_format_mismatch() {
+        let payload = [0u8, 0u8];
+        let header = "{\"t\":{\"dtype\":\"BF16\",\"shape\":[1],\"byte_offset\":0,\"byte_len\":2}}";
+        let err = load_weights_from_resolved_model(
+            Path::new("future-version.focrq"),
+            minimal_focrq_blob(weights::FOCRQ_FORMAT_VERSION + 1, header, &payload),
+        )
+        .unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert_eq!(err.exit_code(), crate::error::EXIT_FORMAT_MISMATCH);
+        assert!(format!("{err}").contains("newer than this binary"));
+    }
+
+    #[test]
+    fn load_malformed_safetensors_preserves_format_mismatch() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(1u64).to_le_bytes());
+        bytes.extend_from_slice(b"{");
+        let err =
+            load_weights_from_resolved_model(Path::new("bad.safetensors"), bytes).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert_eq!(err.exit_code(), crate::error::EXIT_FORMAT_MISMATCH);
     }
 
     // ── stage-helper wiring (no weights required) ──────────────────────────────
