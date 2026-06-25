@@ -50,6 +50,10 @@ def sha256_file(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
+def is_json_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def load_json(path: Path, failures: list[str]) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -124,7 +128,7 @@ def validate_provenance(path: Path, value: dict[str, Any], failures: list[str]) 
         failures.append(f"{path}: exact_command must name gen_reference_fixtures.py")
 
     model_bytes = provenance.get("model_weights_bytes")
-    ok_bytes = isinstance(model_bytes, int) and model_bytes > 0
+    ok_bytes = is_json_int(model_bytes) and model_bytes > 0
     emit("oracle-model-bytes", ok_bytes, file=str(path.relative_to(ROOT)), bytes=model_bytes)
     if not ok_bytes:
         failures.append(f"{path}: model_weights_bytes must be a positive integer")
@@ -134,7 +138,7 @@ def validate_provenance(path: Path, value: dict[str, Any], failures: list[str]) 
         fail(failures, f"{path}: missing determinism object", "oracle-determinism-object", file=str(path.relative_to(ROOT)))
     else:
         seed = determinism.get("seed")
-        ok_seed = isinstance(seed, int) and seed >= 0
+        ok_seed = is_json_int(seed) and seed >= 0
         emit("oracle-determinism-seed", ok_seed, file=str(path.relative_to(ROOT)), seed=seed)
         if not ok_seed:
             failures.append(f"{path}: determinism.seed must be a non-negative integer")
@@ -183,13 +187,14 @@ def validate_deterministic_replay(
         return
     emit("oracle-replay-object", True, file=str(path.relative_to(ROOT)))
 
-    schema_ok = replay.get("schema_version") == REPLAY_SCHEMA_VERSION
+    schema_version = replay.get("schema_version")
+    schema_ok = is_json_int(schema_version) and schema_version == REPLAY_SCHEMA_VERSION
     emit("oracle-replay-schema", schema_ok, file=str(path.relative_to(ROOT)), schema_version=replay.get("schema_version"))
     if not schema_ok:
         failures.append(f"{path}: deterministic_replay.schema_version must be {REPLAY_SCHEMA_VERSION}")
 
     seed = replay.get("rng_seed")
-    seed_ok = isinstance(seed, int) and seed >= 0
+    seed_ok = is_json_int(seed) and seed >= 0
     emit("oracle-replay-seed", seed_ok, file=str(path.relative_to(ROOT)), seed=seed)
     if not seed_ok:
         failures.append(f"{path}: deterministic_replay.rng_seed must be a non-negative integer")
@@ -206,7 +211,7 @@ def validate_deterministic_replay(
 
     prefix_chars = replay.get("expected_prefix_chars")
     expected_chars = len(decoded) if isinstance(decoded, str) else None
-    chars_ok = isinstance(prefix_chars, int) and prefix_chars == expected_chars
+    chars_ok = is_json_int(prefix_chars) and prefix_chars == expected_chars
     emit("oracle-replay-prefix-chars", chars_ok, file=str(path.relative_to(ROOT)), expected=expected_chars, actual=prefix_chars)
     if not chars_ok:
         failures.append(f"{path}: deterministic_replay.expected_prefix_chars mismatch")
@@ -240,11 +245,14 @@ def validate_deterministic_replay(
                 failures.append(f"{path}: replay seed does not match provenance determinism seed")
 
 
-def validate_reference_json(path: Path, failures: list[str]) -> set[Path]:
+def validate_reference_payload(path: Path, value: dict[str, Any], failures: list[str]) -> set[Path]:
     covered_npys: set[Path] = set()
-    value = load_json(path, failures)
-    if value is None:
-        return covered_npys
+    schema_version = value.get("schema_version")
+    schema_ok = is_json_int(schema_version) and schema_version == 1
+    emit("oracle-reference-schema", schema_ok, file=str(path.relative_to(ROOT)), schema_version=schema_version)
+    if not schema_ok:
+        failures.append(f"{path}: schema_version must be 1")
+
     validate_provenance(path, value, failures)
 
     decoded = value.get("decoded_text")
@@ -268,7 +276,7 @@ def validate_reference_json(path: Path, failures: list[str]) -> set[Path]:
     activations = value.get("activations", {})
     if not isinstance(activations, dict):
         fail(failures, f"{path}: activations must be an object", "oracle-activations-object", file=str(path.relative_to(ROOT)))
-        return
+        return covered_npys
     stem = path.name.removesuffix("_reference.json")
     for stage, record in sorted(activations.items()):
         if not isinstance(record, dict):
@@ -291,11 +299,19 @@ def validate_reference_json(path: Path, failures: list[str]) -> set[Path]:
     return covered_npys
 
 
+def validate_reference_json(path: Path, failures: list[str]) -> set[Path]:
+    value = load_json(path, failures)
+    if value is None:
+        return set()
+    return validate_reference_payload(path, value, failures)
+
+
 def validate_manifest(path: Path, failures: list[str]) -> None:
     value = load_json(path, failures)
     if value is None:
         return
-    schema_ok = value.get("schema_version") == 1
+    schema_version = value.get("schema_version")
+    schema_ok = is_json_int(schema_version) and schema_version == 1
     emit("oracle-manifest-schema", schema_ok, file=str(path.relative_to(ROOT)), schema_version=value.get("schema_version"))
     if not schema_ok:
         failures.append(f"{path}: schema_version must be 1")
@@ -303,7 +319,7 @@ def validate_manifest(path: Path, failures: list[str]) -> None:
 
     documents = value.get("documents")
     n_documents = value.get("n_documents")
-    ok_docs = isinstance(documents, list) and n_documents == len(documents)
+    ok_docs = isinstance(documents, list) and is_json_int(n_documents) and n_documents == len(documents)
     emit("oracle-manifest-documents", ok_docs, file=str(path.relative_to(ROOT)), n_documents=n_documents, actual=len(documents) if isinstance(documents, list) else None)
     if not ok_docs:
         failures.append(f"{path}: documents must be a list and n_documents must match")
@@ -390,39 +406,61 @@ def clone_record(record: dict[str, Any]) -> dict[str, Any]:
     return json.loads(json.dumps(record))
 
 
-def replay_validation_failures(record: dict[str, Any], *, quiet: bool = False) -> list[str]:
+def reference_validation_failures(record: dict[str, Any], *, quiet: bool = False) -> list[str]:
     path = ROOT / "tests" / "fixtures" / "native" / "self_test_reference.json"
     failures: list[str] = []
     if quiet:
         with contextlib.redirect_stdout(io.StringIO()):
-            validate_provenance(path, record, failures)
-            validate_deterministic_replay(
-                path,
-                record,
-                record.get("decoded_text"),
-                record.get("decoded_text_sha256"),
-                failures,
-            )
+            validate_reference_payload(path, record, failures)
     else:
-        validate_provenance(path, record, failures)
-        validate_deterministic_replay(
-            path,
-            record,
-            record.get("decoded_text"),
-            record.get("decoded_text_sha256"),
-            failures,
-        )
+        validate_reference_payload(path, record, failures)
     return failures
 
 
 def self_test() -> int:
     ok = True
     good_record = self_test_reference_record()
-    good_failures = replay_validation_failures(good_record, quiet=True)
+    good_failures = reference_validation_failures(good_record, quiet=True)
     emit("oracle-provenance-self-test-good", not good_failures, failures=good_failures)
     ok = ok and not good_failures
 
+    def set_bool_prefix_for_one_char(record: dict[str, Any]) -> None:
+        decoded = "x"
+        decoded_sha = hashlib.sha256(decoded.encode("utf-8")).hexdigest()
+        record.update({"decoded_text": decoded, "decoded_text_sha256": decoded_sha})
+        record["deterministic_replay"].update(
+            {
+                "expected_prefix_chars": True,
+                "expected_prefix_sha256": decoded_sha,
+                "expected_decoded_text_sha256": decoded_sha,
+            }
+        )
+
     bad_cases = [
+        (
+            "bool-reference-schema",
+            lambda record: record.update({"schema_version": True}),
+        ),
+        (
+            "bool-model-bytes",
+            lambda record: record["provenance"].update({"model_weights_bytes": True}),
+        ),
+        (
+            "bool-provenance-seed",
+            lambda record: record["provenance"]["determinism"].update({"seed": True}),
+        ),
+        (
+            "bool-replay-schema",
+            lambda record: record["deterministic_replay"].update({"schema_version": True}),
+        ),
+        (
+            "bool-replay-seed",
+            lambda record: record["deterministic_replay"].update({"rng_seed": True}),
+        ),
+        (
+            "bool-prefix-chars",
+            set_bool_prefix_for_one_char,
+        ),
         (
             "negative-provenance-seed",
             lambda record: record["provenance"]["determinism"].update({"seed": -1}),
@@ -451,11 +489,15 @@ def self_test() -> int:
                 {"replay_command_argv": ["python3", "other.py"]}
             ),
         ),
+        (
+            "invalid-activations-container",
+            lambda record: record.update({"activations": []}),
+        ),
     ]
     for case, mutate in bad_cases:
         record = clone_record(good_record)
         mutate(record)
-        failures = replay_validation_failures(record, quiet=True)
+        failures = reference_validation_failures(record, quiet=True)
         rejected = bool(failures)
         emit("oracle-provenance-self-test-bad", rejected, case=case, failures=failures)
         ok = ok and rejected
