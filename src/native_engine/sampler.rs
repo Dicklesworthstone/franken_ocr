@@ -110,8 +110,7 @@ impl DecodeParams {
 /// One step's decode result (the frozen output contract).
 ///
 /// `is_eos` is `true` when `token == eos_token_id`; the AR loop uses it to halt
-/// ([SPEC-101]). `at_max_length` reflects whether the caller has reached the
-/// generation cap. The `token` is always the chosen id even when `is_eos` (the
+/// ([SPEC-101]). The `token` is always the chosen id even when `is_eos` (the
 /// EOS id itself is the produced token, matching HF where EOS is appended then
 /// generation stops).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,18 +148,17 @@ fn argmax_row(logits: &[f32]) -> FocrResult<u32> {
             "sampler::argmax_row: empty logits row"
         )));
     }
-    let mut best_idx = 0usize;
-    let mut best_val = logits[0];
-    for (i, &v) in logits.iter().enumerate().skip(1) {
-        // Strict `>` keeps the FIRST max on ties (torch.argmax). The compare is
-        // false when `v` is NaN, so NaN is skipped; if `best_val` is NaN we
-        // adopt the first non-NaN we meet (which is `> NaN` is also false, so we
-        // additionally promote when best is NaN).
-        if v > best_val || best_val.is_nan() {
-            best_val = v;
-            best_idx = i;
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        if v.is_nan() {
+            continue;
+        }
+        match best {
+            Some((_, best_val)) if v <= best_val => {}
+            _ => best = Some((i, v)),
         }
     }
+    let best_idx = best.map_or(0, |(i, _)| i);
     Ok(best_idx as u32)
 }
 
@@ -361,6 +359,17 @@ mod tests {
             ..DecodeParams::default()
         };
         assert_eq!(sample(&r, &[], &p).unwrap(), 2);
+    }
+
+    #[test]
+    fn argmax_all_nan_falls_back_to_zero() {
+        let r = row(vec![f32::NAN, f32::NAN, f32::NAN]);
+        let p = DecodeParams {
+            no_repeat_ngram_size: 0,
+            ngram_window: 0,
+            ..DecodeParams::default()
+        };
+        assert_eq!(sample(&r, &[], &p).unwrap(), 0);
     }
 
     #[test]

@@ -187,7 +187,7 @@ impl CropGrid {
     /// Total local tile count `width_crop_num * height_crop_num`.
     #[must_use]
     pub fn blocks(self) -> usize {
-        self.width_crop_num * self.height_crop_num
+        self.width_crop_num.saturating_mul(self.height_crop_num)
     }
 
     /// Whether local tiles are emitted (grid larger than 1×1, [SPEC-026]).
@@ -241,7 +241,10 @@ impl Preprocessed {
     pub fn placeholder_token_count(&self) -> usize {
         let q_base = num_queries(self.mode.base_size());
         // Global: 16 rows of (16 patches + 1 newline) + 1 view separator.
-        let mut total = (q_base + 1) * q_base + 1;
+        let mut total = q_base
+            .saturating_add(1)
+            .saturating_mul(q_base)
+            .saturating_add(1);
         if let PreprocessMode::Gundam { tile_size, .. } = self.mode
             && self.crop_grid.is_tiled()
         {
@@ -249,7 +252,9 @@ impl Preprocessed {
             let w = self.crop_grid.width_crop_num;
             let h = self.crop_grid.height_crop_num;
             // Local: (q_local*W patches + 1 newline) per (q_local*H) rows.
-            total += (q_local * w + 1) * (q_local * h);
+            let local_cols = q_local.saturating_mul(w).saturating_add(1);
+            let local_rows = q_local.saturating_mul(h);
+            total = total.saturating_add(local_cols.saturating_mul(local_rows));
         }
         total
     }
@@ -285,15 +290,15 @@ pub fn preprocess_bytes(bytes: &[u8], mode: PreprocessMode) -> FocrResult<Prepro
 /// without touching the filesystem ([SPEC-022..031]).
 fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Preprocessed> {
     let original_size = img.dimensions();
-    let base_size = mode.base_size();
+    let validated = validate_mode(mode)?;
 
     // Global view: aspect-preserving resize + gray pad to base_size² ([SPEC-022]).
-    let global_img = pad_to_square(&img, base_size as u32);
+    let global_img = pad_to_square(&img, validated.base_size);
     let global = view_tensor(&global_img);
 
     let (tiles, crop_grid) = match mode {
         PreprocessMode::Base { .. } => (Vec::new(), CropGrid::single()),
-        PreprocessMode::Gundam { tile_size, .. } => build_gundam_tiles(&img, tile_size as u32),
+        PreprocessMode::Gundam { .. } => build_gundam_tiles(&img, validated.tile_size)?,
     };
 
     Ok(Preprocessed {
@@ -302,6 +307,49 @@ fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Pre
         tiles,
         crop_grid,
         original_size,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ValidatedMode {
+    base_size: u32,
+    tile_size: u32,
+}
+
+fn validate_mode(mode: PreprocessMode) -> FocrResult<ValidatedMode> {
+    let base_size = validate_edge("base_size", mode.base_size(), BASE_SIZE)?;
+    let tile_size = match mode {
+        PreprocessMode::Base { .. } => 0,
+        PreprocessMode::Gundam { tile_size, .. } => {
+            validate_edge("tile_size", tile_size, GUNDAM_TILE_SIZE)?
+        }
+    };
+    Ok(ValidatedMode {
+        base_size,
+        tile_size,
+    })
+}
+
+fn validate_edge(name: &str, value: usize, max: usize) -> FocrResult<u32> {
+    if value < PATCH_SIZE {
+        return Err(FocrError::Usage(format!(
+            "preprocess {name} must be at least {PATCH_SIZE} pixels, got {value}"
+        )));
+    }
+    if value > max {
+        return Err(FocrError::Usage(format!(
+            "preprocess {name} must be <= {max} pixels for this model, got {value}"
+        )));
+    }
+    if !value.is_multiple_of(PATCH_SIZE) {
+        return Err(FocrError::Usage(format!(
+            "preprocess {name} must be a multiple of patch size {PATCH_SIZE}, got {value}"
+        )));
+    }
+    u32::try_from(value).map_err(|_| {
+        FocrError::Usage(format!(
+            "preprocess {name} exceeds u32 pixel edge limit: {value}"
+        ))
     })
 }
 
@@ -384,19 +432,19 @@ fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
 /// via [`find_closest_aspect_ratio`], resizes to `(tile*W, tile*H)`, and slices
 /// a row-major `W×H` grid of `tile×tile` tiles ([SPEC-024],
 /// `modeling_unlimitedocr.py:192-208`).
-fn build_gundam_tiles(img: &DynamicImage, tile: u32) -> (Vec<ViewTensor>, CropGrid) {
+fn build_gundam_tiles(img: &DynamicImage, tile: u32) -> FocrResult<(Vec<ViewTensor>, CropGrid)> {
     let (w, h) = img.dimensions();
     if w <= CROP_THRESHOLD && h <= CROP_THRESHOLD {
         // No crop ([SPEC-023]): crop_ratio = [1, 1], no local tiles.
-        return (Vec::new(), CropGrid::single());
+        return Ok((Vec::new(), CropGrid::single()));
     }
 
     let ratios = candidate_ratios(MIN_NUM, MAX_NUM);
     let (wc, hc) = find_closest_aspect_ratio(w as f64 / h as f64, &ratios, w, h, tile);
 
     // Resize to (tile*W, tile*H), then crop a row-major W×H grid of tiles.
-    let target_w = tile * wc as u32;
-    let target_h = tile * hc as u32;
+    let target_w = checked_tile_extent(tile, wc, "width")?;
+    let target_h = checked_tile_extent(tile, hc, "height")?;
     // PIL `image.resize((W,H))` default resample is BICUBIC; CatmullRom is the
     // closest crate cubic. Tile geometry (crop boxes) is exact.
     let resized = img.resize_exact(target_w, target_h, FilterType::CatmullRom);
@@ -413,13 +461,26 @@ fn build_gundam_tiles(img: &DynamicImage, tile: u32) -> (Vec<ViewTensor>, CropGr
         tiles.push(view_tensor(&split));
     }
 
-    (
+    Ok((
         tiles,
         CropGrid {
             width_crop_num: wc,
             height_crop_num: hc,
         },
-    )
+    ))
+}
+
+fn checked_tile_extent(tile: u32, count: usize, axis: &str) -> FocrResult<u32> {
+    let count = u32::try_from(count).map_err(|_| {
+        FocrError::Usage(format!(
+            "preprocess Gundam {axis} tile count exceeds u32: {count}"
+        ))
+    })?;
+    tile.checked_mul(count).ok_or_else(|| {
+        FocrError::Usage(format!(
+            "preprocess Gundam {axis} extent overflows u32: tile_size={tile}, tile_count={count}"
+        ))
+    })
 }
 
 /// Build the candidate `(width_tiles, height_tiles)` grids: all `(i, j)` with
@@ -769,6 +830,57 @@ mod tests {
         let h = p.crop_grid.height_crop_num;
         let expected = (q_base + 1) * q_base + 1 + (q_local * w + 1) * (q_local * h);
         assert_eq!(p.placeholder_token_count(), expected);
+    }
+
+    #[test]
+    fn preprocess_rejects_invalid_mode_sizes() {
+        let img = solid(32, 32, [1, 2, 3]);
+        let cases = [
+            PreprocessMode::Base { base_size: 0 },
+            PreprocessMode::Base { base_size: 15 },
+            PreprocessMode::Base { base_size: 2048 },
+            PreprocessMode::Gundam {
+                base_size: BASE_SIZE,
+                tile_size: 0,
+            },
+            PreprocessMode::Gundam {
+                base_size: BASE_SIZE,
+                tile_size: 1024,
+            },
+            PreprocessMode::Gundam {
+                base_size: BASE_SIZE,
+                tile_size: 15,
+            },
+            PreprocessMode::Gundam {
+                base_size: 2048,
+                tile_size: GUNDAM_TILE_SIZE,
+            },
+        ];
+        for mode in cases {
+            let err = preprocess_dynamic(img.clone(), mode).unwrap_err();
+            assert!(
+                matches!(err, FocrError::Usage(_)),
+                "mode {mode:?} should be a usage error, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn placeholder_count_saturates_for_malformed_grid() {
+        let grid = CropGrid {
+            width_crop_num: usize::MAX,
+            height_crop_num: usize::MAX,
+        };
+        assert_eq!(grid.blocks(), usize::MAX);
+
+        let p = Preprocessed {
+            mode: PreprocessMode::gundam(),
+            global: view_tensor(&solid(4, 4, [0, 0, 0])),
+            tiles: Vec::new(),
+            crop_grid: grid,
+            original_size: (4, 4),
+        };
+        assert_eq!(p.placeholder_token_count(), usize::MAX);
     }
 
     // ── decode error path ───────────────────────────────────────────────────
