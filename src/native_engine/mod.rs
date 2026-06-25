@@ -444,8 +444,17 @@ impl OcrModel {
         // Bounded by `max_length` so a non-converging model can never hang.
         let start = generated.len();
         while generated.len() - start < params.max_length {
-            // lm_head over the last hidden row -> [1, vocab] logits.
-            let logits = decoder::lm_head(&self.weights, &hidden)?;
+            // lm_head over ONLY the last hidden row -> [1, vocab] logits. The
+            // next-token logits depend solely on the final position; RMSNorm and the
+            // lm_head linear are per-row independent, so this last-row slice is
+            // bit-identical to projecting ALL rows and discarding the rest — but it
+            // skips the [seq-1, vocab] head GEMM (vocab is huge, 129280), the dominant
+            // prefill cost (the "compute only the rows you read" structural win,
+            // proved bit-identical by decoder::lm_head_last_row_is_full_last_row).
+            // Decode steps after the first already carry one hidden row → no-op slice.
+            debug_assert!(hidden.rows >= 1, "decoder forward must yield >= 1 row");
+            let last_hidden = Mat::from_vec(1, hidden.cols, hidden.row(hidden.rows - 1).to_vec());
+            let logits = decoder::lm_head(&self.weights, &last_hidden)?;
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token);
             emitted.push(step.token);

@@ -694,6 +694,36 @@ mod tests {
         assert!((logits.data[1] - 4.0 * rstd).abs() < 1e-5);
     }
 
+    #[test]
+    fn lm_head_last_row_is_full_last_row() {
+        // The "compute only the rows you read" structural win: the decode driver
+        // feeds lm_head ONLY the last hidden row (mod.rs). RMSNorm and the lm_head
+        // linear are per-row independent, so the last-row slice MUST be exactly
+        // (bit-for-bit) the last row of projecting all rows — proving the prefill
+        // optimization (skip the [seq-1, vocab] head GEMM) changes nothing observable.
+        let (seq, hidden, vocab) = (5usize, 8usize, 7usize);
+        let h: Vec<f32> = (0..seq * hidden)
+            .map(|i| ((i as f32) * 0.37).sin())
+            .collect();
+        let full = Mat::from_vec(seq, hidden, h);
+        let norm_w: Vec<f32> = (0..hidden).map(|i| 0.5 + (i as f32) * 0.1).collect();
+        let head_w: Vec<f32> = (0..vocab * hidden)
+            .map(|i| ((i as f32) * 0.13).cos())
+            .collect();
+        let eps = 1e-6;
+
+        let full_logits = norm_and_lm_head(&full, &norm_w, &head_w, vocab, eps).unwrap();
+        let last = Mat::from_vec(1, hidden, full.row(seq - 1).to_vec());
+        let last_logits = norm_and_lm_head(&last, &norm_w, &head_w, vocab, eps).unwrap();
+
+        assert_eq!((last_logits.rows, last_logits.cols), (1, vocab));
+        let full_last = &full_logits.data[(seq - 1) * vocab..seq * vocab];
+        assert_eq!(
+            last_logits.data, full_last,
+            "last-row lm_head must be bit-identical to full[last]"
+        );
+    }
+
     // ── attn output proj / qkv ([SPEC-090]) ─────────────────────────────────
 
     #[test]
