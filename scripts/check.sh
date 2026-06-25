@@ -31,6 +31,7 @@ run() {
 
 run python3 scripts/check_ledgers.py
 run python3 scripts/check_test_logs.py --self-test
+run python3 scripts/check_focrq_format.py
 run cargo fmt --check
 run cargo check --all-targets
 if [ "$FAST" -eq 0 ]; then
