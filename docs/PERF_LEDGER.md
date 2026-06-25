@@ -8,9 +8,11 @@
 
 ## Measurement protocol
 
-- **Reference** is the PyTorch / `transformers` Unlimited-OCR model (bf16) from
-  `scripts/gen_reference_fixtures.py`, and/or ONNX Runtime / MLAS for the CPU
-  int8 GEMM comparison, run on the **same host** as `focr`.
+- **Correctness reference** is the pinned CUDA PyTorch / `transformers`
+  Unlimited-OCR model (bf16) from `scripts/gen_reference_fixtures.py`.
+- **CPU performance reference** is whichever CPU baseline Phase -1 proves is
+  valid and runnable on the same host: CPU-patched HF if it reproduces the CUDA
+  oracle's tokens, otherwise llama.cpp GGUF / ONNX Runtime / MLAS labeled as such.
 - **`focr`** is measured in the `release-perf` profile (`debug=line-tables-only,
   lto=thin, codegen-units=1`), warm, with a fixed thread budget recorded per row.
 - **Precision column** states what is being compared: `focr-int8` (or `-int4`)
@@ -21,9 +23,9 @@
 
 ## Ratio table
 
-| date | arch | stage | focr | reference | ratio | precision (focr vs ref) | thread budget | notes |
-|------|------|-------|------|-----------|------:|-------------------------|---------------|-------|
-| _—_  | _—_  | _—_   | _—_  | _—_       |  _—_  | _—_                     | _—_           | _no measurements yet_ |
+| date | claim_id | evidence_id | model_commit | fixture_hash | arch/cpu_features | stage | focr | reference | ratio | precision (focr vs ref) | thread budget | command/env | fallback/kill-switch state | notes |
+|------|----------|-------------|--------------|--------------|-------------------|-------|------|-----------|------:|-------------------------|---------------|-------------|----------------------------|-------|
+| _—_  | _—_      | _—_         | _—_          | _—_          | _—_               | _—_   | _—_  | _—_       |  _—_  | _—_                     | _—_           | _—_         | _—_                        | _no measurements yet_ |
 
 **Stage vocabulary:** `preprocess` (image decode/resize/normalize) · `vision-encode`
 (DeepEncoder + projector, per page) · `prefill` (build reference KV: visual + prompt) ·

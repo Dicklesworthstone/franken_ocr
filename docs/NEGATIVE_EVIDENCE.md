@@ -16,6 +16,10 @@ Every entry records:
 
 ```
 date | WIN / NEGATIVE(reverted) | lever (what was tried, where)
+  claim_id / evidence_id                         # artifact graph IDs
+  model source commit + fixture hash             # exact reference provenance
+  CPU feature string + exact command/env         # reproduces the run
+  fallback / kill-switch state                   # proves what path was active
   measured before -> after vs reference (ratio)   # real numbers or "blocked: <why>"
   bit-exact correctness proof                      # test name + result, or the precision contract
   disposition: KEEP / REVERT
@@ -72,10 +76,63 @@ them.
   nobody declares victory on the un-tiled `SDOT`/`VNNI` path or mistakes the
   current frankentorch number for the ceiling.
 - **do-not-retry:** do **not** claim a CPU int8 GEMM win **unless** it is measured
-  against ONNX/MLAS (or the bf16 torch reference) on this model's actual shapes
+  against ONNX/MLAS or the Phase -1 proven CPU baseline on this model's actual shapes
   with the tiled GEMM in place — the un-tiled dot path is already known to lose.
 - **per-lever tally:** W 0 / L 1 / N 0 (inherited; the tiled-GEMM fix is unbuilt)
 - **agent:** inherited (frankentorch)
+
+### NE-INH-3 — un-blocked tiled SMMLA was SLOWER than SDOT (load-bound)
+
+- **lever:** a tiled `SMMLA` (i8mm) int8 GEMM with 2× the MAC density of `SDOT`,
+  but WITHOUT register/cache blocking.
+- **measured (frankensearch/frankentorch, M4):** **19 / 41 / 77 ms** vs SDOT's
+  14.8 / 34 / 64 — a **regression**, despite double the MAC throughput, because the
+  kernel re-loads the activation for every weight pair (≈**2 loads : 1 SMMLA**) and
+  is therefore **load-bound, not compute-bound**. Extra MAC throughput is wasted
+  when you are memory-bound.
+- **disposition:** REVERT.
+- **do-not-retry:** do **not** add a wider/denser matmul instruction (SMMLA, AMX)
+  **unless** the micro-kernel already has **register/cache blocking with
+  compute:load ≥ 2:1 and offline-pre-packed weights**. The instruction is not the
+  lever; the blocking is.
+- **per-lever tally:** W 0 / L 1 / N 0 (inherited)
+- **agent:** inherited (frankensearch/frankentorch)
+
+### NE-INH-4 — AMX-f32 (Accelerate) does NOT beat ONNX-int8
+
+- **lever:** route the matmuls through Apple's AMX coprocessor in **f32** (via
+  Accelerate/numpy) as a "Mac finisher".
+- **measured (M4):** ~**11 / 28 / 77 ms** f32 — does not beat ONNX-int8
+  (7.6/14.5/41.4), because f32 streams **4× the bytes** of int8 on these
+  **memory-bound** sizes, and the element-wise ops (softmax/GELU/transpose) are not
+  on AMX anyway.
+- **disposition:** REVERT (not the easy finisher).
+- **do-not-retry:** do **not** chase AMX **unless** it is **int8** (low bandwidth),
+  applied to **compute-bound prefill** (not memory-bound decode), AND the FFI cost
+  of Accelerate/BNNS is accepted as an **opt-in feature** (the directly-programmable
+  Mac int8 path is NEON SMMLA/SDOT, no FFI).
+- **per-lever tally:** W 0 / L 1 / N 0 (inherited)
+- **agent:** inherited (frankensearch/frankentorch)
+
+### NE-INH-5 — naive hand-written "fused tape-free forward" regressed 3–10× (the most clarifying failure)
+
+- **lever:** delete the per-op framework tape/dispatch overhead by hand-writing a
+  single fused forward — BUT with **naive scalar-f32 attention / softmax /
+  LayerNorm** replacing the library's SIMD/parallel kernels.
+- **measured (frankensearch, M4):** **38 / 194 / 580 ms** — a **3–10× regression**
+  (seq512 was 10× the kernel version). This **disproved the "the gap is all
+  framework overhead" theory**: the real gap to ONNX is **kernels below peak**
+  (SDOT-not-SMMLA linears, f32-not-int8 attention), not per-op tape cost.
+- **disposition:** REVERT.
+- **do-not-retry:** the fused, tape-free, zero-per-op-allocation forward is the
+  RIGHT architecture (franken_ocr is built that way), but **every fused op must
+  stay at peak** (SIMD + parallel + int8/int4). Do **not** trade a good library
+  kernel for a naive hand-written one — ever. Measure framework-tax savings only
+  with at-peak ops on both sides.
+- **lesson for franken_ocr:** out-SPECIALIZE ONNX (fused single-model forward) AND
+  keep every op at peak; both are required, neither alone wins.
+- **per-lever tally:** W 0 / L 1 / N 0 (inherited)
+- **agent:** inherited (frankensearch)
 
 ---
 

@@ -5,7 +5,7 @@
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # STATUS: STUB. This is an honest scaffold, not a finished downloader.
-# The exact resolve URLs, sha256 pins, and any auth/redirect handling are TODO
+# The exact sha256 pins and any auth/redirect handling are TODO
 # and MUST be filled in before this is wired into CI or docs as "just run it".
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -58,7 +58,10 @@ while [ $# -gt 0 ]; do
 done
 
 REPO="baidu/Unlimited-OCR"
-BASE_URL="https://huggingface.co/${REPO}/resolve/main"
+# Current verified HF commit as of 2026-06-25. Phase -1 must refresh this before
+# kernel work and record the exact source hashes in docs/truth-pack/.
+REVISION="${FOCR_MODEL_REVISION:-3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5}"
+BASE_URL="https://huggingface.co/${REPO}/resolve/${REVISION}"
 
 # The files to fetch. sha256 pins are TODO — fill these in from a trusted local
 # copy via `shasum -a 256 <file>` and verify after download before trusting.
@@ -72,6 +75,7 @@ config.json
 echo "[fetch-model] STUB — not yet implemented." >&2
 echo "[fetch-model] destination: ${DEST}" >&2
 echo "[fetch-model] source repo:  ${REPO}" >&2
+echo "[fetch-model] revision:     ${REVISION}" >&2
 echo "[fetch-model]" >&2
 echo "[fetch-model] TODO before this works:" >&2
 echo "[fetch-model]   1. mkdir -p \"\${DEST}\"" >&2
@@ -87,7 +91,7 @@ done
 echo "[fetch-model]" >&2
 echo "[fetch-model] manual fallback (works today, no script needed):" >&2
 echo "[fetch-model]   pip install -U huggingface_hub" >&2
-echo "[fetch-model]   hf download ${REPO} --local-dir \"${DEST}\"" >&2
+echo "[fetch-model]   hf download ${REPO} --revision \"${REVISION}\" --local-dir \"${DEST}\"" >&2
 echo "[fetch-model]" >&2
 echo "[fetch-model] Then: focr convert \"${DEST}/model-00001-of-000001.safetensors\" \\" >&2
 echo "[fetch-model]            -o \"${DEST}/unlimited-ocr.focrq\" --quant int8" >&2

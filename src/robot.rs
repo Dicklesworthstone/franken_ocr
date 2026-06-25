@@ -5,7 +5,7 @@
 //! can validate against a stable contract. This is the Phase-0 seed; event
 //! payloads are finalized + contract-tested in Phase 5.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The robot event-stream schema version. Bumped on any breaking contract change.
 pub const ROBOT_SCHEMA_VERSION: u32 = 1;

@@ -11,7 +11,7 @@
 
 </div>
 
-**A pure-Rust, memory-safe, CPU-only OCR engine that runs exactly one model, Baidu Unlimited-OCR, with no general ML framework, no Python, no FFI, and no GPU. The bet: a single fixed model with compile-time-known shapes, quantized to a custom int4/int8 form and driven by model-specific tiled GEMM kernels, can close the CPU gap to ONNX/MLAS while keeping a constant-size KV cache across dozens of document pages.**
+**A pure-Rust, memory-safe, CPU-only OCR engine that runs exactly one model, Baidu Unlimited-OCR, with no general ML framework, no Python, no FFI, and no GPU. The bet: a single fixed model with compile-time-known shapes, quantized to a custom int4/int8 form and driven by model-specific tiled GEMM kernels, can close the CPU gap to ONNX/MLAS while keeping generated-token KV bounded during long document parses.**
 
 > **Status: pre-Phase-0 kickoff scaffold. This does not run yet.** No inference path is implemented. What exists today is the master plan, the repository skeleton, the agent conventions, and the support files in this directory. Every number and behavior below is a *target*, not a measured result. The full roadmap, kernel strategy, and verification methodology live in [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](./COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md); contributor and agent conventions live in [`AGENTS.md`](./AGENTS.md).
 
@@ -30,7 +30,7 @@
 | Runtime | One static Rust binary. No Python, no CUDA, no FFI at inference time. |
 | Hardware | CPU only, tuned for Apple Silicon (NEON/SDOT/i8mm-SMMLA) and Intel/AMD x86 (AVX2/AVX-VNNI/AVX-512-VNNI/AMX). |
 | Quantization | Mixed int4/int8, custom on-disk format, vision tower kept high precision. |
-| Memory | Constant-size decode KV cache (R-SWA), flat across a 40-page parse. |
+| Memory | R-SWA keeps generated-token KV bounded; the reference block still grows with page count and is capped by the 32K context. |
 | Embedding | Synchronous, blocking library API. The async runtime is an owned internal detail. |
 | Agents | Versioned NDJSON robot mode, stable exit codes, deterministic output under fixed sampling. |
 | Safety | `#![forbid(unsafe_code)]` everywhere except audited SIMD islands, each with a bit-identical scalar fallback. |
@@ -44,9 +44,9 @@ A general ML framework pays a generality tax on every operation: dynamic dtype d
 - **Shape-specialized kernels.** `const`-generic tile sizes, no remainder handling for dims that tile cleanly, no runtime shape branching in the hot loop.
 - **Offline weight transformation.** The bf16 checkpoint becomes a custom `.focrq` artifact: int8 first, int4 later, vision/projector/embeddings/router/norms held at high precision, arch-specific pre-packing so kernels load contiguous register tiles with zero runtime shuffle.
 - **Mixed int4/int8 pushed hard.** Decode is memory-bandwidth-bound, so int4 group-quantized expert weights (the bulk of the parameters) roughly halve the bytes streamed per token. There is no CPU int4 matmul instruction, so int4 unpacks to int8 in-register and feeds the same SMMLA/VNNI/SDOT engine; the win is bandwidth and footprint. Accuracy-sensitive tensors stay int8, and the per-tensor split is chosen by a rate-distortion allocator rather than picked by hand.
-- **Pre-allocation.** R-SWA's KV cache is constant-bounded, so each layer gets one fixed ring buffer that never reallocates, even on a long document.
+- **Pre-allocation.** R-SWA bounds generated-token KV, so each layer gets a fixed ring buffer and a pre-sized reference block. Allocation can be stable, but the live reference length still grows with page count.
 
-**Honest scope.** This is not a leaderboard play. Unlimited-OCR sits around 93.9% on OmniDocBench v1.6, behind PaddleOCR-VL and MinerU. The pitch is fidelity to this model, constant-memory long-document parsing on CPU, and speed on commodity hardware, not topping a benchmark.
+**Honest scope.** This is not a leaderboard play. Unlimited-OCR sits around 93.9% on OmniDocBench v1.6, behind PaddleOCR-VL and MinerU. The pitch is fidelity to this model, bounded generated-token KV for long-document parsing on CPU, and speed on commodity hardware, not topping a benchmark.
 
 ## How it works
 
@@ -60,7 +60,7 @@ image ──► DeepEncoder ──► linear projector ──► DeepSeek-V2 MoE
 - **DeepEncoder (vision tower).** SAM-ViT-B (width 768, 12 layers, global attention at blocks [2,5,8,11]), then 16x conv token compression, then a CLIP-L/14 cascade (24 layers, width 1024, SDPA with `quick_gelu` FFN). SAM and CLIP features concatenate to 2048 dims. Kept at high precision; quantizing the vision tower hurts OCR, a result both community quants confirm.
 - **Linear projector.** A single 2048 to 1280 map bridges the vision tower to the decoder hidden size.
 - **DeepSeek-V2 MoE decoder.** 12 layers, hidden 1280. Layer 0 is a dense MLP; layers 1 to 11 are MoE: a router (1280 to 64) selects the top 6 of 64 experts (each a 1280 to 896 SiLU-gated MLP) plus 2 always-on shared experts. Final RMSNorm and `lm_head` (1280 to 129280) feed autoregressive sampling.
-- **R-SWA (Reference Sliding Window Attention).** The one architectural novelty. Every decoder attention layer is replaced with R-SWA: each generated token attends to all reference tokens (visual plus prompt prefix, kept as a frozen, never-evicted global KV) plus only the previous 128 generated tokens via a ring-buffer KV cache. The decode-side KV memory stays constant instead of growing with output length. That, not arbitrary input resolution, is what "Unlimited" means: constant-memory decoding of dozens of pages in a single pass.
+- **R-SWA (Reference Sliding Window Attention).** The one architectural novelty. Every decoder attention layer is replaced with R-SWA: each generated token attends to all reference tokens (visual plus prompt prefix, kept as a frozen, never-evicted global KV) plus only the previous 128 generated tokens via a ring-buffer KV cache. The generated-token KV memory stays constant instead of growing with output length; the reference block still grows with page/input length. That, not arbitrary input resolution, is what "Unlimited" means.
 
 The checkpoint is a single 6.67 GB bf16 safetensors shard under the MIT license. The plan carries the verified config census and the exact tensor-name map.
 

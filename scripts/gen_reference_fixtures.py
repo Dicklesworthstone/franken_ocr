@@ -82,7 +82,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--corpus",
         type=Path,
         default=Path("tests/fixtures/corpus"),
-        help="Dir of input document images/PDFs to run through the oracle.",
+        help="Dir of input document images to run through the oracle. PDF fixtures "
+        "must be rasterized explicitly and kept separate from v1 native image tests.",
     )
     p.add_argument(
         "--out",

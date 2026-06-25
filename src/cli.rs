@@ -5,8 +5,8 @@
 //! `doctor`) returns a clear `NotImplemented` pointing at the plan phase that
 //! lands it. PDF input is intentionally absent — v1 is image-only (plan §7.7).
 
-use clap::{Parser, Subcommand};
-use franken_ocr::{robot, FocrError, FocrResult};
+use clap::{Parser, Subcommand, ValueEnum};
+use franken_ocr::{FocrError, FocrResult, robot};
 
 #[derive(Parser)]
 #[command(
@@ -40,8 +40,8 @@ pub enum Command {
         #[arg(short, long)]
         output: std::path::PathBuf,
         /// Quantization target.
-        #[arg(long, value_name = "int8|int4")]
-        quant: Option<String>,
+        #[arg(long, value_enum)]
+        quant: Option<QuantTarget>,
     },
     /// Agent-facing diagnostics and the machine contract.
     Robot {
@@ -62,6 +62,12 @@ pub enum RobotCmd {
     Backends,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum QuantTarget {
+    Int8,
+    Int4,
+}
+
 /// Dispatch a parsed CLI invocation.
 pub fn run(cli: Cli) -> FocrResult<()> {
     match cli.command {
@@ -74,7 +80,8 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             // features, thread budget) lands in Phase 5 (plan §7.3).
             emit(&serde_json::json!({
                 "schema_version": robot::ROBOT_SCHEMA_VERSION,
-                "status": "ok",
+                "status": "scaffold",
+                "ready": false,
                 "phase": "pre-Phase-0 skeleton",
                 "model_present": false
             }));
@@ -84,7 +91,11 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             // Real runtime SIMD-tier detection lands in Phase 3 (plan §6.2).
             emit(&serde_json::json!({
                 "schema_version": robot::ROBOT_SCHEMA_VERSION,
-                "simd_tiers": "runtime detection lands in Phase 3 (plan §6.2)",
+                "simd_tiers": {
+                    "selected": null,
+                    "available": [],
+                    "status": "runtime detection lands in Phase 3 (plan §6.2)"
+                },
                 "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0)
             }));
             Ok(())
@@ -102,6 +113,9 @@ pub fn run(cli: Cli) -> FocrResult<()> {
 }
 
 fn emit(value: &serde_json::Value) {
-    // `to_string_pretty` only fails on non-serializable maps; a plain json!{} can't.
-    println!("{}", serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string()));
+    // Robot-facing commands emit exactly one JSON object per line.
+    println!(
+        "{}",
+        serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+    );
 }
