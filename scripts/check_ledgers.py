@@ -55,6 +55,10 @@ def markdown_cells(row: str) -> list[str]:
     return [cell.strip() for cell in row.strip().strip("|").split("|")]
 
 
+def is_empty_cell(value: str) -> bool:
+    return value.strip() in {"", "_—_", "_-_", "_no measurements yet_"}
+
+
 def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
     required_columns = [
         "date",
@@ -75,6 +79,7 @@ def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
         "allocator",
         "command/env",
         "fallback/kill-switch state",
+        "correctness_proof",
         "notes",
     ]
 
@@ -101,7 +106,7 @@ def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
         if len(cells) != len(columns):
             continue
         row = dict(zip(columns, cells, strict=True))
-        if row.get("claim_id") in {"_—_", "_-_", "_no measurements yet_"}:
+        if is_empty_cell(row.get("claim_id", "")):
             continue
         evidence_id = row["evidence_id"]
         evidence_ok = evidence_id.startswith("artifacts/perf/")
@@ -115,11 +120,78 @@ def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
         if not exists:
             failures.append(f"{path}:{line_no}: missing evidence dir {evidence_id}")
 
-        for column in ("command/env", "fallback/kill-switch state", "fixture_hash", "model_commit"):
-            filled = bool(row[column] and row[column] != "_—_")
+        for column in (
+            "command/env",
+            "fallback/kill-switch state",
+            "fixture_hash",
+            "model_commit",
+            "correctness_proof",
+        ):
+            filled = not is_empty_cell(row[column])
             emit("perf-required-cell", filled, line=line_no, column=column)
             if not filled:
                 failures.append(f"{path}:{line_no}: empty required cell {column!r}")
+
+
+def check_negative_evidence(path: Path, text: str, failures: list[str]) -> None:
+    unfenced = strip_fenced_blocks(text)
+    entries = list(
+        re.finditer(
+            r"^(?P<date>\d{4}-\d{2}-\d{2}) \| (?P<outcome>WIN|NEGATIVE\(reverted\)) \| (?P<lever>.+)$",
+            unfenced,
+            flags=re.MULTILINE,
+        )
+    )
+    emit("negative-entry-count", True, count=len(entries))
+
+    required_fields = [
+        "claim_id:",
+        "evidence_id:",
+        "model source commit + fixture hash:",
+        "CPU feature string:",
+        "exact command + env:",
+        "fallback / kill-switch state:",
+        "measured before -> after vs reference:",
+        "bit-exact correctness proof:",
+        "disposition:",
+        "do-not-retry:",
+        "per-lever tally:",
+        "agent:",
+        "evidence dir:",
+    ]
+
+    for index, entry in enumerate(entries):
+        end = entries[index + 1].start() if index + 1 < len(entries) else len(unfenced)
+        section = unfenced[entry.start() : end]
+        title = f"{entry.group('date')} {entry.group('outcome')}"
+        for field in required_fields:
+            ok = field in section
+            emit("negative-required-field", ok, entry=title, field=field)
+            if not ok:
+                failures.append(f"{path}: {title} missing {field}")
+
+        evidence_match = re.search(r"\bevidence_id:\s*(\S+)", section)
+        evidence_id = evidence_match.group(1).rstrip(",.;") if evidence_match else ""
+        evidence_ok = evidence_id.startswith("artifacts/perf/")
+        emit("negative-evidence-prefix", evidence_ok, entry=title, evidence_id=evidence_id)
+        if evidence_match and not evidence_ok:
+            failures.append(f"{path}: {title} evidence_id must start with artifacts/perf/")
+        if evidence_ok:
+            evidence_path = ROOT / evidence_id.rstrip("/")
+            exists = evidence_path.is_dir()
+            emit("negative-evidence-dir", exists, entry=title, evidence_id=evidence_id)
+            if not exists:
+                failures.append(f"{path}: {title} missing evidence dir {evidence_id}")
+
+        disposition_ok = bool(re.search(r"disposition:\s*(KEEP|REVERT)\b", section))
+        emit("negative-disposition", disposition_ok, entry=title)
+        if not disposition_ok:
+            failures.append(f"{path}: {title} disposition must be KEEP or REVERT")
+
+        tally_ok = bool(re.search(r"per-lever tally:\s*W\s+\d+\s*/\s*L\s+\d+\s*/\s*N\s+\d+", section))
+        emit("negative-tally", tally_ok, entry=title)
+        if not tally_ok:
+            failures.append(f"{path}: {title} per-lever tally must be W n / L n / N n")
 
 
 def check_discrepancies(path: Path, text: str, failures: list[str]) -> None:
@@ -241,6 +313,7 @@ def main() -> int:
     )
 
     check_perf_ledger(files["perf"], perf, failures)
+    check_negative_evidence(files["negative"], negative, failures)
     check_discrepancies(files["disc"], disc, failures)
 
     if failures:

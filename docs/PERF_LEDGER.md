@@ -83,11 +83,13 @@ The table carries, per row: the **artifact-graph provenance** fields
 `arch/cpu_features`, `fallback/kill-switch`), the **measured ratio**, the
 **roofline** fields (`floor_kind`, `floor_ms`, `dist_above_floor`), and the
 **fairness** fields (`precision`, `threads (focr=ref N)`, `allocator`,
-`command/env`). Every field is mandatory; a row missing any is invalid.
+`command/env`), plus the mandatory `correctness_proof` reference that proves the
+row did not buy speed by breaking parity. Every field is mandatory; a row missing
+any is invalid.
 
-| date | claim_id | evidence_id | model_commit | fixture_hash | arch/cpu_features | stage | focr_ms | ref_ms | ratio | floor_kind | floor_ms | dist_above_floor | precision (focr vs ref) | threads (focr=ref N) | allocator | command/env | fallback/kill-switch state | notes |
-|------|----------|-------------|--------------|--------------|-------------------|-------|--------:|-------:|------:|------------|---------:|-----------------:|-------------------------|----------------------|-----------|-------------|----------------------------|-------|
-| _—_  | _—_      | _—_         | _—_          | _—_          | _—_               | _—_   | _—_     | _—_    |  _—_  | _—_        | _—_      | _—_              | _—_                     | _—_                  | _—_       | _—_         | _—_                        | _no measurements yet_ |
+| date | claim_id | evidence_id | model_commit | fixture_hash | arch/cpu_features | stage | focr_ms | ref_ms | ratio | floor_kind | floor_ms | dist_above_floor | precision (focr vs ref) | threads (focr=ref N) | allocator | command/env | fallback/kill-switch state | correctness_proof | notes |
+|------|----------|-------------|--------------|--------------|-------------------|-------|--------:|-------:|------:|------------|---------:|-----------------:|-------------------------|----------------------|-----------|-------------|----------------------------|-------------------|-------|
+| _—_  | _—_      | _—_         | _—_          | _—_          | _—_               | _—_   | _—_     | _—_    |  _—_  | _—_        | _—_      | _—_              | _—_                     | _—_                  | _—_       | _—_         | _—_                        | _—_               | _no measurements yet_ |
 
 **Column legend.**
 - `model_commit` — always `3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5` (HF; truth pack).
@@ -99,6 +101,9 @@ The table carries, per row: the **artifact-graph provenance** fields
 - `threads (focr=ref N)` — the single N pinned on **both** sides; **torch is NEVER @64** (§9.3). A row whose reference ran oversubscribed is rejected.
 - `allocator` — `system` (default, no FFI) or `mimalloc-feature`; both sides match.
 - `fallback/kill-switch state` — e.g. `FOCR_INT8_ATTN=0 FOCR_INT8_LMHEAD=0 int4=off`.
+- `correctness_proof` — the exact parity receipt for the row: test name and
+  result, or a pointer into the committed evidence manifest that includes text
+  exactness, max logit/ULP delta, CER/TEDS/Formula-CDM budget, and determinism.
 
 **Stage vocabulary:** `preprocess` (image decode/resize/normalize) · `vision-encode`
 (DeepEncoder + projector, per page) · `prefill` (build reference KV: visual + prompt) ·

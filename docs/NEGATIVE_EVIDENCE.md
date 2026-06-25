@@ -55,7 +55,7 @@ date | WIN / NEGATIVE(reverted) | lever (what was tried, where)
   fallback / kill-switch state                   # which path was active: FOCR_INT8_ATTN / FOCR_INT8_LMHEAD /
                                                   #   mimalloc feature / int4-group on|off — proves what ran
   measured before -> after vs reference (ratio)   # real numbers or "blocked: <why>" (ratio = ref_time / focr_time)
-  bit-exact correctness proof                      # test name + result, or the precision contract (ULP/CER bound)
+  bit-exact correctness proof:                     # test name + result, or the precision contract (ULP/CER bound)
   disposition: KEEP / REVERT
   do-not-retry: "do not retry X unless Y"          # the explicit retry condition
   per-lever tally: W / L / N                        # wins / losses / neutral across attempts
@@ -223,7 +223,7 @@ hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a
   fallback / kill-switch state: FOCR_INT8_ATTN=<0|1>  FOCR_INT8_LMHEAD=<0|1>
     int4-group=<off|g32|g16>  allocator=<system|mimalloc-feature>
   measured before -> after vs reference: <ref_ms> / <focr_ms> -> ratio <x.xx>  (or "blocked: <why>")
-  correctness proof: <test name> -> <pass|CER Δ within AF-2 budget|4-ULP table>
+  bit-exact correctness proof: <test name> -> <pass|CER Δ within AF-2 budget|4-ULP table>
   disposition: <KEEP|REVERT>
   do-not-retry: "do not retry <X> unless <Y>"
   per-lever tally: W <n> / L <n> / N <n>
