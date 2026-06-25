@@ -32,6 +32,7 @@ run() {
 run python3 scripts/check_ledgers.py
 run python3 scripts/check_test_logs.py --self-test
 run python3 scripts/check_focrq_format.py
+run python3 scripts/check_oracle_provenance.py --self-test
 run python3 scripts/check_oracle_provenance.py
 run python3 scripts/oracle_bridge.py --self-test
 run python3 scripts/check_release_linkage.py

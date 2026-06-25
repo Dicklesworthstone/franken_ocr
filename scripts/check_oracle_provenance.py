@@ -8,7 +8,10 @@ not been generated on this machine.
 
 from __future__ import annotations
 
+import argparse
+import contextlib
 import hashlib
+import io
 import json
 import re
 import sys
@@ -330,7 +333,148 @@ def validate_manifest(path: Path, failures: list[str]) -> None:
                 failures.append(f"{md_path}: missing token {token!r}")
 
 
-def main() -> int:
+def self_test_reference_record() -> dict[str, Any]:
+    decoded = "oracle provenance self-test"
+    decoded_sha = hashlib.sha256(decoded.encode("utf-8")).hexdigest()
+    command_argv = [
+        sys.executable,
+        "scripts/gen_reference_fixtures.py",
+        "--model-dir",
+        "/nonexistent/model",
+        "--corpus",
+        "/nonexistent/corpus",
+        "--seed",
+        "7",
+    ]
+    return {
+        "schema_version": 1,
+        "decoded_text": decoded,
+        "decoded_text_sha256": decoded_sha,
+        "deterministic_replay": {
+            "schema_version": REPLAY_SCHEMA_VERSION,
+            "rng_seed": 7,
+            "requires_cuda": True,
+            "expected_prefix_kind": "full_decoded_text",
+            "expected_prefix_chars": len(decoded),
+            "expected_prefix_sha256": decoded_sha,
+            "expected_decoded_text_sha256": decoded_sha,
+            "replay_command_argv": command_argv,
+        },
+        "provenance": {
+            "pinned_torch": PIN_TORCH,
+            "pinned_transformers": PIN_TRANSFORMERS,
+            "torch_version": f"{PIN_TORCH}+cu128",
+            "transformers_version": PIN_TRANSFORMERS,
+            "hf_commit": HF_COMMIT,
+            "github_commit": GITHUB_COMMIT,
+            "oracle_is_correctness_golden": True,
+            "model_weights_sha256": "a" * 64,
+            "model_weights_bytes": 1,
+            "command_argv": command_argv,
+            "exact_command": "python3 scripts/gen_reference_fixtures.py --seed 7",
+            "determinism": {
+                "seed": 7,
+                "torch_manual_seed": True,
+                "torch_deterministic_algorithms": True,
+                "cublas_workspace_config": DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG,
+            },
+            "generation_config": {
+                "temperature": 0.0,
+                "do_sample": False,
+            },
+        },
+    }
+
+
+def clone_record(record: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(record))
+
+
+def replay_validation_failures(record: dict[str, Any], *, quiet: bool = False) -> list[str]:
+    path = ROOT / "tests" / "fixtures" / "native" / "self_test_reference.json"
+    failures: list[str] = []
+    if quiet:
+        with contextlib.redirect_stdout(io.StringIO()):
+            validate_provenance(path, record, failures)
+            validate_deterministic_replay(
+                path,
+                record,
+                record.get("decoded_text"),
+                record.get("decoded_text_sha256"),
+                failures,
+            )
+    else:
+        validate_provenance(path, record, failures)
+        validate_deterministic_replay(
+            path,
+            record,
+            record.get("decoded_text"),
+            record.get("decoded_text_sha256"),
+            failures,
+        )
+    return failures
+
+
+def self_test() -> int:
+    ok = True
+    good_record = self_test_reference_record()
+    good_failures = replay_validation_failures(good_record, quiet=True)
+    emit("oracle-provenance-self-test-good", not good_failures, failures=good_failures)
+    ok = ok and not good_failures
+
+    bad_cases = [
+        (
+            "negative-provenance-seed",
+            lambda record: record["provenance"]["determinism"].update({"seed": -1}),
+        ),
+        (
+            "nondeterministic-generation",
+            lambda record: record["provenance"]["generation_config"].update({"do_sample": True}),
+        ),
+        (
+            "replay-seed-mismatch",
+            lambda record: record["deterministic_replay"].update({"rng_seed": 8}),
+        ),
+        (
+            "replay-sha-mismatch",
+            lambda record: record["deterministic_replay"].update(
+                {"expected_prefix_sha256": "b" * 64}
+            ),
+        ),
+        (
+            "replay-without-cuda",
+            lambda record: record["deterministic_replay"].update({"requires_cuda": False}),
+        ),
+        (
+            "replay-command-missing-generator",
+            lambda record: record["deterministic_replay"].update(
+                {"replay_command_argv": ["python3", "other.py"]}
+            ),
+        ),
+    ]
+    for case, mutate in bad_cases:
+        record = clone_record(good_record)
+        mutate(record)
+        failures = replay_validation_failures(record, quiet=True)
+        rejected = bool(failures)
+        emit("oracle-provenance-self-test-bad", rejected, case=case, failures=failures)
+        ok = ok and rejected
+
+    emit("oracle-provenance-self-test-summary", ok)
+    return 0 if ok else 1
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--self-test", action="store_true", help="run in-memory validator checks")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    if args.self_test:
+        return self_test()
+
     failures: list[str] = []
 
     if not NATIVE.exists():
