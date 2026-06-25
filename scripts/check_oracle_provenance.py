@@ -13,8 +13,11 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import re
+import subprocess  # nosec B404 - live replay runs the repo-pinned generator with shell=False.
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -56,6 +59,48 @@ def is_json_int(value: object) -> bool:
 
 def is_non_empty_string_list(value: object) -> bool:
     return isinstance(value, list) and bool(value) and all(isinstance(arg, str) and arg for arg in value)
+
+
+def replay_script_args(command_argv: object) -> list[str] | None:
+    if not is_non_empty_string_list(command_argv):
+        return None
+    argv = list(command_argv)
+    for index, arg in enumerate(argv):
+        if Path(arg).name == "gen_reference_fixtures.py":
+            return argv[index + 1 :]
+    return None
+
+
+def option_value(args: list[str], option: str) -> str | None:
+    prefix = f"{option}="
+    for index, arg in enumerate(args):
+        if arg == option and index + 1 < len(args):
+            return args[index + 1]
+        if arg.startswith(prefix):
+            return arg[len(prefix) :]
+    return None
+
+
+def replace_option(args: list[str], option: str, value: str) -> list[str]:
+    replaced = False
+    out: list[str] = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == option:
+            out.extend([option, value])
+            replaced = True
+            skip_next = True
+        elif arg.startswith(f"{option}="):
+            out.append(f"{option}={value}")
+            replaced = True
+        else:
+            out.append(arg)
+    if not replaced:
+        out.extend([option, value])
+    return out
 
 
 def load_json(path: Path, failures: list[str]) -> dict[str, Any] | None:
@@ -353,6 +398,129 @@ def validate_manifest(path: Path, failures: list[str]) -> None:
                 failures.append(f"{md_path}: missing token {token!r}")
 
 
+def cuda_replay_available() -> tuple[bool, str]:
+    try:
+        import torch  # type: ignore[import-not-found]  # noqa: WPS433
+    except Exception as exc:  # noqa: BLE001 - optional offline oracle dependency
+        return False, f"torch unavailable: {exc}"
+    try:
+        if not bool(torch.cuda.is_available()):
+            return False, "CUDA unavailable"
+    except Exception as exc:  # noqa: BLE001 - backend probing can fail on partial installs
+        return False, f"CUDA probe failed: {exc}"
+    return True, "CUDA available"
+
+
+def replay_prereq_skip(args: list[str]) -> str | None:
+    ok_cuda, cuda_reason = cuda_replay_available()
+    if not ok_cuda:
+        return cuda_reason
+
+    model_dir = option_value(args, "--model-dir") or os.environ.get("FOCR_MODEL_DIR")
+    if not model_dir:
+        return "no --model-dir and FOCR_MODEL_DIR unset"
+    if not Path(model_dir).expanduser().is_dir():
+        return f"model dir not found: {model_dir}"
+
+    corpus = option_value(args, "--corpus") or "tests/fixtures/corpus"
+    if not Path(corpus).expanduser().is_dir():
+        return f"corpus dir not found: {corpus}"
+    return None
+
+
+def load_replay_expectations(reference_paths: list[Path], failures: list[str]) -> dict[tuple[str, ...], dict[str, str]]:
+    grouped: dict[tuple[str, ...], dict[str, str]] = {}
+    for path in reference_paths:
+        value = load_json(path, failures)
+        if value is None:
+            continue
+        replay = value.get("deterministic_replay")
+        replay_args = replay_script_args(replay.get("replay_command_argv") if isinstance(replay, dict) else None)
+        if replay_args is None:
+            failures.append(f"{path}: deterministic_replay.replay_command_argv cannot be replayed")
+            emit("oracle-live-replay-argv", False, file=str(path.relative_to(ROOT)))
+            continue
+        expected_sha = value.get("decoded_text_sha256")
+        if not isinstance(expected_sha, str):
+            failures.append(f"{path}: decoded_text_sha256 must be a string for live replay")
+            emit("oracle-live-replay-expected-sha", False, file=str(path.relative_to(ROOT)), expected=expected_sha)
+            continue
+        grouped.setdefault(tuple(replay_args), {})[path.name] = expected_sha
+        emit("oracle-live-replay-argv", True, file=str(path.relative_to(ROOT)), argc=len(replay_args))
+    return grouped
+
+
+def validate_live_replay(reference_paths: list[Path], failures: list[str]) -> None:
+    if not reference_paths:
+        emit("oracle-live-replay-summary", True, references=0, skipped=True, reason="no native references")
+        return
+
+    grouped = load_replay_expectations(reference_paths, failures)
+    if not grouped:
+        return
+
+    for replay_args_tuple, expected_by_file in sorted(grouped.items()):
+        replay_args = list(replay_args_tuple)
+        skip_reason = replay_prereq_skip(replay_args)
+        if skip_reason is not None:
+            emit(
+                "oracle-live-replay-summary",
+                True,
+                references=len(expected_by_file),
+                skipped=True,
+                reason=skip_reason,
+            )
+            continue
+
+        with tempfile.TemporaryDirectory(prefix="focr-oracle-replay-") as tmp:
+            replay_args = replace_option(replay_args, "--out", tmp)
+            cmd = [sys.executable, str(ROOT / "scripts" / "gen_reference_fixtures.py"), *replay_args]
+            emit("oracle-live-replay-command", True, argc=len(cmd), out=tmp)
+            proc = subprocess.run(  # nosec B603 - argv is sanitized to an anchored script path.
+                cmd,
+                cwd=ROOT,
+                env={**os.environ, "CUBLAS_WORKSPACE_CONFIG": DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG},
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            ok = proc.returncode == 0
+            emit(
+                "oracle-live-replay-exit",
+                ok,
+                returncode=proc.returncode,
+                stdout_tail=proc.stdout[-1000:],
+                stderr_tail=proc.stderr[-1000:],
+            )
+            if not ok:
+                failures.append(f"live oracle replay failed with exit {proc.returncode}")
+                continue
+
+            for file_name, expected_sha in sorted(expected_by_file.items()):
+                replayed = Path(tmp) / file_name
+                if not replayed.is_file():
+                    fail(
+                        failures,
+                        f"live oracle replay did not regenerate {file_name}",
+                        "oracle-live-replay-file",
+                        file=file_name,
+                    )
+                    continue
+                value = load_json(replayed, failures)
+                actual_sha = value.get("decoded_text_sha256") if value is not None else None
+                ok_sha = actual_sha == expected_sha
+                emit(
+                    "oracle-live-replay-sha",
+                    ok_sha,
+                    file=file_name,
+                    expected=expected_sha,
+                    actual=actual_sha,
+                )
+                if not ok_sha:
+                    failures.append(f"{file_name}: live replay decoded_text_sha256 mismatch")
+
+
 def self_test_reference_record() -> dict[str, Any]:
     decoded = "oracle provenance self-test"
     decoded_sha = hashlib.sha256(decoded.encode("utf-8")).hexdigest()
@@ -427,6 +595,19 @@ def self_test() -> int:
     good_failures = reference_validation_failures(good_record, quiet=True)
     emit("oracle-provenance-self-test-good", not good_failures, failures=good_failures)
     ok = ok and not good_failures
+
+    helper_args = ["--model-dir", "/m", "--corpus=/c", "--out", "/old"]
+    helper_ok = (
+        replay_script_args(["python3", "scripts/gen_reference_fixtures.py", *helper_args]) == helper_args
+        and option_value(helper_args, "--model-dir") == "/m"
+        and option_value(helper_args, "--corpus") == "/c"
+        and replace_option(helper_args, "--out", "replay-out")
+        == ["--model-dir", "/m", "--corpus=/c", "--out", "replay-out"]
+        and replace_option(["--model-dir=/m"], "--out", "replay-out")
+        == ["--model-dir=/m", "--out", "replay-out"]
+    )
+    emit("oracle-live-replay-helper-self-test", helper_ok)
+    ok = ok and helper_ok
 
     def set_bool_prefix_for_one_char(record: dict[str, Any]) -> None:
         decoded = "x"
@@ -527,6 +708,11 @@ def self_test() -> int:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true", help="run in-memory validator checks")
+    parser.add_argument(
+        "--live-replay",
+        action="store_true",
+        help="model-gated: rerun recorded generator commands into a temp dir and compare decoded hashes",
+    )
     return parser.parse_args(argv)
 
 
@@ -539,6 +725,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if not NATIVE.exists():
         emit("oracle-native-fixtures-root", True, file=str(NATIVE.relative_to(ROOT)), skipped=True)
+        if args.live_replay:
+            emit(
+                "oracle-live-replay-summary",
+                True,
+                references=0,
+                skipped=True,
+                reason="native fixtures root absent",
+            )
         emit("oracle-provenance-summary", True, manifests=0, references=0, skipped=True)
         return 0
 
@@ -560,6 +754,9 @@ def main(argv: list[str] | None = None) -> int:
         emit("oracle-npy-covered-by-manifest", covered, file=str(npy.relative_to(ROOT)))
         if not covered:
             failures.append(f"{npy}: .npy is not referenced by a fixture manifest")
+
+    if args.live_replay:
+        validate_live_replay(references, failures)
 
     if failures:
         for failure in failures:
