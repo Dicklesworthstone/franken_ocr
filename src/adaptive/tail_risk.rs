@@ -890,40 +890,60 @@ mod tests {
         assert!(approx(evt, 0.8660067126095988, 1e-8), "evt {evt}");
     }
 
-    /// The fixed-bug guard: the plotting-position weight must NOT collapse a1 to
-    /// a0/2. We assert the denominator a0 − 2·a1 is non-degenerate on a real
-    /// tail, which is precisely what the unbiased `(j-1)/(m-1)` weight would have
-    /// destroyed (prototype docstring; design doc §2.2 "Estimator").
+    /// The fixed-bug guard (the load-bearing AF-2 correctness fix). The prototype
+    /// FIXED a rank-weight collapse: using the *unbiased* rank weight
+    /// `(j−1)/(m−1)` instead of the **plotting-position** weight
+    /// `1 − ((j) − 0.35)/m` collapses `a1` toward `a0/2`, which flips the sign of
+    /// the moment denominator `a0 − 2·a1` and drives the GPD **scale negative**,
+    /// so the fit would be rejected (degenerate). We assert, on an evenly-spaced
+    /// real tail (m ≥ MIN_EXCEEDANCES), that (1) the CORRECT plotting-position
+    /// weight gives a valid `pwm` fit with a positive scale, and (2) the BUGGED
+    /// unbiased weight produces an opposite-sign denominator and a negative scale
+    /// — i.e. it breaks the fit.
+    ///
+    /// Verified against the Python reference (denom_corr=+0.0657,
+    /// scale_corr=+0.3786; denom_bug=−0.0667, scale_bug=−0.7585).
     #[test]
-    fn gpd_pwm_plotting_position_avoids_a1_collapse() {
-        let mut s: Vec<f64> = vec![
-            0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.10, 0.13, 0.17, 0.22, 0.30, 0.42,
-            0.60, 0.85,
-        ];
+    fn gpd_pwm_plotting_position_is_the_fixed_estimator() {
+        // 48 tiny + an evenly-spaced ramp 0.20..0.64 (12 docs) → m = 9 exceedances.
+        let mut vals: Vec<f64> = (0..48).map(|i| 0.001 * i as f64).collect();
+        vals.extend((0..12).map(|k| 0.20 + 0.04 * k as f64));
+        let mut s = vals.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let m = s.iter().filter(|&&v| v > empirical_quantile(&s, 0.85).unwrap()).count();
-        assert!(m >= MIN_EXCEEDANCES, "need a real tail for this guard, m={m}");
-        let fit = fit_gpd_pwm(&s, 0.15).unwrap();
-        // A real pwm fit (not a degenerate fallback) proves a1 did NOT collapse.
-        assert_eq!(fit.method, GpdMethod::Pwm, "plotting-position must give a real fit");
-        // Recompute a1 with the BUGGED unbiased weight and confirm it collapses
-        // toward a0/2 (the bug the prototype fixed), so our choice is load-bearing.
-        let u = empirical_quantile(&s, 0.85).unwrap();
-        let mut exc: Vec<f64> = s.iter().copied().filter(|&v| v > u).collect();
+
+        let u = empirical_quantile(&s, 1.0 - DEFAULT_POT_FRAC).unwrap();
+        let mut exc: Vec<f64> = s.iter().copied().filter(|&v| v > u).map(|v| v - u).collect();
         exc.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let mm = exc.len() as f64;
-        let a0 = fsum(exc.iter().copied()) / mm;
-        // Bugged weight (j-1)/(m-1), j=1..m:
-        let a1_bug = fsum(
-            exc.iter()
-                .enumerate()
-                .map(|(j, &y)| ((j as f64) / (mm - 1.0)) * y),
-        ) / mm;
-        // The bugged a1 sits very close to a0/2 → denom a0 − 2·a1 ≈ 0 (degenerate).
+        let m = exc.len();
+        assert!(m >= MIN_EXCEEDANCES, "need a real tail for this guard, m={m}");
+        let mf = m as f64;
+        let a0 = fsum(exc.iter().copied()) / mf;
+
+        // CORRECT plotting-position weight (what fit_gpd_pwm uses).
+        let a1_corr =
+            fsum(exc.iter().enumerate().map(|(j, &y)| (1.0 - (((j + 1) as f64) - 0.35) / mf) * y))
+                / mf;
+        let denom_corr = a0 - 2.0 * a1_corr;
+        let scale_corr = 2.0 * a0 * a1_corr / denom_corr;
+
+        // BUGGED unbiased rank weight (j-1)/(m-1) (0-indexed j → j/(m-1)).
+        let a1_bug = fsum(exc.iter().enumerate().map(|(j, &y)| ((j as f64) / (mf - 1.0)) * y)) / mf;
+        let denom_bug = a0 - 2.0 * a1_bug;
+        let scale_bug = 2.0 * a0 * a1_bug / denom_bug;
+
+        // (1) The correct weight is the one fit_gpd_pwm actually uses → valid pwm.
+        let fit = fit_gpd_pwm(&s, DEFAULT_POT_FRAC).unwrap();
+        assert_eq!(fit.method, GpdMethod::Pwm, "plotting-position must give a real fit");
+        assert!(scale_corr > 0.0, "correct scale must be positive, got {scale_corr}");
+        assert!(approx(fit.scale, scale_corr, 1e-9), "fit uses the correct weight");
+
+        // (2) The bugged weight flips the denom sign and yields a NEGATIVE scale —
+        // exactly the collapse the prototype fixed; that fit would fall back.
         assert!(
-            (a0 - 2.0 * a1_bug).abs() < 0.05 * a0,
-            "bugged weight should drive denom→0: a0={a0} a1_bug={a1_bug}"
+            (denom_corr > 0.0) != (denom_bug > 0.0),
+            "bugged weight must flip denom sign: corr={denom_corr} bug={denom_bug}"
         );
+        assert!(scale_bug < 0.0, "bugged weight must drive scale negative, got {scale_bug}");
     }
 
     // ----- Deterministic fallback: < MIN_EXCEEDANCES samples ------------------
@@ -966,7 +986,7 @@ mod tests {
         // Build many docs at 0 and a flat plateau of identical worst docs.
         let mut v = vec![0.0; 40];
         // 10 identical tail docs at 0.5 → exceedances all equal after threshold.
-        v.extend(std::iter::repeat(0.5).take(10));
+        v.extend(std::iter::repeat_n(0.5, 10));
         let mut s = v.clone();
         s.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let fit = fit_gpd_pwm(&s, 0.15).unwrap();
@@ -984,7 +1004,7 @@ mod tests {
         // Whatever the fit, on the degenerate case the reported EVT equals the
         // empirical quantile (no extrapolation invented) — the contract guarantee.
         let mut v = vec![0.0; 40];
-        v.extend(std::iter::repeat(0.5).take(10));
+        v.extend(std::iter::repeat_n(0.5, 10));
         let report = compute_report_default(&v).unwrap();
         if report.used_fallback() {
             let mut s = v.clone();

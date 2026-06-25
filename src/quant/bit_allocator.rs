@@ -614,6 +614,10 @@ fn dp_once(tensors: &[Tensor], budget: u64, grid_bytes: u64) -> AllocResult<Vec<
                 .cmp(&t.points[j].rate_bytes)
                 .then(option_rank(&t.points[i].option).cmp(&option_rank(&t.points[j].option)))
         });
+        // `c` is the cell *count* (used in arithmetic `nc = c + cost_cells` and
+        // stored as the backtrack predecessor), not merely an index, so the
+        // range loop is the clear form here.
+        #[allow(clippy::needless_range_loop)]
         for c in 0..=cells {
             let base_d = dp[c];
             if base_d.is_infinite() {
@@ -769,7 +773,7 @@ fn uniform_equal_footprint(tensors: &[Tensor], target_bytes: u64) -> UniformBase
                 footprint_bytes: fp,
                 distortion: round9(dd),
             };
-            if best.as_ref().map_or(true, |b| fp > b.footprint_bytes) {
+            if best.as_ref().is_none_or(|b| fp > b.footprint_bytes) {
                 best = Some(cand);
             }
         }
@@ -950,10 +954,10 @@ fn assemble_reason(t: &Tensor) -> String {
     if let Some(pin) = &t.pin {
         return format!("pinned:{pin}");
     }
-    if let Some(floor) = &t.tier_floor {
-        if &cur.option == floor {
-            return format!("tier-floored:{floor}");
-        }
+    if let Some(floor) = &t.tier_floor
+        && &cur.option == floor
+    {
+        return format!("tier-floored:{floor}");
     }
     if t.chosen_idx == 0 {
         "flat: starved to cheapest (return below price)".to_string()
