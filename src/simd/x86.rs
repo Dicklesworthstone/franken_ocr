@@ -85,8 +85,20 @@
 /// Panics if `a.len() != m*k`, `b.len() != n*k`, or `out.len() != m*n` (a
 /// shape/length contract violation is a programming error).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    assert_eq!(a.len(), m * k, "igemm_s8s8: a.len {} != m*k {}", a.len(), m * k);
-    assert_eq!(b.len(), n * k, "igemm_s8s8: b.len {} != n*k {}", b.len(), n * k);
+    assert_eq!(
+        a.len(),
+        m * k,
+        "igemm_s8s8: a.len {} != m*k {}",
+        a.len(),
+        m * k
+    );
+    assert_eq!(
+        b.len(),
+        n * k,
+        "igemm_s8s8: b.len {} != n*k {}",
+        b.len(),
+        n * k
+    );
     assert_eq!(
         out.len(),
         m * n,
@@ -134,8 +146,20 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// Panics if `a.len() != m*k`, `b.len() != n*k`, or `out.len() != m*n`.
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    assert_eq!(a.len(), m * k, "igemm_u8s8: a.len {} != m*k {}", a.len(), m * k);
-    assert_eq!(b.len(), n * k, "igemm_u8s8: b.len {} != n*k {}", b.len(), n * k);
+    assert_eq!(
+        a.len(),
+        m * k,
+        "igemm_u8s8: a.len {} != m*k {}",
+        a.len(),
+        m * k
+    );
+    assert_eq!(
+        b.len(),
+        n * k,
+        "igemm_u8s8: b.len {} != n*k {}",
+        b.len(),
+        n * k
+    );
     assert_eq!(
         out.len(),
         m * n,
@@ -236,6 +260,11 @@ pub fn scalar_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [
 
 #[cfg(target_arch = "x86_64")]
 mod x86_avx2 {
+    // The kernel's load loops use the index for BOTH the destination vector slot
+    // `av[i]`/`bv[j]` AND the source pointer arithmetic `a[(r0+i)*k + t]`; an
+    // `enumerate()` over one array cannot carry the row/col offset, so the
+    // range loop is the correct idiom here.
+    #![allow(clippy::needless_range_loop)]
     use core::arch::x86_64::*;
 
     /// Micro-kernel tile heights/widths (rows of A / rows of B per block).
@@ -423,6 +452,9 @@ mod x86_avx2 {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_avxvnni {
+    // See `x86_avx2`: the load-loop index doubles as a pointer-arithmetic
+    // offset, so the range loop is intentional.
+    #![allow(clippy::needless_range_loop)]
     use core::arch::x86_64::*;
 
     const MR: usize = 2;
@@ -469,22 +501,19 @@ mod x86_avxvnni {
                     let mut av = [_mm256_setzero_si256(); MR];
                     for i in 0..mr {
                         // SAFETY: r0+i<m, t+32<=k; 32 u8 bytes in-bounds.
-                        av[i] = _mm256_loadu_si256(
-                            a.as_ptr().add((r0 + i) * k + t).cast::<__m256i>(),
-                        );
+                        av[i] =
+                            _mm256_loadu_si256(a.as_ptr().add((r0 + i) * k + t).cast::<__m256i>());
                     }
                     let mut bv = [_mm256_setzero_si256(); NR];
                     for j in 0..nr {
                         // SAFETY: c0+j<n, t+32<=k; 32 i8 bytes in-bounds.
-                        bv[j] = _mm256_loadu_si256(
-                            b.as_ptr().add((c0 + j) * k + t).cast::<__m256i>(),
-                        );
+                        bv[j] =
+                            _mm256_loadu_si256(b.as_ptr().add((c0 + j) * k + t).cast::<__m256i>());
                     }
                     for i in 0..mr {
                         for j in 0..nr {
                             // vpdpbusd: u8(av)·s8(bv), 4 MACs/i32 lane, exact.
-                            acc[i][j] =
-                                _mm256_dpbusd_avx_epi32(acc[i][j], av[i], bv[j]);
+                            acc[i][j] = _mm256_dpbusd_avx_epi32(acc[i][j], av[i], bv[j]);
                         }
                     }
                     t += 32;
@@ -533,9 +562,8 @@ mod x86_avxvnni {
                     let mut av = [_mm256_setzero_si256(); MR];
                     for i in 0..mr {
                         // SAFETY: in-bounds; 32 i8 bytes.
-                        let raw = _mm256_loadu_si256(
-                            a.as_ptr().add((r0 + i) * k + t).cast::<__m256i>(),
-                        );
+                        let raw =
+                            _mm256_loadu_si256(a.as_ptr().add((r0 + i) * k + t).cast::<__m256i>());
                         // a + 128: adding 128 to a signed byte == XOR 0x80,
                         // reinterpreting the result as u8 in [0,255]. We use
                         // add_epi8 with -128 (== +128 mod 256) so the byte
@@ -545,15 +573,13 @@ mod x86_avxvnni {
                     let mut bv = [_mm256_setzero_si256(); NR];
                     for j in 0..nr {
                         // SAFETY: in-bounds; 32 i8 bytes.
-                        bv[j] = _mm256_loadu_si256(
-                            b.as_ptr().add((c0 + j) * k + t).cast::<__m256i>(),
-                        );
+                        bv[j] =
+                            _mm256_loadu_si256(b.as_ptr().add((c0 + j) * k + t).cast::<__m256i>());
                     }
                     for i in 0..mr {
                         for j in 0..nr {
                             // dpbusd((a+128), b) = Σ(a+128)·b over this chunk.
-                            acc[i][j] =
-                                _mm256_dpbusd_avx_epi32(acc[i][j], av[i], bv[j]);
+                            acc[i][j] = _mm256_dpbusd_avx_epi32(acc[i][j], av[i], bv[j]);
                         }
                     }
                     t += 32;
@@ -590,6 +616,9 @@ mod x86_avxvnni {
 
 #[cfg(target_arch = "x86_64")]
 mod x86_avx512vnni {
+    // See `x86_avx2`: the load-loop index doubles as a pointer-arithmetic
+    // offset, so the range loop is intentional.
+    #![allow(clippy::needless_range_loop)]
     use core::arch::x86_64::*;
 
     const MR: usize = 2;
@@ -632,21 +661,18 @@ mod x86_avx512vnni {
                     let mut av = [_mm512_setzero_si512(); MR];
                     for i in 0..mr {
                         // SAFETY: r0+i<m, t+64<=k; 64 u8 bytes in-bounds.
-                        av[i] = _mm512_loadu_si512(
-                            a.as_ptr().add((r0 + i) * k + t).cast::<__m512i>(),
-                        );
+                        av[i] =
+                            _mm512_loadu_si512(a.as_ptr().add((r0 + i) * k + t).cast::<__m512i>());
                     }
                     let mut bv = [_mm512_setzero_si512(); NR];
                     for j in 0..nr {
                         // SAFETY: c0+j<n, t+64<=k; 64 i8 bytes in-bounds.
-                        bv[j] = _mm512_loadu_si512(
-                            b.as_ptr().add((c0 + j) * k + t).cast::<__m512i>(),
-                        );
+                        bv[j] =
+                            _mm512_loadu_si512(b.as_ptr().add((c0 + j) * k + t).cast::<__m512i>());
                     }
                     for i in 0..mr {
                         for j in 0..nr {
-                            acc[i][j] =
-                                _mm512_dpbusd_epi32(acc[i][j], av[i], bv[j]);
+                            acc[i][j] = _mm512_dpbusd_epi32(acc[i][j], av[i], bv[j]);
                         }
                     }
                     t += 64;
@@ -696,22 +722,19 @@ mod x86_avx512vnni {
                     let mut av = [_mm512_setzero_si512(); MR];
                     for i in 0..mr {
                         // SAFETY: in-bounds; 64 i8 bytes.
-                        let raw = _mm512_loadu_si512(
-                            a.as_ptr().add((r0 + i) * k + t).cast::<__m512i>(),
-                        );
+                        let raw =
+                            _mm512_loadu_si512(a.as_ptr().add((r0 + i) * k + t).cast::<__m512i>());
                         av[i] = _mm512_add_epi8(raw, bias); // a + 128 (mod 256)
                     }
                     let mut bv = [_mm512_setzero_si512(); NR];
                     for j in 0..nr {
                         // SAFETY: in-bounds; 64 i8 bytes.
-                        bv[j] = _mm512_loadu_si512(
-                            b.as_ptr().add((c0 + j) * k + t).cast::<__m512i>(),
-                        );
+                        bv[j] =
+                            _mm512_loadu_si512(b.as_ptr().add((c0 + j) * k + t).cast::<__m512i>());
                     }
                     for i in 0..mr {
                         for j in 0..nr {
-                            acc[i][j] =
-                                _mm512_dpbusd_epi32(acc[i][j], av[i], bv[j]);
+                            acc[i][j] = _mm512_dpbusd_epi32(acc[i][j], av[i], bv[j]);
                         }
                     }
                     t += 64;
@@ -862,13 +885,24 @@ mod tests {
     #[test]
     fn dispatch_s8s8_matches_oracle_random_and_adversarial() {
         let mut rng = Rng::new(3);
-        let shapes = [(1, 1, 1), (2, 16, 2), (3, 31, 4), (5, 64, 3), (2, 100, 2), (1, 6848, 1)];
+        let shapes = [
+            (1, 1, 1),
+            (2, 16, 2),
+            (3, 31, 4),
+            (5, 64, 3),
+            (2, 100, 2),
+            (1, 6848, 1),
+        ];
         for &(m, k, n) in &shapes {
             let a = rand_a_s8(&mut rng, m * k);
             let b = rand_b(&mut rng, n * k);
             let mut out = vec![0i32; m * n];
             igemm_s8s8(&a, &b, m, k, n, &mut out);
-            assert_eq!(out, oracle_s8s8(&a, &b, m, k, n), "random m={m} k={k} n={n}");
+            assert_eq!(
+                out,
+                oracle_s8s8(&a, &b, m, k, n),
+                "random m={m} k={k} n={n}"
+            );
         }
         // Adversarial all-max operands at the worst-case K (doctrine #6).
         for &(m, k, n) in &[(2, 6848, 2), (1, 6848, 3)] {
@@ -896,13 +930,24 @@ mod tests {
     #[test]
     fn dispatch_u8s8_matches_oracle_random_and_adversarial() {
         let mut rng = Rng::new(4);
-        let shapes = [(1, 1, 1), (2, 16, 2), (3, 31, 4), (5, 64, 3), (2, 100, 2), (1, 6848, 1)];
+        let shapes = [
+            (1, 1, 1),
+            (2, 16, 2),
+            (3, 31, 4),
+            (5, 64, 3),
+            (2, 100, 2),
+            (1, 6848, 1),
+        ];
         for &(m, k, n) in &shapes {
             let a = rand_a_u8(&mut rng, m * k);
             let b = rand_b(&mut rng, n * k);
             let mut out = vec![0i32; m * n];
             igemm_u8s8(&a, &b, m, k, n, &mut out);
-            assert_eq!(out, oracle_u8s8(&a, &b, m, k, n), "random m={m} k={k} n={n}");
+            assert_eq!(
+                out,
+                oracle_u8s8(&a, &b, m, k, n),
+                "random m={m} k={k} n={n}"
+            );
         }
         // Adversarial worst case: u8 all 255 * s8 all 127 (binding U8S8 worst).
         for &(m, k, n) in &[(2, 6848, 2), (1, 6848, 3)] {
@@ -910,12 +955,20 @@ mod tests {
             let b = vec![127i8; n * k];
             let mut out = vec![0i32; m * n];
             igemm_u8s8(&a, &b, m, k, n, &mut out);
-            assert_eq!(out, oracle_u8s8(&a, &b, m, k, n), "255*127 m={m} k={k} n={n}");
+            assert_eq!(
+                out,
+                oracle_u8s8(&a, &b, m, k, n),
+                "255*127 m={m} k={k} n={n}"
+            );
             // u8 all 255 * s8 all -128 (largest |negative|).
             let b = vec![-128i8; n * k];
             let mut out = vec![0i32; m * n];
             igemm_u8s8(&a, &b, m, k, n, &mut out);
-            assert_eq!(out, oracle_u8s8(&a, &b, m, k, n), "255*-128 m={m} k={k} n={n}");
+            assert_eq!(
+                out,
+                oracle_u8s8(&a, &b, m, k, n),
+                "255*-128 m={m} k={k} n={n}"
+            );
         }
     }
 
@@ -929,7 +982,14 @@ mod tests {
             return;
         }
         let mut rng = Rng::new(10);
-        let shapes = [(1, 1, 1), (2, 15, 3), (3, 16, 2), (4, 17, 5), (2, 64, 4), (3, 6848, 2)];
+        let shapes = [
+            (1, 1, 1),
+            (2, 15, 3),
+            (3, 16, 2),
+            (4, 17, 5),
+            (2, 64, 4),
+            (3, 6848, 2),
+        ];
         for &(m, k, n) in &shapes {
             // s8s8
             let a = rand_a_s8(&mut rng, m * k);
@@ -977,7 +1037,14 @@ mod tests {
             return;
         }
         let mut rng = Rng::new(11);
-        let shapes = [(1, 1, 1), (2, 31, 3), (3, 32, 2), (4, 33, 5), (2, 96, 4), (3, 6848, 2)];
+        let shapes = [
+            (1, 1, 1),
+            (2, 31, 3),
+            (3, 32, 2),
+            (4, 33, 5),
+            (2, 96, 4),
+            (3, 6848, 2),
+        ];
         for &(m, k, n) in &shapes {
             let a = rand_a_s8(&mut rng, m * k);
             let b = rand_b(&mut rng, n * k);
@@ -1025,7 +1092,14 @@ mod tests {
             return;
         }
         let mut rng = Rng::new(12);
-        let shapes = [(1, 1, 1), (2, 63, 3), (3, 64, 2), (4, 65, 5), (2, 192, 4), (3, 6848, 2)];
+        let shapes = [
+            (1, 1, 1),
+            (2, 63, 3),
+            (3, 64, 2),
+            (4, 65, 5),
+            (2, 192, 4),
+            (3, 6848, 2),
+        ];
         for &(m, k, n) in &shapes {
             let a = rand_a_s8(&mut rng, m * k);
             let b = rand_b(&mut rng, n * k);
