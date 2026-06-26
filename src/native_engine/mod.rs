@@ -109,6 +109,13 @@ const MAX_NEW_TOKENS_ENV: &str = "FOCR_MAX_NEW_TOKENS";
 /// R-SWA ring window, before any generated-tail eviction).
 const DECODE_STATELESS_ENV: &str = "FOCR_DECODE_STATELESS";
 
+/// Emit a stage-timing line to stderr when `FOCR_TIMING` is set (perf bring-up).
+fn timing_log(msg: &str) {
+    if std::env::var_os("FOCR_TIMING").is_some() {
+        eprintln!("[focr-timing] {msg}");
+    }
+}
+
 /// Build the single-image greedy decode params, honoring [`MAX_NEW_TOKENS_ENV`].
 fn decode_params_from_env() -> DecodeParams {
     let mut p = DecodeParams::single_image();
@@ -502,15 +509,19 @@ impl OcrModel {
     /// if a required tensor is absent from the loaded weights, or an image-decode
     /// error from [`preprocess::preprocess_image`].
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
+        let t = std::time::Instant::now();
         // ── 1. preprocess ────────────────────────────────────────────────────
         let pre = preprocess::preprocess_image(
             image_path,
             preprocess::PreprocessMode::Base { base_size: 1024 },
         )?;
         let (image_w, image_h) = Self::image_dims(&pre);
+        timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
 
         // ── 2. vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ─────────
+        let tv = std::time::Instant::now();
         let vision_features = self.vision_tower(&pre)?;
+        timing_log(&format!("vision_tower {:.2}s", tv.elapsed().as_secs_f64()));
 
         // ── 3. connector: prompt embeds + masked_scatter of the 273-slot block ─
         let (inputs_embeds, prompt_ids) = self.build_inputs_embeds(&pre, &vision_features)?;
@@ -720,6 +731,12 @@ impl OcrModel {
     /// reference block (the entire prefill) is never evicted; the generated tail
     /// rides a 128-slot ring, so memory and per-step cost are bounded.
     ///
+    /// Both prefill and decode run off a [`decoder::DecoderWeightCache`] built
+    /// once here — the decoder weights are dequantized to f32 a single time
+    /// instead of re-dequantizing ~10 GB of expert weights from the bf16 payload
+    /// every token (the dominant decode cost). No math changes, only the weight
+    /// source, so the output is identical to the `&Weights` path.
+    ///
     /// # Errors
     /// As [`Self::generate`].
     fn generate_cached(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
@@ -737,10 +754,23 @@ impl OcrModel {
             )));
         }
 
+        // Dequantize the decoder weights ONCE; prefill + every decode step then
+        // borrow the owned f32 cache (the per-token re-dequant was the bottleneck).
+        let tb = std::time::Instant::now();
+        let wc = decoder::DecoderWeightCache::build(&self.weights)?;
+        timing_log(&format!("weight_cache_build {:.2}s", tb.elapsed().as_secs_f64()));
+
         // Prefill once, capturing each layer's reference K/V; `last_hidden` is the
         // final prefill position, which predicts the FIRST generated token.
-        let (hidden, mut caches) = decoder::prefill_with_cache(&self.weights, &inputs_embeds)?;
+        let tp = std::time::Instant::now();
+        let (hidden, mut caches) = decoder::prefill_with_cache(&wc, &inputs_embeds)?;
         let mut last_hidden = Self::last_hidden_row(&hidden)?;
+        timing_log(&format!(
+            "prefill {:.2}s ({} tokens)",
+            tp.elapsed().as_secs_f64(),
+            prefill_len
+        ));
+        let td = std::time::Instant::now();
 
         // `generated` seeds the no-repeat-ngram history with the prompt so the
         // sliding-window blocker sees the full context (sampler reads its tail).
@@ -748,7 +778,7 @@ impl OcrModel {
         let mut emitted: Vec<u32> = Vec::new();
 
         while emitted.len() < params.max_length {
-            let logits = decoder::lm_head(&self.weights, &last_hidden)?;
+            let logits = decoder::lm_head_cached(&wc, &last_hidden)?;
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token_id);
             emitted.push(step.token_id);
@@ -767,10 +797,15 @@ impl OcrModel {
             let row = table.data[next * hidden_dim..(next + 1) * hidden_dim].to_vec();
             let token_embed = Mat::from_vec(1, hidden_dim, row);
             let position = prefill_len + (emitted.len() - 1);
-            let h =
-                decoder::decode_step_with_cache(&self.weights, &mut caches, &token_embed, position)?;
+            let h = decoder::decode_step_with_cache(&wc, &mut caches, &token_embed, position)?;
             last_hidden = Self::last_hidden_row(&h)?;
         }
+        timing_log(&format!(
+            "decode {:.2}s ({} tokens, {:.3}s/tok)",
+            td.elapsed().as_secs_f64(),
+            emitted.len(),
+            td.elapsed().as_secs_f64() / (emitted.len().max(1) as f64)
+        ));
         Ok(emitted)
     }
 

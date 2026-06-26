@@ -38,6 +38,7 @@ use super::rswa::{self, RingCache};
 use super::tensor::Mat;
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
+use rayon::prelude::*;
 
 fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
     lhs.checked_mul(rhs).ok_or_else(|| {
@@ -759,6 +760,319 @@ fn token_major_to_head_major(
     Ok((kh, vh))
 }
 
+// ── Dequant-once decoder weight cache (decode-throughput lever) ──────────────
+//
+// The `&Weights` decode path re-dequantized ~10 GB of bf16 expert weights from
+// the payload EVERY token: `moe::forward` loads ALL 64 routed experts per MoE
+// layer (x11 layers) even though only 6 of 64 are used per token, plus the
+// attention projections and the [vocab, hidden] lm_head — the dominant decode
+// cost (memory-bandwidth bound). This cache dequantizes every decoder tensor
+// ONCE into an owned f32 image (~10.5 GB) that the (unchanged) kernels borrow by
+// reference, so each subsequent step is pure GEMM. No math changes — only the
+// weight source — so the cached output is identical to the `&Weights` path.
+
+/// Owned, pre-dequantized decoder weights — built ONCE, borrowed by every prefill
+/// and decode step. See module note above; this is the decode-throughput lever.
+pub struct DecoderWeightCache {
+    layers: Vec<CachedLayer>,
+    /// Final `model.norm.weight` (RMSNorm before the head).
+    final_norm: Vec<f32>,
+    /// `lm_head.weight`, row-major `[vocab, hidden]`.
+    lm_head: Vec<f32>,
+}
+
+/// One decoder layer's dequantized weights.
+struct CachedLayer {
+    input_ln: Vec<f32>,
+    post_attn_ln: Vec<f32>,
+    q_proj: Vec<f32>,
+    k_proj: Vec<f32>,
+    v_proj: Vec<f32>,
+    o_proj: Vec<f32>,
+    mlp: CachedMlp,
+}
+
+/// A layer's dequantized MLP weights — dense (layer 0) or MoE (layers 1..11).
+enum CachedMlp {
+    Dense {
+        gate: Vec<f32>,
+        up: Vec<f32>,
+        down: Vec<f32>,
+    },
+    Moe {
+        /// Router gate `[N_ROUTED_EXPERTS, HIDDEN]`.
+        gate: Vec<f32>,
+        /// 64 routed experts, each `[gate_proj, up_proj, down_proj]`.
+        experts: Vec<[Vec<f32>; 3]>,
+        /// Fused shared expert `[gate_proj, up_proj, down_proj]`.
+        shared: [Vec<f32>; 3],
+    },
+}
+
+impl DecoderWeightCache {
+    /// Dequantize every decoder tensor ONCE from [`Weights`]. Allocates ~10.5 GB
+    /// of f32 for the 12-layer DeepSeek-V2 MoE decoder (64 experts/layer); the
+    /// prefill + decode loop then run entirely off these owned buffers.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if any expected tensor is absent/mis-shaped.
+    pub fn build(weights: &Weights) -> FocrResult<Self> {
+        let mut layers = Vec::with_capacity(config::NUM_HIDDEN_LAYERS);
+        for layer in 0..config::NUM_HIDDEN_LAYERS {
+            let prefix = format!("model.layers.{layer}");
+            let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
+            let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
+            let q_proj = weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?.data;
+            let k_proj = weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?.data;
+            let v_proj = weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?.data;
+            let o_proj = weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?.data;
+            let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
+                let p = format!("{prefix}.mlp");
+                CachedMlp::Dense {
+                    gate: weights.mat(&format!("{p}.gate_proj.weight"))?.data,
+                    up: weights.mat(&format!("{p}.up_proj.weight"))?.data,
+                    down: weights.mat(&format!("{p}.down_proj.weight"))?.data,
+                }
+            } else {
+                let p = format!("{prefix}.mlp");
+                let gate = weights.mat(&format!("{p}.gate.weight"))?.data;
+                let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
+                for e in 0..moe::config::N_ROUTED_EXPERTS {
+                    experts.push([
+                        weights.mat(&format!("{p}.experts.{e}.gate_proj.weight"))?.data,
+                        weights.mat(&format!("{p}.experts.{e}.up_proj.weight"))?.data,
+                        weights.mat(&format!("{p}.experts.{e}.down_proj.weight"))?.data,
+                    ]);
+                }
+                let shared = [
+                    weights.mat(&format!("{p}.shared_experts.gate_proj.weight"))?.data,
+                    weights.mat(&format!("{p}.shared_experts.up_proj.weight"))?.data,
+                    weights.mat(&format!("{p}.shared_experts.down_proj.weight"))?.data,
+                ];
+                CachedMlp::Moe {
+                    gate,
+                    experts,
+                    shared,
+                }
+            };
+            layers.push(CachedLayer {
+                input_ln,
+                post_attn_ln,
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+                mlp,
+            });
+        }
+        let final_norm = weights.vec("model.norm.weight")?;
+        let lm_head = weights.mat("lm_head.weight")?.data;
+        Ok(Self {
+            layers,
+            final_norm,
+            lm_head,
+        })
+    }
+}
+
+/// Borrow a cached layer's attention weights as a [`LayerWeights`] (MLP slots
+/// stay empty — the MLP is run via [`cached_mlp`]).
+fn cached_layer_weights(cl: &CachedLayer) -> LayerWeights<'_> {
+    LayerWeights {
+        input_ln: &cl.input_ln,
+        post_attn_ln: &cl.post_attn_ln,
+        q_proj: &cl.q_proj,
+        k_proj: &cl.k_proj,
+        v_proj: &cl.v_proj,
+        o_proj: &cl.o_proj,
+        gate_w: &[],
+        up_w: &[],
+        down_w: &[],
+    }
+}
+
+/// Run one cached layer's MLP — dense (layer 0) or MoE — over the
+/// `post_attention_layernorm`'d hidden, borrowing the dequantized weights (the
+/// MoE router still selects top-k; only the GEMM runs, no dequant).
+fn cached_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Mat> {
+    match mlp {
+        CachedMlp::Dense { gate, up, down } => {
+            let w = moe::MlpWeights {
+                gate_proj: gate,
+                up_proj: up,
+                down_proj: down,
+                hidden: moe::config::HIDDEN_SIZE,
+                intermediate: moe::config::DENSE_INTERMEDIATE_SIZE,
+            };
+            moe::dense_mlp(normed, &w)
+        }
+        CachedMlp::Moe {
+            gate,
+            experts,
+            shared,
+        } => {
+            let exp: Vec<moe::MlpWeights<'_>> = experts
+                .iter()
+                .map(|e| moe::MlpWeights {
+                    gate_proj: &e[0],
+                    up_proj: &e[1],
+                    down_proj: &e[2],
+                    hidden: moe::config::HIDDEN_SIZE,
+                    intermediate: moe::config::MOE_INTERMEDIATE_SIZE,
+                })
+                .collect();
+            let sh = moe::MlpWeights {
+                gate_proj: &shared[0],
+                up_proj: &shared[1],
+                down_proj: &shared[2],
+                hidden: moe::config::HIDDEN_SIZE,
+                intermediate: moe::config::SHARED_INTERMEDIATE_SIZE,
+            };
+            moe::moe_block_default(normed, gate, &exp, &sh)
+        }
+    }
+}
+
+// ── Bespoke single-token (m=1) decode GEMV — the decode-throughput kernel ────
+//
+// Decode is one token at a time: every projection is a matrix·vector product
+// `y[N] = W[N,K] · x[K]`, with W stored `[out, in]` row-major (output-channel
+// major) — so each output row is a CONTIGUOUS `K`-length dot product. The
+// generic GEMM path transposed W every call and fell below ft-kernel-cpu's
+// threading threshold (m=1), running single-threaded at ~0.4 GFLOP/s. This
+// kernel instead: (1) no transpose — dots the native row layout; (2) fans the N
+// independent rows across cores with rayon; (3) an 8-wide unrolled inner dot
+// that LLVM lowers to NEON/AVX FMA. This is intentionally model-specialized, not
+// a general BLAS — exactly the decode hot path and nothing else.
+
+/// 8-wide unrolled f32 dot product (`sum a[i]*b[i]`). The fixed 8-lane reduction
+/// order is deterministic and auto-vectorizes to NEON/AVX FMA under `-O3`.
+#[inline]
+fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    let n = a.len();
+    let mut acc = [0.0f32; 8];
+    let chunks = n / 8;
+    for c in 0..chunks {
+        let base = c * 8;
+        // Indexed (not iter) so the 8 independent FMAs vectorize cleanly.
+        for (l, slot) in acc.iter_mut().enumerate() {
+            *slot += a[base + l] * b[base + l];
+        }
+    }
+    let mut s = ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+    for i in (chunks * 8)..n {
+        s += a[i] * b[i];
+    }
+    s
+}
+
+/// Single-token GEMV: `y[o] = dot(x[0..k], w[o*k .. o*k+k])` for `o in 0..n`,
+/// over `w` in `[n, k]` row-major layout. The `n` output rows are independent →
+/// fanned across the rayon pool. Returns the `[n]` result.
+fn gemv(x: &[f32], w: &[f32], n: usize, k: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(w.len(), n * k);
+    let mut y = vec![0.0f32; n];
+    // Chunked parallelism keeps per-task work well above rayon's dispatch cost
+    // even for the small projections; the huge lm_head row-splits across cores.
+    y.par_chunks_mut(64)
+        .enumerate()
+        .for_each(|(blk, ys)| {
+            let base = blk * 64;
+            for (j, slot) in ys.iter_mut().enumerate() {
+                let o = base + j;
+                *slot = dot_f32(x, &w[o * k..o * k + k]);
+            }
+        });
+    y
+}
+
+/// SiLU / swish: `x * sigmoid(x) = x / (1 + e^-x)` ([SPEC-075], the SwiGLU gate).
+#[inline]
+fn silu(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// One SwiGLU expert over a single decode row `x[hidden]`, off cached weights:
+/// `down( silu(gate·x) * (up·x) )`. `inter` is the expert's intermediate width.
+fn expert_gemv(x: &[f32], gate_w: &[f32], up_w: &[f32], down_w: &[f32], hidden: usize, inter: usize) -> Vec<f32> {
+    let g = gemv(x, gate_w, inter, hidden);
+    let u = gemv(x, up_w, inter, hidden);
+    let mut act = vec![0.0f32; inter];
+    for i in 0..inter {
+        act[i] = silu(g[i]) * u[i];
+    }
+    gemv(&act, down_w, hidden, inter)
+}
+
+/// Decode MoE/MLP over a single `post_attention_layernorm`'d row, off the cached
+/// weights — mirrors [`moe::moe_block_default`] (route top-k, weighted expert
+/// sum, + shared expert) but specialized to `m == 1` with [`gemv`]. Bit-parity
+/// with the GEMM path is gated by the cached-vs-stateless decode check.
+fn decode_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Vec<f32>> {
+    let hidden = config::HIDDEN_SIZE;
+    let row = normed.row(0);
+    match mlp {
+        CachedMlp::Dense { gate, up, down } => Ok(expert_gemv(
+            row,
+            gate,
+            up,
+            down,
+            hidden,
+            moe::config::DENSE_INTERMEDIATE_SIZE,
+        )),
+        CachedMlp::Moe {
+            gate,
+            experts,
+            shared,
+        } => {
+            let routing = moe::route_default(normed, gate)?;
+            let inter = moe::config::MOE_INTERMEDIATE_SIZE;
+            let mut out = vec![0.0f32; hidden];
+            for j in 0..moe::config::NUM_EXPERTS_PER_TOK {
+                let e = routing.indices[0][j];
+                let w = routing.weights[0][j];
+                let y = expert_gemv(row, &experts[e][0], &experts[e][1], &experts[e][2], hidden, inter);
+                for c in 0..hidden {
+                    out[c] += w * y[c];
+                }
+            }
+            // Shared expert (weight 1.0 over every token).
+            let s = expert_gemv(
+                row,
+                &shared[0],
+                &shared[1],
+                &shared[2],
+                hidden,
+                moe::config::SHARED_INTERMEDIATE_SIZE,
+            );
+            for c in 0..hidden {
+                out[c] += s[c];
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Final RMSNorm + `lm_head` over the decode hidden (`[1, hidden]`), off the
+/// cached head weights via the bespoke [`gemv`] — the per-token `[vocab, hidden]`
+/// projection was a major decode cost run single-threaded by the GEMM path.
+///
+/// # Errors
+/// [`FocrError::Other`] on a shape mismatch.
+pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> {
+    if hidden.rows != 1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::lm_head_cached: expected a single decode row, got {} rows",
+            hidden.rows
+        )));
+    }
+    let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
+    let logits = gemv(normed.row(0), &wc.lm_head, config::VOCAB_SIZE, config::HIDDEN_SIZE);
+    Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
+}
+
 /// Run the full 12-layer prefill over `inputs_embeds` exactly like [`forward`],
 /// but ALSO capture each layer's RoPE'd K/V into a per-layer [`RingCache`] — the
 /// R-SWA reference block ([SPEC-091], never evicted). Returns the final
@@ -776,7 +1090,7 @@ fn token_major_to_head_major(
 /// the cache capacity (it is sized to `seq`, so only an internal inconsistency
 /// trips it).
 pub fn prefill_with_cache(
-    weights: &Weights,
+    wc: &DecoderWeightCache,
     inputs_embeds: &Mat,
 ) -> FocrResult<(Mat, Vec<RingCache>)> {
     checked_mat_len("decoder::prefill_with_cache inputs_embeds", inputs_embeds)?;
@@ -804,24 +1118,8 @@ pub fn prefill_with_cache(
 
     let mut x = inputs_embeds.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
-        let prefix = format!("model.layers.{layer}");
-        let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
-        let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
-        let q_proj = weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?;
-        let k_proj = weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?;
-        let v_proj = weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?;
-        let o_proj = weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?;
-        let lw = LayerWeights {
-            input_ln: &input_ln,
-            post_attn_ln: &post_attn_ln,
-            q_proj: &q_proj.data,
-            k_proj: &k_proj.data,
-            v_proj: &v_proj.data,
-            o_proj: &o_proj.data,
-            gate_w: &[],
-            up_w: &[],
-            down_w: &[],
-        };
+        let cl = &wc.layers[layer];
+        let lw = cached_layer_weights(cl);
 
         // Attention sub-block — mirrors `layer_forward`, but intercepts (k, v) to
         // seed the ring cache's reference block before the prefill SDPA.
@@ -833,13 +1131,9 @@ pub fn prefill_with_cache(
         let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
         let h = add_residual(&x, &attn_out)?;
 
-        // MLP / MoE sub-block (dense layer 0, MoE 1..11).
+        // MLP / MoE sub-block (dense layer 0, MoE 1..11) off the cached weights.
         let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
-        let mlp_out = if layer < config::FIRST_K_DENSE_REPLACE {
-            moe::dense_forward(weights, &normed2)?
-        } else {
-            moe::forward(weights, &normed2, layer)?
-        };
+        let mlp_out = cached_mlp(&cl.mlp, &normed2)?;
         x = add_residual(&h, &mlp_out)?;
     }
     Ok((x, caches))
@@ -866,7 +1160,7 @@ pub fn prefill_with_cache(
 /// As [`forward`], plus a [`RingCache::write_decode_step`] error if the caches
 /// were not populated by [`prefill_with_cache`] first, or a shape mismatch.
 pub fn decode_step_with_cache(
-    weights: &Weights,
+    wc: &DecoderWeightCache,
     caches: &mut [RingCache],
     token_embed: &Mat,
     position: usize,
@@ -899,43 +1193,28 @@ pub fn decode_step_with_cache(
 
     let mut x = token_embed.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
-        let prefix = format!("model.layers.{layer}");
-        let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
-        let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
-        let q_proj = weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?;
-        let k_proj = weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?;
-        let v_proj = weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?;
-        let o_proj = weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?;
-        let lw = LayerWeights {
-            input_ln: &input_ln,
-            post_attn_ln: &post_attn_ln,
-            q_proj: &q_proj.data,
-            k_proj: &k_proj.data,
-            v_proj: &v_proj.data,
-            o_proj: &o_proj.data,
-            gate_w: &[],
-            up_w: &[],
-            down_w: &[],
-        };
+        let cl = &wc.layers[layer];
 
-        // Attention: project the single token, RoPE at `position`, push its K/V
-        // into the ring (the query attends to itself as the newest ring token —
-        // OQ-3), then R-SWA decode attention over reference ++ ring. seq == 1, so
-        // the token-major `[1, qkv_dim]` rows ARE the head-major `[num_heads,
-        // head_dim]` flats the ring/decode kernels expect.
-        let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
-        let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
-        caches[layer].write_decode_step(&k.data, &v.data)?;
+        // Attention via the bespoke m=1 GEMV: project q/k/v, RoPE q/k at the true
+        // `position`, push K/V into the ring (the query attends to itself as the
+        // newest ring token — OQ-3), R-SWA decode attention over reference ++
+        // ring, then o_proj. seq == 1, so the token-major `[1, qkv_dim]` rows ARE
+        // the head-major `[num_heads, head_dim]` flats the ring kernels expect.
+        let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+        let nrow = normed.row(0);
+        let mut q = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.q_proj, qkv_dim, hidden));
+        let mut k = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.k_proj, qkv_dim, hidden));
+        let v = gemv(nrow, &cl.v_proj, qkv_dim, hidden);
+        apply_rope(&mut q, &rope)?;
+        apply_rope(&mut k, &rope)?;
+        caches[layer].write_decode_step(&k.data, &v)?;
         let context = rswa::decode_attention(&caches[layer], &q.data)?;
-        let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
+        let attn_out = Mat::from_vec(1, hidden, gemv(&context.data, &cl.o_proj, hidden, qkv_dim));
         let h = add_residual(&x, &attn_out)?;
 
-        let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
-        let mlp_out = if layer < config::FIRST_K_DENSE_REPLACE {
-            moe::dense_forward(weights, &normed2)?
-        } else {
-            moe::forward(weights, &normed2, layer)?
-        };
+        // MLP / MoE via the bespoke GEMV (routed top-k experts + shared).
+        let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+        let mlp_out = Mat::from_vec(1, hidden, decode_mlp(&cl.mlp, &normed2)?);
         x = add_residual(&h, &mlp_out)?;
     }
     Ok(x)
