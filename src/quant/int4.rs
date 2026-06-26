@@ -89,6 +89,12 @@ impl QuantizedInt4 {
     /// Number of groups per output row (`k / group_size`).
     #[must_use]
     pub fn groups_per_row(&self) -> usize {
+        assert!(
+            self.group_size != 0 && self.k.is_multiple_of(self.group_size),
+            "QuantizedInt4::groups_per_row: group_size {} must divide k {}",
+            self.group_size,
+            self.k
+        );
         self.k / self.group_size
     }
 }
@@ -134,12 +140,13 @@ fn i8_of_nibble(nib: u8) -> i8 {
 /// violations, surfaced early.
 #[must_use]
 pub fn pack_int4_f32(weights: &[f32], n: usize, k: usize, group_size: usize) -> QuantizedInt4 {
+    let len = super::int8::checked_len("pack_int4_f32", n, k, "n*k");
     assert_eq!(
         weights.len(),
-        n * k,
+        len,
         "pack_int4_f32: weights len {} != n*k {}",
         weights.len(),
-        n * k
+        len
     );
     assert!(
         VALID_GROUP_SIZES.contains(&group_size),
@@ -152,8 +159,11 @@ pub fn pack_int4_f32(weights: &[f32], n: usize, k: usize, group_size: usize) -> 
     );
 
     let groups_per_row = k / group_size;
-    let mut packed = vec![0u8; n * (k / 2)];
-    let mut scales = Vec::with_capacity(n * groups_per_row);
+    let packed_len = super::int8::checked_len("pack_int4_f32", n, k / 2, "n*k/2");
+    let scales_len =
+        super::int8::checked_len("pack_int4_f32", n, groups_per_row, "n*(k/group_size)");
+    let mut packed = vec![0u8; packed_len];
+    let mut scales = Vec::with_capacity(scales_len);
 
     for o in 0..n {
         let row = &weights[o * k..(o + 1) * k];
@@ -201,12 +211,13 @@ pub fn pack_int4_f32(weights: &[f32], n: usize, k: usize, group_size: usize) -> 
 /// As [`pack_int4_f32`].
 #[must_use]
 pub fn pack_int4_bf16(weights: &[bf16], n: usize, k: usize, group_size: usize) -> QuantizedInt4 {
+    let len = super::int8::checked_len("pack_int4_bf16", n, k, "n*k");
     assert_eq!(
         weights.len(),
-        n * k,
+        len,
         "pack_int4_bf16: weights len {} != n*k {}",
         weights.len(),
-        n * k
+        len
     );
     let widened: Vec<f32> = weights.iter().map(|&w| w.to_f32()).collect();
     pack_int4_f32(&widened, n, k, group_size)
@@ -223,17 +234,24 @@ pub fn pack_int4_bf16(weights: &[bf16], n: usize, k: usize, group_size: usize) -
 /// path), never folded into the unpacked codes.
 ///
 /// # Panics
-/// Panics if `packed.len() != n · k/2`.
+/// Panics if `k` is odd or `packed.len() != n · k/2`.
 #[must_use]
 pub fn unpack_int4_to_i8(q: &QuantizedInt4) -> Vec<i8> {
+    assert!(
+        q.k.is_multiple_of(2),
+        "unpack_int4_to_i8: k {} must be even",
+        q.k
+    );
+    let packed_len = super::int8::checked_len("unpack_int4_to_i8", q.n, q.k / 2, "n*k/2");
+    let out_len = super::int8::checked_len("unpack_int4_to_i8", q.n, q.k, "n*k");
     assert_eq!(
         q.packed.len(),
-        q.n * (q.k / 2),
+        packed_len,
         "unpack_int4_to_i8: packed len {} != n*k/2 {}",
         q.packed.len(),
-        q.n * (q.k / 2)
+        packed_len
     );
-    let mut out = vec![0i8; q.n * q.k];
+    let mut out = vec![0i8; out_len];
     for o in 0..q.n {
         let row_base = o * (q.k / 2);
         let out_base = o * q.k;
@@ -253,8 +271,18 @@ pub fn unpack_int4_to_i8(q: &QuantizedInt4) -> Vec<i8> {
 #[must_use]
 pub fn dequantize_int4(q: &QuantizedInt4) -> Vec<f32> {
     let codes = unpack_int4_to_i8(q);
-    let groups_per_row = q.k / q.group_size;
-    let mut out = Vec::with_capacity(q.n * q.k);
+    let groups_per_row = q.groups_per_row();
+    let scales_len =
+        super::int8::checked_len("dequantize_int4", q.n, groups_per_row, "n*(k/group_size)");
+    assert_eq!(
+        q.scales.len(),
+        scales_len,
+        "dequantize_int4: scales len {} != n*(k/group_size) {}",
+        q.scales.len(),
+        scales_len
+    );
+    let out_len = super::int8::checked_len("dequantize_int4", q.n, q.k, "n*k");
+    let mut out = Vec::with_capacity(out_len);
     for o in 0..q.n {
         for col in 0..q.k {
             let g = col / q.group_size;
@@ -449,5 +477,56 @@ mod tests {
     #[should_panic(expected = "weights len")]
     fn rejects_shape_mismatch() {
         let _ = pack_int4_f32(&[0.0; 10], 1, 16, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "pack_int4_f32: n*k overflow")]
+    fn pack_int4_f32_rejects_shape_product_overflow() {
+        let _ = pack_int4_f32(&[], usize::MAX, 16, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "pack_int4_bf16: n*k overflow")]
+    fn pack_int4_bf16_rejects_shape_product_overflow() {
+        let _ = pack_int4_bf16(&[], usize::MAX, 16, 16);
+    }
+
+    #[test]
+    #[should_panic(expected = "unpack_int4_to_i8: k 3 must be even")]
+    fn unpack_rejects_odd_k() {
+        let q = QuantizedInt4 {
+            packed: vec![0],
+            scales: vec![1.0],
+            n: 1,
+            k: 3,
+            group_size: 1,
+        };
+        let _ = unpack_int4_to_i8(&q);
+    }
+
+    #[test]
+    #[should_panic(expected = "unpack_int4_to_i8: n*k/2 overflow")]
+    fn unpack_rejects_packed_shape_product_overflow() {
+        let q = QuantizedInt4 {
+            packed: Vec::new(),
+            scales: Vec::new(),
+            n: usize::MAX,
+            k: 4,
+            group_size: 2,
+        };
+        let _ = unpack_int4_to_i8(&q);
+    }
+
+    #[test]
+    #[should_panic(expected = "QuantizedInt4::groups_per_row")]
+    fn groups_per_row_rejects_zero_group_size() {
+        let q = QuantizedInt4 {
+            packed: Vec::new(),
+            scales: Vec::new(),
+            n: 1,
+            k: 16,
+            group_size: 0,
+        };
+        let _ = q.groups_per_row();
     }
 }

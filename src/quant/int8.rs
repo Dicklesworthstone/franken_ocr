@@ -49,6 +49,13 @@ use half::bf16;
 /// the i32 GEMM accumulator bound is `K · Q_MAX²` (doctrine #6).
 pub const Q_MAX: i32 = 127;
 
+#[track_caller]
+pub(crate) fn checked_len(context: &str, lhs: usize, rhs: usize, expr: &str) -> usize {
+    let len = lhs.checked_mul(rhs);
+    assert!(len.is_some(), "{context}: {expr} overflow ({lhs} * {rhs})");
+    len.unwrap_or(0)
+}
+
 /// A symmetric per-output-channel int8-quantized weight, ready to be written to a
 /// `.focrq` `QInt8PerChan` record (its payload is `q`, its inline scales are
 /// `scales`).
@@ -136,14 +143,15 @@ fn quantize_row(row: &[f32]) -> (Vec<i8>, f32) {
 /// bug, surfaced early — same discipline as `QInt8::new`).
 #[must_use]
 pub fn quantize_int8_f32(weights: &[f32], n: usize, k: usize) -> QuantizedInt8 {
+    let len = checked_len("quantize_int8_f32", n, k, "n*k");
     assert_eq!(
         weights.len(),
-        n * k,
+        len,
         "quantize_int8_f32: weights len {} != n*k {}",
         weights.len(),
-        n * k
+        len
     );
-    let mut q = Vec::with_capacity(n * k);
+    let mut q = Vec::with_capacity(len);
     let mut scales = Vec::with_capacity(n);
     for o in 0..n {
         let row = &weights[o * k..(o + 1) * k];
@@ -167,12 +175,13 @@ pub fn quantize_int8_f32(weights: &[f32], n: usize, k: usize) -> QuantizedInt8 {
 /// Panics if `weights.len() != n * k`.
 #[must_use]
 pub fn quantize_int8_bf16(weights: &[bf16], n: usize, k: usize) -> QuantizedInt8 {
+    let len = checked_len("quantize_int8_bf16", n, k, "n*k");
     assert_eq!(
         weights.len(),
-        n * k,
+        len,
         "quantize_int8_bf16: weights len {} != n*k {}",
         weights.len(),
-        n * k
+        len
     );
     let widened: Vec<f32> = weights.iter().map(|&w| w.to_f32()).collect();
     quantize_int8_f32(&widened, n, k)
@@ -185,7 +194,22 @@ pub fn quantize_int8_bf16(weights: &[bf16], n: usize, k: usize) -> QuantizedInt8
 /// measure error.
 #[must_use]
 pub fn dequantize_int8(q: &QuantizedInt8) -> Vec<f32> {
-    let mut out = Vec::with_capacity(q.n * q.k);
+    let len = checked_len("dequantize_int8", q.n, q.k, "n*k");
+    assert_eq!(
+        q.q.len(),
+        len,
+        "dequantize_int8: q len {} != n*k {}",
+        q.q.len(),
+        len
+    );
+    assert_eq!(
+        q.scales.len(),
+        q.n,
+        "dequantize_int8: scales len {} != n {}",
+        q.scales.len(),
+        q.n
+    );
+    let mut out = Vec::with_capacity(len);
     for o in 0..q.n {
         let s = q.scales[o];
         for &v in &q.q[o * q.k..(o + 1) * q.k] {
@@ -320,6 +344,18 @@ mod tests {
     }
 
     #[test]
+    fn signed_weight_ties_round_to_even_on_both_sides_of_zero() {
+        // scale forced to 1.0 by ±127 endpoints. Every ±N.5 value below is an
+        // exact f32 tie, so this catches accidental Rust `round()` half-away use.
+        let q = quantize_int8_f32(&[-127.0, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 127.0], 1, 8);
+        assert_eq!(q.scales, vec![1.0]);
+        assert_eq!(q.q, vec![-127i8, -2, -2, 0, 0, 2, 2, 127]);
+
+        let again = quantize_int8_f32(&[-127.0, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 127.0], 1, 8);
+        assert_eq!(q, again, "weight quant must be byte-identical across runs");
+    }
+
+    #[test]
     fn negative_value_never_reaches_minus_128() {
         // Even a huge-magnitude negative is clamped at -127, never -128.
         let q = quantize_int8_f32(&[-1000.0, 1000.0], 1, 2);
@@ -364,6 +400,30 @@ mod tests {
     #[should_panic(expected = "weights len")]
     fn rejects_shape_mismatch() {
         let _ = quantize_int8_f32(&[1.0, 2.0, 3.0], 2, 3);
+    }
+
+    #[test]
+    #[should_panic(expected = "quantize_int8_f32: n*k overflow")]
+    fn quantize_int8_f32_rejects_shape_product_overflow() {
+        let _ = quantize_int8_f32(&[], usize::MAX, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "quantize_int8_bf16: n*k overflow")]
+    fn quantize_int8_bf16_rejects_shape_product_overflow() {
+        let _ = quantize_int8_bf16(&[], usize::MAX, 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "dequantize_int8: n*k overflow")]
+    fn dequantize_int8_rejects_shape_product_overflow() {
+        let q = QuantizedInt8 {
+            q: Vec::new(),
+            scales: Vec::new(),
+            n: usize::MAX,
+            k: 2,
+        };
+        let _ = dequantize_int8(&q);
     }
 
     // ── i32-overflow safety (doctrine #6, worst case K=6848) ────────────────
@@ -436,6 +496,24 @@ mod tests {
         assert!(a.scale.is_finite());
         assert_eq!(a.q.len(), 0);
         assert_eq!(a.zero_point, 0);
+    }
+
+    #[test]
+    fn activation_u8_ties_round_to_even_and_are_byte_identical() {
+        // min=-127, max=128 -> scale=1 and zero_point=127. The ±N.5 inputs land
+        // exactly on rounding boundaries after division, exercising the pinned
+        // round_ties_even rule for the U8S8 converter helper.
+        let x = [-127.0f32, 128.0, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5];
+        let a = quantize_activation_u8(&x);
+        assert_eq!(a.scale, 1.0);
+        assert_eq!(a.zero_point, 127);
+        assert_eq!(a.q, vec![0u8, 255, 125, 125, 127, 127, 129, 129]);
+
+        let again = quantize_activation_u8(&x);
+        assert_eq!(
+            a, again,
+            "activation quant must be byte-identical across runs"
+        );
     }
 
     #[test]
