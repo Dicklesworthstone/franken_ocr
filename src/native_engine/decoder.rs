@@ -293,9 +293,10 @@ fn linear_no_bias(x: &Mat, w: &[f32], in_: usize, out: usize) -> FocrResult<Mat>
     }
     // Transpose [out, in] -> [in, out] so matmul does [seq,in] x [in,out].
     let mut wt = vec![0.0f32; expected_weight_len];
-    for o in 0..out {
-        for i in 0..in_ {
-            wt[i * out + o] = w[o * in_ + i];
+    for i in 0..in_ {
+        let dst = &mut wt[i * out..(i + 1) * out];
+        for (o, slot) in dst.iter_mut().enumerate() {
+            *slot = w[o * in_ + i];
         }
     }
     let w_mat = Mat::from_vec(in_, out, wt);
@@ -529,15 +530,16 @@ mod tests {
     // ── Token embedding ([SPEC-070]) ────────────────────────────────────────
 
     #[test]
-    fn embed_tokens_gathers_rows() {
+    fn embed_tokens_gathers_rows() -> FocrResult<()> {
         // vocab=3, hidden=2 table: row0=[0,1] row1=[2,3] row2=[4,5]
         let table = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        let out = embed_tokens(&table, 3, 2, &[2, 0, 1, 2]).unwrap();
+        let out = embed_tokens(&table, 3, 2, &[2, 0, 1, 2])?;
         assert_eq!(out.shape(), (4, 2));
         assert_eq!(out.row(0), &[4.0, 5.0]);
         assert_eq!(out.row(1), &[0.0, 1.0]);
         assert_eq!(out.row(2), &[2.0, 3.0]);
         assert_eq!(out.row(3), &[4.0, 5.0]);
+        Ok(())
     }
 
     #[test]
@@ -565,18 +567,19 @@ mod tests {
     // ── RoPE ([SPEC-078]) ───────────────────────────────────────────────────
 
     #[test]
-    fn rope_position_zero_is_identity() {
+    fn rope_position_zero_is_identity() -> FocrResult<()> {
         // head_dim=4, single head; pos 0 => cos=1, sin=0 => x unchanged.
         let rope = RopeTable::build(&[0], 4, 10000.0);
         let mut x = Mat::from_vec(1, 4, vec![1.0, 2.0, 3.0, 4.0]);
-        apply_rope(&mut x, &rope).unwrap();
+        apply_rope(&mut x, &rope)?;
         for (got, want) in x.data.iter().zip([1.0f32, 2.0, 3.0, 4.0].iter()) {
             assert!((got - want).abs() < 1e-6, "{got} != {want}");
         }
+        Ok(())
     }
 
     #[test]
-    fn rope_matches_hand_computed_rotate_half() {
+    fn rope_matches_hand_computed_rotate_half() -> FocrResult<()> {
         // head_dim=2 => half=1, inv_freq[0] = 10000^0 = 1, so angle = pos.
         // rotate_half([a,b]) = [-b, a].
         // out[0] = a*cos - b*sin ; out[1] = b*cos + a*sin.
@@ -585,16 +588,17 @@ mod tests {
         let rope = RopeTable::build(&[pos], 2, theta);
         let (a, b) = (3.0f32, 5.0f32);
         let mut x = Mat::from_vec(1, 2, vec![a, b]);
-        apply_rope(&mut x, &rope).unwrap();
+        apply_rope(&mut x, &rope)?;
         let (s, c) = (pos as f32).sin_cos();
         let want0 = a * c - b * s;
         let want1 = b * c + a * s;
         assert!((x.data[0] - want0).abs() < 1e-5, "{} != {want0}", x.data[0]);
         assert!((x.data[1] - want1).abs() < 1e-5, "{} != {want1}", x.data[1]);
+        Ok(())
     }
 
     #[test]
-    fn rope_preserves_norm_per_head() {
+    fn rope_preserves_norm_per_head() -> FocrResult<()> {
         // A rotation preserves the L2 norm of each head block.
         let rope = RopeTable::build(&[7, 13], 4, 10000.0);
         let mut x = Mat::from_vec(2, 8, (0..16).map(|i| (i as f32) * 0.25 - 2.0).collect());
@@ -609,26 +613,28 @@ mod tests {
             out
         };
         let before = head_norms(&x.data);
-        apply_rope(&mut x, &rope).unwrap();
+        apply_rope(&mut x, &rope)?;
         let after = head_norms(&x.data);
         for (b, a) in before.iter().zip(after.iter()) {
             assert!((b - a).abs() < 1e-4, "norm changed: {b} -> {a}");
         }
+        Ok(())
     }
 
     #[test]
-    fn rope_two_heads_share_phase() {
+    fn rope_two_heads_share_phase() -> FocrResult<()> {
         // head_dim=2, two heads packed in one row -> each head rotated by the
         // SAME phase (RoPE is per-position, shared across heads).
         let rope = RopeTable::build(&[2], 2, 10000.0);
         let mut x = Mat::from_vec(1, 4, vec![1.0, 0.0, 0.0, 1.0]);
-        apply_rope(&mut x, &rope).unwrap();
+        apply_rope(&mut x, &rope)?;
         let (s, c) = (2.0f32).sin_cos();
         // head0 = [1,0] -> [c, s]; head1 = [0,1] -> [-s, c]
         assert!((x.data[0] - c).abs() < 1e-5);
         assert!((x.data[1] - s).abs() < 1e-5);
         assert!((x.data[2] - (-s)).abs() < 1e-5);
         assert!((x.data[3] - c).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
@@ -645,7 +651,7 @@ mod tests {
     // ── Dense SwiGLU MLP ([SPEC-075]) ───────────────────────────────────────
 
     #[test]
-    fn dense_mlp_matches_hand_computed() {
+    fn dense_mlp_matches_hand_computed() -> FocrResult<()> {
         // hidden=2, inter=2, single token x=[1,0].
         // gate_w=[[1,0],[0,1]] => gate = [1, 0]
         // up_w  =[[1,1],[1,1]] => up   = [1, 1]
@@ -656,11 +662,12 @@ mod tests {
         let gate_w = vec![1.0, 0.0, 0.0, 1.0];
         let up_w = vec![1.0, 1.0, 1.0, 1.0];
         let down_w = vec![1.0, 0.0, 0.0, 1.0];
-        let out = dense_mlp(&x, &gate_w, &up_w, &down_w, 2, 2).unwrap();
+        let out = dense_mlp(&x, &gate_w, &up_w, &down_w, 2, 2)?;
         assert_eq!(out.shape(), (1, 2));
         let silu1 = 1.0f32 / (1.0 + (-1.0f32).exp());
         assert!((out.data[0] - silu1).abs() < 1e-5, "{}", out.data[0]);
         assert!(out.data[1].abs() < 1e-6, "{}", out.data[1]);
+        Ok(())
     }
 
     #[test]
@@ -672,14 +679,30 @@ mod tests {
     // ── linear_no_bias (the F.linear [out,in] transpose) ────────────────────
 
     #[test]
-    fn linear_no_bias_transposes_pytorch_layout() {
+    fn linear_no_bias_transposes_pytorch_layout() -> FocrResult<()> {
         // x=[1,2] (1x2 row); w=[out=3, in=2] row-major:
         //   w = [[1,0],[0,1],[1,1]]  => y = [x·w0, x·w1, x·w2] = [1, 2, 3]
         let x = Mat::from_vec(1, 2, vec![1.0, 2.0]);
         let w = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        let y = linear_no_bias(&x, &w, 2, 3).unwrap();
+        let y = linear_no_bias(&x, &w, 2, 3)?;
         assert_eq!(y.shape(), (1, 3));
         assert_eq!(y.data, vec![1.0, 2.0, 3.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn linear_no_bias_transposes_multirow_nonsquare_layout() -> FocrResult<()> {
+        let x = Mat::from_vec(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let w = vec![
+            1.0, 0.0, 0.0, // row 0 selects x0
+            0.0, 1.0, 0.0, // row 1 selects x1
+            0.0, 0.0, 1.0, // row 2 selects x2
+            1.0, 1.0, 1.0, // row 3 sums the input row
+        ];
+        let y = linear_no_bias(&x, &w, 3, 4)?;
+        assert_eq!(y.shape(), (2, 4));
+        assert_eq!(y.data, vec![1.0, 2.0, 3.0, 6.0, 4.0, 5.0, 6.0, 15.0]);
+        Ok(())
     }
 
     #[test]
@@ -691,11 +714,12 @@ mod tests {
     // ── Residual add ([SPEC-072]) ───────────────────────────────────────────
 
     #[test]
-    fn add_residual_sums_elementwise() {
+    fn add_residual_sums_elementwise() -> FocrResult<()> {
         let a = Mat::from_vec(2, 2, vec![1.0, 2.0, 3.0, 4.0]);
         let b = Mat::from_vec(2, 2, vec![10.0, 20.0, 30.0, 40.0]);
-        let c = add_residual(&a, &b).unwrap();
+        let c = add_residual(&a, &b)?;
         assert_eq!(c.data, vec![11.0, 22.0, 33.0, 44.0]);
+        Ok(())
     }
 
     #[test]
@@ -708,32 +732,34 @@ mod tests {
     // ── Final norm + lm_head ([SPEC-071]/[SPEC-081]) ────────────────────────
 
     #[test]
-    fn lm_head_proj_matches_matmul() {
+    fn lm_head_proj_matches_matmul() -> FocrResult<()> {
         // hidden=2 vocab=3; head_w=[vocab,hidden] = [[1,0],[0,1],[1,1]]
         // hidden state [3,4] -> logits [3, 4, 7]
         let h = Mat::from_vec(1, 2, vec![3.0, 4.0]);
         let head_w = vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0];
-        let logits = lm_head_proj(&h, &head_w, 3).unwrap();
+        let logits = lm_head_proj(&h, &head_w, 3)?;
         assert_eq!(logits.shape(), (1, 3));
         assert_eq!(logits.data, vec![3.0, 4.0, 7.0]);
+        Ok(())
     }
 
     #[test]
-    fn norm_and_lm_head_composes_rmsnorm_then_head() {
+    fn norm_and_lm_head_composes_rmsnorm_then_head() -> FocrResult<()> {
         // hidden=2, vocab=2. x=[3,4], norm_w=[1,1], eps=0.
         // rmsnorm: mean(x^2)=12.5, rstd=1/sqrt(12.5); normed=[3*rstd,4*rstd]
         // head_w = identity [[1,0],[0,1]] => logits = normed
         let h = Mat::from_vec(1, 2, vec![3.0, 4.0]);
         let norm_w = vec![1.0, 1.0];
         let head_w = vec![1.0, 0.0, 0.0, 1.0];
-        let logits = norm_and_lm_head(&h, &norm_w, &head_w, 2, 0.0).unwrap();
+        let logits = norm_and_lm_head(&h, &norm_w, &head_w, 2, 0.0)?;
         let rstd = 1.0f32 / 12.5f32.sqrt();
         assert!((logits.data[0] - 3.0 * rstd).abs() < 1e-5);
         assert!((logits.data[1] - 4.0 * rstd).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
-    fn lm_head_last_row_is_full_last_row() {
+    fn lm_head_last_row_is_full_last_row() -> FocrResult<()> {
         // The "compute only the rows you read" structural win: the decode driver
         // feeds lm_head ONLY the last hidden row (mod.rs). RMSNorm and the lm_head
         // linear are per-row independent, so the last-row slice MUST be exactly
@@ -750,9 +776,9 @@ mod tests {
             .collect();
         let eps = 1e-6;
 
-        let full_logits = norm_and_lm_head(&full, &norm_w, &head_w, vocab, eps).unwrap();
+        let full_logits = norm_and_lm_head(&full, &norm_w, &head_w, vocab, eps)?;
         let last = Mat::from_vec(1, hidden, full.row(seq - 1).to_vec());
-        let last_logits = norm_and_lm_head(&last, &norm_w, &head_w, vocab, eps).unwrap();
+        let last_logits = norm_and_lm_head(&last, &norm_w, &head_w, vocab, eps)?;
 
         assert_eq!((last_logits.rows, last_logits.cols), (1, vocab));
         let full_last = &full_logits.data[(seq - 1) * vocab..seq * vocab];
@@ -760,21 +786,23 @@ mod tests {
             last_logits.data, full_last,
             "last-row lm_head must be bit-identical to full[last]"
         );
+        Ok(())
     }
 
     // ── attn output proj / qkv ([SPEC-090]) ─────────────────────────────────
 
     #[test]
-    fn attn_output_proj_projects_context() {
+    fn attn_output_proj_projects_context() -> FocrResult<()> {
         // qkv_dim=2 hidden=2; context=[1,1]; o_proj=[[2,0],[0,3]] -> [2,3]
         let ctx = Mat::from_vec(1, 2, vec![1.0, 1.0]);
         let o = vec![2.0, 0.0, 0.0, 3.0];
-        let out = attn_output_proj(&ctx, &o, 2, 2).unwrap();
+        let out = attn_output_proj(&ctx, &o, 2, 2)?;
         assert_eq!(out.data, vec![2.0, 3.0]);
+        Ok(())
     }
 
     #[test]
-    fn qkv_with_rope_shapes_and_pos0_identity() {
+    fn qkv_with_rope_shapes_and_pos0_identity() -> FocrResult<()> {
         // hidden=2, single head head_dim=2 (qkv_dim=2), one token at pos 0.
         // q/k/v projections identity => q=k=v=normed; RoPE at pos0 = identity.
         let normed = Mat::from_vec(1, 2, vec![1.0, 2.0]);
@@ -791,17 +819,18 @@ mod tests {
             down_w: &[],
         };
         let rope = RopeTable::build(&[0], 2, 10000.0);
-        let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, 2, 2).unwrap();
+        let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, 2, 2)?;
         assert_eq!(q.shape(), (1, 2));
         assert_eq!(v.data, vec![1.0, 2.0]); // v never rope'd
         assert_eq!(q.data, vec![1.0, 2.0]); // pos0 rope = identity
         assert_eq!(k.data, vec![1.0, 2.0]);
+        Ok(())
     }
 
     // ── Full layer driver ([SPEC-072]) ──────────────────────────────────────
 
     #[test]
-    fn layer_forward_pre_norm_residual_identity_path() {
+    fn layer_forward_pre_norm_residual_identity_path() -> FocrResult<()> {
         // Build a layer where attention and MLP both return ZERO; then the
         // output must equal the input (pure residual passthrough), proving the
         // `x + sublayer(...)` wiring ([SPEC-072]).
@@ -832,16 +861,16 @@ mod tests {
             |q, _k, _v| Ok(Mat::zeros(q.rows, q.cols)),
             // mlp returns zeros
             |n| Ok(Mat::zeros(n.rows, n.cols)),
-        )
-        .unwrap();
+        )?;
         assert_eq!(out.shape(), (2, hidden));
         for (got, want) in out.data.iter().zip(x.data.iter()) {
             assert!((got - want).abs() < 1e-6, "{got} != {want}");
         }
+        Ok(())
     }
 
     #[test]
-    fn layer_forward_adds_both_sublayers() {
+    fn layer_forward_adds_both_sublayers() -> FocrResult<()> {
         // attn closure returns a constant context that o_proj maps to a known
         // vector; mlp adds another known vector. Output = x + attn_out + mlp_out.
         let hidden = 2usize;
@@ -869,11 +898,11 @@ mod tests {
             1e-6,
             |_q, _k, _v| Ok(Mat::from_vec(1, qkv_dim, vec![1.0, 1.0])),
             |_n| Ok(Mat::from_vec(1, hidden, vec![100.0, 100.0])),
-        )
-        .unwrap();
+        )?;
         // x + [1,1] + [100,100] = [111, 121]
         assert!((out.data[0] - 111.0).abs() < 1e-4, "{}", out.data[0]);
         assert!((out.data[1] - 121.0).abs() < 1e-4, "{}", out.data[1]);
+        Ok(())
     }
 
     // ── Top-level stubs report the pending-wiring gap ───────────────────────
