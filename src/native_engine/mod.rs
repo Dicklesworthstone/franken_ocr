@@ -599,11 +599,17 @@ impl OcrModel {
         let mut features = Vec::new();
         for view in Self::views(pre) {
             // SAM tower -> [1024, 16*16] x3 feature (flatten(2) layout, OQ-6).
+            let ts = std::time::Instant::now();
             let sam = vision_sam::forward(&self.weights, &view)?;
+            timing_log(&format!("  vision.sam {:.2}s", ts.elapsed().as_secs_f64()));
             // CLIP tower fed SAM's x3 as patch_embeds -> [N+1, 1024] (CLS at 0).
+            let tc = std::time::Instant::now();
             let clip = vision_clip::forward(&self.weights, &view, &sam)?;
+            timing_log(&format!("  vision.clip {:.2}s", tc.elapsed().as_secs_f64()));
             // Bridge: concat CLIP[:,1:] ++ SAM (2048) -> projector -> [N, 1280].
+            let tb = std::time::Instant::now();
             let projected = vision_bridge::forward(&self.weights, &clip, &sam)?;
+            timing_log(&format!("  vision.bridge {:.2}s", tb.elapsed().as_secs_f64()));
             features.push(projected);
         }
         Ok(features)
