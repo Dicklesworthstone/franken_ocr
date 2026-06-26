@@ -47,7 +47,43 @@ use half::bf16;
 use serde::Deserialize;
 
 use super::tensor::{Mat, QInt4, QInt8};
+use crate::FOCR_MODEL_LICENSE_NOTICE;
 use crate::error::{FocrError, FocrResult};
+use crate::quant::int4::VALID_GROUP_SIZES;
+
+fn checked_shape_len(name: &str, lhs: usize, rhs: usize, expr: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::FormatMismatch(format!(
+            "tensor {name:?}: {expr} overflows usize ({lhs} * {rhs})"
+        ))
+    })
+}
+
+fn validate_license_notice(notice: &str) -> FocrResult<()> {
+    if notice == FOCR_MODEL_LICENSE_NOTICE
+        || (notice.contains("Copyright (c) 2026 Baidu") && notice.contains("MIT License"))
+    {
+        Ok(())
+    } else {
+        Err(FocrError::FormatMismatch(
+            ".focrq license_notice must include Copyright (c) 2026 Baidu and MIT License".into(),
+        ))
+    }
+}
+
+fn validate_source_sha256_hex(source_sha256: &str) -> FocrResult<()> {
+    if source_sha256.len() == 64
+        && source_sha256
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err(FocrError::FormatMismatch(
+            ".focrq source_sha256 must be 64 lowercase hex chars when present".into(),
+        ))
+    }
+}
 
 /// The `.focrq` container magic ([SPEC §7]). Six bytes including the trailing
 /// `\0` — a loud, byte-exact rejection on mismatch.
@@ -206,7 +242,10 @@ struct FocrqHeader {
     /// 32-byte source-safetensors sha256, hex-encoded (provenance).
     #[serde(default)]
     source_sha256: String,
-    /// MIT/Baidu license notice — MUST be present in a real artifact.
+    /// MIT/Baidu model-weights notice — MUST be present in a real artifact.
+    /// Writers use [`crate::FOCR_MODEL_LICENSE_NOTICE`] as the single source of
+    /// truth (plan §2.2 / §11); the reader accepts semantically equivalent
+    /// notices that include the required copyright and MIT-license tokens.
     #[serde(default)]
     license_notice: String,
 }
@@ -279,13 +318,12 @@ pub struct Weights {
 }
 
 impl Default for Weights {
-    /// An empty weight set (no tensors). Used by the sibling forward modules'
-    /// NotImplemented-path tests (`decoder`, `moe`, `connector`, `vision_bridge`,
-    /// `mod`) to construct a `Weights` without a real blob: every accessor on it
-    /// returns [`FocrError::FormatMismatch`] (tensor not found), so those
-    /// modules' "forward returns NotImplemented before touching weights"
-    /// assertions hold. Once those forwards land, they look tensors up by name
-    /// and the empty default cleanly errors rather than panicking.
+    /// An empty weight set (no tensors). Used by forward-module tests to
+    /// construct a `Weights` without a real blob: every accessor on it returns
+    /// [`FocrError::FormatMismatch`] (tensor not found). Modules that are still
+    /// unwired return `NotImplemented` before touching weights; modules whose
+    /// loader handoff has landed look tensors up by name and the empty default
+    /// cleanly errors rather than panicking.
     fn default() -> Self {
         Self {
             bytes: Vec::new(),
@@ -401,6 +439,10 @@ impl Weights {
         }
         let header: FocrqHeader = serde_json::from_slice(&bytes[cur..header_end])
             .map_err(|e| FocrError::FormatMismatch(format!(".focrq header JSON invalid: {e}")))?;
+        validate_license_notice(&header.license_notice)?;
+        if !header.source_sha256.is_empty() {
+            validate_source_sha256_hex(&header.source_sha256)?;
+        }
 
         let payload_base = header_end;
         let payload_len = bytes.len() - payload_base;
@@ -666,11 +708,12 @@ impl Weights {
         let data = view
             .to_f32_vec()
             .map_err(|e| FocrError::FormatMismatch(format!("tensor {name:?}: {e}")))?;
-        if data.len() != rows * cols {
+        let expected_len = checked_shape_len(name, rows, cols, "rows*cols")?;
+        if data.len() != expected_len {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?} element count {} != rows*cols {}",
                 data.len(),
-                rows * cols
+                expected_len
             )));
         }
         Ok(Mat::from_vec(rows, cols, data))
@@ -712,11 +755,12 @@ impl Weights {
             )));
         }
         let (n, k) = (view.shape[0], view.shape[1]);
-        if view.data.len() != n * k {
+        let expected_len = checked_shape_len(name, n, k, "n*k")?;
+        if view.data.len() != expected_len {
             return Err(FocrError::FormatMismatch(format!(
                 "QInt8 tensor {name:?}: {} payload bytes != n*k {}",
                 view.data.len(),
-                n * k
+                expected_len
             )));
         }
         // int8 payload is a direct byte→i8 reinterpret (little-endian-agnostic;
@@ -761,21 +805,28 @@ impl Weights {
                 "QInt4 tensor {name:?}: k {k} is not even (two nibbles per byte)"
             )));
         }
-        if view.group_size == 0 || k % view.group_size != 0 {
+        if !VALID_GROUP_SIZES.contains(&view.group_size) {
+            return Err(FocrError::FormatMismatch(format!(
+                "QInt4 tensor {name:?}: group_size {} must be 16 or 32",
+                view.group_size
+            )));
+        }
+        if k % view.group_size != 0 {
             return Err(FocrError::FormatMismatch(format!(
                 "QInt4 tensor {name:?}: group_size {} does not divide k {k}",
                 view.group_size
             )));
         }
-        if view.data.len() != n * (k / 2) {
+        let expected_packed = checked_shape_len(name, n, k / 2, "n*k/2")?;
+        if view.data.len() != expected_packed {
             return Err(FocrError::FormatMismatch(format!(
                 "QInt4 tensor {name:?}: {} packed bytes != n*k/2 {}",
                 view.data.len(),
-                n * (k / 2)
+                expected_packed
             )));
         }
         let scales = decode_f32_le(view.scales)?;
-        let expected_scales = n * (k / view.group_size);
+        let expected_scales = checked_shape_len(name, n, k / view.group_size, "n*(k/group_size)")?;
         if scales.len() != expected_scales {
             return Err(FocrError::FormatMismatch(format!(
                 "QInt4 tensor {name:?}: {} scales != n*(k/group_size) {}",
@@ -795,14 +846,18 @@ impl Weights {
 
     /// Resolve a payload byte range, bounds-checked against the backing buffer.
     fn payload_slice(&self, name: &str, off: usize, len: usize) -> FocrResult<&[u8]> {
-        let start = self.payload_base + off;
+        let start = self.payload_base.checked_add(off).ok_or_else(|| {
+            FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows"))
+        })?;
         let end = start.checked_add(len).ok_or_else(|| {
             FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows"))
         })?;
         self.bytes.get(start..end).ok_or_else(|| {
+            let range_end = off
+                .checked_add(len)
+                .map_or_else(|| "<overflow>".to_owned(), |end| end.to_string());
             FocrError::FormatMismatch(format!(
-                "tensor {name:?} range [{off}, {}) overruns payload",
-                off + len
+                "tensor {name:?} range [{off}, {range_end}) overruns payload"
             ))
         })
     }
@@ -956,9 +1011,55 @@ mod tests {
         directory_json: &str,
         payload: &[u8],
     ) -> Vec<u8> {
+        build_focrq_with_license(
+            version,
+            arch,
+            sha,
+            directory_json,
+            payload,
+            FOCR_MODEL_LICENSE_NOTICE,
+        )
+    }
+
+    fn build_focrq_with_license(
+        version: u32,
+        arch: u8,
+        sha: [u8; 32],
+        directory_json: &str,
+        payload: &[u8],
+        license_notice: &str,
+    ) -> Vec<u8> {
+        build_focrq_with_license_and_header_source_sha(
+            version,
+            arch,
+            sha,
+            directory_json,
+            payload,
+            license_notice,
+            "",
+        )
+    }
+
+    fn build_focrq_with_license_and_header_source_sha(
+        version: u32,
+        arch: u8,
+        sha: [u8; 32],
+        directory_json: &str,
+        payload: &[u8],
+        license_notice: &str,
+        header_source_sha: &str,
+    ) -> Vec<u8> {
+        let license_json = format!(
+            "\"{}\"",
+            license_notice.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        let source_sha_json = format!(
+            "\"{}\"",
+            header_source_sha.replace('\\', "\\\\").replace('"', "\\\"")
+        );
         let header = format!(
             "{{\"tensors\":{directory_json},\"arch_target\":{arch},\
-             \"source_sha256\":\"\",\"license_notice\":\"Copyright (c) 2026 Baidu — MIT\"}}"
+             \"source_sha256\":{source_sha_json},\"license_notice\":{license_json}}}"
         );
         let mut blob = Vec::new();
         blob.extend_from_slice(FOCRQ_MAGIC);
@@ -1004,6 +1105,18 @@ mod tests {
         values.iter().flat_map(|&v| v.to_le_bytes()).collect()
     }
 
+    fn synthetic_weights(record: TensorRecord, bytes: Vec<u8>) -> Weights {
+        Weights {
+            bytes,
+            payload_base: 0,
+            directory: BTreeMap::from([("x".to_owned(), record)]),
+            arch_target: 0,
+            source_sha256: String::new(),
+            license_notice: String::new(),
+            is_focrq: true,
+        }
+    }
+
     // ── .focrq round-trip ──────────────────────────────────────────────────
 
     #[test]
@@ -1023,7 +1136,7 @@ mod tests {
         assert_eq!(w.len(), 1);
         assert_eq!(w.arch_target(), 2);
         assert_eq!(w.source_sha256(), &"07".repeat(32));
-        assert_eq!(w.license_notice(), "Copyright (c) 2026 Baidu — MIT");
+        assert_eq!(w.license_notice(), FOCR_MODEL_LICENSE_NOTICE);
 
         let view = w.tensor("w").unwrap();
         assert_eq!(view.dtype, DType::BF16);
@@ -1033,6 +1146,64 @@ mod tests {
         assert_eq!(m.shape(), (2, 3));
         // bf16 widening of these exact values is bit-exact.
         assert_eq!(m.data, vals);
+    }
+
+    #[test]
+    fn rejects_focrq_without_baidu_mit_license_notice() {
+        let blob = build_focrq_with_license(1, 0, [0u8; 32], "{}", &[], "Copyright (c) 2026 Baidu");
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("license_notice"));
+        assert!(format!("{err}").contains("MIT License"));
+    }
+
+    #[test]
+    fn focrq_header_source_sha256_overrides_prefix_when_valid() {
+        let vals = [1.0f32];
+        let payload = bf16_le_bytes(&vals);
+        let dir = format!(
+            "{{\"w\":{{\"dtype\":\"BF16\",\"shape\":[1],\
+             \"byte_offset\":0,\"byte_len\":{}}}}}",
+            payload.len()
+        );
+        let header_sha = "ab".repeat(32);
+        let blob = build_focrq_with_license_and_header_source_sha(
+            1,
+            0,
+            [7u8; 32],
+            &dir,
+            &payload,
+            FOCR_MODEL_LICENSE_NOTICE,
+            &header_sha,
+        );
+
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.source_sha256(), header_sha);
+    }
+
+    #[test]
+    fn rejects_malformed_focrq_header_source_sha256_override() {
+        let vals = [1.0f32];
+        let payload = bf16_le_bytes(&vals);
+        let dir = format!(
+            "{{\"w\":{{\"dtype\":\"BF16\",\"shape\":[1],\
+             \"byte_offset\":0,\"byte_len\":{}}}}}",
+            payload.len()
+        );
+        let blob = build_focrq_with_license_and_header_source_sha(
+            1,
+            0,
+            [7u8; 32],
+            &dir,
+            &payload,
+            FOCR_MODEL_LICENSE_NOTICE,
+            "AB-not-lowercase-or-64-hex",
+        );
+
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("source_sha256"));
+        assert!(format!("{err}").contains("64 lowercase hex"));
     }
 
     #[test]
@@ -1091,23 +1262,23 @@ mod tests {
 
     #[test]
     fn focrq_qint4_roundtrips() {
-        // n=2, k=4, group_size=2 => 2 packed bytes/row (4 total), 4 scales.
-        let packed = vec![0x21u8, 0x43, 0x65, 0x87];
-        let scale_bytes = f32_le_bytes(&[0.1, 0.2, 0.3, 0.4]);
+        // n=2, k=16, group_size=16 => 8 packed bytes/row (16 total), 2 scales.
+        let packed: Vec<u8> = (0u8..16).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2]);
         let mut payload = packed.clone();
         payload.extend_from_slice(&scale_bytes);
-        let dir = "{\"e\":{\"dtype\":\"QInt4PerGroup\",\"shape\":[2,4],\
-             \"byte_offset\":0,\"byte_len\":4,\"scales_offset\":4,\"scales_len\":16,\
-             \"group_size\":2,\"tier\":3}}";
+        let dir = "{\"e\":{\"dtype\":\"QInt4PerGroup\",\"shape\":[2,16],\
+             \"byte_offset\":0,\"byte_len\":16,\"scales_offset\":16,\"scales_len\":8,\
+             \"group_size\":16,\"tier\":3}}";
         let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
         let w = Weights::from_bytes(blob).unwrap();
         let q = w.qint4("e").unwrap();
         assert_eq!(q.n, 2);
-        assert_eq!(q.k, 4);
-        assert_eq!(q.group_size, 2);
+        assert_eq!(q.k, 16);
+        assert_eq!(q.group_size, 16);
         assert_eq!(q.tier, 3);
         assert_eq!(q.packed, packed);
-        assert_eq!(q.scales, vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(q.scales, vec![0.1, 0.2]);
     }
 
     #[test]
@@ -1363,6 +1534,82 @@ mod tests {
         let err = Weights::from_bytes(blob).unwrap_err();
         assert!(matches!(err, FocrError::FormatMismatch(_)));
         assert!(format!("{err}").contains("element count overflows"));
+    }
+
+    #[test]
+    fn mat_accessor_rejects_shape_product_overflow() {
+        let w = synthetic_weights(
+            TensorRecord {
+                dtype: DType::BF16,
+                shape: vec![usize::MAX, 2],
+                byte_offset: 0,
+                byte_len: 0,
+                scales_offset: 0,
+                scales_len: 0,
+                group_size: 0,
+                tier: 0,
+            },
+            Vec::new(),
+        );
+        let err = w.mat("x").unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("rows*cols overflows"));
+    }
+
+    #[test]
+    fn qint8_accessor_rejects_shape_product_overflow() {
+        let w = synthetic_weights(
+            TensorRecord {
+                dtype: DType::QInt8PerChan,
+                shape: vec![usize::MAX, 2],
+                byte_offset: 0,
+                byte_len: 0,
+                scales_offset: 0,
+                scales_len: 0,
+                group_size: 0,
+                tier: 0,
+            },
+            Vec::new(),
+        );
+        let err = w.qint8("x").unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("n*k overflows"));
+    }
+
+    #[test]
+    fn qint4_accessor_rejects_shape_product_overflow() {
+        let w = synthetic_weights(
+            TensorRecord {
+                dtype: DType::QInt4PerGroup,
+                shape: vec![usize::MAX, 32],
+                byte_offset: 0,
+                byte_len: 0,
+                scales_offset: 0,
+                scales_len: 0,
+                group_size: 16,
+                tier: 0,
+            },
+            Vec::new(),
+        );
+        let err = w.qint4("x").unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("n*k/2 overflows"));
+    }
+
+    #[test]
+    fn qint4_accessor_rejects_noncanonical_group_size_even_when_it_divides_k() {
+        let packed = vec![0u8; 16];
+        let scale_bytes = f32_le_bytes(&[1.0, 1.0, 1.0, 1.0]);
+        let mut payload = packed;
+        payload.extend_from_slice(&scale_bytes);
+        let dir = "{\"q\":{\"dtype\":\"QInt4PerGroup\",\"shape\":[1,32],\
+             \"byte_offset\":0,\"byte_len\":16,\"scales_offset\":16,\"scales_len\":16,\
+             \"group_size\":8,\"tier\":1}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
+        let w = Weights::from_bytes(blob).unwrap();
+        let err = w.qint4("q").unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("must be 16 or 32"));
     }
 
     #[test]
