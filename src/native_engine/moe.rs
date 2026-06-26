@@ -75,6 +75,14 @@ pub mod config {
     pub const FIRST_K_DENSE_REPLACE: usize = 1;
 }
 
+fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "{context}: usize overflow computing {expression} ({lhs} * {rhs})"
+        ))
+    })
+}
+
 /// A SwiGLU MLP's three weight matrices, all PyTorch `[out, in]` row-major.
 ///
 /// `gate_proj` and `up_proj` are `[intermediate, hidden]`; `down_proj` is
@@ -119,7 +127,8 @@ pub struct Routing {
 /// for the parity spine (int8 is an additive kill-switched layer, not this path).
 ///
 /// # Errors
-/// [`FocrError::Other`] if `x.cols != in_` or `w.len() != out * in_`.
+/// [`FocrError::Other`] if `x.cols != in_`, `out * in_` overflows, or
+/// `w.len() != out * in_`.
 fn linear_no_bias(x: &Mat, w: &[f32], out: usize, in_: usize) -> FocrResult<Mat> {
     if x.cols != in_ {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -128,19 +137,20 @@ fn linear_no_bias(x: &Mat, w: &[f32], out: usize, in_: usize) -> FocrResult<Mat>
             in_
         )));
     }
-    if w.len() != out * in_ {
+    let expected_weight_len = checked_shape_mul("moe::linear_no_bias", out, in_, "out*in")?;
+    if w.len() != expected_weight_len {
         return Err(FocrError::Other(anyhow::anyhow!(
             "moe::linear_no_bias: weight len {} != out*in {}",
             w.len(),
-            out * in_
+            expected_weight_len
         )));
     }
     // Transpose [out, in] -> [in, out] so matmul([n_tok, in], [in, out]) works.
-    let mut wt = vec![0.0f32; in_ * out];
-    for o in 0..out {
-        let row = &w[o * in_..(o + 1) * in_];
-        for (i, &v) in row.iter().enumerate() {
-            wt[i * out + o] = v;
+    let mut wt = vec![0.0f32; expected_weight_len];
+    for i in 0..in_ {
+        let dst = &mut wt[i * out..(i + 1) * out];
+        for (o, slot) in dst.iter_mut().enumerate() {
+            *slot = w[o * in_ + i];
         }
     }
     let wt_mat = Mat::from_vec(in_, out, wt);
@@ -476,14 +486,30 @@ mod tests {
     }
 
     #[test]
-    fn linear_no_bias_matches_pytorch_linear() {
+    fn linear_no_bias_matches_pytorch_linear() -> FocrResult<()> {
         // x = [[1,2,3]] (1x3); W = [[1,0,0],[0,1,1]] (out=2,in=3)
         // y = x @ W.T = [[1, 2+3]] = [[1, 5]]
         let x = Mat::from_vec(1, 3, vec![1.0, 2.0, 3.0]);
         let (w, out, in_) = linrow(vec![vec![1.0, 0.0, 0.0], vec![0.0, 1.0, 1.0]]);
-        let y = linear_no_bias(&x, &w, out, in_).unwrap();
+        let y = linear_no_bias(&x, &w, out, in_)?;
         assert_eq!(y.shape(), (1, 2));
         assert_eq!(y.data, vec![1.0, 5.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn linear_no_bias_matches_pytorch_linear_multirow_nonsquare() -> FocrResult<()> {
+        let x = Mat::from_vec(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let (w, out, in_) = linrow(vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+            vec![1.0, 1.0, 1.0],
+        ]);
+        let y = linear_no_bias(&x, &w, out, in_)?;
+        assert_eq!(y.shape(), (2, 4));
+        assert_eq!(y.data, vec![1.0, 2.0, 3.0, 6.0, 4.0, 5.0, 6.0, 15.0]);
+        Ok(())
     }
 
     #[test]
@@ -493,12 +519,22 @@ mod tests {
         assert!(linear_no_bias(&x, &w, out, in_).is_err());
     }
 
+    #[test]
+    fn linear_no_bias_rejects_weight_shape_overflow_without_panicking() {
+        let x = Mat::zeros(1, 2);
+        let result = linear_no_bias(&x, &[], usize::MAX, 2);
+        assert!(matches!(
+            &result,
+            Err(err) if err.to_string().contains("out*in")
+        ));
+    }
+
     /// Hand-check the full router on tiny shapes: hidden=2, n_experts shrunk
     /// conceptually but the real code routes over 64. We instead build a 64-wide
     /// gate where only a few experts get nonzero logits so the top-6 set is
     /// known, then verify selection + softmax-prob weights.
     #[test]
-    fn route_selects_greedy_top6_unnormalized() {
+    fn route_selects_greedy_top6_unnormalized() -> FocrResult<()> {
         // hidden = [[1.0]] -> but HIDDEN_SIZE is 1280; build a 1-token hidden of
         // width 1280 with a single 1.0 in column 0, rest 0. gate row e dotted
         // with that hidden = gate[e][0]. So we control each expert's logit by
@@ -518,7 +554,7 @@ mod tests {
             gate[e * h] = big[k];
         }
 
-        let r = route(&hidden, &gate, false, 1.0).unwrap();
+        let r = route(&hidden, &gate, false, 1.0)?;
         assert_eq!(r.indices.len(), 1);
         // Greedy top-6, descending: exactly the six experts we boosted, in order.
         assert_eq!(r.indices[0], want);
@@ -543,10 +579,11 @@ mod tests {
             s < 0.9999,
             "top-6 should not sum to 1 when unnormalized: {s}"
         );
+        Ok(())
     }
 
     #[test]
-    fn route_norm_topk_renormalizes_to_one() {
+    fn route_norm_topk_renormalizes_to_one() -> FocrResult<()> {
         let h = config::HIDDEN_SIZE;
         let n = config::N_ROUTED_EXPERTS;
         let mut hid = vec![0.0f32; h];
@@ -557,7 +594,7 @@ mod tests {
             gate[e * h] = 6.0 - k as f32;
         }
         // norm_topk_prob = true, scaling = 1.0 -> the 6 weights sum to 1.
-        let r = route(&hidden, &gate, true, 1.0).unwrap();
+        let r = route(&hidden, &gate, true, 1.0)?;
         let s: f32 = r.weights[0].iter().sum();
         assert!(
             (s - 1.0).abs() < 1e-5,
@@ -567,6 +604,7 @@ mod tests {
         for k in 1..config::NUM_EXPERTS_PER_TOK {
             assert!(r.weights[0][k] <= r.weights[0][k - 1]);
         }
+        Ok(())
     }
 
     #[test]
@@ -578,15 +616,15 @@ mod tests {
         let hidden = Mat::from_vec(1, h, hid);
         let gate = vec![0.0f32; n * h];
 
-        let err = route(&hidden, &gate, false, 1.0).unwrap_err();
-        assert!(
-            err.to_string().contains("no finite router score"),
-            "unexpected error: {err:?}"
-        );
+        let result = route(&hidden, &gate, false, 1.0);
+        assert!(matches!(
+            &result,
+            Err(err) if err.to_string().contains("no finite router score")
+        ));
     }
 
     #[test]
-    fn route_applies_scaling_factor() {
+    fn route_applies_scaling_factor() -> FocrResult<()> {
         let h = config::HIDDEN_SIZE;
         let n = config::N_ROUTED_EXPERTS;
         let mut hid = vec![0.0f32; h];
@@ -596,11 +634,12 @@ mod tests {
         for (k, e) in (0..6usize).enumerate() {
             gate[e * h] = 6.0 - k as f32;
         }
-        let base = route(&hidden, &gate, false, 1.0).unwrap();
-        let scaled = route(&hidden, &gate, false, 2.5).unwrap();
+        let base = route(&hidden, &gate, false, 1.0)?;
+        let scaled = route(&hidden, &gate, false, 2.5)?;
         for k in 0..config::NUM_EXPERTS_PER_TOK {
             assert!((scaled.weights[0][k] - 2.5 * base.weights[0][k]).abs() < 1e-5);
         }
+        Ok(())
     }
 
     /// expert_mlp on a hand-computable 1->2->1 SwiGLU.
@@ -610,7 +649,7 @@ mod tests {
     /// h = silu(gate)*up = [1.7615942*6, -0.23840584*2] = [10.569565, -0.47681168]
     /// down_proj = [[1, 1]]    -> y = 10.569565 + (-0.47681168) = 10.092754
     #[test]
-    fn expert_mlp_matches_hand_computed_swiglu() {
+    fn expert_mlp_matches_hand_computed_swiglu() -> FocrResult<()> {
         let x = Mat::from_vec(1, 1, vec![2.0]);
         let gate_proj = vec![1.0f32, -1.0]; // [intermediate=2, hidden=1]
         let up_proj = vec![3.0f32, 1.0];
@@ -622,7 +661,7 @@ mod tests {
             hidden: 1,
             intermediate: 2,
         };
-        let y = expert_mlp(&x, &w).unwrap();
+        let y = expert_mlp(&x, &w)?;
         assert_eq!(y.shape(), (1, 1));
         let silu2 = 2.0f32 / (1.0 + (-2.0f32).exp());
         let silum2 = -2.0f32 / (1.0 + (2.0f32).exp());
@@ -632,6 +671,7 @@ mod tests {
             "{} != {expect}",
             y.data[0]
         );
+        Ok(())
     }
 
     #[test]
@@ -655,7 +695,7 @@ mod tests {
     /// keep it simple by making all experts produce the SAME output, so the
     /// routed contribution is (sum of 6 weights) * expert_out, plus shared.
     #[test]
-    fn moe_block_routes_weights_and_adds_shared() {
+    fn moe_block_routes_weights_and_adds_shared() -> FocrResult<()> {
         let h = 2usize;
         let inter = 2usize;
         let n_tok = 1usize;
@@ -692,7 +732,7 @@ mod tests {
             intermediate: 2,
         };
 
-        let y = moe_block(&hidden, &gate, &experts, &shared, false, 1.0).unwrap();
+        let y = moe_block(&hidden, &gate, &experts, &shared, false, 1.0)?;
         assert_eq!(y.shape(), (n_tok, h));
 
         // Each routed expert outputs silu(1) = 0.7310586 per channel. Six of
@@ -710,10 +750,11 @@ mod tests {
             "{} != {expect}",
             y.data[1]
         );
+        Ok(())
     }
 
     #[test]
-    fn moe_block_shared_contributes_at_weight_one() {
+    fn moe_block_shared_contributes_at_weight_one() -> FocrResult<()> {
         let h = 2usize;
         let hidden = Mat::from_vec(1, h, vec![1.0, 1.0]);
         let gate = vec![0.0f32; config::N_ROUTED_EXPERTS * h];
@@ -739,10 +780,11 @@ mod tests {
             hidden: h,
             intermediate: 2,
         };
-        let y = moe_block(&hidden, &gate, &experts, &shared, false, 1.0).unwrap();
+        let y = moe_block(&hidden, &gate, &experts, &shared, false, 1.0)?;
         let silu1 = 1.0f32 / (1.0 + (-1.0f32).exp());
         assert!((y.data[0] - silu1).abs() < 1e-5);
         assert!((y.data[1] - silu1).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
