@@ -192,12 +192,11 @@ fn mean(vals: &[f64]) -> f64 {
 ///
 /// # Errors
 /// [`TailRiskError::Empty`] on an empty slice, [`TailRiskError::BadAlpha`] when
-/// `alpha ∉ (0, 1]`.
+/// `alpha ∉ (0, 1]`, or the state-space validation errors for non-finite /
+/// out-of-range CER values.
 pub fn cvar(vals: &[f64], alpha: f64) -> TailRiskResult<f64> {
+    validate_samples(vals)?;
     let n = vals.len();
-    if n == 0 {
-        return Err(TailRiskError::Empty);
-    }
     if !(alpha > 0.0 && alpha <= 1.0) {
         return Err(TailRiskError::BadAlpha(alpha));
     }
@@ -359,12 +358,11 @@ impl GpdFit {
 /// `β ≤ 0`. No bound is ever fabricated from too little data.
 ///
 /// # Errors
-/// [`TailRiskError::Empty`] on an empty slice.
+/// [`TailRiskError::Empty`] on an empty slice, or the state-space validation
+/// errors for non-finite / out-of-range CER values.
 pub fn fit_gpd_pwm(sorted_vals: &[f64], pot_frac: f64) -> TailRiskResult<GpdFit> {
+    validate_samples(sorted_vals)?;
     let n = sorted_vals.len();
-    if n == 0 {
-        return Err(TailRiskError::Empty);
-    }
 
     // Threshold u = the (1 − pot_frac) quantile. The GPD models the *excess*
     // over the threshold, so the exceedances are the residuals `y = x − u` for
@@ -876,6 +874,16 @@ mod tests {
         assert_eq!(cvar(&[], 0.1), Err(TailRiskError::Empty));
     }
 
+    #[test]
+    fn cvar_rejects_invalid_samples_without_panicking() {
+        assert!(matches!(
+            cvar(&[f64::NAN], 0.1),
+            Err(TailRiskError::NonFinite(v)) if v.is_nan()
+        ));
+        assert_eq!(cvar(&[-0.1], 0.1), Err(TailRiskError::OutOfRange(-0.1)));
+        assert_eq!(cvar(&[1.1], 0.1), Err(TailRiskError::OutOfRange(1.1)));
+    }
+
     // ----- GPD PWM fit: the FIXED plotting-position rank weight ---------------
 
     #[test]
@@ -1026,6 +1034,18 @@ mod tests {
             approx(report.fit.threshold, 0.38, TOL),
             "thr {}",
             report.fit.threshold
+        );
+    }
+
+    #[test]
+    fn fit_gpd_rejects_invalid_samples_without_panicking() {
+        assert!(matches!(
+            fit_gpd_pwm(&[0.0, f64::NAN], DEFAULT_POT_FRAC),
+            Err(TailRiskError::NonFinite(v)) if v.is_nan()
+        ));
+        assert_eq!(
+            fit_gpd_pwm(&[0.0, 1.2], DEFAULT_POT_FRAC),
+            Err(TailRiskError::OutOfRange(1.2))
         );
     }
 
