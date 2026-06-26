@@ -78,11 +78,14 @@ run is **green, informative, and never silently empty**:
    hand-roll wide SIMD.
 
 2. **Head-to-head e2e stages — model-gated AND baseline-gated.** Each of
-   `{preprocess, vision_encode, prefill, decode_per_token}` checks for the weights
-   (`$FOCR_MODEL_DIR`, header-sniffed — no 6.67 GB read) **and** a reference
-   command (`$FOCR_REFERENCE_CMD`). Absent either, the stage **skips-with-SUCCESS**,
-   emitting one NDJSON line that says exactly what it *would* have measured and
-   why it skipped:
+   `{preprocess, vision_encode, prefill, decode_per_token}` checks for a model
+   artifact (`$FOCR_MODEL_DIR`, header-sniffed — no 6.67 GB read; either a
+   directory containing `.focrq`/safetensors or a direct `.focrq`/safetensors
+   file), a reference command (`$FOCR_REFERENCE_CMD`), and a concrete reference
+   backend label
+   (`$FOCR_REFERENCE_BACKEND`). Absent any of these, the stage
+   **skips-with-SUCCESS**, emitting one NDJSON line that says exactly what it
+   *would* have measured and why it skipped:
 
    ```json
    {"event":"skip","result":"skip_no_model_and_no_baseline",
@@ -90,9 +93,11 @@ run is **green, informative, and never silently empty**:
     "would_measure":"R-SWA decode step vs reference (MUST be faster than CPU reference — the gate)"}
    ```
 
-   The four skip reasons (`skip_no_model_and_no_baseline`, `skip_no_model`,
-   `skip_no_baseline`, `ready`) are the full decision table. A missing weights
-   file **never** red-flags CI (LOGGING_AND_E2E §6).
+   The skip reasons are `skip_no_model_and_no_baseline`, `skip_no_model`,
+   `skip_no_baseline`, `skip_no_reference_backend`,
+   `skip_no_model_and_no_reference_backend`, and `ready`. A missing weights file
+   **never** red-flags CI (LOGGING_AND_E2E §6), but an unlabeled reference backend
+   also never becomes a measured timing event with `reference_backend:"unknown"`.
 
 3. **Future-kernel slots — scaffolded, clearly logged, never silently empty.**
    The int8/int4/SMMLA GEMM tiers land in Phase 2–4 (plan §5.3). Until each
@@ -155,8 +160,9 @@ row** (`perf_harness::Fairness`):
 
 - **Thread parity.** focr's thread budget (`$FOCR_THREADS`, default **8**) is the
   number the reference baseline MUST be pinned to (`OMP_NUM_THREADS` /
-  `torch.set_num_threads(N)`). `Fairness::assert_thread_parity` returns an error
-  naming the violation if they disagree. **NEVER benchmark torch @64** —
+  `torch.set_num_threads(N)`). The reference timing envelope must report the
+  actual reference thread count, and the harness rejects missing or mismatched
+  proof before it can become a measured row. **NEVER benchmark torch @64** —
   oversubscription inflates a fake "win" (a hardened frankentorch lesson). Measure
   at @8 / @32; let the §9.7 USL fit cap the decode pool at its peak, not at
   `num_cpus`.
@@ -166,10 +172,13 @@ row** (`perf_harness::Fairness`):
   "wired into the measured binary, not merely mentioned"). The dep-free bench
   target currently has no allocator feature, so it honestly reports `system`; a
   future `--features mimalloc` claim flips the tag via the `cfg!`.
-- **Precision annotation.** Each row records the focr precision (`f32` / `bf16` /
-  `int8` / `int4`) and, on a head-to-head, the reference precision. A raw ratio
-  across different numerics (`focr-int8` vs `torch-bf16`) is a different claim
-  than `int8` vs `int8`, and the row says which.
+- **Reference identity and precision annotation.** Each row records the focr
+  precision (`f32` / `bf16` / `int8` / `int4`) and, on a head-to-head, the
+  `reference_backend` plus the reference precision. A raw ratio across different
+  backends or numerics (`focr-int8` vs `torch-bf16`, ONNX vs HF vs GGUF) is a
+  different claim, and the row says which. The reference timing envelope must
+  report a non-empty `precision` or `reference_precision`; otherwise the harness
+  logs `head_to_head_reference_error` instead of a timing row.
 - **Best-of-N with warmup discard.** `SampleStats::from_durations` discards the
   warmup samples and reports p50/p90/**min** (the best-of-N) plus `cv_pct`.
 
@@ -186,16 +195,59 @@ Mirrors `scripts/oracle_bridge.py` and plan §9.3 verbatim:
 
 | Env var | Meaning | Default |
 |---------|---------|---------|
-| `FOCR_MODEL_DIR` | Where the 6.67 GB weights / `.focrq` live (header-sniffed; no tensor load to decide whether to skip). | unset ⇒ skip-with-SUCCESS |
+| `FOCR_MODEL_DIR` | Where the 6.67 GB weights / `.focrq` live (header-sniffed; no tensor load to decide whether to skip). May be a directory containing `.focrq`/safetensors or a direct `.focrq`/safetensors artifact path. | unset ⇒ skip-with-SUCCESS |
 | `FOCR_REFERENCE_CMD` | The Phase −1 proven CPU reference command shelled out per stage. | unset ⇒ skip-with-SUCCESS |
-| `FOCR_REFERENCE_PYTHON` | Which reference backend the command speaks (`onnx` \| `hf` \| `gguf`) — the precision column. | unset |
-| `FOCR_THREADS` | focr's thread budget; the reference is pinned to the SAME N. | `8` (NEVER 64) |
+| `FOCR_REFERENCE_BACKEND` | Which reference backend the command speaks (`onnx` \| `hf` \| `gguf` \| `mlas` or another ledger-approved label). This is a backend label, not a precision annotation. | unset ⇒ skip-with-SUCCESS (`skip_no_reference_backend` once a command/model are present) |
+| `FOCR_THREADS` | focr's positive thread budget; the reference is pinned to the SAME N. | `8`; unset, invalid, or `0` ⇒ `8` (NEVER 64) |
 | `FOCR_BENCH_HISTORY` | Opt-in path for the monotone `.bench-history` ratchet, usually `reports/bench/latest.json`. | unset ⇒ log `ratchet_history_disabled`; do not write history |
+
+### `FOCR_REFERENCE_CMD` timing envelope
+
+When `FOCR_MODEL_DIR`, `FOCR_REFERENCE_CMD`, and `FOCR_REFERENCE_BACKEND` are all
+present, the harness executes the reference command once per head-to-head stage
+through the platform shell. For each invocation it sets:
+
+| Env var | Value |
+|---------|-------|
+| `FOCR_GAUNTLET_STAGE` | One of `preprocess`, `vision_encode`, `prefill`, `decode_per_token`. |
+| `FOCR_STAGE` | Alias with the same value, for smaller shell/python helpers. |
+| `FOCR_THREADS` | The pinned thread budget. |
+| `OMP_NUM_THREADS` / `TORCH_NUM_THREADS` / `RAYON_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `VECLIB_MAXIMUM_THREADS` / `BLIS_NUM_THREADS` / `NUMEXPR_NUM_THREADS` | The same pinned thread budget, so torch/ONNX/BLAS/Rayon helpers cannot drift to `@64`. |
+
+The command's last non-empty JSON object line on stdout is the timing envelope.
+The minimal successful shape is:
+
+```json
+{"stage":"decode_per_token","result":"pass","p50_ms":14.5,"precision":"bf16","threads":8}
+```
+
+Accepted duration keys are seconds (`p50_s`, `elapsed_s`, `seconds`, `ref_s`,
+`reference_s`) or milliseconds (`p50_ms`, `elapsed_ms`, `milliseconds`,
+`ref_ms`, `reference_ms`). The `result` field is required and must be `pass`,
+`ok`, or `measured` for a timing row; values starting with `skip` are logged as
+`head_to_head_reference_skip`; `fail`/`error`, missing `result`, non-zero exit,
+malformed JSON, a stage mismatch, or a non-positive/non-finite duration are logged
+as `head_to_head_reference_error`.
+
+Measured envelopes must also carry a positive integer thread-proof field matching
+the pinned `$FOCR_THREADS`: `threads`, `reference_threads`, `torch_threads`, or
+`determinism.torch_threads`. Missing proof or `64` when the harness pinned `8`
+is logged as `head_to_head_reference_error`, not as a timing row.
+
+Measured envelopes must also carry a non-empty reference precision annotation:
+`precision` or `reference_precision`. Missing or blank precision is rejected for
+the same reason as missing thread proof: without it the head-to-head row cannot
+support an honest `focr-int8` vs `torch-bf16` (or `int8` vs `int8`) claim.
+
+This deliberately produces **reference timing events**, not PERF_LEDGER rows by
+itself. A ledger row requires the matching native stage timer too, so the ratio
+is a real `reference/focr` measurement rather than a reference-only number.
 
 If CPU-patched HF cannot be proven equivalent to the CUDA correctness oracle
 (OQ-17), the perf baseline is llama.cpp GGUF / ONNX Runtime / MLAS and is
-**labeled as such** in `reference_precision`. The correctness oracle and the perf
-reference are split (METHODOLOGY §1.2); this harness drives the **perf** side.
+**labeled as such** in `reference_backend`. The numeric posture still belongs in
+`reference_precision`. The correctness oracle and the perf reference are split
+(METHODOLOGY §1.2); this harness drives the **perf** side.
 
 ---
 
@@ -233,7 +285,7 @@ cargo +nightly bench --bench gauntlet_harness
 # Head-to-head (self-hosted model-FULL lane, weights + reference present):
 FOCR_MODEL_DIR=~/.cache/franken_ocr/model \
 FOCR_REFERENCE_CMD="python3 scripts/oracle_bridge.py --perf" \
-FOCR_REFERENCE_PYTHON=onnx \
+FOCR_REFERENCE_BACKEND=onnx \
 FOCR_THREADS=8 \
 FOCR_BENCH_HISTORY=reports/bench/latest.json \
 OMP_NUM_THREADS=8 RAYON_NUM_THREADS=8 \

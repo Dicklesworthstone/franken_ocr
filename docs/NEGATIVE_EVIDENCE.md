@@ -49,8 +49,9 @@ date | WIN / NEGATIVE(reverted) | lever (what was tried, where)
   claim_id / evidence_id                         # artifact-graph IDs (claim under test → evidence dir)
   model source commit + fixture hash             # truth-pack provenance: HF 3a7f4db… + (file_sha256, lines)
                                                   #   from SOURCE_HASHES.md, plus .focrq/weights hash
-  CPU feature string                             # the DISPATCHED SIMD tier (e.g. aarch64+neon+dotprod+i8mm,
-                                                  #   x86_64+avx2+avxvnni, x86_64+avx512vnni) — not the host's max
+  CPU feature string                             # the DISPATCHED SIMD tier (e.g. aarch64+neon+dotprod,
+                                                  #   aarch64+neon+i8mm, x86_64+avx2+avxvnni,
+                                                  #   x86_64+avx512vnni) — not the host's max
   exact command + env                            # the literal gauntlet invocation + FOCR_*/OMP_NUM_THREADS/RAYON_* set
   fallback / kill-switch state                   # which path was active: FOCR_INT8_ATTN / FOCR_INT8_LMHEAD /
                                                   #   mimalloc feature / int4-group on|off — proves what ran
@@ -303,10 +304,10 @@ dirs exist but are not hash-anchored.
     config.json sha256 27246d03…  (SOURCE_HASHES.md)
     model-00001-of-000001.safetensors sha256 <recorded-when-fetched>
     <model>.focrq sha256 <conversion hash for the precision measured>
-  CPU feature string: <dispatched tier, e.g. aarch64+neon+dotprod+i8mm>
+  CPU feature string: <dispatched tier, e.g. aarch64+neon+dotprod or aarch64+neon+i8mm>
   exact command + env:
     cargo bench -p focr --bench gauntlet -- decode-per-token
-    FOCR_REFERENCE_PYTHON=<onnx|hf>  OMP_NUM_THREADS=8  RAYON_NUM_THREADS=8
+    FOCR_REFERENCE_BACKEND=<onnx|hf|gguf>  OMP_NUM_THREADS=8  RAYON_NUM_THREADS=8
     (reference torch set_num_threads(8) — NEVER @64, §9.3)
   fallback / kill-switch state: FOCR_INT8_ATTN=<0|1>  FOCR_INT8_LMHEAD=<0|1>
     int4-group=<off|g32|g16>  allocator=<system|mimalloc-feature>

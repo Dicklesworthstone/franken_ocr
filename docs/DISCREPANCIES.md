@@ -46,7 +46,8 @@ resolved to a truth-pack source line is **incomplete**.
 - Provenance (model commit + fixture hash): HF 3a7f4db… + <oracle file_sha256:lines from
     SOURCE_HASHES.md> + parity corpus fixture sha256 + <.focrq sha256 for the precision under test>
 - CPU feature string: <dispatched SIMD tier the divergence was observed on, e.g.
-    aarch64+neon+dotprod+i8mm — a divergence can be arch-specific (rounding/order)>
+    aarch64+neon+dotprod or aarch64+neon+i8mm — a divergence can be arch-specific
+    (rounding/order)>
 - Exact command + env: <gauntlet/parity invocation + FOCR_*/OMP_NUM_THREADS set>
 - Reference behavior: <what the torch/transformers oracle does — quote the source line>
 - Our impl: <what franken_ocr does, and where (file:fn)>
@@ -86,7 +87,7 @@ The first real entry MUST carry full truth-pack provenance. Shape to follow (a
 - Provenance (model commit + fixture hash): HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
     + modeling_deepseekv2.py sha256 74e36e6b…: <attn lines>  (SOURCE_HASHES.md)
     + parity corpus fixture sha256 <…>  +  <model>.focrq sha256 <int8-attn build>
-- CPU feature string: aarch64+neon+dotprod+i8mm   (and re-checked on x86_64+avx512vnni)
+- CPU feature string: aarch64+neon+i8mm   (and re-checked on x86_64+avx512vnni)
 - Exact command + env: cargo test -p focr --test parity -- disc_int8_attn  /
     OMP_NUM_THREADS=8  (reference torch set_num_threads(8), §9.3)
 - Reference behavior: f32 Q·Kᵀ / scores·V bmm (modeling_deepseekv2.py:<lines>)

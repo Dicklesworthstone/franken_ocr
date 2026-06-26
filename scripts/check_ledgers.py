@@ -155,6 +155,7 @@ def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
         "fixture_hash",
         "arch/cpu_features",
         "stage",
+        "reference_backend",
         "focr_ms",
         "ref_ms",
         "ratio",
@@ -214,6 +215,7 @@ def check_perf_ledger(path: Path, text: str, failures: list[str]) -> None:
             "fallback/kill-switch state",
             "fixture_hash",
             "model_commit",
+            "reference_backend",
             "correctness_proof",
         ):
             filled = not is_empty_cell(row[column])

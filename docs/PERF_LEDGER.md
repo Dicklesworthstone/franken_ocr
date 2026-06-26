@@ -81,20 +81,24 @@ it, and the gap was kernels below peak, not framework overhead — see
 The table carries, per row: the **artifact-graph provenance** fields
 (`claim_id`, `evidence_id`, `model_commit`, `fixture_hash`,
 `arch/cpu_features`, `fallback/kill-switch`), the **measured ratio**, the
-**roofline** fields (`floor_kind`, `floor_ms`, `dist_above_floor`), and the
-**fairness** fields (`precision`, `threads (focr=ref N)`, `allocator`,
-`command/env`), plus the mandatory `correctness_proof` reference that proves the
-row did not buy speed by breaking parity. Every field is mandatory; a row missing
-any is invalid.
+reference backend identity, the **roofline** fields (`floor_kind`, `floor_ms`,
+`dist_above_floor`), and the **fairness** fields (`precision`,
+`threads (focr=ref N)`, `allocator`, `command/env`), plus the mandatory
+`correctness_proof` reference that proves the row did not buy speed by breaking
+parity. Every field is mandatory; a row missing any is invalid.
 
-| date | claim_id | evidence_id | model_commit | fixture_hash | arch/cpu_features | stage | focr_ms | ref_ms | ratio | floor_kind | floor_ms | dist_above_floor | precision (focr vs ref) | threads (focr=ref N) | allocator | command/env | fallback/kill-switch state | correctness_proof | notes |
-|------|----------|-------------|--------------|--------------|-------------------|-------|--------:|-------:|------:|------------|---------:|-----------------:|-------------------------|----------------------|-----------|-------------|----------------------------|-------------------|-------|
-| _—_  | _—_      | _—_         | _—_          | _—_          | _—_               | _—_   | _—_     | _—_    |  _—_  | _—_        | _—_      | _—_              | _—_                     | _—_                  | _—_       | _—_         | _—_                        | _—_               | _no measurements yet_ |
+| date | claim_id | evidence_id | model_commit | fixture_hash | arch/cpu_features | stage | reference_backend | focr_ms | ref_ms | ratio | floor_kind | floor_ms | dist_above_floor | precision (focr vs ref) | threads (focr=ref N) | allocator | command/env | fallback/kill-switch state | correctness_proof | notes |
+|------|----------|-------------|--------------|--------------|-------------------|-------|-------------------|--------:|-------:|------:|------------|---------:|-----------------:|-------------------------|----------------------|-----------|-------------|----------------------------|-------------------|-------|
+| _—_  | _—_      | _—_         | _—_          | _—_          | _—_               | _—_   | _—_              | _—_     | _—_    | _—_   | _—_        | _—_      | _—_              | _—_                     | _—_                  | _—_       | _—_         | _—_                        | _—_               | _no measurements yet_ |
 
 **Column legend.**
 - `model_commit` — always `3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5` (HF; truth pack).
 - `fixture_hash` — parity/perf fixture sha256 + `.focrq` hash for the precision in `precision` (`SOURCE_HASHES.md`).
-- `arch/cpu_features` — the **dispatched** SIMD tier (e.g. `aarch64+neon+dotprod+i8mm`, `x86_64+avx512vnni`).
+- `arch/cpu_features` — the **dispatched** SIMD tier (e.g.
+  `aarch64+neon+dotprod` for SDOT, `aarch64+neon+i8mm` for SMMLA,
+  `x86_64+avx512vnni`).
+- `reference_backend` — the proven CPU perf baseline actually run (`hf`, `onnx`,
+  `gguf`, `mlas`, etc.); backend identity is separate from numeric precision.
 - `floor_kind` — `compute` or `memory`, whichever floor binds for the stage (§9.1); `floor_ms` is that floor's time.
 - `dist_above_floor` = `focr_ms / floor_ms`; **> ~1.3 ⇒ named attackable lever**, not an excuse.
 - `precision` — e.g. `focr-int8 vs torch-bf16`; the accuracy delta lives in `DISCREPANCIES.md`.
