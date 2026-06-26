@@ -58,6 +58,20 @@ fn zeros_checked(context: &str, rows: usize, cols: usize) -> FocrResult<Mat> {
     Ok(Mat { rows, cols, data })
 }
 
+fn validate_mat_len(context: &str, mat: &Mat) -> FocrResult<()> {
+    let expected = checked_mul(context, mat.rows, mat.cols, "rows*cols")?;
+    if mat.data.len() != expected {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: data len {} != rows*cols {} for shape [{}, {}]",
+            mat.data.len(),
+            expected,
+            mat.rows,
+            mat.cols
+        )));
+    }
+    Ok(())
+}
+
 /// Append `newline` (length `dim`) as one extra trailing column to every row of
 /// a `(h, w, dim)` grid laid out row-major as `[h*w, dim]`.
 ///
@@ -89,6 +103,7 @@ fn append_newline_column(grid: &Mat, h: usize, w: usize, newline: &[f32]) -> Foc
     }
     let out_width = checked_add("append_newline_column", w, 1, "w+1")?;
     let out_rows = checked_mul("append_newline_column", h, out_width, "h*(w+1)")?;
+    validate_mat_len("append_newline_column grid", grid)?;
     let mut out = zeros_checked("append_newline_column", out_rows, dim)?;
     for r in 0..h {
         // Copy the w real patch embeddings for this row.
@@ -120,6 +135,10 @@ fn vstack(blocks: &[&Mat], dim: usize) -> FocrResult<Mat> {
             )));
         }
         total_rows = checked_add("vstack", total_rows, b.rows, "sum_rows")?;
+    }
+
+    for b in blocks {
+        validate_mat_len("vstack block", b)?;
     }
 
     let mut out = zeros_checked("vstack", total_rows, dim)?;
@@ -218,6 +237,95 @@ pub fn assemble_crop_block(
     vstack(&[&local_nl, &global_nl, &sep], dim)
 }
 
+/// Rearrange row-major local tile feature grids into the one large local grid
+/// used by the crop connector branch.
+///
+/// Mirrors the pinned source:
+/// `local.view(height_crop_num, width_crop_num, h2, w2, dim)
+///       .permute(0, 2, 1, 3, 4)
+///       .reshape(height_crop_num*h2, width_crop_num*w2, dim)`.
+///
+/// `tiles` are row-major over the crop grid, and each tile is `[tile_h*tile_w,
+/// dim]` in row-major patch order.
+fn rearrange_local_tiles(
+    tiles: &[Mat],
+    width_crop_num: usize,
+    height_crop_num: usize,
+    tile_h: usize,
+    tile_w: usize,
+) -> FocrResult<Mat> {
+    let expected_tiles = checked_mul(
+        "rearrange_local_tiles",
+        width_crop_num,
+        height_crop_num,
+        "width_crop_num*height_crop_num",
+    )?;
+    if tiles.len() != expected_tiles {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rearrange_local_tiles: {} local tile feature blocks != width_crop_num*height_crop_num {}",
+            tiles.len(),
+            expected_tiles
+        )));
+    }
+    let Some(first) = tiles.first() else {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "rearrange_local_tiles: crop branch needs at least one local tile feature block"
+        )));
+    };
+    let dim = first.cols;
+    let expected_tile_rows = checked_mul("rearrange_local_tiles", tile_h, tile_w, "tile_h*tile_w")?;
+    for tile in tiles {
+        if tile.cols != dim {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "rearrange_local_tiles: tile cols {} != dim {}",
+                tile.cols,
+                dim
+            )));
+        }
+        if tile.rows != expected_tile_rows {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "rearrange_local_tiles: tile rows {} != tile_h*tile_w {}",
+                tile.rows,
+                expected_tile_rows
+            )));
+        }
+        validate_mat_len("rearrange_local_tiles tile", tile)?;
+    }
+
+    let out_h = checked_mul(
+        "rearrange_local_tiles",
+        height_crop_num,
+        tile_h,
+        "height_crop_num*tile_h",
+    )?;
+    let out_w = checked_mul(
+        "rearrange_local_tiles",
+        width_crop_num,
+        tile_w,
+        "width_crop_num*tile_w",
+    )?;
+    let mut out = zeros_checked(
+        "rearrange_local_tiles",
+        checked_mul("rearrange_local_tiles", out_h, out_w, "out_h*out_w")?,
+        dim,
+    )?;
+
+    for tile_row in 0..height_crop_num {
+        for tile_col in 0..width_crop_num {
+            let tile = &tiles[tile_row * width_crop_num + tile_col];
+            for local_y in 0..tile_h {
+                for local_x in 0..tile_w {
+                    let src_row = local_y * tile_w + local_x;
+                    let dst_row =
+                        (tile_row * tile_h + local_y) * out_w + tile_col * tile_w + local_x;
+                    out.row_mut(dst_row).copy_from_slice(tile.row(src_row));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Scatter the per-image vision feature rows into the text embedding stream at
 /// the `<image>` placeholder positions ([SPEC-064]).
 ///
@@ -264,6 +372,8 @@ pub fn masked_scatter(
             vision_features.rows
         )));
     }
+    validate_mat_len("masked_scatter inputs_embeds", inputs_embeds)?;
+    validate_mat_len("masked_scatter vision_features", vision_features)?;
     let mut feat = 0usize;
     for (row, &masked) in images_seq_mask.iter().enumerate() {
         if masked {
@@ -313,6 +423,55 @@ pub fn fuse_no_crop(
     }
     let refs: Vec<&Mat> = blocks.iter().collect();
     let features = vstack(&refs, dim)?;
+    masked_scatter(inputs_embeds, &features, images_seq_mask)
+}
+
+/// Full connector entrypoint for the **crop / Gundam** path: rearrange the
+/// local tile feature grids into the reference spatial layout, assemble
+/// `[local, global, view_seperator]`, and scatter into the decoder embeddings.
+///
+/// `local_tiles` are row-major over crop rows, then crop columns, with
+/// `width_crop_num` tiles per row; each tile is `[tile_h*tile_w, dim]`.
+/// `global` is `[h*w, dim]`.
+///
+/// # Errors
+/// Returns [`FocrError::Other`] on any tile-count, shape, dimension, or
+/// placeholder-count mismatch.
+#[allow(clippy::too_many_arguments)]
+pub fn fuse_crop(
+    _weights: &Weights,
+    inputs_embeds: &mut Mat,
+    local_tiles: &[Mat],
+    width_crop_num: usize,
+    height_crop_num: usize,
+    tile_h: usize,
+    tile_w: usize,
+    global: &Mat,
+    h: usize,
+    w: usize,
+    image_newline: &[f32],
+    view_seperator: &[f32],
+    images_seq_mask: &[bool],
+) -> FocrResult<()> {
+    let local =
+        rearrange_local_tiles(local_tiles, width_crop_num, height_crop_num, tile_h, tile_w)?;
+    let h_local = checked_mul(
+        "fuse_crop",
+        height_crop_num,
+        tile_h,
+        "height_crop_num*tile_h",
+    )?;
+    let w_local = checked_mul("fuse_crop", width_crop_num, tile_w, "width_crop_num*tile_w")?;
+    let features = assemble_crop_block(
+        &local,
+        h_local,
+        w_local,
+        global,
+        h,
+        w,
+        image_newline,
+        view_seperator,
+    )?;
     masked_scatter(inputs_embeds, &features, images_seq_mask)
 }
 
@@ -389,6 +548,19 @@ mod tests {
     }
 
     #[test]
+    fn append_newline_rejects_malformed_grid_data() {
+        let g = Mat {
+            rows: 4,
+            cols: 2,
+            data: vec![1.0; 7],
+        };
+        assert!(matches!(
+            append_newline_column(&g, 2, 2, &[0.0, 0.0]),
+            Err(err) if err.to_string().contains("data len 7 != rows*cols 8")
+        ));
+    }
+
+    #[test]
     fn vstack_rejects_total_rows_overflow_without_allocating() {
         let huge = Mat {
             rows: usize::MAX,
@@ -416,6 +588,19 @@ mod tests {
         assert!(matches!(
             vstack(&[&huge], 2),
             Err(err) if err.to_string().contains("rows*cols")
+        ));
+    }
+
+    #[test]
+    fn vstack_rejects_malformed_block_data() {
+        let malformed = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![1.0, 2.0, 3.0],
+        };
+        assert!(matches!(
+            vstack(&[&malformed], 2),
+            Err(err) if err.to_string().contains("data len 3 != rows*cols 4")
         ));
     }
 
@@ -479,6 +664,25 @@ mod tests {
     }
 
     #[test]
+    fn rearrange_local_tiles_matches_reference_permute_layout() {
+        let tiles = vec![
+            Mat::from_vec(4, 1, vec![0.0, 1.0, 2.0, 3.0]),
+            Mat::from_vec(4, 1, vec![10.0, 11.0, 12.0, 13.0]),
+            Mat::from_vec(4, 1, vec![20.0, 21.0, 22.0, 23.0]),
+            Mat::from_vec(4, 1, vec![30.0, 31.0, 32.0, 33.0]),
+        ];
+        let local = rearrange_local_tiles(&tiles, 2, 2, 2, 2).unwrap();
+        assert_eq!(local.shape(), (16, 1));
+        assert_eq!(
+            local.data,
+            vec![
+                0.0, 1.0, 10.0, 11.0, 2.0, 3.0, 12.0, 13.0, 20.0, 21.0, 30.0, 31.0, 22.0, 23.0,
+                32.0, 33.0,
+            ]
+        );
+    }
+
+    #[test]
     fn masked_scatter_overwrites_true_positions_in_order() {
         // 5-token text stream, dim=2; mask True at positions 1,2,4 -> 3 rows.
         let mut embeds = Mat::from_vec(
@@ -525,6 +729,36 @@ mod tests {
         let feats = Mat::zeros(1, 2);
         let mask = vec![true, false]; // len 2 != 3
         assert!(masked_scatter(&mut embeds, &feats, &mask).is_err());
+    }
+
+    #[test]
+    fn masked_scatter_rejects_malformed_inputs_data() {
+        let mut embeds = Mat {
+            rows: 2,
+            cols: 2,
+            data: vec![0.0; 3],
+        };
+        let feats = Mat::zeros(1, 2);
+        let mask = vec![true, false];
+        assert!(matches!(
+            masked_scatter(&mut embeds, &feats, &mask),
+            Err(err) if err.to_string().contains("masked_scatter inputs_embeds")
+        ));
+    }
+
+    #[test]
+    fn masked_scatter_rejects_malformed_vision_data() {
+        let mut embeds = Mat::zeros(2, 2);
+        let feats = Mat {
+            rows: 1,
+            cols: 2,
+            data: vec![1.0],
+        };
+        let mask = vec![true, false];
+        assert!(matches!(
+            masked_scatter(&mut embeds, &feats, &mask),
+            Err(err) if err.to_string().contains("masked_scatter vision_features")
+        ));
     }
 
     /// End-to-end no-crop fuse: a tiny 2x2 global view (7-slot block) scattered
@@ -599,5 +833,82 @@ mod tests {
         assert_eq!(embeds.row(4), g1.row(0));
         assert_eq!(embeds.row(5), &nl[..]);
         assert_eq!(embeds.row(6), &sep[..]);
+    }
+
+    #[test]
+    fn fuse_no_crop_rejects_malformed_global_data() {
+        let weights = Weights::default();
+        let dim = 2;
+        let malformed = Mat {
+            rows: 1,
+            cols: dim,
+            data: vec![42.0],
+        };
+        let mut embeds = Mat::zeros(3, dim);
+        let mask = vec![true, true, true];
+        let err = fuse_no_crop(
+            &weights,
+            &mut embeds,
+            &[malformed],
+            1,
+            1,
+            &[0.0, 0.0],
+            &[1.0, 1.0],
+            &mask,
+        );
+        assert!(matches!(
+            err,
+            Err(err) if err.to_string().contains("append_newline_column grid")
+        ));
+    }
+
+    #[test]
+    fn fuse_crop_end_to_end_rearranges_local_then_global() {
+        let weights = Weights::default();
+        let dim = 2;
+        let local_a = Mat::from_vec(2, dim, vec![10.0, 10.1, 11.0, 11.1]);
+        let local_b = Mat::from_vec(2, dim, vec![20.0, 20.1, 21.0, 21.1]);
+        let global = Mat::from_vec(1, dim, vec![90.0, 90.1]);
+        let nl = vec![-5.0, -5.1];
+        let sep = vec![-9.0, -9.1];
+
+        // Local grid: width_crop_num=2, height_crop_num=1, each local tile 1x2.
+        // Local block has one row of 4 features + newline = 5 rows.
+        // Global block has one feature + newline + separator = 3 rows.
+        let mut embeds = Mat::zeros(10, dim);
+        embeds.row_mut(0).copy_from_slice(&[1.0, 1.0]);
+        embeds.row_mut(9).copy_from_slice(&[2.0, 2.0]);
+        let mut mask = vec![false; 10];
+        for m in mask.iter_mut().take(9).skip(1) {
+            *m = true;
+        }
+
+        fuse_crop(
+            &weights,
+            &mut embeds,
+            &[local_a.clone(), local_b.clone()],
+            2,
+            1,
+            1,
+            2,
+            &global,
+            1,
+            1,
+            &nl,
+            &sep,
+            &mask,
+        )
+        .unwrap();
+
+        assert_eq!(embeds.row(0), &[1.0, 1.0]);
+        assert_eq!(embeds.row(1), local_a.row(0));
+        assert_eq!(embeds.row(2), local_a.row(1));
+        assert_eq!(embeds.row(3), local_b.row(0));
+        assert_eq!(embeds.row(4), local_b.row(1));
+        assert_eq!(embeds.row(5), &nl[..]);
+        assert_eq!(embeds.row(6), global.row(0));
+        assert_eq!(embeds.row(7), &nl[..]);
+        assert_eq!(embeds.row(8), &sep[..]);
+        assert_eq!(embeds.row(9), &[2.0, 2.0]);
     }
 }

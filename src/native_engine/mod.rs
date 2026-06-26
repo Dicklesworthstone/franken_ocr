@@ -33,7 +33,9 @@ pub mod vision_clip;
 pub mod vision_sam;
 pub mod weights;
 
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::error::{FocrError, FocrResult};
@@ -82,6 +84,11 @@ pub struct OcrModel {
 type ModelCacheEntry = Option<(PathBuf, Weak<OcrModel>)>;
 type ModelCache = Mutex<ModelCacheEntry>;
 
+const RAW_SAFETENSORS_SHARD_NAME: &str = "model-00001-of-000001.safetensors";
+const SAFETENSORS_SNIFF_MAX_HEADER_BYTES: usize = 8 * 1024 * 1024;
+const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
+const MODEL_QUANT_ENV: &str = "FOCR_QUANT";
+
 fn model_cache() -> &'static ModelCache {
     static CACHE: OnceLock<ModelCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
@@ -120,6 +127,195 @@ fn looks_like_weight_container(bytes: &[u8]) -> bool {
     bytes.starts_with(weights::FOCRQ_MAGIC) || looks_like_safetensors_container(bytes)
 }
 
+fn resolve_existing_model_artifact(path: &Path) -> Option<PathBuf> {
+    if path.is_dir() {
+        let shard = path.join(RAW_SAFETENSORS_SHARD_NAME);
+        shard.is_file().then_some(shard)
+    } else if path.exists() {
+        Some(path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+fn is_short_model_spec(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ModelQuantPreference {
+    Int8,
+    Int4,
+}
+
+impl ModelQuantPreference {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Int8 => "int8",
+            Self::Int4 => "int4",
+        }
+    }
+}
+
+fn model_quant_preference_from_os(raw: Option<&OsStr>) -> Option<ModelQuantPreference> {
+    let value = raw?.to_str()?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "int8" | "q8" => Some(ModelQuantPreference::Int8),
+        "int4" | "q4" => Some(ModelQuantPreference::Int4),
+        _ => None,
+    }
+}
+
+fn model_quant_preference() -> Option<ModelQuantPreference> {
+    let raw = std::env::var_os(MODEL_QUANT_ENV);
+    model_quant_preference_from_os(raw.as_deref())
+}
+
+fn model_search_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(raw) = std::env::var_os(MODEL_DIR_ENV)
+        && !raw.is_empty()
+    {
+        dirs.extend(std::env::split_paths(&raw));
+    }
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        dirs.push(PathBuf::from(home).join(".cache/franken_ocr/models"));
+    }
+    dirs
+}
+
+/// Directories the model resolver searches for missing relative model specs.
+/// Exposed for diagnostics (`robot health`) so a missing-model report can show
+/// exactly where the binary looked without duplicating resolver policy.
+#[must_use]
+pub fn model_resolution_search_dirs() -> Vec<PathBuf> {
+    model_search_dirs()
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|p| p == &path) {
+        paths.push(path);
+    }
+}
+
+fn short_model_candidates(
+    search_dir: &Path,
+    spec: &Path,
+    quant: Option<ModelQuantPreference>,
+) -> Vec<PathBuf> {
+    let direct = search_dir.join(spec);
+    let mut candidates = Vec::with_capacity(3);
+    if spec.extension().is_none()
+        && let Some(quant) = quant
+    {
+        push_unique_path(
+            &mut candidates,
+            direct.with_extension(format!("{}.focrq", quant.as_str())),
+        );
+    }
+    push_unique_path(&mut candidates, direct.clone());
+    if spec.extension().is_none() {
+        push_unique_path(&mut candidates, direct.with_extension("focrq"));
+    }
+    candidates
+}
+
+fn is_searchable_model_spec(path: &Path) -> bool {
+    path.is_relative() && !path.components().any(|c| matches!(c, Component::ParentDir))
+}
+
+fn model_search_specs(spec: &Path) -> Vec<PathBuf> {
+    let mut specs = vec![spec.to_path_buf()];
+    if !is_short_model_spec(spec)
+        && let Some(file_name) = spec.file_name()
+    {
+        let basename = PathBuf::from(file_name);
+        if basename.as_path() != spec {
+            specs.push(basename);
+        }
+    }
+    specs
+}
+
+fn resolve_model_from_search_dirs_with_quant(
+    spec: &Path,
+    search_dirs: &[PathBuf],
+    quant: Option<ModelQuantPreference>,
+) -> FocrResult<PathBuf> {
+    let specs = model_search_specs(spec);
+    for dir in search_dirs {
+        if let Some(resolved) = resolve_existing_model_artifact(dir) {
+            return Ok(resolved);
+        }
+        for search_spec in &specs {
+            for candidate in short_model_candidates(dir, search_spec, quant) {
+                if let Some(resolved) = resolve_existing_model_artifact(&candidate) {
+                    return Ok(resolved);
+                }
+            }
+        }
+    }
+    let searched = if search_dirs.is_empty() {
+        "<none>".into()
+    } else {
+        search_dirs
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(FocrError::ModelNotFound(format!(
+        "no model artifact named {} (searched directories: {searched}; set {MODEL_DIR_ENV} \
+         or pass an explicit path)",
+        spec.display()
+    )))
+}
+
+#[cfg(test)]
+fn resolve_model_from_search_dirs(spec: &Path, search_dirs: &[PathBuf]) -> FocrResult<PathBuf> {
+    resolve_model_from_search_dirs_with_quant(spec, search_dirs, None)
+}
+
+fn sniff_weight_container_from_reader(mut reader: impl Read) -> bool {
+    let mut prefix = [0u8; 8];
+    if reader.read_exact(&mut prefix).is_err() {
+        return false;
+    }
+    if &prefix[..weights::FOCRQ_MAGIC.len()] == weights::FOCRQ_MAGIC {
+        return true;
+    }
+    let Ok(header_len) = usize::try_from(u64::from_le_bytes(prefix)) else {
+        return false;
+    };
+    if header_len == 0 || header_len > SAFETENSORS_SNIFF_MAX_HEADER_BYTES {
+        return false;
+    }
+    let mut header = vec![0u8; header_len];
+    if reader.read_exact(&mut header).is_err() {
+        return false;
+    }
+    header.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{')
+}
+
+/// Cheaply determine whether `path` resolves to a local model artifact whose
+/// header looks like `.focrq` or safetensors.
+///
+/// This is intentionally a **sniff**, not a load: it resolves the path, opens the
+/// file, and reads only the fixed `.focrq` magic prefix or the bounded
+/// safetensors JSON header. It never parses tensors and never reads payload
+/// bytes, so `robot health` can call it without touching the 6.67 GB model body.
+#[must_use]
+pub fn native_model_available(path: &Path) -> bool {
+    let Ok(resolved) = OcrModel::resolve_model(path) else {
+        return false;
+    };
+    let Ok(file) = std::fs::File::open(resolved) else {
+        return false;
+    };
+    sniff_weight_container_from_reader(file)
+}
+
 fn load_weights_from_resolved_model(resolved: &Path, bytes: Vec<u8>) -> FocrResult<Weights> {
     let recognized_container = looks_like_weight_container(&bytes);
     Weights::from_bytes(bytes).map_err(|e| {
@@ -142,12 +338,28 @@ impl OcrModel {
     /// safetensors directory) — the header-sniff / search-path logic
     /// (`native_model_available`, bd-223.7).
     ///
-    /// Skeleton: returns `path` as-is if it exists, else
-    /// [`FocrError::ModelNotFound`]. The candidate-path search + magic sniff land
-    /// with the resolver bead.
+    /// Returns `path` as-is if it exists as a file; if `path` is a raw
+    /// safetensors directory, returns its canonical shard. Missing relative
+    /// specs are searched under `$FOCR_MODEL_DIR` (split with the platform
+    /// path-list separator) and the user cache default; each `$FOCR_MODEL_DIR`
+    /// entry may itself be a direct artifact/package or a search root.
     pub fn resolve_model(path: &Path) -> FocrResult<PathBuf> {
-        if path.exists() {
-            Ok(path.to_path_buf())
+        if let Some(resolved) = resolve_existing_model_artifact(path) {
+            return Ok(resolved);
+        }
+        if path.is_dir() {
+            return Err(FocrError::ModelNotFound(format!(
+                "no model artifact at {} (expected {RAW_SAFETENSORS_SHARD_NAME} inside \
+                 safetensors directory; resolver lands in Phase 0/1, bd-223.7)",
+                path.display()
+            )));
+        }
+        if is_searchable_model_spec(path) {
+            resolve_model_from_search_dirs_with_quant(
+                path,
+                &model_search_dirs(),
+                model_quant_preference(),
+            )
         } else {
             Err(FocrError::ModelNotFound(format!(
                 "no model artifact at {} (resolver lands in Phase 0/1, bd-223.7)",
@@ -375,19 +587,59 @@ impl OcrModel {
         // from Weights (bd-1es.3). decoder::forward is the Weights-backed shim.
         let mut inputs_embeds = self.embed_prompt(&prompt_ids)?;
 
-        // Scatter every per-view 273-slot block into the placeholder rows. The
-        // no-crop / single-global path (assemble_global_block + masked_scatter)
-        // is the base 1024 case; the connector validates the ORDERING INVARIANT.
-        connector::fuse_no_crop(
-            &self.weights,
-            &mut inputs_embeds,
-            vision_features,
-            Self::global_grid_h(pre),
-            Self::global_grid_w(pre),
-            Self::image_newline(&self.weights)?,
-            Self::view_seperator(&self.weights)?,
-            &images_seq_mask,
-        )?;
+        let image_newline = Self::image_newline(&self.weights)?;
+        let view_seperator = Self::view_seperator(&self.weights)?;
+
+        if pre.crop_grid.is_tiled() {
+            let preprocess::PreprocessMode::Gundam { tile_size, .. } = pre.mode else {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "native_engine::OcrModel::build_inputs_embeds: tiled crop grid requires Gundam preprocess mode"
+                )));
+            };
+            let local_count = pre.tiles.len();
+            let expected_feature_blocks = local_count.checked_add(1).ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!(
+                    "native_engine::OcrModel::build_inputs_embeds: local tile count overflow"
+                ))
+            })?;
+            if vision_features.len() != expected_feature_blocks {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "native_engine::OcrModel::build_inputs_embeds: {} vision feature blocks != {} local tiles + 1 global view",
+                    vision_features.len(),
+                    local_count
+                )));
+            }
+            let (locals, global_tail) = vision_features.split_at(local_count);
+            let q_local = preprocess::num_queries(tile_size);
+            connector::fuse_crop(
+                &self.weights,
+                &mut inputs_embeds,
+                locals,
+                pre.crop_grid.width_crop_num,
+                pre.crop_grid.height_crop_num,
+                q_local,
+                q_local,
+                &global_tail[0],
+                Self::global_grid_h(pre),
+                Self::global_grid_w(pre),
+                image_newline,
+                view_seperator,
+                &images_seq_mask,
+            )?;
+        } else {
+            // Scatter every no-crop / single-global block into the placeholder
+            // rows. The connector validates the ORDERING INVARIANT.
+            connector::fuse_no_crop(
+                &self.weights,
+                &mut inputs_embeds,
+                vision_features,
+                Self::global_grid_h(pre),
+                Self::global_grid_w(pre),
+                image_newline,
+                view_seperator,
+                &images_seq_mask,
+            )?;
+        }
         Ok((inputs_embeds, prompt_ids))
     }
 
@@ -455,8 +707,8 @@ impl OcrModel {
             let last_hidden = Self::last_hidden_row(&hidden)?;
             let logits = decoder::lm_head(&self.weights, &last_hidden)?;
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
-            generated.push(step.token);
-            emitted.push(step.token);
+            generated.push(step.token_id);
+            emitted.push(step.token_id);
             if step.is_eos {
                 break;
             }
@@ -464,7 +716,7 @@ impl OcrModel {
             // step through the ring-cache'd decoder. The Weights-backed driver is
             // NotImplemented until the reader lands; the loop body is the wired
             // shape (one token in -> one hidden row out).
-            let step_embed = self.embed_prompt(&[step.token])?;
+            let step_embed = self.embed_prompt(&[step.token_id])?;
             hidden = decoder::forward(&self.weights, &step_embed)?;
         }
         Ok(emitted)
@@ -476,6 +728,22 @@ impl OcrModel {
                 "native_engine::OcrModel::generate: decoder forward returned zero hidden rows"
             )));
         }
+        let expected_len = hidden.rows.checked_mul(hidden.cols).ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "native_engine::OcrModel::generate: decoder hidden shape product overflow for [{}, {}]",
+                hidden.rows,
+                hidden.cols
+            ))
+        })?;
+        if hidden.data.len() != expected_len {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "native_engine::OcrModel::generate: decoder hidden data len {} != rows*cols {} for shape [{}, {}]",
+                hidden.data.len(),
+                expected_len,
+                hidden.rows,
+                hidden.cols
+            )));
+        }
         Ok(Mat::from_vec(
             1,
             hidden.cols,
@@ -485,24 +753,26 @@ impl OcrModel {
 
     // ── preprocess/weights field accessors (loader-handoff shims) ──────────────
     //
-    // `Preprocessed` and `Weights` are still field-less Phase-1/2 stubs; the
-    // accessors below name the exact data each stage needs so that when the
-    // preprocess (bd-1gv.2/3) and `.focrq` reader (bd-1es.3) beads add the
-    // concrete fields, the wiring is a mechanical body swap with the call sites
-    // above already correct. They return the documented defaults today.
+    // `Preprocessed` now carries real image geometry and view tensors, while
+    // `Weights` is still a Phase-2 handoff seam. The accessors below keep the
+    // orchestration call sites explicit and make each remaining placeholder
+    // visible until the dependent bead lands.
 
     /// Source image pixel dimensions `(w, h)` for bbox de-normalization
-    /// ([SPEC-018]). Filled from `Preprocessed` once it carries the original
-    /// extent (the `ori` tensor of `images=[(crop, ori)]`).
-    fn image_dims(_pre: &Preprocessed) -> (u32, u32) {
-        (0, 0)
+    /// ([SPEC-018]), carried by the preprocess front end after EXIF handling.
+    fn image_dims(pre: &Preprocessed) -> (u32, u32) {
+        pre.original_size
     }
 
     /// The preprocessed view tensors (`[3, H, W]` each), one per crop/global view
-    /// ([SPEC-020..033]). Base mode yields a single 1024 global view; the Gundam
-    /// crop branch yields the local tiles plus the global view.
-    fn views(_pre: &Preprocessed) -> Vec<Mat> {
-        Vec::new()
+    /// ([SPEC-020..033]). Base/no-crop mode yields a single global view; the
+    /// Gundam crop branch yields local tiles first, then the global thumbnail,
+    /// matching the connector `[local, global, view_seperator]` invariant.
+    fn views(pre: &Preprocessed) -> Vec<Mat> {
+        let mut views = Vec::with_capacity(pre.num_views());
+        views.extend(pre.tiles.iter().map(|tile| tile.pixels.clone()));
+        views.push(pre.global.pixels.clone());
+        views
     }
 
     /// The prompt token id-stream (BOS + `<image>` placeholders + task prompt),
@@ -518,13 +788,13 @@ impl OcrModel {
     }
 
     /// Global feature-grid height (16 at base 1024) ([SPEC-063]).
-    fn global_grid_h(_pre: &Preprocessed) -> usize {
-        16
+    fn global_grid_h(pre: &Preprocessed) -> usize {
+        preprocess::num_queries(pre.mode.base_size())
     }
 
     /// Global feature-grid width (16 at base 1024) ([SPEC-063]).
-    fn global_grid_w(_pre: &Preprocessed) -> usize {
-        16
+    fn global_grid_w(pre: &Preprocessed) -> usize {
+        preprocess::num_queries(pre.mode.base_size())
     }
 
     /// The learned `model.image_newline` parameter (length `N_EMBED = 1280`),
@@ -587,6 +857,94 @@ mod tests {
         assert!(matches!(r, Err(FocrError::NotImplemented(_))));
     }
 
+    fn temp_model_dir(label: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("franken_ocr_{label}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp model dir");
+        dir
+    }
+
+    #[test]
+    fn resolve_model_searches_short_name_focrq_candidate() {
+        let dir = temp_model_dir("resolve_short_focrq");
+        let model = dir.join("unlimited-ocr.focrq");
+        std::fs::write(&model, b"only resolver existence is tested").expect("write model");
+
+        let resolved = resolve_model_from_search_dirs(Path::new("unlimited-ocr"), &[dir])
+            .expect("resolve short-name focrq candidate");
+        assert_eq!(resolved, model);
+    }
+
+    #[test]
+    fn resolve_model_searches_short_name_safetensors_directory() {
+        let root = temp_model_dir("resolve_short_safetensors_root");
+        let package = root.join("unlimited-ocr");
+        std::fs::create_dir_all(&package).expect("create safetensors package");
+        let shard = package.join(RAW_SAFETENSORS_SHARD_NAME);
+        std::fs::write(&shard, b"only resolver existence is tested").expect("write shard");
+
+        let resolved = resolve_model_from_search_dirs(Path::new("unlimited-ocr"), &[root])
+            .expect("resolve short-name safetensors directory");
+        assert_eq!(resolved, shard);
+    }
+
+    #[test]
+    fn resolve_model_quant_preference_picks_matching_focrq_candidate() {
+        let dir = temp_model_dir("resolve_quant_preference");
+        let generic = dir.join("unlimited-ocr.focrq");
+        let int4 = dir.join("unlimited-ocr.int4.focrq");
+        std::fs::write(&generic, weights::FOCRQ_MAGIC).expect("write generic model");
+        std::fs::write(&int4, weights::FOCRQ_MAGIC).expect("write int4 model");
+
+        let resolved = resolve_model_from_search_dirs_with_quant(
+            Path::new("unlimited-ocr"),
+            &[dir],
+            Some(ModelQuantPreference::Int4),
+        )
+        .expect("resolve quant-specific focrq candidate");
+        assert_eq!(resolved, int4);
+    }
+
+    #[test]
+    fn resolve_model_accepts_model_dir_direct_focrq_artifact() {
+        let dir = temp_model_dir("resolve_model_dir_direct_focrq");
+        let model = dir.join("custom.focrq");
+        std::fs::write(&model, weights::FOCRQ_MAGIC).expect("write model");
+
+        let resolved =
+            resolve_model_from_search_dirs(Path::new("anything"), std::slice::from_ref(&model))
+                .expect("resolve direct artifact from model dir entry");
+        assert_eq!(resolved, model);
+    }
+
+    #[test]
+    fn resolve_model_searches_relative_default_basename_in_model_dir() {
+        let dir = temp_model_dir("resolve_default_basename");
+        let model = dir.join("unlimited-ocr.focrq");
+        std::fs::write(&model, weights::FOCRQ_MAGIC).expect("write model");
+
+        let resolved =
+            resolve_model_from_search_dirs(Path::new("models/unlimited-ocr.focrq"), &[dir])
+                .expect("resolve default basename in model dir");
+        assert_eq!(resolved, model);
+    }
+
+    #[test]
+    fn resolve_model_missing_short_name_lists_search_dirs() {
+        let dirs = [
+            PathBuf::from("/tmp/franken_ocr_missing_a"),
+            PathBuf::from("/tmp/franken_ocr_missing_b"),
+        ];
+        let err = resolve_model_from_search_dirs(Path::new("missing-model"), &dirs)
+            .expect_err("missing short name should fail");
+        let text = err.to_string();
+        assert!(matches!(err, FocrError::ModelNotFound(_)));
+        assert!(text.contains("missing-model"));
+        assert!(text.contains("/tmp/franken_ocr_missing_a"));
+        assert!(text.contains("/tmp/franken_ocr_missing_b"));
+        assert!(text.contains(MODEL_DIR_ENV));
+    }
+
     fn minimal_focrq_blob(version: u32, header_json: &str, payload: &[u8]) -> Vec<u8> {
         let mut blob = Vec::new();
         blob.extend_from_slice(weights::FOCRQ_MAGIC);
@@ -622,6 +980,73 @@ mod tests {
             load_weights_from_resolved_model(Path::new("bad.safetensors"), bytes).unwrap_err();
         assert!(matches!(err, FocrError::FormatMismatch(_)));
         assert_eq!(err.exit_code(), crate::error::EXIT_FORMAT_MISMATCH);
+    }
+
+    #[test]
+    fn resolve_model_accepts_safetensors_directory_shard() {
+        let dir = temp_model_dir("resolve_safetensors_dir");
+        let shard = dir.join(RAW_SAFETENSORS_SHARD_NAME);
+        std::fs::write(&shard, b"not loaded by resolver").expect("write shard");
+
+        let resolved = OcrModel::resolve_model(&dir).expect("resolve safetensors directory");
+        assert_eq!(resolved, shard);
+    }
+
+    #[test]
+    fn load_safetensors_directory_preserves_format_mismatch() {
+        let dir = temp_model_dir("load_safetensors_dir");
+        let shard = dir.join(RAW_SAFETENSORS_SHARD_NAME);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(1u64).to_le_bytes());
+        bytes.extend_from_slice(b"{");
+        std::fs::write(&shard, bytes).expect("write malformed shard");
+
+        let r = OcrModel::load(&dir);
+        assert!(matches!(&r, Err(FocrError::FormatMismatch(_))));
+        if let Err(err) = r {
+            assert_eq!(err.exit_code(), crate::error::EXIT_FORMAT_MISMATCH);
+        }
+    }
+
+    #[test]
+    fn native_model_available_accepts_focrq_magic_without_loading() {
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!(
+            "franken_ocr_available_focrq_{}.focrq",
+            std::process::id()
+        ));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(weights::FOCRQ_MAGIC);
+        bytes.extend_from_slice(&[0u8; 2]);
+        std::fs::write(&tmp, bytes).expect("write focrq prefix");
+
+        assert!(native_model_available(&tmp));
+    }
+
+    #[test]
+    fn native_model_available_accepts_safetensors_directory_header() {
+        let dir = temp_model_dir("available_safetensors_dir");
+        let shard = dir.join(RAW_SAFETENSORS_SHARD_NAME);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&(2u64).to_le_bytes());
+        bytes.extend_from_slice(b"{}");
+        std::fs::write(&shard, bytes).expect("write safetensors header");
+
+        assert!(native_model_available(&dir));
+    }
+
+    #[test]
+    fn native_model_available_rejects_missing_and_garbage() {
+        let missing = Path::new("/definitely/not/a/real/model/path.focrq");
+        assert!(!native_model_available(missing));
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!(
+            "franken_ocr_available_garbage_{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, b"not a model").expect("write garbage");
+        assert!(!native_model_available(&tmp));
     }
 
     // ── stage-helper wiring (no weights required) ──────────────────────────────
@@ -667,12 +1092,58 @@ mod tests {
         ));
     }
 
-    /// Image dims accessor returns the documented `(0, 0)` placeholder until
-    /// `Preprocessed` carries the original extent; postprocess tolerates it.
+    /// Image dims accessor returns the source size carried by preprocessing for
+    /// postprocess bbox de-normalization.
     #[test]
-    fn image_dims_placeholder_is_zero_until_preprocess_lands() {
-        let pre = Preprocessed::default();
-        assert_eq!(OcrModel::image_dims(&pre), (0, 0));
+    fn image_dims_come_from_preprocessed_original_size() {
+        let pre = Preprocessed {
+            original_size: (123, 45),
+            ..Preprocessed::default()
+        };
+        assert_eq!(OcrModel::image_dims(&pre), (123, 45));
+    }
+
+    /// Preprocessed view tensors must flow into the vision tower in the
+    /// connector's crop-branch order: local tiles first, then the global
+    /// thumbnail. Otherwise masked_scatter can align image placeholders to the
+    /// wrong feature rows once the Gundam branch is wired.
+    #[test]
+    fn views_forward_local_tiles_then_global_thumbnail() {
+        let global = Mat::from_vec(3, 4, (0..12).map(|v| v as f32).collect());
+        let tile_a = Mat::from_vec(3, 1, vec![1.0, 2.0, 3.0]);
+        let tile_b = Mat::from_vec(3, 1, vec![4.0, 5.0, 6.0]);
+        let pre = Preprocessed {
+            mode: preprocess::PreprocessMode::Gundam {
+                base_size: 128,
+                tile_size: 64,
+            },
+            global: preprocess::ViewTensor {
+                pixels: global.clone(),
+                height: 2,
+                width: 2,
+            },
+            tiles: vec![
+                preprocess::ViewTensor {
+                    pixels: tile_a.clone(),
+                    height: 1,
+                    width: 1,
+                },
+                preprocess::ViewTensor {
+                    pixels: tile_b.clone(),
+                    height: 1,
+                    width: 1,
+                },
+            ],
+            crop_grid: preprocess::CropGrid {
+                width_crop_num: 2,
+                height_crop_num: 1,
+            },
+            original_size: (640, 320),
+        };
+
+        assert_eq!(OcrModel::views(&pre), vec![tile_a, tile_b, global]);
+        assert_eq!(OcrModel::global_grid_h(&pre), 2);
+        assert_eq!(OcrModel::global_grid_w(&pre), 2);
     }
 
     #[test]
@@ -681,6 +1152,18 @@ mod tests {
         let err = OcrModel::last_hidden_row(&hidden).expect_err("expected empty hidden error");
         assert!(matches!(err, FocrError::Other(_)));
         assert!(err.to_string().contains("zero hidden rows"));
+    }
+
+    #[test]
+    fn last_hidden_row_rejects_malformed_decoder_output_without_panic() {
+        let hidden = Mat {
+            rows: 2,
+            cols: 3,
+            data: vec![1.0, 2.0, 3.0, 4.0, 5.0],
+        };
+        let err = OcrModel::last_hidden_row(&hidden).expect_err("expected malformed hidden error");
+        assert!(matches!(err, FocrError::Other(_)));
+        assert!(err.to_string().contains("data len 5 != rows*cols 6"));
     }
 
     #[test]
