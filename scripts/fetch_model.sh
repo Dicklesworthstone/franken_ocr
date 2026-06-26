@@ -69,12 +69,18 @@ done
 BASE_URL="https://huggingface.co/${REPO}/resolve/${REVISION}"
 
 # ── canonical filenames + expected byte sizes ────────────────────────────────
-# Sizes are EXACT from the pinned snapshot (model.safetensors.index.json
-# total_size = 6672212480; tokenizer.json from docs/truth-pack/SOURCE_HASHES.md).
-# A downloaded file whose size differs from the expected size is rejected — a
-# truncated transfer (HTML error page, partial download) must never be trusted.
+# Sizes are the EXACT on-disk FILE sizes at the pinned revision (HF LFS
+# x-linked-size). NOTE: the safetensors FILE is larger than the index's
+# `total_size` (6672212480, tensor payload only) by the 8-byte header-length
+# prefix + the JSON tensor directory (~334 KB for 2710 tensors); the file size
+# is 6672547120. Validating against total_size (the previous value) wrongly
+# rejected a complete download. We additionally verify the shard's SHA-256
+# against the pinned LFS object hash — the authoritative integrity check.
+# A downloaded file whose size or hash differs is rejected — a truncated
+# transfer (HTML error page, partial download) must never be trusted.
 SHARD="model-00001-of-000001.safetensors"
-SHARD_BYTES=6672212480          # 6.67 GB (bf16 weights)
+SHARD_BYTES=6672547120          # 6.67 GB bf16 shard, full file (header + payload)
+SHARD_SHA256=2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
 INDEX="model.safetensors.index.json"
 TOKENIZER="tokenizer.json"
 TOKENIZER_BYTES=9979544         # ~9.98 MB
@@ -113,6 +119,17 @@ free_bytes() {
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# sha256 of $1 (BSD/macOS `shasum -a 256` vs GNU `sha256sum`); empty if neither.
+file_sha256() {
+  if have shasum; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif have sha256sum; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo ""
+  fi
+}
+
 # Download $1 (URL) -> $2 (final path), atomically, with retries. Uses curl if
 # present, else wget. Never trusts a partial file: downloads to a temp then
 # size-checks before the atomic mv.
@@ -148,6 +165,17 @@ download() {
     rm -f "$tmp"
     return 1
   fi
+  expect_sha="$(expected_sha_for "$name")"
+  if [ -n "$expect_sha" ]; then
+    got_sha="$(file_sha256 "$tmp")"
+    if [ "$got_sha" != "$expect_sha" ]; then
+      log "ERROR: ${name} sha256 mismatch: got ${got_sha}, expected ${expect_sha}."
+      log "       (corrupt transfer or wrong revision — refusing to trust it.)"
+      rm -f "$tmp"
+      return 1
+    fi
+    log "  sha256 ok: ${name}"
+  fi
   mv -f "$tmp" "$out"
   log "  ok: ${name} (${got} bytes)"
 }
@@ -158,6 +186,14 @@ expected_size_for() {
     "$SHARD")     echo "$SHARD_BYTES" ;;
     "$TOKENIZER") echo "$TOKENIZER_BYTES" ;;
     *)            echo 0 ;;
+  esac
+}
+
+# expected sha256 for a given filename (empty = no hash check).
+expected_sha_for() {
+  case "$1" in
+    "$SHARD") echo "$SHARD_SHA256" ;;
+    *)        echo "" ;;
   esac
 }
 
