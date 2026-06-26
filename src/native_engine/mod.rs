@@ -103,6 +103,12 @@ const BASE_PROMPT_TEXT: &str = "document parsing.";
 /// the full run's tokens.
 const MAX_NEW_TOKENS_ENV: &str = "FOCR_MAX_NEW_TOKENS";
 
+/// Force the stateless O(n^2) re-prefill decode instead of the default O(n)
+/// R-SWA ring-cache decode (bd-1gv.17). Present ⇒ stateless. Kept as the parity
+/// oracle: the cached path must emit the same tokens for the first 128 steps (the
+/// R-SWA ring window, before any generated-tail eviction).
+const DECODE_STATELESS_ENV: &str = "FOCR_DECODE_STATELESS";
+
 /// Build the single-image greedy decode params, honoring [`MAX_NEW_TOKENS_ENV`].
 fn decode_params_from_env() -> DecodeParams {
     let mut p = DecodeParams::single_image();
@@ -687,28 +693,107 @@ impl OcrModel {
     /// greedy autoregressive decode loop to EOS, returning the generated token
     /// ids ([SPEC-072..103]).
     ///
-    /// Doctrine #5: this loop is strictly sequential — one forward at a time, the
-    /// per-step R-SWA/MoE math fans out across cores inside the kernels, never a
-    /// nested runtime, never rayon under a lock. This is the stateless no-cache
-    /// decode: each step re-prefills the full growing sequence (O(n^2)); the
-    /// R-SWA ring cache (bd-1gv.17) replaces it with a bounded O(n) ring update.
+    /// Doctrine #5: strictly sequential — one forward at a time; the per-step
+    /// R-SWA/MoE math fans out across cores inside the kernels, never a nested
+    /// runtime, never rayon under a lock. Two decode kernels share this contract,
+    /// selected at runtime:
+    ///   * **cached** (default, bd-1gv.17): prefill ONCE into a per-layer R-SWA
+    ///     ring cache, then extend one token per step — O(n) ([`Self::generate_cached`]).
+    ///   * **stateless** (`FOCR_DECODE_STATELESS`): re-prefill the whole growing
+    ///     sequence every step — O(n^2), the parity oracle ([`Self::generate_stateless`]).
+    /// Both emit the SAME tokens for the first 128 steps (the R-SWA window).
     ///
     /// # Errors
     /// The first decode-stage error — e.g. [`FocrError::FormatMismatch`] if the
     /// embedding table is absent, or a sampler/lm_head failure.
-    fn generate(&self, mut inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
+    fn generate(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
+        if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
+            self.generate_stateless(inputs_embeds, prompt_ids)
+        } else {
+            self.generate_cached(inputs_embeds, prompt_ids)
+        }
+    }
+
+    /// O(n) cached greedy decode (bd-1gv.17): [`decoder::prefill_with_cache`] once
+    /// to seed each layer's R-SWA reference K/V, then
+    /// [`decoder::decode_step_with_cache`] per token over the ring caches. The
+    /// reference block (the entire prefill) is never evicted; the generated tail
+    /// rides a 128-slot ring, so memory and per-step cost are bounded.
+    ///
+    /// # Errors
+    /// As [`Self::generate`].
+    fn generate_cached(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
         let params = &self.decode_params;
         let hidden_dim = inputs_embeds.cols;
+        let prefill_len = inputs_embeds.rows;
 
-        // The embedding table — one row is appended to `inputs_embeds` per emitted
-        // token so the next forward sees the full growing sequence. This is the
-        // stateless no-cache decode (correct for parity); the R-SWA ring cache
-        // (bd-1gv.17) replaces this O(n^2) re-prefill with an O(n) ring update.
         let table = self.weights.mat("model.embed_tokens.weight")?;
         let vocab = table.rows;
         if table.cols != hidden_dim {
             return Err(FocrError::Other(anyhow::anyhow!(
-                "native_engine::OcrModel::generate: embed table hidden {} != inputs_embeds hidden {}",
+                "native_engine::OcrModel::generate_cached: embed table hidden {} != inputs_embeds hidden {}",
+                table.cols,
+                hidden_dim
+            )));
+        }
+
+        // Prefill once, capturing each layer's reference K/V; `last_hidden` is the
+        // final prefill position, which predicts the FIRST generated token.
+        let (hidden, mut caches) = decoder::prefill_with_cache(&self.weights, &inputs_embeds)?;
+        let mut last_hidden = Self::last_hidden_row(&hidden)?;
+
+        // `generated` seeds the no-repeat-ngram history with the prompt so the
+        // sliding-window blocker sees the full context (sampler reads its tail).
+        let mut generated: Vec<u32> = prompt_ids.to_vec();
+        let mut emitted: Vec<u32> = Vec::new();
+
+        while emitted.len() < params.max_length {
+            let logits = decoder::lm_head(&self.weights, &last_hidden)?;
+            let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
+            generated.push(step.token_id);
+            emitted.push(step.token_id);
+            if step.is_eos {
+                break;
+            }
+            let next = step.token_id as usize;
+            if next >= vocab {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "native_engine::OcrModel::generate_cached: decoded token id {next} outside embed vocab {vocab}"
+                )));
+            }
+            // Embed the just-emitted token and advance the ring one step at its
+            // TRUE absolute position (`prefill_len` + tokens already ringed). After
+            // the push above, `emitted.len() - 1` tokens are already in the ring.
+            let row = table.data[next * hidden_dim..(next + 1) * hidden_dim].to_vec();
+            let token_embed = Mat::from_vec(1, hidden_dim, row);
+            let position = prefill_len + (emitted.len() - 1);
+            let h =
+                decoder::decode_step_with_cache(&self.weights, &mut caches, &token_embed, position)?;
+            last_hidden = Self::last_hidden_row(&h)?;
+        }
+        Ok(emitted)
+    }
+
+    /// O(n^2) stateless greedy decode: re-run [`decoder::forward`] over the whole
+    /// growing sequence every step (append one embed row per emitted token). The
+    /// parity oracle for [`Self::generate_cached`], selected by
+    /// `FOCR_DECODE_STATELESS`.
+    ///
+    /// # Errors
+    /// As [`Self::generate`].
+    fn generate_stateless(
+        &self,
+        mut inputs_embeds: Mat,
+        prompt_ids: &[u32],
+    ) -> FocrResult<Vec<u32>> {
+        let params = &self.decode_params;
+        let hidden_dim = inputs_embeds.cols;
+
+        let table = self.weights.mat("model.embed_tokens.weight")?;
+        let vocab = table.rows;
+        if table.cols != hidden_dim {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "native_engine::OcrModel::generate_stateless: embed table hidden {} != inputs_embeds hidden {}",
                 table.cols,
                 hidden_dim
             )));
@@ -723,12 +808,8 @@ impl OcrModel {
         // Bounded by `max_length` so a non-converging model can never hang.
         while emitted.len() < params.max_length {
             // Full-sequence forward, then lm_head over ONLY the last hidden row
-            // -> [1, vocab] logits. The next-token logits depend solely on the
-            // final position; RMSNorm and the lm_head linear are per-row
-            // independent, so the last-row slice is bit-identical to projecting
-            // ALL rows and discarding the rest — but it skips the [seq-1, vocab]
-            // head GEMM (vocab is huge, 129280), proved by
-            // decoder::lm_head_last_row_is_full_last_row.
+            // -> [1, vocab] logits (the next-token logits depend solely on the
+            // final position; per decoder::lm_head_last_row_is_full_last_row).
             let hidden = decoder::forward(&self.weights, &inputs_embeds)?;
             let last_hidden = Self::last_hidden_row(&hidden)?;
             let logits = decoder::lm_head(&self.weights, &last_hidden)?;
@@ -743,7 +824,7 @@ impl OcrModel {
             let next = step.token_id as usize;
             if next >= vocab {
                 return Err(FocrError::Other(anyhow::anyhow!(
-                    "native_engine::OcrModel::generate: decoded token id {next} outside embed vocab {vocab}"
+                    "native_engine::OcrModel::generate_stateless: decoded token id {next} outside embed vocab {vocab}"
                 )));
             }
             let new_rows = inputs_embeds.rows + 1;

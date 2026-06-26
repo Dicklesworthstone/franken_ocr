@@ -34,6 +34,7 @@
 
 use super::moe;
 use super::nn;
+use super::rswa::{self, RingCache};
 use super::tensor::Mat;
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
@@ -723,6 +724,223 @@ pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
     Ok(x)
 }
 
+/// Repack token-major `[seq, num_heads*head_dim]` K/V (the layout
+/// [`qkv_with_rope`] returns) into the head-major `[num_heads, seq, head_dim]`
+/// flat layout that [`RingCache::record_prefill`] consumes (head `h`'s `seq`
+/// rows are contiguous). Pure index gymnastics — no math.
+///
+/// # Errors
+/// [`FocrError::Other`] on a `seq*head_dim`/`num_heads*…` overflow.
+fn token_major_to_head_major(
+    k: &Mat,
+    v: &Mat,
+    seq: usize,
+    num_heads: usize,
+    head_dim: usize,
+) -> FocrResult<(Vec<f32>, Vec<f32>)> {
+    let span = checked_shape_mul("token_major_to_head_major", seq, head_dim, "seq*head_dim")?;
+    let total = checked_shape_mul(
+        "token_major_to_head_major",
+        num_heads,
+        span,
+        "num_heads*seq*head_dim",
+    )?;
+    let mut kh = vec![0.0f32; total];
+    let mut vh = vec![0.0f32; total];
+    for s in 0..seq {
+        let (kr, vr) = (k.row(s), v.row(s));
+        for h in 0..num_heads {
+            let src = h * head_dim;
+            let dst = h * span + s * head_dim;
+            kh[dst..dst + head_dim].copy_from_slice(&kr[src..src + head_dim]);
+            vh[dst..dst + head_dim].copy_from_slice(&vr[src..src + head_dim]);
+        }
+    }
+    Ok((kh, vh))
+}
+
+/// Run the full 12-layer prefill over `inputs_embeds` exactly like [`forward`],
+/// but ALSO capture each layer's RoPE'd K/V into a per-layer [`RingCache`] — the
+/// R-SWA reference block ([SPEC-091], never evicted). Returns the final
+/// `model.norm`-ready hidden `[seq, hidden]` (bit-identical to [`forward`]'s
+/// output, same kernels) plus the 12 populated caches for
+/// [`decode_step_with_cache`].
+///
+/// This is the prefill half of the O(n) cached decode: the stateless loop
+/// re-runs [`forward`] over the whole growing sequence every step (O(n^2) — the
+/// MLP/MoE re-processes all prior tokens); here we pay the prefill ONCE and then
+/// extend by a single token per step.
+///
+/// # Errors
+/// As [`forward`], plus a [`RingCache::record_prefill`] error if `seq` exceeds
+/// the cache capacity (it is sized to `seq`, so only an internal inconsistency
+/// trips it).
+pub fn prefill_with_cache(
+    weights: &Weights,
+    inputs_embeds: &Mat,
+) -> FocrResult<(Mat, Vec<RingCache>)> {
+    checked_mat_len("decoder::prefill_with_cache inputs_embeds", inputs_embeds)?;
+    let hidden = config::HIDDEN_SIZE;
+    let num_heads = config::NUM_ATTENTION_HEADS;
+    let head_dim = config::HEAD_DIM;
+    let qkv_dim =
+        checked_shape_mul("decoder::prefill_with_cache", num_heads, head_dim, "num_heads*head_dim")?;
+    let eps = config::RMS_NORM_EPS;
+    if inputs_embeds.cols != hidden {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::prefill_with_cache: inputs_embeds cols {} != hidden {hidden}",
+            inputs_embeds.cols
+        )));
+    }
+    let seq = inputs_embeds.rows;
+
+    // Absolute positions 0..seq, one shared RoPE table ([SPEC-095]).
+    let positions: Vec<usize> = (0..seq).collect();
+    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
+
+    let mut caches: Vec<RingCache> = (0..config::NUM_HIDDEN_LAYERS)
+        .map(|_| RingCache::new(seq.max(1)))
+        .collect();
+
+    let mut x = inputs_embeds.clone();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
+        let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let q_proj = weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?;
+        let k_proj = weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?;
+        let v_proj = weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?;
+        let o_proj = weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?;
+        let lw = LayerWeights {
+            input_ln: &input_ln,
+            post_attn_ln: &post_attn_ln,
+            q_proj: &q_proj.data,
+            k_proj: &k_proj.data,
+            v_proj: &v_proj.data,
+            o_proj: &o_proj.data,
+            gate_w: &[],
+            up_w: &[],
+            down_w: &[],
+        };
+
+        // Attention sub-block — mirrors `layer_forward`, but intercepts (k, v) to
+        // seed the ring cache's reference block before the prefill SDPA.
+        let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
+        let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
+        let (kh, vh) = token_major_to_head_major(&k, &v, seq, num_heads, head_dim)?;
+        caches[layer].record_prefill(&kh, &vh, seq)?;
+        let context = prefill_attention(&q, &k, &v, num_heads, head_dim)?;
+        let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
+        let h = add_residual(&x, &attn_out)?;
+
+        // MLP / MoE sub-block (dense layer 0, MoE 1..11).
+        let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
+        let mlp_out = if layer < config::FIRST_K_DENSE_REPLACE {
+            moe::dense_forward(weights, &normed2)?
+        } else {
+            moe::forward(weights, &normed2, layer)?
+        };
+        x = add_residual(&h, &mlp_out)?;
+    }
+    Ok((x, caches))
+}
+
+/// One incremental decode step over the per-layer [`RingCache`]s
+/// ([SPEC-091..095]).
+///
+/// `token_embed` is the new token's embedding row `[1, hidden]` (from
+/// [`embed_tokens`]); `position` is its TRUE absolute position (`prefill_len +
+/// generated_so_far`), used for RoPE ([SPEC-095] — always the logical position,
+/// never a ring slot). Each layer writes this token's RoPE'd K/V into its ring,
+/// then runs R-SWA [`rswa::decode_attention`] over (reference ++ ring). Returns
+/// the final `model.norm`-ready hidden `[1, hidden]` for `lm_head`.
+///
+/// For the first [`rswa::RING_WINDOW`] (128) decode steps this is bit-identical
+/// to the stateless [`forward`] over the equivalent full sequence (the ring holds
+/// every generated token; no eviction, so the union is the full causal context);
+/// beyond that the generated tail is windowed to `W` — the reference model's
+/// actual sliding-window behavior, which the stateless full-causal path does NOT
+/// reproduce.
+///
+/// # Errors
+/// As [`forward`], plus a [`RingCache::write_decode_step`] error if the caches
+/// were not populated by [`prefill_with_cache`] first, or a shape mismatch.
+pub fn decode_step_with_cache(
+    weights: &Weights,
+    caches: &mut [RingCache],
+    token_embed: &Mat,
+    position: usize,
+) -> FocrResult<Mat> {
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::decode_step_with_cache",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
+    if token_embed.rows != 1 || token_embed.cols != hidden {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::decode_step_with_cache: token_embed shape [{}, {}] != [1, {hidden}]",
+            token_embed.rows,
+            token_embed.cols
+        )));
+    }
+    if caches.len() != config::NUM_HIDDEN_LAYERS {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::decode_step_with_cache: {} caches != {} layers",
+            caches.len(),
+            config::NUM_HIDDEN_LAYERS
+        )));
+    }
+
+    // RoPE at the single TRUE absolute position (one row, one shared table).
+    let rope = RopeTable::build(&[position], config::HEAD_DIM, config::ROPE_THETA);
+
+    let mut x = token_embed.clone();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
+        let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let q_proj = weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?;
+        let k_proj = weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?;
+        let v_proj = weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?;
+        let o_proj = weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?;
+        let lw = LayerWeights {
+            input_ln: &input_ln,
+            post_attn_ln: &post_attn_ln,
+            q_proj: &q_proj.data,
+            k_proj: &k_proj.data,
+            v_proj: &v_proj.data,
+            o_proj: &o_proj.data,
+            gate_w: &[],
+            up_w: &[],
+            down_w: &[],
+        };
+
+        // Attention: project the single token, RoPE at `position`, push its K/V
+        // into the ring (the query attends to itself as the newest ring token —
+        // OQ-3), then R-SWA decode attention over reference ++ ring. seq == 1, so
+        // the token-major `[1, qkv_dim]` rows ARE the head-major `[num_heads,
+        // head_dim]` flats the ring/decode kernels expect.
+        let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
+        let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
+        caches[layer].write_decode_step(&k.data, &v.data)?;
+        let context = rswa::decode_attention(&caches[layer], &q.data)?;
+        let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
+        let h = add_residual(&x, &attn_out)?;
+
+        let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
+        let mlp_out = if layer < config::FIRST_K_DENSE_REPLACE {
+            moe::dense_forward(weights, &normed2)?
+        } else {
+            moe::forward(weights, &normed2, layer)?
+        };
+        x = add_residual(&h, &mlp_out)?;
+    }
+    Ok(x)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -736,6 +954,22 @@ mod tests {
             message.contains(needle),
             "error {message:?} did not contain {needle:?}"
         );
+    }
+
+    // ── R-SWA cache repack ([SPEC-091]) ─────────────────────────────────────────
+
+    #[test]
+    fn token_major_to_head_major_transposes_kv() -> FocrResult<()> {
+        // seq=2, num_heads=2, head_dim=2 -> token-major row r = [h0d0,h0d1,h1d0,h1d1].
+        // row0 = [0,1, 2,3]  row1 = [4,5, 6,7]
+        let k = Mat::from_vec(2, 4, vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let v = Mat::from_vec(2, 4, vec![10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0]);
+        let (kh, vh) = token_major_to_head_major(&k, &v, 2, 2, 2)?;
+        // head-major [num_heads, seq, head_dim]: head0 = rows' first head across seq
+        //   head0: s0=[0,1] s1=[4,5] ; head1: s0=[2,3] s1=[6,7]
+        assert_eq!(kh, vec![0.0, 1.0, 4.0, 5.0, 2.0, 3.0, 6.0, 7.0]);
+        assert_eq!(vh, vec![10.0, 11.0, 14.0, 15.0, 12.0, 13.0, 16.0, 17.0]);
+        Ok(())
     }
 
     // ── Token embedding ([SPEC-070]) ────────────────────────────────────────
