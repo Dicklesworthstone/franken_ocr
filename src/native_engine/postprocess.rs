@@ -183,8 +183,9 @@ fn scan_ref_spans(text: &str) -> Vec<RefMatch> {
 ///
 /// A `<|det|>` whose body is `<ws><label-ident><ws><[...]><ws>` then `<|/det|>`,
 /// where the label is a Python identifier-ish token (`[A-Za-z_][\w-]*`, i.e.
-/// starts with a letter/underscore, continues with word chars or `-`), and the
-/// box is a single bracketed group with no nested `]`.
+/// starts with an ASCII letter/underscore, continues with Unicode word chars or
+/// `-`), and the box is a single bracketed group with no nested `]`. Python's
+/// `\s` is Unicode-aware, so whitespace skipping is char-aware here too.
 fn scan_det_spans(text: &str) -> Vec<RefMatch> {
     const DET_OPEN: &str = "<|det|>";
     const DET_CLOSE: &str = "<|/det|>";
@@ -196,19 +197,25 @@ fn scan_det_spans(text: &str) -> Vec<RefMatch> {
         let mut p = open + DET_OPEN.len();
         i = p; // default advance: just past this `<|det|>`
         // \s*
-        p = skip_ws(bytes, p);
+        p = skip_ws(text, p);
         // [A-Za-z_][\w-]*
         let label_start = p;
-        if p >= bytes.len() || !is_ident_start(bytes[p]) {
+        let Some(first) = text[p..].chars().next() else {
+            continue;
+        };
+        if !is_ident_start(first) {
             continue;
         }
-        p += 1;
-        while p < bytes.len() && is_ident_continue(bytes[p]) {
-            p += 1;
+        p += first.len_utf8();
+        while let Some(ch) = text[p..].chars().next() {
+            if !is_ident_continue(ch) {
+                break;
+            }
+            p += ch.len_utf8();
         }
         let label_end = p;
         // \s*
-        p = skip_ws(bytes, p);
+        p = skip_ws(text, p);
         // \[[^\]]+\]
         if p >= bytes.len() || bytes[p] != b'[' {
             continue;
@@ -226,7 +233,7 @@ fn scan_det_spans(text: &str) -> Vec<RefMatch> {
         let box_end = p + 1; // include `]`
         p = box_end;
         // \s*
-        p = skip_ws(bytes, p);
+        p = skip_ws(text, p);
         // <|/det|>
         if !slice_starts_with(bytes, p, DET_CLOSE) {
             continue;
@@ -330,22 +337,25 @@ fn slice_starts_with(hay: &[u8], at: usize, needle: &str) -> bool {
     at + n.len() <= hay.len() && &hay[at..at + n.len()] == n
 }
 
-/// Advance past ASCII whitespace (`\s` in the ASCII-only spans we scan).
-fn skip_ws(hay: &[u8], mut at: usize) -> usize {
-    while at < hay.len() && hay[at].is_ascii_whitespace() {
-        at += 1;
+/// Advance past Unicode whitespace, matching Python regex `\s` on `str`.
+fn skip_ws(text: &str, mut at: usize) -> usize {
+    while let Some(ch) = text[at..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        at += ch.len_utf8();
     }
     at
 }
 
 /// `[A-Za-z_]`.
-fn is_ident_start(b: u8) -> bool {
-    b.is_ascii_alphabetic() || b == b'_'
+fn is_ident_start(ch: char) -> bool {
+    ch.is_ascii_alphabetic() || ch == '_'
 }
 
-/// `[\w-]` == `[A-Za-z0-9_-]`.
-fn is_ident_continue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+/// `[\w-]`: Python's Unicode word chars plus `-`.
+fn is_ident_continue(ch: char) -> bool {
+    ch == '_' || ch == '-' || ch.is_alphanumeric()
 }
 
 // ── markdown assembly ───────────────────────────────────────────────────────
@@ -359,8 +369,8 @@ fn is_ident_continue(b: u8) -> bool {
 /// `![](images/0.jpg)`; in multi-page mode it is `"page_{n}_"` so they become
 /// `![](images/page_{n}_0.jpg)`. The replacements run in match order, each
 /// `str.replace` substituting ALL occurrences of the matched span (Python
-/// semantics), and `\coloneqq` / `\eqqcolon` are normalized on every `other`
-/// iteration (idempotent, applied to the whole running string).
+/// semantics). `\coloneqq` / `\eqqcolon` are normalized globally after the span
+/// rewrites, per SPEC-115.
 fn assemble_page(text: &str, img_base: &str) -> String {
     let matches = re_match(text);
     let mut images = Vec::new();
@@ -379,12 +389,13 @@ fn assemble_page(text: &str, img_base: &str) -> String {
         out = out.replace(&m.full, &replacement);
     }
     for m in &others {
-        out = out
-            .replace(&m.full, "")
-            .replace("\\coloneqq", ":=")
-            .replace("\\eqqcolon", "=:");
+        out = out.replace(&m.full, "");
     }
-    out
+    normalize_colon_equals(&out)
+}
+
+fn normalize_colon_equals(text: &str) -> String {
+    text.replace("\\coloneqq", ":=").replace("\\eqqcolon", "=:")
 }
 
 /// Turn raw decoded model text + the source image dimensions into the final
@@ -562,6 +573,24 @@ mod tests {
     }
 
     #[test]
+    fn re_match_det_uses_python_unicode_whitespace() {
+        let text = "noise <|det|>\u{00a0}figure\u{00a0}[0, 0, 100, 100]\u{00a0}<|/det|> tail";
+        let ms = scan_det_spans(text);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].label, "figure");
+        assert_eq!(ms[0].boxes, vec![[0, 0, 100, 100]]);
+    }
+
+    #[test]
+    fn re_match_det_allows_unicode_word_continuation() {
+        let text = "noise <|det|> a\u{00e9}-label [1, 2, 3, 4] <|/det|> tail";
+        let ms = scan_det_spans(text);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].label, "a\u{00e9}-label");
+        assert_eq!(ms[0].boxes, vec![[1, 2, 3, 4]]);
+    }
+
+    #[test]
     fn re_match_det_rejects_bad_label() {
         // label starting with a digit is not [A-Za-z_]...
         let text = "<|det|>9bad [1,2,3,4]<|/det|>";
@@ -613,7 +642,7 @@ mod tests {
     #[test]
     fn finalize_normalizes_latex_coloneqq() {
         // a \coloneqq inside body text gets normalized when an `other` span is
-        // present (the replacement chains run on the whole string).
+        // present.
         let raw = format!(
             "x \\coloneqq y and a \\eqqcolon b <|ref|>note<|/ref|><|det|>[1,2,3,4]<|/det|>{EOS_MARKER}"
         );
@@ -622,6 +651,23 @@ mod tests {
         assert!(md.contains("a =: b"));
         assert!(!md.contains("\\coloneqq"));
         assert!(!md.contains("\\eqqcolon"));
+    }
+
+    #[test]
+    fn finalize_normalizes_latex_coloneqq_without_tags() {
+        let raw = format!("x \\coloneqq y and a \\eqqcolon b{EOS_MARKER}");
+        let md = finalize(&raw, 100, 100).unwrap();
+        assert_eq!(md, "x := y and a =: b");
+    }
+
+    #[test]
+    fn finalize_normalizes_latex_coloneqq_with_only_image_spans() {
+        let raw =
+            format!("x \\coloneqq y <|ref|>image<|/ref|><|det|>[0,0,10,10]<|/det|>{EOS_MARKER}");
+        let md = finalize(&raw, 100, 100).unwrap();
+        assert!(md.contains("x := y"));
+        assert!(md.contains("![](images/0.jpg)"));
+        assert!(!md.contains("\\coloneqq"));
     }
 
     #[test]
