@@ -39,7 +39,10 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::FOCR_MODEL_LICENSE_NOTICE;
 use crate::error::{FocrError, FocrResult};
+
+use super::int4::VALID_GROUP_SIZES;
 
 /// The `.focrq` magic — must match
 /// [`crate::native_engine::weights::FOCRQ_MAGIC`] byte-for-byte.
@@ -95,15 +98,39 @@ impl WriteDType {
 
     /// Expected payload byte length for `numel` elements of this dtype — the same
     /// rule the reader's `expected_byte_len` enforces (int4 packs 2/byte).
-    #[must_use]
-    fn expected_byte_len(self, numel: usize) -> usize {
+    fn expected_byte_len(self, name: &str, shape: &[usize], numel: usize) -> FocrResult<usize> {
         match self {
-            WriteDType::F32 => numel * 4,
-            WriteDType::F16 | WriteDType::Bf16 => numel * 2,
-            WriteDType::QInt8PerChan => numel,
-            WriteDType::QInt4PerGroup => numel / 2,
+            WriteDType::F32 => checked_mul(name, numel, 4, "shape*dtype bytes"),
+            WriteDType::F16 | WriteDType::Bf16 => checked_mul(name, numel, 2, "shape*dtype bytes"),
+            WriteDType::QInt8PerChan => Ok(numel),
+            WriteDType::QInt4PerGroup => {
+                if !numel.is_multiple_of(2) {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt4 shape {shape:?} has odd element count {numel}"
+                    )));
+                }
+                Ok(numel / 2)
+            }
         }
     }
+}
+
+fn checked_numel(name: &str, shape: &[usize]) -> FocrResult<usize> {
+    shape.iter().copied().try_fold(1usize, |acc, dim| {
+        acc.checked_mul(dim).ok_or_else(|| {
+            FocrError::FormatMismatch(format!(
+                "tensor {name:?}: shape {shape:?} element count overflows usize"
+            ))
+        })
+    })
+}
+
+fn checked_mul(name: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
+    lhs.checked_mul(rhs).ok_or_else(|| {
+        FocrError::FormatMismatch(format!(
+            "tensor {name:?}: {expression} overflows usize ({lhs} * {rhs})"
+        ))
+    })
 }
 
 /// One tensor staged for writing: dtype + shape + raw payload bytes + (for
@@ -121,7 +148,10 @@ struct PendingTensor {
 impl PendingTensor {
     #[allow(dead_code)]
     fn numel(&self) -> usize {
-        self.shape.iter().product()
+        self.shape
+            .iter()
+            .copied()
+            .fold(1usize, usize::saturating_mul)
     }
 }
 
@@ -162,7 +192,7 @@ impl FocrqBuilder {
         Self {
             arch_target: 0,
             source_sha256: [0u8; 32],
-            license_notice: "Copyright (c) 2026 Baidu. MIT License.".to_string(),
+            license_notice: FOCR_MODEL_LICENSE_NOTICE.to_string(),
             provenance_json: None,
             model_config_json: None,
             packing_manifest_json: None,
@@ -302,8 +332,8 @@ impl FocrqBuilder {
                 "add tensor: duplicate name {name:?}"
             )));
         }
-        let numel: usize = shape.iter().product();
-        let expected = dtype.expected_byte_len(numel);
+        let numel = checked_numel(&name, &shape)?;
+        let expected = dtype.expected_byte_len(&name, &shape, numel)?;
         if data.len() != expected {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?}: data len {} != shape×dtype {} ({:?}, shape {:?})",
@@ -313,6 +343,7 @@ impl FocrqBuilder {
                 shape
             )));
         }
+        Self::validate_scales(&name, dtype, &shape, &scales, group_size, tier)?;
         self.tensors.insert(
             name,
             PendingTensor {
@@ -324,6 +355,78 @@ impl FocrqBuilder {
                 tier,
             },
         );
+        Ok(())
+    }
+
+    fn validate_scales(
+        name: &str,
+        dtype: WriteDType,
+        shape: &[usize],
+        scales: &[u8],
+        group_size: usize,
+        tier: u8,
+    ) -> FocrResult<()> {
+        match dtype {
+            WriteDType::F32 | WriteDType::F16 | WriteDType::Bf16 => {
+                if !scales.is_empty() || group_size != 0 || tier != 0 {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: high-precision tensors must not carry quant metadata"
+                    )));
+                }
+            }
+            WriteDType::QInt8PerChan => {
+                let [n, _k] = shape else {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt8 shape must be rank-2 [n,k], got {shape:?}"
+                    )));
+                };
+                if group_size != 0 || tier != 0 {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt8 group_size and tier must be zero"
+                    )));
+                }
+                let expected = checked_mul(name, *n, 4, "qint8 n*f32 scale bytes")?;
+                if scales.len() != expected {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: scale bytes {} != qint8 n*f32 {}",
+                        scales.len(),
+                        expected
+                    )));
+                }
+            }
+            WriteDType::QInt4PerGroup => {
+                let [n, k] = shape else {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt4 shape must be rank-2 [n,k], got {shape:?}"
+                    )));
+                };
+                if !VALID_GROUP_SIZES.contains(&group_size) {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt4 group_size {group_size} must be 16 or 32"
+                    )));
+                }
+                if !k.is_multiple_of(2) {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt4 k {k} must be even"
+                    )));
+                }
+                if !k.is_multiple_of(group_size) {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: QInt4 k {k} must be divisible by group_size {group_size}"
+                    )));
+                }
+                let groups = k / group_size;
+                let scale_count = checked_mul(name, *n, groups, "qint4 n*(k/group_size)")?;
+                let expected = checked_mul(name, scale_count, 4, "qint4 scale_count*f32 bytes")?;
+                if scales.len() != expected {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "tensor {name:?}: scale bytes {} != qint4 n*(k/group_size)*f32 {}",
+                        scales.len(),
+                        expected
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -665,38 +768,37 @@ mod tests {
 
     #[test]
     fn roundtrips_qint4_through_reader() {
-        // n=2, k=4, group_size=2 => 2 packed bytes/row (4 total), 4 scales.
-        let packed = vec![0x21u8, 0x43, 0x65, 0x87];
-        let scale_bytes = f32_le(&[0.1, 0.2, 0.3, 0.4]);
+        // n=2, k=16, group_size=16 => 8 packed bytes/row (16 total), 2 scales.
+        let packed: Vec<u8> = (0u8..16).collect();
+        let scale_bytes = f32_le(&[0.1, 0.2]);
         let mut b = FocrqBuilder::new();
         b.add_quantized(
             "e",
             WriteDType::QInt4PerGroup,
-            vec![2, 4],
+            vec![2, 16],
             packed.clone(),
             scale_bytes,
-            2,
+            16,
             3,
         )
         .unwrap();
         let w = Weights::from_bytes(b.build()).unwrap();
         let q = w.qint4("e").unwrap();
         assert_eq!(q.n, 2);
-        assert_eq!(q.k, 4);
-        assert_eq!(q.group_size, 2);
+        assert_eq!(q.k, 16);
+        assert_eq!(q.group_size, 16);
         assert_eq!(q.tier, 3);
         assert_eq!(q.packed, packed);
-        assert_eq!(q.scales, vec![0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(q.scales, vec![0.1, 0.2]);
     }
 
     #[test]
     fn license_notice_survives_roundtrip() {
-        let mut b =
-            FocrqBuilder::new().with_license_notice("Copyright (c) 2026 Baidu. MIT License.");
+        let mut b = FocrqBuilder::new().with_license_notice(FOCR_MODEL_LICENSE_NOTICE);
         b.add_tensor("x", WriteDType::Bf16, vec![1], bf16_le(&[1.0]))
             .unwrap();
         let w = Weights::from_bytes(b.build()).unwrap();
-        assert_eq!(w.license_notice(), "Copyright (c) 2026 Baidu. MIT License.");
+        assert_eq!(w.license_notice(), FOCR_MODEL_LICENSE_NOTICE);
     }
 
     #[test]
@@ -866,6 +968,98 @@ mod tests {
             .add_tensor("x", WriteDType::Bf16, vec![2, 3], vec![0u8; 4])
             .unwrap_err();
         assert!(matches!(err, FocrError::FormatMismatch(_)));
+    }
+
+    #[test]
+    fn rejects_shape_product_overflow() {
+        let mut b = FocrqBuilder::new();
+        let err = b
+            .add_tensor("x", WriteDType::Bf16, vec![usize::MAX, 2], Vec::new())
+            .unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("element count overflows"));
+    }
+
+    #[test]
+    fn rejects_byte_len_overflow() {
+        let mut b = FocrqBuilder::new();
+        let err = b
+            .add_tensor("x", WriteDType::F32, vec![usize::MAX / 2 + 1], Vec::new())
+            .unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("shape*dtype bytes overflows"));
+    }
+
+    #[test]
+    fn rejects_qint8_scale_len_mismatch() {
+        let mut b = FocrqBuilder::new();
+        let err = b
+            .add_quantized(
+                "q",
+                WriteDType::QInt8PerChan,
+                vec![2, 3],
+                vec![0u8; 6],
+                vec![0u8; 4],
+                0,
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("qint8 n*f32"));
+    }
+
+    #[test]
+    fn rejects_qint8_nonzero_group_metadata() {
+        let mut b = FocrqBuilder::new();
+        let err = b
+            .add_quantized(
+                "q",
+                WriteDType::QInt8PerChan,
+                vec![1, 2],
+                vec![0u8; 2],
+                f32_le(&[1.0]),
+                16,
+                0,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("group_size and tier must be zero"));
+    }
+
+    #[test]
+    fn rejects_qint4_noncanonical_group_size_even_when_it_divides_k() {
+        let mut b = FocrqBuilder::new();
+        let err = b
+            .add_quantized(
+                "q4",
+                WriteDType::QInt4PerGroup,
+                vec![1, 32],
+                vec![0u8; 16],
+                f32_le(&[1.0, 1.0, 1.0, 1.0]),
+                8,
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("must be 16 or 32"));
+    }
+
+    #[test]
+    fn rejects_qint4_scale_len_mismatch() {
+        let mut b = FocrqBuilder::new();
+        let err = b
+            .add_quantized(
+                "q4",
+                WriteDType::QInt4PerGroup,
+                vec![2, 32],
+                vec![0u8; 32],
+                vec![0u8; 4],
+                16,
+                1,
+            )
+            .unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("qint4 n*(k/group_size)*f32"));
     }
 
     #[test]
