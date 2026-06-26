@@ -15,8 +15,9 @@
 # Path dependencies: franken_ocr currently consumes sibling checkouts at
 # `../frankentorch`, `../frankensqlite`, and a host-local `/dp/asupersync`.
 # Fresh GitHub runners do not have those paths, and hosted macOS has a read-only
-# root filesystem, so each Cargo job clones the siblings and rewrites only the CI
-# checkout's `Cargo.toml` patch path to `../asupersync`.
+# root filesystem, so each Cargo job clones the siblings and rewrites the CI-only
+# `/dp/asupersync` paths in this checkout and the cloned `frankensqlite` root to
+# the sibling `../asupersync` checkout.
 #
 # Model gating: CI runs WITHOUT the 6.67 GB weights. The model-gated e2e/parity
 # tests resolve `FOCR_MODEL_PATH` (default `models/unlimited-ocr.focrq`, absent
@@ -73,13 +74,16 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
 
-          $cargoToml = Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"
-          $text = Get-Content -Raw -Path $cargoToml
-          $needle = 'path = "/dp/asupersync"'
-          if (-not $text.Contains($needle)) {
-            throw "expected Cargo.toml to contain $needle before CI path rewrite"
+          function Rewrite-AsupersyncPath([string] $cargoToml) {
+            $text = Get-Content -Raw -Path $cargoToml
+            $needle = 'path = "/dp/asupersync"'
+            if (-not $text.Contains($needle)) {
+              throw "expected $cargoToml to contain $needle before CI path rewrite"
+            }
+            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
           }
-          [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
+          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
 
       # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
       # `scripts/check.sh` runs first (stdlib only — no pip install required).
@@ -168,13 +172,16 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
 
-          $cargoToml = Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"
-          $text = Get-Content -Raw -Path $cargoToml
-          $needle = 'path = "/dp/asupersync"'
-          if (-not $text.Contains($needle)) {
-            throw "expected Cargo.toml to contain $needle before CI path rewrite"
+          function Rewrite-AsupersyncPath([string] $cargoToml) {
+            $text = Get-Content -Raw -Path $cargoToml
+            $needle = 'path = "/dp/asupersync"'
+            if (-not $text.Contains($needle)) {
+              throw "expected $cargoToml to contain $needle before CI path rewrite"
+            }
+            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
           }
-          [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
+          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
 
       - name: Install nightly toolchain
         if: ${{ !matrix.skip }}

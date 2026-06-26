@@ -24,8 +24,9 @@
 #   Phase-0 CI also tracks linux arm64, darwin x86-64, and windows-msvc x86-64 as
 #   advisory targets. This release workflow builds the Unix/macOS targets whose
 #   sibling path dependencies can be provisioned in Actions today. Because hosted
-#   macOS has a read-only root filesystem, the workflow rewrites only the runner
-#   checkout's asupersync patch path from `/dp/asupersync` to `../asupersync`.
+#   macOS has a read-only root filesystem, the workflow rewrites the CI-only
+#   `/dp/asupersync` paths in this checkout and the cloned `frankensqlite` root
+#   to the sibling `../asupersync` checkout.
 #
 # Branch policy (AGENTS.md): release builds run on `main` ONLY. `master` is never
 # referenced. Tag pushes (v*) cut a versioned set of artifacts.
@@ -118,13 +119,16 @@ jobs:
           git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
           git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
 
-          $cargoToml = Join-Path $env:GITHUB_WORKSPACE "Cargo.toml"
-          $text = Get-Content -Raw -Path $cargoToml
-          $needle = 'path = "/dp/asupersync"'
-          if (-not $text.Contains($needle)) {
-            throw "expected Cargo.toml to contain $needle before CI path rewrite"
+          function Rewrite-AsupersyncPath([string] $cargoToml) {
+            $text = Get-Content -Raw -Path $cargoToml
+            $needle = 'path = "/dp/asupersync"'
+            if (-not $text.Contains($needle)) {
+              throw "expected $cargoToml to contain $needle before CI path rewrite"
+            }
+            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
           }
-          [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
+          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
 
       # Honor the pinned nightly from `rust-toolchain.toml` (REQUIRED for the
       # stdarch i8mm/dotprod intrinsics). Add the explicit compile target.
