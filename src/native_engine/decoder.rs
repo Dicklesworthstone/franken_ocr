@@ -18,18 +18,21 @@
 //! ([SPEC-075], layer 0). Norms funnel through the [`crate::native_engine::nn`]
 //! facade ([`nn::rms_norm`]); GEMMs through [`nn::matmul`].
 //!
-//! ## Weights plumbing (facade gap)
+//! ## Weights plumbing (wired)
 //!
-//! [`super::weights::Weights`] is still a stub with no tensor accessors, so the
-//! top-level [`forward`]/[`lm_head`] entrypoints that take `&Weights` cannot yet
-//! pull the embedding table / per-layer norm weights / head matrix out of it —
-//! they remain `NotImplemented` and will become a thin wiring shim once the
-//! `.focrq` reader (bd-1es.3) exposes named tensors. ALL the load-bearing math —
-//! token embed, RMSNorm composition, RoPE, the dense SwiGLU MLP, the lm_head
-//! GEMV, and the full per-layer driver — is implemented and unit-tested here as
-//! pure functions over explicit `&[f32]` / [`Mat`] weight slices, so wiring is a
-//! mechanical hookup with zero remaining numerics risk.
+//! [`super::weights::Weights`] exposes named-tensor accessors (`mat`/`vec`,
+//! widening BF16→f32 at the boundary), so the top-level [`forward`]/[`lm_head`]
+//! entrypoints pull the per-layer norm/projection slices, the `model.norm`
+//! weight, and the top-level `lm_head.weight` straight out of it. [`forward`] is
+//! the **stateless, full-sequence prefill** path (full causal MHA via
+//! [`prefill_attention`]); incremental decode threads a separate
+//! `&mut [RingCache; 12]` (bd-1gv.17) and is out of scope here. ALL the
+//! load-bearing math — token embed, RMSNorm, RoPE, the dense/MoE MLPs, the
+//! lm_head GEMV, and the per-layer driver — stays unit-tested as pure functions
+//! over explicit `&[f32]` / [`Mat`] slices; the entrypoints are the thin wiring
+//! over them.
 
+use super::moe;
 use super::nn;
 use super::tensor::Mat;
 use super::weights::Weights;
@@ -149,6 +152,20 @@ impl RopeTable {
             "RopeTable: head_dim must be even"
         );
         let half = head_dim / 2;
+        let seq = position_ids.len();
+        let table_len = seq.checked_mul(head_dim);
+        assert!(
+            table_len.is_some(),
+            "RopeTable: seq*head_dim overflow ({seq} * {head_dim})"
+        );
+        let table_len = table_len.unwrap_or(0);
+        if seq == 0 {
+            return Self {
+                cos: Vec::new(),
+                sin: Vec::new(),
+                head_dim,
+            };
+        }
         // inv_freq[i] = theta^(-2i/head_dim) = theta^(-(i/half)).  Computed in
         // f64 then narrowed — matches the HF float32 rotary embedding closely.
         let inv_freq: Vec<f32> = (0..half)
@@ -157,9 +174,8 @@ impl RopeTable {
                 (1.0 / (theta as f64).powf(exponent)) as f32
             })
             .collect();
-        let seq = position_ids.len();
-        let mut cos = vec![0.0f32; seq * head_dim];
-        let mut sin = vec![0.0f32; seq * head_dim];
+        let mut cos = vec![0.0f32; table_len];
+        let mut sin = vec![0.0f32; table_len];
         for (p_idx, &pos) in position_ids.iter().enumerate() {
             let base = p_idx * head_dim;
             for i in 0..half {
@@ -479,37 +495,210 @@ pub fn add_residual(a: &Mat, b: &Mat) -> FocrResult<Mat> {
     Ok(Mat::from_vec(a.rows, a.cols, data))
 }
 
-// ── Top-level entrypoints (Weights-backed; pending the .focrq reader) ───────
+// ── Prefill self-attention (full causal MHA over the whole sequence) ────────
 
-/// Project final hidden states to vocabulary logits (`lm_head`, [SPEC-081]).
+/// Full causal multi-head self-attention over the prefill, *given* the already
+/// RoPE'd `(q, k, v)` ([SPEC-090], baidu `SlidingWindowLlamaAttention` prefill
+/// path `_attn_forward`).
+///
+/// In prefill the **entire** sequence is the R-SWA reference block (no token is
+/// ever evicted), so a plain lower-triangular causal mask is exactly the
+/// reference math — the ring buffer only ever restricts the *generated* tail
+/// during incremental decode. `q`/`k`/`v` are token-major `[seq,
+/// num_heads*head_dim]` (head `h` in columns `h*head_dim .. (h+1)*head_dim`).
+///
+/// Transposes to head-major `[num_heads, seq, head_dim]`, runs [`nn::sdpa`] with
+/// `scale = 1/sqrt(head_dim)` and `causal = true`, then repacks the context back
+/// to token-major `[seq, num_heads*head_dim]` for `o_proj`. MHA: `num_kv_heads ==
+/// num_heads` (`repeat_kv` is a no-op), no QKV bias.
 ///
 /// # Errors
-/// [`FocrError::NotImplemented`] until [`Weights`] exposes the `model.norm` /
-/// `lm_head.weight` tensors (bd-1es.3). The math is implemented and tested in
-/// [`norm_and_lm_head`] / [`lm_head_proj`]; this is a wiring shim awaiting the
-/// reader.
-pub fn lm_head(_weights: &Weights, _hidden: &Mat) -> FocrResult<Mat> {
-    Err(FocrError::NotImplemented(
-        "native_engine::decoder::lm_head — needs Weights tensor accessors (bd-1es.3); \
-         math lives in decoder::norm_and_lm_head / lm_head_proj"
-            .into(),
-    ))
+/// [`FocrError::Other`] on a shape mismatch (`q/k/v` cols not `num_heads *
+/// head_dim`, or `q/k/v` rows disagree).
+pub fn prefill_attention(
+    q: &Mat,
+    k: &Mat,
+    v: &Mat,
+    num_heads: usize,
+    head_dim: usize,
+) -> FocrResult<Mat> {
+    let dim = checked_shape_mul(
+        "prefill_attention",
+        num_heads,
+        head_dim,
+        "num_heads*head_dim",
+    )?;
+    let seq = q.rows;
+    if q.cols != dim || k.cols != dim || v.cols != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "prefill_attention: q/k/v cols ({},{},{}) != num_heads*head_dim {dim}",
+            q.cols,
+            k.cols,
+            v.cols
+        )));
+    }
+    if k.rows != seq || v.rows != seq {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "prefill_attention: q/k/v rows disagree ({}, {}, {})",
+            seq,
+            k.rows,
+            v.rows
+        )));
+    }
+
+    // Token-major [seq, num_heads*head_dim] -> head-major [num_heads, seq, head_dim].
+    let span = seq * head_dim;
+    let mut qh = vec![0.0f32; num_heads * span];
+    let mut kh = vec![0.0f32; num_heads * span];
+    let mut vh = vec![0.0f32; num_heads * span];
+    for s in 0..seq {
+        let (qr, kr, vr) = (q.row(s), k.row(s), v.row(s));
+        for h in 0..num_heads {
+            let src = h * head_dim;
+            let dst = h * span + s * head_dim;
+            qh[dst..dst + head_dim].copy_from_slice(&qr[src..src + head_dim]);
+            kh[dst..dst + head_dim].copy_from_slice(&kr[src..src + head_dim]);
+            vh[dst..dst + head_dim].copy_from_slice(&vr[src..src + head_dim]);
+        }
+    }
+
+    // num_bh = batch(1) * num_heads; causal lower-triangular mask.
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let ctx = nn::sdpa(
+        &qh, &kh, &vh, num_heads, seq, seq, head_dim, head_dim, scale, true,
+    );
+    let expected = num_heads * span;
+    if ctx.len() != expected {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "prefill_attention: sdpa context len {} != expected {expected}",
+            ctx.len()
+        )));
+    }
+
+    // Head-major [num_heads, seq, head_dim] -> token-major [seq, num_heads*head_dim].
+    let mut out = Mat::zeros(seq, dim);
+    for h in 0..num_heads {
+        for s in 0..seq {
+            let src = h * span + s * head_dim;
+            let dst = s * dim + h * head_dim;
+            out.data[dst..dst + head_dim].copy_from_slice(&ctx[src..src + head_dim]);
+        }
+    }
+    Ok(out)
 }
 
-/// Run the full 12-layer decoder over `inputs_embeds`, returning the final
-/// normalized hidden states (prefill); decode steps reuse the KV cache.
+// ── Top-level entrypoints (Weights-backed) ──────────────────────────────────
+
+/// Final `model.norm` RMSNorm + `lm_head` projection over the decoder hidden
+/// states ([SPEC-071]/[SPEC-081]).
+///
+/// Pulls `model.norm.weight` (length `hidden`) and the **top-level**
+/// `lm_head.weight` (`[vocab, hidden] = [129280, 1280]`, NOT `model.lm_head`;
+/// `tie_word_embeddings = false`) and composes the tested
+/// [`norm_and_lm_head`]. Returns the f32 logits `[seq, vocab]`; the decode driver
+/// feeds only the last hidden row, yielding `[1, vocab]`.
 ///
 /// # Errors
-/// [`FocrError::NotImplemented`] until [`Weights`] exposes the per-layer
-/// norm/projection/expert tensors + the ring-cache plumbing (bd-1es.3 /
-/// bd-1gv.17). The per-layer driver is implemented and tested in
-/// [`layer_forward`]; this is the wiring shim awaiting those accessors.
-pub fn forward(_weights: &Weights, _inputs_embeds: &Mat) -> FocrResult<Mat> {
-    Err(FocrError::NotImplemented(
-        "native_engine::decoder::forward — needs Weights tensor accessors + RingCache wiring \
-         (bd-1es.3 / bd-1gv.17); per-layer math lives in decoder::layer_forward"
-            .into(),
-    ))
+/// [`FocrError::FormatMismatch`] if `model.norm.weight` / `lm_head.weight` are
+/// absent, or [`FocrError::Other`] on a shape mismatch.
+pub fn lm_head(weights: &Weights, hidden: &Mat) -> FocrResult<Mat> {
+    let norm_w = weights.vec("model.norm.weight")?;
+    let head = weights.mat("lm_head.weight")?;
+    norm_and_lm_head(
+        hidden,
+        &norm_w,
+        &head.data,
+        config::VOCAB_SIZE,
+        config::RMS_NORM_EPS,
+    )
+}
+
+/// Run the full 12-layer DeepSeek-V2 MoE decoder over `inputs_embeds`,
+/// returning the final `model.norm`-ready hidden states `[seq, hidden]`
+/// ([SPEC-072], baidu `DeepseekV2Model.forward`).
+///
+/// Stateless, full-sequence (no KV cache): correct for **prefill / parity**. In
+/// prefill every token is an R-SWA reference token, so attention is plain full
+/// causal MHA (the ring cache only constrains incremental decode, which threads
+/// a separate `&mut [RingCache; 12]` — out of scope here). Per layer 0..11:
+///
+/// 1. RMSNorm(`input_layernorm.weight`) -> Q/K/V proj (separate
+///    `self_attn.{q,k,v}_proj.weight`) -> RoPE (theta 10000, NEOX `rotate_half`)
+///    -> full causal SDPA ([`prefill_attention`]) -> `o_proj` -> residual.
+/// 2. RMSNorm(`post_attention_layernorm.weight`) -> MLP: layer 0 dense
+///    ([`moe::dense_forward`]), layers 1..11 MoE ([`moe::forward`]) -> residual.
+///
+/// Reuses the unit-tested [`layer_forward`] / [`qkv_with_rope`] / [`apply_rope`]
+/// driver; the per-layer weight slices are pulled fresh from [`Weights`].
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] on an absent tensor; [`FocrError::Other`] on a
+/// shape mismatch or kernel error (propagated from the sub-steps).
+pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::forward",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
+    if inputs_embeds.cols != hidden {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::forward: inputs_embeds cols {} != hidden {hidden}",
+            inputs_embeds.cols
+        )));
+    }
+    let seq = inputs_embeds.rows;
+
+    // Absolute position_ids 0..seq ([SPEC-095]: true logical positions); one
+    // RoPE table shared across all 12 layers.
+    let positions: Vec<usize> = (0..seq).collect();
+    let rope = RopeTable::build(&positions, config::HEAD_DIM, config::ROPE_THETA);
+
+    let mut x = inputs_embeds.clone();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let prefix = format!("model.layers.{layer}");
+        // Owned per-layer weight Mats/Vecs; LayerWeights borrows their slices.
+        let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
+        let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
+        let q_proj = weights.mat(&format!("{prefix}.self_attn.q_proj.weight"))?;
+        let k_proj = weights.mat(&format!("{prefix}.self_attn.k_proj.weight"))?;
+        let v_proj = weights.mat(&format!("{prefix}.self_attn.v_proj.weight"))?;
+        let o_proj = weights.mat(&format!("{prefix}.self_attn.o_proj.weight"))?;
+
+        let lw = LayerWeights {
+            input_ln: &input_ln,
+            post_attn_ln: &post_attn_ln,
+            q_proj: &q_proj.data,
+            k_proj: &k_proj.data,
+            v_proj: &v_proj.data,
+            o_proj: &o_proj.data,
+            // Dense gate/up/down are pulled inside the MLP closure (moe::*), so
+            // the driver's vestigial dense slots stay empty here.
+            gate_w: &[],
+            up_w: &[],
+            down_w: &[],
+        };
+
+        x = layer_forward(
+            &x,
+            &lw,
+            &rope,
+            hidden,
+            qkv_dim,
+            eps,
+            |q, k, v| prefill_attention(q, k, v, config::NUM_ATTENTION_HEADS, config::HEAD_DIM),
+            |normed| {
+                if layer < config::FIRST_K_DENSE_REPLACE {
+                    moe::dense_forward(weights, normed)
+                } else {
+                    moe::forward(weights, normed, layer)
+                }
+            },
+        )?;
+    }
+    Ok(x)
 }
 
 #[cfg(test)]
@@ -646,6 +835,20 @@ mod tests {
         // wrong number of rows vs positions
         let mut wrong_rows = Mat::zeros(3, 4);
         assert!(apply_rope(&mut wrong_rows, &rope).is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "RopeTable: seq*head_dim overflow")]
+    fn rope_table_rejects_shape_product_overflow_before_allocating() {
+        let _ = RopeTable::build(&[0, 1], usize::MAX - 1, 10000.0);
+    }
+
+    #[test]
+    fn rope_table_empty_sequence_does_not_allocate_by_head_dim() {
+        let rope = RopeTable::build(&[], usize::MAX - 1, 10000.0);
+        assert_eq!(rope.head_dim, usize::MAX - 1);
+        assert!(rope.cos.is_empty());
+        assert!(rope.sin.is_empty());
     }
 
     // ── Dense SwiGLU MLP ([SPEC-075]) ───────────────────────────────────────
@@ -905,13 +1108,46 @@ mod tests {
         Ok(())
     }
 
-    // ── Top-level stubs report the pending-wiring gap ───────────────────────
+    // ── Top-level entrypoints are wired to the Weights accessors ────────────
 
     #[test]
-    fn top_level_entrypoints_are_pending_weights() {
+    fn top_level_entrypoints_error_cleanly_on_empty_weights() {
+        // `forward`/`lm_head` now look tensors up by name and delegate to the
+        // tested driver; an empty `Weights::default()` has none, so they must
+        // surface a clean `FormatMismatch` (tensor not found), never panic.
         let w = Weights::default();
         let h = Mat::zeros(1, config::HIDDEN_SIZE);
-        assert!(matches!(forward(&w, &h), Err(FocrError::NotImplemented(_))));
-        assert!(matches!(lm_head(&w, &h), Err(FocrError::NotImplemented(_))));
+        assert!(matches!(forward(&w, &h), Err(FocrError::FormatMismatch(_))));
+        assert!(matches!(lm_head(&w, &h), Err(FocrError::FormatMismatch(_))));
+    }
+
+    // ── Prefill attention shape + causal correctness ────────────────────────
+
+    #[test]
+    fn prefill_attention_shapes_and_first_token_self_only() -> FocrResult<()> {
+        // Single head, head_dim=2, seq=2. With a causal mask, row 0 attends only
+        // to itself, so its context == v[0] regardless of v[1] / the scores.
+        let (num_heads, head_dim, seq) = (1usize, 2usize, 2usize);
+        let q = Mat::from_vec(seq, 2, vec![1.0, 0.0, 0.0, 1.0]);
+        let k = Mat::from_vec(seq, 2, vec![1.0, 0.0, 0.0, 1.0]);
+        let v = Mat::from_vec(seq, 2, vec![5.0, 6.0, 7.0, 8.0]);
+        let out = prefill_attention(&q, &k, &v, num_heads, head_dim)?;
+        assert_eq!(out.shape(), (seq, num_heads * head_dim));
+        // Row 0 (causal): only key 0 visible -> context == v row 0.
+        assert!((out.data[0] - 5.0).abs() < 1e-5, "{}", out.data[0]);
+        assert!((out.data[1] - 6.0).abs() < 1e-5, "{}", out.data[1]);
+        // Row 1 attends to both keys -> a convex blend of v[0] and v[1], so each
+        // channel lies strictly between the two value rows.
+        assert!(out.data[2] > 5.0 && out.data[2] < 7.0, "{}", out.data[2]);
+        assert!(out.data[3] > 6.0 && out.data[3] < 8.0, "{}", out.data[3]);
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_attention_rejects_bad_shape() {
+        let q = Mat::zeros(2, 3); // 3 not a multiple of head_dim*heads=4
+        let k = Mat::zeros(2, 4);
+        let v = Mat::zeros(2, 4);
+        assert!(prefill_attention(&q, &k, &v, 2, 2).is_err());
     }
 }

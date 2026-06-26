@@ -36,13 +36,13 @@
 //!
 //! ## `Weights`-backed entry points
 //!
-//! The `.focrq` reader / weight directory (`super::weights::Weights`) is still a
-//! Phase-2 stub with no tensor accessors, so the public [`forward`] /
-//! [`dense_forward`] shims that take a `&Weights` return
-//! [`FocrError::NotImplemented`] until that lands; the real, fully-tested math
-//! lives in the slice-typed primitives below ([`route`], [`expert_mlp`],
-//! [`dense_mlp`], [`moe_block`]) which the decoder driver will call once it can
-//! hand over the per-layer weight slices.
+//! The public [`forward`] (MoE layers 1..11, takes the absolute `layer` index)
+//! and [`dense_forward`] (the layer-0 dense MLP) shims pull the per-layer router
+//! / 64 routed experts / fused shared expert (or the dense gate/up/down) straight
+//! out of [`super::weights::Weights`] via `mat()` (BF16→f32 at the boundary) and
+//! delegate to the fully-tested slice-typed primitives below ([`route`],
+//! [`expert_mlp`], [`dense_mlp`], [`moe_block`]). The decoder driver
+//! ([`super::decoder::forward`]) calls these per layer.
 
 use super::nn;
 use super::tensor::Mat;
@@ -438,35 +438,90 @@ pub fn moe_block_default(
     )
 }
 
-// ── `Weights`-backed shims (wired once the .focrq reader lands) ─────────────
+// ── `Weights`-backed shims (now wired to the safetensors/`.focrq` accessors) ──
 
-/// Run the MoE block (layers 1..11) over a layer's hidden states.
+/// Run the MoE block (layers 1..11) over a layer's `post_attention_layernorm`'d
+/// hidden states, pulling the per-layer router / 64 routed experts / fused
+/// shared expert straight out of [`Weights`] ([SPEC-076/077]).
 ///
-/// Shim: the `.focrq` weight directory has no tensor accessors yet (Phase 2
-/// stub), so this returns [`FocrError::NotImplemented`]. The real math is in
-/// [`moe_block`] — the decoder driver will fetch the per-layer gate / expert /
-/// shared slices and call it directly once the reader lands.
+/// Tensor names (verified against the real checkpoint, `forward_wiring_intel.md`):
+/// router `model.layers.{layer}.mlp.gate.weight` `[64, 1280]`; routed expert `e`
+/// `model.layers.{layer}.mlp.experts.{e}.{gate,up,down}_proj.weight`
+/// (`intermediate = 896`); fused shared expert
+/// `model.layers.{layer}.mlp.shared_experts.{gate,up,down}_proj.weight`
+/// (singular `shared_experts`, `intermediate = 1792`). Delegates to the tested
+/// [`moe_block_default`] (pinned gate: `norm_topk_prob = false`,
+/// `routed_scaling_factor = 1.0`).
+///
+/// `layer` is the **absolute** decoder layer index (1..=11); the dense layer 0
+/// must use [`dense_forward`] instead.
 ///
 /// # Errors
-/// Always [`FocrError::NotImplemented`] until `Weights` exposes tensor slices.
-pub fn forward(_weights: &Weights, _hidden: &Mat) -> FocrResult<Mat> {
-    Err(FocrError::NotImplemented(
-        "native_engine::moe::forward — wire moe_block once Weights exposes tensor slices (bd-1es.3)"
-            .into(),
-    ))
+/// [`FocrError::Other`] if any tensor is absent / wrong-shaped, or on a kernel
+/// dimension mismatch (propagated from [`moe_block`]).
+pub fn forward(weights: &Weights, hidden: &Mat, layer: usize) -> FocrResult<Mat> {
+    let prefix = format!("model.layers.{layer}.mlp");
+    // Router gate [N_ROUTED_EXPERTS, HIDDEN_SIZE] = [64, 1280] (NEVER quantized).
+    let gate = weights.mat(&format!("{prefix}.gate.weight"))?;
+
+    // Load all 64 routed experts as owned f32 Mats (kept alive while the
+    // borrowing MlpWeights slices reference them).
+    let mut routed: Vec<(Mat, Mat, Mat)> = Vec::with_capacity(config::N_ROUTED_EXPERTS);
+    for e in 0..config::N_ROUTED_EXPERTS {
+        let g = weights.mat(&format!("{prefix}.experts.{e}.gate_proj.weight"))?;
+        let u = weights.mat(&format!("{prefix}.experts.{e}.up_proj.weight"))?;
+        let d = weights.mat(&format!("{prefix}.experts.{e}.down_proj.weight"))?;
+        routed.push((g, u, d));
+    }
+    let experts: Vec<MlpWeights<'_>> = routed
+        .iter()
+        .map(|(g, u, d)| MlpWeights {
+            gate_proj: &g.data,
+            up_proj: &u.data,
+            down_proj: &d.data,
+            hidden: config::HIDDEN_SIZE,
+            intermediate: config::MOE_INTERMEDIATE_SIZE,
+        })
+        .collect();
+
+    // Fused shared expert (intermediate 2 * 896 = 1792).
+    let sg = weights.mat(&format!("{prefix}.shared_experts.gate_proj.weight"))?;
+    let su = weights.mat(&format!("{prefix}.shared_experts.up_proj.weight"))?;
+    let sd = weights.mat(&format!("{prefix}.shared_experts.down_proj.weight"))?;
+    let shared = MlpWeights {
+        gate_proj: &sg.data,
+        up_proj: &su.data,
+        down_proj: &sd.data,
+        hidden: config::HIDDEN_SIZE,
+        intermediate: config::SHARED_INTERMEDIATE_SIZE,
+    };
+
+    moe_block_default(hidden, &gate.data, &experts, &shared)
 }
 
-/// Run the dense layer-0 MLP over a layer's hidden states.
+/// Run the dense layer-0 MLP over a layer's `post_attention_layernorm`'d hidden
+/// states ([SPEC-074/075]).
 ///
-/// Shim around [`dense_mlp`]; same `Weights`-accessor blocker as [`forward`].
+/// `first_k_dense_replace = 1`, so layer 0 is the ONLY dense MLP; this shim is
+/// hardcoded to it. Tensor names: `model.layers.0.mlp.{gate,up,down}_proj.weight`
+/// (`intermediate = 6848`). Delegates to the tested [`dense_mlp`].
 ///
 /// # Errors
-/// Always [`FocrError::NotImplemented`] until `Weights` exposes tensor slices.
-pub fn dense_forward(_weights: &Weights, _hidden: &Mat) -> FocrResult<Mat> {
-    Err(FocrError::NotImplemented(
-        "native_engine::moe::dense_forward — wire dense_mlp once Weights exposes tensor slices (bd-1es.3)"
-            .into(),
-    ))
+/// [`FocrError::Other`] if any tensor is absent / wrong-shaped, or on a kernel
+/// dimension mismatch (propagated from [`dense_mlp`]).
+pub fn dense_forward(weights: &Weights, hidden: &Mat) -> FocrResult<Mat> {
+    let prefix = "model.layers.0.mlp";
+    let g = weights.mat(&format!("{prefix}.gate_proj.weight"))?;
+    let u = weights.mat(&format!("{prefix}.up_proj.weight"))?;
+    let d = weights.mat(&format!("{prefix}.down_proj.weight"))?;
+    let w = MlpWeights {
+        gate_proj: &g.data,
+        up_proj: &u.data,
+        down_proj: &d.data,
+        hidden: config::HIDDEN_SIZE,
+        intermediate: config::DENSE_INTERMEDIATE_SIZE,
+    };
+    dense_mlp(hidden, &w)
 }
 
 #[cfg(test)]
@@ -820,13 +875,20 @@ mod tests {
     }
 
     #[test]
-    fn forward_shims_are_not_implemented_until_reader_lands() {
+    fn forward_shims_error_cleanly_on_empty_weights() {
+        // The shims are now wired: they look tensors up by name and delegate to
+        // the tested `moe_block`/`dense_mlp`. An empty `Weights::default()` has no
+        // tensors, so they must surface a clean `FormatMismatch` (tensor not
+        // found) rather than panic or return garbage.
         let w = Weights::default();
         let x = Mat::from_vec(1, config::HIDDEN_SIZE, vec![0.0; config::HIDDEN_SIZE]);
-        assert!(matches!(forward(&w, &x), Err(FocrError::NotImplemented(_))));
+        assert!(matches!(
+            forward(&w, &x, 1),
+            Err(FocrError::FormatMismatch(_))
+        ));
         assert!(matches!(
             dense_forward(&w, &x),
-            Err(FocrError::NotImplemented(_))
+            Err(FocrError::FormatMismatch(_))
         ));
     }
 }
