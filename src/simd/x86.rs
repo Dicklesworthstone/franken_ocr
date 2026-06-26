@@ -85,26 +85,29 @@
 /// Panics if `a.len() != m*k`, `b.len() != n*k`, or `out.len() != m*n` (a
 /// shape/length contract violation is a programming error).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let a_len = super::scalar::checked_len("igemm_s8s8", m, k, "m*k");
+    let b_len = super::scalar::checked_len("igemm_s8s8", n, k, "n*k");
+    let out_len = super::scalar::checked_len("igemm_s8s8", m, n, "m*n");
     assert_eq!(
         a.len(),
-        m * k,
+        a_len,
         "igemm_s8s8: a.len {} != m*k {}",
         a.len(),
-        m * k
+        a_len
     );
     assert_eq!(
         b.len(),
-        n * k,
+        b_len,
         "igemm_s8s8: b.len {} != n*k {}",
         b.len(),
-        n * k
+        b_len
     );
     assert_eq!(
         out.len(),
-        m * n,
+        out_len,
         "igemm_s8s8: out.len {} != m*n {}",
         out.len(),
-        m * n
+        out_len
     );
 
     #[cfg(target_arch = "x86_64")]
@@ -146,26 +149,29 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// Panics if `a.len() != m*k`, `b.len() != n*k`, or `out.len() != m*n`.
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let a_len = super::scalar::checked_len("igemm_u8s8", m, k, "m*k");
+    let b_len = super::scalar::checked_len("igemm_u8s8", n, k, "n*k");
+    let out_len = super::scalar::checked_len("igemm_u8s8", m, n, "m*n");
     assert_eq!(
         a.len(),
-        m * k,
+        a_len,
         "igemm_u8s8: a.len {} != m*k {}",
         a.len(),
-        m * k
+        a_len
     );
     assert_eq!(
         b.len(),
-        n * k,
+        b_len,
         "igemm_u8s8: b.len {} != n*k {}",
         b.len(),
-        n * k
+        b_len
     );
     assert_eq!(
         out.len(),
-        m * n,
+        out_len,
         "igemm_u8s8: out.len {} != m*n {}",
         out.len(),
-        m * n
+        out_len
     );
 
     #[cfg(target_arch = "x86_64")]

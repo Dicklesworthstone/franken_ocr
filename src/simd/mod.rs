@@ -105,6 +105,20 @@ mod tests {
         assert_eq!(got, [30]);
     }
 
+    #[test]
+    #[should_panic(expected = "igemm_s8s8: m*k overflow")]
+    fn public_s8s8_rejects_shape_product_overflow() {
+        let mut out = [];
+        igemm_s8s8(&[], &[], usize::MAX, 2, 0, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "igemm_u8s8: m*n overflow")]
+    fn public_u8s8_rejects_output_shape_overflow() {
+        let mut out = [];
+        igemm_u8s8(&[], &[], usize::MAX, 0, 2, &mut out);
+    }
+
     /// The capability reflection is reachable through the public API and offers
     /// a non-empty available set (for `robot backends`).
     #[test]

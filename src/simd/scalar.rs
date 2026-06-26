@@ -59,6 +59,13 @@ fn acc_add(acc: i32, prod: i32) -> i32 {
     acc + prod
 }
 
+#[track_caller]
+pub(crate) fn checked_len(context: &str, lhs: usize, rhs: usize, expr: &str) -> usize {
+    let len = lhs.checked_mul(rhs);
+    assert!(len.is_some(), "{context}: {expr} overflow ({lhs} * {rhs})");
+    len.unwrap_or(0)
+}
+
 /// `C[M,N] += A[M,K] (i8, row-major) · B[N,K] (i8, output-channel-major)` into
 /// the i32 buffer `out` (the S8S8 reference oracle).
 ///
@@ -69,26 +76,29 @@ fn acc_add(acc: i32, prod: i32) -> i32 {
 /// Panics on a length-contract violation: `a.len() != m*k`, `b.len() != n*k`,
 /// or `out.len() != m*n` (a programming error, caught early like `Mat`).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let a_len = checked_len("igemm_s8s8", m, k, "m*k");
+    let b_len = checked_len("igemm_s8s8", n, k, "n*k");
+    let out_len = checked_len("igemm_s8s8", m, n, "m*n");
     assert_eq!(
         a.len(),
-        m * k,
+        a_len,
         "igemm_s8s8: a.len {} != m*k {}",
         a.len(),
-        m * k
+        a_len
     );
     assert_eq!(
         b.len(),
-        n * k,
+        b_len,
         "igemm_s8s8: b.len {} != n*k {}",
         b.len(),
-        n * k
+        b_len
     );
     assert_eq!(
         out.len(),
-        m * n,
+        out_len,
         "igemm_s8s8: out.len {} != m*n {}",
         out.len(),
-        m * n
+        out_len
     );
     for i in 0..m {
         let a_row = &a[i * k..i * k + k];
@@ -117,26 +127,29 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// As [`igemm_s8s8`] (length-contract violations).
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let a_len = checked_len("igemm_u8s8", m, k, "m*k");
+    let b_len = checked_len("igemm_u8s8", n, k, "n*k");
+    let out_len = checked_len("igemm_u8s8", m, n, "m*n");
     assert_eq!(
         a.len(),
-        m * k,
+        a_len,
         "igemm_u8s8: a.len {} != m*k {}",
         a.len(),
-        m * k
+        a_len
     );
     assert_eq!(
         b.len(),
-        n * k,
+        b_len,
         "igemm_u8s8: b.len {} != n*k {}",
         b.len(),
-        n * k
+        b_len
     );
     assert_eq!(
         out.len(),
-        m * n,
+        out_len,
         "igemm_u8s8: out.len {} != m*n {}",
         out.len(),
-        m * n
+        out_len
     );
     for i in 0..m {
         let a_row = &a[i * k..i * k + k];
@@ -293,6 +306,20 @@ mod tests {
     fn s8s8_rejects_bad_a_len() {
         let mut out = [0i32; 1];
         igemm_s8s8(&[1i8, 2], &[1i8], 1, 1, 1, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "igemm_s8s8: m*k overflow")]
+    fn s8s8_rejects_shape_product_overflow_before_len_checks() {
+        let mut out = [];
+        igemm_s8s8(&[], &[], usize::MAX, 2, 0, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "igemm_u8s8: m*n overflow")]
+    fn u8s8_rejects_output_shape_overflow_before_looping() {
+        let mut out = [];
+        igemm_u8s8(&[], &[], usize::MAX, 0, 2, &mut out);
     }
 
     // ── tiny xorshift PRNG so tests are deterministic with no dev-dep ─────────

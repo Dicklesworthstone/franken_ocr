@@ -165,26 +165,29 @@ fn detect_tier_uncached() -> ArmTier {
 /// shape/contract violation is a programming error, caught early — matches the
 /// scalar reference's asserts).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let a_len = scalar::checked_len("igemm_s8s8", m, k, "m*k");
+    let b_len = scalar::checked_len("igemm_s8s8", n, k, "n*k");
+    let out_len = scalar::checked_len("igemm_s8s8", m, n, "m*n");
     assert_eq!(
         a.len(),
-        m * k,
+        a_len,
         "igemm_s8s8: a.len {} != m*k {}",
         a.len(),
-        m * k
+        a_len
     );
     assert_eq!(
         b.len(),
-        n * k,
+        b_len,
         "igemm_s8s8: b.len {} != n*k {}",
         b.len(),
-        n * k
+        b_len
     );
     assert_eq!(
         out.len(),
-        m * n,
+        out_len,
         "igemm_s8s8: out.len {} != m*n {}",
         out.len(),
-        m * n
+        out_len
     );
 
     #[cfg(target_arch = "aarch64")]
@@ -217,26 +220,29 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// As [`igemm_s8s8`].
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let a_len = scalar::checked_len("igemm_u8s8", m, k, "m*k");
+    let b_len = scalar::checked_len("igemm_u8s8", n, k, "n*k");
+    let out_len = scalar::checked_len("igemm_u8s8", m, n, "m*n");
     assert_eq!(
         a.len(),
-        m * k,
+        a_len,
         "igemm_u8s8: a.len {} != m*k {}",
         a.len(),
-        m * k
+        a_len
     );
     assert_eq!(
         b.len(),
-        n * k,
+        b_len,
         "igemm_u8s8: b.len {} != n*k {}",
         b.len(),
-        n * k
+        b_len
     );
     assert_eq!(
         out.len(),
-        m * n,
+        out_len,
         "igemm_u8s8: out.len {} != m*n {}",
         out.len(),
-        m * n
+        out_len
     );
 
     #[cfg(target_arch = "aarch64")]

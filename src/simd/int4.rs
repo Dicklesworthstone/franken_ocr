@@ -81,6 +81,8 @@
 //! guarded by a runtime feature check with a **bit-identical scalar fallback**
 //! that cross-compiles to every target.
 
+use crate::quant::int4::VALID_GROUP_SIZES;
+
 // ── int4 unpack: nibble → i8, bit-exact to the quant-core packing ───────────
 
 /// Sign-extend a 4-bit two's-complement nibble (`0x0..=0xF`) to `i8` in
@@ -125,14 +127,16 @@ pub fn unpack_to_i8(b_packed: &[u8], n: usize, k: usize) -> Vec<i8> {
         k.is_multiple_of(2),
         "unpack_to_i8: k {k} must be even (two nibbles/byte)"
     );
+    let packed_len = super::scalar::checked_len("unpack_to_i8", n, k / 2, "n*k/2");
+    let out_len = super::scalar::checked_len("unpack_to_i8", n, k, "n*k");
     assert_eq!(
         b_packed.len(),
-        n * (k / 2),
+        packed_len,
         "unpack_to_i8: packed len {} != n*k/2 {}",
         b_packed.len(),
-        n * (k / 2)
+        packed_len
     );
-    let mut out = vec![0i8; n * k];
+    let mut out = vec![0i8; out_len];
     accel::unpack_nibbles(b_packed, &mut out);
     out
 }
@@ -175,37 +179,45 @@ pub fn igemm_s4s8(
 ) {
     assert!(k.is_multiple_of(2), "igemm_s4s8: k {k} must be even");
     assert!(
-        group != 0 && k.is_multiple_of(group),
+        VALID_GROUP_SIZES.contains(&group),
+        "igemm_s4s8: group {group} must be 16 or 32"
+    );
+    assert!(
+        k.is_multiple_of(group),
         "igemm_s4s8: group {group} must divide k {k}"
     );
     let groups = k / group;
+    let a_len = super::scalar::checked_len("igemm_s4s8", m, k, "m*k");
+    let packed_len = super::scalar::checked_len("igemm_s4s8", n, k / 2, "n*k/2");
+    let scales_len = super::scalar::checked_len("igemm_s4s8", n, groups, "n*(k/group)");
+    let out_len = super::scalar::checked_len("igemm_s4s8", m, n, "m*n");
     assert_eq!(
         a.len(),
-        m * k,
+        a_len,
         "igemm_s4s8: a len {} != m*k {}",
         a.len(),
-        m * k
+        a_len
     );
     assert_eq!(
         b_packed.len(),
-        n * (k / 2),
+        packed_len,
         "igemm_s4s8: b_packed len {} != n*k/2 {}",
         b_packed.len(),
-        n * (k / 2)
+        packed_len
     );
     assert_eq!(
         scales.len(),
-        n * groups,
+        scales_len,
         "igemm_s4s8: scales len {} != n*(k/group) {}",
         scales.len(),
-        n * groups
+        scales_len
     );
     assert_eq!(
         out.len(),
-        m * n,
+        out_len,
         "igemm_s4s8: out len {} != m*n {}",
         out.len(),
-        m * n
+        out_len
     );
 
     // Unpack the whole B once (the bandwidth win is the *stored/streamed* bytes;
@@ -490,6 +502,19 @@ mod tests {
         assert_eq!(two_rows, vec![1i8, 2, 3, 4, 5, 6, 7, -8]);
     }
 
+    #[test]
+    #[should_panic(expected = "unpack_to_i8: n*k/2 overflow")]
+    fn unpack_to_i8_rejects_packed_shape_overflow_before_allocating() {
+        let _ = unpack_to_i8(&[], usize::MAX, 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "igemm_s4s8: m*k overflow")]
+    fn igemm_s4s8_rejects_activation_shape_overflow_before_len_checks() {
+        let mut out = [];
+        igemm_s4s8(&[], &[], &[], 16, usize::MAX, 16, 1, &mut out);
+    }
+
     // ── accelerated unpack == scalar oracle (randomized + adversarial) ───────
 
     /// Tiny xorshift PRNG so the tests need no `rand` dependency.
@@ -707,9 +732,20 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "must be 16 or 32")]
+    fn igemm_s4s8_rejects_noncanonical_group_even_when_it_divides_k() {
+        let (m, k, n, group) = (1usize, 32usize, 1usize, 8usize);
+        let a = vec![1i8; m * k];
+        let b_packed = vec![0u8; n * (k / 2)];
+        let scales = vec![1.0f32; n * (k / group)];
+        let mut out = vec![0f32; m * n];
+        igemm_s4s8(&a, &b_packed, &scales, group, m, k, n, &mut out);
+    }
+
+    #[test]
     #[should_panic(expected = "must divide k")]
     fn igemm_s4s8_rejects_non_dividing_group() {
-        let (m, k, n, group) = (1usize, 16usize, 1usize, 5usize); // 5 ∤ 16
+        let (m, k, n, group) = (1usize, 24usize, 1usize, 16usize); // 16 ∤ 24
         let a = vec![1i8; m * k];
         let b_packed = vec![0u8; n * (k / 2)];
         let scales = vec![1.0f32; n * (k / group).max(1)];
