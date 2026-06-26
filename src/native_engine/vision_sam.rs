@@ -329,7 +329,7 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
 /// (window_unpartition); `x = shortcut + x; x = x + mlp(norm2(x))`.
 fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     let dim = x.cols;
-    let normed = layer_norm_rows(x, &blk.norm1);
+    let normed = layer_norm_rows(x, &blk.norm1)?;
 
     let attn_out = if blk.window > 0 {
         // window_partition: pad to multiple of window, tile into win x win.
@@ -401,7 +401,7 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     }
 
     // residual 2: x = h1 + mlp(norm2(h1))
-    let normed2 = layer_norm_rows(&h1, &blk.norm2);
+    let normed2 = layer_norm_rows(&h1, &blk.norm2)?;
     let mut mlp = blk.lin1.apply(&normed2)?;
     nn::gelu(&mut mlp);
     let mlp = blk.lin2.apply(&mlp)?;
@@ -682,9 +682,8 @@ fn interp_linear_rows(src: &[f32], rows: usize, hd: usize, new_rows: usize) -> V
 // ── normalization helpers ──────────────────────────────────────────────────
 
 /// LayerNorm over the last dim of token rows `[n, cols]` with affine params.
-fn layer_norm_rows(x: &Mat, ln: &LayerNormP) -> Mat {
+fn layer_norm_rows(x: &Mat, ln: &LayerNormP) -> FocrResult<Mat> {
     nn::layer_norm(x, Some(&ln.w), Some(&ln.b), LN_EPS)
-        .expect("layer_norm affine length matches cols by construction")
 }
 
 /// `LayerNorm2d` over an NCHW-flat `[C, H*W]` buffer: normalize across the
@@ -806,9 +805,10 @@ fn nhwc_rows_to_nchw(x: &Mat, ch: usize, gh: usize, gw: usize) -> Vec<f32> {
 /// Transpose a `[rows, cols]` row-major matrix to `[cols, rows]`.
 fn transpose(m: &[f32], rows: usize, cols: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; rows * cols];
-    for r in 0..rows {
-        for c in 0..cols {
-            out[c * rows + r] = m[r * cols + c];
+    for c in 0..cols {
+        let dst = &mut out[c * rows..(c + 1) * rows];
+        for (r, slot) in dst.iter_mut().enumerate() {
+            *slot = m[r * cols + c];
         }
     }
     out
@@ -951,9 +951,11 @@ mod tests {
         }
     }
 
-    fn assert_err_contains<T: std::fmt::Debug>(res: FocrResult<T>, needle: &str) {
-        let err = res.expect_err("expected vision_sam shape error");
-        let message = err.to_string();
+    fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
+        let message = match res {
+            Ok(_) => String::from("<ok>"),
+            Err(err) => err.to_string(),
+        };
         assert!(
             message.contains(needle),
             "error {message:?} did not contain {needle:?}"
@@ -965,10 +967,11 @@ mod tests {
         let m = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]; // [2,3]
         let t = transpose(&m, 2, 3); // [3,2]
         assert_eq!(t, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(transpose(&t, 3, 2), m);
     }
 
     #[test]
-    fn linear_applies_weight_and_bias() {
+    fn linear_applies_weight_and_bias() -> FocrResult<()> {
         // w = [[1,2,3],[4,5,6]] (out=2,in=3), b=[10,20]
         let lin = Linear {
             w: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
@@ -978,10 +981,11 @@ mod tests {
         };
         // x = [[1,1,1]] -> y = [1+2+3+10, 4+5+6+20] = [16, 35]
         let x = Mat::from_vec(1, 3, vec![1.0, 1.0, 1.0]);
-        let y = lin.apply(&x).unwrap();
+        let y = lin.apply(&x)?;
         assert_eq!(y.shape(), (1, 2));
         assert!((y.data[0] - 16.0).abs() < 1e-5);
         assert!((y.data[1] - 35.0).abs() < 1e-5);
+        Ok(())
     }
 
     #[test]
@@ -1067,12 +1071,13 @@ mod tests {
     }
 
     #[test]
-    fn conv_apply_identity_1x1_preserves() {
+    fn conv_apply_identity_1x1_preserves() -> FocrResult<()> {
         // 2 channels, 2x2 grid, identity 1x1 conv -> unchanged.
         let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let conv = identity_conv1(2);
-        let out = conv_apply(&conv, &input, 2, 2, 0, 1).unwrap();
+        let out = conv_apply(&conv, &input, 2, 2, 0, 1)?;
         assert_eq!(out, input);
+        Ok(())
     }
 
     #[test]
@@ -1304,7 +1309,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_gemm_matches_scalar_reference_with_relpos() {
+    fn attention_gemm_matches_scalar_reference_with_relpos() -> FocrResult<()> {
         let dim = EMBED_DIM;
         let hd = HEAD_DIM;
         let grid = 3usize;
@@ -1339,8 +1344,8 @@ mod tests {
                 .map(|i| ((i % 29) as f32 - 14.0) * 0.003)
                 .collect(),
         );
-        let got = attention(&attn, &x, grid, grid).unwrap();
-        let expected = attention_scalar_reference(&attn, &x, grid, grid).unwrap();
+        let got = attention(&attn, &x, grid, grid)?;
+        let expected = attention_scalar_reference(&attn, &x, grid, grid)?;
         let max_abs = got
             .data
             .iter()
@@ -1348,6 +1353,7 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         assert!(max_abs <= 2.0e-6, "max_abs={max_abs}");
+        Ok(())
     }
 
     #[test]
@@ -1369,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn block_forward_preserves_shape_global() {
+    fn block_forward_preserves_shape_global() -> FocrResult<()> {
         // global block (window=0) on a 2x2 grid; zero MLP + zero rel-pos so
         // output = x + attn(LN(x)) with proj/qkv identity. We only assert shape
         // and that the residual path ran (output differs from input generally).
@@ -1381,12 +1387,13 @@ mod tests {
             *v = ((i % 7) as f32) * 0.1 - 0.3;
         }
         let x = Mat::from_vec(n, dim, data);
-        let out = block_forward(&blk, &x, 2, 2).unwrap();
+        let out = block_forward(&blk, &x, 2, 2)?;
         assert_eq!(out.shape(), (n, dim));
+        Ok(())
     }
 
     #[test]
-    fn block_forward_windowed_pads_and_unpartitions() {
+    fn block_forward_windowed_pads_and_unpartitions() -> FocrResult<()> {
         // windowed block, window=3 over a 2x2 grid forces padding to 3x3 then
         // strips it back to 2x2. Shape must round-trip.
         let blk = tiny_block(3);
@@ -1394,8 +1401,9 @@ mod tests {
         let dim = EMBED_DIM;
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32 % 5.0) * 0.01).collect();
         let x = Mat::from_vec(n, dim, data);
-        let out = block_forward(&blk, &x, 2, 2).unwrap();
+        let out = block_forward(&blk, &x, 2, 2)?;
         assert_eq!(out.shape(), (n, dim));
+        Ok(())
     }
 
     #[test]
@@ -1416,7 +1424,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_zero_relpos_is_uniform_average_for_equal_q() {
+    fn attention_zero_relpos_is_uniform_average_for_equal_q() -> FocrResult<()> {
         // With identical token vectors, equal logits => uniform softmax =>
         // attention output == the (shared) value vector (proj identity).
         let dim = EMBED_DIM;
@@ -1443,17 +1451,18 @@ mod tests {
         };
         // all 4 tokens identical = ones
         let x = Mat::from_vec(4, dim, vec![1.0; 4 * dim]);
-        let out = attention(&attn, &x, 2, 2).unwrap();
+        let out = attention(&attn, &x, 2, 2)?;
         assert_eq!(out.shape(), (4, dim));
         // uniform average of identical value vectors -> 1.0 everywhere
         for &v in &out.data {
             assert!((v - 1.0).abs() < 1e-4, "got {v}");
         }
+        Ok(())
     }
 
     #[test]
     #[ignore = "local perf probe; run explicitly with --ignored --nocapture"]
-    fn sam_attention_relpos_bias_local_probe() {
+    fn sam_attention_relpos_bias_local_probe() -> FocrResult<()> {
         let dim = EMBED_DIM;
         let hd = HEAD_DIM;
         let grid = 14usize;
@@ -1494,12 +1503,12 @@ mod tests {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(3)
             .max(1);
-        let warm = attention(&attn, &x, grid, grid).unwrap();
+        let warm = attention(&attn, &x, grid, grid)?;
         let warm_checksum: f32 = warm.data.iter().step_by(97).copied().sum();
         let start = Instant::now();
         let mut checksum = 0.0f32;
         for _ in 0..runs {
-            let out = attention(&attn, &x, grid, grid).unwrap();
+            let out = attention(&attn, &x, grid, grid)?;
             checksum += out.data.iter().step_by(97).copied().sum::<f32>();
         }
         let elapsed = start.elapsed();
@@ -1522,10 +1531,11 @@ mod tests {
                 "checksum": checksum
             })
         );
+        Ok(())
     }
 
     #[test]
-    fn forward_with_end_to_end_shapes() {
+    fn forward_with_end_to_end_shapes() -> FocrResult<()> {
         // Tiny end-to-end: H=W=32 image -> patch grid 2x2 -> neck keeps 2x2 ->
         // net_2 /2 -> 1x1 -> net_3 /2 -> 1x1. Output [OUT_CH, 1].
         let h = 32;
@@ -1647,11 +1657,12 @@ mod tests {
         };
 
         let image = Mat::from_vec(3, h * h, vec![0.5; 3 * h * h]);
-        let out = forward_with(&w, &image, h, h).unwrap();
+        let out = forward_with(&w, &image, h, h)?;
         // gh=2 -> net_2 -> 1 -> net_3 -> 1 ; 1024 channels x 1 spatial.
         assert_eq!(out.shape(), (OUT_CH, 1));
         // all-zero weights -> all-zero feature.
         assert!(out.data.iter().all(|&v| v.abs() < 1e-6));
+        Ok(())
     }
 
     #[test]
