@@ -34,10 +34,19 @@ use std::path::Path;
 use std::time::Instant;
 
 use parity_harness::{
-    COSINE_F32_THRESHOLD, DType, FixtureLoader, Logger, NormalizedValue, OpFamily, TensorSpec,
-    cosine, establish_floor, max_abs_diff, scrub_volatile, ulp_compare,
+    COSINE_F32_THRESHOLD, DType, FixtureLoader, Logger, NormalizedValue, OpFamily, ReferenceGolden,
+    TensorSpec, cosine, establish_floor, max_abs_diff, scrub_volatile, ulp_compare,
 };
 use serde_json::{Value, json};
+
+// The subject (engine) side of the ladder. These are the SAME public kernels the
+// off-repo example dumps (`examples/full_vision_dump.rs`, `examples/decoder_dump.rs`)
+// drove to PROVE vision cosine 0.9996 and decoder argmax-exact against baidu. Wiring
+// them here promotes those manual proofs into committed, gated L1/L2/L3 parity rungs
+// (bd-2ksr: replace the diagnostic oracle-only self-compares with real subject capture).
+use franken_ocr::native_engine::tensor::Mat;
+use franken_ocr::native_engine::weights::Weights;
+use franken_ocr::native_engine::{decoder, vision_bridge};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Gating helpers — the model/fixture gate (skip-with-SUCCESS discipline).
@@ -68,6 +77,179 @@ fn golden_stem(path: &Path) -> String {
         .and_then(|n| n.strip_suffix("_reference.json"))
         .unwrap_or("unknown")
         .to_string()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subject (engine) seam capture — the bd-2ksr deliverable.
+//
+// The committed oracle (scripts/gen_reference_fixtures.py) dumps each module's
+// OUTPUT activation (sam_output / clip_output / projector_output /
+// decoder_layer_NN_hidden / lm_head_logits). That lets us isolate two seams using
+// ONLY committed fixtures — feed the engine the oracle's EXACT upstream tensors
+// and compare its output to the oracle's output, the same decouple the example
+// dumps use:
+//   * projector (vision bridge): vision_bridge::forward(clip_output, sam_output)
+//     vs projector_output — isolates the 2048→1280 projector.
+//   * final norm + lm_head: decoder::lm_head(decoder_layer_11_hidden) vs
+//     lm_head_logits — isolates the model.norm + lm_head GEMV.
+// Every comparison runs through the shared comparator and emits a REAL
+// `log.parity` (pass/fail), never a diagnostic self-compare. A shape/numel
+// mismatch or a missing tensor is surfaced LOUDLY (never a fabricated pass).
+//
+// The seams that still need an input the committed manifest does not carry
+// (sam_output/clip_output need the preprocessed image; decoder per-layer needs
+// the prior layer hidden as a single-layer entry; L4/L5 need the full forward)
+// stay honest xfails naming exactly what is missing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The subject identity stamped on every real parity row so the differential
+/// guard (`EngineIdentity subject != oracle`) holds structurally.
+const SUBJECT_IDENTITY: &str = "franken_ocr";
+/// The oracle identity (the pinned baidu reference).
+const ORACLE_IDENTITY: &str = "unlimited-ocr-oracle";
+
+/// Resolve + load the subject model weights the same way [`model_present`]
+/// resolves the path (`$FOCR_MODEL_PATH` else the default `.focrq`). Only called
+/// after a rung confirms `model_present()`, so a failure here is a genuine load
+/// error worth surfacing (never silently skipped).
+fn load_subject_weights() -> Result<Weights, String> {
+    let path = std::env::var_os("FOCR_MODEL_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("models/unlimited-ocr.focrq"));
+    Weights::load(&path).map_err(|e| format!("load subject weights {}: {e}", path.display()))
+}
+
+/// Reshape a loaded oracle activation into the 2-D `[rows, cols]` [`Mat`] the
+/// engine kernels consume, taking the LAST shape dim as `cols` so a leading batch
+/// dim folds into `rows`. Rejects a non-divisible flat length loudly (a corrupt
+/// manifest must never silently misshape into a fabricated pass).
+fn activation_as_mat(stage: &str, nv: &NormalizedValue) -> Result<Mat, String> {
+    let cols = nv
+        .spec
+        .shape
+        .last()
+        .copied()
+        .filter(|&c| c > 0)
+        .unwrap_or_else(|| nv.data.len().max(1));
+    if cols == 0 || !nv.data.len().is_multiple_of(cols) {
+        return Err(format!(
+            "activation {stage}: flat len {} not divisible by last-dim cols {cols} (shape {:?})",
+            nv.data.len(),
+            nv.spec.shape
+        ));
+    }
+    Ok(Mat::from_vec(nv.data.len() / cols, cols, nv.data.clone()))
+}
+
+/// One real subject-vs-oracle seam result for a rung's aggregate.
+struct SeamOutcome {
+    /// The engine output for this seam.
+    subject: Mat,
+    /// The oracle output for this seam.
+    oracle: NormalizedValue,
+    /// The oracle activation's array sha256 (provenance), `""` if absent.
+    oracle_sha256: String,
+}
+
+/// Capture the projector (vision bridge) subject seam from the committed
+/// `clip_output` + `sam_output`, comparing the engine projector to
+/// `projector_output`. Returns `None` when this golden lacks the three
+/// activations (the rung then knows the seam was not exercised), `Some(Err)` on a
+/// load/shape/kernel failure (a loud non-pass), `Some(Ok)` on a real capture.
+fn capture_projector_seam(
+    w: &Weights,
+    loader: &FixtureLoader,
+    golden: &ReferenceGolden,
+    doc_stem: &str,
+) -> Option<Result<SeamOutcome, String>> {
+    // All three must be present to isolate the projector from committed fixtures.
+    let clip_entry = golden.activations.get("clip_output")?;
+    let sam_entry = golden.activations.get("sam_output")?;
+    let proj_entry = golden.activations.get("projector_output")?;
+    let oracle_sha256 = proj_entry.sha256.clone().unwrap_or_default();
+    let run = || -> Result<SeamOutcome, String> {
+        let clip = loader.load_activation(doc_stem, "clip_output", clip_entry)?;
+        let sam = loader.load_activation(doc_stem, "sam_output", sam_entry)?;
+        let oracle = loader.load_activation(doc_stem, "projector_output", proj_entry)?;
+        let clip_mat = activation_as_mat("clip_output", &clip)?;
+        let sam_mat = activation_as_mat("sam_output", &sam)?;
+        let subject = vision_bridge::forward(w, &clip_mat, &sam_mat)
+            .map_err(|e| format!("vision_bridge::forward: {e}"))?;
+        if subject.data.len() != oracle.data.len() {
+            return Err(format!(
+                "projector subject numel {} != oracle {} (subject [{},{}], oracle shape {:?})",
+                subject.data.len(),
+                oracle.data.len(),
+                subject.rows,
+                subject.cols,
+                oracle.spec.shape
+            ));
+        }
+        Ok(SeamOutcome {
+            subject,
+            oracle,
+            oracle_sha256,
+        })
+    };
+    Some(run())
+}
+
+/// Capture the final-norm + lm_head subject seam from the committed
+/// `decoder_layer_11_hidden`, comparing the engine logits to `lm_head_logits`.
+fn capture_lm_head_seam(
+    w: &Weights,
+    loader: &FixtureLoader,
+    golden: &ReferenceGolden,
+    doc_stem: &str,
+) -> Option<Result<SeamOutcome, String>> {
+    let hidden_entry = golden.activations.get("decoder_layer_11_hidden")?;
+    let logits_entry = golden.activations.get("lm_head_logits")?;
+    let oracle_sha256 = logits_entry.sha256.clone().unwrap_or_default();
+    let run = || -> Result<SeamOutcome, String> {
+        let hidden = loader.load_activation(doc_stem, "decoder_layer_11_hidden", hidden_entry)?;
+        let oracle = loader.load_activation(doc_stem, "lm_head_logits", logits_entry)?;
+        let hidden_mat = activation_as_mat("decoder_layer_11_hidden", &hidden)?;
+        let subject =
+            decoder::lm_head(w, &hidden_mat).map_err(|e| format!("decoder::lm_head: {e}"))?;
+        if subject.data.len() != oracle.data.len() {
+            return Err(format!(
+                "lm_head subject numel {} != oracle {} (subject [{},{}], oracle shape {:?})",
+                subject.data.len(),
+                oracle.data.len(),
+                subject.rows,
+                subject.cols,
+                oracle.spec.shape
+            ));
+        }
+        Ok(SeamOutcome {
+            subject,
+            oracle,
+            oracle_sha256,
+        })
+    };
+    Some(run())
+}
+
+/// Per-row argmax (torch tie-break: lowest index wins) over a `[rows, cols]` flat
+/// buffer — the L3 token-decision invariant. NaN is skipped so an all-NaN row
+/// falls back to index 0 (never silently "passes" by comparing two NaNs equal).
+fn argmax_rows(data: &[f32], cols: usize) -> Vec<usize> {
+    if cols == 0 {
+        return Vec::new();
+    }
+    data.chunks_exact(cols)
+        .map(|row| {
+            let mut best_idx = 0usize;
+            let mut best_val = f32::NEG_INFINITY;
+            for (i, &v) in row.iter().enumerate() {
+                if v > best_val {
+                    best_val = v;
+                    best_idx = i;
+                }
+            }
+            best_idx
+        })
+        .collect()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -163,62 +345,108 @@ fn l1_per_op_cosine() {
         return;
     }
 
-    // FIXTURE+MODEL PRESENT: walk every dumped activation seam, load the oracle
-    // .npy, run the engine to the same seam, and compare through cosine + the ULP
-    // table. The engine seam-capture API is mid-flux; until it lands this branch
-    // is unreachable on a dev box (model_present() is false). The comparator it
-    // WILL call is demonstrated end-to-end below on the loaded oracle tensor vs
-    // itself (a real fixture read), so the wiring is exercised the moment
-    // fixtures exist — only the subject-side seam capture is pending.
+    // FIXTURE+MODEL PRESENT: run the REAL subject (engine) per-op seam capture.
+    // The projector (vision bridge) is isolated from the committed clip_output +
+    // sam_output and compared to projector_output through cosine + the ULP table —
+    // a true franken_ocr-vs-baidu parity row, not an oracle self-compare.
     let loader = FixtureLoader::new();
-    let goldens = loader.list_goldens().unwrap_or_default();
-    for gpath in &goldens {
-        let stem = golden_stem(gpath);
-        let golden = match loader.load_golden(gpath) {
+    let w = match load_subject_weights() {
+        Ok(w) => w,
+        Err(e) => {
+            log.error("WeightsLoad", 1, &e);
+            log.result("xfail", t0.elapsed().as_micros());
+            return;
+        }
+    };
+    let mut ran = 0usize;
+    let mut all_pass = true;
+    for gpath in loader.list_goldens().unwrap_or_default() {
+        let stem = golden_stem(&gpath);
+        let golden = match loader.load_golden(&gpath) {
             Ok(g) => g,
             Err(e) => {
                 log.error("FixtureParse", 1, &e);
+                all_pass = false;
                 continue;
             }
         };
         if let Err(e) = FixtureLoader::check_provenance(&golden) {
             log.error("Provenance", 1, &format!("{stem}: {e}"));
+            all_pass = false;
             continue;
         }
         let doc_stem = golden.doc_stem_or(&stem);
-        for (stage, entry) in &golden.activations {
-            match loader.load_activation(&doc_stem, stage, entry) {
-                Ok(oracle) => {
-                    // Subject-side seam capture pending; demonstrate the comparator
-                    // on the real loaded oracle tensor (self-compare ⇒ cosine 1.0)
-                    // so the read+normalize+compare path is proven once fixtures land.
-                    let c = cosine(&oracle.data, &oracle.data);
-                    log.diagnostic_parity(
-                        "L1",
-                        "cosine",
-                        c,
-                        COSINE_F32_THRESHOLD,
-                        stage,
-                        entry.sha256.as_deref().unwrap_or(""),
-                        json!({"note": "DIAGNOSTIC self-compare (oracle vs oracle): proves the read+comparator path runs on real fixtures; subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
-                        "oracle_self_compare",
-                    );
-                }
-                Err(e) => log.error("ActivationLoad", 1, &format!("{stage}: {e}")),
+
+        match capture_projector_seam(&w, &loader, &golden, &doc_stem) {
+            Some(Ok(seam)) => {
+                let c = cosine(&seam.subject.data, &seam.oracle.data);
+                let report =
+                    ulp_compare(&seam.subject.data, &seam.oracle.data, OpFamily::MatmulF32);
+                let pass = c >= COSINE_F32_THRESHOLD;
+                ran += 1;
+                all_pass &= pass;
+                log.parity(
+                    "L1",
+                    "cosine",
+                    c,
+                    COSINE_F32_THRESHOLD,
+                    "projector_output",
+                    &seam.oracle_sha256,
+                    json!({
+                        "seam": "vision_bridge (projector 2048->1280)",
+                        "subject": SUBJECT_IDENTITY,
+                        "oracle": ORACLE_IDENTITY,
+                        "max_abs_diff": report.max_abs_diff,
+                        "max_ulp": report.max_ulp,
+                        "ulp_budget": report.budget_ulp,
+                        "input": "oracle clip_output + sam_output (exact)",
+                        "doc": stem.as_str(),
+                    }),
+                    pass,
+                );
+            }
+            Some(Err(e)) => {
+                log.error("ProjectorSeam", 1, &format!("{stem}: {e}"));
+                all_pass = false;
+            }
+            None => {
+                // The committed manifest can isolate the projector only; sam_output
+                // and clip_output need the preprocessed image input (not dumped by
+                // gen_reference_fixtures.py). Name the gap precisely — never a pass.
+                log.error(
+                    "SeamUnavailable",
+                    1,
+                    &format!(
+                        "{stem}: no isolatable L1 per-op seam (need clip_output + sam_output + \
+                         projector_output to isolate the projector; SAM/CLIP isolation needs a \
+                         sam_input activation the committed oracle does not dump)"
+                    ),
+                );
             }
         }
     }
-    // No subject (engine) tensor exists to compare yet — the loop above ran the
-    // read+comparator path on the ORACLE only. Mirror L0: XFAIL, never a fabricated
-    // pass (audit rank 1; previously logged "pass" after an oracle-vs-oracle compare).
-    log.assertion("L1 subject (engine) per-op seam capture wired", false);
-    log.error(
-        "NotImplemented",
-        1,
-        "L1 live cosine compare needs engine per-op seam capture; oracle fixtures \
-         were present but the subject side is a stub.",
-    );
-    log.result("xfail", t0.elapsed().as_micros());
+
+    if ran == 0 {
+        // Mirror L0: a precise XFAIL, never a fabricated pass.
+        log.assertion("L1 subject (engine) per-op seam capture exercised", false);
+        log.error(
+            "NotImplemented",
+            1,
+            "L1: oracle fixtures present but no committed-isolatable per-op seam ran \
+             (projector seam needs clip_output + sam_output + projector_output).",
+        );
+        log.result("xfail", t0.elapsed().as_micros());
+    } else {
+        log.result(
+            if all_pass { "pass" } else { "fail" },
+            t0.elapsed().as_micros(),
+        );
+        assert!(
+            all_pass,
+            "L1 subject-vs-oracle per-op parity FAILED (projector cosine < {COSINE_F32_THRESHOLD}); \
+             see structured log"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,44 +488,102 @@ fn l2_per_layer_cosine_and_ledger() {
         return;
     }
 
-    // FIXTURE+MODEL PRESENT: per-layer compare with the max-abs ledger. Engine
-    // hidden-state capture is mid-flux; unreachable on a dev box. The ledger shape
-    // is demonstrated on the loaded oracle seams.
+    // FIXTURE+MODEL PRESENT: REAL subject per-stage compare with the max-abs
+    // ledger. The projector vision stage is isolated from the committed
+    // clip_output + sam_output and compared to projector_output (cosine ≈ 1.0 +
+    // ledgered max-abs). The 12 decoder-layer hiddens additionally need a
+    // single-layer engine entry seeded by the prior layer's oracle hidden (the
+    // engine exposes only the 12-layer driver today) — named precisely, not faked.
     let loader = FixtureLoader::new();
+    let w = match load_subject_weights() {
+        Ok(w) => w,
+        Err(e) => {
+            log.error("WeightsLoad", 1, &e);
+            log.result("xfail", t0.elapsed().as_micros());
+            return;
+        }
+    };
+    let mut ran = 0usize;
+    let mut all_pass = true;
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
         let Ok(golden) = loader.load_golden(&gpath) else {
             continue;
         };
+        if let Err(e) = FixtureLoader::check_provenance(&golden) {
+            log.error("Provenance", 1, &format!("{stem}: {e}"));
+            all_pass = false;
+            continue;
+        }
         let doc_stem = golden.doc_stem_or(&stem);
-        for (stage, entry) in &golden.activations {
-            if let Ok(oracle) = loader.load_activation(&doc_stem, stage, entry) {
-                let c = cosine(&oracle.data, &oracle.data);
-                let mad = max_abs_diff(&oracle.data, &oracle.data);
-                log.diagnostic_parity(
+
+        match capture_projector_seam(&w, &loader, &golden, &doc_stem) {
+            Some(Ok(seam)) => {
+                let c = cosine(&seam.subject.data, &seam.oracle.data);
+                let mad = max_abs_diff(&seam.subject.data, &seam.oracle.data);
+                let pass = c >= COSINE_F32_THRESHOLD;
+                ran += 1;
+                all_pass &= pass;
+                log.parity(
                     "L2",
                     "max_abs_diff",
                     mad,
                     0.0,
-                    stage,
-                    "",
-                    json!({"cosine": c, "ledger": "per-layer max-abs (cross-layer drift)", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
-                    "oracle_self_compare",
+                    "projector_output",
+                    &seam.oracle_sha256,
+                    json!({
+                        "cosine": c,
+                        "ledger": "per-stage max-abs (cross-stage drift)",
+                        "seam": "vision_bridge (projector 2048->1280)",
+                        "subject": SUBJECT_IDENTITY,
+                        "oracle": ORACLE_IDENTITY,
+                        "cosine_threshold": COSINE_F32_THRESHOLD,
+                        "doc": stem.as_str(),
+                    }),
+                    pass,
+                );
+            }
+            Some(Err(e)) => {
+                log.error("ProjectorSeam", 1, &format!("{stem}: {e}"));
+                all_pass = false;
+            }
+            None => {
+                log.error(
+                    "SeamUnavailable",
+                    1,
+                    &format!(
+                        "{stem}: projector vision-stage seam needs clip_output + sam_output + \
+                         projector_output; the 12 decoder_layer_NN_hidden seams additionally \
+                         need a single-layer engine entry (only the 12-layer driver is exposed)"
+                    ),
                 );
             }
         }
     }
-    // No subject (engine) hidden states to compare yet — the loop ran the per-layer
-    // read+ledger path on the ORACLE only. Mirror L0: XFAIL, never a fabricated pass
-    // (audit rank 1).
-    log.assertion("L2 subject (engine) per-layer seam capture wired", false);
-    log.error(
-        "NotImplemented",
-        1,
-        "L2 per-layer cosine + max-abs ledger needs engine hidden-state capture; \
-         oracle fixtures were present but the subject side is a stub.",
-    );
-    log.result("xfail", t0.elapsed().as_micros());
+
+    if ran == 0 {
+        log.assertion(
+            "L2 subject (engine) per-stage seam capture exercised",
+            false,
+        );
+        log.error(
+            "NotImplemented",
+            1,
+            "L2: oracle fixtures present but no committed-isolatable per-stage seam ran \
+             (projector seam needs clip_output + sam_output + projector_output).",
+        );
+        log.result("xfail", t0.elapsed().as_micros());
+    } else {
+        log.result(
+            if all_pass { "pass" } else { "fail" },
+            t0.elapsed().as_micros(),
+        );
+        assert!(
+            all_pass,
+            "L2 subject-vs-oracle per-stage parity FAILED (projector cosine < {COSINE_F32_THRESHOLD}); \
+             see structured log"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -351,55 +637,110 @@ fn l3_logits_measured_budget_and_argmax() {
         return;
     }
 
-    // FIXTURE+MODEL PRESENT: load lm_head_logits, run the engine prefill, compare
-    // the logit rows within `derived_tol` and require argmax match where the
-    // reference is deterministic. Engine prefill capture is mid-flux ⇒ unreachable
-    // on a dev box. The argmax+budget comparator is demonstrated on the loaded
-    // oracle logits (self-compare ⇒ argmax identical, spread 0 within budget).
+    // FIXTURE+MODEL PRESENT: REAL subject logit capture. Feed the engine the
+    // oracle's exact decoder_layer_11_hidden through the final model.norm + lm_head
+    // (decoder::lm_head), and compare to lm_head_logits: argmax MUST match at every
+    // position (the token decision) and the continuous logits must stay within the
+    // f32-vs-bf16 cosine gate. This isolates the final-norm + lm_head GEMV — the
+    // exact path the example decoder_dump proved argmax-exact vs baidu.
     let loader = FixtureLoader::new();
+    let w = match load_subject_weights() {
+        Ok(w) => w,
+        Err(e) => {
+            log.error("WeightsLoad", 1, &e);
+            log.result("xfail", t0.elapsed().as_micros());
+            return;
+        }
+    };
+    let mut ran = 0usize;
+    let mut all_pass = true;
     for gpath in loader.list_goldens().unwrap_or_default() {
         let stem = golden_stem(&gpath);
         let Ok(golden) = loader.load_golden(&gpath) else {
             continue;
         };
+        if let Err(e) = FixtureLoader::check_provenance(&golden) {
+            log.error("Provenance", 1, &format!("{stem}: {e}"));
+            all_pass = false;
+            continue;
+        }
         let doc_stem = golden.doc_stem_or(&stem);
-        match golden.activations.get("lm_head_logits") {
-            Some(entry) => {
-                if let Ok(logits) = loader.load_activation(&doc_stem, "lm_head_logits", entry) {
-                    let report = ulp_compare(&logits.data, &logits.data, OpFamily::MatmulF32);
-                    log.diagnostic_parity(
-                        "L3",
-                        "max_abs_diff",
-                        report.max_abs_diff,
-                        derived_tol,
-                        "lm_head_logits",
-                        entry.sha256.as_deref().unwrap_or(""),
-                        json!({"budget_source": "oracle_floor §2", "note": "DIAGNOSTIC self-compare (oracle vs oracle); subject seam capture pending ⇒ NOT a parity pass (audit rank 1)"}),
-                        "oracle_self_compare",
-                    );
-                }
+
+        match capture_lm_head_seam(&w, &loader, &golden, &doc_stem) {
+            Some(Ok(seam)) => {
+                let vocab = seam.subject.cols;
+                let subj_argmax = argmax_rows(&seam.subject.data, vocab);
+                let oracle_argmax = argmax_rows(&seam.oracle.data, vocab);
+                let argmax_exact = subj_argmax == oracle_argmax;
+                let report =
+                    ulp_compare(&seam.subject.data, &seam.oracle.data, OpFamily::MatmulF32);
+                let c = cosine(&seam.subject.data, &seam.oracle.data);
+                // The token decision (argmax) MUST be exact; the continuous logits
+                // are an f32-vs-bf16 divergence held to the cosine gate. max-abs is
+                // ledgered against the derived §2 floor but is not the pass gate
+                // (a continuous spread inside the bf16 noise is not a token error).
+                let pass = argmax_exact && c >= COSINE_F32_THRESHOLD;
+                ran += 1;
+                all_pass &= pass;
+                log.parity(
+                    "L3",
+                    "cosine",
+                    c,
+                    COSINE_F32_THRESHOLD,
+                    "lm_head_logits",
+                    &seam.oracle_sha256,
+                    json!({
+                        "seam": "final model.norm + lm_head (1280->129280)",
+                        "subject": SUBJECT_IDENTITY,
+                        "oracle": ORACLE_IDENTITY,
+                        "argmax_exact": argmax_exact,
+                        "positions": subj_argmax.len(),
+                        "max_abs_diff": report.max_abs_diff,
+                        "max_abs_floor": derived_tol,
+                        "budget_source": "oracle_floor §2 (continuous logits ledgered, not the f32 gate)",
+                        "input": "oracle decoder_layer_11_hidden (exact)",
+                        "doc": stem.as_str(),
+                    }),
+                    pass,
+                );
             }
-            None => log.error(
-                "ActivationManifest",
-                1,
-                &format!("{stem}: missing lm_head_logits activation manifest entry"),
-            ),
+            Some(Err(e)) => {
+                log.error("LmHeadSeam", 1, &format!("{stem}: {e}"));
+                all_pass = false;
+            }
+            None => {
+                log.error(
+                    "SeamUnavailable",
+                    1,
+                    &format!(
+                        "{stem}: lm_head seam needs decoder_layer_11_hidden + lm_head_logits; \
+                         full prefill-logit capture from inputs_embeds needs the connector wiring"
+                    ),
+                );
+            }
         }
     }
-    // No subject (engine) prefill logits to compare yet — the loop ran the
-    // argmax+budget comparator on the ORACLE only. Mirror L0: XFAIL, never a
-    // fabricated pass (audit rank 1).
-    log.assertion(
-        "L3 subject (engine) prefill-logits seam capture wired",
-        false,
-    );
-    log.error(
-        "NotImplemented",
-        1,
-        "L3 logit compare needs engine prefill-logit capture; the oracle lm_head \
-         logits were present but the subject side is a stub.",
-    );
-    log.result("xfail", t0.elapsed().as_micros());
+
+    if ran == 0 {
+        log.assertion("L3 subject (engine) logit seam capture exercised", false);
+        log.error(
+            "NotImplemented",
+            1,
+            "L3: oracle fixtures present but no committed-isolatable logit seam ran \
+             (lm_head seam needs decoder_layer_11_hidden + lm_head_logits).",
+        );
+        log.result("xfail", t0.elapsed().as_micros());
+    } else {
+        log.result(
+            if all_pass { "pass" } else { "fail" },
+            t0.elapsed().as_micros(),
+        );
+        assert!(
+            all_pass,
+            "L3 subject-vs-oracle logit parity FAILED (argmax drift or cosine < \
+             {COSINE_F32_THRESHOLD}); see structured log"
+        );
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
