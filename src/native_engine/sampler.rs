@@ -358,6 +358,97 @@ pub fn decode_step(
     Ok(DecodeOutput::new(token_id, params))
 }
 
+/// Greedy fp32 decode for `B` in-flight page-streams at once (bd-1azu.7 — the
+/// Phase-6 continuous-batch decode spine, bd-1azu).
+///
+/// `logits` is the stacked `[B, vocab]` lm_head output: row `s` is stream `s`'s
+/// next-token logits, exactly the `[1, vocab]` row the single-stream [`sample`]
+/// consumes. `histories[s]` is stream `s`'s OWN generated sequence so far
+/// (prompt and emitted tokens); each stream's sliding-window n-gram blocker reads
+/// only its own tail, so two streams with different histories ban different
+/// tokens off otherwise-identical logits ([SPEC-102/103]). Returns one chosen
+/// token id per stream — `result[s]` is the id the single-stream path picks for
+/// `(row s, histories[s])`.
+///
+/// LOSSLESS by construction: this is a per-stream loop that calls the existing
+/// [`sample`] on each stream's `[1, vocab]` row with that stream's history, so
+/// `batched_sample(logits, histories, params)[s]` is byte-for-byte identical to
+/// `sample(row s as a [1, vocab] Mat, histories[s], params)`. Greedy argmax +
+/// the ngram ban is a per-row reduction with no cross-stream interaction, so there
+/// is no shared reduction order to preserve (unlike attention, bd-1waa) — the
+/// batched API only amortizes the caller's dispatch, it does not change the math.
+///
+/// PERF SEAM (bd-1azu, OFF here): each stream's row is copied into a temporary
+/// `[1, vocab]` [`Mat`] to reuse [`sample`] verbatim. A future lossless
+/// optimization can drop the copy by argmax-ing `logits.row(s)` in place against a
+/// per-stream ngram mask, but that is a perf-only change and MUST keep this
+/// per-stream == single-stream invariant.
+///
+/// # Errors
+/// * [`FocrError::Other`] if `histories.len() != logits.rows` (one history per
+///   stream), or the backing data length disagrees with `rows * cols`.
+/// * Propagates [`sample`]'s per-stream errors ([`FocrError::NotImplemented`] for
+///   `temperature > 0`, [`FocrError::Other`] for an empty row).
+pub fn batched_sample(
+    logits: &Mat,
+    histories: &[&[u32]],
+    params: &DecodeParams,
+) -> FocrResult<Vec<u32>> {
+    if histories.len() != logits.rows {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "sampler::batched_sample: {} histories for {} logits rows (need one history per stream)",
+            histories.len(),
+            logits.rows
+        )));
+    }
+    let expected_len = logits.rows.checked_mul(logits.cols).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "sampler::batched_sample: logits shape product overflow for [{}, {}]",
+            logits.rows,
+            logits.cols
+        ))
+    })?;
+    if logits.data.len() != expected_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "sampler::batched_sample: logits data len {} != rows*cols {} for shape [{}, {}]",
+            logits.data.len(),
+            expected_len,
+            logits.rows,
+            logits.cols
+        )));
+    }
+
+    let mut tokens = Vec::with_capacity(logits.rows);
+    for (s, hist) in histories.iter().enumerate() {
+        // PERF SEAM: per-stream `[1, vocab]` row copy so we can reuse the
+        // single-stream `sample` byte-for-byte (same fn, same args) — lossless by
+        // construction. The optimization that removes this copy lives behind the
+        // bd-1azu batched-decode kill-switch, not here.
+        let row = Mat::from_vec(1, logits.cols, logits.row(s).to_vec());
+        tokens.push(sample(&row, hist, params)?);
+    }
+    Ok(tokens)
+}
+
+/// Batched [`decode_step`]: greedy-decode `B` streams and classify EOS per stream
+/// (bd-1azu.7). `result[s]` is byte-for-byte the [`DecodeOutput`] the
+/// single-stream [`decode_step`] returns for `(row s, histories[s])`. Thin wrapper
+/// over [`batched_sample`] plus per-stream EOS classification ([SPEC-101]).
+///
+/// # Errors
+/// Propagates [`batched_sample`]'s errors.
+pub fn batched_decode_step(
+    logits: &Mat,
+    histories: &[&[u32]],
+    params: &DecodeParams,
+) -> FocrResult<Vec<DecodeOutput>> {
+    let tokens = batched_sample(logits, histories, params)?;
+    Ok(tokens
+        .into_iter()
+        .map(|token_id| DecodeOutput::new(token_id, params))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
