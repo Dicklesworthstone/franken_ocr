@@ -2,7 +2,7 @@
 name = "franken_ocr"
 version = "0.0.0"
 edition = "2024"
-license = "MIT"
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 description = "Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model (single-binary CLI: focr)"
 readme = "README.md"
 

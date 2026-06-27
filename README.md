@@ -171,7 +171,7 @@ Please don't take this the wrong way, but I do not accept outside contributions 
 
 ## License
 
-The `franken_ocr` source code is licensed under the [MIT License](./LICENSE), Copyright (c) 2026 The franken_ocr authors.
+The `franken_ocr` source code is licensed under the [MIT License with an OpenAI/Anthropic Rider](./LICENSE), Copyright (c) 2026 Jeffrey Emanuel.
 
 The model weights are a separate matter. The Baidu Unlimited-OCR weights, and any quantized derivative this project distributes, are under the MIT License, Copyright (c) 2026 Baidu, reproduced in full in [`LICENSE`](./LICENSE) under "THIRD-PARTY MODEL WEIGHTS, NOTICE". That notice travels with any distributed weight artifact.
 

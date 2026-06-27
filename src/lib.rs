@@ -48,7 +48,7 @@ pub const MODEL_PATH_ENV: &str = "FOCR_MODEL_PATH";
 /// Source-code license notice for this crate, surfaced in the long version
 /// report separately from the model-weights notice.
 pub const FOCR_PROJECT_LICENSE_NOTICE: &str =
-    "franken_ocr - Copyright (c) 2026 The franken_ocr authors, MIT License";
+    "franken_ocr - Copyright (c) 2026 Jeffrey Emanuel, MIT License (with OpenAI/Anthropic Rider)";
 
 /// Baidu Unlimited-OCR model-weights notice. This is the single source of truth
 /// for the notice that must travel with redistributed `.focrq` artifacts and
