@@ -92,6 +92,9 @@ pub fn long_version_report() -> String {
 pub enum Command {
     /// Parse a document image into structured markdown (or `--json`).
     Ocr(OcrArgs),
+    /// OCR many images in ONE process — load the 6.2 GB weights + build the int8
+    /// decoder cache ONCE, then stream a result per image (the throughput path).
+    OcrBatch(OcrBatchArgs),
     /// Offline weight transformation: safetensors → `.focrq` (plan §5).
     Convert(ConvertArgs),
     /// Agent-facing diagnostics and the machine contract.
@@ -117,6 +120,23 @@ pub struct OcrArgs {
     /// Stream NDJSON robot events as pages complete.
     #[arg(long)]
     pub robot: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct OcrBatchArgs {
+    /// Input document image paths. The model + int8 decoder cache are built once
+    /// and reused across all of them (load-once batch throughput).
+    #[arg(required = true)]
+    pub images: Vec<PathBuf>,
+    /// Explicit model artifact path (else the env-resolved default).
+    #[arg(long)]
+    pub model: Option<PathBuf>,
+    /// Emit machine-readable JSON (one object per image + a final summary).
+    #[arg(long)]
+    pub json: bool,
+    /// Use the f32 decoder instead of the default int8 throughput path.
+    #[arg(long = "f32")]
+    pub no_int8: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -386,6 +406,7 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             run_ocr(args, true)
         }
         Command::Ocr(args) => run_ocr(args, false),
+        Command::OcrBatch(args) => run_ocr_batch(args),
         Command::Convert(args) => run_convert(&args),
         Command::Runs(args) => run_runs(&args),
         Command::Sync(args) => run_sync(&args),
@@ -416,6 +437,83 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         }));
     } else {
         println!("{markdown}");
+    }
+    Ok(())
+}
+
+/// Load-once batch OCR: build the model + int8 decoder cache ONCE (the
+/// [`OcrEngine`] `Arc` cache amortizes the 6.2 GB weight read; the model's int8
+/// `OnceLock` amortizes the ~1.2 s quant), then recognize every image in the same
+/// process. Defaults to the int8 throughput decode path (`--f32` opts out). This
+/// is where the throughput win lands: per-image cost drops to vision + decode,
+/// with load + quant paid once instead of once per `focr ocr` invocation.
+fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
+    if let Some(err) = forced_test_error()? {
+        return Err(err);
+    }
+    if !args.no_int8 {
+        native_engine::force_int8_decode(true);
+    }
+    let engine = OcrEngine::new()?;
+    let model = args.model.clone();
+    let count = args.images.len();
+    let total = std::time::Instant::now();
+    let mut results: Vec<serde_json::Value> = Vec::with_capacity(count);
+
+    for image in &args.images {
+        let started = std::time::Instant::now();
+        let outcome = match model.as_deref() {
+            Some(m) => engine.recognize_with_model(m, image),
+            None => engine.recognize(image),
+        };
+        let secs = started.elapsed().as_secs_f64();
+        match outcome {
+            Ok(markdown) => {
+                if args.json {
+                    results.push(serde_json::json!({
+                        "image": image.display().to_string(),
+                        "ok": true,
+                        "seconds": secs,
+                        "markdown": markdown,
+                    }));
+                } else {
+                    eprintln!("[focr] {} ({secs:.2}s)", image.display());
+                    println!("===== {} =====", image.display());
+                    println!("{markdown}");
+                }
+            }
+            Err(err) => {
+                if args.json {
+                    results.push(serde_json::json!({
+                        "image": image.display().to_string(),
+                        "ok": false,
+                        "seconds": secs,
+                        "error": err.to_string(),
+                    }));
+                } else {
+                    eprintln!("[focr] {} FAILED ({secs:.2}s): {err}", image.display());
+                }
+            }
+        }
+    }
+
+    let elapsed = total.elapsed().as_secs_f64();
+    let per_image = elapsed / (count.max(1) as f64);
+    if args.json {
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "command": "ocr-batch",
+            "count": count,
+            "int8": !args.no_int8,
+            "seconds_total": elapsed,
+            "seconds_per_image": per_image,
+            "results": results,
+        }));
+    } else {
+        eprintln!(
+            "[focr] batch complete: {count} images in {elapsed:.2}s ({per_image:.2}s/image, int8={})",
+            !args.no_int8
+        );
     }
     Ok(())
 }

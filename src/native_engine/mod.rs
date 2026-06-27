@@ -73,6 +73,12 @@ pub struct OcrModel {
     /// single-image window 128). Built once at load so the AR loop reads a
     /// stable config (plan §6.10, [SPEC-100..103]).
     decode_params: DecodeParams,
+    /// Lazily-built, then reused int8 decoder weight cache (per-output-channel
+    /// S8S8). Building it quantizes the whole decoder (~1.2 s); caching it on the
+    /// model amortizes that across every page in a load-once batch
+    /// ([`OcrEngine`] already amortizes the 6.2 GB weight load via its `Arc`
+    /// cache, so a batch loop pays load + quant ONCE, not per page).
+    decoder_cache_i8: std::sync::OnceLock<decoder::DecoderWeightCacheI8>,
 }
 
 /// Process-global cache of the last-loaded model, keyed by resolved path.
@@ -115,6 +121,23 @@ const DECODE_STATELESS_ENV: &str = "FOCR_DECODE_STATELESS";
 /// verified against the f32 path + baidu CER. Off by default until the int8 CER
 /// sweep is locked in; flip the default once proven across the 20-page gauntlet.
 const DECODE_INT8_ENV: &str = "FOCR_DECODE_INT8";
+
+/// Process-global override that forces the int8 decode path without mutating the
+/// environment (edition-2024 `set_var` is `unsafe`, and this crate denies unsafe).
+/// Set by the load-once batch CLI so a batch run gets the int8 throughput path +
+/// amortized int8 weight cache. OR'd with [`DECODE_INT8_ENV`].
+static FORCE_INT8_DECODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Force (or clear) the int8 decode path process-wide. See [`FORCE_INT8_DECODE`].
+pub fn force_int8_decode(on: bool) {
+    FORCE_INT8_DECODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether decode should run int8: the process-global force flag OR the env var.
+fn int8_decode_requested() -> bool {
+    FORCE_INT8_DECODE.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os(DECODE_INT8_ENV).is_some()
+}
 
 /// Emit a stage-timing line to stderr when `FOCR_TIMING` is set (perf bring-up).
 fn timing_log(msg: &str) {
@@ -458,6 +481,7 @@ impl OcrModel {
             path: resolved.clone(),
             weights,
             decode_params: decode_params_from_env(),
+            decoder_cache_i8: std::sync::OnceLock::new(),
         });
 
         let mut guard = model_cache_guard()?;
@@ -733,7 +757,7 @@ impl OcrModel {
     fn generate(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
         if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
             self.generate_stateless(inputs_embeds, prompt_ids)
-        } else if std::env::var_os(DECODE_INT8_ENV).is_some() {
+        } else if int8_decode_requested() {
             self.generate_cached_i8(inputs_embeds, prompt_ids)
         } else {
             self.generate_cached(inputs_embeds, prompt_ids)
@@ -848,14 +872,24 @@ impl OcrModel {
             )));
         }
 
-        // Quantize the decoder weights to int8 ONCE; prefill + every decode step
-        // then run off the owned int8 cache (~2.8 GB, 4x less traffic than f32).
+        // Quantize the decoder weights to int8 ONCE and cache on the model; a
+        // load-once batch then reuses it across pages (the build is ~1.2 s). The
+        // first page pays the quant; every later page in the same process skips it.
         let tb = std::time::Instant::now();
-        let wc = decoder::DecoderWeightCacheI8::build(&self.weights)?;
+        let wc = match self.decoder_cache_i8.get() {
+            Some(c) => c,
+            None => {
+                let built = decoder::DecoderWeightCacheI8::build(&self.weights)?;
+                // A concurrent racer may win the set; either way `get` then yields
+                // the single shared cache (the batch CLI is sequential anyway).
+                let _ = self.decoder_cache_i8.set(built);
+                self.decoder_cache_i8.get().expect("just set")
+            }
+        };
         timing_log(&format!("weight_cache_build_i8 {:.2}s", tb.elapsed().as_secs_f64()));
 
         let tp = std::time::Instant::now();
-        let (hidden, mut caches) = decoder::prefill_with_cache_i8(&wc, &inputs_embeds)?;
+        let (hidden, mut caches) = decoder::prefill_with_cache_i8(wc, &inputs_embeds)?;
         let mut last_hidden = Self::last_hidden_row(&hidden)?;
         timing_log(&format!(
             "prefill_i8 {:.2}s ({} tokens)",
@@ -868,7 +902,7 @@ impl OcrModel {
         let mut emitted: Vec<u32> = Vec::new();
 
         while emitted.len() < params.max_length {
-            let logits = decoder::lm_head_cached_i8(&wc, &last_hidden)?;
+            let logits = decoder::lm_head_cached_i8(wc, &last_hidden)?;
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token_id);
             emitted.push(step.token_id);
@@ -884,7 +918,7 @@ impl OcrModel {
             let row = table.data[next * hidden_dim..(next + 1) * hidden_dim].to_vec();
             let token_embed = Mat::from_vec(1, hidden_dim, row);
             let position = prefill_len + (emitted.len() - 1);
-            let h = decoder::decode_step_with_cache_i8(&wc, &mut caches, &token_embed, position)?;
+            let h = decoder::decode_step_with_cache_i8(wc, &mut caches, &token_embed, position)?;
             last_hidden = Self::last_hidden_row(&h)?;
         }
         timing_log(&format!(
