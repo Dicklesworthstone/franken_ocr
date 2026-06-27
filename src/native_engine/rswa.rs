@@ -31,6 +31,11 @@
 //! `position_ids` only as provenance / a sanity hook, never re-deriving phase
 //! from the ring slot.
 
+// Numerical kernel file: hot attention loops index parallel stride-arrays by range
+// (`v[r*HEAD_DIM..]`, `scores[r]`, `scale[r]`), where `clippy::needless_range_loop`
+// is a false positive — the index is genuinely needed across several arrays.
+#![allow(clippy::needless_range_loop)]
+
 use super::tensor::Mat;
 use crate::error::{FocrError, FocrResult};
 

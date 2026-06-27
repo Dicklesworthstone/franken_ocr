@@ -32,6 +32,11 @@
 //! over explicit `&[f32]` / [`Mat`] slices; the entrypoints are the thin wiring
 //! over them.
 
+// Numerical kernel file: many hot loops index parallel stride-arrays by range
+// (`a[r*stride..]`, `caches[layer]`/`weights[layer]`), where `clippy::needless_range_loop`
+// is a false positive — the index is genuinely needed across several arrays.
+#![allow(clippy::needless_range_loop)]
+
 use super::moe;
 use super::nn;
 use super::rswa::{self, RingCache};
@@ -1329,8 +1334,8 @@ fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
     y
 }
 
-/// One SwiGLU expert over a single decode row `x[hidden]`, int8: `down(silu(gate·x)
-/// * (up·x))`. The int8 twin of [`expert_gemv`]. Internally parallel (used for the
+/// One SwiGLU expert over a single decode row `x[hidden]`, int8: `down(silu(gate·x) *
+/// (up·x))`. The int8 twin of [`expert_gemv`]. Internally parallel (used for the
 /// big dense layer-0 MLP + the shared expert).
 fn expert_gemv_i8(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32> {
     let g = gemv_i8(x, gate);

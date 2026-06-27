@@ -749,6 +749,7 @@ impl OcrModel {
     ///     ring cache, then extend one token per step — O(n) ([`Self::generate_cached`]).
     ///   * **stateless** (`FOCR_DECODE_STATELESS`): re-prefill the whole growing
     ///     sequence every step — O(n^2), the parity oracle ([`Self::generate_stateless`]).
+    ///
     /// Both emit the SAME tokens for the first 128 steps (the R-SWA window).
     ///
     /// # Errors
