@@ -138,6 +138,12 @@ pub struct RingCache {
     /// Next ring slot to write (`0..RING_WINDOW`). Only advances modulo `W` at
     /// steady state; during warm-up it tracks `ring_len`.
     ring_pos: usize,
+    /// Monotonic count of [`RingCache::write_decode_step`] calls since the last
+    /// [`RingCache::record_prefill`] (reset to `0` there). Not part of the
+    /// attention math — it exists so [`RingCache::checkpoint`] /
+    /// [`RingCache::rollback_to`] (bd-1azu.31) can count the discarded
+    /// speculative steps and enforce the lossless roll-back contract.
+    decode_writes: usize,
     /// Per-row symmetric int8 mirror of the K/V regions — `Some` iff
     /// [`FOCR_INT8_KV`](INT8_KV_ENV) was set when this cache was built (so the
     /// default path allocates nothing). Populated in lock-step with the f32 K/V
@@ -210,6 +216,72 @@ fn quantize_row_i8(row: &[f32], q: &mut [i8]) -> f32 {
     scale
 }
 
+/// A lightweight, copy-able snapshot of a [`RingCache`]'s *mutable generated-tail
+/// write state* — the cursors needed to roll the ring back to a prior decode
+/// point WITHOUT copying any K/V buffer (bd-1azu.31).
+///
+/// Captured by [`RingCache::checkpoint`] and replayed by
+/// [`RingCache::rollback_to`] to discard speculative decode steps (e.g. the
+/// rejected suffix of a speculative-decoding draft block): checkpoint before the
+/// draft, write the draft tokens, then roll back to erase the rejected ones. Only
+/// the generated tail moves — the reference (prefill) block is frozen and never
+/// rolls back — so the snapshot is just the prefill boundary (recorded as a
+/// provenance guard), the ring `len`/`pos` cursors, and the monotonic
+/// decode-write count.
+///
+/// ## LOSSLESS contract
+/// Rollback restores the EXACT byte-for-byte readable ring state — the discarded
+/// speculative steps leave no trace — PROVIDED those steps only *appended* fresh
+/// ring slots and never wrapped around to overwrite a slot that was already live
+/// at the checkpoint. That holds whenever
+/// `checkpoint.ring_len + (#discarded steps) <= RING_WINDOW`, which is the
+/// speculative-decode regime (a short draft block appended to the generated
+/// tail). If a discarded write evicted a checkpoint-live slot (a steady-state
+/// in-place overwrite), that slot's prior K/V is physically gone and cannot be
+/// reconstructed from cursors alone; [`RingCache::rollback_to`] `debug_assert`s
+/// against exactly that case rather than silently returning a corrupted cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RingCheckpoint {
+    /// Reference-block boundary at checkpoint time (frozen; a provenance guard so
+    /// a checkpoint can't be replayed onto a differently-prefilled cache).
+    prefill_len: Option<usize>,
+    /// Live ring rows at checkpoint (`0..=RING_WINDOW`).
+    ring_len: usize,
+    /// Next ring write slot at checkpoint (`0..RING_WINDOW`).
+    ring_pos: usize,
+    /// [`RingCache::write_decode_step`] count at checkpoint time — lets
+    /// [`RingCache::rollback_to`] tally the discarded steps and enforce the
+    /// lossless contract.
+    decode_writes: usize,
+}
+
+impl RingCheckpoint {
+    /// Reference-block length captured at checkpoint (`None` if not yet prefilled).
+    #[must_use]
+    pub fn prefill_len(&self) -> Option<usize> {
+        self.prefill_len
+    }
+
+    /// Live ring rows captured at checkpoint (`0..=RING_WINDOW`).
+    #[must_use]
+    pub fn ring_len(&self) -> usize {
+        self.ring_len
+    }
+
+    /// Next ring write slot captured at checkpoint (`0..RING_WINDOW`).
+    #[must_use]
+    pub fn ring_pos(&self) -> usize {
+        self.ring_pos
+    }
+
+    /// Effective key count (`prefill_len + ring_len`) captured at checkpoint —
+    /// the number of keys a decode query attended over at that point.
+    #[must_use]
+    pub fn effective_len(&self) -> usize {
+        self.prefill_len.unwrap_or(0) + self.ring_len
+    }
+}
+
 impl RingCache {
     /// Allocate a ring cache for one layer sized for the worst-case prefill.
     ///
@@ -237,6 +309,7 @@ impl RingCache {
             prefill_len: None,
             ring_len: 0,
             ring_pos: 0,
+            decode_writes: 0,
             int8: with_int8.then(|| Int8Kv::new(prefill_capacity)),
         }
     }
@@ -332,6 +405,7 @@ impl RingCache {
         self.prefill_len = Some(seq);
         self.ring_len = 0;
         self.ring_pos = 0;
+        self.decode_writes = 0;
         Ok(())
     }
 
@@ -409,7 +483,76 @@ impl RingCache {
                 );
             }
         }
+        // Count this write so checkpoint/rollback (bd-1azu.31) can tally the
+        // discarded speculative steps; not used by the attention math.
+        self.decode_writes += 1;
         Ok(slot)
+    }
+
+    /// Capture the current generated-tail write cursors as a [`RingCheckpoint`]
+    /// for a later [`RingCache::rollback_to`] (bd-1azu.31 — speculative-decode
+    /// roll-back). `O(1)`, copies NO K/V buffer: only the ring `len`/`pos`, the
+    /// (frozen) prefill boundary, and the decode-write counter. Take this BEFORE
+    /// writing speculative decode steps; if they are rejected, [`rollback_to`]
+    /// erases them so they leave no trace.
+    ///
+    /// [`rollback_to`]: RingCache::rollback_to
+    #[must_use]
+    pub fn checkpoint(&self) -> RingCheckpoint {
+        RingCheckpoint {
+            prefill_len: self.prefill_len,
+            ring_len: self.ring_len,
+            ring_pos: self.ring_pos,
+            decode_writes: self.decode_writes,
+        }
+    }
+
+    /// Roll the ring back to a prior [`RingCheckpoint`], discarding every decode
+    /// step written since it was taken so subsequent reads/writes behave as if
+    /// those speculative steps never happened (bd-1azu.31). Restores only the
+    /// generated-tail cursors (`ring_len`/`ring_pos`/`decode_writes`); the
+    /// reference (prefill) block is frozen and untouched. The stale K/V bytes left
+    /// in the now-dead ring slots (`>= ring_len`) are never read — the decode read
+    /// paths scan exactly `0..ring_len` — so no buffer needs clearing or copying,
+    /// which is what makes the roll-back both `O(1)` and byte-for-byte lossless.
+    ///
+    /// # Panics (debug only)
+    /// `debug_assert`s the [LOSSLESS contract](RingCheckpoint): the checkpoint
+    /// must belong to this cache (same `prefill_len`), must not be from the future
+    /// (its `decode_writes` not above the cache's), and the discarded steps must
+    /// not have wrapped the ring past the checkpoint's live rows
+    /// (`checkpoint.ring_len + discarded <= RING_WINDOW`) — otherwise an evicted
+    /// slot's prior K/V is physically gone and the roll-back would NOT be lossless.
+    pub fn rollback_to(&mut self, cp: &RingCheckpoint) {
+        // Contract guard (debug builds only — compiled out of release, where the
+        // local would otherwise be unused). `discarded` lives entirely inside the
+        // gated block so there is no release-build dead-code/unused-var warning.
+        #[cfg(debug_assertions)]
+        {
+            assert_eq!(
+                cp.prefill_len, self.prefill_len,
+                "rswa: rollback_to checkpoint prefill_len {:?} != cache {:?}",
+                cp.prefill_len, self.prefill_len
+            );
+            assert!(
+                cp.decode_writes <= self.decode_writes,
+                "rswa: rollback_to checkpoint is from the future \
+                 (cp.decode_writes={} > cache={})",
+                cp.decode_writes,
+                self.decode_writes
+            );
+            let discarded = self.decode_writes - cp.decode_writes;
+            assert!(
+                cp.ring_len + discarded <= RING_WINDOW,
+                "rswa: rollback_to is not lossless — {discarded} discarded steps \
+                 wrapped the ring past checkpoint.ring_len={} (W={RING_WINDOW}); an \
+                 evicted slot's prior K/V cannot be restored from cursors alone",
+                cp.ring_len
+            );
+        }
+        self.ring_len = cp.ring_len;
+        self.ring_pos = cp.ring_pos;
+        self.decode_writes = cp.decode_writes;
     }
 
     /// Reference-K row `r` for head `h` (`r < prefill_len`).
@@ -609,6 +752,33 @@ impl BatchedRingCache {
         v_step: &[f32],
     ) -> FocrResult<usize> {
         self.streams[s][layer].write_decode_step(k_step, v_step)
+    }
+
+    /// Capture stream `s` layer `layer`'s ring write cursors as a
+    /// [`RingCheckpoint`] for a later [`BatchedRingCache::rollback_to`]
+    /// (bd-1azu.31 — per-stream speculative-decode roll-back). Per-stream
+    /// independent; delegates to [`RingCache::checkpoint`].
+    ///
+    /// # Panics
+    /// Panics if `s >= num_streams()` or `layer >= num_layers()`.
+    #[must_use]
+    pub fn checkpoint(&self, s: usize, layer: usize) -> RingCheckpoint {
+        self.streams[s][layer].checkpoint()
+    }
+
+    /// Roll stream `s` layer `layer`'s ring back to a prior [`RingCheckpoint`],
+    /// discarding the speculative decode steps written into THAT stream's ring so
+    /// it behaves as if they never happened. Per-stream independent (a roll-back
+    /// on one stream never touches another); delegates to
+    /// [`RingCache::rollback_to`] under the identical lossless contract / debug
+    /// asserts.
+    ///
+    /// # Panics
+    /// Panics if `s >= num_streams()` or `layer >= num_layers()`; in debug builds
+    /// also on a checkpoint that violates the lossless contract (see
+    /// [`RingCache::rollback_to`]).
+    pub fn rollback_to(&mut self, s: usize, layer: usize, cp: &RingCheckpoint) {
+        self.streams[s][layer].rollback_to(cp);
     }
 
     /// Total default-path (f32) KV working-set bytes across all streams/layers —
@@ -1652,6 +1822,135 @@ mod tests {
             decode_attention_int8(&cache, &q),
             "without an int8 KV mirror",
         );
+    }
+
+    // ── checkpoint / rollback (bd-1azu.31) — direct private-row byte-identity ───
+
+    /// Roll-back restores the cursors AND leaves every accepted (live) K/V row
+    /// byte-for-byte identical to a control cache that never wrote the
+    /// speculative steps — proved here by reading the private `ring_*`/`ref_*`
+    /// rows directly (the integration test proves the same through the public
+    /// `decode_attention` output). Also shows the design is O(1): the dead ring
+    /// slots are NOT cleared (they still hold the discarded draft) yet are never
+    /// read, since the cursors confine all reads to `0..ring_len`.
+    #[test]
+    fn checkpoint_rollback_restores_ring_rows_byte_identical() {
+        let pf = 5usize;
+        let accept = 9usize;
+        let accept_tok =
+            |t: usize| one_token(|h, d| ((h * 7 + d * 3 + t * 5) % 13) as f32 * 0.1 - 0.6);
+        let build = || {
+            let mut c = RingCache::new(64);
+            let k = fill_head_major(pf, |r, d| ((r * 3 + d) % 11) as f32 * 0.07 - 0.3);
+            let v = fill_head_major(pf, |r, d| ((r + d * 2) % 9) as f32 * 0.05 - 0.2);
+            c.record_prefill(&k, &v, pf).unwrap();
+            for t in 0..accept {
+                let kt = accept_tok(t);
+                c.write_decode_step(&kt, &kt).unwrap();
+            }
+            c
+        };
+        let control = build();
+        let mut test = build();
+
+        let cp = test.checkpoint();
+        assert_eq!(cp.ring_len(), accept);
+        assert_eq!(cp.ring_pos(), accept);
+        assert_eq!(cp.prefill_len(), Some(pf));
+        assert_eq!(cp.effective_len(), pf + accept);
+
+        // Speculate 6 distinct (clearly non-zero) draft steps, then roll back.
+        for t in 0..6 {
+            let kt = one_token(|h, d| ((h + d + t) % 5) as f32 * 0.3 + 0.9);
+            test.write_decode_step(&kt, &kt).unwrap();
+        }
+        assert_eq!(test.ring_len(), accept + 6);
+        test.rollback_to(&cp);
+
+        // Cursors (including the private decode-write counter) restored exactly.
+        assert_eq!(test.ring_len(), accept);
+        assert_eq!(test.ring_pos(), accept);
+        assert_eq!(test.decode_writes, accept);
+        assert_eq!(test.effective_len(), pf + accept);
+        assert!(!test.is_warm());
+
+        // Every LIVE K/V row is byte-identical to the never-speculated control.
+        for h in 0..NUM_HEADS {
+            for r in 0..test.ring_len() {
+                assert_eq!(
+                    test.ring_k_row(h, r),
+                    control.ring_k_row(h, r),
+                    "ring_k h{h} r{r}"
+                );
+                assert_eq!(
+                    test.ring_v_row(h, r),
+                    control.ring_v_row(h, r),
+                    "ring_v h{h} r{r}"
+                );
+            }
+            for r in 0..pf {
+                assert_eq!(
+                    test.ref_k_row(h, r),
+                    control.ref_k_row(h, r),
+                    "ref_k h{h} r{r}"
+                );
+                assert_eq!(
+                    test.ref_v_row(h, r),
+                    control.ref_v_row(h, r),
+                    "ref_v h{h} r{r}"
+                );
+            }
+        }
+        // The first dead slot still holds the discarded draft (not cleared) — the
+        // O(1) roll-back relies on it simply never being read past `ring_len`.
+        assert_ne!(
+            test.ring_k_row(0, accept),
+            control.ring_k_row(0, accept),
+            "dead slot is intentionally left stale (never read)"
+        );
+
+        // A fresh accepted write lands in the checkpoint's slot, as if the
+        // speculation never happened.
+        let kt = accept_tok(accept);
+        assert_eq!(test.write_decode_step(&kt, &kt).unwrap(), accept);
+        assert_eq!(test.ring_len(), accept + 1);
+    }
+
+    /// The contract guard refuses a roll-back that would have to resurrect an
+    /// evicted (steady-state-overwritten) slot — indices alone cannot restore it.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "not lossless")]
+    fn rollback_rejects_eviction_in_steady_state() {
+        let mut c = RingCache::new(8);
+        let k = fill_head_major(3, |_, _| 0.25);
+        c.record_prefill(&k, &k, 3).unwrap();
+        for _ in 0..RING_WINDOW {
+            let t = one_token(|_, _| 0.5);
+            c.write_decode_step(&t, &t).unwrap();
+        }
+        assert!(c.is_warm());
+        let cp = c.checkpoint();
+        // One steady-state write overwrites slot 0 (live at the checkpoint).
+        let t = one_token(|_, _| 1.0);
+        c.write_decode_step(&t, &t).unwrap();
+        c.rollback_to(&cp); // must panic: not lossless.
+    }
+
+    /// A no-op roll-back to a fresh checkpoint (no writes in between) leaves the
+    /// cache bit-identical and is always allowed.
+    #[test]
+    fn rollback_noop_is_identity() {
+        let mut c = RingCache::new(16);
+        let k = fill_head_major(4, |r, d| ((r + d) % 7) as f32 * 0.1);
+        c.record_prefill(&k, &k, 4).unwrap();
+        let t = one_token(|_, _| 0.3);
+        c.write_decode_step(&t, &t).unwrap();
+        let cp = c.checkpoint();
+        c.rollback_to(&cp);
+        assert_eq!(c.ring_len(), 1);
+        assert_eq!(c.ring_pos(), 1);
+        assert_eq!(c.decode_writes, 1);
     }
 }
 
