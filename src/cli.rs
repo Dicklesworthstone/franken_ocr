@@ -441,12 +441,54 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     Ok(())
 }
 
+/// Emit ONE batch image's outcome in the shared `ocr-batch` shape — a JSON object
+/// pushed to `results` (with `--json`) or the `[focr] … =====` markdown block on
+/// stdout/stderr. Factored so the sequential and spine drivers render byte-for-byte
+/// identically; only the source of `outcome` differs between them.
+fn emit_batch_result(
+    json: bool,
+    image: &std::path::Path,
+    secs: f64,
+    outcome: FocrResult<String>,
+    results: &mut Vec<serde_json::Value>,
+) {
+    match outcome {
+        Ok(markdown) => {
+            if json {
+                results.push(serde_json::json!({
+                    "image": image.display().to_string(),
+                    "ok": true,
+                    "seconds": secs,
+                    "markdown": markdown,
+                }));
+            } else {
+                eprintln!("[focr] {} ({secs:.2}s)", image.display());
+                println!("===== {} =====", image.display());
+                println!("{markdown}");
+            }
+        }
+        Err(err) => {
+            if json {
+                results.push(serde_json::json!({
+                    "image": image.display().to_string(),
+                    "ok": false,
+                    "seconds": secs,
+                    "error": err.to_string(),
+                }));
+            } else {
+                eprintln!("[focr] {} FAILED ({secs:.2}s): {err}", image.display());
+            }
+        }
+    }
+}
+
 /// Load-once batch OCR: build the model + int8 decoder cache ONCE (the
 /// [`OcrEngine`] `Arc` cache amortizes the 6.2 GB weight read; the model's int8
 /// `OnceLock` amortizes the ~1.2 s quant), then recognize every image in the same
-/// process. Defaults to the int8 throughput decode path (`--f32` opts out). This
-/// is where the throughput win lands: per-image cost drops to vision + decode,
-/// with load + quant paid once instead of once per `focr ocr` invocation.
+/// process. Defaults to the int8 throughput decode path (`--f32` opts out). With
+/// the continuous-batch spine armed (`FOCR_BATCH_SPINE`) all pages decode together
+/// through the scheduler; otherwise the proven sequential per-image loop runs.
+/// Either driver renders the SAME per-image output (bd-1azu.13).
 fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     if let Some(err) = forced_test_error()? {
         return Err(err);
@@ -460,40 +502,36 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     let total = std::time::Instant::now();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(count);
 
-    for image in &args.images {
-        let started = std::time::Instant::now();
-        let outcome = match model.as_deref() {
-            Some(m) => engine.recognize_with_model(m, image),
-            None => engine.recognize(image),
-        };
-        let secs = started.elapsed().as_secs_f64();
-        match outcome {
-            Ok(markdown) => {
-                if args.json {
-                    results.push(serde_json::json!({
-                        "image": image.display().to_string(),
-                        "ok": true,
-                        "seconds": secs,
-                        "markdown": markdown,
-                    }));
-                } else {
-                    eprintln!("[focr] {} ({secs:.2}s)", image.display());
-                    println!("===== {} =====", image.display());
-                    println!("{markdown}");
-                }
-            }
-            Err(err) => {
-                if args.json {
-                    results.push(serde_json::json!({
-                        "image": image.display().to_string(),
-                        "ok": false,
-                        "seconds": secs,
-                        "error": err.to_string(),
-                    }));
-                } else {
-                    eprintln!("[focr] {} FAILED ({secs:.2}s): {err}", image.display());
-                }
-            }
+    if native_engine::batch_scheduler::spine_enabled() {
+        // Continuous-batch decode spine (FOCR_BATCH_SPINE=1): prefill + decode
+        // every page TOGETHER. The per-page markdown is byte-identical to the
+        // sequential loop below (bd-1azu.13), only throughput differs. A
+        // batch-level failure (ModelNotFound / timeout) propagates as the run's
+        // exit code rather than being folded into per-image results.
+        let image_refs: Vec<&std::path::Path> = args
+            .images
+            .iter()
+            .map(std::path::PathBuf::as_path)
+            .collect();
+        let batch = match model.as_deref() {
+            Some(m) => engine.recognize_batch_with_model(m, &image_refs),
+            None => engine.recognize_batch(&image_refs),
+        }?;
+        let per_image = total.elapsed().as_secs_f64() / (count.max(1) as f64);
+        for (image, outcome) in args.images.iter().zip(batch) {
+            emit_batch_result(args.json, image, per_image, outcome, &mut results);
+        }
+    } else {
+        // Sequential per-image loop — the proven oracle path (FOCR_BATCH_SPINE=0),
+        // byte-for-byte what it has always been.
+        for image in &args.images {
+            let started = std::time::Instant::now();
+            let outcome = match model.as_deref() {
+                Some(m) => engine.recognize_with_model(m, image),
+                None => engine.recognize(image),
+            };
+            let secs = started.elapsed().as_secs_f64();
+            emit_batch_result(args.json, image, secs, outcome, &mut results);
         }
     }
 

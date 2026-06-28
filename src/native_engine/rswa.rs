@@ -506,6 +506,41 @@ impl BatchedRingCache {
         Self { streams, n_layers }
     }
 
+    /// Adopt `B` pre-built, already-prefilled per-stream [`RingCache`] vectors as
+    /// the batched cache — the bd-1azu.11 spine seam. Each `streams[s]` is page
+    /// `s`'s full `Vec<RingCache>` straight out of
+    /// [`super::decoder::prefill_with_cache_i8`] (one [`RingCache`] per decoder
+    /// layer, its reference block already recorded), so stream `s` decodes
+    /// byte-for-byte as if it had run alone. Stream slot `s` here is the cache
+    /// index the scheduler's [`super::batch_scheduler::DecoderBatchStep`] addresses.
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] if `streams` is empty, the first stream has zero
+    /// layers, or any stream's layer count differs from the first (every stream
+    /// must carry the same number of layers for a batched forward).
+    pub fn from_streams(streams: Vec<Vec<RingCache>>) -> FocrResult<Self> {
+        let Some(first) = streams.first() else {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "rswa: BatchedRingCache::from_streams needs at least one stream"
+            )));
+        };
+        let n_layers = first.len();
+        if n_layers == 0 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "rswa: BatchedRingCache::from_streams stream 0 has zero layers"
+            )));
+        }
+        for (s, layers) in streams.iter().enumerate() {
+            if layers.len() != n_layers {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "rswa: BatchedRingCache::from_streams stream {s} has {} layers != {n_layers}",
+                    layers.len()
+                )));
+            }
+        }
+        Ok(Self { streams, n_layers })
+    }
+
     /// Number of in-flight page-streams `B`.
     #[must_use]
     pub fn num_streams(&self) -> usize {
@@ -1811,5 +1846,69 @@ mod batched_ring_tests {
             .sum();
         assert_eq!(bc.kv_f32_bytes(), expect);
         assert!(bc.kv_f32_bytes() > 0);
+    }
+
+    /// `from_streams` must ADOPT pre-built, already-prefilled per-stream rings so
+    /// the batched cache decodes byte-for-byte as the standalone `Vec<RingCache>`
+    /// it was handed — the bd-1azu.11 prefill→spine handoff. Build standalone
+    /// streams, move them into a [`BatchedRingCache`], and verify the adopted slot
+    /// stays bit-exact to an independent mirror across decode steps.
+    #[test]
+    fn from_streams_adopts_prebuilt_rings_bit_exact() {
+        let n_layers = 2usize;
+        let caps = [6usize, 13];
+        // Each stream's standalone Vec<RingCache> with prefill recorded.
+        let mut built: Vec<Vec<RingCache>> = Vec::new();
+        for (s, &cap) in caps.iter().enumerate() {
+            let mut layers: Vec<RingCache> = (0..n_layers).map(|_| RingCache::new(cap)).collect();
+            for (l, cache) in layers.iter_mut().enumerate() {
+                let (k, v) = build_prefill(s, l, cap);
+                cache.record_prefill(&k, &v, cap).expect("prefill");
+            }
+            built.push(layers);
+        }
+        // Independent mirror of stream 1 to compare against after adoption.
+        let st = 1usize;
+        let mut standalone: Vec<RingCache> =
+            (0..n_layers).map(|_| RingCache::new(caps[st])).collect();
+        for (l, cache) in standalone.iter_mut().enumerate() {
+            let (k, v) = build_prefill(st, l, caps[st]);
+            cache
+                .record_prefill(&k, &v, caps[st])
+                .expect("mirror prefill");
+        }
+
+        let mut bc = BatchedRingCache::from_streams(built).expect("adopt");
+        assert_eq!(bc.num_streams(), caps.len());
+        assert_eq!(bc.num_layers(), n_layers);
+
+        for t in 0..5usize {
+            for (l, cache) in standalone.iter_mut().enumerate() {
+                let (k, v) = build_step(st, l, t);
+                cache.write_decode_step(&k, &v).expect("mirror step");
+            }
+            for l in 0..n_layers {
+                let (k, v) = build_step(st, l, t);
+                bc.write_decode_step(st, l, &k, &v).expect("adopted step");
+            }
+            for l in 0..n_layers {
+                let q = build_q(st, l, t);
+                let a = decode_attention(bc.layer(st, l), &q).expect("adopted attn");
+                let b = decode_attention(&standalone[l], &q).expect("mirror attn");
+                assert_eq!(
+                    a.data, b.data,
+                    "adopted stream {st} layer {l} step {t} differs"
+                );
+            }
+        }
+    }
+
+    /// `from_streams` rejects an empty batch and ragged per-stream layer counts.
+    #[test]
+    fn from_streams_rejects_empty_and_ragged() {
+        assert!(BatchedRingCache::from_streams(Vec::new()).is_err());
+        let s0: Vec<RingCache> = vec![RingCache::new(4), RingCache::new(4)];
+        let s1: Vec<RingCache> = vec![RingCache::new(4)]; // ragged: 1 layer vs 2
+        assert!(BatchedRingCache::from_streams(vec![s0, s1]).is_err());
     }
 }

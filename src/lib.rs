@@ -203,6 +203,53 @@ impl OcrEngine {
         )
     }
 
+    /// Recognize a batch of document images in one load-once pass, returning one
+    /// [`FocrResult`] per image in input order (`result[i]` ⇄ `images[i]`).
+    ///
+    /// The model is resolved from [`OcrEngine::model_path`] and loaded/cached on
+    /// first use; see [`OcrEngine::recognize_batch_with_model`] for the
+    /// path-explicit form and the spine semantics.
+    ///
+    /// # Errors
+    /// [`FocrError::ModelNotFound`] if the model artifact is absent/unresolvable,
+    /// or [`FocrError::Timeout`] if the whole batch exceeds its budget. Per-image
+    /// failures surface inside the returned `Vec`, never as the outer error.
+    pub fn recognize_batch(&self, images: &[&Path]) -> FocrResult<Vec<FocrResult<String>>> {
+        self.recognize_batch_with_model(&Self::model_path(), images)
+    }
+
+    /// Recognize `images` against the model artifact at an explicit `model_path`
+    /// (the path-explicit form of [`OcrEngine::recognize_batch`]).
+    ///
+    /// The model is acquired ONCE (the per-engine `Arc` cache), then the entire
+    /// batch runs inside a SINGLE blocking stage on the runtime's blocking pool —
+    /// the continuous-batch decode spine is the single sequential driver, with no
+    /// per-step relock (Doctrine #5). The forward budget scales with the image
+    /// count. When the spine is disarmed ([`native_engine`]
+    /// `FOCR_BATCH_SPINE`), [`OcrModel::recognize_batch`] falls back to the proven
+    /// per-image sequential path, so the spine-off result is byte-identical to
+    /// today's loop.
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_batch`].
+    pub fn recognize_batch_with_model(
+        &self,
+        model_path: &Path,
+        images: &[&Path],
+    ) -> FocrResult<Vec<FocrResult<String>>> {
+        let model = self.model_at(model_path)?;
+        let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
+        let count = u32::try_from(owned.len().max(1)).unwrap_or(u32::MAX);
+        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
+        let budget = per_image
+            .checked_mul(count)
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        self.run_blocking_stage_with_budget("forward-batch", budget, move || {
+            let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
+            Ok(model.recognize_batch(&refs))
+        })
+    }
+
     fn stage_budget(stage: &str, default_ms: u64) -> Duration {
         let key = format!("FOCR_STAGE_BUDGET_{stage}_MS");
         let millis = std::env::var(&key)

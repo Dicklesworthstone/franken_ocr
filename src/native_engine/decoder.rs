@@ -2101,6 +2101,39 @@ pub fn batched_decode_step_i8(
     token_embeds: &[Mat],
     positions: &[usize],
 ) -> FocrResult<Vec<Mat>> {
+    // Advance EVERY stream in the cache, in cache order — the original full-batch
+    // contract. Delegates to the subset-aware core with the identity stream map,
+    // so this remains byte-for-byte the function its tests pin.
+    let stream_ids: Vec<usize> = (0..caches.num_streams()).collect();
+    batched_decode_step_i8_streams(wc, caches, &stream_ids, token_embeds, positions)
+}
+
+/// Subset-aware twin of [`batched_decode_step_i8`] (bd-1azu.11): advance ONLY the
+/// `stream_ids` of the `caches` this step — the active set the continuous-batch
+/// scheduler hands over, which shrinks as streams retire. `token_embeds[k]`,
+/// `positions[k]`, and the returned row `k` all correspond to cache stream
+/// `stream_ids[k]`. With `stream_ids == 0..num_streams()` this is exactly the
+/// full-batch [`batched_decode_step_i8`].
+///
+/// LOSSLESS by construction, identically to [`batched_decode_step_i8`]: each
+/// projection runs as ONE `M = stream_ids.len()` int8 GEMM whose per-row i32
+/// contraction is `M`-independent (bd-1azu.2), so dropping retired rows from the
+/// active set NEVER changes a surviving row — the throughput win of pruning
+/// retired slots costs zero accuracy. RoPE at each stream's TRUE absolute
+/// position, the R-SWA ring write into stream `stream_ids[k]`'s OWN ring,
+/// `decode_attention`, and the MoE dispatch all stay a faithful per-stream loop.
+///
+/// # Errors
+/// [`FocrError::Other`] if `token_embeds`/`positions` disagree with
+/// `stream_ids.len()`, a `stream_ids` entry is out of range, the cache layer
+/// count is wrong, or any `token_embeds[k]` is not `[1, hidden]`.
+pub fn batched_decode_step_i8_streams(
+    wc: &DecoderWeightCacheI8,
+    caches: &mut BatchedRingCache,
+    stream_ids: &[usize],
+    token_embeds: &[Mat],
+    positions: &[usize],
+) -> FocrResult<Vec<Mat>> {
     let hidden = config::HIDDEN_SIZE;
     let qkv_dim = checked_shape_mul(
         "decoder::batched_decode_step_i8",
@@ -2109,10 +2142,10 @@ pub fn batched_decode_step_i8(
         "num_heads*head_dim",
     )?;
     let eps = config::RMS_NORM_EPS;
-    let b = caches.num_streams();
+    let b = stream_ids.len();
     if token_embeds.len() != b || positions.len() != b {
         return Err(FocrError::Other(anyhow::anyhow!(
-            "decoder::batched_decode_step_i8: token_embeds {} / positions {} != streams {b}",
+            "decoder::batched_decode_step_i8: token_embeds {} / positions {} != active streams {b}",
             token_embeds.len(),
             positions.len()
         )));
@@ -2123,6 +2156,14 @@ pub fn batched_decode_step_i8(
             caches.num_layers(),
             config::NUM_HIDDEN_LAYERS
         )));
+    }
+    let n_streams = caches.num_streams();
+    for (k, &sid) in stream_ids.iter().enumerate() {
+        if sid >= n_streams {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "decoder::batched_decode_step_i8: active slot {k} stream id {sid} >= cache streams {n_streams}"
+            )));
+        }
     }
     for (s, te) in token_embeds.iter().enumerate() {
         if te.rows != 1 || te.cols != hidden {
@@ -2185,9 +2226,9 @@ pub fn batched_decode_step_i8(
             let rope = RopeTable::build(&[positions[s]], config::HEAD_DIM, config::ROPE_THETA);
             apply_rope(&mut q_mats[s], &rope)?;
             apply_rope(&mut k_mats[s], &rope)?;
-            caches.write_decode_step(s, layer, &k_mats[s].data, &v_rows[s])?;
+            caches.write_decode_step(stream_ids[s], layer, &k_mats[s].data, &v_rows[s])?;
             context_rows.push(rswa::decode_attention(
-                caches.layer(s, layer),
+                caches.layer(stream_ids[s], layer),
                 &q_mats[s].data,
             )?);
         }

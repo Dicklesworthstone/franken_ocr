@@ -404,6 +404,25 @@ fn load_weights_from_resolved_model(resolved: &Path, bytes: Vec<u8>) -> FocrResu
     })
 }
 
+/// One page's prefill state, handed from the batch spine front end
+/// ([`OcrModel::prefill_page_i8`]) to the [`batch_scheduler`]: everything a
+/// [`batch_scheduler::PageStream`] needs to seed decode, plus the per-layer R-SWA
+/// rings (already prefilled) and the source pixel dims postprocess needs.
+struct PagePrefill {
+    /// Reference/prompt length already in the KV cache (`inputs_embeds.rows`).
+    prefill_len: usize,
+    /// The prompt id-stream (seeds the n-gram-ban history).
+    prompt_ids: Vec<u32>,
+    /// Prefill's final hidden row `[1, hidden]` — predicts the first token.
+    last_hidden: Mat,
+    /// One prefilled [`rswa::RingCache`] per decoder layer for this page.
+    caches: Vec<rswa::RingCache>,
+    /// Source image width (bbox de-normalization).
+    image_w: u32,
+    /// Source image height (bbox de-normalization).
+    image_h: u32,
+}
+
 impl OcrModel {
     /// Resolve `path` to a concrete model artifact (`.focrq` blob or a
     /// safetensors directory) — the header-sniff / search-path logic
@@ -582,6 +601,171 @@ impl OcrModel {
     pub fn recognize(&self, image_path: &Path) -> FocrResult<String> {
         let (decoded, image_w, image_h) = self.forward(image_path)?;
         postprocess::finalize(&decoded, image_w, image_h)
+    }
+
+    /// Recognize a batch of document images, returning one [`FocrResult`] per
+    /// image in input order (`result[i]` ⇄ `image_paths[i]`).
+    ///
+    /// When the continuous-batch decode spine is armed
+    /// ([`batch_scheduler::spine_enabled`], `FOCR_BATCH_SPINE`) AND the int8 decode
+    /// path is active, every page is prefilled and then decoded TOGETHER through
+    /// the [`batch_scheduler`] — the int8 weight cache and the embed table are read
+    /// ONCE for the whole batch, and the scheduler is the single sequential driver
+    /// (Doctrine #5: the model is already an owned `Arc`, no per-step relock).
+    /// Otherwise each image falls back to the proven sequential
+    /// [`Self::recognize`].
+    ///
+    /// LOSSLESS: with the spine on, each page's emitted tokens are byte-for-byte
+    /// the tokens [`Self::generate_cached_i8`] produces for that page ALONE (the
+    /// batched int8 GEMMs are `M`-independent — bd-1azu.2 — and R-SWA attention is
+    /// per-stream), so the finalized markdown is sha256-identical to the spine-off
+    /// path (the bd-1azu.13 gate). The spine is the int8 throughput path; if int8
+    /// is not requested it stays on the sequential fallback so the result tracks
+    /// whatever oracle is in force.
+    #[must_use]
+    pub fn recognize_batch(&self, image_paths: &[&Path]) -> Vec<FocrResult<String>> {
+        // The spine reproduces the int8 R-SWA cached decode (`generate_cached_i8`),
+        // which `generate` selects only when int8 is requested AND the stateless
+        // O(n^2) oracle is NOT forced. Engage the spine under EXACTLY that
+        // condition so its output tracks whichever sequential oracle is in force.
+        let spine = batch_scheduler::spine_enabled()
+            && int8_decode_requested()
+            && std::env::var_os(DECODE_STATELESS_ENV).is_none();
+        if !spine {
+            return image_paths.iter().map(|p| self.recognize(p)).collect();
+        }
+        match self.recognize_batch_spine(image_paths) {
+            Ok(results) => results,
+            Err(err) => {
+                // A batch-level failure (e.g. the int8 weight cache or embed table
+                // could not be built) is the SAME error the sequential loop would
+                // hit on every page; report it per image so the CLI's exit
+                // semantics (and per-image JSON shape) match the sequential path.
+                let msg = err.to_string();
+                image_paths
+                    .iter()
+                    .map(|_| Err(FocrError::Other(anyhow::anyhow!("{msg}"))))
+                    .collect()
+            }
+        }
+    }
+
+    /// The continuous-batch spine body for [`Self::recognize_batch`]: prefill every
+    /// page, assemble a [`rswa::BatchedRingCache`] from the per-page rings, then
+    /// drive the [`batch_scheduler::BatchScheduler`] to emit every page's tokens at
+    /// once, detokenizing + [`postprocess::finalize`]-ing each in input order.
+    ///
+    /// Per-page prefill failures (e.g. a bad image) are recorded for that page and
+    /// excluded from the batch; the surviving pages still decode. The outer `Err`
+    /// is reserved for batch-level setup failures (weight cache / embed table).
+    fn recognize_batch_spine(&self, image_paths: &[&Path]) -> FocrResult<Vec<FocrResult<String>>> {
+        let n = image_paths.len();
+        // ── batch-level artifacts, read ONCE (Doctrine #5) ───────────────────────
+        let wc = self.decoder_cache_i8()?;
+        let embed_table = self.weights.mat("model.embed_tokens.weight")?;
+        let tokenizer = self.tokenizer()?;
+
+        // ── per-page prefill (preprocess → vision → connector → prefill) ─────────
+        let mut out: Vec<Option<FocrResult<String>>> = (0..n).map(|_| None).collect();
+        let mut streams: Vec<batch_scheduler::PageStream> = Vec::new();
+        let mut stream_caches: Vec<Vec<rswa::RingCache>> = Vec::new();
+        // (global page index, image_w, image_h) in scheduler-submission order.
+        let mut scheduled: Vec<(usize, u32, u32)> = Vec::new();
+        for (gi, &path) in image_paths.iter().enumerate() {
+            match self.prefill_page_i8(wc, path) {
+                Ok(p) => {
+                    streams.push(batch_scheduler::PageStream::new(
+                        gi,
+                        p.prefill_len,
+                        &p.prompt_ids,
+                        p.last_hidden,
+                    ));
+                    stream_caches.push(p.caches);
+                    scheduled.push((gi, p.image_w, p.image_h));
+                }
+                Err(e) => out[gi] = Some(Err(e)),
+            }
+        }
+
+        // ── decode every prefilled page together, re-sorted to input order ───────
+        if !streams.is_empty() {
+            let mut batched = rswa::BatchedRingCache::from_streams(stream_caches)?;
+            let mut step = batch_scheduler::DecoderBatchStep {
+                wc,
+                caches: &mut batched,
+                embed_table: &embed_table,
+                params: &self.decode_params,
+            };
+            let mut scheduler =
+                batch_scheduler::BatchScheduler::from_env(self.decode_params.max_length);
+            let token_lists = scheduler.run(streams, &mut step)?;
+            // `token_lists[k]` ⇄ `scheduled[k]` (both in ascending input-index order).
+            for (k, tokens) in token_lists.into_iter().enumerate() {
+                let (gi, w, h) = scheduled[k];
+                let finalized = tokenizer
+                    .decode(&tokens)
+                    .and_then(|decoded| postprocess::finalize(&decoded, w, h));
+                out[gi] = Some(finalized);
+            }
+        }
+
+        Ok(out
+            .into_iter()
+            .map(|slot| {
+                slot.unwrap_or_else(|| {
+                    Err(FocrError::Other(anyhow::anyhow!(
+                        "native_engine::OcrModel::recognize_batch: page produced no result"
+                    )))
+                })
+            })
+            .collect())
+    }
+
+    /// Build (or fetch the cached) int8 decoder weight cache — the spine twin of
+    /// the get-or-build inside [`Self::generate_cached_i8`], factored so the batch
+    /// driver reads the ~1.2 s quant ONCE without re-running it per page. Does NOT
+    /// change the sequential path (which keeps its own inline get-or-build).
+    fn decoder_cache_i8(&self) -> FocrResult<&decoder::DecoderWeightCacheI8> {
+        if let Some(c) = self.decoder_cache_i8.get() {
+            return Ok(c);
+        }
+        let built = decoder::DecoderWeightCacheI8::build(&self.weights)?;
+        let _ = self.decoder_cache_i8.set(built);
+        Ok(self
+            .decoder_cache_i8
+            .get()
+            .expect("decoder int8 cache just set"))
+    }
+
+    /// Prefill ONE page for the batch spine: the [`Self::forward`] front end
+    /// (preprocess in Base mode → vision tower → connector) followed by the int8
+    /// [`decoder::prefill_with_cache_i8`], returning the seed state a
+    /// [`batch_scheduler::PageStream`] needs plus the page's pixel dims for
+    /// postprocess. Mirrors EXACTLY the prefill the sequential
+    /// [`Self::generate_cached_i8`] does, so the seeded decode is byte-identical.
+    fn prefill_page_i8(
+        &self,
+        wc: &decoder::DecoderWeightCacheI8,
+        image_path: &Path,
+    ) -> FocrResult<PagePrefill> {
+        let pre = preprocess::preprocess_image(
+            image_path,
+            preprocess::PreprocessMode::Base { base_size: 1024 },
+        )?;
+        let (image_w, image_h) = Self::image_dims(&pre);
+        let vision_features = self.vision_tower(&pre)?;
+        let (inputs_embeds, prompt_ids) = self.build_inputs_embeds(&pre, &vision_features)?;
+        let prefill_len = inputs_embeds.rows;
+        let (hidden, caches) = decoder::prefill_with_cache_i8(wc, &inputs_embeds)?;
+        let last_hidden = Self::last_hidden_row(&hidden)?;
+        Ok(PagePrefill {
+            prefill_len,
+            prompt_ids,
+            last_hidden,
+            caches,
+            image_w,
+            image_h,
+        })
     }
 
     // ── stage orchestration (private) ──────────────────────────────────────────

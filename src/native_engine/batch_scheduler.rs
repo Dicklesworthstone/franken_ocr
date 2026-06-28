@@ -130,6 +130,12 @@ impl PageStream {
 
 /// Read-only view of one active stream handed to a [`BatchStep`].
 pub struct StreamSlot<'a> {
+    /// Stable index of this stream into the submitted `streams` vector — and thus
+    /// into any per-stream side table the step keeps (e.g. the cache stream slot
+    /// of the [`super::rswa::BatchedRingCache`]). Unlike the active-set position,
+    /// this never shifts as streams retire/backfill, so the step can address the
+    /// correct (full-cache) stream even after the active set shrinks (bd-1azu.11).
+    pub slot_index: usize,
     /// Token history (prompt + emitted) for n-gram banning.
     pub history: &'a [u32],
     /// Current decode hidden `[1, hidden]`.
@@ -262,6 +268,7 @@ impl BatchScheduler {
             let slots: Vec<StreamSlot<'_>> = active
                 .iter()
                 .map(|&i| StreamSlot {
+                    slot_index: i,
                     history: &streams[i].generated,
                     hidden: &streams[i].last_hidden,
                     position: streams[i].position,
@@ -336,10 +343,14 @@ impl BatchScheduler {
 ///
 /// Construction (weight cache + prefill-seeded rings) and the `focr ocr-batch`
 /// driving land in bd-1azu.9/.11; the end-to-end positional/KV correctness of
-/// this composition is proven by the model-gated bd-1azu.13 parity gate. Note: a
-/// just-EOS stream is still advanced this step (its discarded KV write is
-/// per-stream-isolated and harmless); bd-1azu.11 prunes retired slots from the
-/// advance for efficiency.
+/// this composition is proven by the model-gated bd-1azu.13 parity gate. The
+/// advance addresses each active stream's OWN cache slot via
+/// [`StreamSlot::slot_index`] through [`decoder::batched_decode_step_i8_streams`],
+/// so once a stream retires it is pruned from the cache fan-out (bd-1azu.11) — the
+/// active set is a SUBSET of the cache's streams, never required to equal it. Note
+/// a stream that emits EOS on a given step is still advanced THAT step (its
+/// discarded KV write is per-stream-isolated and harmless); it is excluded from
+/// every subsequent step.
 pub struct DecoderBatchStep<'a> {
     /// Int8 decoder weight cache (dequant-once).
     pub wc: &'a DecoderWeightCacheI8,
@@ -370,9 +381,12 @@ impl BatchStep for DecoderBatchStep<'_> {
         let histories: Vec<&[u32]> = slots.iter().map(|s| s.history).collect();
         let decoded = sampler::batched_decode_step(&logits, &histories, self.params)?;
 
-        // 3. Advance every stream one decode step (M=B projection + attention).
+        // 3. Advance ONLY the active streams one decode step (M=active projection
+        //    + attention), addressing each one's OWN cache slot via `slot_index`
+        //    so retired streams are pruned from the cache fan-out (bd-1azu.11).
         let mut token_embeds: Vec<Mat> = Vec::with_capacity(b);
         let mut positions: Vec<usize> = Vec::with_capacity(b);
+        let mut stream_ids: Vec<usize> = Vec::with_capacity(b);
         for (out, slot) in decoded.iter().zip(slots.iter()) {
             let t = out.token_id as usize;
             if t >= vocab {
@@ -383,9 +397,15 @@ impl BatchStep for DecoderBatchStep<'_> {
             let row = self.embed_table.data[t * hidden_dim..(t + 1) * hidden_dim].to_vec();
             token_embeds.push(Mat::from_vec(1, hidden_dim, row));
             positions.push(slot.position);
+            stream_ids.push(slot.slot_index);
         }
-        let new_hiddens =
-            decoder::batched_decode_step_i8(self.wc, self.caches, &token_embeds, &positions)?;
+        let new_hiddens = decoder::batched_decode_step_i8_streams(
+            self.wc,
+            self.caches,
+            &stream_ids,
+            &token_embeds,
+            &positions,
+        )?;
 
         // 4. Assemble per-stream results.
         Ok(decoded
@@ -586,5 +606,66 @@ mod tests {
         assert!(!sched.stats().guard_held_during_fanout);
         sched.note_guard_held_during_fanout();
         assert!(sched.stats().guard_held_during_fanout);
+    }
+
+    /// A [`BatchStep`] that records the `slot_index` of every active slot it sees,
+    /// step by step. Behaves like [`MockStep`] (emits `0,1,2,…`, EOS on the
+    /// `eos_after`-th token) but its purpose is to prove the bd-1azu.11 plumbing:
+    /// `slot_index` is the STABLE stream identity (the cache slot the production
+    /// `DecoderBatchStep` addresses), NOT the shifting active-set position.
+    struct SlotTraceStep {
+        traces: Vec<Vec<usize>>,
+    }
+
+    impl BatchStep for SlotTraceStep {
+        fn step(&mut self, slots: &[StreamSlot<'_>]) -> FocrResult<Vec<StreamOut>> {
+            self.traces
+                .push(slots.iter().map(|s| s.slot_index).collect());
+            Ok(slots
+                .iter()
+                .map(|s| {
+                    let eos_after = s.hidden.data[1] as usize;
+                    let emitted_before = s.history.len();
+                    let is_eos = eos_after != 0 && emitted_before + 1 >= eos_after;
+                    StreamOut {
+                        token: emitted_before as u32,
+                        is_eos,
+                        new_hidden: s.hidden.clone(),
+                    }
+                })
+                .collect())
+        }
+    }
+
+    /// `slot_index` must identify the stream's STABLE submission slot (the cache
+    /// index) across BOTH retirement (active vector shrinks) and backfill (a
+    /// pending stream is admitted into a freed slot), never collapsing to the
+    /// active-set position. This is the invariant the production
+    /// `DecoderBatchStep` relies on to address each active stream's OWN
+    /// `BatchedRingCache` slot after others retire.
+    #[test]
+    fn slot_index_identifies_cache_stream_through_retire_and_backfill() {
+        // width 2, 4 streams → forces both retirement and mid-batch backfill.
+        let mut sched = BatchScheduler::new(2, 100);
+        let streams = vec![stream(0, 1), stream(1, 2), stream(2, 1), stream(3, 2)];
+        let mut step = SlotTraceStep { traces: Vec::new() };
+        let out = sched.run(streams, &mut step).expect("run");
+
+        // Each stream still emits exactly its own token count, re-sorted to input.
+        assert_eq!(out[0].len(), 1);
+        assert_eq!(out[1].len(), 2);
+        assert_eq!(out[2].len(), 1);
+        assert_eq!(out[3].len(), 2);
+
+        // The slot_index trace is the stable stream identity at each step:
+        //  step 1: streams 0,1 active           → [0, 1]
+        //  step 2: 0 retired, 2 backfilled       → [1, 2]
+        //  step 3: 1 & 2 retired, 3 backfilled   → [3]
+        //  step 4: 3's final token               → [3]
+        assert_eq!(
+            step.traces,
+            vec![vec![0usize, 1], vec![1, 2], vec![3], vec![3]],
+            "slot_index must track stable stream identity, not active position"
+        );
     }
 }
