@@ -521,6 +521,163 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
     Ok(Mat::from_vec(OUT_CH, gh3 * gw3, x3))
 }
 
+/// Batched SAM tower over `V` views (images) in ONE forward (bd-1azu.10).
+///
+/// Returns one `[OUT_CH, gh3*gw3]` matrix per view, where the `i`-th output is
+/// **byte-for-byte identical** to [`forward_with`] called on `images[i]` alone.
+///
+/// Structure (lossless, doctrine #5 "one live forward"): every view's patch
+/// tokens are stacked along a leading batch dim into a single `[V·gh·gw, dim]`
+/// buffer. The transformer blocks then run their M-independent stages
+/// (`norm1`/`norm2` LayerNorm and the `lin1`/`lin2` MLP linears) once over the
+/// whole stack — bit-identical per row because [`nn::layer_norm`] is strictly
+/// row-wise and the f32 GEMMs are M-independent. Attention is **block-diagonal**:
+/// each block's [`attention`] (or window-partitioned [`attention_windowed`]) runs
+/// per view over only that view's own tokens, so a view never attends across
+/// into another view. The convs (patch-embed, neck, `net_2`, `net_3`, all cheap
+/// relative to attention) run per-view in a sequential loop, exactly as
+/// [`forward_with`] does.
+///
+/// No nested rayon: the outer loops over views/blocks are sequential, so each
+/// `nn::matmul` / `conv_apply` / `attention` fans out one-at-a-time
+/// (bd-1azu.14, doctrine #5).
+///
+/// # Errors
+/// [`FocrError::Other`] on an empty batch, a ragged batch (a view whose
+/// `image.cols != h*win`), a non-3-channel view, non-`PATCH`-divisible or
+/// zero spatial dims, or any kernel rejection.
+pub fn forward_with_batched(
+    w: &SamWeights,
+    images: &[&Mat],
+    h: usize,
+    win: usize,
+) -> FocrResult<Vec<Mat>> {
+    let v = images.len();
+    if v == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam forward_with_batched: empty view batch"
+        )));
+    }
+    if h == 0 || win == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam forward_with_batched: spatial dims ({h},{win}) must be non-zero"
+        )));
+    }
+    let expected_cols = checked_shape_mul("vision_sam forward_with_batched", h, win, "H*W")?;
+    if !h.is_multiple_of(PATCH) || !win.is_multiple_of(PATCH) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam forward_with_batched: spatial dims ({h},{win}) must be multiples of patch {PATCH}"
+        )));
+    }
+    for (i, img) in images.iter().enumerate() {
+        if img.rows != 3 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam forward_with_batched: view {i} expected 3 input channels, got {}",
+                img.rows
+            )));
+        }
+        if img.cols != expected_cols {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam forward_with_batched: view {i} cols {} != H*W {}*{} ({expected_cols}) (ragged batch)",
+                img.cols,
+                h,
+                win
+            )));
+        }
+    }
+
+    let gh = h / PATCH;
+    let gw = win / PATCH;
+    let n = checked_shape_mul("vision_sam forward_with_batched", gh, gw, "gh*gw")?;
+    let dim = w.patch_embed.out_ch;
+
+    // The abs pos-embed depends only on (pos_embed, gh, gw) — identical for every
+    // view, so build it once and add the same contribution to each view's block.
+    let pos = abs_pos(&w.pos_embed, w.pos_grid_h, w.pos_grid_w, dim, gh, gw)?;
+
+    // ── per-view patch_embed → NHWC rows → +pos, stacked into [V*n, dim]. ──
+    let row_span = checked_shape_mul("vision_sam forward_with_batched", n, dim, "n*dim")?;
+    let total_rows = checked_shape_mul("vision_sam forward_with_batched", v, n, "V*n")?;
+    let stacked_len = checked_shape_mul(
+        "vision_sam forward_with_batched",
+        total_rows,
+        dim,
+        "V*n*dim",
+    )?;
+    let mut stacked = vec![0.0f32; stacked_len];
+    for (vv, img) in images.iter().enumerate() {
+        let conv_out = conv_apply(&w.patch_embed, &img.data, h, win, 0, PATCH)?;
+        ensure_flat_len(
+            "vision_sam forward_with_batched patch_embed output",
+            &conv_out,
+            dim,
+            gh,
+            gw,
+        )?;
+        let x_view = nchw_to_nhwc_rows(&conv_out, dim, gh, gw);
+        let base = vv * row_span;
+        let dst = &mut stacked[base..base + row_span];
+        for (xv, pv) in dst.iter_mut().zip(x_view.data.iter().zip(pos.iter())) {
+            *xv = *pv.0 + *pv.1;
+        }
+    }
+    let mut x = Mat::from_vec(total_rows, dim, stacked);
+
+    // ── 12 transformer blocks over the stacked [V*n, dim] buffer. ──
+    for blk in &w.blocks {
+        x = block_forward_batched(blk, &x, gh, gw, v)?;
+    }
+
+    // ── split back to V per-view [n, dim], run neck + net_2 + net_3 per view. ──
+    let mut out = Vec::with_capacity(v);
+    for vv in 0..v {
+        let base = vv * row_span;
+        let x_view = Mat::from_vec(n, dim, x.data[base..base + row_span].to_vec());
+
+        // neck: x_view is [n, dim] NHWC rows; neck operates NCHW.
+        let x_nchw = nhwc_rows_to_nchw(&x_view, dim, gh, gw);
+        let nc1 = conv_apply(&w.neck_conv1, &x_nchw, gh, gw, 0, 1)?;
+        ensure_flat_len(
+            "vision_sam forward_with_batched neck_conv1 output",
+            &nc1,
+            NECK_CH,
+            gh,
+            gw,
+        )?;
+        let nc1 = layer_norm_2d(&nc1, &w.neck_ln1, NECK_CH, gh, gw)?;
+        let nc2 = conv_apply(&w.neck_conv2, &nc1, gh, gw, 1, 1)?;
+        ensure_flat_len(
+            "vision_sam forward_with_batched neck_conv2 output",
+            &nc2,
+            NECK_CH,
+            gh,
+            gw,
+        )?;
+        let neck = layer_norm_2d(&nc2, &w.neck_ln2, NECK_CH, gh, gw)?;
+
+        let (gh2, gw2) = (gh.div_ceil(2), gw.div_ceil(2));
+        let x2 = conv_apply(&w.net2, &neck, gh, gw, 1, 2)?;
+        ensure_flat_len(
+            "vision_sam forward_with_batched net2 output",
+            &x2,
+            NET2_CH,
+            gh2,
+            gw2,
+        )?;
+        let (gh3, gw3) = (gh2.div_ceil(2), gw2.div_ceil(2));
+        let x3 = conv_apply(&w.net3, &x2, gh2, gw2, 1, 2)?;
+        ensure_flat_len(
+            "vision_sam forward_with_batched net3 output",
+            &x3,
+            OUT_CH,
+            gh3,
+            gw3,
+        )?;
+        out.push(Mat::from_vec(OUT_CH, gh3 * gw3, x3));
+    }
+    Ok(out)
+}
+
 // ── transformer block ──────────────────────────────────────────────────────
 
 /// One [`BlockP`] over NHWC token rows `[gh*gw, dim]`.
@@ -528,67 +685,10 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
 /// `shortcut = x; x = norm1(x);` (window_partition if windowed) `x = attn(x);`
 /// (window_unpartition); `x = shortcut + x; x = x + mlp(norm2(x))`.
 fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
-    let dim = x.cols;
     let normed = layer_norm_rows(x, &blk.norm1)?;
 
     let attn_out = if blk.window > 0 {
-        // window_partition: pad to multiple of window, tile into win x win.
-        let ws = blk.window;
-        let pad_h = (ws - gh % ws) % ws;
-        let pad_w = (ws - gw % ws) % ws;
-        let hp = gh + pad_h;
-        let wp = gw + pad_w;
-        let nwin_h = hp / ws;
-        let nwin_w = wp / ws;
-        let nwin = nwin_h * nwin_w;
-
-        // Build per-window token blocks [nwin][ws*ws, dim] (zero-padded tail).
-        let mut windows = vec![0.0f32; nwin * ws * ws * dim];
-        for wy in 0..nwin_h {
-            for wx in 0..nwin_w {
-                let widx = wy * nwin_w + wx;
-                for ly in 0..ws {
-                    for lx in 0..ws {
-                        let gy = wy * ws + ly;
-                        let gxx = wx * ws + lx;
-                        let dst = ((widx * ws + ly) * ws + lx) * dim;
-                        if gy < gh && gxx < gw {
-                            let src = (gy * gw + gxx) * dim;
-                            windows[dst..dst + dim].copy_from_slice(&normed.data[src..src + dim]);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Attention per window (each window: ws x ws grid).
-        let mut out_windows = vec![0.0f32; windows.len()];
-        for widx in 0..nwin {
-            let base = widx * ws * ws * dim;
-            let win_in = Mat::from_vec(ws * ws, dim, windows[base..base + ws * ws * dim].to_vec());
-            let win_out = attention(&blk.attn, &win_in, ws, ws)?;
-            out_windows[base..base + ws * ws * dim].copy_from_slice(&win_out.data);
-        }
-
-        // window_unpartition: scatter back, strip padding.
-        let mut merged = vec![0.0f32; gh * gw * dim];
-        for wy in 0..nwin_h {
-            for wx in 0..nwin_w {
-                let widx = wy * nwin_w + wx;
-                for ly in 0..ws {
-                    for lx in 0..ws {
-                        let gy = wy * ws + ly;
-                        let gxx = wx * ws + lx;
-                        if gy < gh && gxx < gw {
-                            let src = ((widx * ws + ly) * ws + lx) * dim;
-                            let dst = (gy * gw + gxx) * dim;
-                            merged[dst..dst + dim].copy_from_slice(&out_windows[src..src + dim]);
-                        }
-                    }
-                }
-            }
-        }
-        Mat::from_vec(gh * gw, dim, merged)
+        attention_windowed(&blk.attn, &normed, gh, gw, blk.window)?
     } else {
         attention(&blk.attn, &normed, gh, gw)?
     };
@@ -610,6 +710,140 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
         *a += *b;
     }
     Ok(h1)
+}
+
+/// Batched analogue of [`block_forward`] over a stacked `[V*n, dim]` buffer
+/// (`n = gh*gw`), bd-1azu.10.
+///
+/// `norm1`, `norm2` and the MLP (`lin1`/`gelu`/`lin2`) run once over the whole
+/// `V*n`-row stack — byte-identical per row to the per-view forward because
+/// [`nn::layer_norm`] is row-wise, [`nn::gelu`] is element-wise, and the GEMMs in
+/// [`Linear::apply`] are M-independent. Attention is computed **per view** over a
+/// slice of the (row-wise-identical) normalized buffer, via the same
+/// [`attention`] / [`attention_windowed`] the per-view path uses — so a view
+/// never attends across into another view's tokens (block-diagonal). The two
+/// residual adds are element-wise over the stack.
+fn block_forward_batched(blk: &BlockP, x: &Mat, gh: usize, gw: usize, v: usize) -> FocrResult<Mat> {
+    let dim = x.cols;
+    let n = checked_shape_mul("vision_sam block_forward_batched", gh, gw, "gh*gw")?;
+    let row_span = checked_shape_mul("vision_sam block_forward_batched", n, dim, "n*dim")?;
+    let total_rows = checked_shape_mul("vision_sam block_forward_batched", v, n, "V*n")?;
+    if x.rows != total_rows {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam block_forward_batched: x.rows {} != V*n {total_rows}",
+            x.rows
+        )));
+    }
+    ensure_flat_len("vision_sam block_forward_batched input", &x.data, v, n, dim)?;
+
+    // norm1 over the whole stack (row-wise -> identical to per-view).
+    let normed = layer_norm_rows(x, &blk.norm1)?;
+
+    // Attention per view (block-diagonal): slice this view's normalized rows and
+    // run the exact same attention the per-view forward uses.
+    let mut attn_data = vec![0.0f32; x.data.len()];
+    for view in 0..v {
+        let base = view * row_span;
+        let normed_view = Mat::from_vec(n, dim, normed.data[base..base + row_span].to_vec());
+        let av = if blk.window > 0 {
+            attention_windowed(&blk.attn, &normed_view, gh, gw, blk.window)?
+        } else {
+            attention(&blk.attn, &normed_view, gh, gw)?
+        };
+        ensure_mat_shape(
+            &av,
+            n,
+            dim,
+            "vision_sam block_forward_batched attention view",
+        )?;
+        attn_data[base..base + row_span].copy_from_slice(&av.data);
+    }
+
+    // residual 1: x = shortcut + attn (element-wise over the stack).
+    let mut h1 = x.clone();
+    for (a, b) in h1.data.iter_mut().zip(attn_data.iter()) {
+        *a += *b;
+    }
+
+    // residual 2: x = h1 + mlp(norm2(h1)), all batched over the stack.
+    let normed2 = layer_norm_rows(&h1, &blk.norm2)?;
+    let mut mlp = blk.lin1.apply(&normed2)?;
+    nn::gelu(&mut mlp);
+    let mlp = blk.lin2.apply(&mlp)?;
+    ensure_same_shape("vision_sam block_forward_batched mlp residual", &mlp, &h1)?;
+    for (a, b) in h1.data.iter_mut().zip(mlp.data.iter()) {
+        *a += *b;
+    }
+    Ok(h1)
+}
+
+/// Window-partitioned multi-head attention over `norm1`-normalized NHWC token
+/// rows `[gh*gw, dim]`: pad to a multiple of `ws`, run [`attention`] once per
+/// `ws×ws` window (zero-padded tail tokens included exactly as upstream), then
+/// `window_unpartition` back to `[gh*gw, dim]` stripping the padding.
+///
+/// Extracted verbatim from the windowed branch of [`block_forward`] so the
+/// per-view (sequential) and batched paths share one definition — the batched
+/// SAM tower (bd-1azu.10) calls this per view, guaranteeing byte-identical
+/// output to the per-view forward.
+fn attention_windowed(p: &AttnP, normed: &Mat, gh: usize, gw: usize, ws: usize) -> FocrResult<Mat> {
+    let dim = normed.cols;
+    // window_partition: pad to multiple of window, tile into win x win.
+    let pad_h = (ws - gh % ws) % ws;
+    let pad_w = (ws - gw % ws) % ws;
+    let hp = gh + pad_h;
+    let wp = gw + pad_w;
+    let nwin_h = hp / ws;
+    let nwin_w = wp / ws;
+    let nwin = nwin_h * nwin_w;
+
+    // Build per-window token blocks [nwin][ws*ws, dim] (zero-padded tail).
+    let mut windows = vec![0.0f32; nwin * ws * ws * dim];
+    for wy in 0..nwin_h {
+        for wx in 0..nwin_w {
+            let widx = wy * nwin_w + wx;
+            for ly in 0..ws {
+                for lx in 0..ws {
+                    let gy = wy * ws + ly;
+                    let gxx = wx * ws + lx;
+                    let dst = ((widx * ws + ly) * ws + lx) * dim;
+                    if gy < gh && gxx < gw {
+                        let src = (gy * gw + gxx) * dim;
+                        windows[dst..dst + dim].copy_from_slice(&normed.data[src..src + dim]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Attention per window (each window: ws x ws grid).
+    let mut out_windows = vec![0.0f32; windows.len()];
+    for widx in 0..nwin {
+        let base = widx * ws * ws * dim;
+        let win_in = Mat::from_vec(ws * ws, dim, windows[base..base + ws * ws * dim].to_vec());
+        let win_out = attention(p, &win_in, ws, ws)?;
+        out_windows[base..base + ws * ws * dim].copy_from_slice(&win_out.data);
+    }
+
+    // window_unpartition: scatter back, strip padding.
+    let mut merged = vec![0.0f32; gh * gw * dim];
+    for wy in 0..nwin_h {
+        for wx in 0..nwin_w {
+            let widx = wy * nwin_w + wx;
+            for ly in 0..ws {
+                for lx in 0..ws {
+                    let gy = wy * ws + ly;
+                    let gxx = wx * ws + lx;
+                    if gy < gh && gxx < gw {
+                        let src = ((widx * ws + ly) * ws + lx) * dim;
+                        let dst = (gy * gw + gxx) * dim;
+                        merged[dst..dst + dim].copy_from_slice(&out_windows[src..src + dim]);
+                    }
+                }
+            }
+        }
+    }
+    Ok(Mat::from_vec(gh * gw, dim, merged))
 }
 
 // ── attention with decomposed relative position ([SPEC-044]) ───────────────
@@ -2371,5 +2605,177 @@ mod tests {
                 kw: 3,
             },
         }
+    }
+
+    // ── bd-1azu.10: batched-SAM parity (model-free, byte-exact) ──────────────
+    // Deterministic NON-trivial weights so a cross-view attention leak OR an
+    // M-dependent GEMM would change the output and fail the bit-exact assert.
+    // (The all-zero `tiny_weights_minimal()` is too weak — every stage collapses
+    // to a constant, so it could not detect a view-to-view leak.)
+    fn det(i: usize, salt: usize) -> f32 {
+        let x = (i as u64)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((salt as u64).wrapping_mul(40_503))
+            % 1000;
+        (x as f32) / 1000.0 - 0.5
+    }
+    fn rand_lin(out: usize, inn: usize, salt: usize) -> Linear {
+        Linear {
+            w: (0..out * inn).map(|i| det(i, salt)).collect(),
+            b: (0..out).map(|i| det(i, salt + 1)).collect(),
+            out,
+            in_: inn,
+        }
+    }
+    fn rand_ln(dim: usize, salt: usize) -> LayerNormP {
+        LayerNormP {
+            // gains near 1.0 (1 + small varied offset), varied bias.
+            w: (0..dim).map(|i| 1.0 + det(i, salt)).collect(),
+            b: (0..dim).map(|i| det(i, salt + 2)).collect(),
+        }
+    }
+    fn rand_conv(
+        out_ch: usize,
+        in_ch: usize,
+        kh: usize,
+        kw: usize,
+        bias: bool,
+        salt: usize,
+    ) -> Conv {
+        Conv {
+            w: (0..out_ch * in_ch * kh * kw)
+                .map(|i| det(i, salt))
+                .collect(),
+            b: if bias {
+                Some((0..out_ch).map(|i| det(i, salt + 1)).collect())
+            } else {
+                None
+            },
+            out_ch,
+            in_ch,
+            kh,
+            kw,
+        }
+    }
+
+    /// A REAL-shaped (EMBED_DIM/NUM_HEADS/DEPTH/WINDOW/GLOBAL_BLOCKS/PATCH) SAM
+    /// with deterministic varied weights over a `gh×gw` patch grid. Rel-pos
+    /// tables are sized to the window (windowed blocks) or the grid (global
+    /// blocks), so no rel-pos interpolation fires (the deployed identity path).
+    fn tiny_weights_nontrivial(gh: usize, gw: usize) -> SamWeights {
+        let dim = EMBED_DIM;
+        let hd = HEAD_DIM;
+        let blocks: Vec<BlockP> = (0..DEPTH)
+            .map(|i| {
+                let window = if GLOBAL_BLOCKS.contains(&i) {
+                    0
+                } else {
+                    WINDOW
+                };
+                let size_h = if window == 0 { gh } else { window };
+                let size_w = if window == 0 { gw } else { window };
+                let rel_rows_h = 2 * size_h - 1;
+                let rel_rows_w = 2 * size_w - 1;
+                BlockP {
+                    norm1: rand_ln(dim, 100 + i * 13),
+                    attn: AttnP {
+                        qkv: rand_lin(3 * dim, dim, 200 + i * 13),
+                        proj: rand_lin(dim, dim, 300 + i * 13),
+                        rel_pos_h: (0..rel_rows_h * hd).map(|j| det(j, 700 + i * 13)).collect(),
+                        rel_pos_w: (0..rel_rows_w * hd).map(|j| det(j, 800 + i * 13)).collect(),
+                        size_h,
+                        size_w,
+                    },
+                    norm2: rand_ln(dim, 400 + i * 13),
+                    lin1: rand_lin(MLP_HIDDEN, dim, 500 + i * 13),
+                    lin2: rand_lin(dim, MLP_HIDDEN, 600 + i * 13),
+                    window,
+                }
+            })
+            .collect();
+        SamWeights {
+            patch_embed: rand_conv(EMBED_DIM, 3, PATCH, PATCH, true, 11),
+            pos_embed: (0..gh * gw * EMBED_DIM).map(|i| det(i, 13)).collect(),
+            pos_grid_h: gh,
+            pos_grid_w: gw,
+            blocks,
+            neck_conv1: rand_conv(NECK_CH, EMBED_DIM, 1, 1, false, 21),
+            neck_ln1: rand_ln(NECK_CH, 23),
+            neck_conv2: rand_conv(NECK_CH, NECK_CH, 3, 3, false, 25),
+            neck_ln2: rand_ln(NECK_CH, 27),
+            net2: rand_conv(NET2_CH, NECK_CH, 3, 3, false, 29),
+            net3: rand_conv(OUT_CH, NET2_CH, 3, 3, false, 31),
+        }
+    }
+
+    /// A `[3, h*win]` image with deterministic varied (bounded) pixels.
+    fn nontrivial_image(h: usize, win: usize, salt: usize) -> Mat {
+        let cols = h * win;
+        Mat::from_vec(
+            3,
+            cols,
+            (0..3 * cols)
+                .map(|i| ((((i + salt * 7919) as f32) * 0.0007).sin()) * 0.5)
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn batched_sam_equals_per_view_byte_for_byte() -> FocrResult<()> {
+        // H=W=240 -> gh=gw=15: windowed blocks (WINDOW=14) partition into a 2x2
+        // grid of windows (real + zero-padded tail) AND global blocks run on the
+        // 15x15 grid -> a cross-view leak in EITHER path would change a byte.
+        let h = 240;
+        let win = 240;
+        let gh = h / PATCH;
+        let gw = win / PATCH;
+        let w = tiny_weights_nontrivial(gh, gw);
+        let v0 = nontrivial_image(h, win, 1);
+        let v1 = nontrivial_image(h, win, 2);
+        let v2 = nontrivial_image(h, win, 3);
+
+        let batched = forward_with_batched(&w, &[&v0, &v1, &v2], h, win)?;
+        assert_eq!(batched.len(), 3);
+        for (i, view) in [&v0, &v1, &v2].iter().enumerate() {
+            let seq = forward_with(&w, view, h, win)?;
+            assert_eq!(batched[i].shape(), seq.shape(), "view {i} shape");
+            assert_eq!(
+                batched[i].data, seq.data,
+                "view {i}: batched SAM != per-view sequential (cross-view leak or M-dependence)"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batched_sam_single_view_equals_forward_with() -> FocrResult<()> {
+        let h = 240;
+        let win = 240;
+        let gh = h / PATCH;
+        let gw = win / PATCH;
+        let w = tiny_weights_nontrivial(gh, gw);
+        let view = nontrivial_image(h, win, 5);
+        let batched = forward_with_batched(&w, &[&view], h, win)?;
+        let seq = forward_with(&w, &view, h, win)?;
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0].shape(), seq.shape());
+        assert_eq!(batched[0].data, seq.data);
+        Ok(())
+    }
+
+    #[test]
+    fn batched_sam_rejects_ragged_and_empty() {
+        let h = 32;
+        let win = 32;
+        let w = tiny_weights_minimal(); // validation fires before any compute
+        // empty batch -> Err.
+        assert!(forward_with_batched(&w, &[], h, win).is_err());
+        // ragged: second view has a different H*W (cols mismatch) -> Err.
+        let a = nontrivial_image(h, win, 1);
+        let b = nontrivial_image(h, win + PATCH, 2); // cols = h*(win+16) != h*win
+        assert!(forward_with_batched(&w, &[&a, &b], h, win).is_err());
+        // non-3-channel view -> Err.
+        let bad = Mat::from_vec(2, h * win, vec![0.0; 2 * h * win]);
+        assert!(forward_with_batched(&w, &[&bad], h, win).is_err());
     }
 }

@@ -385,8 +385,12 @@ pub fn forward_with_batched(
     // Build the stacked [V*seq, dim] buffer: per view, class token then patches,
     // then add the (shared) pos embedding to that view's block.
     let total_rows = checked_shape_mul("vision_clip forward_with_batched", v, seq, "V*seq")?;
-    let stacked_len =
-        checked_shape_mul("vision_clip forward_with_batched", total_rows, dim, "V*seq*dim")?;
+    let stacked_len = checked_shape_mul(
+        "vision_clip forward_with_batched",
+        total_rows,
+        dim,
+        "V*seq*dim",
+    )?;
     let mut data = vec![0.0f32; stacked_len];
     for (vv, sf) in sam_features_per_view.iter().enumerate() {
         let base = vv * seq * dim;
@@ -418,7 +422,11 @@ pub fn forward_with_batched(
     let mut out = Vec::with_capacity(v);
     for vv in 0..v {
         let base = vv * seq * dim;
-        out.push(Mat::from_vec(seq, dim, x.data[base..base + seq * dim].to_vec()));
+        out.push(Mat::from_vec(
+            seq,
+            dim,
+            x.data[base..base + seq * dim].to_vec(),
+        ));
     }
     Ok(out)
 }
@@ -493,11 +501,21 @@ fn self_attention_batched(
     let three_dim = checked_shape_mul("vision_clip self_attention_batched", 3, dim, "3*dim")?;
     let head_span = checked_shape_mul("vision_clip self_attention_batched", seq, hd, "seq*hd")?;
     let num_bh = checked_shape_mul("vision_clip self_attention_batched", v, heads, "V*heads")?;
-    let buf_len = checked_shape_mul("vision_clip self_attention_batched", num_bh, head_span, "V*heads*seq*hd")?;
+    let buf_len = checked_shape_mul(
+        "vision_clip self_attention_batched",
+        num_bh,
+        head_span,
+        "V*heads*seq*hd",
+    )?;
 
     // Fused qkv projection over the whole stacked buffer -> [V*seq, 3*dim].
     let qkv = linear(&w.qkv_proj, x)?;
-    ensure_mat_shape(&qkv, rows, three_dim, "vision_clip self_attention_batched qkv")?;
+    ensure_mat_shape(
+        &qkv,
+        rows,
+        three_dim,
+        "vision_clip self_attention_batched qkv",
+    )?;
 
     // Repack into head-major [num_bh=V*heads, seq, hd] buffers, view-major.
     let mut q = vec![0.0f32; buf_len];
@@ -531,7 +549,8 @@ fn self_attention_batched(
     }
 
     // Repack [num_bh, seq, hd] -> [V*seq, dim].
-    let merged_len = checked_shape_mul("vision_clip self_attention_batched", rows, dim, "V*seq*dim")?;
+    let merged_len =
+        checked_shape_mul("vision_clip self_attention_batched", rows, dim, "V*seq*dim")?;
     let mut merged = Mat::from_vec(rows, dim, vec![0.0f32; merged_len]);
     for view in 0..v {
         for hh in 0..heads {
