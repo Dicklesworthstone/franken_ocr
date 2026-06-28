@@ -142,7 +142,11 @@ impl DecodeOutput {
 ///
 /// # Errors
 /// Returns [`FocrError::Other`] if the row is empty (`vocab == 0`).
-fn argmax_row(logits: &[f32]) -> FocrResult<u32> {
+///
+/// `pub(crate)` so the speculative-decode verifier ([`super::spec`], bd-1azu.32)
+/// reuses the EXACT argmax/tie-break the production decode loop runs — sharing
+/// this one function is what makes the verifier byte-for-byte greedy.
+pub(crate) fn argmax_row(logits: &[f32]) -> FocrResult<u32> {
     if logits.is_empty() {
         return Err(FocrError::Other(anyhow::anyhow!(
             "sampler::argmax_row: empty logits row"
@@ -214,7 +218,12 @@ fn for_each_sliding_window_ngram_ban(
 /// Return a masked logits copy only when the blocker actually bans at least one
 /// in-vocab token. The common no-ban decode step returns `None`, avoiding a
 /// full-vocab copy.
-fn masked_sliding_window_logits_if_needed(
+///
+/// `pub(crate)` so the speculative-decode verifier ([`super::spec`], bd-1azu.32)
+/// applies the IDENTICAL sliding-window n-gram ban the production decode loop
+/// runs before argmax — the verifier reuses this exact masking, never a re-derived
+/// copy, so its per-position greedy token matches sequential decode bit-for-bit.
+pub(crate) fn masked_sliding_window_logits_if_needed(
     row: &[f32],
     sequence: &[u32],
     ngram_size: usize,

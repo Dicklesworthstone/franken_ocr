@@ -28,6 +28,7 @@ pub mod nn;
 pub mod postprocess;
 pub mod rswa;
 pub mod sampler;
+pub(crate) mod spec;
 pub mod tensor;
 pub mod vision_bridge;
 pub mod vision_clip;
