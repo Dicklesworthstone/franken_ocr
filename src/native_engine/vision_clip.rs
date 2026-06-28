@@ -314,6 +314,241 @@ pub fn forward_with(
     Ok(x)
 }
 
+/// Batched CLIP tower over `V` views in ONE forward (bd-1azu.10).
+///
+/// Each view's `sam_features` is `[N, hidden]`; the views are stacked along a
+/// leading batch dimension and every stage runs over the `[V·(N+1), dim]` buffer
+/// at once. Per-view independence is preserved EXACTLY: the LayerNorm, linear,
+/// FFN, pos-embed and class-token steps are row-wise (stacking is a no-op on the
+/// math), and attention runs with `num_bh = V·heads` so each view's heads attend
+/// ONLY within that view's `seq` tokens (block-diagonal — never across views).
+///
+/// This is byte-identical to calling [`forward_with`] per view: the f32 GEMMs are
+/// M-independent (per output row the K-reduction is the same regardless of how
+/// many rows are stacked) and `nn::sdpa` processes each `bh` block in isolation.
+/// The single-forward shape is what the continuous-batch spine needs to defeat
+/// the per-page Amdahl vision wall (Doctrine #5: one live forward).
+///
+/// Returns one `[N+1, hidden]` matrix per view (class token at row 0), matching
+/// [`forward_with`]'s per-view contract.
+///
+/// # Errors
+/// [`FocrError::Other`] on an empty batch, a ragged batch (views of differing
+/// `N`), or any width/weight mismatch.
+pub fn forward_with_batched(
+    cfg: &ClipConfig,
+    weights: &ClipWeights,
+    sam_features_per_view: &[&Mat],
+) -> FocrResult<Vec<Mat>> {
+    let v = sam_features_per_view.len();
+    if v == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip forward_with_batched: empty view batch"
+        )));
+    }
+    let dim = cfg.hidden_size;
+    let n = sam_features_per_view[0].rows;
+    for (i, sf) in sam_features_per_view.iter().enumerate() {
+        if sf.cols != dim {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_clip forward_with_batched: view {i} width {} != hidden_size {dim}",
+                sf.cols
+            )));
+        }
+        if sf.rows != n {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_clip forward_with_batched: view {i} rows {} != {n} (ragged batch)",
+                sf.rows
+            )));
+        }
+        ensure_mat_data_len(sf, "vision_clip forward_with_batched sam_features")?;
+    }
+    if weights.class_embedding.len() != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip forward_with_batched: class_embedding len {} != hidden_size {dim}",
+            weights.class_embedding.len()
+        )));
+    }
+    if weights.blocks.len() != cfg.num_layers {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip forward_with_batched: {} blocks != num_layers {}",
+            weights.blocks.len(),
+            cfg.num_layers
+        )));
+    }
+
+    let seq = checked_shape_add("vision_clip forward_with_batched", n, 1, "N+1")?;
+    // Position embedding for this seq is identical across views (depends on seq).
+    let pos = abs_pos_for_len(&weights.position_embedding, weights.num_positions, dim, seq)?;
+    ensure_mat_shape(&pos, seq, dim, "vision_clip forward_with_batched pos")?;
+
+    // Build the stacked [V*seq, dim] buffer: per view, class token then patches,
+    // then add the (shared) pos embedding to that view's block.
+    let total_rows = checked_shape_mul("vision_clip forward_with_batched", v, seq, "V*seq")?;
+    let stacked_len =
+        checked_shape_mul("vision_clip forward_with_batched", total_rows, dim, "V*seq*dim")?;
+    let mut data = vec![0.0f32; stacked_len];
+    for (vv, sf) in sam_features_per_view.iter().enumerate() {
+        let base = vv * seq * dim;
+        data[base..base + dim].copy_from_slice(&weights.class_embedding);
+        data[base + dim..base + seq * dim].copy_from_slice(&sf.data);
+        for s in 0..seq {
+            let off = base + s * dim;
+            let prow = &pos.data[s * dim..(s + 1) * dim];
+            for (d, pv) in prow.iter().enumerate() {
+                data[off + d] += *pv;
+            }
+        }
+    }
+    let mut x = Mat::from_vec(total_rows, dim, data);
+
+    // pre_layrnorm (row-wise -> identical to per-view).
+    x = nn::layer_norm(
+        &x,
+        Some(&weights.pre_layernorm.weight),
+        Some(&weights.pre_layernorm.bias),
+        cfg.pre_layernorm_eps,
+    )?;
+
+    for block in &weights.blocks {
+        x = transformer_block_batched(cfg, block, &x, v, seq)?;
+    }
+
+    // Split the [V*seq, dim] buffer back into V per-view [seq, dim] matrices.
+    let mut out = Vec::with_capacity(v);
+    for vv in 0..v {
+        let base = vv * seq * dim;
+        out.push(Mat::from_vec(seq, dim, x.data[base..base + seq * dim].to_vec()));
+    }
+    Ok(out)
+}
+
+/// Batched analogue of [`transformer_block`]: every stage is row-wise except the
+/// attention, which uses [`self_attention_batched`] (`num_bh = V·heads`).
+fn transformer_block_batched(
+    cfg: &ClipConfig,
+    w: &ClipBlockWeights,
+    x: &Mat,
+    v: usize,
+    seq: usize,
+) -> FocrResult<Mat> {
+    let normed = nn::layer_norm(
+        x,
+        Some(&w.layer_norm1.weight),
+        Some(&w.layer_norm1.bias),
+        cfg.layernorm_eps,
+    )?;
+    let attn = self_attention_batched(cfg, w, &normed, v, seq)?;
+    let h = add(x, &attn)?;
+
+    let normed2 = nn::layer_norm(
+        &h,
+        Some(&w.layer_norm2.weight),
+        Some(&w.layer_norm2.bias),
+        cfg.layernorm_eps,
+    )?;
+    let mlp = feed_forward(w, &normed2)?;
+    add(&h, &mlp)
+}
+
+/// Batched analogue of [`self_attention`] over a `[V*seq, dim]` buffer. The qkv
+/// and out projections are M-batched (row-independent); the SDPA runs with
+/// `num_bh = V·heads` where head block `view*heads + h` covers view `view`'s
+/// `seq` tokens, so attention is strictly block-diagonal across views — byte
+/// identical to running [`self_attention`] on each view separately.
+fn self_attention_batched(
+    cfg: &ClipConfig,
+    w: &ClipBlockWeights,
+    x: &Mat,
+    v: usize,
+    seq: usize,
+) -> FocrResult<Mat> {
+    let dim = cfg.hidden_size;
+    let heads = cfg.num_heads;
+    if heads == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention_batched: num_heads must be non-zero"
+        )));
+    }
+    if dim == 0 || !dim.is_multiple_of(heads) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention_batched: hidden_size {dim} must be non-zero and divisible by heads {heads}"
+        )));
+    }
+    let rows = checked_shape_mul("vision_clip self_attention_batched", v, seq, "V*seq")?;
+    if x.rows != rows {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention_batched: x.rows {} != V*seq {rows}",
+            x.rows
+        )));
+    }
+    if x.cols != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention_batched: x.cols {} != hidden_size {dim}",
+            x.cols
+        )));
+    }
+    ensure_mat_data_len(x, "vision_clip self_attention_batched input")?;
+    let hd = dim / heads;
+    let three_dim = checked_shape_mul("vision_clip self_attention_batched", 3, dim, "3*dim")?;
+    let head_span = checked_shape_mul("vision_clip self_attention_batched", seq, hd, "seq*hd")?;
+    let num_bh = checked_shape_mul("vision_clip self_attention_batched", v, heads, "V*heads")?;
+    let buf_len = checked_shape_mul("vision_clip self_attention_batched", num_bh, head_span, "V*heads*seq*hd")?;
+
+    // Fused qkv projection over the whole stacked buffer -> [V*seq, 3*dim].
+    let qkv = linear(&w.qkv_proj, x)?;
+    ensure_mat_shape(&qkv, rows, three_dim, "vision_clip self_attention_batched qkv")?;
+
+    // Repack into head-major [num_bh=V*heads, seq, hd] buffers, view-major.
+    let mut q = vec![0.0f32; buf_len];
+    let mut k = vec![0.0f32; buf_len];
+    let mut vbuf = vec![0.0f32; buf_len];
+    for view in 0..v {
+        for s in 0..seq {
+            let row = qkv.row(view * seq + s);
+            for hh in 0..heads {
+                let bh = view * heads + hh;
+                for d in 0..hd {
+                    let q_src = hh * hd + d;
+                    let k_src = dim + hh * hd + d;
+                    let v_src = 2 * dim + hh * hd + d;
+                    let dst = bh * head_span + s * hd + d;
+                    q[dst] = row[q_src];
+                    k[dst] = row[k_src];
+                    vbuf[dst] = row[v_src];
+                }
+            }
+        }
+    }
+
+    let scale = 1.0f32 / (hd as f32).sqrt();
+    let ctx = nn::sdpa(&q, &k, &vbuf, num_bh, seq, seq, hd, hd, scale, false);
+    if ctx.len() != buf_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip self_attention_batched: sdpa context len {} != expected {buf_len}",
+            ctx.len()
+        )));
+    }
+
+    // Repack [num_bh, seq, hd] -> [V*seq, dim].
+    let merged_len = checked_shape_mul("vision_clip self_attention_batched", rows, dim, "V*seq*dim")?;
+    let mut merged = Mat::from_vec(rows, dim, vec![0.0f32; merged_len]);
+    for view in 0..v {
+        for hh in 0..heads {
+            let bh = view * heads + hh;
+            for s in 0..seq {
+                for d in 0..hd {
+                    let src = bh * head_span + s * hd + d;
+                    let dst = (view * seq + s) * dim + hh * hd + d;
+                    merged.data[dst] = ctx[src];
+                }
+            }
+        }
+    }
+
+    linear(&w.out_proj, &merged)
+}
+
 /// One `NoTPTransformerBlock` ([SPEC-049], `deepencoder.py:392-396`):
 /// `h = x + attn(LN1(x)); out = h + mlp(LN2(h))`.
 fn transformer_block(cfg: &ClipConfig, w: &ClipBlockWeights, x: &Mat) -> FocrResult<Mat> {
@@ -1301,6 +1536,116 @@ mod tests {
                 .map(|_| block_identity(dim, cfg.ffn_hidden_size))
                 .collect(),
         }
+    }
+
+    // ── bd-1azu.10: batched-CLIP parity (model-free, byte-exact) ────────────
+    // Deterministic non-trivial weights so a cross-view attention leak OR an
+    // M-dependent GEMM would change the output and fail the bit-exact assert.
+    fn det(i: usize, salt: usize) -> f32 {
+        let x = (i as u64)
+            .wrapping_mul(2_654_435_761)
+            .wrapping_add((salt as u64).wrapping_mul(40_503))
+            % 1000;
+        (x as f32) / 1000.0 - 0.5
+    }
+    fn rand_lin(out: usize, inn: usize, salt: usize) -> LinearParams {
+        LinearParams {
+            weight: (0..out * inn).map(|i| det(i, salt)).collect(),
+            bias: Some((0..out).map(|i| det(i, salt + 1)).collect()),
+            out_features: out,
+            in_features: inn,
+        }
+    }
+    fn rand_ln(dim: usize, salt: usize) -> LayerNormParams {
+        LayerNormParams {
+            weight: (0..dim).map(|i| 1.0 + det(i, salt)).collect(),
+            bias: (0..dim).map(|i| det(i, salt + 2)).collect(),
+        }
+    }
+    fn rand_weights(cfg: &ClipConfig, num_patches: usize) -> ClipWeights {
+        let dim = cfg.hidden_size;
+        let np = num_patches + 1;
+        ClipWeights {
+            class_embedding: (0..dim).map(|i| det(i, 11)).collect(),
+            position_embedding: (0..np * dim).map(|i| det(i, 13)).collect(),
+            num_positions: np,
+            pre_layernorm: rand_ln(dim, 17),
+            blocks: (0..cfg.num_layers)
+                .map(|l| ClipBlockWeights {
+                    layer_norm1: rand_ln(dim, 100 + l * 10),
+                    qkv_proj: rand_lin(3 * dim, dim, 200 + l * 10),
+                    out_proj: rand_lin(dim, dim, 300 + l * 10),
+                    layer_norm2: rand_ln(dim, 400 + l * 10),
+                    fc1: rand_lin(cfg.ffn_hidden_size, dim, 500 + l * 10),
+                    fc2: rand_lin(dim, cfg.ffn_hidden_size, 600 + l * 10),
+                })
+                .collect(),
+        }
+    }
+    fn parity_cfg() -> ClipConfig {
+        ClipConfig {
+            num_layers: 3,
+            hidden_size: 8,
+            num_heads: 2,
+            ffn_hidden_size: 16,
+            patch_size: 14,
+            layernorm_eps: 1e-5,
+            pre_layernorm_eps: 1e-5,
+        }
+    }
+    fn parity_view(num_patches: usize, dim: usize, salt: usize) -> Mat {
+        Mat::from_vec(
+            num_patches,
+            dim,
+            (0..num_patches * dim)
+                .map(|i| (((i + salt * 7) as f32) * 0.013).sin())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn batched_clip_equals_per_view_byte_for_byte() -> FocrResult<()> {
+        let cfg = parity_cfg();
+        let num_patches = 5;
+        let w = rand_weights(&cfg, num_patches);
+        let views: Vec<Mat> = (0..4)
+            .map(|vi| parity_view(num_patches, cfg.hidden_size, vi))
+            .collect();
+        let refs: Vec<&Mat> = views.iter().collect();
+        let batched = forward_with_batched(&cfg, &w, &refs)?;
+        assert_eq!(batched.len(), views.len());
+        for (vi, view) in views.iter().enumerate() {
+            let seq_out = forward_with(&cfg, &w, view)?;
+            assert_eq!(batched[vi].shape(), seq_out.shape(), "view {vi} shape");
+            assert_eq!(
+                batched[vi].data, seq_out.data,
+                "view {vi}: batched CLIP != per-view sequential (cross-view leak or M-dependence)"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batched_clip_single_view_equals_forward_with() -> FocrResult<()> {
+        let cfg = parity_cfg();
+        let num_patches = 6;
+        let w = rand_weights(&cfg, num_patches);
+        let view = parity_view(num_patches, cfg.hidden_size, 3);
+        let batched = forward_with_batched(&cfg, &w, &[&view])?;
+        let seq_out = forward_with(&cfg, &w, &view)?;
+        assert_eq!(batched.len(), 1);
+        assert_eq!(batched[0].data, seq_out.data);
+        Ok(())
+    }
+
+    #[test]
+    fn batched_clip_rejects_ragged_and_empty() {
+        let cfg = parity_cfg();
+        let w = rand_weights(&cfg, 4);
+        assert!(forward_with_batched(&cfg, &w, &[]).is_err());
+        let a = parity_view(4, cfg.hidden_size, 1);
+        let b = parity_view(5, cfg.hidden_size, 2); // ragged: different N
+        assert!(forward_with_batched(&cfg, &w, &[&a, &b]).is_err());
     }
 
     #[test]
