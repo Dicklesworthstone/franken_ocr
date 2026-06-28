@@ -20,6 +20,7 @@
 //!
 //! [`Mat`]: tensor::Mat
 
+pub mod batch_scheduler;
 pub mod connector;
 pub mod decoder;
 pub mod moe;
