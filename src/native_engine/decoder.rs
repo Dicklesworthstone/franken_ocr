@@ -1147,13 +1147,166 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
         )));
     }
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
-    let logits = gemv(
-        normed.row(0),
-        &wc.lm_head,
-        config::VOCAB_SIZE,
-        config::HIDDEN_SIZE,
-    );
+    let row = normed.row(0);
+    // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv`).
+    // Byte-for-byte identical either way — each logit is an independent dot.
+    let logits = if lmhead_shard_enabled() {
+        gemv_sharded(
+            row,
+            &wc.lm_head,
+            config::VOCAB_SIZE,
+            config::HIDDEN_SIZE,
+            lmhead_shard_tiles(),
+        )
+    } else {
+        gemv(row, &wc.lm_head, config::VOCAB_SIZE, config::HIDDEN_SIZE)
+    };
     Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
+}
+
+// ── Chunked prefill (FOCR_PREFILL_CHUNK, bd-1azu.9) ──────────────────────────
+//
+// Chunked prefill co-schedules a slice of the prompt into the decode batch as a
+// "mixed prefill/decode forward": instead of running the WHOLE prefill through
+// each layer in one monolithic SDPA, it consumes `C` tokens at a time, pushing
+// each chunk through all 12 layers (writing its K/V into the per-layer rings)
+// before the next chunk. This is the front end of the continuous-batch spine —
+// a prefill chunk is processed like a decode step, one pass through the layers,
+// so it can later share the batched per-layer GEMMs with in-flight decode rows.
+//
+// LOSSLESS by construction: chunking is a pure TILING of the SAME causal
+// attention. Every per-token op outside attention (RMSNorm, the q/k/v/o
+// projections, RoPE at the TRUE absolute position, the dense/MoE MLP, the
+// residual adds) is independent ROW-by-ROW, so a chunk's rows are byte-identical
+// whether projected alone or as part of the whole sequence. The only cross-token
+// op is attention, and for chunk `[c0, c1)` each new query at global position
+// `t ∈ [c0, c1)` attends EXACTLY the prior tokens it would monolithically —
+// keys `[0, t]` (earlier chunks already written into the running K/V, plus this
+// chunk up to `t`) — in the SAME ascending reduction order. The trailing
+// (future) keys a monolithic SDPA carries are masked to 0 for row `t` and add
+// exact `0.0`, so restricting the key set to `[0, c1)` is byte-for-byte the same
+// reduction (see [`chunk_prefill_attention`]). Hence the final hidden AND every
+// layer's ring K/V equal the monolithic [`prefill_with_cache`] output exactly.
+
+/// `FOCR_PREFILL_CHUNK`: kill-switch arming chunked prefill. UNSET ⇒ today's
+/// monolithic [`prefill_with_cache`] / [`prefill_with_cache_i8`] path, byte-for-
+/// byte. When present its value is the chunk size `C` (tokens consumed per
+/// pass); present-but-invalid (`empty`/unparseable/`0`) falls back to
+/// [`DEFAULT_PREFILL_CHUNK`] so mere presence still arms the lever, exactly like
+/// [`BATCH_SIZE_ENV`].
+const PREFILL_CHUNK_ENV: &str = "FOCR_PREFILL_CHUNK";
+
+/// Fallback chunk size when [`PREFILL_CHUNK_ENV`] is present but unparseable/`0`.
+const DEFAULT_PREFILL_CHUNK: usize = 256;
+
+/// The configured prefill chunk size ([`PREFILL_CHUNK_ENV`], read ONCE into a
+/// process-global per doctrine — never re-read per prefill). `None` ⇒ the
+/// monolithic path (the unset default); `Some(C)` ⇒ chunk `C > 0` tokens per
+/// pass. A chunk `>=` the sequence length collapses to a single chunk, which is
+/// itself byte-for-byte the monolithic path.
+#[must_use]
+pub fn prefill_chunk_size() -> Option<usize> {
+    static SIZE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        // unset ⇒ monolithic prefill, byte-for-byte
+        std::env::var_os(PREFILL_CHUNK_ENV)?;
+        Some(
+            std::env::var(PREFILL_CHUNK_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_PREFILL_CHUNK),
+        )
+    })
+}
+
+/// Tile `[0, seq)` into CONTIGUOUS, gap-free, ascending `[c0, c1)` chunks of at
+/// most `chunk` tokens (the last is the `seq % chunk` remainder). `chunk` is
+/// clamped to `>= 1`. The ascending coverage is what lets chunk `g`'s attention
+/// see exactly the keys earlier chunks already wrote — and preserves token order.
+fn prefill_chunk_bounds(seq: usize, chunk: usize) -> Vec<(usize, usize)> {
+    let chunk = chunk.max(1);
+    let mut bounds = Vec::with_capacity(seq.div_ceil(chunk));
+    let mut c0 = 0usize;
+    while c0 < seq {
+        let c1 = (c0 + chunk).min(seq);
+        bounds.push((c0, c1));
+        c0 = c1;
+    }
+    bounds
+}
+
+/// Causal self-attention for ONE prefill chunk: the `cs = c1 - c0` new queries
+/// `q_chunk` (global positions `[c0, c1)`, already RoPE'd) attend over the
+/// running reference keys/values `k_prefix`/`v_prefix` — the FULL `[0, c1)`
+/// prefix (earlier chunks ++ this chunk's own K/V) — under the triangular causal
+/// mask, returning the `[cs, num_heads*head_dim]` context (pre-`o_proj`).
+///
+/// BYTE-FOR-BYTE identical to the corresponding rows of the monolithic
+/// [`prefill_attention`] over the whole sequence. The trick: front-pad the
+/// queries to the `c1` rows the prefix spans (rows `[0, c0)` are scratch and
+/// discarded) so [`prefill_attention`]'s top-left causal mask (`limit = row+1`)
+/// lands each REAL query row `t` on keys `[0, t]` — exactly its monolithic
+/// reach. Each kept row's score dot (over `head_dim`), softmax (ascending over
+/// `[0, t]`), and `P·V` (ascending, with the future keys a monolithic pass would
+/// carry contributing exact `0.0`) are unchanged, and the scratch rows are
+/// row-independent in SDPA, so they never perturb a kept row.
+///
+/// # Errors
+/// [`FocrError::Other`] on a shape mismatch (`q_chunk`/`k_prefix`/`v_prefix`
+/// widths disagree, `c0 + cs != c1`, or `c0 > c1`).
+pub fn chunk_prefill_attention(
+    q_chunk: &Mat,
+    k_prefix: &Mat,
+    v_prefix: &Mat,
+    num_heads: usize,
+    head_dim: usize,
+    c0: usize,
+) -> FocrResult<Mat> {
+    checked_mat_len("chunk_prefill_attention q_chunk", q_chunk)?;
+    checked_mat_len("chunk_prefill_attention k_prefix", k_prefix)?;
+    checked_mat_len("chunk_prefill_attention v_prefix", v_prefix)?;
+    let dim = checked_shape_mul(
+        "chunk_prefill_attention",
+        num_heads,
+        head_dim,
+        "num_heads*head_dim",
+    )?;
+    let c1 = k_prefix.rows;
+    let cs = q_chunk.rows;
+    if q_chunk.cols != dim || k_prefix.cols != dim || v_prefix.cols != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "chunk_prefill_attention: q/k/v cols ({},{},{}) != num_heads*head_dim {dim}",
+            q_chunk.cols,
+            k_prefix.cols,
+            v_prefix.cols
+        )));
+    }
+    if v_prefix.rows != c1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "chunk_prefill_attention: k/v prefix rows disagree ({}, {})",
+            c1,
+            v_prefix.rows
+        )));
+    }
+    if c0 > c1 || c0 + cs != c1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "chunk_prefill_attention: chunk [{c0}, {}) of {cs} rows does not fit prefix {c1}",
+            c0 + cs
+        )));
+    }
+    // Front-pad the chunk's queries to the prefix length so SDPA's top-left
+    // causal mask aligns each real query row to its TRUE global position. The
+    // scratch rows `[0, c0)` are discarded (their masked attention over the
+    // zero query never feeds back into a kept row).
+    let mut q_padded = Mat::zeros(c1, dim);
+    q_padded.data[c0 * dim..c1 * dim].copy_from_slice(&q_chunk.data);
+    let ctx_full = prefill_attention(&q_padded, k_prefix, v_prefix, num_heads, head_dim)?;
+    Ok(Mat::from_vec(
+        cs,
+        dim,
+        ctx_full.data[c0 * dim..c1 * dim].to_vec(),
+    ))
 }
 
 /// Run the full 12-layer prefill over `inputs_embeds` exactly like [`forward`],
@@ -1168,6 +1321,10 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
 /// MLP/MoE re-processes all prior tokens); here we pay the prefill ONCE and then
 /// extend by a single token per step.
 ///
+/// `FOCR_PREFILL_CHUNK` ([`prefill_chunk_size`]) arms the chunked path
+/// ([`prefill_with_cache_chunked`]); unset ⇒ the monolithic loop, byte-for-byte
+/// the original.
+///
 /// # Errors
 /// As [`forward`], plus a [`RingCache::record_prefill`] error if `seq` exceeds
 /// the cache capacity (it is sized to `seq`, so only an internal inconsistency
@@ -1175,6 +1332,22 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
 pub fn prefill_with_cache(
     wc: &DecoderWeightCache,
     inputs_embeds: &Mat,
+) -> FocrResult<(Mat, Vec<RingCache>)> {
+    prefill_with_cache_chunked(wc, inputs_embeds, prefill_chunk_size())
+}
+
+/// [`prefill_with_cache`] with the chunk decision made explicit (so the parity
+/// test can exercise both schedules in one process without re-reading the
+/// kill-switch). `chunk = None` runs the monolithic loop — the exact original
+/// path; `chunk = Some(C)` tiles the prefill into `C`-token chunks (lossless, see
+/// the module note above [`PREFILL_CHUNK_ENV`]).
+///
+/// # Errors
+/// As [`prefill_with_cache`].
+pub fn prefill_with_cache_chunked(
+    wc: &DecoderWeightCache,
+    inputs_embeds: &Mat,
+    chunk: Option<usize>,
 ) -> FocrResult<(Mat, Vec<RingCache>)> {
     checked_mat_len("decoder::prefill_with_cache inputs_embeds", inputs_embeds)?;
     let hidden = config::HIDDEN_SIZE;
@@ -1195,13 +1368,67 @@ pub fn prefill_with_cache(
     }
     let seq = inputs_embeds.rows;
 
-    // Absolute positions 0..seq, one shared RoPE table ([SPEC-095]).
-    let positions: Vec<usize> = (0..seq).collect();
-    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
-
     let mut caches: Vec<RingCache> = (0..config::NUM_HIDDEN_LAYERS)
         .map(|_| RingCache::new(seq.max(1)))
         .collect();
+
+    if let Some(chunk) = chunk {
+        // ── Chunked schedule: push each `chunk`-token slice through all layers,
+        //    growing the per-layer K/V, then seed the rings ONCE at the end. ──
+        let mut out = Mat::zeros(seq, hidden);
+        let mut k_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        let mut v_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        for (c0, c1) in prefill_chunk_bounds(seq, chunk) {
+            // RoPE over THIS chunk's TRUE absolute positions [c0, c1) ([SPEC-095]).
+            let positions: Vec<usize> = (c0..c1).collect();
+            let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
+            let mut x = Mat::from_vec(
+                c1 - c0,
+                hidden,
+                inputs_embeds.data[c0 * hidden..c1 * hidden].to_vec(),
+            );
+            for layer in 0..config::NUM_HIDDEN_LAYERS {
+                let cl = &wc.layers[layer];
+                let lw = cached_layer_weights(cl);
+                let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
+                let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
+                // Append this chunk's K/V into the running reference block.
+                k_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&k.data);
+                v_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&v.data);
+                let kpre = Mat::from_vec(c1, qkv_dim, k_full[layer].data[..c1 * qkv_dim].to_vec());
+                let vpre = Mat::from_vec(c1, qkv_dim, v_full[layer].data[..c1 * qkv_dim].to_vec());
+                let context = chunk_prefill_attention(&q, &kpre, &vpre, num_heads, head_dim, c0)?;
+                let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
+                let h = add_residual(&x, &attn_out)?;
+                let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
+                let mlp_out = cached_mlp(&cl.mlp, &normed2)?;
+                x = add_residual(&h, &mlp_out)?;
+            }
+            out.data[c0 * hidden..c1 * hidden].copy_from_slice(&x.data);
+        }
+        // Seed each ring with the full accumulated reference block — byte-for-byte
+        // the monolithic `record_prefill` (same K/V, same order).
+        for layer in 0..config::NUM_HIDDEN_LAYERS {
+            let (kh, vh) = token_major_to_head_major(
+                &k_full[layer],
+                &v_full[layer],
+                seq,
+                num_heads,
+                head_dim,
+            )?;
+            caches[layer].record_prefill(&kh, &vh, seq)?;
+        }
+        return Ok((out, caches));
+    }
+
+    // ── Monolithic schedule (the unset default): one SDPA over the whole seq. ──
+    // Absolute positions 0..seq, one shared RoPE table ([SPEC-095]).
+    let positions: Vec<usize> = (0..seq).collect();
+    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
 
     let mut x = inputs_embeds.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
@@ -1428,6 +1655,147 @@ fn expert_gemv_i8_serial(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> V
 /// int8 (`in` inferred from `w.len()/out`). Thin wrapper over [`nn::quantize_int8`].
 fn quant_oc(w: &[f32], out: usize) -> QInt8 {
     nn::quantize_int8(w, out, w.len() / out)
+}
+
+// ── CCD-sharded / L3-tiled lm_head (FOCR_LMHEAD_SHARD, bd-1azu.25) ────────────
+//
+// The `lm_head` projects the final hidden `[1, 1280]` against the `[129280, 1280]`
+// vocab weight to `[1, 129280]` logits. Each logit `o` is a SELF-CONTAINED dot
+// `Σ_i x[i]·w[o,i]` (int8: `(Σ_i xq[i]·w[o,i])·a_scale·scale[o]`) — the vocab
+// columns never reduce into one another. So splitting the 129280 output columns
+// into CONTIGUOUS tiles, computing each tile, and writing it back into its own
+// `[.., tile]` column span is BYTE-FOR-BYTE identical to the single monolithic
+// GEMV: same single activation quantize, same per-logit i32 contraction
+// (N-independent — already relied on by [`gemv_i8`]'s 64-row blocking and
+// [`fuse_qkv`]), same per-channel dequant operands in the same order, and the
+// ascending tile order preserves the vocab column order — so argmax/sampling are
+// unchanged. This is the L3-resident weight-tiling seam (read one vocab tile of
+// the 660 MB int8 panel at a time); DEFAULT OFF keeps the exact monolithic path.
+
+/// `FOCR_LMHEAD_SHARD`: kill-switch arming the vocab-tiled (`lm_head`-sharded)
+/// projection ([`gemv_i8_sharded`] / [`gemv_sharded`]). DEFAULT OFF — the head
+/// stays the single monolithic [`gemv_i8`]/[`gemv`]; armed, the 129280 vocab
+/// columns are computed in [`lmhead_shard_tiles`] CONTIGUOUS tiles, byte-for-byte
+/// identical. Consulted ONCE per `lm_head` call, never inside the math, exactly
+/// like [`QKV_FUSED_ENV`].
+const LMHEAD_SHARD_ENV: &str = "FOCR_LMHEAD_SHARD";
+
+/// `FOCR_LMHEAD_SHARD_TILES`: number of CONTIGUOUS vocab tiles the sharded
+/// `lm_head` splits its output columns into. Parsed ONCE; defaults to
+/// [`DEFAULT_LMHEAD_SHARD_TILES`] when unset, empty, unparseable, or `0`. The tile
+/// count never changes a logit value or the column order — only how the columns
+/// are grouped into kernel calls.
+const LMHEAD_SHARD_TILES_ENV: &str = "FOCR_LMHEAD_SHARD_TILES";
+
+/// Fallback vocab-tile count when [`LMHEAD_SHARD_TILES_ENV`] is unset/invalid.
+const DEFAULT_LMHEAD_SHARD_TILES: usize = 16;
+
+/// Whether the vocab-tiled `lm_head` is armed (the [`LMHEAD_SHARD_ENV`]
+/// kill-switch, read ONCE into a process-wide bool — never touched inside the
+/// per-logit math). The sharded kernels are pure and testable regardless of this
+/// flag; only the head's decision to route through them is gated here.
+#[must_use]
+pub fn lmhead_shard_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(LMHEAD_SHARD_ENV).is_some())
+}
+
+/// The configured contiguous vocab-tile count ([`LMHEAD_SHARD_TILES_ENV`], read
+/// ONCE). Always `>= 1`.
+#[must_use]
+pub fn lmhead_shard_tiles() -> usize {
+    static TILES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TILES.get_or_init(|| {
+        std::env::var(LMHEAD_SHARD_TILES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_LMHEAD_SHARD_TILES)
+    })
+}
+
+/// Partition `n` output channels (vocab columns) into `tiles` CONTIGUOUS,
+/// gap-free, non-overlapping ranges covering `[0, n)` in fixed ascending order
+/// (the `n % tiles` remainder is spread one-per-tile across the leading tiles).
+/// `tiles` is clamped to `[1, n.max(1)]` so every emitted range is in-bounds.
+/// The ascending coverage is what preserves the vocab column order — and hence
+/// argmax/sampling — under sharding.
+fn vocab_tile_ranges(n: usize, tiles: usize) -> Vec<(usize, usize)> {
+    let tiles = tiles.clamp(1, n.max(1));
+    let base = n / tiles;
+    let rem = n % tiles;
+    let mut ranges = Vec::with_capacity(tiles);
+    let mut start = 0usize;
+    for t in 0..tiles {
+        let len = base + usize::from(t < rem);
+        let end = start + len;
+        ranges.push((start, end));
+        start = end;
+    }
+    debug_assert_eq!(start, n, "vocab_tile_ranges must cover [0, n)");
+    ranges
+}
+
+/// Vocab-tiled f32 `lm_head` GEMV — the `FOCR_LMHEAD_SHARD` twin of [`gemv`].
+/// Splits the `n` output channels into [`vocab_tile_ranges`] CONTIGUOUS tiles and
+/// computes each tile's logit slice into its own `y[start..end]` span. BYTE-FOR-
+/// BYTE identical to [`gemv`]: every channel `o`'s value is `dot_f32(x, w[o,:])`
+/// regardless of which tile (or 64-row rayon chunk) it lands in — tiling only
+/// repartitions the column ranges, never a per-logit reduction or the order.
+fn gemv_sharded(x: &[f32], w: &[f32], n: usize, k: usize, tiles: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(w.len(), n * k);
+    let mut y = vec![0.0f32; n];
+    for (start, end) in vocab_tile_ranges(n, tiles) {
+        // Same 64-row rayon chunking as `gemv`, confined to this tile's columns.
+        y[start..end]
+            .par_chunks_mut(64)
+            .enumerate()
+            .for_each(|(blk, ys)| {
+                let base = start + blk * 64;
+                for (j, slot) in ys.iter_mut().enumerate() {
+                    let o = base + j;
+                    *slot = dot_f32(x, &w[o * k..o * k + k]);
+                }
+            });
+    }
+    y
+}
+
+/// Vocab-tiled int8 `lm_head` GEMV — the `FOCR_LMHEAD_SHARD` twin of [`gemv_i8`].
+/// The activation is dynamically int8-quantized ONCE (the same `(xq, a_scale)`
+/// [`gemv_i8`] would produce), then the `n` output channels are computed in
+/// [`vocab_tile_ranges`] CONTIGUOUS tiles, each tile's slice written into its own
+/// `y[start..end]` span. BYTE-FOR-BYTE identical to [`gemv_i8`]: each channel
+/// `o`'s i32 dot `Σ_i xq[i]·w[o,i]` is independent of how the columns are grouped
+/// into [`simd::igemm_s8s8`] calls (the N-independence [`gemv_i8`] already exploits
+/// with its 64-row blocking), and the dequant `acc·a_scale·scales[o]` uses the
+/// SAME operands in the SAME left-associative order.
+fn gemv_i8_sharded(x: &[f32], qw: &QInt8, tiles: usize) -> Vec<f32> {
+    let k = qw.k;
+    let n = qw.n;
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.scales.len(), n);
+    let (xq, a_scale) = quantize_row_i8(x);
+    let mut y = vec![0.0f32; n];
+    for (start, end) in vocab_tile_ranges(n, tiles) {
+        // Same `I8_GEMV_BLOCK` rayon chunking as `gemv_i8`, confined to this
+        // tile's columns; `base`/`scales` index the ABSOLUTE channel.
+        y[start..end]
+            .par_chunks_mut(I8_GEMV_BLOCK)
+            .enumerate()
+            .for_each(|(blk, ys)| {
+                let base = start + blk * I8_GEMV_BLOCK;
+                let cnt = ys.len();
+                let mut acc = vec![0i32; cnt];
+                simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
+                for (j, slot) in ys.iter_mut().enumerate() {
+                    *slot = acc[j] as f32 * a_scale * qw.scales[base + j];
+                }
+            });
+    }
+    y
 }
 
 /// `FOCR_QKV_FUSED`: at cache-build, STACK q/k/v into ONE `[3*qkv_dim, hidden]`
@@ -1803,7 +2171,14 @@ pub fn lm_head_cached_i8(wc: &DecoderWeightCacheI8, hidden: &Mat) -> FocrResult<
     }
     let t = prof::enabled().then(std::time::Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
-    let logits = gemv_i8(normed.row(0), &wc.lm_head);
+    let row = normed.row(0);
+    // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv_i8`).
+    // Byte-for-byte identical either way — each logit is an independent int8 dot.
+    let logits = if lmhead_shard_enabled() {
+        gemv_i8_sharded(row, &wc.lm_head, lmhead_shard_tiles())
+    } else {
+        gemv_i8(row, &wc.lm_head)
+    };
     if let Some(t) = t {
         prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
     }
@@ -1815,11 +2190,31 @@ pub fn lm_head_cached_i8(wc: &DecoderWeightCacheI8, hidden: &Mat) -> FocrResult<
 /// K/V into the R-SWA ring just like the f32 path. Returns the final
 /// `model.norm`-ready hidden `[seq, hidden]` + the 12 populated caches.
 ///
+/// `FOCR_PREFILL_CHUNK` ([`prefill_chunk_size`]) arms the chunked schedule
+/// ([`prefill_with_cache_i8_chunked`]); unset ⇒ the monolithic loop, byte-for-byte.
+///
 /// # Errors
 /// As [`prefill_with_cache`].
 pub fn prefill_with_cache_i8(
     wc: &DecoderWeightCacheI8,
     inputs_embeds: &Mat,
+) -> FocrResult<(Mat, Vec<RingCache>)> {
+    prefill_with_cache_i8_chunked(wc, inputs_embeds, prefill_chunk_size())
+}
+
+/// [`prefill_with_cache_i8`] with the chunk decision made explicit (the int8 twin
+/// of [`prefill_with_cache_chunked`]). `chunk = None` is the exact monolithic
+/// int8 path; `chunk = Some(C)` tiles the prefill into `C`-token chunks. The
+/// attention is the SAME f32 [`chunk_prefill_attention`] as the f32 path — only
+/// the projections/MLP run int8 — and every chunked op is row-independent, so it
+/// is byte-for-byte the monolithic int8 prefill.
+///
+/// # Errors
+/// As [`prefill_with_cache_i8`].
+pub fn prefill_with_cache_i8_chunked(
+    wc: &DecoderWeightCacheI8,
+    inputs_embeds: &Mat,
+    chunk: Option<usize>,
 ) -> FocrResult<(Mat, Vec<RingCache>)> {
     checked_mat_len(
         "decoder::prefill_with_cache_i8 inputs_embeds",
@@ -1828,9 +2223,9 @@ pub fn prefill_with_cache_i8(
     let hidden = config::HIDDEN_SIZE;
     let num_heads = config::NUM_ATTENTION_HEADS;
     let head_dim = config::HEAD_DIM;
-    // Validate num_heads*head_dim doesn't overflow (the int8 linears infer the
-    // qkv width from `q_proj.n`, so the product itself isn't threaded through).
-    let _ = checked_shape_mul(
+    // qkv width = num_heads*head_dim (the int8 linears infer it from `q_proj.n`,
+    // so it isn't threaded through; we still need it for the chunked K/V buffers).
+    let qkv_dim = checked_shape_mul(
         "decoder::prefill_with_cache_i8",
         num_heads,
         head_dim,
@@ -1844,11 +2239,64 @@ pub fn prefill_with_cache_i8(
         )));
     }
     let seq = inputs_embeds.rows;
-    let positions: Vec<usize> = (0..seq).collect();
-    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
     let mut caches: Vec<RingCache> = (0..config::NUM_HIDDEN_LAYERS)
         .map(|_| RingCache::new(seq.max(1)))
         .collect();
+
+    if let Some(chunk) = chunk {
+        // ── Chunked schedule (int8 projections/MLP; f32 chunked attention). ──
+        let mut out = Mat::zeros(seq, hidden);
+        let mut k_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        let mut v_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        for (c0, c1) in prefill_chunk_bounds(seq, chunk) {
+            let positions: Vec<usize> = (c0..c1).collect();
+            let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
+            let mut x = Mat::from_vec(
+                c1 - c0,
+                hidden,
+                inputs_embeds.data[c0 * hidden..c1 * hidden].to_vec(),
+            );
+            for layer in 0..config::NUM_HIDDEN_LAYERS {
+                let cl = &wc.layers[layer];
+                let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+                let mut q = nn::linear_int8_dynamic(&normed, &cl.q_proj, None)?;
+                let mut k = nn::linear_int8_dynamic(&normed, &cl.k_proj, None)?;
+                let v = nn::linear_int8_dynamic(&normed, &cl.v_proj, None)?;
+                apply_rope(&mut q, &rope)?;
+                apply_rope(&mut k, &rope)?;
+                k_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&k.data);
+                v_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&v.data);
+                let kpre = Mat::from_vec(c1, qkv_dim, k_full[layer].data[..c1 * qkv_dim].to_vec());
+                let vpre = Mat::from_vec(c1, qkv_dim, v_full[layer].data[..c1 * qkv_dim].to_vec());
+                let context = chunk_prefill_attention(&q, &kpre, &vpre, num_heads, head_dim, c0)?;
+                let attn_out = nn::linear_int8_dynamic(&context, &cl.o_proj, None)?;
+                let h = add_residual(&x, &attn_out)?;
+                let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+                let mlp_out = prefill_mlp_i8(&cl.mlp, &normed2)?;
+                x = add_residual(&h, &mlp_out)?;
+            }
+            out.data[c0 * hidden..c1 * hidden].copy_from_slice(&x.data);
+        }
+        for layer in 0..config::NUM_HIDDEN_LAYERS {
+            let (kh, vh) = token_major_to_head_major(
+                &k_full[layer],
+                &v_full[layer],
+                seq,
+                num_heads,
+                head_dim,
+            )?;
+            caches[layer].record_prefill(&kh, &vh, seq)?;
+        }
+        return Ok((out, caches));
+    }
+
+    // ── Monolithic schedule (the unset default). ──
+    let positions: Vec<usize> = (0..seq).collect();
+    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
 
     let mut x = inputs_embeds.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
@@ -2400,6 +2848,187 @@ mod tests {
             assert!(!batch_spine_enabled());
         }
         assert!(batch_size_cap() >= 1);
+    }
+
+    // ── Chunked prefill kill-switch + tiling (FOCR_PREFILL_CHUNK, bd-1azu.9) ──────
+
+    /// `FOCR_PREFILL_CHUNK` defaults to the monolithic schedule (`None`) when the
+    /// environment is unset — the lever is additive, default-OFF (Doctrine #3).
+    /// Guarded behind the env presence so a host that exports it does not flake.
+    #[test]
+    fn prefill_chunk_defaults_off() {
+        if std::env::var_os("FOCR_PREFILL_CHUNK").is_none() {
+            assert_eq!(prefill_chunk_size(), None);
+        }
+    }
+
+    /// [`prefill_chunk_bounds`] tiles `[0, seq)` into CONTIGUOUS, gap-free,
+    /// ascending `[c0, c1)` chunks of at most `chunk` tokens, covering exactly
+    /// `[0, seq)` for every chunk size — including `1`, primes, sizes that do not
+    /// divide `seq`, and sizes `>= seq` (a single chunk). This ascending coverage
+    /// is what lets chunk `g` attend exactly the keys earlier chunks wrote.
+    #[test]
+    fn prefill_chunk_bounds_cover_contiguously_in_order() {
+        for &seq in &[0usize, 1, 2, 5, 7, 16, 17] {
+            for &chunk in &[1usize, 2, 3, 5, 7, 16, 64] {
+                let bounds = prefill_chunk_bounds(seq, chunk);
+                let mut cursor = 0usize;
+                for &(c0, c1) in &bounds {
+                    assert_eq!(c0, cursor, "seq={seq} chunk={chunk}: gap/overlap");
+                    assert!(c1 > c0, "seq={seq} chunk={chunk}: empty/reversed chunk");
+                    assert!(c1 - c0 <= chunk, "seq={seq} chunk={chunk}: chunk too wide");
+                    assert!(c1 <= seq, "seq={seq} chunk={chunk}: chunk past seq");
+                    cursor = c1;
+                }
+                assert_eq!(cursor, seq, "seq={seq} chunk={chunk}: must cover [0, seq)");
+            }
+        }
+    }
+
+    /// The assembled chunked attention is BYTE-FOR-BYTE the monolithic
+    /// [`prefill_attention`] over the whole sequence, for every chunk size — the
+    /// crux of the chunked-prefill lossless claim, exercised on the REAL
+    /// [`chunk_prefill_attention`] kernel at a small synthetic head shape (a model
+    /// is not needed: attention is shape-parametrized).
+    #[test]
+    fn chunked_attention_is_byte_identical_to_monolithic() {
+        let (num_heads, head_dim, seq) = (3usize, 4usize, 11usize);
+        let dim = num_heads * head_dim;
+        // Deterministic synthetic q/k/v spanning negatives/positives.
+        let mk = |salt: f32| -> Mat {
+            let data: Vec<f32> = (0..seq * dim)
+                .map(|i| ((i as f32 + salt) * 0.37).sin() * 1.7 - 0.2)
+                .collect();
+            Mat::from_vec(seq, dim, data)
+        };
+        let (q, k, v) = (mk(0.0), mk(11.0), mk(23.0));
+        let monolithic = prefill_attention(&q, &k, &v, num_heads, head_dim).unwrap();
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        // chunk 1, 2, a prime (3), and the full length (single chunk).
+        for &chunk in &[1usize, 2, 3, seq] {
+            let mut assembled = Mat::zeros(seq, dim);
+            for (c0, c1) in prefill_chunk_bounds(seq, chunk) {
+                let q_chunk = Mat::from_vec(c1 - c0, dim, q.data[c0 * dim..c1 * dim].to_vec());
+                let kpre = Mat::from_vec(c1, dim, k.data[..c1 * dim].to_vec());
+                let vpre = Mat::from_vec(c1, dim, v.data[..c1 * dim].to_vec());
+                let ctx = chunk_prefill_attention(&q_chunk, &kpre, &vpre, num_heads, head_dim, c0)
+                    .unwrap();
+                assembled.data[c0 * dim..c1 * dim].copy_from_slice(&ctx.data);
+            }
+            assert_eq!(
+                bits(&monolithic.data),
+                bits(&assembled.data),
+                "chunk={chunk}: chunked attention != monolithic prefill_attention"
+            );
+        }
+    }
+
+    // ── Vocab-tiled lm_head bit-identity (FOCR_LMHEAD_SHARD, bd-1azu.25) ──────────
+
+    /// [`vocab_tile_ranges`] partitions `[0, n)` into CONTIGUOUS, gap-free,
+    /// ascending tiles for every tile count — including counts that do not divide
+    /// `n` and counts larger than `n` (which must clamp, never emit out-of-bounds
+    /// or empty-then-restart ranges). The ascending coverage is what preserves the
+    /// vocab column order under sharding.
+    #[test]
+    fn vocab_tile_ranges_cover_contiguously_in_order() {
+        for &n in &[0usize, 1, 7, 64, 65, 129_280] {
+            for &tiles in &[1usize, 2, 3, 7, 16, 1000, 200_000] {
+                let ranges = vocab_tile_ranges(n, tiles);
+                // Contiguous from 0, gap-free, non-overlapping, covering [0, n).
+                let mut cursor = 0usize;
+                for &(start, end) in &ranges {
+                    assert_eq!(start, cursor, "n={n} tiles={tiles}: tile gap/overlap");
+                    assert!(end >= start, "n={n} tiles={tiles}: reversed tile");
+                    assert!(end <= n, "n={n} tiles={tiles}: tile end out of bounds");
+                    cursor = end;
+                }
+                assert_eq!(cursor, n, "n={n} tiles={tiles}: ranges must cover [0, n)");
+                // Tile count is clamped into `[1, n.max(1)]`.
+                assert!(!ranges.is_empty(), "n={n} tiles={tiles}: at least one tile");
+                assert!(
+                    ranges.len() <= n.max(1),
+                    "n={n} tiles={tiles}: more tiles than channels"
+                );
+            }
+        }
+    }
+
+    /// [`gemv_i8_sharded`] must reproduce, BYTE-FOR-BYTE, what the monolithic
+    /// [`gemv_i8`] produces — for several contiguous-tile counts INCLUDING ones
+    /// that do not evenly divide the vocab and one larger than a 64-row block.
+    /// `n` is a deliberately awkward small synthetic vocab (not a multiple of
+    /// [`I8_GEMV_BLOCK`]) so tile and 64-row chunk boundaries straddle, proving
+    /// each logit is an independent dot whose value is invariant to grouping.
+    #[test]
+    fn lmhead_shard_i8_is_byte_identical_to_monolithic() {
+        let mk = |n: usize, k: usize, salt: i32| -> QInt8 {
+            let mut w = vec![0i8; n * k];
+            for o in 0..n {
+                for i in 0..k {
+                    let raw = ((o as i32 * 13 + i as i32 * 7 + salt * 101) % 255) - 127;
+                    w[o * k + i] = raw as i8;
+                }
+            }
+            let scales: Vec<f32> = (0..n)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            QInt8::new(w, scales, n, k)
+        };
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        // Small synthetic vocab `n=150` (crosses two 64-blocks, not a multiple of 64).
+        let (n, k) = (150usize, 96usize);
+        let qw = mk(n, k, 3);
+        let x: Vec<f32> = (0..k)
+            .map(|i| (i as f32 * 0.41).sin() * 2.5 - 0.4)
+            .collect();
+        let monolithic = gemv_i8(&x, &qw);
+        // 7 does not divide 150; 13 does not divide 150; 1 is the trivial tile;
+        // 200 > n exercises the clamp; 150 is one-column-per-tile.
+        for &tiles in &[1usize, 2, 7, 13, 64, 150, 200] {
+            let sharded = gemv_i8_sharded(&x, &qw, tiles);
+            assert_eq!(
+                bits(&monolithic),
+                bits(&sharded),
+                "int8 lm_head: {tiles}-tile shard != monolithic gemv_i8 (n={n} k={k})"
+            );
+        }
+    }
+
+    /// [`gemv_sharded`] must reproduce, BYTE-FOR-BYTE, what the monolithic
+    /// [`gemv`] produces — the f32-head twin of the int8 check, across non-dividing
+    /// tile counts on a small synthetic vocab.
+    #[test]
+    fn lmhead_shard_f32_is_byte_identical_to_monolithic() {
+        let (n, k) = (150usize, 96usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|idx| ((idx as f32 * 0.013).sin() * 1.7) - 0.3)
+            .collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| (i as f32 * 0.29).cos() * 2.1 + 0.2)
+            .collect();
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let monolithic = gemv(&x, &w, n, k);
+        for &tiles in &[1usize, 2, 7, 13, 64, 150, 200] {
+            let sharded = gemv_sharded(&x, &w, n, k, tiles);
+            assert_eq!(
+                bits(&monolithic),
+                bits(&sharded),
+                "f32 lm_head: {tiles}-tile shard != monolithic gemv (n={n} k={k})"
+            );
+        }
+    }
+
+    /// The vocab-shard env kill-switch defaults OFF and the tile count defaults to
+    /// a positive value when the environment is unset — an additive, default-OFF
+    /// lever (Doctrine #3). Guarded behind the env so a host that exports
+    /// `FOCR_LMHEAD_SHARD` does not flake.
+    #[test]
+    fn lmhead_shard_defaults_off_with_positive_tiles() {
+        if std::env::var_os("FOCR_LMHEAD_SHARD").is_none() {
+            assert!(!lmhead_shard_enabled());
+        }
+        assert!(lmhead_shard_tiles() >= 1);
     }
 
     fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {

@@ -326,6 +326,29 @@ impl RingCache {
         self.prefill_len
     }
 
+    /// Live reference-block **K** for head `h`, flat `[prefill_len * HEAD_DIM]`
+    /// (the permanent R-SWA reference rows seeded by [`RingCache::record_prefill`];
+    /// empty before prefill). Exposed for byte-for-byte cache parity tooling — e.g.
+    /// asserting chunked prefill produces the SAME ring K/V as the monolithic path
+    /// (bd-1azu.9). Read-only view; the decode math is unaffected.
+    ///
+    /// # Panics
+    /// Panics if `h >= NUM_HEADS`.
+    #[must_use]
+    pub fn reference_k(&self, h: usize) -> &[f32] {
+        &self.ref_k[h][..self.prefill_len.unwrap_or(0) * HEAD_DIM]
+    }
+
+    /// Live reference-block **V** for head `h`, flat `[prefill_len * HEAD_DIM]` —
+    /// the [`RingCache::reference_k`] twin.
+    ///
+    /// # Panics
+    /// Panics if `h >= NUM_HEADS`.
+    #[must_use]
+    pub fn reference_v(&self, h: usize) -> &[f32] {
+        &self.ref_v[h][..self.prefill_len.unwrap_or(0) * HEAD_DIM]
+    }
+
     /// Number of live ring rows (`0..=RING_WINDOW`).
     #[must_use]
     pub fn ring_len(&self) -> usize {
