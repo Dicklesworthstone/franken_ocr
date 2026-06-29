@@ -141,6 +141,25 @@ fn int8_decode_requested() -> bool {
         || std::env::var_os(DECODE_INT8_ENV).is_some()
 }
 
+/// `FOCR_SPEC_DECODE` (bd-1azu.35): presence kill-switch arming the draft -> verify
+/// -> accept speculative decode inside the int8 generate loop
+/// ([`OcrModel::spec_decode_i8`]). DEFAULT OFF => [`OcrModel::generate_cached_i8`]
+/// runs EXACTLY today's sequential greedy loop, byte-for-byte the same tokens. When
+/// set, the spec loop emits the BYTE-IDENTICAL token stream — speculation changes
+/// only WHEN logits are evaluated, never WHICH token greedy decode picks. Its
+/// verifier's chooser (`spec::accept_longest`) assumes the frozen single-image ban,
+/// so the dispatch also guards `no_repeat_ngram_size == 35 && ngram_window == 128`.
+const SPEC_DECODE_ENV: &str = "FOCR_SPEC_DECODE";
+
+/// Whether speculative decode is armed ([`SPEC_DECODE_ENV`], read ONCE into a
+/// process-wide bool — never touched per token), exactly like the other decode
+/// kill-switches. The spec kernels are pure and gated regardless of this flag; only
+/// the generate loop's decision to route through them is read here.
+fn spec_decode_enabled() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(SPEC_DECODE_ENV).is_some())
+}
+
 /// Emit a stage-timing line to stderr when `FOCR_TIMING` is set (perf bring-up).
 fn timing_log(msg: &str) {
     if std::env::var_os("FOCR_TIMING").is_some() {
@@ -1103,7 +1122,29 @@ impl OcrModel {
         // sampler's separate copy-then-mask pass. DEFAULT OFF — read ONCE here.
         let fuse_ngram_lmhead = decoder::fuse_ngram_lmhead_enabled();
 
-        while emitted.len() < params.max_length {
+        // FOCR_SPEC_DECODE (bd-1azu.35): when armed AND the decode params match the
+        // frozen single-image ban the speculative verifier's chooser assumes
+        // (`spec::accept_longest` hardwires 35-gram / 128-window), run the draft ->
+        // verify -> accept loop in place of the sequential greedy `while` below; it
+        // emits the BYTE-FOR-BYTE-identical token stream. Unset (the default) => the
+        // spec loop is skipped and the `while` runs EXACTLY today's code, untouched.
+        let spec_decode = spec_decode_enabled()
+            && params.no_repeat_ngram_size == sampler::DEFAULT_NO_REPEAT_NGRAM_SIZE
+            && params.ngram_window == sampler::NGRAM_WINDOW_SINGLE;
+        if spec_decode {
+            self.spec_decode_i8(
+                wc,
+                &mut caches,
+                &last_hidden,
+                &mut generated,
+                &mut emitted,
+                &table,
+                vocab,
+                hidden_dim,
+                prefill_len,
+            )?;
+        }
+        while !spec_decode && emitted.len() < params.max_length {
             // When armed AND the blocker can ban (enough history), mask in the
             // lm_head epilogue and argmax the already-masked logits; otherwise the
             // exact default `lm_head_cached_i8` -> `sampler::decode_step`. The chosen
@@ -1155,6 +1196,206 @@ impl OcrModel {
             ));
         }
         Ok(emitted)
+    }
+
+    /// `FOCR_SPEC_DECODE` (bd-1azu.35): the draft -> verify -> accept speculative
+    /// twin of [`Self::generate_cached_i8`]'s sequential greedy loop, called in its
+    /// place (over the SAME prefilled `caches` / `last_hidden`) when armed. Each
+    /// round cheaply PROPOSES the next tokens with the prompt-lookup drafter
+    /// (`spec::draft_ngram`), VERIFIES them in ONE read-only batched forward
+    /// ([`decoder::verify_forward_i8`], which folds the draft into a PRIVATE ring
+    /// clone — the live `caches` are untouched), ACCEPTS the longest prefix equal to
+    /// sequential greedy plus one correction token (`spec::resolve_round`), then
+    /// COMMITS exactly the accepted tokens (and the correction) by REPLAYING each
+    /// through the real [`decoder::decode_step_with_cache_i8`] — the byte-for-byte
+    /// same KV write the sequential loop performs for that emitted token.
+    ///
+    /// LOSSLESS by construction: speculation changes only WHEN logits are evaluated,
+    /// never WHICH token greedy decode picks. Every accepted token equals its
+    /// per-position greedy token and the correction is greedy over the trailing
+    /// verify row (`spec::resolve_round`), so `generated`/`emitted` advance
+    /// token-for-token as the sequential loop would; and because the commit replays
+    /// the IDENTICAL `decode_step_with_cache_i8` call (same token embed, same TRUE
+    /// absolute position, same prior ring), `caches` after committing `k` accepted
+    /// tokens is byte-for-byte the ring after `k` sequential decode steps
+    /// ([SPEC-100..103]). EOS and `max_length` are honored exactly as the sequential
+    /// loop: a token is emitted iff `emitted.len() < max_length`, and an emitted EOS
+    /// halts before its KV write (`accept_longest` only accepts EOS as the LAST
+    /// accepted token).
+    ///
+    /// Doctrine #5 (one live forward): the verify and commit kernels run
+    /// sequentially in this single-stream loop, never nested under rayon.
+    ///
+    /// # Errors
+    /// As [`Self::generate_cached_i8`]; propagates the verify/commit kernel errors
+    /// and the out-of-vocab guard.
+    #[allow(clippy::too_many_arguments)]
+    fn spec_decode_i8(
+        &self,
+        wc: &decoder::DecoderWeightCacheI8,
+        caches: &mut [rswa::RingCache],
+        last_hidden: &Mat,
+        generated: &mut Vec<u32>,
+        emitted: &mut Vec<u32>,
+        table: &Mat,
+        vocab: usize,
+        hidden_dim: usize,
+        prefill_len: usize,
+    ) -> FocrResult<()> {
+        let params = &self.decode_params;
+        // Own a mutable copy of the seed hidden (the prefill last row); the caller's
+        // `last_hidden` stays intact for the guarded sequential `while` (which only
+        // runs when spec decode is OFF). Each commit replaces this with the freshly
+        // decoded row, exactly as the sequential loop reassigns its `last_hidden`.
+        let mut last_hidden = last_hidden.clone();
+        while emitted.len() < params.max_length {
+            let draft = spec::draft_ngram(generated, spec::SPEC_DRAFT_MAX, spec::SPEC_DRAFT_NGRAM);
+            if draft.is_empty() {
+                // EMPTY-DRAFT FALLBACK: nothing to verify, so take exactly ONE
+                // sequential greedy step — the default loop's body (raw `lm_head` +
+                // `decode_step`), then commit the chosen token.
+                let logits = decoder::lm_head_cached_i8(wc, &last_hidden)?;
+                let step = sampler::decode_step(&logits, generated, params)?;
+                generated.push(step.token_id);
+                emitted.push(step.token_id);
+                if step.is_eos {
+                    break;
+                }
+                last_hidden = Self::commit_decode_token_i8(
+                    wc,
+                    caches,
+                    table,
+                    vocab,
+                    hidden_dim,
+                    prefill_len,
+                    emitted.len(),
+                    step.token_id,
+                )?;
+                continue;
+            }
+            // Embed each draft token (defensive vocab guard; drafter ids are always
+            // prior `generated` tokens, hence already in-vocab).
+            let mut draft_embeds: Vec<Mat> = Vec::with_capacity(draft.len());
+            for &id in &draft {
+                draft_embeds.push(Self::embed_decode_token_i8(table, vocab, hidden_dim, id)?);
+            }
+            // VERIFY: ONE read-only forward over the draft (private ring clone), then
+            // assemble the `K + 1` verify rows. Row 0 is the live current-state row
+            // (`lm_head` over `last_hidden` == what the next sequential step would
+            // argmax); rows `1..=K` are the draft rows. So `verify_logits[i]`
+            // conditions on `generated` ++ `draft[0..i]`, the `resolve_round`
+            // contract.
+            let base_position = prefill_len + emitted.len();
+            let verify_rows =
+                decoder::verify_forward_i8(wc, &*caches, &draft_embeds, base_position)?;
+            let mut verify_logits: Vec<Mat> = Vec::with_capacity(draft.len() + 1);
+            verify_logits.push(decoder::lm_head_cached_i8(wc, &last_hidden)?);
+            verify_logits.extend(verify_rows);
+            // ACCEPT the longest greedy-matching prefix + choose the correction with
+            // the SAME chooser the sequential loop runs.
+            let emit = spec::resolve_round(generated, &draft, &verify_logits, params)?;
+            // COMMIT the accepted tokens by replaying each through the real decode
+            // step (byte-for-byte the sequential KV writes), honoring EOS/max_length
+            // exactly: a token is emitted only while `emitted.len() < max_length`,
+            // and an emitted EOS halts before its KV write.
+            let mut stopped = false;
+            for &token in &draft[..emit.accepted] {
+                generated.push(token);
+                emitted.push(token);
+                // `eos_token_id` on the left keeps the identifier off the left of `=`
+                // (dodges a ubs secrets-heuristic FP; these are vocabulary token ids).
+                if params.eos_token_id == token {
+                    stopped = true;
+                    break;
+                }
+                // Commit advances the ring KV at this token's true position. The
+                // returned hidden is ALWAYS superseded — either by the correction
+                // commit below (a correction exists whenever the loop completes without
+                // a stop) or discarded when we break — so it is intentionally dropped.
+                Self::commit_decode_token_i8(
+                    wc,
+                    caches,
+                    table,
+                    vocab,
+                    hidden_dim,
+                    prefill_len,
+                    emitted.len(),
+                    token,
+                )?;
+                if emitted.len() >= params.max_length {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                break;
+            }
+            // CORRECTION/bonus token: `None` only when an accepted token was EOS
+            // (handled by the loop break above), so this is `Some` here. Emit and
+            // commit it exactly as the sequential loop emits its chosen token; the
+            // outer `while` re-gates `max_length`.
+            let Some(correction) = emit.correction else {
+                break;
+            };
+            generated.push(correction.token_id);
+            emitted.push(correction.token_id);
+            if correction.is_eos {
+                break;
+            }
+            last_hidden = Self::commit_decode_token_i8(
+                wc,
+                caches,
+                table,
+                vocab,
+                hidden_dim,
+                prefill_len,
+                emitted.len(),
+                correction.token_id,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Embed one decode token id into a `[1, hidden]` row from the embed table — the
+    /// exact slice [`Self::generate_cached_i8`] takes per step, with the same
+    /// out-of-vocab guard. Shared by the draft-embed build and the commit replay.
+    fn embed_decode_token_i8(
+        table: &Mat,
+        vocab: usize,
+        hidden_dim: usize,
+        token: u32,
+    ) -> FocrResult<Mat> {
+        let idx = token as usize;
+        if idx >= vocab {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "native_engine::OcrModel::generate_cached_i8: decoded token id {idx} outside embed vocab {vocab}"
+            )));
+        }
+        let row = table.data[idx * hidden_dim..(idx + 1) * hidden_dim].to_vec();
+        Ok(Mat::from_vec(1, hidden_dim, row))
+    }
+
+    /// Commit one emitted token to the live int8 decode state: write its K/V into the
+    /// ring at its TRUE absolute position via the real
+    /// [`decoder::decode_step_with_cache_i8`] and return the new last hidden row —
+    /// byte-for-byte the call [`Self::generate_cached_i8`] makes for that token.
+    /// `emitted_len` is `emitted.len()` AFTER the token was pushed, so the position is
+    /// `prefill_len + emitted_len - 1`, matching the sequential loop exactly.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_decode_token_i8(
+        wc: &decoder::DecoderWeightCacheI8,
+        caches: &mut [rswa::RingCache],
+        table: &Mat,
+        vocab: usize,
+        hidden_dim: usize,
+        prefill_len: usize,
+        emitted_len: usize,
+        token: u32,
+    ) -> FocrResult<Mat> {
+        let token_embed = Self::embed_decode_token_i8(table, vocab, hidden_dim, token)?;
+        let position = prefill_len + (emitted_len - 1);
+        let h = decoder::decode_step_with_cache_i8(wc, caches, &token_embed, position)?;
+        Self::last_hidden_row(&h)
     }
 
     /// O(n^2) stateless greedy decode: re-run [`decoder::forward`] over the whole

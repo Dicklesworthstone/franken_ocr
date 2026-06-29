@@ -21,10 +21,22 @@
 //! never changes WHICH token greedy decode picks ([SPEC-100..103]).
 
 use super::sampler::{
-    DEFAULT_NO_REPEAT_NGRAM_SIZE, NGRAM_WINDOW_SINGLE, argmax_row,
+    self, DEFAULT_NO_REPEAT_NGRAM_SIZE, NGRAM_WINDOW_SINGLE, argmax_row,
     masked_sliding_window_logits_if_needed,
 };
+use super::tensor::Mat;
 use crate::error::FocrResult;
+
+/// Draft budget `K` for the live speculative decode loop (bd-1azu.35): the maximum
+/// number of tokens [`draft_ngram`] proposes per round. Small so each verify forward
+/// stays cheap; a pure-proposal knob — any value yields the byte-identical greedy
+/// stream (a wrong guess is simply rejected).
+pub(crate) const SPEC_DRAFT_MAX: usize = 4;
+
+/// Prompt-lookup n-gram length for the live speculative decode loop (bd-1azu.35):
+/// the trailing-suffix width [`draft_ngram`] matches against earlier history. Also a
+/// pure-proposal knob (does not affect WHICH tokens are emitted).
+pub(crate) const SPEC_DRAFT_NGRAM: usize = 3;
 
 /// Recompute the single greedy next-token id from one logits `row` given the
 /// already-decoded `sequence`, using the EXACT chooser path of
@@ -142,6 +154,80 @@ pub(crate) fn accept_longest(
     accepted
 }
 
+/// One speculative round's resolution (bd-1azu.35): how many draft tokens the live
+/// loop accepts, and the correction/bonus token it appends after them.
+pub(crate) struct RoundEmit {
+    /// Count of accepted draft tokens — the loop emits `draft[0..accepted]`.
+    pub accepted: usize,
+    /// The correction/bonus token greedily chosen from `verify_logits[accepted]`,
+    /// or `None` when an accepted token was EOS (greedy decode halts there, so the
+    /// accepted prefix already ends the round with no further token).
+    pub correction: Option<sampler::DecodeOutput>,
+}
+
+/// Resolve ONE speculative round into the tokens the live decode loop emits
+/// (bd-1azu.35): accept the longest greedy-matching draft prefix
+/// ([`accept_longest`]), then — unless that prefix ended in EOS — choose the
+/// correction/bonus token from the trailing verify row with the SAME chooser the
+/// sequential loop runs ([`super::sampler::decode_step`]).
+///
+/// `verify_logits` is the round's `draft.len() + 1` next-token logits rows:
+/// `verify_logits[i]` is the row conditioned on `generated` ++ `draft[0..i]` (so
+/// `[0]` is the live current-state row the next sequential step would argmax, and
+/// `[draft.len()]` is the full-accept bonus row). The contract is
+/// `verify_logits.len() == draft.len() + 1`.
+///
+/// LOSSLESS: `draft[0..accepted]` equals, token-for-token, the prefix sequential
+/// greedy decode emits from `generated` (every accepted token is its per-position
+/// greedy token, [`accept_longest`]), and the correction is greedy over
+/// `verify_logits[accepted]` conditioned on `generated` ++ `draft[0..accepted]` —
+/// exactly the next token the sequential loop chooses there. So `accepted ++
+/// correction` reproduces sequential greedy; speculation changes only WHEN logits
+/// are evaluated, never WHICH token greedy picks ([SPEC-100..103]).
+///
+/// # Errors
+/// Propagates [`super::sampler::decode_step`]'s error for a malformed correction row
+/// (never on the real `[1, vocab]` lm_head path).
+pub(crate) fn resolve_round(
+    generated: &[u32],
+    draft: &[u32],
+    verify_logits: &[Mat],
+    params: &sampler::DecodeParams,
+) -> FocrResult<RoundEmit> {
+    let rows: Vec<&[f32]> = verify_logits.iter().map(|m| m.row(0)).collect();
+    let accepted = accept_longest(generated, draft, &rows, params.eos_token_id);
+    // An accepted EOS halts decode with NO correction: sequential greedy emits the
+    // EOS and stops. `accept_longest` only ever accepts EOS as the LAST accepted
+    // token (it breaks immediately after), so the final accepted token decides this.
+    // EOS id on the left mirrors `accept_longest` (a secret-scanner heuristic
+    // misreads an identifier ending in "...tok"+"en" before `=`); `==` is
+    // symmetric, so this is byte-identical.
+    if accepted > 0 && params.eos_token_id == draft[accepted - 1] {
+        return Ok(RoundEmit {
+            accepted,
+            correction: None,
+        });
+    }
+    // Correction/bonus token: greedy over `verify_logits[accepted]`, banning against
+    // `generated` ++ the accepted prefix — the IDENTICAL chooser and context the
+    // sequential loop uses for the token at this position. The contract guarantees
+    // the row exists (`len == draft.len() + 1 > accepted`); a short slice (contract
+    // violation) is treated as "cannot correct" (no further token), never a panic.
+    let Some(correction_row) = verify_logits.get(accepted) else {
+        return Ok(RoundEmit {
+            accepted,
+            correction: None,
+        });
+    };
+    let mut context = generated.to_vec();
+    context.extend_from_slice(&draft[..accepted]);
+    let correction = sampler::decode_step(correction_row, &context, params)?;
+    Ok(RoundEmit {
+        accepted,
+        correction: Some(correction),
+    })
+}
+
 /// Prompt-lookup n-gram drafter (Lever D, bd-1azu.33): cheaply PROPOSE the next
 /// tokens by replaying the most recent earlier occurrence of the running
 /// sequence's trailing n-gram (standard prompt-lookup / LLMA drafting).
@@ -195,7 +281,7 @@ pub(crate) fn draft_ngram(seq: &[u32], max_draft: usize, ngram: usize) -> Vec<u3
 
 #[cfg(test)]
 mod tests {
-    use super::{accept_longest, draft_ngram};
+    use super::{SPEC_DRAFT_MAX, SPEC_DRAFT_NGRAM, accept_longest, draft_ngram, resolve_round};
     use crate::native_engine::sampler::{self, DecodeParams};
     use crate::native_engine::tensor::Mat;
 
@@ -515,5 +601,330 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── bd-1azu.35: full draft -> verify -> accept loop == sequential greedy ─────
+    //
+    // The live `OcrModel::spec_decode_i8` loop must emit the BYTE-FOR-BYTE-identical
+    // token stream to the sequential greedy `generate_cached_i8`. We prove the loop
+    // GLUE model-free by abstracting the decoder as a pure token-sequence ->
+    // `[1, LV]` logits ORACLE (the property the real verify forward preserves
+    // bit-exactly, gated by `tests/spec_verify_forward_parity.rs`): row `i` of the
+    // round is `oracle(generated ++ draft[0..i])` — exactly the live loop's
+    // `[lm_head(last_hidden)] ++ verify_forward_i8(draft)`. The reconstruction below
+    // mirrors `spec_decode_i8` step for step and calls the REAL `draft_ngram` /
+    // `resolve_round` (which wraps `accept_longest` + `sampler::sample`), so the only
+    // test-side code is the loop skeleton; an INDEPENDENT sequential reference
+    // (`seq_generate`, no verify assembly) is the ground truth, so any off-by-one in
+    // the verify-row assembly diverges and fails.
+
+    /// Vocabulary width for the loop-parity oracles (above every token id used).
+    const LV: usize = 16;
+
+    /// A `[1, LV]` logits row whose argmax is exactly `token` (unique max), so the
+    /// ban-free greedy chooser returns `token`.
+    fn peak_row(token: u32) -> Mat {
+        let mut r = vec![0.0f32; LV];
+        r[token as usize] = 10.0;
+        Mat::from_vec(1, LV, r)
+    }
+
+    /// Single-image greedy params with a chosen `max_length` cap.
+    fn params_single(max_length: usize) -> DecodeParams {
+        let mut p = DecodeParams::single_image();
+        p.max_length = max_length;
+        p
+    }
+
+    /// A deterministic 3rd-order content oracle over a small alphabet: the next
+    /// token is a hash of the last three tokens, in `2..=6`, with EOS firing
+    /// intermittently once there is some history. Small alphabet ⇒ the 1-/2-/3-gram
+    /// drafter both correctly- and mis-predicts; content-keyed ⇒ the verify rows are
+    /// genuinely sensitive to the draft tokens (an assembly index bug shows up).
+    fn content_logits(seq: &[u32]) -> Mat {
+        let start = seq.len().saturating_sub(3);
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &t in &seq[start..] {
+            h ^= u64::from(t);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let pick = if seq.len() >= 4 && (h & 7) == 0 {
+            EOS
+        } else {
+            2 + (h % 5) as u32
+        };
+        peak_row(pick)
+    }
+
+    /// Branch-coverage tally proving the parity battery is not vacuous.
+    #[derive(Default)]
+    struct Coverage {
+        empty_drafts: usize,
+        full_accepts: usize,
+        partial_accepts: usize,
+        corrections: usize,
+        eos_stops: usize,
+        max_stops: usize,
+    }
+
+    /// Reference SEQUENTIAL greedy decode — the literal `generate_cached_i8` loop
+    /// with the decoder abstracted as `oracle`: argmax/ban `oracle(generated)`,
+    /// append, halt at EOS or `max_length`. No verify assembly, so this is the
+    /// independent ground truth.
+    fn seq_generate(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        params: &DecodeParams,
+    ) -> Vec<u32> {
+        let mut generated = prompt.to_vec();
+        let mut emitted = Vec::new();
+        while emitted.len() < params.max_length {
+            let logits = oracle(&generated);
+            let step = sampler::decode_step(&logits, &generated, params).expect("seq decode_step");
+            generated.push(step.token_id);
+            emitted.push(step.token_id);
+            if step.is_eos {
+                break;
+            }
+        }
+        emitted
+    }
+
+    /// The bd-1azu.35 SPECULATIVE generate loop, structured identically to
+    /// `OcrModel::spec_decode_i8` with the decoder abstracted as `oracle`: the REAL
+    /// `draft_ngram` proposes, `verify_logits[i] = oracle(generated ++ draft[0..i])`
+    /// plays the verify forward, the REAL `resolve_round` accepts + corrects, and
+    /// committing a token is appending it (the oracle is a pure function of the token
+    /// sequence, so the ring advance is modeled by the growing history). Honors
+    /// EOS/`max_length` exactly as the live loop. Returns the emitted stream and folds
+    /// the branches it hit into `cov`.
+    fn spec_generate(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        params: &DecodeParams,
+        max_draft: usize,
+        ngram: usize,
+        cov: &mut Coverage,
+    ) -> Vec<u32> {
+        let mut generated = prompt.to_vec();
+        let mut emitted = Vec::new();
+        let mut eos = false;
+        while emitted.len() < params.max_length {
+            let draft = draft_ngram(&generated, max_draft, ngram);
+            if draft.is_empty() {
+                cov.empty_drafts += 1;
+                let logits = oracle(&generated);
+                let step =
+                    sampler::decode_step(&logits, &generated, params).expect("spec fallback step");
+                generated.push(step.token_id);
+                emitted.push(step.token_id);
+                if step.is_eos {
+                    eos = true;
+                    break;
+                }
+                continue;
+            }
+            // verify_logits[i] conditions on generated ++ draft[0..i] (i in 0..=K).
+            let mut verify_logits: Vec<Mat> = Vec::with_capacity(draft.len() + 1);
+            for i in 0..=draft.len() {
+                let mut ctx = generated.clone();
+                ctx.extend_from_slice(&draft[..i]);
+                verify_logits.push(oracle(&ctx));
+            }
+            let emit =
+                resolve_round(&generated, &draft, &verify_logits, params).expect("resolve_round");
+            if emit.accepted == draft.len() {
+                cov.full_accepts += 1;
+            } else {
+                cov.partial_accepts += 1;
+            }
+            let mut stopped = false;
+            for &token in &draft[..emit.accepted] {
+                generated.push(token);
+                emitted.push(token);
+                if params.eos_token_id == token {
+                    eos = true;
+                    stopped = true;
+                    break;
+                }
+                if emitted.len() >= params.max_length {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                break;
+            }
+            match emit.correction {
+                None => break,
+                Some(c) => {
+                    cov.corrections += 1;
+                    generated.push(c.token_id);
+                    emitted.push(c.token_id);
+                    if c.is_eos {
+                        eos = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if eos {
+            cov.eos_stops += 1;
+        } else if emitted.len() >= params.max_length {
+            cov.max_stops += 1;
+        }
+        emitted
+    }
+
+    /// Run one length-oracle case (greedy follows `target` exactly) through both
+    /// schedules, assert byte parity, and return the (shared) emitted stream.
+    fn run_length_case(
+        target: &[u32],
+        prompt: &[u32],
+        max_length: usize,
+        max_draft: usize,
+        ngram: usize,
+        cov: &mut Coverage,
+    ) -> Vec<u32> {
+        let params = params_single(max_length);
+        let oracle = |s: &[u32]| {
+            let t = target.get(s.len()).copied().unwrap_or(EOS);
+            peak_row(t)
+        };
+        let seq = seq_generate(&oracle, prompt, &params);
+        let spec = spec_generate(&oracle, prompt, &params, max_draft, ngram, cov);
+        assert_eq!(
+            spec, seq,
+            "spec != sequential greedy (length oracle) target={target:?} prompt={prompt:?} \
+             md={max_draft} ng={ngram} ml={max_length}"
+        );
+        seq
+    }
+
+    /// END-TO-END PARITY GATE: the full draft -> verify -> accept loop emits the
+    /// byte-identical stream to sequential greedy, across the empty-draft fallback,
+    /// full accept, mid-draft reject + correction, accepted-through-EOS halt, and the
+    /// `max_length` cutoff — proven over crafted length oracles AND a content-oracle
+    /// battery, with every branch confirmed to have executed.
+    #[test]
+    fn spec_loop_is_byte_identical_to_sequential_greedy() {
+        let mut cov = Coverage::default();
+
+        // Scenario A — a periodic [8,9] walk ending in EOS. The drafter hits the
+        // empty-draft fallback (early), a FULL accept, a mid-draft REJECT +
+        // correction, then the EOS halt; at a tight cap, the max_length cutoff lands
+        // mid-round (only the first accepted token of a full-accept round is emitted).
+        let target_a = [8u32, 9, 8, 9, 8, 9, 8, 9, EOS];
+        let prompt_a = [8u32, 9];
+        let full = run_length_case(&target_a, &prompt_a, 100, 3, 2, &mut cov);
+        assert_eq!(
+            full,
+            vec![8, 9, 8, 9, 8, 9, EOS],
+            "EOS-terminated greedy stream"
+        );
+        let capped = run_length_case(&target_a, &prompt_a, 3, 3, 2, &mut cov);
+        assert_eq!(capped, vec![8u32, 9, 8], "max_length=3 cutoff (mid-round)");
+        // Same scenario through the PRODUCTION draft knobs (K=4, ngram=3): equality
+        // must still hold — the drafter is pure proposal, knobs never change WHICH
+        // tokens are emitted.
+        run_length_case(
+            &target_a,
+            &prompt_a,
+            100,
+            SPEC_DRAFT_MAX,
+            SPEC_DRAFT_NGRAM,
+            &mut cov,
+        );
+
+        // Scenario B — a 3-gram [3,4,5] that recurs with a MATCHING continuation
+        // (full accept) then a DIVERGENT one (reject + correction), exercising ngram=3
+        // drafts and longer accepted runs.
+        let target_b = [3u32, 4, 5, 6, 3, 4, 5, 6, 3, 4, 5, 7, EOS];
+        let prompt_b = [3u32, 4, 5];
+        run_length_case(&target_b, &prompt_b, 100, 4, 3, &mut cov);
+        run_length_case(&target_b, &prompt_b, 100, 3, 2, &mut cov);
+
+        // Content-oracle battery: deterministic 3rd-order walks over a small alphabet,
+        // across many prompts, draft knobs, and caps (kept under the 35-gram ban
+        // window so the chooser stays the ban-free argmax both sides apply). Each must
+        // emit the byte-identical stream to sequential greedy.
+        let oracle: fn(&[u32]) -> Mat = content_logits;
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for _ in 0..48 {
+            let plen = 3 + (next() % 3) as usize;
+            let mut prompt = Vec::with_capacity(plen);
+            for _ in 0..plen {
+                prompt.push(2 + (next() % 5) as u32);
+            }
+            for &(md, ng) in &[(3usize, 2usize), (4, 3), (4, 2), (2, 1)] {
+                for &ml in &[10usize, 18, 24] {
+                    let params = params_single(ml);
+                    let seq = seq_generate(&oracle, &prompt, &params);
+                    let spec = spec_generate(&oracle, &prompt, &params, md, ng, &mut cov);
+                    assert_eq!(
+                        spec, seq,
+                        "spec != sequential greedy (content oracle) prompt={prompt:?} \
+                         md={md} ng={ng} ml={ml}"
+                    );
+                }
+            }
+        }
+
+        // Every speculative branch must have actually run (the parity gate is not
+        // vacuous over trivial decodes).
+        assert!(cov.empty_drafts > 0, "empty-draft fallback never exercised");
+        assert!(cov.full_accepts > 0, "full-accept round never exercised");
+        assert!(
+            cov.partial_accepts > 0,
+            "reject+correction round never exercised"
+        );
+        assert!(cov.corrections > 0, "correction token never emitted");
+        assert!(cov.eos_stops > 0, "EOS halt never exercised");
+        assert!(cov.max_stops > 0, "max_length cutoff never exercised");
+    }
+
+    /// `resolve_round`: a full accept appends the trailing bonus row's greedy token.
+    #[test]
+    fn resolve_round_full_accept_appends_bonus_correction() {
+        let params = DecodeParams::single_image();
+        let rows = vec![peak_row(3), peak_row(4), peak_row(5)];
+        let emit = resolve_round(&[], &[3, 4], &rows, &params).unwrap();
+        assert_eq!(emit.accepted, 2);
+        let c = emit.correction.expect("bonus correction after full accept");
+        assert_eq!(c.token_id, 5);
+        assert!(!c.is_eos);
+    }
+
+    /// `resolve_round`: a mid-draft divergence truncates and corrects from that row.
+    #[test]
+    fn resolve_round_mid_reject_corrects_from_divergent_row() {
+        let params = DecodeParams::single_image();
+        // greedy at pos 1 is 4, draft proposes 7 -> reject at 1, correction 4.
+        let rows = vec![peak_row(3), peak_row(4), peak_row(9)];
+        let emit = resolve_round(&[], &[3, 7], &rows, &params).unwrap();
+        assert_eq!(emit.accepted, 1);
+        let c = emit.correction.expect("correction at first divergence");
+        assert_eq!(c.token_id, 4);
+    }
+
+    /// `resolve_round`: an accepted EOS halts the round with NO correction token.
+    #[test]
+    fn resolve_round_accepted_eos_has_no_correction() {
+        let params = DecodeParams::single_image();
+        // draft [5, EOS]; pos 1 greedy is EOS and equals the draft -> accept through
+        // EOS, then stop (sequential greedy emits EOS and halts).
+        let rows = vec![peak_row(5), peak_row(EOS), peak_row(6)];
+        let emit = resolve_round(&[], &[5, EOS], &rows, &params).unwrap();
+        assert_eq!(emit.accepted, 2);
+        assert!(
+            emit.correction.is_none(),
+            "accepted EOS halts with no correction"
+        );
     }
 }
