@@ -28,7 +28,7 @@
 //!   [R8] `ocr --robot` errors emit run_start then run_error.code from
 //!        FocrError::exit_code.                                                -> ocr_robot_error_stream_matches_exit_code
 //! CLI surface (`src/cli.rs`):
-//!   [C1] `--help` (root/tree) renders the frozen help golden and excludes pdf. -> cli_root_help_golden / full_help_tree_has_no_pdf
+//!   [C1] `--help` renders the frozen root golden; `ocr --help` documents PDF.   -> cli_root_help_golden / ocr_help_documents_pdf_input
 //!   [C2] `--version` renders `focr <version>` (version scrubbed).             -> cli_version_golden
 //!   [C3] `ocr`    -> env/default model resolver; missing default exits 3.      -> exit_code_conformance / ocr_default_model_not_found_golden
 //!   [C4] `convert`-> NotImplemented, exit 1.                                   -> exit_code_conformance / convert_not_implemented_golden
@@ -1277,12 +1277,13 @@ fn cli_root_help_golden() {
     assert_golden_capture(test, "cli_help_root", &scrubbed);
 }
 
-/// The CLI surface is v1 image-only. Plan §7.7 explicitly says the excluded
-/// document format must not appear anywhere in the help tree until native
-/// rasterization is deliberately scoped and parity-tested.
+/// Native PDF rasterization shipped (bd-0a7): plan §7.7's gate — "excluded until
+/// native rasterization is deliberately scoped and parity-tested" — has been met,
+/// so `focr ocr --help` MUST now document PDF as an accepted input, and every help
+/// screen in the tree must still render and exit 0.
 #[test]
-fn full_help_tree_has_no_pdf() {
-    let test = "full_help_tree_has_no_pdf";
+fn ocr_help_documents_pdf_input() {
+    let test = "ocr_help_documents_pdf_input";
     let help_cases: &[&[&str]] = &[
         &["--help"],
         &["ocr", "--help"],
@@ -1296,17 +1297,15 @@ fn full_help_tree_has_no_pdf() {
         &["doctor", "--help"],
     ];
 
+    // Every help screen renders cleanly and exits 0.
     for argv in help_cases {
         let out = run_focr(argv);
-        let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let combined = format!("{stdout}\n{stderr}");
-        let lower = combined.to_ascii_lowercase();
-        let pass = out.status.code() == Some(0) && !lower.contains("pdf");
+        let pass = out.status.code() == Some(0);
         tlog!(test,
             "case": format!("help:{argv:?}"),
             "event": "assert",
-            "assertion": "help exits 0 and does not mention the excluded document format",
+            "assertion": "help renders and exits 0",
             "inputs": {"argv": argv},
             "exit_code": out.status.code(),
             "pass": pass,
@@ -1317,11 +1316,28 @@ fn full_help_tree_has_no_pdf() {
             Some(0),
             "{argv:?} --help must exit 0; stderr:\n{stderr}"
         );
-        assert!(
-            !lower.contains("pdf"),
-            "{argv:?} help must not contain the excluded document format token; output:\n{combined}"
-        );
     }
+
+    // `ocr --help` documents PDF as a now-supported input format.
+    let out = run_focr(&["ocr", "--help"]);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let documents_pdf = combined.to_ascii_lowercase().contains("pdf");
+    tlog!(test,
+        "case": "ocr_help_documents_pdf",
+        "event": "assert",
+        "assertion": "ocr --help documents PDF as a supported input",
+        "pass": documents_pdf,
+        "result": if documents_pdf { "pass" } else { "fail" },
+    );
+    assert!(
+        documents_pdf,
+        "ocr --help must document PDF as a supported input now that native \
+         rasterization shipped; output:\n{combined}"
+    );
 }
 
 /// `focr ocr --help` must expose the Phase-1 request parameters from the pinned

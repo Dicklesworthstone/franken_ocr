@@ -471,10 +471,10 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         })?
     };
     if robot_mode {
-        emit(&serde_json::json!({
-            "schema_version": robot::ROBOT_SCHEMA_VERSION,
-            "event": "run_complete",
-        }));
+        // The terminal success event carries the recognized markdown so a machine
+        // consumer actually receives the OCR result on the NDJSON stream (the
+        // human / `--json` modes print it below instead).
+        emit(&robot::run_complete_event(&markdown));
     } else if args.json {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,

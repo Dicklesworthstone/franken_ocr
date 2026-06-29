@@ -50,5 +50,5 @@
   ],
   "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "schema_version": 1,
-  "status": "skeleton — run_start/run_error are wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+  "status": "skeleton — run_start/run_complete (carries `markdown`)/run_error are wired; the streaming stage/page event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
 }

@@ -24,7 +24,7 @@ pub fn robot_schema() -> Value {
         "events": EVENT_KINDS,
         "exit_codes": EXIT_CODE_TABLE,
         "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
-        "status": "skeleton — run_start/run_error are wired; remaining event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+        "status": "skeleton — run_start/run_complete (carries `markdown`)/run_error are wired; the streaming stage/page event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
     })
 }
 
@@ -38,6 +38,22 @@ pub fn run_start_event(command: &str) -> Value {
         "schema_version": ROBOT_SCHEMA_VERSION,
         "event": "run_start",
         "command": command,
+    })
+}
+
+/// Build the robot-mode terminal `run_complete` event carrying the recognized
+/// document markdown.
+///
+/// This is the SUCCESS terminal of the OCR event stream: a machine consumer reads
+/// the recognized text from `markdown` here (the human and `--json` modes print it
+/// directly instead). The `run_complete` kind is already advertised by
+/// [`robot_schema`], so finalizing its payload does not change the advertised
+/// event set and [`ROBOT_SCHEMA_VERSION`] is unchanged.
+pub fn run_complete_event(markdown: &str) -> Value {
+    json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "run_complete",
+        "markdown": markdown,
     })
 }
 
@@ -114,5 +130,15 @@ mod tests {
         assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
         assert_eq!(event["event"], "run_start");
         assert_eq!(event["command"], "ocr");
+    }
+
+    #[test]
+    fn run_complete_event_carries_recognized_markdown() {
+        let event = run_complete_event("# Title\n\nbody text");
+        assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
+        assert_eq!(event["event"], "run_complete");
+        assert_eq!(event["markdown"], "# Title\n\nbody text");
+        // The terminal success event is an advertised kind (no schema bump).
+        assert!(EVENT_KINDS.contains(&"run_complete"));
     }
 }
