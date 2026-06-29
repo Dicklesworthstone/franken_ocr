@@ -1,6 +1,10 @@
 # franken_ocr
 
 <div align="center">
+  <img src="franken_ocr_illustration.webp" alt="franken_ocr - Pure-Rust CPU-only OCR for Baidu Unlimited-OCR">
+</div>
+
+<div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![version: v0.1.0](https://img.shields.io/badge/version-v0.1.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.1.0)
