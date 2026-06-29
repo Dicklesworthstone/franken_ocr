@@ -35,7 +35,9 @@ anyhow = "1"
 # asupersync: orchestration/cancellation/IO only — the engine owns exactly one
 # Runtime below the sync public API (plan §3.3). default-features=false keeps the
 # surface minimal. Local /dp/asupersync = 0.3.5 satisfies ">=0.3.5,<0.4".
-asupersync = { version = ">=0.3.5, <0.4", default-features = false }
+asupersync = { version = ">=0.3.5, <0.4", default-features = false, features = [
+    "tls-webpki-roots",
+] }
 # FrankenTorch compute kernels for the in-process native OCR engine: int8 dynamic
 # linear (SDOT/VNNI), GEMM/sgemm, conv2d (im2col), sdpa, rms_norm, layer_norm.
 ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu" }

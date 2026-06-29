@@ -1,1 +1,1 @@
-focr: model not found / not resolvable: no model artifact named models/unlimited-ocr.focrq (searched directories: [model-search-dirs]; set FOCR_MODEL_DIR or pass an explicit path)
+focr: model not found / not resolvable: no model artifact named models/unlimited-ocr.focrq (searched directories: [model-search-dirs]; set FOCR_MODEL_DIR or pass an explicit path) — run `focr pull` to download the int8 weights (~3.9 GB), or point FOCR_MODEL_PATH at an existing model

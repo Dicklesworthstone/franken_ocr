@@ -22,6 +22,7 @@
 pub mod adaptive;
 pub mod cli;
 pub mod conformance;
+pub mod dist;
 pub mod error;
 pub mod native_engine;
 pub mod preprocess;

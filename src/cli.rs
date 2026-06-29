@@ -14,7 +14,7 @@
 //! doctrine #9.
 
 use crate::{
-    FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine,
+    FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine, dist,
     native_engine, quant, robot, simd,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -97,6 +97,8 @@ pub enum Command {
     OcrBatch(OcrBatchArgs),
     /// Offline weight transformation: safetensors → `.focrq` (plan §5).
     Convert(ConvertArgs),
+    /// Download the model weights (int8 `.focrq` + tokenizer) into the cache.
+    Pull(PullArgs),
     /// Agent-facing diagnostics and the machine contract.
     Robot {
         #[command(subcommand)]
@@ -137,6 +139,20 @@ pub struct OcrBatchArgs {
     /// Use the f32 decoder instead of the default int8 throughput path.
     #[arg(long = "f32")]
     pub no_int8: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct PullArgs {
+    /// Quant level to fetch (only `int8` is published today).
+    #[arg(long, default_value = dist::DEFAULT_QUANT)]
+    pub quant: String,
+    /// Manifest source — a local path or an `http(s)` URL. Defaults to
+    /// `$FOCR_MANIFEST_URL`, else the built-in repo manifest.
+    #[arg(long)]
+    pub manifest: Option<String>,
+    /// Emit a single JSON result object instead of human progress lines.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -426,6 +442,7 @@ pub fn run(cli: Cli) -> FocrResult<()> {
         Command::Ocr(args) => run_ocr(args, false),
         Command::OcrBatch(args) => run_ocr_batch(args),
         Command::Convert(args) => run_convert(&args),
+        Command::Pull(args) => run_pull(&args),
         Command::Runs(args) => run_runs(&args),
         Command::Sync(args) => run_sync(&args),
         Command::Doctor(args) => run_doctor(&args),
@@ -439,9 +456,28 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     }
 
     let engine = OcrEngine::new()?;
-    let markdown = match request.model.as_deref() {
-        Some(model) => engine.recognize_with_model(model, &request.image)?,
-        None => engine.recognize(&request.image)?,
+    let first = match request.model.as_deref() {
+        Some(model) => engine.recognize_with_model(model, &request.image),
+        None => engine.recognize(&request.image),
+    };
+    let markdown = match first {
+        Ok(md) => md,
+        // First-run auto-download: only when the user did NOT pin an explicit
+        // --model, we are on an interactive TTY, and not in robot mode (robots
+        // never prompt/fetch — they get the model-not-found error + pull hint).
+        Err(FocrError::ModelNotFound(msg)) => {
+            if request.model.is_none() && !robot_mode && is_interactive() {
+                match offer_first_run_download()? {
+                    Some(outcome) => {
+                        engine.recognize_with_model(&outcome.focrq_path, &request.image)?
+                    }
+                    None => return Err(FocrError::ModelNotFound(with_pull_hint(&msg))),
+                }
+            } else {
+                return Err(FocrError::ModelNotFound(with_pull_hint(&msg)));
+            }
+        }
+        Err(e) => return Err(e),
     };
     if robot_mode {
         emit(&serde_json::json!({
@@ -864,6 +900,75 @@ fn emit(value: &serde_json::Value) {
         "{}",
         serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
     );
+}
+
+/// Both stdin AND stderr are TTYs — the prerequisite for an interactive
+/// download prompt (stderr is where the prompt is written; stdin is the answer
+/// channel; stdout is reserved for the OCR result / JSON).
+fn is_interactive() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
+}
+
+/// Append the actionable acquisition hint to a model-not-found message.
+fn with_pull_hint(msg: &str) -> String {
+    format!(
+        "{msg} — run `focr pull` to download the int8 weights (~3.9 GB), or point \
+         FOCR_MODEL_PATH at an existing model"
+    )
+}
+
+/// Prompt on the TTY; if confirmed, download the default int8 model + tokenizer
+/// and return where they landed (else `Ok(None)` when the user declines).
+fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
+    use std::io::Write as _;
+    eprint!("focr: model not found. Download the int8 weights now (~3.9 GB)? [y/N] ");
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| FocrError::Other(anyhow::anyhow!("reading prompt response: {e}")))?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        return Ok(None);
+    }
+    let source = dist::resolve_manifest_source(None);
+    let outcome = dist::pull(dist::DEFAULT_QUANT, &source, false, |line| {
+        eprintln!("focr pull: {line}");
+    })?;
+    Ok(Some(outcome))
+}
+
+/// `focr pull` — download (or confirm-cached) the model weights + tokenizer.
+fn run_pull(args: &PullArgs) -> FocrResult<()> {
+    let source = dist::resolve_manifest_source(args.manifest.as_deref());
+    let outcome = dist::pull(&args.quant, &source, args.json, |line| {
+        if !args.json {
+            eprintln!("focr pull: {line}");
+        }
+    })?;
+    if args.json {
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "command": "pull",
+            "status": "ok",
+            "quant": outcome.quant,
+            "focrq": outcome.focrq_path.display().to_string(),
+            "tokenizer": outcome.tokenizer_path.display().to_string(),
+            "from_cache": outcome.from_cache,
+            "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
+        }));
+    } else {
+        eprintln!(
+            "focr pull: ready — model at {} ({})",
+            outcome.focrq_path.display(),
+            if outcome.from_cache {
+                "already cached"
+            } else {
+                "downloaded"
+            }
+        );
+    }
+    Ok(())
 }
 
 fn robot_backends_payload() -> serde_json::Value {
