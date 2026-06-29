@@ -66,7 +66,7 @@ The project must be both:
    - **robot mode** (agent-first, versioned NDJSON, self-describing `robot schema`)
    - human mode (`focr ocr <image>` → markdown, or `--json`)
 
-Input: **document images only in v1** (PNG/JPG/…; PDF is rasterized out-of-band — see plan §7.7). No Python, no FFI, **no network at inference time**, no GPU required.
+Input: **document images** (PNG/JPG/…) **and PDFs**. Scanned / image-XObject PDF pages are rasterized **natively, in-process**, in pure memory-safe Rust (`src/pdf.rs`, no FFI); born-digital *vector/text* pages and the two codecs with no pure-Rust decoder (`JPXDecode`/`JBIG2Decode`) still surface a clear error asking for out-of-band rasterization — see plan §7.7. No Python, no FFI, **no network at inference time**, no GPU required.
 
 ---
 

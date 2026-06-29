@@ -528,12 +528,19 @@ where
 ///
 /// **Per-page resilience (mirrors the `ocr-batch` path):** a page that cannot be
 /// rendered or recognized — an unsupported codec (`JPXDecode`/`JBIG2Decode`), a
-/// vector/text page, a decode or timeout error — is logged to stderr and SKIPPED,
-/// so one bad page never discards (nor wastes the compute already spent on) the
-/// OCR of every other page. Only [`FocrError::ModelNotFound`] is propagated (it is
-/// a whole-document condition: it lets [`recognize_with_autodownload`] offer the
-/// first-run download and retry the whole document). If NOT ONE page decodes, the
-/// first failure is surfaced as a clean error instead of an empty document.
+/// vector/text page, a per-page decode or timeout error — is logged to stderr and
+/// SKIPPED, so one bad page never discards (nor wastes the compute already spent
+/// on) the OCR of every other page. The **whole-run** conditions are propagated
+/// immediately instead of being swallowed per-page:
+/// * [`FocrError::ModelNotFound`] — lets [`recognize_with_autodownload`] offer the
+///   first-run download and retry the whole document;
+/// * [`FocrError::Cancelled`] — a Ctrl+C / cooperative cancel must abort the run,
+///   not log a skip per remaining page and keep churning;
+/// * [`FocrError::FormatMismatch`] — a bad/incompatible model artifact fails every
+///   page identically, so surface it once rather than N times.
+///
+/// If NOT ONE page decodes, the first per-page failure is surfaced as a clean
+/// error instead of an empty document.
 fn recognize_pdf(engine: &OcrEngine, request: &OcrRequest, robot_mode: bool) -> FocrResult<String> {
     let pages = pdf::PdfPages::open(&request.image)?;
     let page_count = pages.len();
@@ -554,9 +561,16 @@ fn recognize_pdf(engine: &OcrEngine, request: &OcrRequest, robot_mode: bool) -> 
                     document.push_str(page_md.trim_end());
                     ok_pages += 1;
                 }
-                // A missing model is a whole-document condition, never per-page:
-                // propagate it so the caller can offer the download and retry.
-                Err(e @ FocrError::ModelNotFound(_)) => return Err(e),
+                // Whole-run conditions are never per-page — abort immediately:
+                // a missing model (so the caller can offer the download + retry),
+                // a Ctrl+C / cooperative cancel, or a bad/incompatible model file
+                // (every page would fail it identically). Swallowing any of these
+                // per-page would lose the signal and waste compute on doomed pages.
+                Err(
+                    e @ (FocrError::ModelNotFound(_)
+                    | FocrError::Cancelled
+                    | FocrError::FormatMismatch(_)),
+                ) => return Err(e),
                 // Isolate every other per-page failure: warn and skip, keeping the
                 // rest of the document. (stderr only, never in robot mode.)
                 Err(e) => {
