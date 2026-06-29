@@ -111,6 +111,7 @@ nohup.out
 /*.txt
 /*.py
 /*.sh
+!/install.sh
 /*.json
 !package.json
 /*.jsonl
