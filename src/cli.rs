@@ -1472,7 +1472,9 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "models": models,
         }));
     } else {
-        println!("{:<14}  {:<8}  {:<22}  MODEL", "ID", "STATUS", "TASKS");
+        // TASKS last: its width varies per model (GOT-OCR2 serves seven), so a
+        // fixed-width column would misalign — keep it trailing.
+        println!("{:<14}  {:<8}  {:<22}  TASKS", "ID", "STATUS", "MODEL");
         for a in archs {
             let tasks = a
                 .tasks()
@@ -1485,8 +1487,8 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 "{:<14}  {:<8}  {:<22}  {}",
                 a.id(),
                 status,
-                tasks,
-                a.display_name()
+                a.display_name(),
+                tasks
             );
         }
     }
