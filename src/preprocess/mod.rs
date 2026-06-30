@@ -369,7 +369,12 @@ fn validate_edge(name: &str, value: usize, max: usize) -> FocrResult<u32> {
 }
 
 /// Decode an image file into an EXIF-transposed [`DynamicImage`] ([SPEC-020]).
-fn decode_path(path: &Path) -> FocrResult<DynamicImage> {
+///
+/// `pub(crate)` so the figure-extraction path
+/// ([`crate::native_engine::OcrModel::recognize_with_figures`]) can re-decode the
+/// source with the EXACT same EXIF transform the forward used — the layout boxes
+/// are in this image's pixel space, so the crop must come from this same decode.
+pub(crate) fn decode_path(path: &Path) -> FocrResult<DynamicImage> {
     let reader = ImageReader::open(path)
         .map_err(|e| FocrError::InputDecode(format!("open {}: {e}", path.display())))?
         .with_guessed_format()

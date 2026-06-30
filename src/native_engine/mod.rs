@@ -318,6 +318,30 @@ pub struct RecognizedDocument {
     pub layout: Vec<LayoutSpan>,
 }
 
+/// One figure/image region the model grounded but did NOT transcribe to text —
+/// the regions the markdown renders as `![](images/…)` placeholders — cropped out
+/// of the source image at its original resolution.
+///
+/// The caller (CLI `--extract-figures`) writes [`Self::image`] to a real file and
+/// rewrites the markdown's [`Self::markdown_ref`] token to point at it. The crop
+/// comes from the SAME decode the forward saw (EXIF-aligned), so [`Self::boxes`]
+/// land exactly on the pixels.
+#[derive(Debug, Clone)]
+pub struct ExtractedFigure {
+    /// 0-based index among the page's image spans — matches the markdown token.
+    pub index: usize,
+    /// The ref label (`image` for the standard figure span).
+    pub label: String,
+    /// The source-pixel box `[x1, y1, x2, y2]` this crop came from (clamped to the
+    /// image bounds).
+    pub bbox: [i64; 4],
+    /// The exact markdown token the rendered document uses for this figure
+    /// (`![](images/{index}.jpg)`), for the caller's string-replace.
+    pub markdown_ref: String,
+    /// The cropped region at original resolution (the caller encodes it).
+    pub image: image::DynamicImage,
+}
+
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|p| p == &path) {
         paths.push(path);
@@ -785,6 +809,95 @@ impl OcrModel {
             .map(|(label, boxes)| LayoutSpan { label, boxes })
             .collect();
         Ok(RecognizedDocument { markdown, layout })
+    }
+
+    /// Recognize one document image AND crop the figure regions it grounds but
+    /// does not transcribe (the `![](images/…)` placeholders) out of the source,
+    /// returning the [`RecognizedDocument`] plus the cropped figures. The CLI's
+    /// `--extract-figures` writes each figure to a file and rewrites the markdown
+    /// reference to point at it.
+    ///
+    /// The source is re-decoded with the SAME EXIF transform the forward used (so
+    /// the crops align with the layout boxes); the re-decode is skipped entirely
+    /// when the page grounds no figures.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_with_layout`], plus [`FocrError::InputDecode`] if the
+    /// source cannot be re-decoded for cropping.
+    pub fn recognize_with_figures(
+        &self,
+        image_path: &Path,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        let (decoded, image_w, image_h) = self.forward(image_path)?;
+        let document = Self::finalize_document(&decoded, image_w, image_h)?;
+        let figures = if postprocess::figure_refs(&decoded, image_w, image_h, "").is_empty() {
+            Vec::new()
+        } else {
+            let source = preprocess::decode_path(image_path)?;
+            Self::crop_figures(&decoded, &source, image_w, image_h, "")
+        };
+        Ok((document, figures))
+    }
+
+    /// In-memory form of [`Self::recognize_with_figures`] — the native PDF path
+    /// feeds one rasterized page here; that page raster IS the crop source.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_dynamic_with_layout`].
+    pub fn recognize_dynamic_with_figures(
+        &self,
+        img: image::DynamicImage,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        // The forward consumes `img`; retain the source pixels for cropping. Only
+        // the figure path pays this clone (figureless callers use
+        // `recognize_dynamic_with_layout`), and it is dwarfed by the forward.
+        let source = img.clone();
+        let (decoded, image_w, image_h) = self.forward_dynamic(img)?;
+        let document = Self::finalize_document(&decoded, image_w, image_h)?;
+        let figures = Self::crop_figures(&decoded, &source, image_w, image_h, "");
+        Ok((document, figures))
+    }
+
+    /// Crop each figure/image span of one page out of `source` (the original-
+    /// resolution, EXIF-aligned decode), pairing it with the markdown token it
+    /// appears as. Boxes are corner-ordered and clamped to the image; a degenerate
+    /// (empty) box is skipped while KEEPING the span's index, so a written figure's
+    /// `markdown_ref` always matches the rendered placeholder. `img_base` matches
+    /// the page's markdown prefix (`""` for the single-image / per-PDF-page paths).
+    fn crop_figures(
+        decoded: &str,
+        source: &image::DynamicImage,
+        image_w: u32,
+        image_h: u32,
+        img_base: &str,
+    ) -> Vec<ExtractedFigure> {
+        let iw = i64::from(source.width());
+        let ih = i64::from(source.height());
+        postprocess::figure_refs(decoded, image_w, image_h, img_base)
+            .into_iter()
+            .filter_map(|fr| {
+                // The standard image span carries one box; use the first.
+                let &[x1, y1, x2, y2] = fr.boxes.first()?;
+                let cx1 = x1.min(x2).clamp(0, iw);
+                let cy1 = y1.min(y2).clamp(0, ih);
+                let cx2 = x1.max(x2).clamp(0, iw);
+                let cy2 = y1.max(y2).clamp(0, ih);
+                let w = u32::try_from(cx2 - cx1).unwrap_or(0);
+                let h = u32::try_from(cy2 - cy1).unwrap_or(0);
+                if w == 0 || h == 0 {
+                    return None; // degenerate box — nothing to crop
+                }
+                #[allow(clippy::cast_sign_loss)] // cx1/cy1 >= 0 after clamp
+                let image = source.crop_imm(cx1 as u32, cy1 as u32, w, h);
+                Some(ExtractedFigure {
+                    index: fr.index,
+                    label: fr.label,
+                    bbox: [cx1, cy1, cx2, cy2],
+                    markdown_ref: fr.markdown_ref,
+                    image,
+                })
+            })
+            .collect()
     }
 
     /// Recognize a batch of document images, returning one [`FocrResult`] per
@@ -2126,5 +2239,69 @@ mod tests {
         let last = OcrModel::last_hidden_row(&hidden).expect("last row");
         assert_eq!(last.shape(), (1, 2));
         assert_eq!(last.row(0), &[5.0, 6.0]);
+    }
+
+    #[test]
+    fn crop_figures_crops_only_image_spans_from_source() {
+        // A non-image span (ignored) + one full-frame image span. `[0,0,999,999]`
+        // rescales exactly to the source dims, so the crop is the whole image.
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            120,
+            80,
+            image::Rgb([7, 8, 9]),
+        ));
+        let decoded = concat!(
+            "<|ref|>title<|/ref|><|det|>[[0,0,500,500]]<|/det|>",
+            "<|ref|>image<|/ref|><|det|>[[0,0,999,999]]<|/det|>",
+        );
+        let figs = OcrModel::crop_figures(decoded, &source, 120, 80, "");
+        assert_eq!(figs.len(), 1, "only the image span is cropped");
+        assert_eq!(figs[0].index, 0);
+        assert_eq!(figs[0].label, "image");
+        assert_eq!(figs[0].markdown_ref, "![](images/0.jpg)");
+        assert_eq!(figs[0].bbox, [0, 0, 120, 80]);
+        assert_eq!(figs[0].image.width(), 120);
+        assert_eq!(figs[0].image.height(), 80);
+    }
+
+    #[test]
+    fn crop_figures_crops_the_right_subregion() {
+        // Left half red, right half blue; an image span over the right half must
+        // crop to a blue-only region. Box x1=500 (~middle) .. x2=999 (right edge).
+        let mut buf = image::RgbImage::new(100, 40);
+        for y in 0..40 {
+            for x in 0..100 {
+                let c = if x < 50 {
+                    image::Rgb([255, 0, 0])
+                } else {
+                    image::Rgb([0, 0, 255])
+                };
+                buf.put_pixel(x, y, c);
+            }
+        }
+        let source = image::DynamicImage::ImageRgb8(buf);
+        // x1 = int(500/999*100)=50, x2 = int(999/999*100)=100 -> right half.
+        let decoded = "<|ref|>image<|/ref|><|det|>[[500,0,999,999]]<|/det|>";
+        let figs = OcrModel::crop_figures(decoded, &source, 100, 40, "");
+        assert_eq!(figs.len(), 1);
+        assert_eq!(figs[0].bbox, [50, 0, 100, 40]);
+        let crop = figs[0].image.to_rgb8();
+        assert_eq!(crop.dimensions(), (50, 40));
+        assert!(
+            crop.pixels().all(|p| p.0 == [0, 0, 255]),
+            "the right-half crop must be all blue"
+        );
+    }
+
+    #[test]
+    fn crop_figures_skips_degenerate_box() {
+        let source = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            50,
+            50,
+            image::Rgb([0, 0, 0]),
+        ));
+        // x1 == x2 after rescale -> zero width -> skipped.
+        let decoded = "<|ref|>image<|/ref|><|det|>[[10,0,10,999]]<|/det|>";
+        assert!(OcrModel::crop_figures(decoded, &source, 50, 50, "").is_empty());
     }
 }

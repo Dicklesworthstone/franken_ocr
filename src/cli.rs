@@ -96,6 +96,8 @@ pub enum Command {
     /// `-o FILE` writes the result to a file instead of stdout: a `.json` path
     /// emits structured JSON (markdown + per-span bounding boxes), any other
     /// extension (e.g. `.md`) emits markdown; `--json` forces JSON.
+    /// `--extract-figures` additionally saves figure/image regions the model does
+    /// not transcribe into a subfolder, referenced from the markdown/JSON.
     Ocr(OcrArgs),
     /// OCR many images in ONE process — load the 6.2 GB weights + build the int8
     /// decoder cache ONCE, then stream a result per image (the throughput path).
@@ -129,6 +131,17 @@ pub struct OcrArgs {
     /// any other extension (e.g. `.md`) emits markdown. `--json` forces JSON.
     #[arg(short = 'o', long)]
     pub output: Option<PathBuf>,
+    /// Save figure/image regions the model sees but does not transcribe to a
+    /// subfolder (default `<output-stem>_figures/`), referenced from the
+    /// markdown/JSON. Each figure is a PNG (line-art) or JPG (photo) chosen by
+    /// content. Requires `-o` (or `--figures-dir` for a stdout run).
+    #[arg(long)]
+    pub extract_figures: bool,
+    /// Directory to save extracted figures into (implies `--extract-figures`).
+    /// Relative paths are taken relative to the output file's directory (or the
+    /// current directory for a stdout run) and used verbatim in references.
+    #[arg(long, value_name = "DIR")]
+    pub figures_dir: Option<PathBuf>,
     /// Stream NDJSON robot events as pages complete.
     #[arg(long)]
     pub robot: bool,
@@ -231,6 +244,8 @@ impl RobotRunArgs {
             request: self.request,
             json: false,
             output: None,
+            extract_figures: false,
+            figures_dir: None,
             robot: true,
         }
     }
@@ -481,9 +496,12 @@ impl Recognition {
     /// The structured JSON form. Always carries `schema_version` + `markdown`; a
     /// single image adds a top-level `layout` array, a PDF adds a `pages` array of
     /// `{page, layout}`. Every `layout` is a list of `{label, boxes}`, and each box
-    /// is `[x1, y1, x2, y2]` in source-image pixels (top-left origin).
-    fn to_json(&self) -> serde_json::Value {
-        match self {
+    /// is `[x1, y1, x2, y2]` in source-image pixels (top-left origin). When figures
+    /// were extracted, a top-level `figures` array of `{label, page, bbox, path}`
+    /// is appended (each `path` is the saved file, also referenced from the
+    /// markdown).
+    fn to_json(&self, figures: &[WrittenFigure]) -> serde_json::Value {
+        let mut value = match self {
             Recognition::Single(doc) => serde_json::json!({
                 "schema_version": robot::ROBOT_SCHEMA_VERSION,
                 "markdown": doc.markdown,
@@ -506,7 +524,24 @@ impl Recognition {
                     "pages": pages,
                 })
             }
+        };
+        if !figures.is_empty()
+            && let Some(obj) = value.as_object_mut()
+        {
+            let arr: Vec<serde_json::Value> = figures
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "label": f.label,
+                        "page": f.page,
+                        "bbox": f.bbox,
+                        "path": f.path,
+                    })
+                })
+                .collect();
+            obj.insert("figures".to_string(), serde_json::Value::Array(arr));
         }
+        value
     }
 }
 
@@ -536,11 +571,17 @@ fn output_is_json(output: Option<&Path>) -> bool {
 }
 
 /// Write the recognition result to `path` as pretty JSON (with per-span bounding
-/// boxes) when `want_json`, else as the rendered markdown. Both forms end with a
-/// trailing newline so the file is well-formed for downstream tools.
-fn write_ocr_output(path: &Path, rec: &Recognition, want_json: bool) -> FocrResult<()> {
+/// boxes + any extracted `figures`) when `want_json`, else as the rendered
+/// markdown. Both forms end with a trailing newline so the file is well-formed for
+/// downstream tools.
+fn write_ocr_output(
+    path: &Path,
+    rec: &Recognition,
+    want_json: bool,
+    figures: &[WrittenFigure],
+) -> FocrResult<()> {
     let contents = if want_json {
-        let mut s = serde_json::to_string_pretty(&rec.to_json()).map_err(|e| {
+        let mut s = serde_json::to_string_pretty(&rec.to_json(figures)).map_err(|e| {
             FocrError::Other(anyhow::anyhow!(
                 "serializing OCR JSON for {}: {e}",
                 path.display()
@@ -564,11 +605,238 @@ fn write_ocr_output(path: &Path, rec: &Recognition, want_json: bool) -> FocrResu
     })
 }
 
+// ── figure extraction (`--extract-figures`) ─────────────────────────────────
+
+/// The encoding chosen for one extracted figure by [`choose_figure_format`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FigureFormat {
+    /// Lossless — for line-art / charts / screenshots (sharp edges, flat regions).
+    Png,
+    /// Lossy q85 — for photographic regions (smaller, ringing is imperceptible).
+    Jpeg,
+}
+
+impl FigureFormat {
+    fn ext(self) -> &'static str {
+        match self {
+            FigureFormat::Png => "png",
+            FigureFormat::Jpeg => "jpg",
+        }
+    }
+}
+
+/// Pick a format for a cropped figure by content (the user's "auto" choice):
+/// photographic regions have MANY distinct colors → JPG (small, lossy is fine);
+/// line-art / charts / screenshots cluster into a few flat colors → PNG (lossless,
+/// no ringing on sharp lines or embedded text). A grid sample of up to ~4096
+/// pixels is quantized to 5 bits/channel and the distinct-color count + ratio
+/// decide. Deterministic; defaults to PNG (the safe, lossless choice) on any
+/// degenerate input.
+fn choose_figure_format(img: &image::DynamicImage) -> FigureFormat {
+    let rgb = img.to_rgb8();
+    let total = u64::from(rgb.width()) * u64::from(rgb.height());
+    if total == 0 {
+        return FigureFormat::Png;
+    }
+    let step = total.div_ceil(4096).max(1) as usize;
+    let mut seen = std::collections::HashSet::new();
+    let mut sampled = 0u64;
+    for px in rgb.pixels().step_by(step) {
+        let [r, g, b] = px.0;
+        let key = (u32::from(r >> 3) << 10) | (u32::from(g >> 3) << 5) | u32::from(b >> 3);
+        seen.insert(key);
+        sampled += 1;
+    }
+    if sampled == 0 {
+        return FigureFormat::Png;
+    }
+    let ratio = seen.len() as f64 / sampled as f64;
+    // Few distinct colors OR a low unique-color ratio ⇒ line-art ⇒ PNG.
+    if seen.len() <= 64 || ratio < 0.10 {
+        FigureFormat::Png
+    } else {
+        FigureFormat::Jpeg
+    }
+}
+
+/// Encode `img` to `path` in the chosen format — JPG at quality 85, PNG lossless.
+fn write_figure(img: &image::DynamicImage, path: &Path, fmt: FigureFormat) -> FocrResult<()> {
+    let file = std::fs::File::create(path)
+        .map_err(|e| FocrError::Other(anyhow::anyhow!("create figure {}: {e}", path.display())))?;
+    let mut writer = std::io::BufWriter::new(file);
+    let enc = |e: image::ImageError| {
+        FocrError::Other(anyhow::anyhow!("encode figure {}: {e}", path.display()))
+    };
+    match fmt {
+        FigureFormat::Jpeg => {
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, 85)
+                .encode_image(img)
+                .map_err(enc)?;
+        }
+        FigureFormat::Png => {
+            img.write_to(&mut writer, image::ImageFormat::Png)
+                .map_err(enc)?;
+        }
+    }
+    Ok(())
+}
+
+/// One figure written to disk, for the JSON `figures` array.
+struct WrittenFigure {
+    /// The model's ref label (`image`).
+    label: String,
+    /// 1-based source page (1 for a single image).
+    page: usize,
+    /// Source-pixel box `[x1, y1, x2, y2]` the figure was cropped from.
+    bbox: [i64; 4],
+    /// The reference path written into the markdown/JSON (relative to the output).
+    path: String,
+}
+
+/// Where extracted figures are written and how they are referenced — resolved
+/// from `--extract-figures` / `--figures-dir` + the `-o` path BEFORE any forward,
+/// so a usage error fires immediately.
+#[derive(Debug)]
+struct FigurePlan {
+    /// Filesystem directory figures are written into.
+    dir: PathBuf,
+    /// Prefix prepended to each figure filename in references (ends with `/`).
+    ref_prefix: String,
+}
+
+impl FigurePlan {
+    /// `Ok(None)` when figure extraction is off; `Ok(Some(plan))` otherwise.
+    /// Usage error if `--extract-figures` is set with neither `-o` nor
+    /// `--figures-dir` (no way to place the subfolder).
+    fn resolve(args: &OcrArgs) -> FocrResult<Option<FigurePlan>> {
+        if !args.extract_figures && args.figures_dir.is_none() {
+            return Ok(None);
+        }
+        let output = args.output.as_deref();
+        let plan = if let Some(dir_arg) = args.figures_dir.as_deref() {
+            // Explicit dir: used verbatim in references; resolved against the
+            // output file's dir (or the cwd for a stdout run) when relative.
+            let ref_prefix = with_trailing_slash(&dir_arg.to_string_lossy());
+            let dir = if dir_arg.is_absolute() {
+                dir_arg.to_path_buf()
+            } else {
+                output_parent(output).join(dir_arg)
+            };
+            FigurePlan { dir, ref_prefix }
+        } else {
+            // `--extract-figures`: derive `<output-stem>_figures/` next to `-o`.
+            let Some(out) = output else {
+                return Err(FocrError::Usage(
+                    "--extract-figures needs -o/--output to derive the figures \
+                     subfolder; pass --figures-dir DIR for a stdout run"
+                        .to_string(),
+                ));
+            };
+            let stem = out
+                .file_stem()
+                .map_or_else(|| "ocr".to_string(), |s| s.to_string_lossy().into_owned());
+            let dirname = format!("{stem}_figures");
+            let dir = output_parent(output).join(&dirname);
+            FigurePlan {
+                dir,
+                ref_prefix: format!("{dirname}/"),
+            }
+        };
+        Ok(Some(plan))
+    }
+
+    fn writer(&self) -> FigureWriter {
+        FigureWriter {
+            dir: self.dir.clone(),
+            ref_prefix: self.ref_prefix.clone(),
+            created: false,
+            written: Vec::new(),
+        }
+    }
+}
+
+/// The output file's parent directory, or `.` (cwd) for a bare filename / stdout.
+fn output_parent(output: Option<&Path>) -> PathBuf {
+    output
+        .and_then(Path::parent)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+}
+
+fn with_trailing_slash(s: &str) -> String {
+    if s.is_empty() || s.ends_with('/') {
+        s.to_string()
+    } else {
+        format!("{s}/")
+    }
+}
+
+/// Writes a run's figures to disk (creating the dir lazily on the first one) and
+/// rewrites each page's `![](images/…)` token to a real `![figure N](path)`,
+/// accumulating the [`WrittenFigure`] records for the JSON output.
+struct FigureWriter {
+    dir: PathBuf,
+    ref_prefix: String,
+    created: bool,
+    written: Vec<WrittenFigure>,
+}
+
+impl FigureWriter {
+    fn ensure_dir(&mut self) -> FocrResult<()> {
+        if !self.created {
+            std::fs::create_dir_all(&self.dir).map_err(|e| {
+                FocrError::Other(anyhow::anyhow!(
+                    "create figures dir {}: {e}",
+                    self.dir.display()
+                ))
+            })?;
+            self.created = true;
+        }
+        Ok(())
+    }
+
+    /// Write one page's figures and return its markdown with each figure token
+    /// rewritten to point at the saved file. `page` is 1-based (1 for a single
+    /// image); figures are named `page{page}_figure_{n}.{ext}` (n 1-based, matching
+    /// the page-local markdown index).
+    fn process_page(
+        &mut self,
+        page: usize,
+        markdown: &str,
+        figures: Vec<native_engine::ExtractedFigure>,
+    ) -> FocrResult<String> {
+        let mut md = markdown.to_string();
+        for fig in figures {
+            let fignum = fig.index + 1;
+            let fmt = choose_figure_format(&fig.image);
+            let name = format!("page{page}_figure_{fignum}.{}", fmt.ext());
+            self.ensure_dir()?;
+            write_figure(&fig.image, &self.dir.join(&name), fmt)?;
+            let rel = format!("{}{name}", self.ref_prefix);
+            md = md.replace(&fig.markdown_ref, &format!("![figure {fignum}]({rel})"));
+            self.written.push(WrittenFigure {
+                label: fig.label,
+                page,
+                bbox: fig.bbox,
+                path: rel,
+            });
+        }
+        Ok(md)
+    }
+
+    fn into_written(self) -> Vec<WrittenFigure> {
+        self.written
+    }
+}
+
 fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     let request = args.to_request()?;
     if let Some(err) = forced_test_error()? {
         return Err(err);
     }
+    // Resolve the figure-extraction policy BEFORE the forward so a usage error
+    // (e.g. `--extract-figures` without a place to put the subfolder) fires fast.
+    let figure_plan = FigurePlan::resolve(&args)?;
 
     let engine = OcrEngine::new()?;
     // A `.pdf` (or `%PDF-`-magic) input rasterizes each page and OCRs them as one
@@ -576,18 +844,40 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // `recognize_with_autodownload` so model resolution + the first-run download
     // offer behave identically. Both recognize WITH layout so the JSON output can
     // carry bounding boxes — the layout parse is negligible next to the forward
-    // pass, and markdown-only consumers simply ignore it.
-    let recognition = if pdf::looks_like_pdf(&request.image) {
-        Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode)?)
-    } else {
-        Recognition::Single(recognize_with_autodownload(
-            &request,
-            robot_mode,
-            |model| match model {
-                Some(m) => engine.recognize_with_layout_model(m, &request.image),
-                None => engine.recognize_with_layout(&request.image),
-            },
-        )?)
+    // pass, and markdown-only consumers simply ignore it. With `--extract-figures`
+    // the figure-aware variants additionally crop the `![](images/…)` regions out
+    // of the source and rewrite the markdown references to the saved files.
+    let is_pdf = pdf::looks_like_pdf(&request.image);
+    let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, is_pdf) {
+        (Some(plan), true) => {
+            let (pdf_rec, figs) = recognize_pdf_with_figures(&engine, &request, robot_mode, plan)?;
+            (Recognition::Pdf(pdf_rec), figs)
+        }
+        (Some(plan), false) => {
+            let (mut doc, raw) =
+                recognize_with_autodownload(&request, robot_mode, |model| match model {
+                    Some(m) => engine.recognize_with_figures_model(m, &request.image),
+                    None => engine.recognize_with_figures(&request.image),
+                })?;
+            let mut writer = plan.writer();
+            doc.markdown = writer.process_page(1, &doc.markdown, raw)?;
+            (Recognition::Single(doc), writer.into_written())
+        }
+        (None, true) => (
+            Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode)?),
+            Vec::new(),
+        ),
+        (None, false) => (
+            Recognition::Single(recognize_with_autodownload(
+                &request,
+                robot_mode,
+                |model| match model {
+                    Some(m) => engine.recognize_with_layout_model(m, &request.image),
+                    None => engine.recognize_with_layout(&request.image),
+                },
+            )?),
+            Vec::new(),
+        ),
     };
 
     let markdown = recognition.markdown();
@@ -600,7 +890,7 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // regardless of mode, and is written FIRST so the file already exists when a
     // robot consumer sees the completion event below.
     if let Some(path) = args.output.as_deref() {
-        write_ocr_output(path, &recognition, want_json)?;
+        write_ocr_output(path, &recognition, want_json, &figures)?;
     }
 
     if robot_mode {
@@ -611,13 +901,18 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     } else if let Some(path) = args.output.as_deref() {
         // Result already went to the file; don't also echo it to stdout. Confirm
         // on stderr so stdout stays empty/clean for any wrapping pipeline.
+        let figs = if figures.is_empty() {
+            String::new()
+        } else {
+            format!(", {} figure(s)", figures.len())
+        };
         eprintln!(
-            "[focr] wrote {} ({})",
+            "[focr] wrote {} ({}{figs})",
             path.display(),
             if want_json { "json" } else { "markdown" }
         );
     } else if args.json {
-        emit(&recognition.to_json());
+        emit(&recognition.to_json(&figures));
     } else {
         println!("{markdown}");
     }
@@ -768,6 +1063,89 @@ fn recognize_pdf(
             pages: page_layouts,
         })
     })
+}
+
+/// [`recognize_pdf`] + figure extraction — the `--extract-figures` PDF path. Same
+/// per-page resilience and whole-run abort rules, but each page is recognized WITH
+/// its figure crops. The recognition pass is retryable (first-run model download),
+/// so it does NO file I/O — it only collects each decodable page's number, doc, and
+/// crops; the figures are written ONCE afterward and every page's markdown
+/// references are rewritten to the saved files (page-namespaced so per-page
+/// `images/0.jpg` tokens never collide across pages).
+fn recognize_pdf_with_figures(
+    engine: &OcrEngine,
+    request: &OcrRequest,
+    robot_mode: bool,
+    plan: &FigurePlan,
+) -> FocrResult<(PdfRecognition, Vec<WrittenFigure>)> {
+    type OkPage = (
+        usize,
+        native_engine::RecognizedDocument,
+        Vec<native_engine::ExtractedFigure>,
+    );
+    let pages = pdf::PdfPages::open(&request.image)?;
+    let page_count = pages.len();
+    let ok_pages: Vec<OkPage> = recognize_with_autodownload(request, robot_mode, |model| {
+        let mut out: Vec<OkPage> = Vec::new();
+        let mut first_error: Option<FocrError> = None;
+        for idx in 0..page_count {
+            let page = pages.render(idx).and_then(|image| match model {
+                Some(m) => engine.recognize_dynamic_with_figures_model(m, image),
+                None => engine.recognize_dynamic_with_figures(image),
+            });
+            match page {
+                Ok((doc, figs)) => out.push((idx + 1, doc, figs)),
+                Err(
+                    e @ (FocrError::ModelNotFound(_)
+                    | FocrError::Cancelled
+                    | FocrError::FormatMismatch(_)),
+                ) => return Err(e),
+                Err(e) => {
+                    if robot_mode {
+                        emit(&robot::page_skipped_event(idx + 1, &e));
+                    } else {
+                        eprintln!("[focr] PDF page {} skipped: {e}", idx + 1);
+                    }
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                FocrError::InputDecode(format!(
+                    "PDF {} produced no decodable pages",
+                    request.image.display()
+                ))
+            }));
+        }
+        Ok(out)
+    })?;
+
+    // Write pass — runs ONCE: write each page's figures and rewrite its markdown,
+    // then concatenate exactly as `recognize_pdf` does (trim_end + blank-line join).
+    let mut writer = plan.writer();
+    let mut document = String::new();
+    let mut page_layouts: Vec<PdfPageLayout> = Vec::new();
+    for (i, (page_no, doc, figs)) in ok_pages.into_iter().enumerate() {
+        let md = writer.process_page(page_no, &doc.markdown, figs)?;
+        if i > 0 {
+            document.push_str("\n\n");
+        }
+        document.push_str(md.trim_end());
+        page_layouts.push(PdfPageLayout {
+            page: page_no,
+            layout: doc.layout,
+        });
+    }
+    Ok((
+        PdfRecognition {
+            markdown: document,
+            pages: page_layouts,
+        },
+        writer.into_written(),
+    ))
 }
 
 /// Emit ONE batch image's outcome in the shared `ocr-batch` shape — a JSON object
@@ -1434,6 +1812,8 @@ mod tests {
                 },
                 json: false,
                 output: None,
+                extract_figures: false,
+                figures_dir: None,
                 robot: true,
             }),
         };
@@ -1478,6 +1858,8 @@ mod tests {
             },
             json: false,
             output: None,
+            extract_figures: false,
+            figures_dir: None,
             robot: false,
         };
         let err = args.to_request().expect_err("negative base-size is usage");
@@ -1524,7 +1906,7 @@ mod tests {
                 boxes: vec![[10, 20, 110, 60]],
             }],
         });
-        let json = rec.to_json();
+        let json = rec.to_json(&[]);
         assert_eq!(json["schema_version"], robot::ROBOT_SCHEMA_VERSION);
         assert_eq!(json["markdown"], "# Title\n\nbody");
         assert_eq!(json["layout"][0]["label"], "title");
@@ -1554,7 +1936,7 @@ mod tests {
                 },
             ],
         });
-        let json = rec.to_json();
+        let json = rec.to_json(&[]);
         assert_eq!(json["markdown"], "p1\n\np2");
         assert_eq!(json["pages"][0]["page"], 1);
         assert_eq!(
@@ -1579,12 +1961,12 @@ mod tests {
 
         // Markdown form: source lacks a trailing newline, so one is appended.
         let md_path = dir.join("out.md");
-        write_ocr_output(&md_path, &rec, false).expect("write md");
+        write_ocr_output(&md_path, &rec, false, &[]).expect("write md");
         assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "hello world\n");
 
         // JSON form: valid JSON, newline-terminated, carrying the bounding boxes.
         let json_path = dir.join("out.json");
-        write_ocr_output(&json_path, &rec, true).expect("write json");
+        write_ocr_output(&json_path, &rec, true, &[]).expect("write json");
         let raw = std::fs::read_to_string(&json_path).unwrap();
         assert!(raw.ends_with('\n'), "json file should end with a newline");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
@@ -1595,6 +1977,182 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A default `OcrArgs` for the figure-plan tests, mutated by `f`.
+    fn ocr_args_with(f: impl FnOnce(&mut OcrArgs)) -> OcrArgs {
+        let mut args = OcrArgs {
+            request: OcrRequestArgs {
+                image: PathBuf::from("scan.png"),
+                model: None,
+                base_size: DEFAULT_BASE_SIZE,
+                image_size: DEFAULT_IMAGE_SIZE,
+                crop_mode: CropMode::Gundam,
+                max_length: DEFAULT_MAX_LENGTH,
+                temperature: DEFAULT_TEMPERATURE,
+                no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
+                ngram_window: DEFAULT_NGRAM_WINDOW,
+            },
+            json: false,
+            output: None,
+            extract_figures: false,
+            figures_dir: None,
+            robot: false,
+        };
+        f(&mut args);
+        args
+    }
+
+    #[test]
+    fn extract_figures_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "focr",
+            "ocr",
+            "scan.png",
+            "-o",
+            "out.md",
+            "--extract-figures",
+        ])
+        .expect("--extract-figures parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        assert!(args.extract_figures);
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--figures-dir", "assets"])
+            .expect("--figures-dir parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        assert_eq!(args.figures_dir.as_deref(), Some(Path::new("assets")));
+    }
+
+    #[test]
+    fn figure_plan_resolves_auto_subfolder_explicit_dir_and_usage_error() {
+        // Auto: `<stem>_figures/` next to the `-o` file.
+        let plan = FigurePlan::resolve(&ocr_args_with(|a| {
+            a.extract_figures = true;
+            a.output = Some(PathBuf::from("/a/b/report.md"));
+        }))
+        .unwrap()
+        .expect("enabled");
+        assert_eq!(plan.dir, PathBuf::from("/a/b/report_figures"));
+        assert_eq!(plan.ref_prefix, "report_figures/");
+
+        // Explicit relative dir: resolved under the output dir; verbatim in refs.
+        let plan = FigurePlan::resolve(&ocr_args_with(|a| {
+            a.figures_dir = Some(PathBuf::from("assets"));
+            a.output = Some(PathBuf::from("/a/b/report.md"));
+        }))
+        .unwrap()
+        .expect("enabled");
+        assert_eq!(plan.dir, PathBuf::from("/a/b/assets"));
+        assert_eq!(plan.ref_prefix, "assets/");
+
+        // Off when neither flag is set.
+        assert!(
+            FigurePlan::resolve(&ocr_args_with(|_| {}))
+                .unwrap()
+                .is_none()
+        );
+
+        // `--extract-figures` with no `-o` and no `--figures-dir` is a usage error.
+        let err = FigurePlan::resolve(&ocr_args_with(|a| a.extract_figures = true))
+            .expect_err("needs a place for the subfolder");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn choose_figure_format_png_for_flat_jpg_for_photo() {
+        // Flat 2-color line-art ⇒ PNG (lossless).
+        let mut flat = image::RgbImage::new(64, 64);
+        for (i, px) in flat.pixels_mut().enumerate() {
+            *px = if i % 9 == 0 {
+                image::Rgb([0, 0, 0])
+            } else {
+                image::Rgb([255, 255, 255])
+            };
+        }
+        assert_eq!(
+            choose_figure_format(&image::DynamicImage::ImageRgb8(flat)),
+            FigureFormat::Png
+        );
+
+        // Many distinct colors (photo-like) ⇒ JPG. A per-pixel `(x*4, y*4, x^y)`
+        // ramp gives ~4096 distinct colors (≈1024 after 5-bit quantization), well
+        // above the line-art threshold.
+        let mut photo = image::RgbImage::new(64, 64);
+        for (i, px) in photo.pixels_mut().enumerate() {
+            let x = (i % 64) as u8;
+            let y = (i / 64) as u8;
+            *px = image::Rgb([x.wrapping_mul(4), y.wrapping_mul(4), x ^ (y << 1)]);
+        }
+        assert_eq!(
+            choose_figure_format(&image::DynamicImage::ImageRgb8(photo)),
+            FigureFormat::Jpeg
+        );
+    }
+
+    #[test]
+    fn figure_writer_writes_file_and_rewrites_markdown_reference() {
+        let dir = std::env::temp_dir().join(format!("focr_figwriter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plan = FigurePlan {
+            dir: dir.clone(),
+            ref_prefix: "figs/".to_string(),
+        };
+        let mut writer = plan.writer();
+        // A flat white image ⇒ PNG; bbox + ref carried through to the record.
+        let fig = native_engine::ExtractedFigure {
+            index: 0,
+            label: "image".to_string(),
+            bbox: [5, 6, 25, 16],
+            markdown_ref: "![](images/0.jpg)".to_string(),
+            image: image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+                20,
+                10,
+                image::Rgb([255, 255, 255]),
+            )),
+        };
+        let md = writer
+            .process_page(1, "before ![](images/0.jpg)\nafter", vec![fig])
+            .expect("process page");
+
+        // The placeholder is rewritten to `![figure 1](<ref_prefix><name>)`.
+        assert!(
+            md.contains("![figure 1](figs/page1_figure_1.png)"),
+            "md: {md}"
+        );
+        assert!(!md.contains("images/0.jpg"), "old token gone; md: {md}");
+        // The PNG file actually exists.
+        assert!(dir.join("page1_figure_1.png").is_file());
+        // The JSON record carries the relative path, page, and bbox.
+        let written = writer.into_written();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].path, "figs/page1_figure_1.png");
+        assert_eq!(written[0].page, 1);
+        assert_eq!(written[0].bbox, [5, 6, 25, 16]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn json_appends_figures_array_only_when_present() {
+        let rec = Recognition::Single(native_engine::RecognizedDocument {
+            markdown: "see ![figure 1](figs/page1_figure_1.png)".to_string(),
+            layout: vec![],
+        });
+        let figures = vec![WrittenFigure {
+            label: "image".to_string(),
+            page: 1,
+            bbox: [1, 2, 3, 4],
+            path: "figs/page1_figure_1.png".to_string(),
+        }];
+        let json = rec.to_json(&figures);
+        assert_eq!(json["figures"][0]["path"], "figs/page1_figure_1.png");
+        assert_eq!(json["figures"][0]["page"], 1);
+        assert_eq!(json["figures"][0]["bbox"], serde_json::json!([1, 2, 3, 4]));
+        // No figures ⇒ no `figures` key.
+        assert!(rec.to_json(&[]).get("figures").is_none());
     }
 
     #[test]

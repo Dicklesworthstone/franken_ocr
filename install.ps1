@@ -532,6 +532,7 @@ function Write-Summary {
     $lines.Add('  focr ocr page.png --json  emit structured JSON (with bounding boxes)')
     $lines.Add('  focr ocr page.png -o out.md    write markdown to a file')
     $lines.Add('  focr ocr page.png -o out.json  write JSON (markdown + boxes) to a file')
+    $lines.Add('  focr ocr page.png -o out.md --extract-figures   save figures next to the .md')
     $lines.Add('  focr robot selftest       verify the int8 kernel on this host')
     $lines.Add('  focr --help               full command reference')
     $lines.Add('')

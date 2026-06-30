@@ -14,7 +14,23 @@ sections as they land.
 
 ## [Unreleased]
 
-Nothing below has shipped; these are the next workstreams.
+Landed on `main` since `0.3.0`, not yet tagged.
+
+### Added
+
+- **`focr ocr --extract-figures`** (`bd-23s8`). Saves the figure/image regions the
+  model grounds but does not transcribe to text (the `![](images/…)` placeholders)
+  as real image files in a subfolder — default `<output-stem>_figures/`, or set
+  `--figures-dir DIR` — and rewrites the Markdown to reference them
+  (`![figure N](report_figures/page1_figure_1.jpg)`); the JSON gains a `figures`
+  array of `{label, page, bbox, path}`. Each figure's format is chosen by content:
+  JPG q85 for photographic regions, lossless PNG for line-art / charts /
+  screenshots. PDFs name figures per page. The crop comes from a fresh EXIF-aligned
+  decode of the source so it lands exactly on the grounded box. New library entry
+  points `OcrEngine::recognize_with_figures` / `recognize_dynamic_with_figures`
+  (and `_model` variants) return the document plus the cropped `ExtractedFigure`s.
+
+### Direction (not yet shipped)
 
 - **int4 expert quantization.** Group-quantized int4 expert weights at a
   Q4_K_M-class footprint, gated on a measured character-error-rate budget. A packed

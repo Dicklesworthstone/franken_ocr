@@ -34,7 +34,7 @@ pub mod tokenizer;
 
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
-pub use native_engine::{LayoutSpan, RecognizedDocument};
+pub use native_engine::{ExtractedFigure, LayoutSpan, RecognizedDocument};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -295,6 +295,68 @@ impl OcrEngine {
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
             move || model.recognize_dynamic_with_layout(image),
+        )
+    }
+
+    /// Recognize a single document image, returning the markdown + layout AND the
+    /// figure regions cropped out of the source image — the regions the markdown
+    /// renders as `![](images/…)` placeholders. This is what `focr ocr
+    /// --extract-figures` uses to write real figure files.
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_with_layout`].
+    pub fn recognize_with_figures(
+        &self,
+        image_path: &Path,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        self.recognize_with_figures_model(&Self::model_path(), image_path)
+    }
+
+    /// The path-explicit form of [`OcrEngine::recognize_with_figures`].
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_with_model`].
+    pub fn recognize_with_figures_model(
+        &self,
+        model_path: &Path,
+        image_path: &Path,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        let model = self.model_at(model_path)?;
+        let image_path = image_path.to_path_buf();
+        self.run_blocking_stage_with_budget(
+            "forward",
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
+            move || model.recognize_with_figures(&image_path),
+        )
+    }
+
+    /// Recognize an in-memory [`image::DynamicImage`], returning the markdown +
+    /// layout AND the cropped figure regions — the in-memory form the native PDF
+    /// `--extract-figures` path uses (the page raster is the crop source).
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_dynamic_with_layout`].
+    pub fn recognize_dynamic_with_figures(
+        &self,
+        image: image::DynamicImage,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        self.recognize_dynamic_with_figures_model(&Self::model_path(), image)
+    }
+
+    /// The path-explicit form of [`OcrEngine::recognize_dynamic_with_figures`].
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_with_model`].
+    pub fn recognize_dynamic_with_figures_model(
+        &self,
+        model_path: &Path,
+        image: image::DynamicImage,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        let model = self.model_at(model_path)?;
+        self.run_blocking_stage_with_budget(
+            "forward",
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
+            move || model.recognize_dynamic_with_figures(image),
         )
     }
 

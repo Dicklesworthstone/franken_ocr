@@ -68,13 +68,16 @@ focr ocr page.png --json
 focr ocr page.png -o page.md
 focr ocr page.png -o page.json            # structured JSON with bounding boxes
 
-# 5. Stream NDJSON pipeline events for an agent (run_start ... run_complete; full event set via `focr robot schema`).
+# 5. Also save figures the model can't transcribe (charts/photos) next to the .md.
+focr ocr page.png -o page.md --extract-figures   # -> page.md + page_figures/
+
+# 6. Stream NDJSON pipeline events for an agent (run_start ... run_complete; full event set via `focr robot schema`).
 focr ocr page.png --robot
 
-# 6. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
+# 7. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
 focr robot selftest
 
-# 6. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
+# 8. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
 focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
 ```
 
@@ -207,6 +210,7 @@ focr ocr page.png                          # Markdown to stdout
 focr ocr page.png --json                   # structured JSON to stdout
 focr ocr page.png -o page.md               # write Markdown to a file
 focr ocr page.png -o page.json             # write structured JSON (markdown + boxes) to a file
+focr ocr page.png -o page.md --extract-figures   # also save figures, referenced from the .md
 focr ocr page.png --robot                  # NDJSON pipeline events
 focr ocr page.png --crop-mode base         # disable dynamic-resolution tiling
 focr ocr page.png --max-length 4096 --temperature 0.0
@@ -220,6 +224,16 @@ structured JSON carries the rendered `markdown` plus a `layout` array — one
 `{label, boxes}` entry per grounded span, where each box is `[x1, y1, x2, y2]` in
 source-image pixels (a PDF nests these under a per-page `pages` array). This is the
 same shape `--json` prints to stdout.
+
+**Figures (`--extract-figures`).** The model sees figures/photos/diagrams it does not
+transcribe to text. With `--extract-figures`, those regions are cropped out of the
+source image and saved into a subfolder (default `<output-stem>_figures/`, or set
+`--figures-dir DIR`), then referenced from the output: the Markdown gets a real
+`![figure N](report_figures/page1_figure_1.jpg)` in place of each figure, and the
+JSON gains a `figures` array of `{label, page, bbox, path}`. Each figure's format is
+chosen by content — JPG (quality 85) for photographic regions, lossless PNG for
+line-art / charts / screenshots. Requires `-o` (or `--figures-dir` for a stdout run).
+PDFs name figures per page (`page{N}_figure_{M}`).
 
 Tuning flags: `--base-size` and `--image-size` (preprocessing resolution), `--crop-mode` (`gundam` or `base`), `--max-length` (decode token cap), `--temperature` (sampling), `--no-repeat-ngram` and `--ngram-window` (the sliding no-repeat n-gram decode guard).
 

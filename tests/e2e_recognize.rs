@@ -1013,6 +1013,125 @@ fn cli_ocr_output_file_contract_when_model_present_else_skip() {
     }
 }
 
+/// Assert `path` is a non-empty PNG or JPEG by magic bytes (the two formats the
+/// figure extractor writes).
+fn assert_is_png_or_jpeg(path: &Path) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read figure {path:?}: {e}"));
+    assert!(!bytes.is_empty(), "figure {path:?} is empty");
+    let is_png = bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let is_jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    assert!(
+        is_png || is_jpeg,
+        "figure {path:?} is neither PNG nor JPEG (magic {:02X?})",
+        &bytes[..bytes.len().min(8)]
+    );
+}
+
+/// Model-gated e2e for `focr ocr --extract-figures` (bd-23s8). With a real model,
+/// `-o out.md --extract-figures` must exit clean and write a non-empty markdown
+/// file; if the model grounds any figure regions, every file it wrote into
+/// `out_figures/` is a valid PNG/JPEG AND is referenced by the markdown. (A 4×4
+/// fixture rarely yields figures, so figure PRESENCE is not asserted — the path
+/// running clean and any written figure being valid + referenced is.)
+/// Skip-with-SUCCESS when the model or binary is absent.
+#[test]
+fn cli_ocr_extract_figures_when_model_present_else_skip() {
+    let test = "cli_ocr_extract_figures_when_model_present_else_skip";
+    let case = "extract_figures";
+
+    let Some(model_path) = resolve_present_model() else {
+        log_success(
+            test,
+            case,
+            "e2e skipped: no model present; --extract-figures path unverified",
+        );
+        return;
+    };
+    let Some(bin) = focr_bin() else {
+        log_success(
+            test,
+            case,
+            "focr binary not built (CARGO_BIN_EXE_focr unset); --extract-figures unverified",
+        );
+        return;
+    };
+
+    let image = write_tiny_png();
+    let img = image.to_string_lossy().into_owned();
+    let model = model_path.to_string_lossy().into_owned();
+    let md_out = unique_output_path("md");
+    let stem = md_out
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("doc")
+        .to_string();
+    let figdir = md_out.with_file_name(format!("{stem}_figures"));
+    let _ = std::fs::remove_file(&md_out);
+    let _ = std::fs::remove_dir_all(&figdir);
+    let md_arg = md_out.to_string_lossy().into_owned();
+
+    let out = run_focr(
+        &bin,
+        &[
+            "ocr",
+            &img,
+            "--model",
+            &model,
+            "-o",
+            &md_arg,
+            "--extract-figures",
+        ],
+    );
+    match out.code {
+        Some(0) => {
+            let body = std::fs::read_to_string(&md_out).unwrap_or_else(|e| {
+                panic!("--extract-figures exited 0 but no md at {md_out:?}: {e}")
+            });
+            assert!(
+                !body.trim().is_empty(),
+                "--extract-figures wrote an empty markdown file"
+            );
+            let mut n = 0usize;
+            if figdir.is_dir() {
+                for entry in std::fs::read_dir(&figdir).expect("read figures dir") {
+                    let p = entry.expect("figures dir entry").path();
+                    if p.is_file() {
+                        assert_is_png_or_jpeg(&p);
+                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+                        assert!(
+                            body.contains(name),
+                            "figure file {name} is not referenced by the markdown:\n{body}"
+                        );
+                        n += 1;
+                    }
+                }
+            }
+            log_success(
+                test,
+                case,
+                &format!("--extract-figures ran clean; {n} valid figure(s) written + referenced"),
+            );
+        }
+        Some(1) if out.stderr.contains("not yet implemented") => {
+            log_xfail(
+                test,
+                case,
+                "exit 1 not-implemented",
+                "exit 0 + figures path",
+            );
+            log_success(
+                test,
+                case,
+                "forward still NotImplemented (documented phase gap); tightens in once it lands",
+            );
+        }
+        other => panic!(
+            "`focr ocr --extract-figures` over a present model exited {other:?}; stderr:\n{}",
+            out.stderr
+        ),
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Robot-mode pipe smoke (LOGGING_AND_E2E.md §4.5): the stable, always-on
 // surface. `focr robot schema` emits exactly one parseable JSON object on

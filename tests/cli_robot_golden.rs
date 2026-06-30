@@ -1357,6 +1357,8 @@ fn ocr_help_lists_reference_infer_args() {
         "--ngram-window",
         "--json",
         "--output",
+        "--extract-figures",
+        "--figures-dir",
         "--robot",
     ];
     for flag in required {
@@ -1621,6 +1623,96 @@ fn ocr_output_flag_is_plumbed_and_writes_nothing_on_failure() {
         );
         let _ = std::fs::remove_file(&out_path);
     }
+}
+
+/// **`--extract-figures` without a destination is a clean usage error (bd-23s8).**
+/// The figure subfolder is derived from `-o`; with neither `-o` nor `--figures-dir`
+/// there is nowhere to put it, so the run must fail fast with a usage error (exit 2)
+/// BEFORE any model load — proven here with no model present at all.
+#[test]
+fn ocr_extract_figures_without_output_is_usage_error() {
+    let test = "ocr_extract_figures_without_output_is_usage_error";
+    let out = run_focr(&["ocr", "/some/document.png", "--extract-figures"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = out.status.code();
+    let mentions = stderr.contains("extract-figures") || stderr.contains("usage error");
+    let pass = code == Some(2) && mentions;
+    tlog!(test,
+        "case": "extract_figures_no_output",
+        "event": "assert",
+        "assertion": "--extract-figures with no -o/--figures-dir is a usage error (exit 2), fired before any forward",
+        "inputs": {"argv": ["ocr", "/some/document.png", "--extract-figures"]},
+        "exit_code": code,
+        "stderr_head": stderr.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        code,
+        Some(2),
+        "--extract-figures without a destination must exit 2 (usage); stderr:\n{stderr}"
+    );
+    assert!(
+        mentions,
+        "the usage error should name the flag; got:\n{stderr}"
+    );
+}
+
+/// **`--extract-figures` is plumbed end-to-end and writes NOTHING on a load
+/// failure (bd-23s8).** With a future-version `.focrq` (FormatMismatch, exit 7) the
+/// forward errors before any figure crop, so neither the output file nor the
+/// derived `<stem>_figures/` subfolder is created. (A real model writing real
+/// figures is covered model-gated in `e2e_recognize`.)
+#[test]
+fn ocr_extract_figures_plumbed_and_writes_no_files_on_failure() {
+    let test = "ocr_extract_figures_plumbed_and_writes_no_files_on_failure";
+    let model = write_future_focrq();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let work = std::env::temp_dir().join(format!("focr_fig_fail_{}_{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&work).expect("mk workdir");
+    let out_md = work.join("doc.md");
+    let figures_dir = work.join("doc_figures"); // the auto-derived subfolder
+    let out_str = out_md.to_string_lossy().into_owned();
+
+    let out = run_focr_with_model_path(
+        &[
+            "ocr",
+            "/some/document.png",
+            "-o",
+            out_str.as_str(),
+            "--extract-figures",
+        ],
+        &model,
+    );
+    let code = out.status.code();
+    let md_exists = out_md.exists();
+    let figdir_exists = figures_dir.exists();
+    let pass = code == Some(7) && !md_exists && !figdir_exists;
+    tlog!(test,
+        "case": "extract_figures_on_failure",
+        "event": "assert",
+        "assertion": "`-o doc.md --extract-figures` is plumbed; a load failure writes neither the md nor the figures dir",
+        "inputs": {"argv": ["ocr", "/some/document.png", "-o", "[doc.md]", "--extract-figures"], "FOCR_MODEL_PATH": "[future-focrq]"},
+        "exit_code": code,
+        "md_exists": md_exists,
+        "figures_dir_exists": figdir_exists,
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        code,
+        Some(7),
+        "must surface FormatMismatch (exit 7); got {code:?}"
+    );
+    assert!(!md_exists, "no output file on failure: {out_md:?}");
+    assert!(
+        !figdir_exists,
+        "no figures subfolder on failure: {figures_dir:?}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
 }
 
 /// [C4] `focr convert --quant int4` -> NotImplemented golden. The int8 path is
