@@ -309,6 +309,11 @@ pub struct ConvertArgs {
     /// Offline pre-packing target recorded in the `.focrq` header.
     #[arg(long, value_enum, default_value_t = ArchTarget::Generic)]
     pub arch: ArchTarget,
+    /// Target model-architecture id the `.focrq` self-declares (the loader selects
+    /// it from the registry). Default `unlimited-ocr`; e.g. `got-ocr2` (omits the
+    /// tied `lm_head`, writes the Apache-2.0 notice). See `focr models`.
+    #[arg(long, default_value = "unlimited-ocr")]
+    pub model_id: String,
     /// Emit machine-readable scaffold JSON before the Phase-2 NotImplemented.
     #[arg(long)]
     pub json: bool,
@@ -1321,9 +1326,18 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     // `from_bytes` keeps ownership of the single read; the hash above borrowed it.
     let weights = native_engine::weights::Weights::from_bytes(bytes)?;
     let tensor_count = weights.len();
+    // Resolve the target model architecture (the `.focrq` self-declares its id).
+    let arch = native_engine::model_arch::arch_by_id(&args.model_id).ok_or_else(|| {
+        FocrError::Usage(format!(
+            "unknown --model-id {:?} (see `focr models` for the registry)",
+            args.model_id
+        ))
+    })?;
+    let omit_lm_head = arch.tie_word_embeddings();
     let quantized = weights
         .names()
         .filter(|name| quant::convert::is_decoder_int8_tensor(name))
+        .filter(|name| !(omit_lm_head && *name == "lm_head.weight"))
         .count();
 
     let blob = quant::convert::safetensors_to_focrq(
@@ -1331,6 +1345,7 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
         quant::convert::ConvertQuant::Int8,
         args.arch.packing_byte(),
         source_sha256,
+        arch,
     )?;
     let output_bytes = blob.len();
     std::fs::write(&args.output, &blob).map_err(|e| {
@@ -1351,6 +1366,7 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             "output": args.output,
             "quant": args.quant.as_str(),
             "arch": args.arch.as_str(),
+            "model_id": arch.id(),
             "source_sha256": sha_hex,
             "tensors": tensor_count,
             "tensors_quantized": quantized,

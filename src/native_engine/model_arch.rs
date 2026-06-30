@@ -161,6 +161,14 @@ pub trait ModelArch: Send + Sync {
     /// Whether this arch's forward is implemented TODAY (vs a planned zoo target
     /// the registry merely describes). Only Unlimited-OCR is `true` so far.
     fn implemented(&self) -> bool;
+    /// Whether `lm_head.weight` is a tied byte-alias of `model.embed_tokens.weight`
+    /// and should therefore be **omitted** from the `.focrq` (the loader reuses the
+    /// stored embedding for the output projection). `false` (the default) means the
+    /// converter stores `lm_head` as its own tensor, as Unlimited-OCR does. GOT-OCR2
+    /// ties (verified byte-identical — `docs/zoo/got-ocr2-spec.md` §12).
+    fn tie_word_embeddings(&self) -> bool {
+        false
+    }
 }
 
 /// The Baidu Unlimited-OCR architecture — the FIRST [`ModelArch`] implementation
@@ -232,6 +240,9 @@ pub struct PlannedArch {
     /// until censused. Informational for a planned model (never used for inference).
     decode_contract: DecodeContract,
     tasks: &'static [Task],
+    /// Whether the model ties `lm_head` to `embed_tokens` (so the converter omits
+    /// `lm_head.weight`); see [`ModelArch::tie_word_embeddings`].
+    tie_word_embeddings: bool,
 }
 
 /// A not-yet-determined greedy contract for a planned model whose config has not
@@ -274,6 +285,9 @@ impl ModelArch for PlannedArch {
     fn implemented(&self) -> bool {
         false
     }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
 }
 
 // ── the planned zoo models (descriptors only; forwards land in sub-epics B-F) ──
@@ -305,6 +319,8 @@ static GOT_OCR2: PlannedArch = PlannedArch {
         Task::Geometry,
         Task::Music,
     ],
+    // Verified byte-identical lm_head == embed_tokens (spec §12) → omit lm_head.
+    tie_word_embeddings: true,
 };
 static SMOLVLM2: PlannedArch = PlannedArch {
     id: "smolvlm2",
@@ -316,6 +332,7 @@ static SMOLVLM2: PlannedArch = PlannedArch {
     tokenizer: TokenizerKind::SmolLm2Bpe,
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Describe, Task::Vqa],
+    tie_word_embeddings: false, // placeholder until censused (sub-epic C)
 };
 static ONECHART: PlannedArch = PlannedArch {
     id: "onechart",
@@ -327,6 +344,7 @@ static ONECHART: PlannedArch = PlannedArch {
     tokenizer: TokenizerKind::Qwen2Bpe,
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Chart],
+    tie_word_embeddings: false, // placeholder until censused (sub-epic D)
 };
 static TROMR: PlannedArch = PlannedArch {
     id: "tromr",
@@ -338,6 +356,7 @@ static TROMR: PlannedArch = PlannedArch {
     tokenizer: TokenizerKind::MusicVocab,
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Music],
+    tie_word_embeddings: false, // placeholder until censused (sub-epic E)
 };
 static TROCR: PlannedArch = PlannedArch {
     id: "trocr",
@@ -349,6 +368,7 @@ static TROCR: PlannedArch = PlannedArch {
     tokenizer: TokenizerKind::SentencePiece,
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Handwriting],
+    tie_word_embeddings: false, // placeholder until censused (sub-epic F)
 };
 static PIX2TEX: PlannedArch = PlannedArch {
     id: "pix2tex",
@@ -360,6 +380,7 @@ static PIX2TEX: PlannedArch = PlannedArch {
     tokenizer: TokenizerKind::SentencePiece,
     decode_contract: PLACEHOLDER_CONTRACT,
     tasks: &[Task::Formula],
+    tie_word_embeddings: false, // placeholder until censused (sub-epic F)
 };
 
 /// The model registry, in priority order (the default + implemented first, then the

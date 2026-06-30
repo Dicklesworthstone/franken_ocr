@@ -43,6 +43,7 @@ use sha2::{Digest, Sha256};
 
 use super::focrq::{FocrqBuilder, WriteDType};
 use crate::error::{FocrError, FocrResult};
+use crate::native_engine::model_arch::ModelArch;
 use crate::native_engine::nn;
 use crate::native_engine::weights::{DType, Weights};
 
@@ -116,6 +117,13 @@ pub fn is_decoder_int8_tensor(name: &str) -> bool {
 /// byte recorded in the header (`0` Generic … `3` X86Amx); `source_sha256` is the
 /// 32-byte digest of the input shard ([`sha256_of_bytes`]).
 ///
+/// `arch` is the target architecture (its `model_id` + license notice go into the
+/// header, and its [`ModelArch::tie_word_embeddings`] decides whether the tied
+/// `lm_head.weight` is omitted). Passing [`crate::native_engine::model_arch::default_arch`]
+/// reproduces the historical Unlimited-OCR output **byte-for-byte** (default id ⇒
+/// the `model_id` key is omitted, the notice is the Baidu/MIT one, and `lm_head`
+/// is stored), so existing artifacts are unchanged.
+///
 /// # Errors
 /// * [`FocrError::NotImplemented`] for [`ConvertQuant::Int4`] — the int4 group
 ///   path is not yet validated (doctrine #1).
@@ -127,6 +135,7 @@ pub fn safetensors_to_focrq(
     quant: ConvertQuant,
     arch_target: u8,
     source_sha256: [u8; 32],
+    arch: &dyn ModelArch,
 ) -> FocrResult<Vec<u8>> {
     if quant == ConvertQuant::Int4 {
         return Err(FocrError::NotImplemented(
@@ -138,12 +147,22 @@ pub fn safetensors_to_focrq(
 
     let mut builder = FocrqBuilder::new()
         .with_arch_target(arch_target)
-        .with_source_sha256(source_sha256);
+        .with_source_sha256(source_sha256)
+        .with_model_id(arch.id())
+        .with_license_notice(arch.license_notice());
+
+    // When the arch ties `lm_head` to `embed_tokens` (GOT-OCR2: proven byte-identical,
+    // spec §12), omit `lm_head.weight` — it is a duplicate the loader reconstructs
+    // from the stored embedding. Skips ~155 M params from the artifact.
+    let omit_lm_head = arch.tie_word_embeddings();
 
     // `names()` is already sorted (the directory is a `BTreeMap`); collect so the
     // immutable directory borrow is released before the per-tensor accessors run.
     let names: Vec<String> = weights.names().map(str::to_owned).collect();
     for name in &names {
+        if omit_lm_head && name == "lm_head.weight" {
+            continue;
+        }
         if is_decoder_int8_tensor(name) {
             quantize_decoder_tensor(&mut builder, weights, name)?;
         } else {
@@ -337,8 +356,14 @@ mod tests {
     fn int8_decoder_tensors_match_load_time_quant() {
         let src = synthetic_safetensors();
         let w = Weights::from_bytes(src).expect("synthetic safetensors parse");
-        let blob =
-            safetensors_to_focrq(&w, ConvertQuant::Int8, 2, [7u8; 32]).expect("convert int8");
+        let blob = safetensors_to_focrq(
+            &w,
+            ConvertQuant::Int8,
+            2,
+            [7u8; 32],
+            crate::native_engine::model_arch::default_arch(),
+        )
+        .expect("convert int8");
         let out = Weights::from_bytes(blob).expect("focrq parse");
 
         for name in INT8_NAMES {
@@ -365,8 +390,14 @@ mod tests {
     fn high_precision_tensors_roundtrip_unchanged() {
         let src = synthetic_safetensors();
         let w = Weights::from_bytes(src).expect("synthetic safetensors parse");
-        let blob =
-            safetensors_to_focrq(&w, ConvertQuant::Int8, 2, [7u8; 32]).expect("convert int8");
+        let blob = safetensors_to_focrq(
+            &w,
+            ConvertQuant::Int8,
+            2,
+            [7u8; 32],
+            crate::native_engine::model_arch::default_arch(),
+        )
+        .expect("convert int8");
         let out = Weights::from_bytes(blob).expect("focrq parse");
 
         for name in KEPT_NAMES {
@@ -388,8 +419,14 @@ mod tests {
     fn header_carries_arch_sha_and_license() {
         let src = synthetic_safetensors();
         let w = Weights::from_bytes(src).expect("synthetic safetensors parse");
-        let blob =
-            safetensors_to_focrq(&w, ConvertQuant::Int8, 2, [7u8; 32]).expect("convert int8");
+        let blob = safetensors_to_focrq(
+            &w,
+            ConvertQuant::Int8,
+            2,
+            [7u8; 32],
+            crate::native_engine::model_arch::default_arch(),
+        )
+        .expect("convert int8");
         let out = Weights::from_bytes(blob).expect("focrq parse");
         assert!(out.is_focrq());
         assert_eq!(out.arch_target(), 2);
@@ -420,9 +457,137 @@ mod tests {
     fn int4_is_not_implemented() {
         let src = synthetic_safetensors();
         let w = Weights::from_bytes(src).expect("synthetic safetensors parse");
-        let err = safetensors_to_focrq(&w, ConvertQuant::Int4, 0, [0u8; 32])
-            .expect_err("int4 must be NotImplemented");
+        let err = safetensors_to_focrq(
+            &w,
+            ConvertQuant::Int4,
+            0,
+            [0u8; 32],
+            crate::native_engine::model_arch::default_arch(),
+        )
+        .expect_err("int4 must be NotImplemented");
         assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
         assert_eq!(err.exit_code(), 1);
+    }
+
+    // ── B2: arch-aware GOT-OCR2 convert ──────────────────────────────────────
+
+    /// A GOT-OCR2-shaped synthetic checkpoint: a tied `lm_head` (== `embed_tokens`),
+    /// the Qwen2 decoder int8 GEMMs (+ a qkv bias), norms, the `mm_projector_vary`
+    /// connector, and a `model.vision_tower_high.*` tensor.
+    fn synthetic_got_safetensors() -> Vec<u8> {
+        let ramp = |n: usize, k: usize, bias: f32| -> Vec<f32> {
+            (0..n * k).map(|i| (i as f32) * 0.25 - bias).collect()
+        };
+        let embed = ramp(6, 8, 11.0);
+        build_safetensors(&[
+            ("lm_head.weight", vec![6, 8], embed.clone()), // tied -> omitted
+            ("model.embed_tokens.weight", vec![6, 8], embed), // stored HP (serves both)
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 7.0),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.bias",
+                vec![8],
+                ramp(1, 8, 1.0),
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![10, 8],
+                ramp(10, 8, 9.0),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![8, 10],
+                ramp(8, 10, 4.0),
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                vec![8],
+                ramp(1, 8, 1.0),
+            ),
+            ("model.norm.weight", vec![8], ramp(1, 8, 2.0)),
+            (
+                "model.mm_projector_vary.weight",
+                vec![8, 8],
+                ramp(8, 8, 1.0),
+            ),
+            (
+                "model.vision_tower_high.blocks.0.attn.proj.weight",
+                vec![8, 8],
+                ramp(8, 8, 2.0),
+            ),
+        ])
+    }
+
+    #[test]
+    fn got_convert_omits_tied_lm_head_and_tags_arch() {
+        let w = Weights::from_bytes(synthetic_got_safetensors()).expect("synthetic GOT parse");
+        let got = crate::native_engine::model_arch::arch_by_id("got-ocr2").unwrap();
+        let blob =
+            safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [3u8; 32], got).expect("got convert");
+        // the bytes physically declare the arch.
+        assert!(String::from_utf8_lossy(&blob).contains("\"model_id\":\"got-ocr2\""));
+
+        let out = Weights::from_bytes(blob).expect("got .focrq loads");
+        assert_eq!(out.model_id(), "got-ocr2");
+        // tied lm_head is OMITTED; embed_tokens carries it (high-precision).
+        assert!(
+            out.tensor("lm_head.weight").is_err(),
+            "lm_head must be omitted"
+        );
+        assert_eq!(
+            out.tensor("model.embed_tokens.weight").unwrap().dtype,
+            DType::BF16
+        );
+        // the decoder GEMMs are int8 …
+        assert!(out.qint8("model.layers.0.self_attn.q_proj.weight").is_ok());
+        assert!(out.qint8("model.layers.0.mlp.gate_proj.weight").is_ok());
+        assert!(out.qint8("model.layers.0.mlp.down_proj.weight").is_ok());
+        // … while the qkv bias, norms, connector, and vision stay high-precision.
+        assert_eq!(
+            out.tensor("model.layers.0.self_attn.q_proj.bias")
+                .unwrap()
+                .dtype,
+            DType::BF16
+        );
+        assert_eq!(out.tensor("model.norm.weight").unwrap().dtype, DType::BF16);
+        assert_eq!(
+            out.tensor("model.mm_projector_vary.weight").unwrap().dtype,
+            DType::BF16
+        );
+        assert_eq!(
+            out.tensor("model.vision_tower_high.blocks.0.attn.proj.weight")
+                .unwrap()
+                .dtype,
+            DType::BF16
+        );
+    }
+
+    #[test]
+    fn default_arch_convert_is_unchanged_stores_lm_head_no_model_id() {
+        // Back-compat: the Unlimited-OCR (default arch) path stores lm_head as int8
+        // and emits NO model_id key — byte-identical to the historical artifact.
+        let w = Weights::from_bytes(synthetic_safetensors()).expect("synthetic parse");
+        let blob = safetensors_to_focrq(
+            &w,
+            ConvertQuant::Int8,
+            2,
+            [7u8; 32],
+            crate::native_engine::model_arch::default_arch(),
+        )
+        .expect("default convert");
+        assert!(
+            !String::from_utf8_lossy(&blob).contains("model_id"),
+            "default arch must omit the model_id key (byte-parity with v1)"
+        );
+        let out = Weights::from_bytes(blob).expect("loads");
+        assert_eq!(out.model_id(), "unlimited-ocr");
+        assert!(
+            out.qint8("lm_head.weight").is_ok(),
+            "default keeps lm_head int8"
+        );
+        assert_eq!(out.license_notice(), FOCR_MODEL_LICENSE_NOTICE);
     }
 }
