@@ -107,6 +107,13 @@ jobs:
           # The script builds --all-targets (lib, both bins, tests); cache them.
           cache-all-crates: true
 
+      # gum gives the installer e2e (tests/installer_e2e.sh, run by check.sh) its
+      # teeth: its gum/TTY render gates SKIP without gum, so install it here on
+      # both runners (Homebrew ships on macOS and ubuntu-latest). Best-effort — a
+      # transient install hiccup must not fail the gate; the test then just skips.
+      - name: Install gum (installer e2e render path)
+        run: brew install gum || echo "gum install failed; installer e2e gum gates will skip"
+
       # The one and only test step: the same gate humans run locally. We do NOT
       # duplicate its commands here — the script is the single source of truth.
       - name: Run the gate (scripts/check.sh)

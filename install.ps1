@@ -21,7 +21,7 @@
     & ([scriptblock]::Create((irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1))) -Verify
 
   Options:
-    -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to v0.1.0)
+    -Version <vX.Y.Z>  Install a specific version (default: latest, falls back to v0.2.0)
     -Dir <path>        Install focr.exe into <path> (default: %LOCALAPPDATA%\Programs\focr)
     -Verify            Run "focr robot selftest" after install and report the verdict
     -NoPull            Do not offer to download the model after install (focr pull)
@@ -33,7 +33,7 @@
     HTTPS_PROXY        HTTPS proxy for downloads (preferred)
     HTTP_PROXY         HTTP proxy for downloads
 
-  Platform: only x86-64 Windows (AMD64) has a published binary in v0.1.0.
+  Platform: only x86-64 Windows (AMD64) has a published binary in v0.2.0.
   Windows on ARM64 is not published yet; this installer says so and stops.
 #>
 [CmdletBinding()]
@@ -56,7 +56,7 @@ $ErrorActionPreference = 'Stop'
 $script:Owner           = 'Dicklesworthstone'
 $script:Repo            = 'franken_ocr'
 $script:Asset           = 'focr-x86_64-pc-windows-msvc.exe'
-$script:FallbackVersion = 'v0.1.0'
+$script:FallbackVersion = 'v0.2.0'
 
 $script:Quiet               = [bool]$Quiet
 $script:Esc                 = [char]27
@@ -87,22 +87,34 @@ try {
 }
 
 # Resolve the install directory: -Dir wins, otherwise %LOCALAPPDATA%\Programs\focr.
+# Guard every Join-Path against a null env var: on non-Windows PowerShell both
+# LOCALAPPDATA and USERPROFILE are unset, and `Join-Path $null ...` would throw a
+# raw .NET stack trace HERE (top level, under ErrorActionPreference=Stop) — before
+# Main's platform check can print the friendly "use install.sh" message. Leaving
+# the dir empty lets that guard do its job.
 $resolvedDir = $Dir
 if ([string]::IsNullOrEmpty($resolvedDir)) {
     $localApp = $env:LOCALAPPDATA
-    if ([string]::IsNullOrEmpty($localApp)) {
+    if ([string]::IsNullOrEmpty($localApp) -and -not [string]::IsNullOrEmpty($env:USERPROFILE)) {
         $localApp = Join-Path $env:USERPROFILE 'AppData\Local'
     }
-    $resolvedDir = Join-Path $localApp 'Programs\focr'
+    if (-not [string]::IsNullOrEmpty($localApp)) {
+        $resolvedDir = Join-Path $localApp 'Programs\focr'
+    }
 }
 $script:InstallDir = $resolvedDir
 
-# Model cache resolves to %LOCALAPPDATA%\franken_ocr\models on Windows.
+# Model cache resolves to %LOCALAPPDATA%\franken_ocr\models on Windows. Same
+# null-env guard so non-Windows pwsh reaches Main's friendly platform check.
 $localAppForModel = $env:LOCALAPPDATA
-if ([string]::IsNullOrEmpty($localAppForModel)) {
+if ([string]::IsNullOrEmpty($localAppForModel) -and -not [string]::IsNullOrEmpty($env:USERPROFILE)) {
     $localAppForModel = Join-Path $env:USERPROFILE 'AppData\Local'
 }
-$script:ModelCache = Join-Path $localAppForModel 'franken_ocr\models'
+if (-not [string]::IsNullOrEmpty($localAppForModel)) {
+    $script:ModelCache = Join-Path $localAppForModel 'franken_ocr\models'
+} else {
+    $script:ModelCache = ''
+}
 
 # ============================================================================
 # Output helpers: ANSI when supported, Write-Host colors otherwise

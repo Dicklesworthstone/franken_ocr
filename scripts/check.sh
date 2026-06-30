@@ -113,6 +113,10 @@ run python3 scripts/check_oracle_provenance.py --live-replay
 run python3 scripts/oracle_bridge.py --self-test
 run python3 scripts/check_release_linkage.py
 run python3 scripts/gauntlet_cert.py --self-test
+# Installer end-to-end gate: drives install.sh through its gum/TTY render path
+# (which only runs interactively, so nothing else exercises it) and a full
+# fake-release install. Gum/pty sub-gates SKIP cleanly when gum/script are absent.
+run bash tests/installer_e2e.sh
 run cargo fmt --check
 run cargo check --all-targets
 if [ "$FAST" -eq 0 ]; then

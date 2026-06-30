@@ -316,13 +316,21 @@ fn bounded_inflate(raw: &[u8], cap: u64) -> Result<Option<Vec<u8>>, String> {
 /// to. Unknown color spaces get the 4-component (CMYK) upper bound;
 /// `raw_samples_to_image` rejects them afterward. `saturating_mul` keeps the
 /// arithmetic from overflowing on hostile inputs.
+///
+/// `bpc` is clamped to the PDF-legal image range `1..=16` BEFORE it scales the cap:
+/// a crafted `/BitsPerComponent` (e.g. `i64::MAX`) would otherwise blow the cap up
+/// to `u64::MAX`, and a `cap` of `u64::MAX` makes the `take(cap + 1)` bound in
+/// [`bounded_inflate`] effectively unbounded — re-opening the very bomb hole this
+/// guards. The real bit-depth is validated separately in `raw_samples_to_image`.
 fn expected_sample_cap(width: u32, height: u32, bpc: i64, color_space: &str) -> u64 {
     let comps: u64 = match color_space {
         "DeviceGray" | "CalGray" => 1,
         "DeviceRGB" | "CalRGB" => 3,
         _ => 4, // DeviceCMYK and any unknown: the largest plausible component count
     };
-    let bytes_per_comp = (bpc.max(1) as u64).div_ceil(8);
+    // PDF images are 1/2/4/8/16 bpc; clamp so a hostile bit-depth cannot inflate
+    // the cap past the bytes a real 16-bit image of these dimensions would need.
+    let bytes_per_comp = (bpc.clamp(1, 16) as u64).div_ceil(8);
     u64::from(width)
         .saturating_mul(u64::from(height))
         .saturating_mul(comps)
@@ -728,5 +736,56 @@ mod tests {
             .expect_err("chained filter must error");
         assert!(err.to_string().contains("chain"), "got: {err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn expected_sample_cap_clamps_a_hostile_bit_depth() {
+        // A real 16-bit RGB image of these dims: 4 * w*h * 3 comps * 2 bytes.
+        assert_eq!(
+            expected_sample_cap(1024, 1024, 16, "DeviceRGB"),
+            4 * 1024 * 1024 * 3 * 2
+        );
+        // A crafted /BitsPerComponent must NOT inflate the cap past the 16-bpc
+        // figure — an unclamped i64::MAX would saturate `cap` to u64::MAX, which
+        // makes bounded_inflate's `take(cap + 1)` effectively unbounded and
+        // re-opens the decompression-bomb hole this guard exists to close.
+        assert_eq!(
+            expected_sample_cap(1024, 1024, i64::MAX, "DeviceRGB"),
+            expected_sample_cap(1024, 1024, 16, "DeviceRGB")
+        );
+        // A zero/negative bit depth clamps UP to 1 (never a zero or giant cap).
+        assert_eq!(expected_sample_cap(8, 8, -5, "DeviceGray"), 4 * 8 * 8);
+        // Unknown color spaces take the 4-component (CMYK) upper bound.
+        assert_eq!(expected_sample_cap(2, 2, 8, "Indexed"), 4 * 2 * 2 * 4);
+    }
+
+    #[test]
+    fn bounded_inflate_passes_small_streams_and_rejects_a_bomb() {
+        use std::io::Write;
+        let zlib_of = |n: usize| -> Vec<u8> {
+            let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+            enc.write_all(&vec![0u8; n]).expect("encode");
+            enc.finish().expect("finish")
+        };
+
+        // Inflates within the cap → Ok(Some(bytes)).
+        let small = zlib_of(1000);
+        let out = bounded_inflate(&small, 4096)
+            .expect("no error")
+            .expect("inflated");
+        assert_eq!(out.len(), 1000);
+
+        // A ~1000:1 "zip bomb" that inflates far past the cap → Err (the bomb signal),
+        // having allocated at most cap + 1 bytes rather than the full inflation.
+        let bomb = zlib_of(1_000_000);
+        let err = bounded_inflate(&bomb, 4096).expect_err("bomb must be rejected");
+        assert!(err.contains("cap"), "got: {err}");
+
+        // Not standalone zlib → Ok(None) so the caller falls back to lopdf.
+        assert!(
+            bounded_inflate(b"not a zlib stream", 4096)
+                .expect("no error")
+                .is_none()
+        );
     }
 }

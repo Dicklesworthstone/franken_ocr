@@ -13,7 +13,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 #
 # Options:
-#   --version vX.Y.Z   Install a specific version (default: latest, falls back to v0.1.0)
+#   --version vX.Y.Z   Install a specific version (default: latest, falls back to v0.2.0)
 #   --dir DIR          Install the binary into DIR (default: ~/.local/bin)
 #   --easy-mode        Add the install directory to PATH in your shell rc files
 #   --verify           Run "focr robot selftest" after install
@@ -35,7 +35,7 @@
 #                          .sha256 sidecar are fetched from directly under it.
 #
 # WINDOWS
-#   v0.1.0 ships a native x86_64 Windows binary (focr-x86_64-pc-windows-msvc.exe),
+#   v0.2.0 ships a native x86_64 Windows binary (focr-x86_64-pc-windows-msvc.exe),
 #   proven end-to-end on Windows 10. This POSIX installer cannot install it from a
 #   Git-Bash/MSYS/Cygwin shell, so there it points you at the PowerShell installer:
 #     irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex
@@ -60,7 +60,7 @@ shopt -s lastpipe 2>/dev/null || true
 OWNER="${OWNER:-Dicklesworthstone}"
 REPO="${REPO:-franken_ocr}"
 BINARY_NAME="focr"
-FALLBACK_VERSION="v0.1.0"
+FALLBACK_VERSION="v0.2.0"
 VERSION="${VERSION:-}"
 
 # Install directory: --dir wins, then PREFIX/bin, then ~/.local/bin.
@@ -78,7 +78,9 @@ NO_GUM=0
 NO_PULL=0
 NO_VERIFY=0
 OFFLINE=0
-LOCK_FILE="/tmp/focr-install.lock"
+# Per-user, $TMPDIR-aware lock so a second user's installer on a shared host does
+# not collide with (and cannot clear, under the /tmp sticky bit) another user's lock.
+LOCK_FILE="${TMPDIR:-/tmp}/focr-install.$(id -u 2>/dev/null || echo 0).lock"
 
 # Runtime globals (initialized so set -u never trips before they are assigned).
 TMP=""
@@ -497,7 +499,12 @@ check_disk_space() {
   [ -d "$path" ] || path=$(dirname "$path")
   if command -v df >/dev/null 2>&1; then
     local avail_kb
-    avail_kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}')
+    # `df` exits non-zero when `$path` does not exist yet (e.g. the default
+    # ~/.local/bin on a fresh account, before check_write_permissions mkdir's it).
+    # Under `set -euo pipefail` an unguarded assignment would inherit that failure
+    # and abort the whole installer with no message — so swallow it and let the
+    # `-n` guard below skip the (best-effort) space check.
+    avail_kb=$(df -Pk "$path" 2>/dev/null | awk 'NR==2 {print $4}') || avail_kb=""
     if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "$min_kb" ]; then
       err "Not enough free space in $path (need at least 20 MB for the binary)."
       exit 1
@@ -630,10 +637,13 @@ verify_download() {
   fi
 
   local actual=""
+  # `|| actual=""` keeps a hashing-tool failure (rare: tmpfs/ENOMEM) from aborting
+  # the script under `set -e`; an empty digest then falls into the mismatch check
+  # below and produces a clean error instead of a silent exit.
   if command -v sha256sum >/dev/null 2>&1; then
-    actual=$(sha256sum "$TMP/$ASSET" | awk '{print $1}')
+    actual=$(sha256sum "$TMP/$ASSET" | awk '{print $1}') || actual=""
   elif command -v shasum >/dev/null 2>&1; then
-    actual=$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}')
+    actual=$(shasum -a 256 "$TMP/$ASSET" | awk '{print $1}') || actual=""
   else
     err "No SHA256 tool found (need sha256sum or shasum)."
     err "Install one, or re-run with --no-verify to skip verification."
@@ -652,7 +662,14 @@ verify_download() {
 }
 
 install_binary() {
-  install -m 0755 "$TMP/$ASSET" "$DEST/$BINARY_NAME"
+  # A reinstall while focr is running can fail with ETXTBSY ("Text file busy")
+  # on Linux; catch it so the user gets a clear error instead of a bare `set -e`
+  # abort with no message.
+  if ! install -m 0755 "$TMP/$ASSET" "$DEST/$BINARY_NAME"; then
+    err "Failed to install focr to $DEST/$BINARY_NAME"
+    err "If focr is currently running, stop it and re-run the installer."
+    exit 1
+  fi
   ok "Installed focr to $DEST/$BINARY_NAME"
 }
 
