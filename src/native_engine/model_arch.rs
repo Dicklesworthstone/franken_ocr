@@ -212,11 +212,147 @@ impl ModelArch for UnlimitedOcr {
 /// The one process-global Unlimited-OCR descriptor instance.
 static UNLIMITED_OCR: UnlimitedOcr = UnlimitedOcr;
 
-/// The model registry, in priority order (the default first) — every architecture
-/// the runtime knows about. This is the single place new zoo models register as
-/// their sub-epics land (A2+). Today it holds the one IMPLEMENTED arch
-/// (Unlimited-OCR); planned archs are appended here when they ship.
-static REGISTRY: &[&dyn ModelArch] = &[&UNLIMITED_OCR];
+/// A data-driven [`ModelArch`] for a PLANNED zoo model (epic bd-3jo6): described in
+/// the registry — so `focr models` shows the roadmap — but with `implemented()` =
+/// false until its forward lands. The graph-shape fields are confidently known
+/// from the model survey; the exact decode contract + per-config values are filled
+/// in (and the type upgraded to a real impl like [`UnlimitedOcr`]) when the model's
+/// sub-epic ships. For a planned model the decode contract is informational and is
+/// never used for inference.
+pub struct PlannedArch {
+    id: &'static str,
+    display_name: &'static str,
+    license_notice: &'static str,
+    default_artifact_basename: &'static str,
+    vision_encoder: VisionEncoder,
+    decoder: Decoder,
+    tokenizer: TokenizerKind,
+    tasks: &'static [Task],
+}
+
+impl ModelArch for PlannedArch {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+    fn display_name(&self) -> &'static str {
+        self.display_name
+    }
+    fn license_notice(&self) -> &'static str {
+        self.license_notice
+    }
+    fn default_artifact_basename(&self) -> &'static str {
+        self.default_artifact_basename
+    }
+    fn vision_encoder(&self) -> VisionEncoder {
+        self.vision_encoder
+    }
+    fn decoder(&self) -> Decoder {
+        self.decoder
+    }
+    fn tokenizer(&self) -> TokenizerKind {
+        self.tokenizer
+    }
+    fn decode_contract(&self) -> DecodeContract {
+        // Informational for a planned model; the real values are read from the
+        // model's config when its decoder lands (A7 + the model's sub-epic).
+        DecodeContract {
+            temperature: 0.0,
+            eos_token_id: 0,
+            no_repeat_ngram_size: 0,
+            ngram_window: 0,
+        }
+    }
+    fn tasks(&self) -> &'static [Task] {
+        self.tasks
+    }
+    fn implemented(&self) -> bool {
+        false
+    }
+}
+
+// ── the planned zoo models (descriptors only; forwards land in sub-epics B-F) ──
+static GOT_OCR2: PlannedArch = PlannedArch {
+    id: "got-ocr2",
+    display_name: "GOT-OCR2.0",
+    license_notice: "GOT-OCR2.0 (StepFun) - Apache-2.0",
+    default_artifact_basename: "got-ocr2.focrq",
+    vision_encoder: VisionEncoder::SamVit,
+    decoder: Decoder::Qwen2Dense,
+    tokenizer: TokenizerKind::Qwen2Bpe,
+    tasks: &[
+        Task::Ocr,
+        Task::Formula,
+        Task::Tables,
+        Task::Chart,
+        Task::Molecular,
+        Task::Geometry,
+        Task::Music,
+    ],
+};
+static SMOLVLM2: PlannedArch = PlannedArch {
+    id: "smolvlm2",
+    display_name: "SmolVLM2-500M",
+    license_notice: "SmolVLM2 (HuggingFaceTB) - Apache-2.0",
+    default_artifact_basename: "smolvlm2.focrq",
+    vision_encoder: VisionEncoder::Siglip,
+    decoder: Decoder::LlamaDense,
+    tokenizer: TokenizerKind::SmolLm2Bpe,
+    tasks: &[Task::Describe, Task::Vqa],
+};
+static ONECHART: PlannedArch = PlannedArch {
+    id: "onechart",
+    display_name: "OneChart",
+    license_notice: "OneChart - Apache-2.0",
+    default_artifact_basename: "onechart.focrq",
+    vision_encoder: VisionEncoder::SamVit,
+    decoder: Decoder::Qwen2Dense,
+    tokenizer: TokenizerKind::Qwen2Bpe,
+    tasks: &[Task::Chart],
+};
+static TROMR: PlannedArch = PlannedArch {
+    id: "tromr",
+    display_name: "Polyphonic-TrOMR",
+    license_notice: "Polyphonic-TrOMR (NetEase) - Apache-2.0",
+    default_artifact_basename: "tromr.focrq",
+    vision_encoder: VisionEncoder::ResNetVit,
+    decoder: Decoder::Seq2SeqDense,
+    tokenizer: TokenizerKind::MusicVocab,
+    tasks: &[Task::Music],
+};
+static TROCR: PlannedArch = PlannedArch {
+    id: "trocr",
+    display_name: "TrOCR",
+    license_notice: "TrOCR (Microsoft) - MIT",
+    default_artifact_basename: "trocr.focrq",
+    vision_encoder: VisionEncoder::BeitVit,
+    decoder: Decoder::Seq2SeqDense,
+    tokenizer: TokenizerKind::SentencePiece,
+    tasks: &[Task::Handwriting],
+};
+static PIX2TEX: PlannedArch = PlannedArch {
+    id: "pix2tex",
+    display_name: "pix2tex (LaTeX-OCR)",
+    license_notice: "pix2tex / LaTeX-OCR - MIT",
+    default_artifact_basename: "pix2tex.focrq",
+    vision_encoder: VisionEncoder::ResNetVit,
+    decoder: Decoder::Seq2SeqDense,
+    tokenizer: TokenizerKind::SentencePiece,
+    tasks: &[Task::Formula],
+};
+
+/// The model registry, in priority order (the default + implemented first, then the
+/// planned zoo models). This is the single place models register. Today exactly one
+/// is IMPLEMENTED (Unlimited-OCR); the rest are planned descriptors (epic bd-3jo6)
+/// shown by `focr models` and upgraded to real impls as their sub-epics land.
+static REGISTRY: &[&dyn ModelArch] = &[
+    &UNLIMITED_OCR,
+    &GOT_OCR2,
+    &SMOLVLM2,
+    &ONECHART,
+    &TROMR,
+    &TROCR,
+    &PIX2TEX,
+];
 
 /// The model registry slice (see [`static@REGISTRY`]).
 #[must_use]
@@ -243,11 +379,28 @@ mod tests {
     use crate::{DEFAULT_MODEL_PATH, FOCR_MODEL_LICENSE_NOTICE};
 
     #[test]
-    fn registry_holds_the_default_and_only_implemented_arch() {
+    fn registry_lists_the_default_first_then_the_planned_zoo() {
         let archs = registry();
-        assert_eq!(archs.len(), 1, "only Unlimited-OCR is implemented today");
+        // Exactly one IMPLEMENTED arch (the default, first), the rest planned.
         assert_eq!(archs[0].id(), "unlimited-ocr");
-        assert!(archs.iter().all(|a| a.implemented()));
+        assert!(archs[0].implemented());
+        let implemented: Vec<&str> = archs
+            .iter()
+            .filter(|a| a.implemented())
+            .map(|a| a.id())
+            .collect();
+        assert_eq!(
+            implemented,
+            ["unlimited-ocr"],
+            "only Unlimited-OCR runs today"
+        );
+        // The planned zoo models are all present and NOT yet implemented.
+        for id in [
+            "got-ocr2", "smolvlm2", "onechart", "tromr", "trocr", "pix2tex",
+        ] {
+            let a = arch_by_id(id).unwrap_or_else(|| panic!("planned arch {id} registered"));
+            assert!(!a.implemented(), "{id} is planned, not implemented");
+        }
         // Every registered id is unique (a registry invariant the zoo relies on).
         let mut ids: Vec<&str> = archs.iter().map(|a| a.id()).collect();
         ids.sort_unstable();
@@ -256,16 +409,21 @@ mod tests {
     }
 
     #[test]
-    fn lookup_and_default_resolve_unlimited_ocr() {
+    fn lookup_and_default_resolve() {
         assert_eq!(default_arch().id(), "unlimited-ocr");
+        assert!(default_arch().implemented());
         assert_eq!(
             arch_by_id("unlimited-ocr").map(ModelArch::id),
             Some("unlimited-ocr")
         );
-        assert!(
-            arch_by_id("got-ocr2").is_none(),
-            "planned archs are not registered yet"
-        );
+        // A planned arch resolves (described) but is not implemented.
+        let got = arch_by_id("got-ocr2").expect("got-ocr2 is a registered planned arch");
+        assert_eq!(got.id(), "got-ocr2");
+        assert!(!got.implemented());
+        assert_eq!(got.decoder(), Decoder::Qwen2Dense);
+        assert_eq!(got.tokenizer(), TokenizerKind::Qwen2Bpe);
+        // An unknown id resolves to nothing.
+        assert!(arch_by_id("does-not-exist").is_none());
     }
 
     /// The descriptor must match the LIVE engine constants, so it can never drift.
