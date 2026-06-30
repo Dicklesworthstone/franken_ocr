@@ -771,6 +771,44 @@ mod tests {
         assert_eq!(cases.len(), 24, "expected the 24 golden cases");
     }
 
+    /// **L0c — the GOT prompt-id gate, cross-validated against the torch oracle.**
+    /// The committed fixture is the EXACT plain-OCR prompt string GOT builds
+    /// (system + MPT conv + `<img><imgpad>×256</img>` splice) and the 287 ids the
+    /// upstream `GOTQwenForCausalLM`'s own tokenizer produced for it
+    /// (`scripts/gen_reference_fixtures_got.py`). Our encoder must reproduce them
+    /// exactly — proving the tokenizer handles the real prompt (256 `<imgpad>`
+    /// specials + role markers), not just the L0a corpus.
+    #[test]
+    fn prompt_id_oracle_cross_check() {
+        let Some(tk) = load_real() else {
+            return;
+        };
+        const L0C: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/l0c_prompt.json"
+        ));
+        let v: serde_json::Value = serde_json::from_str(L0C).unwrap();
+        let prompt = v["prompt"].as_str().unwrap();
+        let want: Vec<u32> = v["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        let got = tk.encode(prompt).unwrap();
+        assert_eq!(got.len(), 287, "GOT plain-OCR prompt is 287 ids");
+        assert_eq!(
+            got, want,
+            "Rust tiktoken must match the torch-oracle GOT prompt ids exactly"
+        );
+        // the 256 <imgpad> splice slots are contiguous in the stream.
+        assert_eq!(
+            got.iter().filter(|&&id| id == IMG_PAD).count(),
+            256,
+            "256 <imgpad> image slots"
+        );
+    }
+
     #[test]
     fn round_trip_byte_reconstructable_subset() {
         let Some(tk) = load_real() else {
