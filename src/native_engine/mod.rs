@@ -715,12 +715,44 @@ impl OcrModel {
         self.forward_pre(pre)
     }
 
+    /// The model architecture this loaded model is — the [`model_arch::ModelArch`]
+    /// descriptor that drives its identity, config, and (A1) the forward dispatch.
+    /// Today the only loadable artifact is the Baidu Unlimited-OCR model, so this
+    /// is always [`model_arch::default_arch`]; once `.focrq` v2 carries an arch tag
+    /// (foundation task A2) this will read the tag from `self.weights`.
+    #[must_use]
+    pub fn arch(&self) -> &'static dyn model_arch::ModelArch {
+        model_arch::default_arch()
+    }
+
+    /// Guard the per-arch forward dispatch (A1): an IMPLEMENTED arch proceeds; a
+    /// planned zoo arch (described in the registry but whose forward lands in a
+    /// later sub-epic) returns a clean [`FocrError::NotImplemented`] naming itself,
+    /// rather than mis-running a different model's forward.
+    fn ensure_arch_implemented(arch: &dyn model_arch::ModelArch) -> FocrResult<()> {
+        if arch.implemented() {
+            Ok(())
+        } else {
+            Err(FocrError::NotImplemented(format!(
+                "model architecture '{}' ({}) forward is not yet implemented \
+                 (franken_ocr model zoo, epic bd-3jo6)",
+                arch.id(),
+                arch.display_name()
+            )))
+        }
+    }
+
     /// Shared post-preprocess forward: vision tower → connector → decoder →
     /// detokenize, over an already-built [`Preprocessed`] bundle. Both
     /// [`Self::forward`] (from a path) and [`Self::forward_dynamic`] (from an
     /// in-memory image) funnel through here, so the two entry points run the
     /// byte-identical model pipeline once preprocessing has produced `pre`.
     fn forward_pre(&self, pre: Preprocessed) -> FocrResult<(String, u32, u32)> {
+        // Per-arch forward dispatch seam (model zoo, A1): only an IMPLEMENTED arch
+        // runs its forward. Today the only loadable arch is Unlimited-OCR (always
+        // implemented), so this never trips; it is the point where GOT-OCR2 /
+        // SmolVLM2 / … route to their own forward once those sub-epics land.
+        Self::ensure_arch_implemented(self.arch())?;
         let (image_w, image_h) = Self::image_dims(&pre);
 
         // ── vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ───────────
@@ -2304,5 +2336,64 @@ mod tests {
         // x1 == x2 after rescale -> zero width -> skipped.
         let decoded = "<|ref|>image<|/ref|><|det|>[[10,0,10,999]]<|/det|>";
         assert!(OcrModel::crop_figures(decoded, &source, 50, 50, "").is_empty());
+    }
+
+    #[test]
+    fn forward_dispatch_guard_passes_unlimited_ocr_rejects_a_planned_arch() {
+        use crate::native_engine::model_arch::{
+            self, DecodeContract, Decoder, ModelArch, Task, TokenizerKind, VisionEncoder,
+        };
+        // The implemented default arch (Unlimited-OCR) passes the dispatch guard.
+        OcrModel::ensure_arch_implemented(model_arch::default_arch())
+            .expect("unlimited-ocr is implemented");
+
+        // A planned zoo arch (forward not yet built) returns a clean
+        // NotImplemented (exit 1) naming itself — never mis-runs another forward.
+        struct PlannedArch;
+        impl ModelArch for PlannedArch {
+            fn id(&self) -> &'static str {
+                "got-ocr2"
+            }
+            fn display_name(&self) -> &'static str {
+                "GOT-OCR2.0"
+            }
+            fn license_notice(&self) -> &'static str {
+                "Apache-2.0"
+            }
+            fn default_artifact_basename(&self) -> &'static str {
+                "got-ocr2.focrq"
+            }
+            fn vision_encoder(&self) -> VisionEncoder {
+                VisionEncoder::SamVit
+            }
+            fn decoder(&self) -> Decoder {
+                Decoder::Qwen2Dense
+            }
+            fn tokenizer(&self) -> TokenizerKind {
+                TokenizerKind::Qwen2Bpe
+            }
+            fn decode_contract(&self) -> DecodeContract {
+                DecodeContract {
+                    temperature: 0.0,
+                    eos_token_id: 0,
+                    no_repeat_ngram_size: 0,
+                    ngram_window: 0,
+                }
+            }
+            fn tasks(&self) -> &'static [Task] {
+                &[Task::Ocr]
+            }
+            fn implemented(&self) -> bool {
+                false
+            }
+        }
+        let err = OcrModel::ensure_arch_implemented(&PlannedArch)
+            .expect_err("a planned arch must be rejected");
+        assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 1);
+        assert!(
+            err.to_string().contains("got-ocr2"),
+            "names the arch: {err}"
+        );
     }
 }

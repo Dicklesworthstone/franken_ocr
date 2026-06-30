@@ -78,14 +78,17 @@ where
 }
 
 /// Long, attribution-bearing version report. The short `-V` surface remains
-/// Clap's script-friendly `focr <semver>` output.
+/// Clap's script-friendly `focr <semver>` output. The model-license notice is
+/// read from the default model's [`crate::model_arch::ModelArch`] descriptor (the
+/// source of truth as the model zoo grows); today that is byte-identical to
+/// [`FOCR_MODEL_LICENSE_NOTICE`].
 #[must_use]
 pub fn long_version_report() -> String {
     format!(
         "focr {}\nsource_license: {}\nmodel_license: {}\n",
         env!("CARGO_PKG_VERSION"),
         FOCR_PROJECT_LICENSE_NOTICE,
-        FOCR_MODEL_LICENSE_NOTICE
+        crate::model_arch::default_arch().license_notice()
     )
 }
 
