@@ -26,6 +26,7 @@ use serde::Deserialize;
 use crate::error::{FocrError, FocrResult};
 
 mod pretok;
+pub mod tiktoken;
 mod unicode_tables;
 
 /// Hardcoded special-token ids ([SPEC-014/019]). These are pinned by the model
@@ -497,8 +498,9 @@ enum Segment<'a> {
 }
 
 /// Length in bytes of a UTF-8 char from its lead byte (1..=4). Used to advance
-/// the added-token scanner on char boundaries without re-decoding.
-fn utf8_char_len(lead: u8) -> usize {
+/// the added-token scanner on char boundaries without re-decoding. Shared with
+/// the sibling [`tiktoken`] module's special-token scanner.
+pub(super) fn utf8_char_len(lead: u8) -> usize {
     if lead < 0x80 {
         1
     } else if lead >> 5 == 0b110 {
