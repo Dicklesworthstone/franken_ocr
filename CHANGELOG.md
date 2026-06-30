@@ -14,8 +14,28 @@ sections as they land.
 
 ## [Unreleased]
 
-Landed on `main` since `0.2.0`, not yet tagged — a first-run UX pass driven by a
-clean-machine install report.
+Nothing below has shipped; these are the next workstreams.
+
+- **int4 expert quantization.** Group-quantized int4 expert weights at a
+  Q4_K_M-class footprint, gated on a measured character-error-rate budget. A packed
+  int4 s4s8 micro-kernel and exploratory `FOCR_EXPERTS_INT4` / `FOCR_LMHEAD_INT4`
+  experiments already exist behind kill switches, but int4 is not validated and
+  `focr convert` accepts only int8 as of `0.3.0`.
+- **The full conformance ladder.** Extend the seeded parity ladder into the complete
+  three-pillar gauntlet (oracle, differential, metamorphic) with per-stage exit
+  gates across the whole forward path.
+- **ARM64 Windows** (`bd-3u97`). `x86_64` Windows ships today; the aarch64-windows
+  target is not yet published.
+
+## [0.3.0] - 2026-06-30
+
+The first-run-experience release. A clean-machine install report exposed three
+papercuts on the path from "curl the installer" to "OCR a page", and all three are
+now closed: the installer no longer aborts under `gum`, a freshly-pulled model is
+found with no flags, and `focr ocr` can write its result straight to a file —
+including structured JSON with bounding boxes. The native PDF path picked up two
+robustness fixes on top: a decompression-bomb bound and a machine-visible per-page
+skip event. Still pure, memory-safe Rust — no Python, no CUDA, no FFI at inference.
 
 ### Added
 
@@ -27,39 +47,62 @@ clean-machine install report.
   nests these under a per-page `pages` array). The same shape is what `--json`
   prints to stdout. New engine entry points `OcrEngine::recognize_with_layout` /
   `recognize_dynamic_with_layout` (and `_model` variants) return the markdown and
-  the layout parsed from the **same** decode, so the two can never disagree.
+  the layout parsed from the **same** decode, so the two can never disagree
+  ([e3c3e68](https://github.com/Dicklesworthstone/franken_ocr/commit/e3c3e68)).
+- **Robot per-page skip event for PDFs** (`bd-fck1`). The resilient PDF document
+  loop used to drop an undecodable page silently from the machine stream. It now
+  emits a structured `page` NDJSON event (`status=skipped`, 1-based page number, a
+  machine-classifiable `error_kind`) in robot mode, so a consumer can tell the
+  document is missing pages; human mode keeps the stderr warning. `page` is an
+  already-advertised event kind, so the robot schema stays v1
+  ([ba71ff4](https://github.com/Dicklesworthstone/franken_ocr/commit/ba71ff4)).
 
 ### Fixed
 
-- **Fresh-install OCR happy path** (`bd-3u6x`). `focr pull` installs the model as
-  `unlimited-ocr.int8.focrq`, but the default `focr ocr` lookup previously searched
-  only the bare `unlimited-ocr.focrq` basename, so a freshly-pulled model was
-  invisible without a manual `--model`. The resolver now also probes the
-  quant-suffixed names (`.int8.focrq`, `.int4.focrq`); a pulled model resolves with
-  no flag. An exact-basename match still wins over a quant variant.
-- **Installer aborted instantly under `gum`.** The first status line rendered
-  `gum style ... "-> ..."`, so `gum` parsed the leading `->` as an unknown flag,
-  printed its usage, and (under `set -euo pipefail`) aborted the whole install. All
-  status helpers now pass `--` before dynamic text, a fresh-account `~/.local/bin`
-  default no longer trips `check_disk_space`'s `df`, and a new true end-to-end
-  installer test (`tests/installer_e2e.sh`, wired into CI) drives the real installer
-  through the `gum`/pty path against a fake `file://` release so this class of bug
-  can never ship silently again.
+- **Fresh-install OCR happy path** (`bd-3u6x`, critical). `focr pull` installs the
+  model as `unlimited-ocr.int8.focrq`, but the default `focr ocr` lookup previously
+  searched only the bare `unlimited-ocr.focrq` basename — so a freshly-pulled model
+  was invisible without a manual `--model`, and the clean-machine happy path was
+  broken. The resolver now also probes the quant-suffixed names `focr pull`
+  installs (`.int8.focrq`, `.int4.focrq`); a pulled model resolves with no flag. An
+  exact-basename match still wins over a quant variant
+  ([e3c3e68](https://github.com/Dicklesworthstone/franken_ocr/commit/e3c3e68)).
+- **Installer aborted instantly under `gum`** (`bd-1km0`). The first status line
+  rendered `gum style … "-> …"`, so `gum` parsed the leading `->` as an unknown
+  flag, printed its usage, and under `set -euo pipefail` aborted the whole install.
+  It only triggered with `gum` installed AND an interactive TTY, so no
+  non-interactive CI run ever exercised it. The whole `set -e`/arg-parse class is
+  fixed: every `gum style` text arg gets a `--` flag terminator; `check_disk_space`
+  guards a `df` that exits non-zero when the default `~/.local/bin` parent does not
+  exist yet on a fresh account; the checksum pipelines and a failed `install`
+  (ETXTBSY on reinstall-while-running) are guarded; the lock path is per-user and
+  `$TMPDIR`-aware; `install.ps1` null-guards the top-level `LOCALAPPDATA` /
+  `USERPROFILE` `Join-Path` so non-Windows `pwsh` reaches the friendly message, not
+  a stack trace; and a `FOCR_INSTALL_BASE_URL` override lands for mirrors / airgap /
+  tests. A new true end-to-end installer test (`tests/installer_e2e.sh`, wired into
+  `scripts/check.sh` + CI with `gum` installed) drives the **real** installer
+  through the `gum`/pty path against a fake `file://` release into a fresh-account
+  dir — so this class of bug can never ship silently again
+  ([7f25594](https://github.com/Dicklesworthstone/franken_ocr/commit/7f25594),
+  [89c5b21](https://github.com/Dicklesworthstone/franken_ocr/commit/89c5b21)).
 
-### Direction after `0.2.0`
+### Security
 
-Nothing below has shipped; these are the next workstreams.
-
-- **int4 expert quantization.** Group-quantized int4 expert weights at a
-  Q4_K_M-class footprint, gated on a measured character-error-rate budget. A packed
-  int4 s4s8 micro-kernel and exploratory `FOCR_EXPERTS_INT4` / `FOCR_LMHEAD_INT4`
-  experiments already exist behind kill switches, but int4 is not validated and
-  `focr convert` accepts only int8 as of `0.2.0`.
-- **The full conformance ladder.** Extend the seeded parity ladder into the complete
-  three-pillar gauntlet (oracle, differential, metamorphic) with per-stage exit
-  gates across the whole forward path.
-- **ARM64 Windows** (`bd-3u97`). `x86_64` Windows ships in `0.2.0`; the aarch64-windows
-  target is not yet published.
+- **PDF decompression-bomb bound** (`bd-2zpu`, `bd-2yqe`). `lopdf`'s
+  `Stream::decompressed_content` materializes the full inflated output before any
+  length check, so a tiny highly-compressed sole-`FlateDecode` image stream (a "zip
+  bomb") could inflate to gigabytes and OOM the process. `decompressed_stream` now
+  inflates a sole `FlateDecode` (no PNG/TIFF predictor) itself via the pure-Rust
+  `flate2` `ZlibDecoder` + `Read::take(cap + 1)` under an `expected_sample_cap`
+  bound (4× the already-`MAX_PIXELS`-bounded declared sample bytes); a clean inflate
+  that overruns the cap is the bomb signal and errors, while a non-zlib raw stream
+  falls back to lopdf's framing-tolerant decoder. A fresh-eyes follow-up
+  (`bd-2yqe`) clamped a hostile declared bit-depth that could otherwise saturate the
+  cap to `u64::MAX` and reopen the hole. `flate2` is a direct dependency now
+  (already in the lock graph via `lopdf`/`png`/`tiff`; pure-Rust `miniz_oxide`
+  backend, no FFI)
+  ([ba71ff4](https://github.com/Dicklesworthstone/franken_ocr/commit/ba71ff4),
+  [89c5b21](https://github.com/Dicklesworthstone/franken_ocr/commit/89c5b21)).
 
 ## [0.2.0] - 2026-06-29
 
@@ -351,6 +394,7 @@ results above. The `.focrq` byte-parity, the SHA256 manifest verification in
 `focr pull`, and the 24/24 `robot selftest` (including the K=6848 overflow case) were
 all verified on real hardware on Apple Silicon and on a real x86 AVX2 host.
 
-[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Dicklesworthstone/franken_ocr/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.1.0

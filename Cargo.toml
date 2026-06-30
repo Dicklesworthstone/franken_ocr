@@ -1,6 +1,6 @@
 [package]
 name = "franken_ocr"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 description = "Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model (single-binary CLI: focr)"
