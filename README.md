@@ -260,6 +260,17 @@ focr pull --manifest ./manifest.json        # override the manifest source
 
 Downloads run over asupersync's native HTTP stack (rustls + webpki-roots), reassemble GitHub split parts, verify against a committed SHA256 manifest, and cache to `~/.cache/franken_ocr/models`. Verified in production against this repo's `models-v1` GitHub release and a Hugging Face mirror.
 
+### `focr models`
+
+List the models this build can run — the "model zoo" — with their id, the tasks they serve, and status.
+
+```bash
+focr models                                 # human table
+focr models --json                          # machine-readable list
+```
+
+Today this lists the Baidu Unlimited-OCR model (`ready`). The roadmap (epic `bd-3jo6`) adds specialized models — GOT-OCR2 (math/tables/charts/molecular/geometry/music), SmolVLM2 (photo description / VQA), OneChart (chart → data), Polyphonic-TrOMR (sheet music) — each transformed to the same int8 CPU performance bar; they appear here (`planned`, then `ready`) as they land.
+
 ### `focr convert <input>`
 
 Offline weight transformation: a bf16 safetensors checkpoint into a custom int8 `.focrq` artifact.

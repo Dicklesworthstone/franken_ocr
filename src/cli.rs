@@ -109,6 +109,8 @@ pub enum Command {
     Convert(ConvertArgs),
     /// Download the model weights (int8 `.focrq` + tokenizer) into the cache.
     Pull(PullArgs),
+    /// List the models this build can run (the "model zoo"): id, tasks, status.
+    Models(ModelsArgs),
     /// Agent-facing diagnostics and the machine contract.
     Robot {
         #[command(subcommand)]
@@ -165,6 +167,13 @@ pub struct OcrBatchArgs {
     /// Use the f32 decoder instead of the default int8 throughput path.
     #[arg(long = "f32")]
     pub no_int8: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ModelsArgs {
+    /// Emit a machine-readable JSON list instead of a human table.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -473,6 +482,7 @@ pub fn run(cli: Cli) -> FocrResult<()> {
         Command::OcrBatch(args) => run_ocr_batch(args),
         Command::Convert(args) => run_convert(&args),
         Command::Pull(args) => run_pull(&args),
+        Command::Models(args) => run_models(&args),
         Command::Runs(args) => run_runs(&args),
         Command::Sync(args) => run_sync(&args),
         Command::Doctor(args) => run_doctor(&args),
@@ -1413,6 +1423,76 @@ fn run_sync(args: &SyncArgs) -> FocrResult<()> {
     ))
 }
 
+/// A stable lowercase name for a [`crate::model_arch::Task`] (the machine
+/// contract for `focr models --json`).
+fn task_name(t: crate::model_arch::Task) -> &'static str {
+    use crate::model_arch::Task;
+    match t {
+        Task::Ocr => "ocr",
+        Task::Formula => "formula",
+        Task::Tables => "tables",
+        Task::Chart => "chart",
+        Task::Molecular => "molecular",
+        Task::Geometry => "geometry",
+        Task::Music => "music",
+        Task::Describe => "describe",
+        Task::Vqa => "vqa",
+        Task::Handwriting => "handwriting",
+    }
+}
+
+/// Render one model-architecture descriptor as a JSON object for `focr models
+/// --json`.
+fn model_arch_json(a: &dyn crate::model_arch::ModelArch) -> serde_json::Value {
+    serde_json::json!({
+        "id": a.id(),
+        "display_name": a.display_name(),
+        "implemented": a.implemented(),
+        "status": if a.implemented() { "ready" } else { "planned" },
+        "tasks": a.tasks().iter().map(|t| task_name(*t)).collect::<Vec<_>>(),
+        "vision_encoder": format!("{:?}", a.vision_encoder()),
+        "decoder": format!("{:?}", a.decoder()),
+        "tokenizer": format!("{:?}", a.tokenizer()),
+        "default_artifact": a.default_artifact_basename(),
+        "license": a.license_notice(),
+    })
+}
+
+/// `focr models` — list the model architectures this build can run (the "model
+/// zoo", epic bd-3jo6). A human table by default; `--json` for a machine-readable
+/// list. Today the registry holds the implemented Baidu Unlimited-OCR model; the
+/// specialized zoo models appear here (as `planned`, then `ready`) once their
+/// descriptors register.
+fn run_models(args: &ModelsArgs) -> FocrResult<()> {
+    let archs = crate::model_arch::registry();
+    if args.json {
+        let models: Vec<serde_json::Value> = archs.iter().map(|a| model_arch_json(*a)).collect();
+        emit(&serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "models": models,
+        }));
+    } else {
+        println!("{:<14}  {:<8}  {:<22}  MODEL", "ID", "STATUS", "TASKS");
+        for a in archs {
+            let tasks = a
+                .tasks()
+                .iter()
+                .map(|t| task_name(*t))
+                .collect::<Vec<_>>()
+                .join(",");
+            let status = if a.implemented() { "ready" } else { "planned" };
+            println!(
+                "{:<14}  {:<8}  {:<22}  {}",
+                a.id(),
+                status,
+                tasks,
+                a.display_name()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run_doctor(args: &DoctorArgs) -> FocrResult<()> {
     if args.json {
         emit(&doctor_scaffold_payload());
@@ -2156,6 +2236,40 @@ mod tests {
         assert_eq!(json["figures"][0]["bbox"], serde_json::json!([1, 2, 3, 4]));
         // No figures ⇒ no `figures` key.
         assert!(rec.to_json(&[]).get("figures").is_none());
+    }
+
+    #[test]
+    fn models_json_describes_the_registered_archs() {
+        let archs = crate::model_arch::registry();
+        assert!(!archs.is_empty());
+        let j = model_arch_json(archs[0]);
+        assert_eq!(j["id"], "unlimited-ocr");
+        assert_eq!(j["status"], "ready");
+        assert_eq!(j["implemented"], true);
+        assert_eq!(j["tasks"], serde_json::json!(["ocr"]));
+        assert_eq!(j["decoder"], "DeepSeekV2MoeRswa");
+        assert_eq!(j["vision_encoder"], "SamClip");
+        assert!(j["license"].as_str().unwrap_or_default().contains("Baidu"));
+    }
+
+    #[test]
+    fn task_name_is_stable_lowercase() {
+        use crate::model_arch::Task;
+        assert_eq!(task_name(Task::Ocr), "ocr");
+        assert_eq!(task_name(Task::Music), "music");
+        assert_eq!(task_name(Task::Describe), "describe");
+        assert_eq!(task_name(Task::Chart), "chart");
+    }
+
+    #[test]
+    fn models_command_parses() {
+        let cli = Cli::try_parse_from(["focr", "models"]).expect("focr models parses");
+        assert!(matches!(cli.command, Command::Models(_)));
+        let cli = Cli::try_parse_from(["focr", "models", "--json"]).expect("--json parses");
+        let Command::Models(args) = cli.command else {
+            panic!("expected models");
+        };
+        assert!(args.json);
     }
 
     #[test]

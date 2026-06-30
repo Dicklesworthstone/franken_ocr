@@ -1715,6 +1715,49 @@ fn ocr_extract_figures_plumbed_and_writes_no_files_on_failure() {
     let _ = std::fs::remove_dir_all(&work);
 }
 
+/// **`focr models` lists the model zoo (bd-3jo6).** The discovery command surfaces
+/// every architecture this build can run — today the implemented Baidu
+/// Unlimited-OCR model — as a human table and as machine JSON. Always-on (no
+/// weights needed): it reads the static registry, not a loaded model.
+#[test]
+fn models_lists_the_registered_archs_human_and_json() {
+    let test = "models_lists_the_registered_archs_human_and_json";
+
+    let out = run_focr(&["models"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let human_ok = out.status.code() == Some(0)
+        && stdout.contains("unlimited-ocr")
+        && stdout.contains("ready");
+
+    let jout = run_focr(&["models", "--json"]);
+    let jstdout = String::from_utf8_lossy(&jout.stdout);
+    let v = parse_json_line(jstdout.trim(), "focr models --json");
+    let json_ok = jout.status.code() == Some(0)
+        && v["models"][0]["id"] == serde_json::json!("unlimited-ocr")
+        && v["models"][0]["implemented"] == serde_json::json!(true);
+
+    tlog!(test,
+        "case": "models_discovery",
+        "event": "assert",
+        "assertion": "`focr models` lists the registry (human table + machine JSON), exit 0",
+        "human_ok": human_ok,
+        "json_ok": json_ok,
+        "result": if human_ok && json_ok { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "focr models exits 0; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("unlimited-ocr") && stdout.contains("ready"),
+        "human table lists the default model as ready:\n{stdout}"
+    );
+    assert_eq!(jout.status.code(), Some(0), "focr models --json exits 0");
+    assert_eq!(v["models"][0]["id"], serde_json::json!("unlimited-ocr"));
+    assert_eq!(v["models"][0]["implemented"], serde_json::json!(true));
+}
+
 /// [C4] `focr convert --quant int4` -> NotImplemented golden. The int8 path is
 /// now implemented (it writes a real `.focrq`); int4 remains the unvalidated
 /// lossy path that refuses BEFORE any file I/O (doctrine #1), so this stays a
