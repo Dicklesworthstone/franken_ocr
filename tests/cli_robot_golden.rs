@@ -1356,6 +1356,7 @@ fn ocr_help_lists_reference_infer_args() {
         "--no-repeat-ngram",
         "--ngram-window",
         "--json",
+        "--output",
         "--robot",
     ];
     for flag in required {
@@ -1519,6 +1520,107 @@ fn ocr_env_model_path_without_cli_model_reaches_resolver() {
         stderr.contains("format/version mismatch"),
         "stderr must preserve FormatMismatch, got:\n{stderr}"
     );
+}
+
+/// **Regression for the fresh-install UX bug (bd-3u6x).** `focr pull` installs the
+/// model as `unlimited-ocr.int8.focrq`, but the default `focr ocr` lookup
+/// historically only searched the bare `unlimited-ocr.focrq` basename — so a
+/// freshly-pulled model was invisible without a manual `--model`, and the happy
+/// path broke on a clean machine. The resolver now also probes the quant-suffixed
+/// names (`.int8.focrq`, `.int4.focrq`). A future-version `unlimited-ocr.int8.focrq`
+/// dropped into `FOCR_MODEL_DIR` must therefore be RESOLVED by a bare
+/// `focr ocr <img>` (NO `--model`): proven by reaching the loader and failing
+/// FormatMismatch (exit 7), NOT ModelNotFound (exit 3, which is what the bug
+/// produced).
+#[test]
+fn ocr_default_resolves_pulled_int8_artifact_without_explicit_model() {
+    let test = "ocr_default_resolves_pulled_int8_artifact_without_explicit_model";
+    let dir = write_future_focrq_in_temp_model_dir("unlimited-ocr.int8.focrq");
+    let out = run_focr_with_model_dir(&["ocr", "/some/document.png"], &dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = out.status.code();
+    let pass = code == Some(7) && stderr.contains("format/version mismatch");
+    tlog!(test,
+        "case": "default_resolves_pulled_int8",
+        "event": "assert",
+        "assertion": "bare `focr ocr` resolves a pulled unlimited-ocr.int8.focrq in FOCR_MODEL_DIR",
+        "inputs": {"argv": ["ocr", "/some/document.png"], "FOCR_MODEL_DIR": "[int8-future-focrq]"},
+        "exit_code": code,
+        "stderr_head": stderr.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+        "detail": "exit 3 (ModelNotFound) here would mean the int8 artifact is still invisible to the default lookup — the original bug",
+    );
+    assert_eq!(
+        code,
+        Some(7),
+        "a pulled `unlimited-ocr.int8.focrq` must resolve from FOCR_MODEL_DIR without --model \
+         (exit 7 FormatMismatch = resolved+loaded; exit 3 = still not found); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("format/version mismatch"),
+        "stderr must show the loader was reached (FormatMismatch), got:\n{stderr}"
+    );
+}
+
+/// Run `focr ocr <img> -o <out> --model <model_path>` (the output-flag plumbing)
+/// and report the exit code plus whether the output file now exists. The output
+/// path is cleared first so the existence check reflects only this run.
+fn run_focr_ocr_to_output(out_path: &Path, model_path: &Path) -> (Option<i32>, bool) {
+    let _ = std::fs::remove_file(out_path);
+    let out_str = out_path.to_string_lossy().into_owned();
+    let out = run_focr_with_model_path(
+        &["ocr", "/some/document.png", "-o", out_str.as_str()],
+        model_path,
+    );
+    (out.status.code(), out_path.exists())
+}
+
+/// **`-o/--output` plumbing reaches the engine and writes nothing on failure
+/// (bd-sreb).** The output flag is wired through `run_ocr` for both `.json` and
+/// `.md`; when the model fails to load (future-version `.focrq` ⇒ FormatMismatch,
+/// exit 7) the recognition errors BEFORE any write, so no empty/partial output
+/// file is left behind. (The success-path file *contents* — valid JSON carrying
+/// the bounding boxes, non-empty markdown — are covered model-gated in
+/// `e2e_recognize`.)
+#[test]
+fn ocr_output_flag_is_plumbed_and_writes_nothing_on_failure() {
+    let test = "ocr_output_flag_is_plumbed_and_writes_nothing_on_failure";
+    let model = write_future_focrq();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    for ext in ["json", "md"] {
+        let out_path = std::env::temp_dir().join(format!(
+            "focr_out_fail_{}_{}.{}",
+            std::process::id(),
+            nanos,
+            ext
+        ));
+        let (code, exists) = run_focr_ocr_to_output(&out_path, &model);
+        let pass = code == Some(7) && !exists;
+        tlog!(test,
+            "case": format!("output_{ext}_on_failure"),
+            "event": "assert",
+            "assertion": "`-o out.<ext>` is accepted end-to-end; a load failure writes no output file",
+            "inputs": {"argv": ["ocr", "/some/document.png", "-o", format!("[out.{ext}]")], "FOCR_MODEL_PATH": "[future-focrq]"},
+            "exit_code": code,
+            "output_exists": exists,
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert_eq!(
+            code,
+            Some(7),
+            "`-o out.{ext}` must still surface FormatMismatch (exit 7); got {code:?}"
+        );
+        assert!(
+            !exists,
+            "a failed OCR run must not leave a stray output file at {out_path:?}"
+        );
+        let _ = std::fs::remove_file(&out_path);
+    }
 }
 
 /// [C4] `focr convert --quant int4` -> NotImplemented golden. The int8 path is

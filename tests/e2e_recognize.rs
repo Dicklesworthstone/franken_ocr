@@ -829,6 +829,191 @@ fn recognize_real_model_when_present_else_skip_with_success() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Model-gated e2e for `focr ocr -o/--output FILE` (bd-sreb). Drives the STABLE
+// CLI surface end-to-end and asserts the on-disk file contract the user asked
+// for: `.md` => markdown body, `.json` => structured JSON carrying the bounding
+// boxes. Skip-with-SUCCESS when the model or the binary is absent (§4.1).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A unique temp output path with the given extension (we never delete fixtures
+/// proactively — AGENTS.md RULE 1 — but a freshly-stamped name can't collide, and
+/// the test clears it before each run so the existence check is meaningful).
+fn unique_output_path(ext: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "focr_e2e_out_{}_{}.{ext}",
+        std::process::id(),
+        nanos
+    ))
+}
+
+/// Assert the structured-JSON output contract: a top-level string `markdown` plus
+/// a `layout` array whose entries are `{label: string, boxes: [[i64; 4], …]}`.
+/// Returns the number of layout spans for the SUCCESS log.
+fn assert_layout_json_contract(raw: &str) -> usize {
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .unwrap_or_else(|e| panic!("`-o out.json` produced invalid JSON: {e}; body:\n{raw}"));
+    assert!(
+        v.get("markdown")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "json output must carry a string `markdown`; body:\n{raw}"
+    );
+    let Some(layout) = v.get("layout").and_then(serde_json::Value::as_array) else {
+        panic!("json output must carry a `layout` array; body:\n{raw}");
+    };
+    for span in layout {
+        assert!(
+            span.get("label")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "every layout span must carry a string `label`: {span}"
+        );
+        let Some(boxes) = span.get("boxes").and_then(serde_json::Value::as_array) else {
+            panic!("every layout span must carry a `boxes` array: {span}");
+        };
+        for b in boxes {
+            let Some(coords) = b.as_array() else {
+                panic!("each box must be a JSON array: {b}");
+            };
+            assert_eq!(coords.len(), 4, "each box must be [x1, y1, x2, y2]: {b}");
+            assert!(
+                coords.iter().all(|c| c.is_i64() || c.is_u64()),
+                "box coordinates must be integers (model pixel grid): {b}"
+            );
+        }
+    }
+    layout.len()
+}
+
+/// `focr ocr <img> --model <real> -o out.<md|json>` end-to-end over a present
+/// model. `.md` must yield a non-empty markdown file; `.json` must yield valid
+/// JSON carrying `markdown` + a `layout` array of `{label, boxes}` with integer
+/// `[x1,y1,x2,y2]` boxes — the exact structured-output contract the CLI promises.
+/// A documented Phase forward gap (exit 1 `not yet implemented`) is an
+/// XFAIL-with-SUCCESS that tightens in automatically once the forward lands.
+#[test]
+fn cli_ocr_output_file_contract_when_model_present_else_skip() {
+    let test = "cli_ocr_output_file_contract_when_model_present_else_skip";
+    let case = "output_flag";
+
+    let Some(model_path) = resolve_present_model() else {
+        log_line(
+            test,
+            case,
+            "skip",
+            "skip_no_model",
+            &format!("searched_dirs={:?}", searched_dirs()),
+        );
+        log_success(
+            test,
+            case,
+            "e2e skipped: no model present; `-o` file contract unverified",
+        );
+        return;
+    };
+    let Some(bin) = focr_bin() else {
+        log_success(
+            test,
+            case,
+            "focr binary not built in this `cargo test` invocation (CARGO_BIN_EXE_focr \
+             unset) — `-o` file contract unverified",
+        );
+        return;
+    };
+
+    let image = write_tiny_png();
+    let img = image.to_string_lossy().into_owned();
+    let model = model_path.to_string_lossy().into_owned();
+
+    // ── markdown output ─────────────────────────────────────────────────────
+    let md_out = unique_output_path("md");
+    let _ = std::fs::remove_file(&md_out);
+    let md_arg = md_out.to_string_lossy().into_owned();
+    let out = run_focr(&bin, &["ocr", &img, "--model", &model, "-o", &md_arg]);
+    match out.code {
+        Some(0) => {
+            let body = std::fs::read_to_string(&md_out).unwrap_or_else(|e| {
+                panic!("`-o out.md` exited 0 but no markdown file at {md_out:?}: {e}")
+            });
+            assert!(
+                !body.trim().is_empty(),
+                "`-o out.md` wrote an empty markdown file"
+            );
+            log_success(
+                test,
+                "output_md",
+                &format!(
+                    "`-o out.md` wrote {} chars of markdown",
+                    body.chars().count()
+                ),
+            );
+        }
+        Some(1) if out.stderr.contains("not yet implemented") => {
+            log_xfail(
+                test,
+                "output_md",
+                "exit 1 not-implemented",
+                "exit 0 + markdown file",
+            );
+            log_success(
+                test,
+                "output_md",
+                "forward still NotImplemented (documented phase gap); the file assertion \
+                 tightens in once the forward lands",
+            );
+        }
+        other => panic!(
+            "`focr ocr -o out.md` over a present model exited {other:?}; stderr:\n{}",
+            out.stderr
+        ),
+    }
+
+    // ── json output (must carry bounding boxes) ─────────────────────────────
+    let json_out = unique_output_path("json");
+    let _ = std::fs::remove_file(&json_out);
+    let json_arg = json_out.to_string_lossy().into_owned();
+    let out = run_focr(&bin, &["ocr", &img, "--model", &model, "-o", &json_arg]);
+    match out.code {
+        Some(0) => {
+            let raw = std::fs::read_to_string(&json_out).unwrap_or_else(|e| {
+                panic!("`-o out.json` exited 0 but no json file at {json_out:?}: {e}")
+            });
+            let spans = assert_layout_json_contract(&raw);
+            log_success(
+                test,
+                "output_json",
+                &format!(
+                    "`-o out.json` wrote valid JSON with `markdown` + a {spans}-span `layout` \
+                     carrying integer bounding boxes"
+                ),
+            );
+        }
+        Some(1) if out.stderr.contains("not yet implemented") => {
+            log_xfail(
+                test,
+                "output_json",
+                "exit 1 not-implemented",
+                "exit 0 + json file with boxes",
+            );
+            log_success(
+                test,
+                "output_json",
+                "forward still NotImplemented (documented phase gap); the JSON-with-boxes \
+                 assertion tightens in once the forward lands",
+            );
+        }
+        other => panic!(
+            "`focr ocr -o out.json` over a present model exited {other:?}; stderr:\n{}",
+            out.stderr
+        ),
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Robot-mode pipe smoke (LOGGING_AND_E2E.md §4.5): the stable, always-on
 // surface. `focr robot schema` emits exactly one parseable JSON object on
 // stdout (data-only), exit 0.

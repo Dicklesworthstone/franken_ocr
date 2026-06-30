@@ -34,6 +34,7 @@ pub mod tokenizer;
 
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
+pub use native_engine::{LayoutSpan, RecognizedDocument};
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -236,6 +237,64 @@ impl OcrEngine {
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
             move || model.recognize_dynamic(image),
+        )
+    }
+
+    /// Recognize a single document image, returning the markdown AND the
+    /// structured layout (bounding boxes) — the structured form of
+    /// [`OcrEngine::recognize`] that `focr ocr --json` / `-o out.json` uses.
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize`].
+    pub fn recognize_with_layout(&self, image_path: &Path) -> FocrResult<RecognizedDocument> {
+        self.recognize_with_layout_model(&Self::model_path(), image_path)
+    }
+
+    /// The path-explicit form of [`OcrEngine::recognize_with_layout`].
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_with_model`].
+    pub fn recognize_with_layout_model(
+        &self,
+        model_path: &Path,
+        image_path: &Path,
+    ) -> FocrResult<RecognizedDocument> {
+        let model = self.model_at(model_path)?;
+        let image_path = image_path.to_path_buf();
+        self.run_blocking_stage_with_budget(
+            "forward",
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
+            move || model.recognize_with_layout(&image_path),
+        )
+    }
+
+    /// Recognize an in-memory [`image::DynamicImage`], returning the markdown AND
+    /// the structured layout — the in-memory form of
+    /// [`OcrEngine::recognize_with_layout`] the native PDF JSON path uses.
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_dynamic`].
+    pub fn recognize_dynamic_with_layout(
+        &self,
+        image: image::DynamicImage,
+    ) -> FocrResult<RecognizedDocument> {
+        self.recognize_dynamic_with_layout_model(&Self::model_path(), image)
+    }
+
+    /// The path-explicit form of [`OcrEngine::recognize_dynamic_with_layout`].
+    ///
+    /// # Errors
+    /// As [`OcrEngine::recognize_with_model`].
+    pub fn recognize_dynamic_with_layout_model(
+        &self,
+        model_path: &Path,
+        image: image::DynamicImage,
+    ) -> FocrResult<RecognizedDocument> {
+        let model = self.model_at(model_path)?;
+        self.run_blocking_stage_with_budget(
+            "forward",
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
+            move || model.recognize_dynamic_with_layout(image),
         )
     }
 

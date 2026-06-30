@@ -246,6 +246,11 @@ enum ModelQuantPreference {
 }
 
 impl ModelQuantPreference {
+    /// Distributed quant variants, in resolver-preference order when no explicit
+    /// `FOCR_MODEL_QUANT` is set: int8 is the default `focr pull` installs
+    /// (`unlimited-ocr.int8.focrq`); int4 is the smaller refinement variant.
+    const ALL: [ModelQuantPreference; 2] = [Self::Int8, Self::Int4];
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Int8 => "int8",
@@ -289,6 +294,30 @@ pub fn model_resolution_search_dirs() -> Vec<PathBuf> {
     model_search_dirs()
 }
 
+/// One parsed layout span from the model's grounding output: a ref/det label
+/// (`"title"`, `"text"`, `"image"`, …) plus its bounding boxes in PIXEL
+/// coordinates `[x1, y1, x2, y2]` for the source image (de-normalized from the
+/// model's 0..=999 grid). Surfaced by [`OcrModel::recognize_with_layout`] for the
+/// `focr ocr --json` / `-o out.json` structured-output path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutSpan {
+    /// The ref/det label classifying the span.
+    pub label: String,
+    /// Pixel bounding boxes `[x1, y1, x2, y2]`; a span may carry several.
+    pub boxes: Vec<[i64; 4]>,
+}
+
+/// A recognized document: the rendered markdown body plus the structured layout
+/// (bounding boxes) parsed from the SAME decoded model output, so the two can
+/// never disagree.
+#[derive(Debug, Clone)]
+pub struct RecognizedDocument {
+    /// The markdown body (identical to what [`OcrModel::recognize`] returns).
+    pub markdown: String,
+    /// The per-span layout (labels + pixel bounding boxes).
+    pub layout: Vec<LayoutSpan>,
+}
+
 fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     if !paths.iter().any(|p| p == &path) {
         paths.push(path);
@@ -301,19 +330,46 @@ fn short_model_candidates(
     quant: Option<ModelQuantPreference>,
 ) -> Vec<PathBuf> {
     let direct = search_dir.join(spec);
-    let mut candidates = Vec::with_capacity(3);
-    if spec.extension().is_none()
-        && let Some(quant) = quant
-    {
-        push_unique_path(
-            &mut candidates,
-            direct.with_extension(format!("{}.focrq", quant.as_str())),
-        );
-    }
-    push_unique_path(&mut candidates, direct.clone());
-    if spec.extension().is_none() {
+    let mut candidates = Vec::new();
+
+    // A spec that names a `.focrq` blob (the default `unlimited-ocr.focrq`) or a
+    // bare stem (`unlimited-ocr`) gets the quant-variant expansion: the artifact
+    // `focr pull` actually installs is `unlimited-ocr.int8.focrq`, so the default
+    // lookup must try the `<stem>.int8.focrq` / `<stem>.int4.focrq` names too —
+    // otherwise a fresh `focr pull` + `focr ocr page.png` fails for want of a
+    // `--model` flag (bd-3u6x). `with_extension` replaces a trailing `.focrq` or
+    // appends one to a bare stem, so both spec forms map to the same candidates.
+    // Any other spec (a safetensors directory, an explicit non-focrq file) is
+    // taken verbatim.
+    let is_focrq_or_bare = match spec.extension() {
+        None => true,
+        Some(ext) => ext.eq_ignore_ascii_case("focrq"),
+    };
+
+    if is_focrq_or_bare {
+        // 1. An explicit `FOCR_MODEL_QUANT` preference wins.
+        if let Some(quant) = quant {
+            push_unique_path(
+                &mut candidates,
+                direct.with_extension(format!("{}.focrq", quant.as_str())),
+            );
+        }
+        // 2. The exact name (an explicit `<name>.focrq` a user / `focr convert`
+        //    produced; a no-op existence-wise for a bare stem).
+        push_unique_path(&mut candidates, direct.clone());
+        // 3. The bare `<stem>.focrq` (covers a no-extension spec).
         push_unique_path(&mut candidates, direct.with_extension("focrq"));
+        // 4. The canonical distributed quant variants `focr pull` installs.
+        for quant in ModelQuantPreference::ALL {
+            push_unique_path(
+                &mut candidates,
+                direct.with_extension(format!("{}.focrq", quant.as_str())),
+            );
+        }
+    } else {
+        push_unique_path(&mut candidates, direct);
     }
+
     candidates
 }
 
@@ -686,6 +742,49 @@ impl OcrModel {
     pub fn recognize_dynamic(&self, img: image::DynamicImage) -> FocrResult<String> {
         let (decoded, image_w, image_h) = self.forward_dynamic(img)?;
         postprocess::finalize(&decoded, image_w, image_h)
+    }
+
+    /// Recognize one document image end-to-end, returning the markdown AND the
+    /// structured layout (bounding boxes) parsed from the same decoded output.
+    ///
+    /// The boxes come from [`postprocess::parse_layout`] over the EXACT raw decode
+    /// that [`postprocess::finalize`] renders to markdown, so `markdown` and
+    /// `layout` are always consistent. This is the structured form
+    /// `focr ocr --json` / `-o out.json` uses.
+    ///
+    /// # Errors
+    /// As [`Self::recognize`].
+    pub fn recognize_with_layout(&self, image_path: &Path) -> FocrResult<RecognizedDocument> {
+        let (decoded, image_w, image_h) = self.forward(image_path)?;
+        Self::finalize_document(&decoded, image_w, image_h)
+    }
+
+    /// In-memory form of [`Self::recognize_with_layout`] — the native PDF path
+    /// feeds one rasterized page here to collect its per-page layout.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_dynamic`].
+    pub fn recognize_dynamic_with_layout(
+        &self,
+        img: image::DynamicImage,
+    ) -> FocrResult<RecognizedDocument> {
+        let (decoded, image_w, image_h) = self.forward_dynamic(img)?;
+        Self::finalize_document(&decoded, image_w, image_h)
+    }
+
+    /// Assemble the markdown body and the pixel-rescaled layout from one forward's
+    /// `(decoded, width, height)` — the single point that keeps the two in sync.
+    fn finalize_document(
+        decoded: &str,
+        image_w: u32,
+        image_h: u32,
+    ) -> FocrResult<RecognizedDocument> {
+        let markdown = postprocess::finalize(decoded, image_w, image_h)?;
+        let layout = postprocess::parse_layout(decoded, image_w, image_h)
+            .into_iter()
+            .map(|(label, boxes)| LayoutSpan { label, boxes })
+            .collect();
+        Ok(RecognizedDocument { markdown, layout })
     }
 
     /// Recognize a batch of document images, returning one [`FocrResult`] per
@@ -1749,6 +1848,38 @@ mod tests {
             resolve_model_from_search_dirs(Path::new("models/unlimited-ocr.focrq"), &[dir])
                 .expect("resolve default basename in model dir");
         assert_eq!(resolved, model);
+    }
+
+    #[test]
+    fn resolve_model_default_spec_finds_pulled_int8_artifact() {
+        // The real fresh-install path: `focr pull` installs
+        // `unlimited-ocr.int8.focrq`, and a bare `focr ocr page.png` resolves the
+        // DEFAULT_MODEL_PATH spec `models/unlimited-ocr.focrq`. That MUST find the
+        // pulled int8 artifact with no `--model` / env override (bd-3u6x).
+        let dir = temp_model_dir("resolve_default_int8");
+        let int8 = dir.join("unlimited-ocr.int8.focrq");
+        std::fs::write(&int8, weights::FOCRQ_MAGIC).expect("write int8 model");
+
+        let resolved =
+            resolve_model_from_search_dirs(Path::new("models/unlimited-ocr.focrq"), &[dir])
+                .expect("default spec resolves the pulled int8 artifact");
+        assert_eq!(resolved, int8);
+    }
+
+    #[test]
+    fn resolve_model_prefers_exact_focrq_over_quant_variant() {
+        // When BOTH a generic `unlimited-ocr.focrq` (e.g. from `focr convert`) and a
+        // pulled `unlimited-ocr.int8.focrq` are present, the exact name wins.
+        let dir = temp_model_dir("resolve_exact_over_int8");
+        let generic = dir.join("unlimited-ocr.focrq");
+        let int8 = dir.join("unlimited-ocr.int8.focrq");
+        std::fs::write(&generic, weights::FOCRQ_MAGIC).expect("write generic model");
+        std::fs::write(&int8, weights::FOCRQ_MAGIC).expect("write int8 model");
+
+        let resolved =
+            resolve_model_from_search_dirs(Path::new("models/unlimited-ocr.focrq"), &[dir])
+                .expect("resolve exact generic focrq");
+        assert_eq!(resolved, generic);
     }
 
     #[test]

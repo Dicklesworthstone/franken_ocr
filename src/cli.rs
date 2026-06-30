@@ -92,6 +92,10 @@ pub fn long_version_report() -> String {
 #[derive(Subcommand)]
 pub enum Command {
     /// Parse a document image into structured markdown (or `--json`).
+    ///
+    /// `-o FILE` writes the result to a file instead of stdout: a `.json` path
+    /// emits structured JSON (markdown + per-span bounding boxes), any other
+    /// extension (e.g. `.md`) emits markdown; `--json` forces JSON.
     Ocr(OcrArgs),
     /// OCR many images in ONE process — load the 6.2 GB weights + build the int8
     /// decoder cache ONCE, then stream a result per image (the throughput path).
@@ -120,6 +124,11 @@ pub struct OcrArgs {
     /// Emit machine-readable JSON instead of human markdown.
     #[arg(long)]
     pub json: bool,
+    /// Write the result to FILE instead of stdout. The format follows the
+    /// extension: `.json` emits structured JSON (markdown + bounding boxes),
+    /// any other extension (e.g. `.md`) emits markdown. `--json` forces JSON.
+    #[arg(short = 'o', long)]
+    pub output: Option<PathBuf>,
     /// Stream NDJSON robot events as pages complete.
     #[arg(long)]
     pub robot: bool,
@@ -221,6 +230,7 @@ impl RobotRunArgs {
         OcrArgs {
             request: self.request,
             json: false,
+            output: None,
             robot: true,
         }
     }
@@ -451,6 +461,109 @@ pub fn run(cli: Cli) -> FocrResult<()> {
     }
 }
 
+/// The result of one OCR run — a single image or a multi-page PDF — unified so the
+/// output layer (markdown vs JSON-with-boxes, file vs stdout) is written once,
+/// identically, regardless of which input path produced it.
+enum Recognition {
+    Single(native_engine::RecognizedDocument),
+    Pdf(PdfRecognition),
+}
+
+impl Recognition {
+    /// The rendered markdown document (PDF pages already joined by blank lines).
+    fn markdown(&self) -> &str {
+        match self {
+            Recognition::Single(doc) => &doc.markdown,
+            Recognition::Pdf(pdf) => &pdf.markdown,
+        }
+    }
+
+    /// The structured JSON form. Always carries `schema_version` + `markdown`; a
+    /// single image adds a top-level `layout` array, a PDF adds a `pages` array of
+    /// `{page, layout}`. Every `layout` is a list of `{label, boxes}`, and each box
+    /// is `[x1, y1, x2, y2]` in source-image pixels (top-left origin).
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            Recognition::Single(doc) => serde_json::json!({
+                "schema_version": robot::ROBOT_SCHEMA_VERSION,
+                "markdown": doc.markdown,
+                "layout": layout_to_json(&doc.layout),
+            }),
+            Recognition::Pdf(pdf) => {
+                let pages: Vec<serde_json::Value> = pdf
+                    .pages
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "page": p.page,
+                            "layout": layout_to_json(&p.layout),
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "schema_version": robot::ROBOT_SCHEMA_VERSION,
+                    "markdown": pdf.markdown,
+                    "pages": pages,
+                })
+            }
+        }
+    }
+}
+
+/// Serialize a page's layout spans as a JSON array of `{label, boxes}`, where each
+/// box is the `[x1, y1, x2, y2]` pixel rectangle the model grounded that span to.
+fn layout_to_json(layout: &[native_engine::LayoutSpan]) -> serde_json::Value {
+    serde_json::Value::Array(
+        layout
+            .iter()
+            .map(|span| {
+                serde_json::json!({
+                    "label": span.label,
+                    "boxes": span.boxes,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// True when the OCR result should be emitted as JSON. An output path ending in
+/// `.json` selects JSON even without `--json` (a `.md`/other extension stays
+/// markdown); the explicit `--json` flag is handled by the caller.
+fn output_is_json(output: Option<&Path>) -> bool {
+    output
+        .and_then(Path::extension)
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+}
+
+/// Write the recognition result to `path` as pretty JSON (with per-span bounding
+/// boxes) when `want_json`, else as the rendered markdown. Both forms end with a
+/// trailing newline so the file is well-formed for downstream tools.
+fn write_ocr_output(path: &Path, rec: &Recognition, want_json: bool) -> FocrResult<()> {
+    let contents = if want_json {
+        let mut s = serde_json::to_string_pretty(&rec.to_json()).map_err(|e| {
+            FocrError::Other(anyhow::anyhow!(
+                "serializing OCR JSON for {}: {e}",
+                path.display()
+            ))
+        })?;
+        s.push('\n');
+        s
+    } else {
+        let md = rec.markdown();
+        if md.ends_with('\n') {
+            md.to_string()
+        } else {
+            format!("{md}\n")
+        }
+    };
+    std::fs::write(path, contents).map_err(|e| {
+        FocrError::Other(anyhow::anyhow!(
+            "writing OCR output to {}: {e}",
+            path.display()
+        ))
+    })
+}
+
 fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     let request = args.to_request()?;
     if let Some(err) = forced_test_error()? {
@@ -461,25 +574,50 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // A `.pdf` (or `%PDF-`-magic) input rasterizes each page and OCRs them as one
     // document; everything else is a single decoded image. Both funnel through
     // `recognize_with_autodownload` so model resolution + the first-run download
-    // offer behave identically.
-    let markdown = if pdf::looks_like_pdf(&request.image) {
-        recognize_pdf(&engine, &request, robot_mode)?
+    // offer behave identically. Both recognize WITH layout so the JSON output can
+    // carry bounding boxes — the layout parse is negligible next to the forward
+    // pass, and markdown-only consumers simply ignore it.
+    let recognition = if pdf::looks_like_pdf(&request.image) {
+        Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode)?)
     } else {
-        recognize_with_autodownload(&request, robot_mode, |model| match model {
-            Some(m) => engine.recognize_with_model(m, &request.image),
-            None => engine.recognize(&request.image),
-        })?
+        Recognition::Single(recognize_with_autodownload(
+            &request,
+            robot_mode,
+            |model| match model {
+                Some(m) => engine.recognize_with_layout_model(m, &request.image),
+                None => engine.recognize_with_layout(&request.image),
+            },
+        )?)
     };
+
+    let markdown = recognition.markdown();
+    // `--json` forces JSON; a `.json` output path selects it implicitly. (When no
+    // `-o` is given, `output_is_json(None)` is false, so stdout behavior is exactly
+    // the legacy `args.json` choice.)
+    let want_json = args.json || output_is_json(args.output.as_deref());
+
+    // An `-o/--output FILE` writes the result to disk (markdown or JSON-with-boxes)
+    // regardless of mode, and is written FIRST so the file already exists when a
+    // robot consumer sees the completion event below.
+    if let Some(path) = args.output.as_deref() {
+        write_ocr_output(path, &recognition, want_json)?;
+    }
+
     if robot_mode {
         // The terminal success event carries the recognized markdown so a machine
         // consumer actually receives the OCR result on the NDJSON stream (the
         // human / `--json` modes print it below instead).
-        emit(&robot::run_complete_event(&markdown));
+        emit(&robot::run_complete_event(markdown));
+    } else if let Some(path) = args.output.as_deref() {
+        // Result already went to the file; don't also echo it to stdout. Confirm
+        // on stderr so stdout stays empty/clean for any wrapping pipeline.
+        eprintln!(
+            "[focr] wrote {} ({})",
+            path.display(),
+            if want_json { "json" } else { "markdown" }
+        );
     } else if args.json {
-        emit(&serde_json::json!({
-            "schema_version": robot::ROBOT_SCHEMA_VERSION,
-            "markdown": markdown,
-        }));
+        emit(&recognition.to_json());
     } else {
         println!("{markdown}");
     }
@@ -495,13 +633,13 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
 /// robot mode (robots never prompt/fetch — they get the clean model-not-found
 /// error + pull hint). Both the single-image and PDF paths funnel through here so
 /// model resolution and the auto-download behave identically.
-fn recognize_with_autodownload<F>(
+fn recognize_with_autodownload<T, F>(
     request: &OcrRequest,
     robot_mode: bool,
     recog: F,
-) -> FocrResult<String>
+) -> FocrResult<T>
 where
-    F: Fn(Option<&Path>) -> FocrResult<String>,
+    F: Fn(Option<&Path>) -> FocrResult<T>,
 {
     match recog(request.model.as_deref()) {
         Ok(md) => Ok(md),
@@ -519,8 +657,24 @@ where
     }
 }
 
-/// Recognize every page of a PDF and concatenate the per-page markdown into one
-/// document (successful pages joined by a blank line).
+/// One successfully-OCR'd PDF page's structured layout (for the JSON output).
+struct PdfPageLayout {
+    /// 1-based page number in the source PDF.
+    page: usize,
+    /// The page's parsed layout spans (labels + pixel bounding boxes).
+    layout: Vec<crate::native_engine::LayoutSpan>,
+}
+
+/// A recognized PDF: the concatenated markdown plus per-page layout for the pages
+/// that decoded (skipped pages are absent from `pages`, as from the markdown).
+struct PdfRecognition {
+    markdown: String,
+    pages: Vec<PdfPageLayout>,
+}
+
+/// Recognize every page of a PDF, concatenating the per-page markdown into one
+/// document (successful pages joined by a blank line) and collecting each decoded
+/// page's layout spans for the JSON output.
 ///
 /// Each page is rasterized in-memory by [`pdf`] and fed through the identical OCR
 /// pipeline a PNG takes — no out-of-band `pdftoppm`. Pages render lazily, one at a
@@ -543,24 +697,33 @@ where
 ///
 /// If NOT ONE page decodes, the first per-page failure is surfaced as a clean
 /// error instead of an empty document.
-fn recognize_pdf(engine: &OcrEngine, request: &OcrRequest, robot_mode: bool) -> FocrResult<String> {
+fn recognize_pdf(
+    engine: &OcrEngine,
+    request: &OcrRequest,
+    robot_mode: bool,
+) -> FocrResult<PdfRecognition> {
     let pages = pdf::PdfPages::open(&request.image)?;
     let page_count = pages.len();
     recognize_with_autodownload(request, robot_mode, |model| {
         let mut document = String::new();
+        let mut page_layouts: Vec<PdfPageLayout> = Vec::new();
         let mut ok_pages = 0usize;
         let mut first_error: Option<FocrError> = None;
         for idx in 0..page_count {
             let page = pages.render(idx).and_then(|image| match model {
-                Some(m) => engine.recognize_dynamic_with_model(m, image),
-                None => engine.recognize_dynamic(image),
+                Some(m) => engine.recognize_dynamic_with_layout_model(m, image),
+                None => engine.recognize_dynamic_with_layout(image),
             });
             match page {
-                Ok(page_md) => {
+                Ok(doc) => {
                     if ok_pages > 0 {
                         document.push_str("\n\n");
                     }
-                    document.push_str(page_md.trim_end());
+                    document.push_str(doc.markdown.trim_end());
+                    page_layouts.push(PdfPageLayout {
+                        page: idx + 1,
+                        layout: doc.layout,
+                    });
                     ok_pages += 1;
                 }
                 // Whole-run conditions are never per-page — abort immediately:
@@ -600,7 +763,10 @@ fn recognize_pdf(engine: &OcrEngine, request: &OcrRequest, robot_mode: bool) -> 
                 ))
             }));
         }
-        Ok(document)
+        Ok(PdfRecognition {
+            markdown: document,
+            pages: page_layouts,
+        })
     })
 }
 
@@ -1267,6 +1433,7 @@ mod tests {
                     ngram_window: DEFAULT_NGRAM_WINDOW,
                 },
                 json: false,
+                output: None,
                 robot: true,
             }),
         };
@@ -1310,11 +1477,124 @@ mod tests {
                 ngram_window: DEFAULT_NGRAM_WINDOW,
             },
             json: false,
+            output: None,
             robot: false,
         };
         let err = args.to_request().expect_err("negative base-size is usage");
         assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
         assert_eq!(err.exit_code(), 2);
+    }
+
+    #[test]
+    fn output_is_json_follows_extension_case_insensitively() {
+        assert!(output_is_json(Some(Path::new("out.json"))));
+        assert!(output_is_json(Some(Path::new("OUT.JSON"))));
+        assert!(output_is_json(Some(Path::new("/tmp/a/b.Json"))));
+        // A `.md` / other / missing extension stays markdown.
+        assert!(!output_is_json(Some(Path::new("out.md"))));
+        assert!(!output_is_json(Some(Path::new("out.txt"))));
+        assert!(!output_is_json(Some(Path::new("out"))));
+        assert!(!output_is_json(None));
+    }
+
+    #[test]
+    fn ocr_output_flag_parses_short_and_long() {
+        for flag in ["-o", "--output"] {
+            let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", flag, "result.json"])
+                .expect("ocr -o/--output parses");
+            let Command::Ocr(args) = cli.command else {
+                panic!("expected ocr command");
+            };
+            assert_eq!(args.output.as_deref(), Some(Path::new("result.json")));
+        }
+        // No `-o` => None, i.e. the legacy stdout path.
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        assert!(args.output.is_none());
+    }
+
+    #[test]
+    fn single_image_json_carries_markdown_and_bounding_boxes() {
+        let rec = Recognition::Single(native_engine::RecognizedDocument {
+            markdown: "# Title\n\nbody".to_string(),
+            layout: vec![native_engine::LayoutSpan {
+                label: "title".to_string(),
+                boxes: vec![[10, 20, 110, 60]],
+            }],
+        });
+        let json = rec.to_json();
+        assert_eq!(json["schema_version"], robot::ROBOT_SCHEMA_VERSION);
+        assert_eq!(json["markdown"], "# Title\n\nbody");
+        assert_eq!(json["layout"][0]["label"], "title");
+        assert_eq!(
+            json["layout"][0]["boxes"][0],
+            serde_json::json!([10, 20, 110, 60])
+        );
+        // A single image has no per-page `pages` array.
+        assert!(json.get("pages").is_none());
+    }
+
+    #[test]
+    fn pdf_json_carries_per_page_layout_with_one_based_page_numbers() {
+        let rec = Recognition::Pdf(PdfRecognition {
+            markdown: "p1\n\np2".to_string(),
+            pages: vec![
+                PdfPageLayout {
+                    page: 1,
+                    layout: vec![native_engine::LayoutSpan {
+                        label: "text".to_string(),
+                        boxes: vec![[0, 0, 5, 5]],
+                    }],
+                },
+                PdfPageLayout {
+                    page: 2,
+                    layout: vec![],
+                },
+            ],
+        });
+        let json = rec.to_json();
+        assert_eq!(json["markdown"], "p1\n\np2");
+        assert_eq!(json["pages"][0]["page"], 1);
+        assert_eq!(
+            json["pages"][0]["layout"][0]["boxes"][0],
+            serde_json::json!([0, 0, 5, 5])
+        );
+        assert_eq!(json["pages"][1]["page"], 2);
+        assert_eq!(json["pages"][1]["layout"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn write_ocr_output_writes_markdown_and_json_with_boxes() {
+        let dir = std::env::temp_dir().join(format!("focr_output_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = Recognition::Single(native_engine::RecognizedDocument {
+            markdown: "hello world".to_string(),
+            layout: vec![native_engine::LayoutSpan {
+                label: "text".to_string(),
+                boxes: vec![[1, 2, 3, 4]],
+            }],
+        });
+
+        // Markdown form: source lacks a trailing newline, so one is appended.
+        let md_path = dir.join("out.md");
+        write_ocr_output(&md_path, &rec, false).expect("write md");
+        assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "hello world\n");
+
+        // JSON form: valid JSON, newline-terminated, carrying the bounding boxes.
+        let json_path = dir.join("out.json");
+        write_ocr_output(&json_path, &rec, true).expect("write json");
+        let raw = std::fs::read_to_string(&json_path).unwrap();
+        assert!(raw.ends_with('\n'), "json file should end with a newline");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(parsed["markdown"], "hello world");
+        assert_eq!(
+            parsed["layout"][0]["boxes"][0],
+            serde_json::json!([1, 2, 3, 4])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

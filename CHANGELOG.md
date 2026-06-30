@@ -14,7 +14,41 @@ sections as they land.
 
 ## [Unreleased]
 
-Direction after `0.2.0`. Nothing here has shipped; these are the next workstreams.
+Landed on `main` since `0.2.0`, not yet tagged — a first-run UX pass driven by a
+clean-machine install report.
+
+### Added
+
+- **`focr ocr -o/--output FILE`** (`bd-sreb`). Writes the OCR result to a file
+  instead of stdout; the format follows the extension — `.json` emits structured
+  JSON, any other extension (e.g. `.md`) emits markdown, and `--json` forces JSON.
+  The structured JSON carries the rendered `markdown` plus a `layout` array of
+  `{label, boxes}` spans, each box `[x1, y1, x2, y2]` in source-image pixels (a PDF
+  nests these under a per-page `pages` array). The same shape is what `--json`
+  prints to stdout. New engine entry points `OcrEngine::recognize_with_layout` /
+  `recognize_dynamic_with_layout` (and `_model` variants) return the markdown and
+  the layout parsed from the **same** decode, so the two can never disagree.
+
+### Fixed
+
+- **Fresh-install OCR happy path** (`bd-3u6x`). `focr pull` installs the model as
+  `unlimited-ocr.int8.focrq`, but the default `focr ocr` lookup previously searched
+  only the bare `unlimited-ocr.focrq` basename, so a freshly-pulled model was
+  invisible without a manual `--model`. The resolver now also probes the
+  quant-suffixed names (`.int8.focrq`, `.int4.focrq`); a pulled model resolves with
+  no flag. An exact-basename match still wins over a quant variant.
+- **Installer aborted instantly under `gum`.** The first status line rendered
+  `gum style ... "-> ..."`, so `gum` parsed the leading `->` as an unknown flag,
+  printed its usage, and (under `set -euo pipefail`) aborted the whole install. All
+  status helpers now pass `--` before dynamic text, a fresh-account `~/.local/bin`
+  default no longer trips `check_disk_space`'s `df`, and a new true end-to-end
+  installer test (`tests/installer_e2e.sh`, wired into CI) drives the real installer
+  through the `gum`/pty path against a fake `file://` release so this class of bug
+  can never ship silently again.
+
+### Direction after `0.2.0`
+
+Nothing below has shipped; these are the next workstreams.
 
 - **int4 expert quantization.** Group-quantized int4 expert weights at a
   Q4_K_M-class footprint, gated on a measured character-error-rate budget. A packed

@@ -61,13 +61,17 @@ focr pull
 # 2. OCR a page into Markdown (the human default).
 focr ocr page.png
 
-# 3. Same page as structured JSON.
+# 3. Same page as structured JSON (markdown + every span's bounding boxes).
 focr ocr page.png --json
 
-# 4. Stream NDJSON pipeline events for an agent (run_start ... run_complete; full event set via `focr robot schema`).
+# 4. Write the result to a file — format follows the extension (.md or .json).
+focr ocr page.png -o page.md
+focr ocr page.png -o page.json            # structured JSON with bounding boxes
+
+# 5. Stream NDJSON pipeline events for an agent (run_start ... run_complete; full event set via `focr robot schema`).
 focr ocr page.png --robot
 
-# 5. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
+# 6. Prove the int8 kernel on THIS CPU is bit-identical to the scalar oracle.
 focr robot selftest
 
 # 6. (optional) Convert your own bf16 safetensors into the int8 .focrq format.
@@ -185,7 +189,7 @@ cargo build --release
 1. **Install** the binary with the curl one-liner, or download and verify a release asset by hand.
 2. **Fetch the weights once:** `focr pull`. This downloads about 3.9 GB of int8 weights plus `tokenizer.json` into `~/.cache/franken_ocr/models`, verifying every byte by SHA256 against a committed manifest.
 3. **Verify your CPU kernel** (optional but reassuring): `focr robot selftest`. Exit 0 means the dispatched int8 GEMM is bit-identical to the scalar oracle on this host.
-4. **OCR a page:** `focr ocr page.png` for Markdown, add `--json` for structured output, or `--robot` for an NDJSON event stream.
+4. **OCR a page:** `focr ocr page.png` for Markdown, add `--json` for structured output (markdown + bounding boxes), `-o out.md` / `-o out.json` to write a file, or `--robot` for an NDJSON event stream.
 5. **Batch many pages** in one process (model loaded once): `focr ocr-batch page1.png page2.png page3.png --json`.
 
 ---
@@ -200,12 +204,22 @@ Parse a document image into Markdown (default), JSON, or an NDJSON stream.
 
 ```bash
 focr ocr page.png                          # Markdown to stdout
-focr ocr page.png --json                   # structured JSON
+focr ocr page.png --json                   # structured JSON to stdout
+focr ocr page.png -o page.md               # write Markdown to a file
+focr ocr page.png -o page.json             # write structured JSON (markdown + boxes) to a file
 focr ocr page.png --robot                  # NDJSON pipeline events
 focr ocr page.png --crop-mode base         # disable dynamic-resolution tiling
 focr ocr page.png --max-length 4096 --temperature 0.0
 focr ocr page.png --model /path/to/unlimited-ocr.focrq
 ```
+
+**Output (`-o`/`--output FILE`).** Writes the result to a file instead of stdout; the
+format follows the extension — `.json` emits structured JSON, any other extension
+(e.g. `.md`) emits Markdown. `--json` forces JSON regardless of extension. The
+structured JSON carries the rendered `markdown` plus a `layout` array — one
+`{label, boxes}` entry per grounded span, where each box is `[x1, y1, x2, y2]` in
+source-image pixels (a PDF nests these under a per-page `pages` array). This is the
+same shape `--json` prints to stdout.
 
 Tuning flags: `--base-size` and `--image-size` (preprocessing resolution), `--crop-mode` (`gundam` or `base`), `--max-length` (decode token cap), `--temperature` (sampling), `--no-repeat-ngram` and `--ngram-window` (the sliding no-repeat n-gram decode guard).
 
@@ -274,7 +288,7 @@ focr doctor --json                          # idempotent self-check / repair
 
 | Variable | Effect |
 |---|---|
-| `FOCR_MODEL_PATH` | Override the model artifact path (a `.focrq` blob or a safetensors directory). Defaults to `models/unlimited-ocr.focrq` when unset. |
+| `FOCR_MODEL_PATH` | Override the model artifact path (a `.focrq` blob or a safetensors directory). When unset, the model cache is searched for `unlimited-ocr.focrq` and the quant-suffixed names a `focr pull` installs (`unlimited-ocr.int8.focrq`, `unlimited-ocr.int4.focrq`), so a freshly-pulled model resolves with no `--model` flag. |
 | `FOCR_MANIFEST_URL` | Override the manifest source (a local path or an `https` URL). Defaults to the built-in repo manifest. |
 | `FOCR_NO_REPEAT_NGRAM` | Override the sliding no-repeat n-gram size for decode (default 35). |
 | `FOCR_FORCE_ARCH` | Force the SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`vnni`/`amx`) for CPU dispatch; used by `robot selftest` and SIMD detection. |
