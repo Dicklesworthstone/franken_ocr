@@ -58,9 +58,28 @@ pub struct Manifest {
     /// License notice that must travel with the redistributed weights.
     #[serde(default)]
     pub license_notice: String,
+    /// Per-quant artifacts, keyed by quant tag (`"int8"`, …). Describes the
+    /// primary [`model`](Self::model) (default `unlimited-ocr`); old binaries
+    /// read only these top-level fields, so they stay in place for back-compat.
+    pub quants: BTreeMap<String, QuantEntry>,
+    /// The tokenizer sidecar for the primary model, installed beside the `.focrq`.
+    pub tokenizer: RemoteFile,
+    /// Additional models, keyed by model id (e.g. `"got-ocr2"`), selectable via
+    /// `focr pull <model>`. The primary model above is NOT duplicated here. A
+    /// binary predating multi-model manifests simply ignores this field.
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelEntry>,
+}
+
+/// The artifacts for one non-primary model (its quants + tokenizer sidecar).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelEntry {
+    /// License notice that must travel with this model's redistributed weights.
+    #[serde(default)]
+    pub license_notice: String,
     /// Per-quant artifacts, keyed by quant tag (`"int8"`, …).
     pub quants: BTreeMap<String, QuantEntry>,
-    /// The `tokenizer.json` sidecar, installed beside the `.focrq`.
+    /// The tokenizer sidecar (e.g. `qwen.tiktoken`), installed beside the `.focrq`.
     pub tokenizer: RemoteFile,
 }
 
@@ -385,6 +404,7 @@ pub struct PullOutcome {
 /// receives human status lines. Network only happens here — once it returns Ok,
 /// the model loads offline.
 pub fn pull(
+    model: Option<&str>,
     quant: &str,
     manifest_source: &str,
     quiet: bool,
@@ -412,15 +432,28 @@ pub fn pull(
     };
     let manifest = parse_manifest(&manifest_bytes)?;
 
-    let quant_entry = manifest.quants.get(quant).ok_or_else(|| {
+    // Select the model: the primary top-level model (default, and the only one
+    // old binaries know) unless `model` names a distinct entry in `models`.
+    let (quants, tokenizer): (&BTreeMap<String, QuantEntry>, &RemoteFile) = match model {
+        None => (&manifest.quants, &manifest.tokenizer),
+        Some(m) if m == manifest.model => (&manifest.quants, &manifest.tokenizer),
+        Some(m) => {
+            let entry = manifest.models.get(m).ok_or_else(|| {
+                let mut avail = vec![manifest.model.clone()];
+                avail.extend(manifest.models.keys().cloned());
+                FocrError::Usage(format!(
+                    "manifest has no model '{m}' (available: {})",
+                    avail.join(", ")
+                ))
+            })?;
+            (&entry.quants, &entry.tokenizer)
+        }
+    };
+
+    let quant_entry = quants.get(quant).ok_or_else(|| {
         FocrError::Usage(format!(
             "manifest has no quant '{quant}' (available: {})",
-            manifest
-                .quants
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
+            quants.keys().cloned().collect::<Vec<_>>().join(", ")
         ))
     })?;
 
@@ -428,11 +461,11 @@ pub fn pull(
     std::fs::create_dir_all(&dir)
         .map_err(|e| FocrError::Other(anyhow::anyhow!("create cache {}: {e}", dir.display())))?;
     let focrq_path = dir.join(&quant_entry.focrq.filename);
-    let tokenizer_path = dir.join(&manifest.tokenizer.filename);
+    let tokenizer_path = dir.join(&tokenizer.filename);
 
     // 2. Download each artifact unless already byte-perfect in the cache.
     let focrq_cached = already_cached(&focrq_path, &quant_entry.focrq);
-    let tok_cached = already_cached(&tokenizer_path, &manifest.tokenizer);
+    let tok_cached = already_cached(&tokenizer_path, tokenizer);
 
     if !focrq_cached {
         install_file(
@@ -446,13 +479,7 @@ pub fn pull(
         progress(&format!("cached: {}", focrq_path.display()));
     }
     if !tok_cached {
-        install_file(
-            &runtime,
-            &manifest.tokenizer,
-            &tokenizer_path,
-            quiet,
-            &mut progress,
-        )?;
+        install_file(&runtime, tokenizer, &tokenizer_path, quiet, &mut progress)?;
     } else {
         progress(&format!("cached: {}", tokenizer_path.display()));
     }
@@ -568,11 +595,45 @@ mod tests {
                     urls: vec!["https://example/tok".into()],
                 }],
             },
+            models: BTreeMap::from([(
+                "got-ocr2".to_string(),
+                ModelEntry {
+                    license_notice: "Apache-2.0 (GOT-OCR2.0)".into(),
+                    quants: BTreeMap::from([(
+                        "int8".to_string(),
+                        QuantEntry {
+                            focrq: RemoteFile {
+                                filename: "got-ocr2.int8.focrq".into(),
+                                size: 813877416,
+                                sha256: "ef".repeat(32),
+                                parts: vec![RemotePart {
+                                    size: 813877416,
+                                    sha256: "ef".repeat(32),
+                                    urls: vec!["https://example/got".into()],
+                                }],
+                            },
+                        },
+                    )]),
+                    tokenizer: RemoteFile {
+                        filename: "qwen.tiktoken".into(),
+                        size: 2561218,
+                        sha256: "12".repeat(32),
+                        parts: vec![RemotePart {
+                            size: 2561218,
+                            sha256: "12".repeat(32),
+                            urls: vec!["https://example/qwen".into()],
+                        }],
+                    },
+                },
+            )]),
         };
         let json = serde_json::to_vec(&m).expect("serialize");
         let back = parse_manifest(&json).expect("parse");
         assert_eq!(back.model, "unlimited-ocr");
         assert_eq!(back.quants["int8"].focrq.size, 3914093440);
+        // The secondary model resolves by id with its own tokenizer filename.
+        assert_eq!(back.models["got-ocr2"].tokenizer.filename, "qwen.tiktoken");
+        assert_eq!(back.models["got-ocr2"].quants["int8"].focrq.size, 813877416);
 
         // A newer schema is rejected loudly.
         let future = br#"{"schema_version":999,"model":"x","quants":{},"tokenizer":{"filename":"t","size":0,"sha256":"","parts":[]}}"#;

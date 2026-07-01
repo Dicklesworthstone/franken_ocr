@@ -43,5 +43,44 @@
         ]
       }
     ]
+  },
+  "models": {
+    "got-ocr2": {
+      "license_notice": "GOT-OCR2.0 - Copyright (c) 2024 Ucas-HaoranWei, Apache-2.0",
+      "quants": {
+        "int8": {
+          "focrq": {
+            "filename": "got-ocr2.int8.focrq",
+            "size": 813877416,
+            "sha256": "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f",
+            "parts": [
+              {
+                "size": 813877416,
+                "sha256": "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f",
+                "urls": [
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/got-ocr2.int8.focrq",
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/got-ocr2.int8.focrq"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "tokenizer": {
+        "filename": "qwen.tiktoken",
+        "size": 2561218,
+        "sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186",
+        "parts": [
+          {
+            "size": 2561218,
+            "sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/qwen.tiktoken",
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/qwen.tiktoken"
+            ]
+          }
+        ]
+      }
+    }
   }
 }

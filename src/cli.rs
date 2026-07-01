@@ -178,6 +178,9 @@ pub struct ModelsArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct PullArgs {
+    /// Model id to fetch (e.g. `got-ocr2`). Defaults to the manifest's primary
+    /// model (`unlimited-ocr`).
+    pub model: Option<String>,
     /// Quant level to fetch (only `int8` is published today).
     #[arg(long, default_value = dist::DEFAULT_QUANT)]
     pub quant: String,
@@ -1686,7 +1689,7 @@ fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
         return Ok(None);
     }
     let source = dist::resolve_manifest_source(None);
-    let outcome = dist::pull(dist::DEFAULT_QUANT, &source, false, |line| {
+    let outcome = dist::pull(None, dist::DEFAULT_QUANT, &source, false, |line| {
         eprintln!("focr pull: {line}");
     })?;
     Ok(Some(outcome))
@@ -1695,11 +1698,17 @@ fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
 /// `focr pull` — download (or confirm-cached) the model weights + tokenizer.
 fn run_pull(args: &PullArgs) -> FocrResult<()> {
     let source = dist::resolve_manifest_source(args.manifest.as_deref());
-    let outcome = dist::pull(&args.quant, &source, args.json, |line| {
-        if !args.json {
-            eprintln!("focr pull: {line}");
-        }
-    })?;
+    let outcome = dist::pull(
+        args.model.as_deref(),
+        &args.quant,
+        &source,
+        args.json,
+        |line| {
+            if !args.json {
+                eprintln!("focr pull: {line}");
+            }
+        },
+    )?;
     if args.json {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
