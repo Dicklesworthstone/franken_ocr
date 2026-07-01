@@ -280,7 +280,8 @@ focr models --json                          # machine-readable list
 
 ```bash
 focr pull got-ocr2                                    # download the weights + tokenizer
-focr ocr --model got-ocr2.int8.focrq page.png         # specialized OCR
+focr ocr --model got-ocr2.int8.focrq page.png         # plain-text OCR
+focr ocr --model got-ocr2.int8.focrq --format eq.png  # structured .mmd: LaTeX / tables / charts / music
 ```
 
 The roadmap (epic `bd-3jo6`) adds further specialized models — SmolVLM2 (photo description / VQA), OneChart (chart → data), Polyphonic-TrOMR (sheet music) — each transformed to the same int8 CPU performance bar; they appear here (`planned`, then `ready`) as they land.

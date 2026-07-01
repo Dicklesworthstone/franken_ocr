@@ -153,6 +153,30 @@ fn int8_decode_requested() -> bool {
         || std::env::var_os(DECODE_INT8_ENV).is_some()
 }
 
+/// `FOCR_GOT_FORMAT` (bd-3jo6.2.10 / B10): request GOT-OCR2's `OCR with format:`
+/// structured output (Mathpix-Markdown — inline LaTeX math, Markdown tables, TikZ
+/// geometry, SMILES molecules, `**kern` sheet music; the model auto-selects the
+/// formalism) instead of plain `OCR: ` text. Presence ⇒ on. Only affects the
+/// `got-ocr2` arm; a no-op for the default unlimited-ocr model.
+const GOT_FORMAT_ENV: &str = "FOCR_GOT_FORMAT";
+
+/// Process-global "use GOT `OCR with format:` mode" flag, set by the CLI from
+/// `--format` (edition-2024 `set_var` is `unsafe`; this crate denies unsafe — same
+/// pattern as [`FORCE_INT8_DECODE`]). OR'd with [`GOT_FORMAT_ENV`].
+static FORCE_GOT_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Force (or clear) GOT `OCR with format:` mode process-wide. Default false ⇒
+/// [`OcrModel::forward_got`] runs plain `OCR: `, byte-identical to today.
+pub fn force_got_format(on: bool) {
+    FORCE_GOT_FORMAT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether GOT should run `OCR with format:`: the process-global flag OR the env var.
+fn got_format_requested() -> bool {
+    FORCE_GOT_FORMAT.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os(GOT_FORMAT_ENV).is_some()
+}
+
 /// `FOCR_SPEC_DECODE` (bd-1azu.35): presence kill-switch arming the draft -> verify
 /// -> accept speculative decode inside the int8 generate loop
 /// ([`OcrModel::spec_decode_i8`]). DEFAULT OFF => [`OcrModel::generate_cached_i8`]
@@ -738,15 +762,17 @@ impl OcrModel {
         let (w, h) = img.dimensions();
         let tk = self.got_tokenizer()?;
         // O(n) KV-cache greedy decode (B9); the model stops at <|im_end|>. Cap length
-        // defensively (config max_new_tokens 4096). Plain-OCR mode (format=false); the
-        // `OCR with format:` .mmd mode is a library capability pending a CLI flag.
+        // defensively (config max_new_tokens 4096). `--format` (CLI) / FOCR_GOT_FORMAT
+        // selects the `OCR with format:` .mmd mode (LaTeX/tables/charts/molecular/geometry/
+        // sheet-music); default plain `OCR: ` is byte-identical to today.
+        let format = got_format_requested();
         let text = got::recognize(
             &self.weights,
             tk,
             img,
             self.arch().vision_tower_prefix(),
             4096,
-            false,
+            format,
         )?;
         timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
         Ok((text, w, h))

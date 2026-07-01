@@ -235,6 +235,13 @@ pub struct OcrRequestArgs {
     /// Sliding no-repeat n-gram lookback window.
     #[arg(long, default_value_t = DEFAULT_NGRAM_WINDOW)]
     pub ngram_window: i64,
+    /// GOT-OCR2 structured output: use the model's `OCR with format:` mode instead
+    /// of plain text, emitting Mathpix-Markdown (.mmd) — inline LaTeX math, Markdown
+    /// tables, TikZ geometry, SMILES molecules, and `**kern` sheet music (the model
+    /// auto-selects the formalism from the image). Only affects the `got-ocr2` model
+    /// (`--model got-ocr2…`); a no-op for the default unlimited-ocr model.
+    #[arg(long)]
+    pub format: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -248,6 +255,7 @@ pub struct OcrRequest {
     pub temperature: f32,
     pub no_repeat_ngram: u32,
     pub ngram_window: u32,
+    pub format: bool,
 }
 
 impl OcrArgs {
@@ -281,6 +289,7 @@ impl OcrRequestArgs {
             temperature: non_negative_finite_f32("temperature", self.temperature)?,
             no_repeat_ngram: non_negative_u32("no-repeat-ngram", self.no_repeat_ngram)?,
             ngram_window: non_negative_u32("ngram-window", self.ngram_window)?,
+            format: self.format,
         })
     }
 }
@@ -855,6 +864,9 @@ impl FigureWriter {
 
 fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     let request = args.to_request()?;
+    // GOT-OCR2 `--format` (.mmd) mode is threaded to the leaf via a process-global
+    // (the shared OcrEngine/OcrModel signatures stay frozen for the Baidu path).
+    native_engine::force_got_format(request.format);
     if let Some(err) = forced_test_error()? {
         return Err(err);
     }
@@ -1533,6 +1545,9 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "                           need FORMAT, not for plain text. `focr pull got-ocr2`,"
         );
         println!("                           then `focr ocr --model got-ocr2.int8.focrq <image>`.");
+        println!(
+            "                           Add `--format` for structured .mmd output (LaTeX/tables/…)."
+        );
     }
     Ok(())
 }
@@ -1942,6 +1957,7 @@ mod tests {
                     temperature: DEFAULT_TEMPERATURE,
                     no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                     ngram_window: DEFAULT_NGRAM_WINDOW,
+                    format: false,
                 },
                 json: false,
                 output: None,
@@ -1968,6 +1984,7 @@ mod tests {
                         temperature: DEFAULT_TEMPERATURE,
                         no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                         ngram_window: DEFAULT_NGRAM_WINDOW,
+                        format: false,
                     },
                 }),
             },
@@ -1988,6 +2005,7 @@ mod tests {
                 temperature: DEFAULT_TEMPERATURE,
                 no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                 ngram_window: DEFAULT_NGRAM_WINDOW,
+                format: false,
             },
             json: false,
             output: None,
@@ -2028,6 +2046,23 @@ mod tests {
             panic!("expected ocr command");
         };
         assert!(args.output.is_none());
+    }
+
+    #[test]
+    fn ocr_format_flag_threads_to_request() {
+        // `--format` (GOT `OCR with format:` .mmd mode) parses and reaches OcrRequest;
+        // absent, it defaults false (plain OCR — byte-identical to today).
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--format"])
+            .expect("ocr --format parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        assert!(args.to_request().expect("request builds").format);
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        assert!(!args.to_request().expect("request builds").format);
     }
 
     #[test]
@@ -2125,6 +2160,7 @@ mod tests {
                 temperature: DEFAULT_TEMPERATURE,
                 no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                 ngram_window: DEFAULT_NGRAM_WINDOW,
+                format: false,
             },
             json: false,
             output: None,
