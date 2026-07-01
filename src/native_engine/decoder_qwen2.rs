@@ -375,9 +375,15 @@ impl Qwen2KvCache {
 }
 
 /// Full-causal m=1 attention: the single new query (`q_row`, `[qkv_dim]`) attends
-/// ALL `n_kv` cached keys (every cached position ≤ the current one, so `causal=false`
-/// is exactly the last-row causal mask). Repacks token-major K/V → head-major and
-/// runs [`nn::sdpa`] at `seq_q=1`, scale `1/√head_dim` = 1/8. O(n_kv) per step.
+/// ALL `n_kv` cached keys (every cached position ≤ the current one — no mask needed).
+/// scale `1/√head_dim` = 1/8.
+///
+/// Reads the **token-major** cache directly — no per-step head-major repack (the old
+/// `nn::sdpa` path allocated + copied `2·num_heads·n_kv·head_dim` floats EVERY token,
+/// an O(n²) alloc-churn that dominated long-page decode). This bespoke scaled-dot-product
+/// (per-head dot → softmax → weighted V, all f32) is the standard attention math; it is
+/// argmax-exact vs the sdpa path (certified: `kvcache_greedy_matches_oracle_l4` still ==
+/// the oracle L4). Per-step temp is just `[n_kv]` scores. (Perf lever, bead B9.)
 fn qwen2_decode_attention(
     cache: &Qwen2KvCache,
     q_row: &[f32],
@@ -386,23 +392,39 @@ fn qwen2_decode_attention(
 ) -> Vec<f32> {
     let n_kv = cache.n_kv;
     let dim = num_heads * head_dim;
-    let span = n_kv * head_dim;
-    let mut kh = vec![0.0f32; num_heads * span];
-    let mut vh = vec![0.0f32; num_heads * span];
-    for r in 0..n_kv {
-        for h in 0..num_heads {
-            let src = r * dim + h * head_dim;
-            let dst = h * span + r * head_dim;
-            kh[dst..dst + head_dim].copy_from_slice(&cache.k[src..src + head_dim]);
-            vh[dst..dst + head_dim].copy_from_slice(&cache.v[src..src + head_dim]);
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let mut out = vec![0.0f32; dim];
+    let mut scores = vec![0.0f32; n_kv];
+    for h in 0..num_heads {
+        let qh = &q_row[h * head_dim..h * head_dim + head_dim];
+        // scores[r] = scale · (q_h · k[r, head h]); track the max for a stable softmax.
+        let mut smax = f32::NEG_INFINITY;
+        for (r, s) in scores.iter_mut().enumerate() {
+            let base = r * dim + h * head_dim;
+            let kh = &cache.k[base..base + head_dim];
+            let dot: f32 = qh.iter().zip(kh).map(|(&a, &b)| a * b).sum();
+            *s = dot * scale;
+            smax = smax.max(*s);
+        }
+        // softmax over the cached positions.
+        let mut denom = 0.0f32;
+        for s in &mut scores {
+            *s = (*s - smax).exp();
+            denom += *s;
+        }
+        let inv = 1.0 / denom;
+        // out_h = Σ_r softmax[r] · v[r, head h].
+        let oh = &mut out[h * head_dim..h * head_dim + head_dim];
+        for (r, &s) in scores.iter().enumerate() {
+            let w = s * inv;
+            let base = r * dim + h * head_dim;
+            let vh = &cache.v[base..base + head_dim];
+            for (o, &vv) in oh.iter_mut().zip(vh) {
+                *o += w * vv;
+            }
         }
     }
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-    // q_row is already head-major for a single token (contiguous head blocks); ctx
-    // comes back head-major = token-major for one row.
-    nn::sdpa(
-        q_row, &kh, &vh, num_heads, 1, n_kv, head_dim, head_dim, scale, false,
-    )
+    out
 }
 
 /// One layer's decode weights, loaded ONCE (int8 GEMMs read verbatim from the
