@@ -121,7 +121,10 @@ pub fn recognize(
     let prompt_ids = plain_ocr_prompt_ids(tk)?;
     let inputs_embeds = build_inputs_embeds(weights, &image, &prompt_ids, prefix)?;
     let cfg = DecoderConfig::got_ocr2();
-    let ids = decoder_qwen2::generate_greedy(weights, &cfg, &inputs_embeds, max_new, EOS_ID)?;
+    // The O(n)-per-token KV-cache decode (B9) — bit-identical to the certified
+    // re-prefill `generate_greedy`, but usable on real (long) documents.
+    let ids =
+        decoder_qwen2::generate_greedy_kvcache(weights, &cfg, &inputs_embeds, max_new, EOS_ID)?;
     Ok(tk.decode_skip_special(&ids)?.trim().to_string())
 }
 

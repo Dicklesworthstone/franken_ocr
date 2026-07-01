@@ -24,13 +24,15 @@
 //! seam: feed the oracle's post-splice `hidden_0` and match the last-position
 //! logits (see the `#[cfg(test)]` parity gate).
 //!
-//! Scope: **prefill only** (the parity path). The m=1 generation decode-step (a
-//! bias-carrying `gemv_i8` + a growing full-causal KV cache) lands with B7's
-//! generation loop; the prefill last-position logits already certify every kernel.
+//! Generation: [`generate_greedy`] is the correct O(n²) re-prefill path (the parity
+//! oracle); [`generate_greedy_kvcache`] (bead B9) is the O(n)-per-token full-causal
+//! **KV-cache** decode used in production — held bit-identical to `generate_greedy`
+//! (hence the torch oracle L4) by routing every decode GEMM through the SAME
+//! `nn::linear_int8_dynamic` (ties-to-even) the prefill uses.
 
 use super::decoder;
 use super::nn;
-use super::tensor::Mat;
+use super::tensor::{Mat, QInt8};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
 
@@ -331,6 +333,268 @@ pub fn generate_greedy(
     Ok(ids)
 }
 
+// ── B9: full-causal KV-cache decode (O(n)/token, replaces the O(n²) re-prefill) ──
+//
+// The decode path is held BIT-IDENTICAL to [`generate_greedy`] (hence to the torch
+// oracle L4) by routing every decode GEMM through the SAME [`nn::linear_int8_dynamic`]
+// (m=1) the prefill uses — its ties-to-even activation quant avoids the rounding gap
+// the standalone `decoder::gemv_i8` (half-away) would introduce. The bespoke
+// prequant-fused `gemv_i8_bias` is a ledgered perf follow-on; correctness first.
+
+/// One decoder layer's full-causal KV cache: post-RoPE **K** and post-proj **V**,
+/// token-major `[n_kv, qkv_dim]`, grown by one row per decode step. NOT R-SWA — GOT
+/// Qwen2 attends the whole prefix (no window, no eviction, f32 KV).
+struct Qwen2KvCache {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    n_kv: usize,
+    qkv_dim: usize,
+}
+
+impl Qwen2KvCache {
+    fn new(qkv_dim: usize, max_positions: usize) -> Self {
+        Self {
+            k: Vec::with_capacity(max_positions * qkv_dim),
+            v: Vec::with_capacity(max_positions * qkv_dim),
+            n_kv: 0,
+            qkv_dim,
+        }
+    }
+    /// Seed all `N` prefill rows at once (`k_all`/`v_all` are `[N, qkv_dim]`).
+    fn seed(&mut self, k_all: &[f32], v_all: &[f32]) {
+        self.k.extend_from_slice(k_all);
+        self.v.extend_from_slice(v_all);
+        self.n_kv += k_all.len() / self.qkv_dim;
+    }
+    /// Append one decode step's k/v row (each `[qkv_dim]`).
+    fn append(&mut self, k_row: &[f32], v_row: &[f32]) {
+        self.k.extend_from_slice(k_row);
+        self.v.extend_from_slice(v_row);
+        self.n_kv += 1;
+    }
+}
+
+/// Full-causal m=1 attention: the single new query (`q_row`, `[qkv_dim]`) attends
+/// ALL `n_kv` cached keys (every cached position ≤ the current one, so `causal=false`
+/// is exactly the last-row causal mask). Repacks token-major K/V → head-major and
+/// runs [`nn::sdpa`] at `seq_q=1`, scale `1/√head_dim` = 1/8. O(n_kv) per step.
+fn qwen2_decode_attention(
+    cache: &Qwen2KvCache,
+    q_row: &[f32],
+    num_heads: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let n_kv = cache.n_kv;
+    let dim = num_heads * head_dim;
+    let span = n_kv * head_dim;
+    let mut kh = vec![0.0f32; num_heads * span];
+    let mut vh = vec![0.0f32; num_heads * span];
+    for r in 0..n_kv {
+        for h in 0..num_heads {
+            let src = r * dim + h * head_dim;
+            let dst = h * span + r * head_dim;
+            kh[dst..dst + head_dim].copy_from_slice(&cache.k[src..src + head_dim]);
+            vh[dst..dst + head_dim].copy_from_slice(&cache.v[src..src + head_dim]);
+        }
+    }
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    // q_row is already head-major for a single token (contiguous head blocks); ctx
+    // comes back head-major = token-major for one row.
+    nn::sdpa(
+        q_row, &kh, &vh, num_heads, 1, n_kv, head_dim, head_dim, scale, false,
+    )
+}
+
+/// One layer's decode weights, loaded ONCE (int8 GEMMs read verbatim from the
+/// `.focrq` `QInt8PerChan` records, f32 norms/biases) so no weight is re-read per token.
+struct GotLayerW {
+    input_ln: Vec<f32>,
+    post_attn_ln: Vec<f32>,
+    q: QInt8,
+    k: QInt8,
+    v: QInt8,
+    o: QInt8,
+    gate: QInt8,
+    up: QInt8,
+    down: QInt8,
+    q_b: Vec<f32>,
+    k_b: Vec<f32>,
+    v_b: Vec<f32>,
+}
+
+/// The whole GOT decoder's decode-time weights (pre-loaded once for a generation).
+struct GotDecodeWeights {
+    layers: Vec<GotLayerW>,
+    final_norm: Vec<f32>,
+    embed: Vec<f32>,
+    cfg: DecoderConfig,
+}
+
+impl GotDecodeWeights {
+    fn build(weights: &Weights, cfg: &DecoderConfig) -> FocrResult<Self> {
+        let (hidden, qkv_dim, inter) = (cfg.hidden_size, cfg.qkv_dim(), cfg.intermediate_size);
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        for l in 0..cfg.num_hidden_layers {
+            let p = format!("model.layers.{l}");
+            layers.push(GotLayerW {
+                input_ln: weights.vec(&format!("{p}.input_layernorm.weight"))?,
+                post_attn_ln: weights.vec(&format!("{p}.post_attention_layernorm.weight"))?,
+                q: decoder::quant_oc_loaded(
+                    weights,
+                    &format!("{p}.self_attn.q_proj.weight"),
+                    qkv_dim,
+                )?,
+                k: decoder::quant_oc_loaded(
+                    weights,
+                    &format!("{p}.self_attn.k_proj.weight"),
+                    qkv_dim,
+                )?,
+                v: decoder::quant_oc_loaded(
+                    weights,
+                    &format!("{p}.self_attn.v_proj.weight"),
+                    qkv_dim,
+                )?,
+                o: decoder::quant_oc_loaded(
+                    weights,
+                    &format!("{p}.self_attn.o_proj.weight"),
+                    hidden,
+                )?,
+                gate: decoder::quant_oc_loaded(
+                    weights,
+                    &format!("{p}.mlp.gate_proj.weight"),
+                    inter,
+                )?,
+                up: decoder::quant_oc_loaded(weights, &format!("{p}.mlp.up_proj.weight"), inter)?,
+                down: decoder::quant_oc_loaded(
+                    weights,
+                    &format!("{p}.mlp.down_proj.weight"),
+                    hidden,
+                )?,
+                q_b: weights.vec(&format!("{p}.self_attn.q_proj.bias"))?,
+                k_b: weights.vec(&format!("{p}.self_attn.k_proj.bias"))?,
+                v_b: weights.vec(&format!("{p}.self_attn.v_proj.bias"))?,
+            });
+        }
+        Ok(Self {
+            layers,
+            final_norm: weights.vec("model.norm.weight")?,
+            embed: weights.mat("model.embed_tokens.weight")?.data,
+            cfg: *cfg,
+        })
+    }
+}
+
+/// Seeding prefill: run all `N` positions through the layers (BIT-IDENTICAL to
+/// [`forward_prefill`] — same `linear_int8_dynamic` kernel), capturing each layer's
+/// post-RoPE K + post-proj V into `caches`, and return the **last-position** logits.
+fn forward_prefill_seed(
+    w: &GotDecodeWeights,
+    inputs_embeds: &Mat,
+    caches: &mut [Qwen2KvCache],
+) -> FocrResult<Vec<f32>> {
+    let cfg = &w.cfg;
+    let eps = cfg.rms_norm_eps;
+    let mut x = inputs_embeds.clone();
+    let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
+    let rope = decoder::RopeTable::build(&positions, cfg.head_dim, cfg.rope_theta);
+    for (l, cl) in w.layers.iter().enumerate() {
+        let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+        let mut q = nn::linear_int8_dynamic(&normed, &cl.q, Some(&cl.q_b))?;
+        let mut k = nn::linear_int8_dynamic(&normed, &cl.k, Some(&cl.k_b))?;
+        let v = nn::linear_int8_dynamic(&normed, &cl.v, Some(&cl.v_b))?;
+        decoder::apply_rope(&mut q, &rope)?;
+        decoder::apply_rope(&mut k, &rope)?;
+        caches[l].seed(&k.data, &v.data); // the very K/V prefill_attention consumes
+        let ctx = decoder::prefill_attention(&q, &k, &v, cfg.num_attention_heads, cfg.head_dim)?;
+        let attn = nn::linear_int8_dynamic(&ctx, &cl.o, None)?;
+        let h = decoder::add_residual(&x, &attn)?;
+        let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+        let mlp = decoder::expert_mlp_i8(&normed2, &cl.gate, &cl.up, &cl.down)?;
+        x = decoder::add_residual(&h, &mlp)?;
+    }
+    let logits = decoder::norm_and_lm_head(&x, &w.final_norm, &w.embed, cfg.vocab_size, eps)?;
+    Ok(logits.data[(logits.rows - 1) * cfg.vocab_size..].to_vec())
+}
+
+/// One decode step over a single token embedding `x: [1, hidden]` at absolute
+/// `position`, appending to `caches`. Returns the `[vocab]` next-token logits.
+fn qwen2_decode_step(
+    w: &GotDecodeWeights,
+    caches: &mut [Qwen2KvCache],
+    x: &Mat,
+    position: usize,
+) -> FocrResult<Vec<f32>> {
+    let cfg = &w.cfg;
+    let (qkv_dim, eps) = (cfg.qkv_dim(), cfg.rms_norm_eps);
+    let rope = decoder::RopeTable::build(&[position], cfg.head_dim, cfg.rope_theta);
+    let mut x = x.clone();
+    for (l, cl) in w.layers.iter().enumerate() {
+        let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+        let mut q = nn::linear_int8_dynamic(&normed, &cl.q, Some(&cl.q_b))?;
+        let mut k = nn::linear_int8_dynamic(&normed, &cl.k, Some(&cl.k_b))?;
+        let v = nn::linear_int8_dynamic(&normed, &cl.v, Some(&cl.v_b))?;
+        decoder::apply_rope(&mut q, &rope)?;
+        decoder::apply_rope(&mut k, &rope)?;
+        caches[l].append(&k.data, &v.data);
+        let ctx =
+            qwen2_decode_attention(&caches[l], &q.data, cfg.num_attention_heads, cfg.head_dim);
+        let ctx = Mat::from_vec(1, qkv_dim, ctx);
+        let attn = nn::linear_int8_dynamic(&ctx, &cl.o, None)?;
+        let h = decoder::add_residual(&x, &attn)?;
+        let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+        let mlp = decoder::expert_mlp_i8(&normed2, &cl.gate, &cl.up, &cl.down)?;
+        x = decoder::add_residual(&h, &mlp)?;
+    }
+    let logits = decoder::norm_and_lm_head(&x, &w.final_norm, &w.embed, cfg.vocab_size, eps)?;
+    Ok(logits.data)
+}
+
+/// **O(n)-per-token** greedy decode: identical id-stream to [`generate_greedy`] but
+/// with a full-causal KV cache instead of re-running prefill each step. The bit-for-bit
+/// equality is enforced by reusing [`nn::linear_int8_dynamic`] for every GEMM (the
+/// prefill kernel), so the decode never diverges from the certified path.
+///
+/// # Errors
+/// Any prefill/decode-step error, or a missing `model.embed_tokens.weight`.
+pub fn generate_greedy_kvcache(
+    weights: &Weights,
+    cfg: &DecoderConfig,
+    inputs_embeds: &Mat,
+    max_new: usize,
+    eos: u32,
+) -> FocrResult<Vec<u32>> {
+    let w = GotDecodeWeights::build(weights, cfg)?;
+    let n = inputs_embeds.rows;
+    let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
+        .map(|_| Qwen2KvCache::new(cfg.qkv_dim(), n + max_new))
+        .collect();
+    let last_logits = forward_prefill_seed(&w, inputs_embeds, &mut caches)?;
+    let mut ids = Vec::new();
+    let mut next = argmax(&last_logits) as u32;
+    for _ in 0..max_new {
+        ids.push(next);
+        if next == eos {
+            break;
+        }
+        let te = decoder::embed_tokens(&w.embed, cfg.vocab_size, cfg.hidden_size, &[next])?;
+        // the new token occupies the position after every currently-cached row.
+        let position = caches[0].n_kv;
+        let logits = qwen2_decode_step(&w, &mut caches, &te, position)?;
+        next = argmax(&logits) as u32;
+    }
+    Ok(ids)
+}
+
+/// Argmax over a logit row (first max on ties) — the shared greedy pick.
+fn argmax(v: &[f32]) -> usize {
+    v.iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+            if x > bv { (i, x) } else { (bi, bv) }
+        })
+        .0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -466,6 +730,35 @@ mod tests {
             ids,
             vec![9707, 38, 1793, 12],
             "greedy ids diverged from the torch oracle L4"
+        );
+    }
+
+    /// **B9 — the O(n) KV-cache decode reproduces the oracle L4** (transitively ==
+    /// the certified `generate_greedy`, since it's held bit-identical by reusing the
+    /// prefill's `linear_int8_dynamic` kernel). Runs 8 tokens — FAST here because the
+    /// cache makes each step O(n_kv), unlike the re-prefill path. Env-gated.
+    #[test]
+    fn kvcache_greedy_matches_oracle_l4() {
+        let (Ok(model), Ok(h0)) = (
+            std::env::var("FOCR_GOT_MODEL"),
+            std::env::var("FOCR_ORACLE_HIDDEN0"),
+        ) else {
+            return;
+        };
+        let cfg = DecoderConfig::got_ocr2();
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load GOT weights");
+        let h0_flat = read_f32_le(&h0);
+        let n = h0_flat.len() / cfg.hidden_size;
+        let inputs = Mat::from_vec(n, cfg.hidden_size, h0_flat);
+
+        let ids =
+            generate_greedy_kvcache(&weights, &cfg, &inputs, 8, 151_645).expect("kvcache gen");
+        eprintln!("[B9 kvcache] first ids = {ids:?}");
+        // == the torch oracle greedy L4 prefix (oracle_fixtures.json l4_greedy_decode_ids).
+        assert_eq!(
+            ids,
+            vec![9707, 38, 1793, 12, 93495, 17, 13, 15],
+            "KV-cache decode diverged from the torch oracle L4"
         );
     }
 }
