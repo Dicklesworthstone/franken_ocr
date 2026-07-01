@@ -737,14 +737,16 @@ impl OcrModel {
         let t = std::time::Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.got_tokenizer()?;
-        // The greedy AR loop re-runs prefill per token (correct, O(n²)); the model
-        // stops at <|im_end|>. Cap length defensively (config max_new_tokens 4096).
+        // O(n) KV-cache greedy decode (B9); the model stops at <|im_end|>. Cap length
+        // defensively (config max_new_tokens 4096). Plain-OCR mode (format=false); the
+        // `OCR with format:` .mmd mode is a library capability pending a CLI flag.
         let text = got::recognize(
             &self.weights,
             tk,
             img,
             self.arch().vision_tower_prefix(),
             4096,
+            false,
         )?;
         timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
         Ok((text, w, h))

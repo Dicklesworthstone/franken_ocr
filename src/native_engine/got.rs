@@ -83,30 +83,31 @@ pub fn build_inputs_embeds(
     Ok(inputs_embeds)
 }
 
-/// Build the GOT plain-OCR prompt id-stream (the `ocr_type != "format"` path of
-/// `GOTQwenForCausalLM.chat`): the MPT system turn, the `<img><imgpad>×256</img>`
-/// image splice, the `OCR: ` instruction, and the assistant role marker. Encoded
-/// with all specials enabled — token-id-EXACT to the torch oracle's 287-id
+/// Build the GOT OCR prompt id-stream (`GOTQwenForCausalLM.chat`): the MPT system
+/// turn, the `<img><imgpad>×256</img>` image splice, the instruction, and the
+/// assistant role marker. `format=false` → `OCR: ` (plain text); `format=true` →
+/// `OCR with format: ` (the layout/LaTeX/table `.mmd` mode). Encoded with all
+/// specials enabled — the plain form is token-id-EXACT to the torch oracle's 287-id
 /// `l0c_prompt_ids` (proven by `tiktoken::tests::prompt_id_oracle_cross_check`).
 ///
 /// # Errors
 /// A tokenizer encode error (impossible for this fixed ASCII prompt).
-pub fn plain_ocr_prompt_ids(tk: &Tiktoken) -> FocrResult<Vec<u32>> {
+pub fn ocr_prompt_ids(tk: &Tiktoken, format: bool) -> FocrResult<Vec<u32>> {
     let system = "<|im_start|>system\n        You should follow the instructions carefully and explain your answers in detail.";
     let imgpad = "<imgpad>".repeat(IMAGE_TOKEN_LEN);
+    let instruction = if format { "OCR with format: " } else { "OCR: " };
     let prompt = format!(
-        "{system}<|im_end|><|im_start|>user\n<img>{imgpad}</img>\nOCR: <|im_end|><|im_start|>assistant\n"
+        "{system}<|im_end|><|im_start|>user\n<img>{imgpad}</img>\n{instruction}<|im_end|><|im_start|>assistant\n"
     );
     tk.encode(&prompt)
 }
 
 /// End-to-end GOT-OCR2 recognition: squash-bicubic-1024/CLIP preprocess → SAM
-/// vision + connector + `<imgpad>` splice → Qwen2 dense decoder greedy generation →
-/// tiktoken decode (specials stripped). `prefix` is the arch's vision-tower tensor
-/// prefix (`model.vision_tower_high`); `max_new` caps the generated length.
-///
-/// The generation is the correct, unoptimized O(n²) prefill-per-step path (the
-/// KV-cache decode-step is the perf follow-on); it stops early at `<|im_end|>`.
+/// vision + connector + `<imgpad>` splice → Qwen2 dense decoder greedy generation
+/// (the O(n) KV-cache decode) → tiktoken decode (specials stripped). `prefix` is the
+/// arch's vision-tower tensor prefix (`model.vision_tower_high`); `max_new` caps the
+/// generated length; `format` selects plain vs `OCR with format:` (.mmd) mode. Stops
+/// early at `<|im_end|>`.
 ///
 /// # Errors
 /// A preprocess, vision, decode, or tokenizer error.
@@ -116,9 +117,10 @@ pub fn recognize(
     img: &DynamicImage,
     prefix: &str,
     max_new: usize,
+    format: bool,
 ) -> FocrResult<String> {
     let image = preprocess::got_view_tensor(img);
-    let prompt_ids = plain_ocr_prompt_ids(tk)?;
+    let prompt_ids = ocr_prompt_ids(tk, format)?;
     let inputs_embeds = build_inputs_embeds(weights, &image, &prompt_ids, prefix)?;
     let cfg = DecoderConfig::got_ocr2();
     // The O(n)-per-token KV-cache decode (B9) — bit-identical to the certified
@@ -143,6 +145,72 @@ fn transpose(m: &Mat) -> Mat {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **B11 — the committed GOT `focr ocr` e2e regression gate.** Runs the WHOLE
+    /// pipeline (preprocess → vision → splice → KV-cache decode → tiktoken) on the
+    /// committed `sample_text.png` and asserts the exact golden text (the forward is
+    /// int8-bit-deterministic). Env-gated: `FOCR_GOT_MODEL` (the got-ocr2 weights) +
+    /// `FOCR_GOT_TIKTOKEN` (qwen.tiktoken); skip-with-success when absent. Fast now
+    /// that generation is O(n) (B9 KV cache).
+    #[test]
+    fn recognize_reads_the_sample_image_e2e() {
+        let (Ok(model), Ok(tkp)) = (
+            std::env::var("FOCR_GOT_MODEL"),
+            std::env::var("FOCR_GOT_TIKTOKEN"),
+        ) else {
+            return;
+        };
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load GOT weights");
+        let tk = Tiktoken::from_qwen_tiktoken(&std::fs::read(&tkp).expect("qwen.tiktoken"))
+            .expect("tiktoken");
+        let img = image::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/sample_text.png"
+        ))
+        .expect("sample image");
+
+        let text = recognize(&weights, &tk, &img, "model.vision_tower_high", 64, false)
+            .expect("recognize");
+        eprintln!("[B11 e2e] {text:?}");
+        assert_eq!(
+            text,
+            "HelloGOT-OCR2.0 Thequickbrownfaxjumps overthelazydog. 1234567890+=% Invoice#A-4217Total:$1,234.56",
+            "GOT e2e OCR output regressed"
+        );
+    }
+
+    /// **B7 — the `OCR with format:` (.mmd) prompt swaps only the instruction.** Fast
+    /// (tokenizer only, env-gated on `FOCR_GOT_TIKTOKEN`). The plain form is the
+    /// certified 287-id L0c stream; format adds 2 ids (`OCR: `→`OCR with format: `).
+    #[test]
+    fn format_prompt_swaps_the_instruction() {
+        let Ok(tkp) = std::env::var("FOCR_GOT_TIKTOKEN") else {
+            return;
+        };
+        let tk = Tiktoken::from_qwen_tiktoken(&std::fs::read(&tkp).expect("qwen.tiktoken"))
+            .expect("tiktoken");
+        let plain = ocr_prompt_ids(&tk, false).unwrap();
+        let fmt = ocr_prompt_ids(&tk, true).unwrap();
+        assert_eq!(plain.len(), 287, "plain L0c prompt is 287 ids");
+        assert_eq!(
+            fmt.len(),
+            289,
+            "format adds 2 ids (OCR: -> OCR with format: )"
+        );
+        assert_eq!(
+            plain.iter().filter(|&&i| i == IMG_PAD_ID).count(),
+            IMAGE_TOKEN_LEN
+        );
+        assert_eq!(
+            fmt.iter().filter(|&&i| i == IMG_PAD_ID).count(),
+            IMAGE_TOKEN_LEN
+        );
+        // the "OCR with format: " instruction tokenizes to these ids (from L0a corpus).
+        assert!(
+            fmt.windows(5).any(|w| w == [93495, 448, 3561, 25, 220]),
+            "format instruction ids missing"
+        );
+    }
 
     /// **B3 — the GOT vision/connector/splice parity gate.** Env-gated: `FOCR_GOT_MODEL`
     /// = the got-ocr2 weights (`.focrq` or safetensors — vision is HP either way),
