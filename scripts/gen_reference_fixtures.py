@@ -7,12 +7,16 @@ anything. This is a deliberate, human-run, out-of-band step whose only job is to
 freeze the reference model's behavior into files the Rust conformance tests
 compare against.
 
-It CANNOT run on a machine without a CUDA GPU and the 6.67 GB weights — per
-plan OQ-17 (docs/truth-pack/oq/preprocess-infer.md) the official `model.infer()`
-path hard-codes `.cuda()` + `torch.autocast("cuda", dtype=bfloat16)`, so the
-CORRECTNESS oracle is GPU-only. A CPU-patched run is a SEPARATE step that must
-first be PROVEN to reproduce the GPU oracle's tokens within the nondeterminism
-floor; the golden fixtures (correctness) never depend on CPU HF.
+It CANNOT run as the CORRECTNESS oracle on a machine without a CUDA GPU and the
+6.67 GB weights — per plan OQ-17 (docs/truth-pack/oq/preprocess-infer.md) the
+official `model.infer()` path hard-codes `.cuda()` +
+`torch.autocast("cuda", dtype=bfloat16)`, so the CORRECTNESS oracle is GPU-only.
+A CPU-patched run (`--device cpu --cpu-patch`, the same shims
+scripts/baseline/run_baidu_reference.py proved on the 20-page corpus) is a
+SEPARATE step that must first be PROVEN to reproduce the GPU oracle's tokens
+within the nondeterminism floor; its provenance records
+`oracle_is_correctness_golden: false` and the golden fixtures (correctness)
+never depend on CPU HF.
 
 WHAT THIS DOES
 --------------
@@ -33,8 +37,16 @@ WHAT THIS DOES
      b. With forward hooks, capture PER-STAGE activations at the seams the Rust
         engine is unit-tested against — DeepEncoder (SAM out, CLIP out,
         projector-1280), decoder per-layer hidden states, and lm_head logits —
-        and dump each as a .npy under <out>/activations/<doc>/<stage>.npy for
-        bit-/tolerance-level differential tests.
+        PLUS the seam INPUTS the ladder needs to isolate the remaining rungs
+        (bd-3s7v): `sam_input` (the exact preprocessed tensor entering SAM;
+        unlocks L0-exact and SAM/CLIP isolation) and `inputs_embeds` (the
+        post-splice hidden entering decoder layer 0; unlocks decoder-from-embeds
+        isolation) — and dump each as a .npy under
+        <out>/activations/<doc>/<stage>.npy for bit-/tolerance-level
+        differential tests.
+     c. Wrap model.generate to freeze the decoded TOKEN-ID stream + decode
+        metadata into the golden JSON (`token_stream`, bd-3s7v) — the L4
+        exact-token bar — without changing any generate() argument.
 
 4. Record provenance alongside every artifact: model sha256, the pinned HF
    commit, torch/transformers versions, generation config, and a timestamp, so a
@@ -211,6 +223,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "CUDA-only; a non-cuda value is allowed ONLY for the separate, "
         "must-be-proven CPU-equivalence experiment, never for golden fixtures.",
     )
+    p.add_argument(
+        "--cpu-patch",
+        action="store_true",
+        help="Monkeypatch the reference's hard-coded .cuda()/autocast('cuda') "
+        "to no-ops so infer() runs with --device cpu (the separate "
+        "CPU-equivalence path, OQ-17; provenance stays "
+        "oracle_is_correctness_golden=false). Same shims "
+        "scripts/baseline/run_baidu_reference.py proved on the 20-page corpus. "
+        "Rejected with --device cuda.",
+    )
     return p.parse_args(argv)
 
 
@@ -251,6 +273,38 @@ def _assert_pinned_stack() -> tuple[Any, Any]:
             "docs/truth-pack/PINNED_SOURCES.md."
         )
     return torch, transformers
+
+
+def _install_cpu_patches(torch: Any) -> None:
+    """Make the CUDA-hard-coded `infer()` runnable on CPU (--cpu-patch only).
+
+    The reference modeling code calls `.cuda()` and `torch.autocast("cuda",
+    dtype=bfloat16)` unconditionally (OQ-17). These are the exact shims
+    scripts/baseline/run_baidu_reference.py used for the proven CPU baseline:
+    `.cuda()` becomes identity, the cuda autocast becomes a nullcontext (the
+    graph stays in the loaded bf16 dtype), and CUDA is reported unavailable so
+    flash-attn style branches stay off.
+    """
+    import contextlib  # noqa: WPS433 (only needed on the patched path)
+
+    torch.Tensor.cuda = lambda self, *a, **k: self
+    _orig_autocast = torch.autocast
+
+    class _AutocastShim(contextlib.AbstractContextManager):
+        def __init__(self, device_type: str, *a: Any, **k: Any):
+            if device_type == "cuda":
+                self._cm: Any = contextlib.nullcontext()
+            else:
+                self._cm = _orig_autocast(device_type, *a, **k)
+
+        def __enter__(self) -> Any:
+            return self._cm.__enter__()
+
+        def __exit__(self, *exc: Any) -> Any:
+            return self._cm.__exit__(*exc)
+
+    torch.autocast = _AutocastShim
+    torch.cuda.is_available = lambda: False
 
 
 def _resolve_model_dir(cli_dir: Path | None) -> Path:
@@ -342,6 +396,15 @@ class ActivationCapture:
       - model.layers[i]     -> per-decoder-layer hidden states (SPEC-070..072)
       - lm_head             -> logits            (SPEC-081)
 
+    Seam INPUTS (forward_pre_hooks, bd-3s7v) — the tensors the parity ladder
+    needs to ISOLATE the seams the output dumps alone cannot:
+      - sam_input     : the exact preprocessed tensor entering model.sam_model
+                        (L0-exact; vision_sam::forward(sam_input) -> sam_output;
+                        vision_clip::forward(sam_input, sam_output) -> clip_output)
+      - inputs_embeds : the post-splice hidden entering model.layers[0] on the
+                        PREFILL pass (embedding + vision masked_scatter already
+                        applied; decoder::forward(inputs_embeds) -> final hidden)
+
     `infer()` calls `generate()`, which runs many forward passes (one prefill +
     one per generated token). We only want the prefill activations (the seam the
     Rust unit tests target), so every hook records the FIRST call whose primary
@@ -385,12 +448,53 @@ class ActivationCapture:
             return lhs
         return None
 
+    @staticmethod
+    def _primary_input(args: Any, kwargs: Any) -> Any | None:
+        """Pull the load-bearing tensor out of a pre-hook's `(args, kwargs)`.
+
+        The reference calls SAM positionally with the pixel tensor and the
+        decoder layers with `hidden_states` (positionally or by keyword), so
+        scan positional args first, then the `hidden_states` kwarg, then any
+        tensor kwarg.
+        """
+        import torch as _t  # local alias only for isinstance checks
+
+        for a in args or ():
+            if isinstance(a, _t.Tensor):
+                return a
+        if kwargs:
+            hs = kwargs.get("hidden_states")
+            if isinstance(hs, _t.Tensor):
+                return hs
+            for v in kwargs.values():
+                if isinstance(v, _t.Tensor):
+                    return v
+        return None
+
     def _store_once(self, stage: str, tensor: Any) -> None:
         if stage in self._captured:
             return
         self._captured[stage] = self._to_numpy(tensor)
 
     # --- hook factories --------------------------------------------------------
+    def _make_input_hook(
+        self, stage: str, *, prefill_only: bool = False
+    ) -> Callable[..., None]:
+        """forward_pre_hook capturing a module's INPUT tensor (bd-3s7v)."""
+
+        def hook(_module: Any, args: Any, kwargs: Any = None) -> None:
+            t = self._primary_input(args, kwargs)
+            if t is None:
+                return
+            # Decoder pre-hooks must skip the seq_len == 1 decode steps (same
+            # gate as the layer OUTPUT hooks); vision inputs have no causal seq
+            # dim, so they record the first invocation only.
+            if prefill_only and not (t.dim() >= 2 and t.shape[-2] > 1):
+                return
+            self._store_once(stage, t)
+
+        return hook
+
     def _make_stage_hook(self, stage: str) -> Callable[..., None]:
         def hook(_module: Any, _inp: Any, out: Any) -> None:
             t = self._primary_tensor(out)
@@ -437,6 +541,11 @@ class ActivationCapture:
         sam = getattr(inner, "sam_model", None)
         if sam is not None:
             self._handles.append(
+                sam.register_forward_pre_hook(
+                    self._make_input_hook("sam_input"), with_kwargs=True
+                )
+            )
+            self._handles.append(
                 sam.register_forward_hook(self._make_stage_hook("sam_output"))
             )
         clip = getattr(inner, "vision_model", None)
@@ -454,6 +563,15 @@ class ActivationCapture:
         layers = getattr(inner, "layers", None)
         if layers is not None:
             for idx, layer in enumerate(layers):
+                if idx == 0:
+                    # The post-splice hidden entering layer 0 == the decoder's
+                    # inputs_embeds (embedding + vision masked_scatter applied).
+                    self._handles.append(
+                        layer.register_forward_pre_hook(
+                            self._make_input_hook("inputs_embeds", prefill_only=True),
+                            with_kwargs=True,
+                        )
+                    )
                 self._handles.append(
                     layer.register_forward_hook(self._make_layer_hook(idx))
                 )
@@ -498,6 +616,134 @@ class ActivationCapture:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Token-stream capture (bd-3s7v) — the L4 exact-token bar.
+# ─────────────────────────────────────────────────────────────────────────────
+class TokenStreamCapture:
+    """Wrap `model.generate` to freeze the token-id stream + decode metadata.
+
+    `infer()` calls `generate()` exactly once per document with `input_ids`
+    (the prompt, image-pad tokens included) and receives the FULL sequence ids
+    back; recording both sides gives L4 its exact greedy token bar without
+    re-deriving ids from decoded text (lossy under the stop-string strip). The
+    wrapper passes every argument through UNCHANGED — the decode itself is
+    untouched.
+    """
+
+    # JSON-safe scalars copied verbatim into decode metadata when present.
+    _META_KWARGS = (
+        "max_length",
+        "max_new_tokens",
+        "do_sample",
+        "temperature",
+        "eos_token_id",
+        "pad_token_id",
+        "no_repeat_ngram_size",
+        "use_cache",
+    )
+
+    def __init__(self, torch: Any, model: Any):
+        self.torch = torch
+        self.model = model
+        self._orig: Any = None
+        self.calls: list[dict[str, Any]] = []
+
+    def _ids(self, t: Any) -> list[int] | None:
+        if not isinstance(t, self.torch.Tensor):
+            return None
+        arr = t.detach().to("cpu")
+        if arr.dim() == 2:  # [batch, seq] — infer() always runs batch 1
+            arr = arr[0]
+        return [int(x) for x in arr.tolist()]
+
+    def register(self) -> None:
+        self._orig = self.model.generate
+
+        def wrapped(*g_args: Any, **g_kwargs: Any) -> Any:
+            out = self._orig(*g_args, **g_kwargs)
+            record: dict[str, Any] = {
+                "prompt_ids": self._ids(g_kwargs.get("input_ids")),
+                "generate_kwargs": {
+                    k: g_kwargs[k]
+                    for k in self._META_KWARGS
+                    if k in g_kwargs
+                    and isinstance(g_kwargs[k], (bool, int, float, str, type(None)))
+                },
+                # infer() routes the sliding-window ngram blocker through a
+                # custom LogitsProcessor, invisible in the kwarg scalars.
+                "has_logits_processor": "logits_processor" in g_kwargs,
+            }
+            mask = g_kwargs.get("images_seq_mask")
+            if isinstance(mask, self.torch.Tensor):
+                record["images_seq_mask_true_count"] = int(mask.sum().item())
+            seq = out.sequences if hasattr(out, "sequences") else out
+            record["full_sequence_ids"] = self._ids(seq)
+            self.calls.append(record)
+            return out
+
+        self.model.generate = wrapped
+
+    def remove(self) -> None:
+        if self._orig is not None:
+            self.model.generate = self._orig
+            self._orig = None
+
+    def golden_block(self) -> dict[str, Any] | None:
+        """The `token_stream` block for the golden JSON. `None` if generate()
+        never ran (a loud absence — the golden then shows the decode was never
+        reached, not an empty stream)."""
+        if not self.calls:
+            return None
+        call = self.calls[0]
+        prompt = call.get("prompt_ids")
+        full = call.get("full_sequence_ids")
+        generated: list[int] | None = None
+        if (
+            full is not None
+            and prompt is not None
+            and full[: len(prompt)] == prompt
+        ):
+            generated = full[len(prompt) :]
+
+        def _sha(ids: list[int] | None) -> str | None:
+            # Over the compact JSON list ("[1,2,3]") — platform/endian-neutral.
+            if ids is None:
+                return None
+            return hashlib.sha256(
+                json.dumps(ids, separators=(",", ":")).encode("ascii")
+            ).hexdigest()
+
+        return {
+            "schema_version": 1,
+            "captured_from": "model.generate wrapper (ids as returned; prompt = input_ids kwarg)",
+            "n_generate_calls": len(self.calls),
+            "prompt_ids": prompt,
+            "n_prompt": len(prompt) if prompt is not None else None,
+            "generated_ids": generated,
+            "n_generated": len(generated) if generated is not None else None,
+            "n_full": len(full) if full is not None else None,
+            "prompt_ids_sha256": _sha(prompt),
+            "generated_ids_sha256": _sha(generated),
+            "ids_sha256_domain": "sha256 over json.dumps(ids, separators=(',', ':'))",
+            "decode_metadata": {
+                k: call[k]
+                for k in (
+                    "generate_kwargs",
+                    "has_logits_processor",
+                    "images_seq_mask_true_count",
+                )
+                if k in call
+            },
+        }
+
+    def __enter__(self) -> "TokenStreamCapture":
+        self.register()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.remove()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Per-document oracle run
 # ─────────────────────────────────────────────────────────────────────────────
 def _list_corpus(corpus: Path) -> list[Path]:
@@ -509,7 +755,11 @@ def _list_corpus(corpus: Path) -> list[Path]:
     docs = sorted(
         p
         for p in corpus.iterdir()
-        if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES
+        if p.is_file()
+        and p.suffix.lower() in IMAGE_SUFFIXES
+        # Skip hidden files — macOS writes AppleDouble sidecars ("._page.png",
+        # not decodable images) next to every file on external volumes.
+        and not p.name.startswith(".")
     )
     if not docs:
         raise SystemExit(
@@ -555,6 +805,10 @@ def _run_one(
     if want_activations:
         capture = ActivationCapture(torch, model)
         capture.register()
+    # Token stream is captured on EVERY run (not only --activations): it is part
+    # of the e2e golden record (the L4 bar) and costs nothing extra.
+    tokens = TokenStreamCapture(torch, model)
+    tokens.register()
 
     t0 = time.time()
     try:
@@ -578,9 +832,11 @@ def _run_one(
             save_results=True,
         )
     finally:
+        tokens.remove()
         if capture is not None:
             capture.remove()
     elapsed = time.time() - t0
+    token_stream = tokens.golden_block()
 
     # `infer` may return None (it primarily writes files). Capture decoded text
     # both from its return value and from the written result.md, preferring the
@@ -631,6 +887,10 @@ def _run_one(
         # NOT part of the comparison surface.
         "decoded_text": decoded_text,
         "decoded_text_sha256": decoded_text_sha256,
+        # The exact token-id stream generate() produced (bd-3s7v) — L4 compares
+        # the engine's greedy ids against this, id-for-id, over the §2
+        # reproducible prefix.
+        "token_stream": token_stream,
         "deterministic_replay": replay_contract,
         "result_md_present": md_text is not None,
         "activations": activations_manifest,
@@ -646,8 +906,10 @@ def _run_one(
         json.dumps(golden, indent=2, ensure_ascii=False, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    n_generated = (token_stream or {}).get("n_generated")
     print(
         f"[fixtures]   {doc.name}: {len(decoded_text or '')} chars, "
+        f"{n_generated} generated ids, "
         f"{len(activations_manifest)} activations, {elapsed:.1f}s "
         f"-> {golden_path}",
         file=sys.stderr,
@@ -657,6 +919,7 @@ def _run_one(
         "golden": golden_path.name,
         "decoded_text_sha256": golden["decoded_text_sha256"],
         "n_activations": len(activations_manifest),
+        "n_generated_ids": n_generated,
         "elapsed_seconds": round(elapsed, 4),
     }
 
@@ -673,6 +936,7 @@ def _build_provenance(
     prompt: str,
     mode: str,
     device: str,
+    cpu_patch: bool,
     max_length: int,
     determinism: dict[str, Any],
     command_argv: list[str],
@@ -723,6 +987,9 @@ def _build_provenance(
         "model_weights_bytes": weights.stat().st_size,
         "model_index_total_size": index_total,
         "device": device,
+        # True ⇒ infer() ran through the .cuda()/autocast no-op shims (the
+        # separate CPU-equivalence path) — never a correctness golden.
+        "cpu_patched_infer": cpu_patch,
         "cuda": cuda_info,
         "torch_version": torch.__version__,
         "transformers_version": transformers.__version__,
@@ -836,6 +1103,18 @@ def main(argv: list[str] | None = None) -> int:
     # 1. Assert the pinned oracle stack BEFORE touching anything expensive.
     torch, transformers = _assert_pinned_stack()
 
+    # 1b. The CPU-equivalence shims must be in place BEFORE the model loads
+    # (from_pretrained probes torch.cuda). Contradiction with --device cuda is
+    # refused loudly — the patch exists ONLY for the separate CPU experiment.
+    if args.cpu_patch:
+        if args.device == "cuda":
+            raise SystemExit(
+                "gen_reference_fixtures: --cpu-patch contradicts --device cuda; "
+                "the shims exist only for the separate CPU-equivalence run "
+                "(OQ-17), never for golden fixtures."
+            )
+        _install_cpu_patches(torch)
+
     # 2. Resolve + validate the model dir and corpus.
     model_dir = _resolve_model_dir(args.model_dir)
     docs = _list_corpus(args.corpus)
@@ -870,6 +1149,7 @@ def main(argv: list[str] | None = None) -> int:
         prompt=args.prompt,
         mode=args.mode,
         device=args.device,
+        cpu_patch=args.cpu_patch,
         max_length=args.max_length,
         determinism=determinism,
         command_argv=[sys.executable, *sys.argv],

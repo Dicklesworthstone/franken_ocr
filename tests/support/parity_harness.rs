@@ -517,7 +517,10 @@ impl FixtureLoader {
                 && path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with("_reference.json"))
+                    // Hidden files are never goldens — macOS writes AppleDouble
+                    // sidecars ("._<doc>_reference.json", not JSON) next to every
+                    // file on external volumes, where the off-repo fixtures live.
+                    .is_some_and(|n| n.ends_with("_reference.json") && !n.starts_with('.'))
             {
                 out.push(path);
             }
@@ -1498,6 +1501,53 @@ mod tests {
     }
 
     #[test]
+    fn golden_carries_bd3s7v_seam_inputs_and_token_stream() {
+        // The extended oracle dump (bd-3s7v) adds two seam-INPUT activations
+        // (sam_input, inputs_embeds) and a `token_stream` block to the golden.
+        // The loader must expose the inputs through the same manifest path the
+        // output seams use, and the token stream through `raw` (L4 reads it).
+        let raw = json!({
+            "doc": "page_0009.png",
+            "decoded_text": "<|det|>",
+            "decoded_text_sha256": "deadbeef",
+            "activations": {
+                "sam_input": { "file": "sam_input.npy", "shape": [1, 3, 1024, 1024],
+                               "dtype": "float32", "sha256": "aa",
+                               "file_sha256": "cc".repeat(32) },
+                "inputs_embeds": { "file": "inputs_embeds.npy", "shape": [1, 277, 1280],
+                                   "dtype": "float32", "sha256": "bb",
+                                   "file_sha256": "dd".repeat(32) }
+            },
+            "token_stream": {
+                "schema_version": 1,
+                "prompt_ids": [0, 128815, 128815, 1],
+                "n_prompt": 4,
+                "generated_ids": [128818, 1],
+                "n_generated": 2
+            },
+            "provenance": {
+                "hf_commit": HF_COMMIT,
+                "pinned_torch": PIN_TORCH,
+                "pinned_transformers": PIN_TRANSFORMERS
+            }
+        });
+        let g = FixtureLoader::golden_from_value(raw).expect("parse golden");
+        assert_eq!(g.activations["sam_input"].shape, vec![1, 3, 1024, 1024]);
+        assert_eq!(g.activations["inputs_embeds"].shape, vec![1, 277, 1280]);
+        assert!(
+            FixtureLoader::check_provenance(&g).is_ok(),
+            "pinned provenance resolves"
+        );
+        let stream = &g.raw["token_stream"];
+        assert_eq!(stream["n_generated"], json!(2));
+        assert_eq!(
+            stream["generated_ids"].as_array().map(Vec::len),
+            Some(2),
+            "generated token-id stream is reachable through raw (the L4 bar)"
+        );
+    }
+
+    #[test]
     fn golden_from_value_rejects_malformed_activation_shape() {
         let non_integer_dim = json!({
             "doc": "doc01.png",
@@ -1642,6 +1692,37 @@ mod tests {
         let loader = FixtureLoader::at("/nonexistent/franken_ocr/fixtures");
         assert!(!loader.any_present(), "absent root ⇒ no goldens present");
         assert!(loader.list_goldens().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fixture_loader_skips_hidden_sidecar_goldens() {
+        // macOS writes AppleDouble sidecars ("._<doc>_reference.json", not JSON)
+        // next to every file on external volumes — exactly where the off-repo
+        // oracle fixtures live. The loader must never treat one as a golden (it
+        // would surface as a FixtureParse error and fail a rung spuriously).
+        let root = std::env::temp_dir().join("franken_ocr_hidden_golden_test");
+        fs::create_dir_all(&root).expect("create fixture test root");
+        fs::write(
+            root.join("doc01_reference.json"),
+            b"{\"doc\":\"doc01.png\"}",
+        )
+        .expect("write golden");
+        fs::write(
+            root.join("._doc01_reference.json"),
+            b"\x00\x05\x16\x07not json",
+        )
+        .expect("write sidecar");
+        let loader = FixtureLoader::at(&root);
+        let goldens = loader.list_goldens().expect("list goldens");
+        assert_eq!(
+            goldens.len(),
+            1,
+            "only the real golden is listed, got {goldens:?}"
+        );
+        assert!(
+            goldens[0].file_name().and_then(|n| n.to_str()) == Some("doc01_reference.json"),
+            "the visible golden survives"
+        );
     }
 
     #[test]
