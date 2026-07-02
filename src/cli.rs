@@ -242,6 +242,14 @@ pub struct OcrRequestArgs {
     /// (`--model got-ocr2…`); a no-op for the default unlimited-ocr model.
     #[arg(long)]
     pub format: bool,
+    /// Task selector — convenience routing over the model zoo (`focr models`).
+    /// `ocr` (the default) is today's behavior, unchanged. The specialized tasks
+    /// are served by got-ocr2's `OCR with format:` mode, so they imply `--format`
+    /// (an explicit `--format` composes idempotently) and need a got-ocr2 model:
+    /// `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `describe` is
+    /// planned (smolvlm2) and fails clean today.
+    #[arg(long, value_enum, default_value_t = OcrTask::Ocr)]
+    pub task: OcrTask,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +307,7 @@ fn decode_overrides_from(request: &OcrRequest) -> native_engine::DecodeOverrides
 
 impl OcrRequestArgs {
     fn to_request(&self) -> FocrResult<OcrRequest> {
+        validate_task_selection(self.task, self.effective_model_spec().as_deref())?;
         Ok(OcrRequest {
             image: self.image.clone(),
             model: self.model.clone(),
@@ -309,9 +318,64 @@ impl OcrRequestArgs {
             temperature: non_negative_finite_f32("temperature", self.temperature)?,
             no_repeat_ngram: non_negative_u32("no-repeat-ngram", self.no_repeat_ngram)?,
             ngram_window: non_negative_u32("ngram-window", self.ngram_window)?,
-            format: self.format,
+            // `--format` and a format-implying `--task` compose OR-wise: an
+            // explicit `--format` wins / is idempotent alongside `--task`.
+            format: self.format || self.task.implies_got_format(),
         })
     }
+
+    /// The model spec this run would use, for CLI-level `--task` guidance ONLY:
+    /// the explicit `--model`, else the `FOCR_MODEL_PATH` env override, else
+    /// `None` — the engine's default resolution, which is always an
+    /// unlimited-ocr artifact (bd-3u6x).
+    fn effective_model_spec(&self) -> Option<PathBuf> {
+        self.model
+            .clone()
+            .or_else(|| std::env::var_os(crate::MODEL_PATH_ENV).map(PathBuf::from))
+    }
+}
+
+/// CLI-level `--task` feasibility check (best-effort: no model file is opened
+/// here — the engine's `.focrq` arch tag stays the real dispatcher).
+///
+/// * `describe` has no shipped model: fail clean (`NotImplemented`, the
+///   `convert --quant int4` precedent) naming the planned smolvlm2 model
+///   instead of silently running plain OCR.
+/// * a got-only task whose model spec is KNOWABLY not got-ocr2 (see
+///   [`model_spec_is_knowably_not_got`]) gets the pull/model guidance now,
+///   before any weights load.
+/// * an ambiguous explicit spec passes through: mislabeling would reject real
+///   got-ocr2 files, and `--format` is a documented no-op for non-GOT models.
+fn validate_task_selection(task: OcrTask, model_spec: Option<&Path>) -> FocrResult<()> {
+    if task == OcrTask::Describe {
+        return Err(FocrError::NotImplemented(
+            "--task describe (photo description/VQA) is planned for the smolvlm2 model; \
+             no shipped model serves it yet — see `focr models`"
+                .into(),
+        ));
+    }
+    if task.implies_got_format() && model_spec_is_knowably_not_got(model_spec) {
+        return Err(FocrError::Usage(format!(
+            "--task {task} needs the got-ocr2 model, but this run would use the plain-text \
+             unlimited-ocr model. Run `focr pull got-ocr2`, then re-run with \
+             `--model got-ocr2.int8.focrq` (see `focr models`)"
+        )));
+    }
+    Ok(())
+}
+
+/// True when the model spec is KNOWABLY not a got-ocr2 artifact: no spec at all
+/// (the default resolution is always unlimited-ocr) or a file name carrying
+/// `unlimited`. A name carrying `got` — or naming neither family — passes.
+fn model_spec_is_knowably_not_got(spec: Option<&Path>) -> bool {
+    let Some(path) = spec else {
+        return true;
+    };
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    let name = name.to_string_lossy().to_ascii_lowercase();
+    name.contains("unlimited") && !name.contains("got")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -327,6 +391,62 @@ impl std::fmt::Display for CropMode {
         f.write_str(match self {
             Self::Gundam => "gundam",
             Self::Base => "base",
+        })
+    }
+}
+
+/// `--task` selector: route a run to the model/mode serving that task (the
+/// model-zoo convenience surface, bd-3jo6.1.5). Values mirror the registry's
+/// task names (`focr models`); the engine's `.focrq` arch tag stays the real
+/// dispatcher — this only picks the prompt mode and validates the combination.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum OcrTask {
+    /// Plain document text → markdown (the default; today's behavior).
+    Ocr,
+    /// Math / formulas → LaTeX (got-ocr2; implies `--format`).
+    Formula,
+    /// Tables → structured markdown (got-ocr2; implies `--format`).
+    Tables,
+    /// Charts → structured output (got-ocr2; implies `--format`).
+    Chart,
+    /// Molecular structures → SMILES (got-ocr2; implies `--format`).
+    Molecular,
+    /// Geometry → TikZ (got-ocr2; implies `--format`).
+    Geometry,
+    /// Sheet music → `**kern` (got-ocr2; implies `--format`).
+    Music,
+    /// Photo description / VQA — planned (smolvlm2); errors cleanly today.
+    Describe,
+}
+
+impl OcrTask {
+    /// The six GOT-OCR2 structured tasks all run the model's `OCR with format:`
+    /// mode — the same engine switch as `--format` (the model auto-selects the
+    /// formalism from the image, so one switch serves all six).
+    fn implies_got_format(self) -> bool {
+        matches!(
+            self,
+            Self::Formula
+                | Self::Tables
+                | Self::Chart
+                | Self::Molecular
+                | Self::Geometry
+                | Self::Music
+        )
+    }
+}
+
+impl std::fmt::Display for OcrTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ocr => "ocr",
+            Self::Formula => "formula",
+            Self::Tables => "tables",
+            Self::Chart => "chart",
+            Self::Molecular => "molecular",
+            Self::Geometry => "geometry",
+            Self::Music => "music",
+            Self::Describe => "describe",
         })
     }
 }
@@ -887,8 +1007,9 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // GOT-OCR2 `--format` (.mmd) mode and the decode tuning flags (`--max-length`,
     // `--temperature`, `--no-repeat-ngram`, `--ngram-window`) are threaded to the
     // leaf via process-globals (the shared OcrEngine/OcrModel signatures stay
-    // frozen for the Baidu path). MUST precede `OcrEngine::new()`: the decode
-    // params are resolved at model load.
+    // frozen for the Baidu path). `request.format` already carries `--format` OR a
+    // format-implying `--task` (folded in `to_request`). MUST precede
+    // `OcrEngine::new()`: the decode params are resolved at model load.
     native_engine::force_got_format(request.format);
     native_engine::set_decode_overrides(decode_overrides_from(&request));
     if let Some(err) = forced_test_error()? {
@@ -1530,7 +1651,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "models": models,
             "guidance": {
                 "unlimited-ocr": "default; FAST plain-text document OCR (general documents & PDFs)",
-                "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text"
+                "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text; shorthand: `focr ocr --task formula|tables|chart|molecular|geometry|music` (implies `--format`)"
             },
         }));
     } else {
@@ -1570,7 +1691,13 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         );
         println!("                           then `focr ocr --model got-ocr2.int8.focrq <image>`.");
         println!(
-            "                           Add `--format` for structured .mmd output (LaTeX/tables/…)."
+            "                           Add `--format` for structured .mmd output (LaTeX/tables/…),"
+        );
+        println!(
+            "                           or `--task formula|tables|chart|molecular|geometry|music`"
+        );
+        println!(
+            "                           to select the format mode by task (implies `--format`)."
         );
     }
     Ok(())
@@ -1982,6 +2109,7 @@ mod tests {
                     no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                     ngram_window: DEFAULT_NGRAM_WINDOW,
                     format: false,
+                    task: OcrTask::Ocr,
                 },
                 json: false,
                 output: None,
@@ -2009,6 +2137,7 @@ mod tests {
                         no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                         ngram_window: DEFAULT_NGRAM_WINDOW,
                         format: false,
+                        task: OcrTask::Ocr,
                     },
                 }),
             },
@@ -2030,6 +2159,7 @@ mod tests {
                 no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                 ngram_window: DEFAULT_NGRAM_WINDOW,
                 format: false,
+                task: OcrTask::Ocr,
             },
             json: false,
             output: None,
@@ -2087,6 +2217,172 @@ mod tests {
             panic!("expected ocr command");
         };
         assert!(!args.to_request().expect("request builds").format);
+    }
+
+    /// Parse `focr ocr <argv…>` and build the request (panics on non-ocr).
+    fn ocr_request_from(argv: &[&str]) -> FocrResult<OcrRequest> {
+        let full: Vec<&str> = ["focr", "ocr"].iter().chain(argv).copied().collect();
+        let cli = Cli::try_parse_from(full).expect("ocr argv parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        args.to_request()
+    }
+
+    #[test]
+    fn ocr_task_flag_threads_format_to_request() {
+        // Each got-ocr2 structured task implies `--format` (the same engine seam
+        // `--format` uses); `--task ocr` / no `--task` stay plain (format=false),
+        // byte-identical to today.
+        for task in [
+            "formula",
+            "tables",
+            "chart",
+            "molecular",
+            "geometry",
+            "music",
+        ] {
+            let req =
+                ocr_request_from(&["scan.png", "--task", task, "--model", "got-ocr2.int8.focrq"])
+                    .expect("request builds");
+            assert!(req.format, "--task {task} must imply format");
+        }
+        let req = ocr_request_from(&["scan.png", "--task", "ocr"]).expect("request builds");
+        assert!(!req.format, "--task ocr stays plain");
+        let req = ocr_request_from(&["scan.png"]).expect("request builds");
+        assert!(!req.format, "default task stays plain");
+    }
+
+    #[test]
+    fn ocr_task_composes_with_explicit_format() {
+        // Explicit `--format` wins / is idempotent: `--task ocr --format` keeps
+        // format=true (the task default never masks the flag), and adding
+        // `--format` to a format-implying task changes nothing.
+        let req =
+            ocr_request_from(&["scan.png", "--task", "ocr", "--format"]).expect("request builds");
+        assert!(req.format, "--format must not be masked by --task ocr");
+        let with_both = ocr_request_from(&[
+            "scan.png",
+            "--task",
+            "tables",
+            "--format",
+            "--model",
+            "got-ocr2.int8.focrq",
+        ])
+        .expect("request builds");
+        let task_only = ocr_request_from(&[
+            "scan.png",
+            "--task",
+            "tables",
+            "--model",
+            "got-ocr2.int8.focrq",
+        ])
+        .expect("request builds");
+        assert!(
+            with_both.format && task_only.format,
+            "--format is idempotent with --task"
+        );
+    }
+
+    #[test]
+    fn ocr_task_describe_fails_clean_naming_smolvlm2() {
+        // `describe` is advertised but its model (smolvlm2, sub-epic C) has not
+        // shipped: fail clean at request build — the `convert --quant int4`
+        // NotImplemented precedent — instead of silently running plain OCR.
+        let err = ocr_request_from(&["photo.jpg", "--task", "describe"])
+            .expect_err("describe has no shipped model");
+        assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 1);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("smolvlm2"),
+            "must name the planned model: {msg}"
+        );
+    }
+
+    #[test]
+    fn ocr_task_got_only_task_guides_to_got_model() {
+        // A `--model` that knowably names unlimited-ocr cannot serve a got-only
+        // task: Usage guidance (exit 2) pointing at `focr pull got-ocr2`.
+        let err = ocr_request_from(&[
+            "scan.png",
+            "--task",
+            "formula",
+            "--model",
+            "unlimited-ocr.int8.focrq",
+        ])
+        .expect_err("unlimited-ocr cannot serve --task formula");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+        assert_eq!(err.exit_code(), 2);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("focr pull got-ocr2"),
+            "must carry the pull hint: {msg}"
+        );
+        assert!(
+            msg.contains("--task formula"),
+            "must name the offending task: {msg}"
+        );
+
+        // No `--model` ⇒ the default resolution (always unlimited-ocr) — same
+        // guidance. Read-only env guard (no set_var under deny(unsafe)): only
+        // assert when FOCR_MODEL_PATH is not overriding the default; the pure
+        // classifier below covers the None case unconditionally.
+        if std::env::var_os(crate::MODEL_PATH_ENV).is_none() {
+            let err = ocr_request_from(&["scan.png", "--task", "music"])
+                .expect_err("default model cannot serve --task music");
+            assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+        }
+
+        // A got-named model passes and carries format (case-insensitive name).
+        let req = ocr_request_from(&[
+            "scan.png",
+            "--task",
+            "geometry",
+            "--model",
+            "/models/GOT-OCR2.int8.focrq",
+        ])
+        .expect("got model serves geometry");
+        assert!(req.format);
+
+        // The pure classifier: default/unlimited are knowably-not-got; a got or
+        // ambiguous name passes through to the engine's arch-tag dispatch.
+        assert!(model_spec_is_knowably_not_got(None));
+        assert!(model_spec_is_knowably_not_got(Some(Path::new(
+            "/m/unlimited-ocr.int8.focrq"
+        ))));
+        assert!(!model_spec_is_knowably_not_got(Some(Path::new(
+            "got-ocr2.int8.focrq"
+        ))));
+        assert!(!model_spec_is_knowably_not_got(Some(Path::new(
+            "/m/custom.focrq"
+        ))));
+    }
+
+    #[test]
+    fn ocr_task_rejects_unknown_value_and_composes_with_robot_run() {
+        // Clap owns the value set: an unknown task is a parse error (usage).
+        assert!(Cli::try_parse_from(["focr", "ocr", "scan.png", "--task", "poetry"]).is_err());
+        // `focr robot run` flattens the same OcrRequestArgs, so `--task`
+        // composes with robot mode identically.
+        let cli = Cli::try_parse_from([
+            "focr",
+            "robot",
+            "run",
+            "scan.png",
+            "--task",
+            "chart",
+            "--model",
+            "got-ocr2.int8.focrq",
+        ])
+        .expect("robot run --task parses");
+        let Command::Robot {
+            cmd: RobotCmd::Run(args),
+        } = cli.command
+        else {
+            panic!("expected robot run");
+        };
+        assert!(args.request.to_request().expect("request builds").format);
     }
 
     #[test]
@@ -2234,6 +2530,7 @@ mod tests {
                 no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
                 ngram_window: DEFAULT_NGRAM_WINDOW,
                 format: false,
+                task: OcrTask::Ocr,
             },
             json: false,
             output: None,
