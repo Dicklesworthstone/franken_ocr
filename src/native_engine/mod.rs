@@ -177,6 +177,71 @@ fn got_format_requested() -> bool {
         || std::env::var_os(GOT_FORMAT_ENV).is_some()
 }
 
+/// CLI decode-parameter overrides (`--max-length`, `--temperature`,
+/// `--no-repeat-ngram`, `--ngram-window`), threaded to the leaf via a
+/// process-global for the same reason as [`force_got_format`]: the shared
+/// `OcrEngine`/`OcrModel` signatures stay frozen, and edition-2024 `set_var` is
+/// `unsafe` (this crate denies unsafe). `None` = keep the built-in default.
+/// Applied when a model's [`DecodeParams`] are built (at model load), so the CLI
+/// sets these BEFORE constructing the engine. A `no_repeat_ngram`/`ngram_window`
+/// override automatically disarms speculative decode: its dispatch guards on the
+/// frozen `35/128` single-image ban (see [`SPEC_DECODE_ENV`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DecodeOverrides {
+    /// Generated-token cap (`--max-length`). Also clamps the GOT arm (which
+    /// additionally caps at its config `max_new_tokens` 4096, bd-3j3p).
+    pub max_length: Option<usize>,
+    /// Decode temperature (`--temperature`; 0.0 = greedy).
+    pub temperature: Option<f32>,
+    /// Sliding no-repeat n-gram size (`--no-repeat-ngram` / FOCR_NO_REPEAT_NGRAM).
+    pub no_repeat_ngram: Option<usize>,
+    /// Sliding no-repeat n-gram lookback window (`--ngram-window`).
+    pub ngram_window: Option<usize>,
+}
+
+/// The process-global [`DecodeOverrides`] store. A `Mutex` (not `OnceLock`) so a
+/// long-lived embedder can re-set between recognitions; reads happen once per
+/// model load, never per token.
+static DECODE_OVERRIDES: Mutex<DecodeOverrides> = Mutex::new(DecodeOverrides {
+    max_length: None,
+    temperature: None,
+    no_repeat_ngram: None,
+    ngram_window: None,
+});
+
+/// Set (or clear, with `DecodeOverrides::default()`) the process-wide decode
+/// parameter overrides. Call BEFORE constructing the engine — a model already
+/// loaded into the process cache keeps the params it was built with.
+pub fn set_decode_overrides(overrides: DecodeOverrides) {
+    *DECODE_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = overrides;
+}
+
+/// The current process-wide decode overrides (a copy).
+fn decode_overrides() -> DecodeOverrides {
+    *DECODE_OVERRIDES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Apply `overrides` onto `params` (a `Some` field wins; `None` keeps `params`).
+/// Pure, so the mapping is unit-testable without touching the process global.
+fn apply_decode_overrides(params: &mut DecodeParams, overrides: DecodeOverrides) {
+    if let Some(n) = overrides.max_length {
+        params.max_length = n;
+    }
+    if let Some(t) = overrides.temperature {
+        params.temperature = t;
+    }
+    if let Some(n) = overrides.no_repeat_ngram {
+        params.no_repeat_ngram_size = n;
+    }
+    if let Some(w) = overrides.ngram_window {
+        params.ngram_window = w;
+    }
+}
+
 /// `FOCR_SPEC_DECODE` (bd-1azu.35): presence kill-switch arming the draft -> verify
 /// -> accept speculative decode inside the int8 generate loop
 /// ([`OcrModel::spec_decode_i8`]). DEFAULT OFF => [`OcrModel::generate_cached_i8`]
@@ -203,7 +268,8 @@ fn timing_log(msg: &str) {
     }
 }
 
-/// Build the single-image greedy decode params, honoring [`MAX_NEW_TOKENS_ENV`].
+/// Build the single-image greedy decode params, honoring [`MAX_NEW_TOKENS_ENV`]
+/// and then the CLI [`DecodeOverrides`] (an explicit CLI flag outranks the env).
 fn decode_params_from_env() -> DecodeParams {
     let mut p = DecodeParams::single_image();
     if let Some(raw) = std::env::var_os(MAX_NEW_TOKENS_ENV)
@@ -213,6 +279,7 @@ fn decode_params_from_env() -> DecodeParams {
     {
         p.max_length = n;
     }
+    apply_decode_overrides(&mut p, decode_overrides());
     p
 }
 
@@ -761,17 +828,20 @@ impl OcrModel {
         let t = std::time::Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.got_tokenizer()?;
-        // O(n) KV-cache greedy decode (B9); the model stops at <|im_end|>. Cap length
-        // defensively (config max_new_tokens 4096). `--format` (CLI) / FOCR_GOT_FORMAT
-        // selects the `OCR with format:` .mmd mode (LaTeX/tables/charts/molecular/geometry/
-        // sheet-music); default plain `OCR: ` is byte-identical to today.
+        // O(n) KV-cache greedy decode (B9); the model stops at <|im_end|>. The token
+        // cap honors `--max-length`/FOCR_MAX_NEW_TOKENS via `decode_params` (bd-3j3p),
+        // clamped to GOT's config `max_new_tokens` 4096 (the Baidu default 32768 thus
+        // resolves to 4096, byte-identical to the old hardcoded cap). `--format` (CLI)
+        // / FOCR_GOT_FORMAT selects the `OCR with format:` .mmd mode (LaTeX/tables/
+        // charts/molecular/geometry/sheet-music); default plain `OCR: ` unchanged.
         let format = got_format_requested();
+        let max_new = self.decode_params.max_length.min(got::MAX_NEW_TOKENS);
         let text = got::recognize(
             &self.weights,
             tk,
             img,
             self.arch().vision_tower_prefix(),
-            4096,
+            max_new,
             format,
         )?;
         timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
@@ -2250,6 +2320,38 @@ mod tests {
         );
         assert_eq!(p.ngram_window, sampler::NGRAM_WINDOW_SINGLE);
         assert!(p.max_length > 0, "max_length must bound the decode loop");
+    }
+
+    /// [`apply_decode_overrides`] is the pure CLI-flag → [`DecodeParams`] mapping
+    /// (bd-3j3p): a `Some` field wins, a `None` keeps the built default — tested
+    /// without touching the process-global store.
+    #[test]
+    fn decode_overrides_apply_some_fields_and_keep_none() {
+        let base = DecodeParams::single_image();
+
+        // Default overrides are the identity.
+        let mut p = DecodeParams::single_image();
+        apply_decode_overrides(&mut p, DecodeOverrides::default());
+        assert_eq!(p.max_length, base.max_length);
+        assert_eq!(p.temperature.to_bits(), base.temperature.to_bits());
+        assert_eq!(p.no_repeat_ngram_size, base.no_repeat_ngram_size);
+        assert_eq!(p.ngram_window, base.ngram_window);
+
+        // Each Some field lands; untouched fields keep the build default.
+        let mut p = DecodeParams::single_image();
+        apply_decode_overrides(
+            &mut p,
+            DecodeOverrides {
+                max_length: Some(700),
+                temperature: None,
+                no_repeat_ngram: Some(20),
+                ngram_window: None,
+            },
+        );
+        assert_eq!(p.max_length, 700);
+        assert_eq!(p.temperature.to_bits(), base.temperature.to_bits());
+        assert_eq!(p.no_repeat_ngram_size, 20);
+        assert_eq!(p.ngram_window, base.ngram_window);
     }
 
     /// The connector structural geometry the driver passes is the base-1024 16×16

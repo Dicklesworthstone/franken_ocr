@@ -34,6 +34,10 @@ use crate::tokenizer::tiktoken::Tiktoken;
 /// GOT generation stop id (`<|im_end|>`).
 pub const EOS_ID: u32 = 151_645;
 
+/// GOT's own generated-token ceiling (`generation_config.json` `max_new_tokens`).
+/// The forward clamps any requested `--max-length` to this (bd-3j3p).
+pub const MAX_NEW_TOKENS: usize = 4096;
+
 /// `FOCR_GOT_NO_REPEAT_NGRAM` — override the GOT global no-repeat-n-gram size
 /// (bd-ff4i kill-switch; upstream `chat()` hard-codes 20, spec §12 OQ-8). `0`
 /// disables the guard, restoring the pre-guard unguarded greedy; unset or

@@ -277,6 +277,26 @@ impl RobotRunArgs {
     }
 }
 
+/// Map the request's decode tuning flags onto engine
+/// [`native_engine::DecodeOverrides`]. A value becomes an override only when it
+/// differs from the compiled default (bit-exact for the float), so an untouched
+/// flag keeps the engine-side default AND leaves env overrides (e.g.
+/// `FOCR_MAX_NEW_TOKENS`) in force. The preprocess flags (`--base-size`,
+/// `--image-size`, `--crop-mode`) are a separate, still-unwired surface — see
+/// the tracking bead filed with this change.
+fn decode_overrides_from(request: &OcrRequest) -> native_engine::DecodeOverrides {
+    native_engine::DecodeOverrides {
+        max_length: (i64::from(request.max_length) != DEFAULT_MAX_LENGTH)
+            .then_some(request.max_length as usize),
+        temperature: (request.temperature.to_bits() != DEFAULT_TEMPERATURE.to_bits())
+            .then_some(request.temperature),
+        no_repeat_ngram: (i64::from(request.no_repeat_ngram) != DEFAULT_NO_REPEAT_NGRAM)
+            .then_some(request.no_repeat_ngram as usize),
+        ngram_window: (i64::from(request.ngram_window) != DEFAULT_NGRAM_WINDOW)
+            .then_some(request.ngram_window as usize),
+    }
+}
+
 impl OcrRequestArgs {
     fn to_request(&self) -> FocrResult<OcrRequest> {
         Ok(OcrRequest {
@@ -864,9 +884,13 @@ impl FigureWriter {
 
 fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     let request = args.to_request()?;
-    // GOT-OCR2 `--format` (.mmd) mode is threaded to the leaf via a process-global
-    // (the shared OcrEngine/OcrModel signatures stay frozen for the Baidu path).
+    // GOT-OCR2 `--format` (.mmd) mode and the decode tuning flags (`--max-length`,
+    // `--temperature`, `--no-repeat-ngram`, `--ngram-window`) are threaded to the
+    // leaf via process-globals (the shared OcrEngine/OcrModel signatures stay
+    // frozen for the Baidu path). MUST precede `OcrEngine::new()`: the decode
+    // params are resolved at model load.
     native_engine::force_got_format(request.format);
+    native_engine::set_decode_overrides(decode_overrides_from(&request));
     if let Some(err) = forced_test_error()? {
         return Err(err);
     }
@@ -2063,6 +2087,55 @@ mod tests {
             panic!("expected ocr command");
         };
         assert!(!args.to_request().expect("request builds").format);
+    }
+
+    #[test]
+    fn tuning_flags_become_decode_overrides_only_when_explicit() {
+        // Default flags ⇒ NO overrides: engine defaults + env (FOCR_MAX_NEW_TOKENS)
+        // stay in force.
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png"]).expect("ocr parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        let req = args.to_request().expect("request builds");
+        assert_eq!(
+            decode_overrides_from(&req),
+            native_engine::DecodeOverrides::default()
+        );
+
+        // Explicit flags ⇒ each maps to Some(value) on the engine overrides.
+        let cli = Cli::try_parse_from([
+            "focr",
+            "ocr",
+            "scan.png",
+            "--max-length",
+            "700",
+            "--temperature",
+            "0.5",
+            "--no-repeat-ngram",
+            "20",
+            "--ngram-window",
+            "1024",
+        ])
+        .expect("ocr with tuning flags parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        let o = decode_overrides_from(&args.to_request().expect("request builds"));
+        assert_eq!(o.max_length, Some(700));
+        assert_eq!(o.temperature, Some(0.5));
+        assert_eq!(o.no_repeat_ngram, Some(20));
+        assert_eq!(o.ngram_window, Some(1024));
+
+        // Explicitly passing the default value is indistinguishable from default
+        // (and behaviorally identical), so it maps to no override.
+        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--max-length", "32768"])
+            .expect("ocr parses");
+        let Command::Ocr(args) = cli.command else {
+            panic!("expected ocr command");
+        };
+        let o = decode_overrides_from(&args.to_request().expect("request builds"));
+        assert_eq!(o.max_length, None);
     }
 
     #[test]
