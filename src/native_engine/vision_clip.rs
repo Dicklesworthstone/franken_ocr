@@ -196,7 +196,8 @@ pub fn forward(weights: &Weights, _image: &Mat, sam_features: &Mat) -> FocrResul
 
 /// Build a [`ClipWeights`] from the `model.vision_model.*` tensors (note the
 /// preserved upstream `pre_layrnorm` typo). Dims read from each tensor shape.
-fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
+/// `pub(crate)` so the batch spine (bd-1azu.10) hydrates ONCE per batch.
+pub(crate) fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
     let p = "model.vision_model";
     let ln = |n: &str| -> FocrResult<LayerNormParams> {
         Ok(LayerNormParams {
@@ -429,6 +430,30 @@ pub fn forward_with_batched(
         ));
     }
     Ok(out)
+}
+
+/// [`forward_with_batched`] fed directly with raw SAM `x3` outputs
+/// (`[OUT_CH, num_patches]` channel-major, exactly what [`super::vision_sam`]
+/// produces): applies to each view the SAME `flatten(2).transpose(1,2)`
+/// transpose [`forward`] performs, then runs the batched stack. Keeps the
+/// SAM→CLIP layout knowledge inside this module so the batch spine
+/// (bd-1azu.10) cannot drift from the per-view path.
+///
+/// # Errors
+/// A transpose shape rejection, or anything [`forward_with_batched`] returns.
+pub(crate) fn forward_batched_from_sam(
+    cfg: &ClipConfig,
+    weights: &ClipWeights,
+    sam_features_per_view: &[&Mat],
+) -> FocrResult<Vec<Mat>> {
+    let mut transposed = Vec::with_capacity(sam_features_per_view.len());
+    for sf in sam_features_per_view {
+        ensure_mat_data_len(sf, "vision_clip forward_batched_from_sam sam_features")?;
+        let t = transpose(&sf.data, sf.rows, sf.cols)?;
+        transposed.push(Mat::from_vec(sf.cols, sf.rows, t));
+    }
+    let refs: Vec<&Mat> = transposed.iter().collect();
+    forward_with_batched(cfg, weights, &refs)
 }
 
 /// Batched analogue of [`transformer_block`]: every stage is row-wise except the
@@ -1654,6 +1679,32 @@ mod tests {
         let seq_out = forward_with(&cfg, &w, &view)?;
         assert_eq!(batched.len(), 1);
         assert_eq!(batched[0].data, seq_out.data);
+        Ok(())
+    }
+
+    #[test]
+    fn batched_from_sam_equals_per_view_forward_path() -> FocrResult<()> {
+        // Feed CHANNEL-MAJOR sam-style features ([dim, num_patches], what
+        // vision_sam emits) through the from-sam wrapper and assert bit-equality
+        // with the per-view path (the same transpose + forward_with) — the exact
+        // seam the batch spine (bd-1azu.10) rides.
+        let cfg = parity_cfg();
+        let num_patches = 5;
+        let w = rand_weights(&cfg, num_patches);
+        let sams: Vec<Mat> = (0..3)
+            .map(|vi| parity_view(cfg.hidden_size, num_patches, vi))
+            .collect();
+        let refs: Vec<&Mat> = sams.iter().collect();
+        let batched = forward_batched_from_sam(&cfg, &w, &refs)?;
+        assert_eq!(batched.len(), sams.len());
+        for (vi, sam) in sams.iter().enumerate() {
+            let t = transpose(&sam.data, sam.rows, sam.cols)?;
+            let per_view = forward_with(&cfg, &w, &Mat::from_vec(sam.cols, sam.rows, t))?;
+            assert_eq!(
+                batched[vi].data, per_view.data,
+                "view {vi}: from-sam batched CLIP != per-view transpose+forward_with"
+            );
+        }
         Ok(())
     }
 

@@ -292,8 +292,9 @@ pub fn forward_prefix(weights: &Weights, image: &Mat, prefix: &str) -> FocrResul
 
 /// Build a [`SamWeights`] from the named `{prefix}.*` tensors in `weights`
 /// (BF16→f32 widened at the accessor). Dims are read from each tensor's shape;
-/// rel-pos table sizes are derived from the stored rows.
-fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<SamWeights> {
+/// rel-pos table sizes are derived from the stored rows. `pub(crate)` so the
+/// batch spine (bd-1azu.10) hydrates ONCE per batch instead of once per view.
+pub(crate) fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<SamWeights> {
     let p = prefix;
     let flat = |n: &str| weights.vec(n);
     let conv = |n: &str, bias: bool| -> FocrResult<Conv> {

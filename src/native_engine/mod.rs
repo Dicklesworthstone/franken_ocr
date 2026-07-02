@@ -177,6 +177,25 @@ fn got_format_requested() -> bool {
         || std::env::var_os(GOT_FORMAT_ENV).is_some()
 }
 
+/// `FOCR_BATCH_VISION` (bd-1azu.10 / bd-t6a): inside the batch spine, run the
+/// vision tower BATCHED ACROSS PAGES — hydrate the SAM/CLIP weights once per
+/// batch and stack every admitted page's views into one batched SAM forward +
+/// one batched CLIP forward (both proven byte-identical to their per-view
+/// forwards; the composition is lossless by construction and held by a
+/// model-gated parity gate). `=0`/`off` reverts to the per-page vision loop
+/// (the kill-switch). Only the spine reads this; the sequential single-page
+/// path is untouched.
+const BATCH_VISION_ENV: &str = "FOCR_BATCH_VISION";
+
+/// Whether the spine batches vision across pages: default ON;
+/// `FOCR_BATCH_VISION=0` (or `off`/`false`/`no`) reverts to the per-page loop.
+fn batch_vision_enabled() -> bool {
+    !matches!(
+        std::env::var(BATCH_VISION_ENV).ok().as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
 /// CLI decode-parameter overrides (`--max-length`, `--temperature`,
 /// `--no-repeat-ngram`, `--ngram-window`), threaded to the leaf via a
 /// process-global for the same reason as [`force_got_format`]: the shared
@@ -621,7 +640,7 @@ fn load_weights_from_resolved_model(resolved: &Path, bytes: Vec<u8>) -> FocrResu
 }
 
 /// One page's prefill state, handed from the batch spine front end
-/// ([`OcrModel::prefill_page_i8`]) to the [`batch_scheduler`]: everything a
+/// ([`OcrModel::prefill_from_features`]) to the [`batch_scheduler`]: everything a
 /// [`batch_scheduler::PageStream`] needs to seed decode, plus the per-layer R-SWA
 /// rings (already prefilled) and the source pixel dims postprocess needs.
 struct PagePrefill {
@@ -1151,14 +1170,69 @@ impl OcrModel {
         let embed_table = self.weights.mat("model.embed_tokens.weight")?;
         let tokenizer = self.tokenizer()?;
 
-        // ── per-page prefill (preprocess → vision → connector → prefill) ─────────
+        // ── per-page prefill, staged so vision can batch ACROSS pages ────────────
         let mut out: Vec<Option<FocrResult<String>>> = (0..n).map(|_| None).collect();
+
+        // Stage 1: preprocess every page (a per-page error records + skips it).
+        let mut pres: Vec<Option<Preprocessed>> = (0..n).map(|_| None).collect();
+        for (gi, &path) in image_paths.iter().enumerate() {
+            match preprocess::preprocess_image(
+                path,
+                preprocess::PreprocessMode::Base { base_size: 1024 },
+            ) {
+                Ok(p) => pres[gi] = Some(p),
+                Err(e) => out[gi] = Some(Err(e)),
+            }
+        }
+
+        // Stage 2: the vision tower over every admitted page — batched ACROSS
+        // pages by default (bd-1azu.10: hydrate once, ONE SAM + ONE CLIP forward
+        // for the whole batch), or the per-page loop under FOCR_BATCH_VISION=0.
+        // A batched-path error is batch-level (e.g. weight hydration — the
+        // per-page path would hit it on page 1 too), so it is recorded on every
+        // admitted page rather than aborting pages that already failed cleanly.
+        let admitted: Vec<usize> = (0..n).filter(|&gi| pres[gi].is_some()).collect();
+        let mut feats: Vec<Option<Vec<Mat>>> = (0..n).map(|_| None).collect();
+        if !admitted.is_empty() {
+            if batch_vision_enabled() {
+                let prefs: Vec<&Preprocessed> = admitted
+                    .iter()
+                    .map(|&gi| pres[gi].as_ref().expect("admitted page has a preprocess"))
+                    .collect();
+                match self.vision_tower_batched_pages(&prefs) {
+                    Ok(all) => {
+                        for (k, f) in all.into_iter().enumerate() {
+                            feats[admitted[k]] = Some(f);
+                        }
+                    }
+                    Err(e) => {
+                        let msg = format!("batched vision failed: {e}");
+                        for &gi in &admitted {
+                            out[gi] = Some(Err(FocrError::Other(anyhow::anyhow!("{msg}"))));
+                        }
+                    }
+                }
+            } else {
+                for &gi in &admitted {
+                    let pre = pres[gi].as_ref().expect("admitted page has a preprocess");
+                    match self.vision_tower(pre) {
+                        Ok(f) => feats[gi] = Some(f),
+                        Err(e) => out[gi] = Some(Err(e)),
+                    }
+                }
+            }
+        }
+
+        // Stage 3: per-page connector + int8 prefill (unchanged math).
         let mut streams: Vec<batch_scheduler::PageStream> = Vec::new();
         let mut stream_caches: Vec<Vec<rswa::RingCache>> = Vec::new();
         // (global page index, image_w, image_h) in scheduler-submission order.
         let mut scheduled: Vec<(usize, u32, u32)> = Vec::new();
-        for (gi, &path) in image_paths.iter().enumerate() {
-            match self.prefill_page_i8(wc, path) {
+        for gi in 0..n {
+            let (Some(pre), Some(vf)) = (pres[gi].take(), feats[gi].take()) else {
+                continue;
+            };
+            match self.prefill_from_features(wc, &pre, &vf) {
                 Ok(p) => {
                     streams.push(batch_scheduler::PageStream::new(
                         gi,
@@ -1223,24 +1297,21 @@ impl OcrModel {
             .expect("decoder int8 cache just set"))
     }
 
-    /// Prefill ONE page for the batch spine: the [`Self::forward`] front end
-    /// (preprocess in Base mode → vision tower → connector) followed by the int8
+    /// Connector + int8 prefill for ONE page whose vision features are ALREADY
+    /// computed (stage 3 of the spine; stages 1–2 preprocess and run the tower,
+    /// batched across pages by default per bd-1azu.10). Followed by the int8
     /// [`decoder::prefill_with_cache_i8`], returning the seed state a
     /// [`batch_scheduler::PageStream`] needs plus the page's pixel dims for
     /// postprocess. Mirrors EXACTLY the prefill the sequential
     /// [`Self::generate_cached_i8`] does, so the seeded decode is byte-identical.
-    fn prefill_page_i8(
+    fn prefill_from_features(
         &self,
         wc: &decoder::DecoderWeightCacheI8,
-        image_path: &Path,
+        pre: &Preprocessed,
+        vision_features: &[Mat],
     ) -> FocrResult<PagePrefill> {
-        let pre = preprocess::preprocess_image(
-            image_path,
-            preprocess::PreprocessMode::Base { base_size: 1024 },
-        )?;
-        let (image_w, image_h) = Self::image_dims(&pre);
-        let vision_features = self.vision_tower(&pre)?;
-        let (inputs_embeds, prompt_ids) = self.build_inputs_embeds(&pre, &vision_features)?;
+        let (image_w, image_h) = Self::image_dims(pre);
+        let (inputs_embeds, prompt_ids) = self.build_inputs_embeds(pre, vision_features)?;
         let prefill_len = inputs_embeds.rows;
         let (hidden, caches) = decoder::prefill_with_cache_i8(wc, &inputs_embeds)?;
         let last_hidden = Self::last_hidden_row(&hidden)?;
@@ -1315,6 +1386,103 @@ impl OcrModel {
             features.push(projected);
         }
         Ok(features)
+    }
+
+    /// Batched vision across the spine's admitted pages (bd-1azu.10 / bd-t6a):
+    /// hydrate [`vision_sam::SamWeights`] + [`vision_clip::ClipWeights`] ONCE,
+    /// group every page's views by side (Base mode: one 1024² view per page ⇒
+    /// one group), run ONE batched SAM forward + ONE batched CLIP forward per
+    /// group — both proven byte-identical to their per-view forwards — then the
+    /// cheap per-view bridge. Returns per-page feature vectors in exactly the
+    /// order [`Self::vision_tower`] produces them, so the connector downstream
+    /// cannot tell the difference. `FOCR_BATCH_VISION=0` bypasses this path.
+    ///
+    /// # Errors
+    /// A weight-hydration failure, a non-square view, or any batched-forward
+    /// rejection (e.g. a ragged same-side group, which Base mode cannot produce).
+    fn vision_tower_batched_pages(&self, pres: &[&Preprocessed]) -> FocrResult<Vec<Vec<Mat>>> {
+        // (page, view-slot) inventory, preserving vision_tower's per-page order.
+        let mut page_views: Vec<Vec<Mat>> = pres.iter().map(|pre| Self::views(pre)).collect();
+        let th = std::time::Instant::now();
+        let sam_w = vision_sam::sam_weights_from(&self.weights, "model.sam_model")?;
+        let clip_cfg = vision_clip::ClipConfig::default();
+        let clip_w = vision_clip::clip_weights_from(&self.weights)?;
+        timing_log(&format!(
+            "  vision.hydrate(batch) {:.2}s",
+            th.elapsed().as_secs_f64()
+        ));
+
+        // Group all views by side so each batched forward sees a rectangular
+        // stack (Gundam mixes 640² tiles with the 1024² global; Base is uniform).
+        let mut groups: std::collections::BTreeMap<usize, Vec<(usize, usize)>> =
+            std::collections::BTreeMap::new();
+        for (p, views) in page_views.iter().enumerate() {
+            for (v, view) in views.iter().enumerate() {
+                let side = (view.cols as f64).sqrt() as usize;
+                if side * side != view.cols {
+                    return Err(FocrError::Other(anyhow::anyhow!(
+                        "native_engine::OcrModel::vision_tower_batched_pages: page {p} view {v} \
+                         cols {} is not a perfect square",
+                        view.cols
+                    )));
+                }
+                groups.entry(side).or_default().push((p, v));
+            }
+        }
+
+        // One batched SAM + CLIP forward per side group; bridge stays per-view.
+        let mut features: Vec<Vec<Option<Mat>>> = page_views
+            .iter()
+            .map(|views| views.iter().map(|_| None).collect())
+            .collect();
+        for (side, slots) in &groups {
+            let view_refs: Vec<&Mat> = slots.iter().map(|&(p, v)| &page_views[p][v]).collect();
+            let ts = std::time::Instant::now();
+            let sams = vision_sam::forward_with_batched(&sam_w, &view_refs, *side, *side)?;
+            timing_log(&format!(
+                "  vision.sam(batch of {}, side {side}) {:.2}s",
+                slots.len(),
+                ts.elapsed().as_secs_f64()
+            ));
+            let tc = std::time::Instant::now();
+            let sam_refs: Vec<&Mat> = sams.iter().collect();
+            let clips = vision_clip::forward_batched_from_sam(&clip_cfg, &clip_w, &sam_refs)?;
+            timing_log(&format!(
+                "  vision.clip(batch of {}) {:.2}s",
+                slots.len(),
+                tc.elapsed().as_secs_f64()
+            ));
+            let tb = std::time::Instant::now();
+            for ((&(p, v), sam), clip) in slots.iter().zip(&sams).zip(&clips) {
+                let projected = vision_bridge::forward(&self.weights, clip, sam)?;
+                features[p][v] = Some(projected);
+            }
+            timing_log(&format!(
+                "  vision.bridge(batch of {}) {:.2}s",
+                slots.len(),
+                tb.elapsed().as_secs_f64()
+            ));
+        }
+        page_views.clear();
+
+        features
+            .into_iter()
+            .enumerate()
+            .map(|(p, views)| {
+                views
+                    .into_iter()
+                    .enumerate()
+                    .map(|(v, slot)| {
+                        slot.ok_or_else(|| {
+                            FocrError::Other(anyhow::anyhow!(
+                                "native_engine::OcrModel::vision_tower_batched_pages: page {p} \
+                                 view {v} produced no feature (grouping bug)"
+                            ))
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Build the decoder `inputs_embeds` by embedding the prompt id-stream and
@@ -2320,6 +2488,59 @@ mod tests {
         );
         assert_eq!(p.ngram_window, sampler::NGRAM_WINDOW_SINGLE);
         assert!(p.max_length > 0, "max_length must bound the decode loop");
+    }
+
+    /// bd-1azu.10 / bd-t6a parity gate: the batched-across-pages vision tower is
+    /// BIT-IDENTICAL to the per-page tower on the REAL model. Env-gated:
+    /// `FOCR_MODEL_PATH` (the model artifact) + `FOCR_PARITY_IMAGES`
+    /// (comma-separated page paths, ≥2 recommended so the batch is real);
+    /// skip-with-SUCCESS when either is absent so the committed suite stays
+    /// model-free.
+    #[test]
+    fn batched_vision_matches_per_page_tower_on_real_model() {
+        let (Ok(model_path), Ok(images)) = (
+            std::env::var("FOCR_MODEL_PATH"),
+            std::env::var("FOCR_PARITY_IMAGES"),
+        ) else {
+            eprintln!("skip-with-SUCCESS: FOCR_MODEL_PATH / FOCR_PARITY_IMAGES unset");
+            return;
+        };
+        let model = OcrModel::load(Path::new(&model_path)).expect("model loads");
+        let paths: Vec<&str> = images.split(',').filter(|s| !s.is_empty()).collect();
+        assert!(
+            !paths.is_empty(),
+            "FOCR_PARITY_IMAGES must name at least one page"
+        );
+        let pres: Vec<Preprocessed> = paths
+            .iter()
+            .map(|p| {
+                preprocess::preprocess_image(
+                    Path::new(p),
+                    preprocess::PreprocessMode::Base { base_size: 1024 },
+                )
+                .expect("page preprocesses")
+            })
+            .collect();
+        let prefs: Vec<&Preprocessed> = pres.iter().collect();
+        let batched = model
+            .vision_tower_batched_pages(&prefs)
+            .expect("batched tower runs");
+        for (k, pre) in pres.iter().enumerate() {
+            let per_page = model.vision_tower(pre).expect("per-page tower runs");
+            assert_eq!(batched[k].len(), per_page.len(), "page {k} view count");
+            for (v, (b, s)) in batched[k].iter().zip(&per_page).enumerate() {
+                assert_eq!(b.shape(), s.shape(), "page {k} view {v} shape");
+                let bits_equal = b
+                    .data
+                    .iter()
+                    .zip(&s.data)
+                    .all(|(x, y)| x.to_bits() == y.to_bits());
+                assert!(
+                    bits_equal,
+                    "page {k} view {v}: batched vision != per-page tower (bit drift)"
+                );
+            }
+        }
     }
 
     /// [`apply_decode_overrides`] is the pure CLI-flag → [`DecodeParams`] mapping
