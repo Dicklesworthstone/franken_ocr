@@ -105,6 +105,25 @@ impl DecodeParams {
     pub fn sliding_ngram_active(&self) -> bool {
         self.no_repeat_ngram_size > 0 && self.ngram_window > 0
     }
+
+    /// Whether these params are exactly the FROZEN single-image ban the
+    /// speculative-decode verifier's chooser hardwires (bd-1azu.32/.35/.36):
+    /// `no_repeat_ngram_size == 35` over the `ngram_window == 128` lookback.
+    ///
+    /// This is the params half of the `FOCR_SPEC_DECODE` dispatch guard in
+    /// `OcrModel::generate_cached_i8` — `spec::accept_longest` recomputes each
+    /// per-position greedy token with [`DEFAULT_NO_REPEAT_NGRAM_SIZE`] /
+    /// [`NGRAM_WINDOW_SINGLE`] baked in, so ANY override of either knob (e.g.
+    /// `--no-repeat-ngram 20`, `--ngram-window 1024`, `FOCR_NO_REPEAT_NGRAM`)
+    /// MUST keep speculative decode disengaged: this predicate returning `false`
+    /// means the sequential greedy loop runs untouched, byte-for-byte today's
+    /// path. Extracted here so the gate is testable from the public surface
+    /// (`tests/spec_decode_gate.rs`) — a pure read, no numerics.
+    #[must_use]
+    pub fn matches_frozen_spec_ban(&self) -> bool {
+        self.no_repeat_ngram_size == DEFAULT_NO_REPEAT_NGRAM_SIZE
+            && self.ngram_window == NGRAM_WINDOW_SINGLE
+    }
 }
 
 /// One step's decode result (the frozen output contract).
@@ -904,5 +923,532 @@ mod tests {
         assert_eq!(logits[2], f32::NEG_INFINITY);
         assert_eq!(logits[0], 0.0);
         assert_eq!(logits[1], 0.0);
+    }
+}
+
+/// bd-1azu.36 (LINEAR half) — speculative-decode gate FAULT-INJECTION battery: an
+/// UNTRUSTED drafter can never change the emitted stream.
+///
+/// Lives here rather than in `tests/spec_decode_gate.rs` (its integration-side
+/// companion) because the seams under fault —
+/// `native_engine::spec::{accept_longest, resolve_round}` — are `pub(crate)`, so
+/// integration tests (public API only) cannot reach them, and `spec.rs`/`mod.rs`
+/// are owner-frozen this wave. The sampler is the natural in-crate home: the
+/// verifier's chooser under fault IS this module's [`sample`]/[`decode_step`],
+/// and every assertion replays it as the ground truth.
+///
+/// The model-free abstraction mirrors `spec.rs`'s own loop-parity tests: the
+/// decoder is a pure token-sequence -> `[1, V]` logits ORACLE (the property the
+/// real verify forward preserves bit-exactly, gated by
+/// `tests/spec_verify_forward_parity.rs`), and the loop skeleton mirrors
+/// `OcrModel::spec_decode_i8` — but the DRAFTER is an injected ADVERSARY instead
+/// of `spec::draft_ngram`: garbage ids, out-of-vocab/wild ids, forged EOS,
+/// oversized blocks far past `SPEC_DRAFT_MAX`, and always-empty proposals. The
+/// gate holds iff the emitted stream is byte-for-byte sequential greedy in every
+/// case (a draft is a PROPOSAL — the verifier accepts only tokens equal to the
+/// per-position greedy choice, and fails CLOSED on malformed verify rows).
+///
+/// TREE-verify clauses (tree-attention node parity, longest-path accept,
+/// `FOCR_SPEC_TREE_W=1` collapse) stay parked behind bd-1azu.34.
+#[cfg(test)]
+mod spec_gate_fault_injection {
+    use super::{DecodeParams, decode_step, sample};
+    use crate::native_engine::spec::{SPEC_DRAFT_MAX, accept_longest, resolve_round};
+    use crate::native_engine::tensor::Mat;
+
+    /// Vocabulary width for the synthetic logits rows (above every id used,
+    /// including the distinct-id oversized-draft targets).
+    const V: usize = 128;
+    /// EOS id under test == the frozen default ([SPEC-101]).
+    const EOS: u32 = 1;
+
+    /// A `[1, V]` logits row whose unique argmax is `token`.
+    fn peak_row(token: u32) -> Mat {
+        let mut r = vec![0.0f32; V];
+        r[token as usize] = 10.0;
+        Mat::from_vec(1, V, r)
+    }
+
+    /// A `[1, V]` row peaked at `peak` with a distinct runner-up at `runner_up`,
+    /// so a ban on `peak` flips the greedy token (the spec.rs ban-fixture idiom).
+    fn row_peaked(peak: u32, runner_up: u32) -> Mat {
+        let mut r = vec![0.0f32; V];
+        r[peak as usize] = 10.0;
+        r[runner_up as usize] = 9.0;
+        Mat::from_vec(1, V, r)
+    }
+
+    /// Single-image greedy params (the frozen 35/128 ban) with a `max_length` cap.
+    fn params(max_length: usize) -> DecodeParams {
+        let mut p = DecodeParams::single_image();
+        p.max_length = max_length;
+        p
+    }
+
+    /// Deterministic xorshift64 step (the house PRNG idiom — reproducible, no
+    /// dev-dependency).
+    fn xs(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    }
+
+    /// A deterministic 3rd-order content oracle: the next token is a hash of the
+    /// last three tokens, in `2..=6`, with EOS firing intermittently once there
+    /// is some history. Content-keyed, so verify rows are genuinely sensitive to
+    /// the draft tokens; the small alphabet lets plausible garbage both agree and
+    /// diverge. (Alphabet is `{EOS} ∪ 2..=6` — ids outside it are NEVER greedy.)
+    fn content_oracle(seq: &[u32]) -> Mat {
+        let start = seq.len().saturating_sub(3);
+        let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
+        for &t in &seq[start..] {
+            h ^= u64::from(t).wrapping_add(0x517C_C1B7_2722_0A95);
+            h = h.rotate_left(23).wrapping_mul(0x2545_F491_4F6C_DD1D);
+        }
+        let pick = if seq.len() >= 5 && (h & 7) == 0 {
+            EOS
+        } else {
+            2 + (h % 5) as u32
+        };
+        peak_row(pick)
+    }
+
+    /// Reference SEQUENTIAL greedy decode — the literal `generate_cached_i8` loop
+    /// with the decoder abstracted as `oracle`: choose via [`decode_step`] (the
+    /// production chooser), append, halt at EOS or `max_length`. No draft, no
+    /// verify assembly — the independent ground truth.
+    fn seq_generate(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        params: &DecodeParams,
+    ) -> Vec<u32> {
+        let mut generated = prompt.to_vec();
+        let mut emitted = Vec::new();
+        while emitted.len() < params.max_length {
+            let logits = oracle(&generated);
+            let step = decode_step(&logits, &generated, params).expect("seq decode_step");
+            generated.push(step.token_id);
+            emitted.push(step.token_id);
+            if step.is_eos {
+                break;
+            }
+        }
+        emitted
+    }
+
+    /// What each adversarial drafter actually hit — TEETH for the battery (the
+    /// parity assertions must not pass vacuously).
+    #[derive(Default)]
+    struct RoundStats {
+        /// Speculative rounds run (a non-empty draft reached the verifier).
+        rounds: usize,
+        /// Empty-draft fallback steps (one sequential step, no verify).
+        fallbacks: usize,
+        /// Total accepted draft tokens across all rounds.
+        accepted_tokens: usize,
+        /// Rounds where the verifier rejected at least one proposed token.
+        rejected_rounds: usize,
+    }
+
+    /// The `OcrModel::spec_decode_i8` loop skeleton with the DRAFTER injected as
+    /// an arbitrary (adversarial) closure: `verify_logits[i]` plays the batched
+    /// verify forward (`oracle(generated ++ draft[0..i])` — the contract
+    /// `decoder::verify_forward_i8` upholds bit-exactly), the REAL
+    /// [`resolve_round`] accepts + corrects, and committing a token is appending
+    /// it (the oracle is a pure function of the token sequence). Honors
+    /// EOS/`max_length` exactly as the live loop; mirrors `spec.rs`'s own
+    /// `spec_generate` step for step.
+    fn spec_generate_with_drafter(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        params: &DecodeParams,
+        drafter: &mut dyn FnMut(&[u32]) -> Vec<u32>,
+        stats: &mut RoundStats,
+    ) -> Vec<u32> {
+        let mut generated = prompt.to_vec();
+        let mut emitted = Vec::new();
+        while emitted.len() < params.max_length {
+            let draft = drafter(&generated);
+            if draft.is_empty() {
+                stats.fallbacks += 1;
+                let logits = oracle(&generated);
+                let step = decode_step(&logits, &generated, params).expect("spec fallback step");
+                generated.push(step.token_id);
+                emitted.push(step.token_id);
+                if step.is_eos {
+                    break;
+                }
+                continue;
+            }
+            // verify_logits[i] conditions on generated ++ draft[0..i] (i in 0..=K).
+            let mut verify_logits: Vec<Mat> = Vec::with_capacity(draft.len() + 1);
+            for i in 0..=draft.len() {
+                let mut ctx = generated.clone();
+                ctx.extend_from_slice(&draft[..i]);
+                verify_logits.push(oracle(&ctx));
+            }
+            let emit =
+                resolve_round(&generated, &draft, &verify_logits, params).expect("resolve_round");
+            stats.rounds += 1;
+            stats.accepted_tokens += emit.accepted;
+            if emit.accepted < draft.len() {
+                stats.rejected_rounds += 1;
+            }
+            let mut stopped = false;
+            for &token in &draft[..emit.accepted] {
+                generated.push(token);
+                emitted.push(token);
+                if params.eos_token_id == token {
+                    stopped = true;
+                    break;
+                }
+                if emitted.len() >= params.max_length {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                break;
+            }
+            match emit.correction {
+                None => break,
+                Some(c) => {
+                    generated.push(c.token_id);
+                    emitted.push(c.token_id);
+                    if c.is_eos {
+                        break;
+                    }
+                }
+            }
+        }
+        emitted
+    }
+
+    /// The next up-to-`k` tokens sequential greedy WOULD emit from `seq` — the
+    /// "perfect drafter" (teeth: full agreement must actually be accepted).
+    fn greedy_lookahead(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        seq: &[u32],
+        k: usize,
+        params: &DecodeParams,
+    ) -> Vec<u32> {
+        let mut ctx = seq.to_vec();
+        let mut out = Vec::new();
+        for _ in 0..k {
+            let step = decode_step(&oracle(&ctx), &ctx, params).expect("lookahead step");
+            out.push(step.token_id);
+            if step.is_eos {
+                break;
+            }
+            ctx.push(step.token_id);
+        }
+        out
+    }
+
+    /// Assert one (oracle, prompt, drafter) case: the speculative stream equals
+    /// the sequential greedy stream byte-for-byte, whatever the drafter proposed.
+    fn assert_drafter_harmless(
+        label: &str,
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        max_length: usize,
+        drafter: &mut dyn FnMut(&[u32]) -> Vec<u32>,
+        stats: &mut RoundStats,
+    ) {
+        let p = params(max_length);
+        let seq = seq_generate(oracle, prompt, &p);
+        let spec = spec_generate_with_drafter(oracle, prompt, &p, drafter, stats);
+        assert_eq!(
+            spec, seq,
+            "{label}: adversarial drafter changed the emitted stream \
+             (prompt={prompt:?} ml={max_length})"
+        );
+    }
+
+    /// GATE (bd-1azu.36 fault-injection): NO drafter behavior — plausible garbage,
+    /// out-of-vocab/wild ids, EOS spam, oversized blocks far past
+    /// [`SPEC_DRAFT_MAX`], always-empty proposals, or the true greedy continuation
+    /// — changes the emitted stream: it is byte-for-byte sequential greedy in
+    /// every case. Prompts + caps stay under the 35-gram window so this battery
+    /// runs ban-free (the ban path has its own dedicated fixture below); teeth
+    /// assertions prove accepts, rejects, AND fallbacks all actually ran.
+    #[test]
+    fn adversarial_drafters_never_change_the_emitted_stream() {
+        let oracle: fn(&[u32]) -> Mat = content_oracle;
+        let prompts: [&[u32]; 3] = [&[2, 3, 4], &[5, 5, 5, 5], &[2, 6, 2, 6, 3]];
+
+        let mut garbage = RoundStats::default();
+        let mut wild = RoundStats::default();
+        let mut spam = RoundStats::default();
+        let mut oversized = RoundStats::default();
+        let mut empty = RoundStats::default();
+        let mut echo = RoundStats::default();
+        let mut seed: u64 = 0x5EC6_A7E0_D00D_F00D;
+
+        for prompt in prompts {
+            for ml in [8usize, 20] {
+                // (a) plausible garbage: random-length drafts of random ids in
+                // 0..8 (the oracle's alphabet ∪ EOS ∪ two never-emitted ids) —
+                // agreement is possible but never trusted.
+                let mut s = xs(&mut seed);
+                assert_drafter_harmless(
+                    "garbage",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| {
+                        let len = 1 + (xs(&mut s) % 6) as usize;
+                        (0..len).map(|_| (xs(&mut s) % 8) as u32).collect()
+                    },
+                    &mut garbage,
+                );
+
+                // (b) wild out-of-vocab ids: can never equal a greedy token, and
+                // must be rejected without panicking (the verifier never indexes
+                // by a draft id).
+                assert_drafter_harmless(
+                    "wild-ids",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| vec![u32::MAX, V as u32, 0x7FFF_FFFF],
+                    &mut wild,
+                );
+
+                // (c) EOS spam: a forged-termination attempt every round.
+                assert_drafter_harmless(
+                    "eos-spam",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| vec![EOS; 4],
+                    &mut spam,
+                );
+
+                // (d) oversized: 64 tokens (>> SPEC_DRAFT_MAX) of id 30, which the
+                // content oracle never emits — the budget is a proposal knob, not
+                // a safety boundary the verifier relies on.
+                assert_drafter_harmless(
+                    "oversized",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| vec![30u32; 64],
+                    &mut oversized,
+                );
+
+                // (e) always-empty: the loop must ride the sequential fallback.
+                assert_drafter_harmless(
+                    "empty",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| Vec::new(),
+                    &mut empty,
+                );
+
+                // (f) echo of the true greedy continuation: full accepts.
+                let p_look = params(ml);
+                assert_drafter_harmless(
+                    "echo",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |g: &[u32]| greedy_lookahead(&oracle, g, 4, &p_look),
+                    &mut echo,
+                );
+            }
+        }
+
+        // TEETH — each guaranteed by construction (pure oracles, fixed seeds):
+        assert!(
+            garbage.rounds > 0,
+            "garbage drafter never reached the verifier"
+        );
+        assert!(
+            wild.rounds > 0,
+            "wild-id drafter never reached the verifier"
+        );
+        assert_eq!(
+            wild.rejected_rounds, wild.rounds,
+            "an out-of-vocab id can never equal a greedy token"
+        );
+        assert_eq!(wild.accepted_tokens, 0, "wild ids must never be accepted");
+        assert!(
+            spam.rounds > 0,
+            "EOS-spam drafter never reached the verifier"
+        );
+        assert!(
+            oversized.rounds > 0,
+            "oversized drafter never reached the verifier"
+        );
+        assert_eq!(
+            oversized.accepted_tokens, 0,
+            "an id the oracle never emits must never be accepted"
+        );
+        assert_eq!(
+            empty.rounds, 0,
+            "an empty draft must not reach the verifier"
+        );
+        assert!(empty.fallbacks > 0, "empty-draft fallback never exercised");
+        assert!(echo.rounds > 0, "echo drafter never reached the verifier");
+        assert!(
+            echo.accepted_tokens > 0,
+            "full agreement was never accepted — the harness has no teeth"
+        );
+        assert_eq!(
+            echo.rejected_rounds, 0,
+            "the true greedy continuation must never be rejected"
+        );
+    }
+
+    /// Direct verifier-level fault: a draft far beyond the [`SPEC_DRAFT_MAX`]
+    /// budget is verified position by position — truncated at the first
+    /// divergence with the true greedy correction, or fully accepted when it
+    /// genuinely agrees — never trusted, never panicking. Distinct-id targets
+    /// keep the 35-gram ban silent (no 34-gram ever recurs), so greedy is the raw
+    /// per-row argmax throughout.
+    #[test]
+    fn oversized_draft_is_verified_position_by_position_never_trusted() {
+        const K: usize = 64;
+        let p = params(1000);
+        let target: Vec<u32> = (0..=K).map(|i| i as u32 + 2).collect();
+        let rows: Vec<Mat> = target.iter().map(|&t| peak_row(t)).collect();
+
+        // (a) agrees for 5 positions then diverges: truncated exactly there, the
+        // correction is the true greedy token, the oversized tail is discarded.
+        let mut draft: Vec<u32> = target[..K].to_vec();
+        draft[5] = 99;
+        assert!(
+            draft.len() > SPEC_DRAFT_MAX,
+            "the fault draft must dwarf the live proposal budget"
+        );
+        let emit = resolve_round(&[], &draft, &rows, &p).unwrap();
+        assert_eq!(
+            emit.accepted, 5,
+            "first divergence truncates; budget ignored"
+        );
+        assert_eq!(
+            emit.correction.expect("correction at divergence").token_id,
+            target[5]
+        );
+
+        // (b) fully-agreeing oversized draft: all K accepted + the bonus token.
+        let emit = resolve_round(&[], &target[..K], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, K, "genuine agreement is accepted in full");
+        assert_eq!(
+            emit.correction.expect("bonus after full accept").token_id,
+            target[K]
+        );
+    }
+
+    /// The 69-token spec.rs ban fixture: the trailing 34 tokens repeat an earlier
+    /// 34-gram whose observed completion was token 7, so the frozen 35/128
+    /// blocker bans 7 at the next position.
+    fn history_banning_token_7() -> Vec<u32> {
+        let prefix: Vec<u32> = (20u32..54).collect();
+        assert_eq!(prefix.len(), 34);
+        let mut h = Vec::with_capacity(69);
+        h.extend_from_slice(&prefix); // leading 34-gram
+        h.push(7); // its observed completion
+        h.extend_from_slice(&prefix); // current prefix == leading 34-gram
+        h
+    }
+
+    /// A malicious drafter cannot SMUGGLE a banned token past the frozen 35-gram
+    /// ban: the verifier recomputes greedy WITH the ban, rejects the raw-argmax
+    /// token the ban forbids, and corrects to the ban-aware choice.
+    #[test]
+    fn drafter_cannot_smuggle_a_banned_token() {
+        let history = history_banning_token_7();
+        // Raw argmax is 7 (banned in this context); runner-up is 6.
+        let rows = vec![row_peaked(7, 6), peak_row(8)];
+        let p = params(1000);
+        // Ground truth via the production chooser: the ban flips greedy to 6.
+        let g = sample(&rows[0], &history, &p).expect("production chooser");
+        assert_eq!(g, 6, "the 35-gram ban must flip greedy from 7 to 6");
+
+        let emit = resolve_round(&history, &[7], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 0, "the banned token must not be accepted");
+        assert_eq!(
+            emit.correction.expect("ban-aware correction").token_id,
+            6,
+            "the correction must be the ban-aware greedy token"
+        );
+    }
+
+    /// A drafter cannot FORGE termination: a proposed EOS where greedy would not
+    /// pick EOS is rejected, and the stream continues with the true token.
+    #[test]
+    fn drafter_cannot_forge_eos_termination() {
+        let rows = vec![peak_row(5), peak_row(6)];
+        let p = params(1000);
+        let emit = resolve_round(&[], &[EOS], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 0, "a forged EOS must be rejected");
+        let c = emit.correction.expect("correction after forged EOS");
+        assert_eq!(c.token_id, 5);
+        assert!(!c.is_eos, "the stream must not terminate on a forged EOS");
+    }
+
+    /// An empty draft resolves to exactly one pure sequential step: nothing
+    /// accepted, and the correction equals the production chooser's decision.
+    #[test]
+    fn empty_draft_resolves_to_the_pure_sequential_step() {
+        let rows = vec![peak_row(9)];
+        let p = params(1000);
+        let emit = resolve_round(&[2, 3], &[], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 0);
+        let c = emit
+            .correction
+            .expect("the round still yields the sequential token");
+        assert_eq!(c.token_id, 9);
+        assert_eq!(
+            c.token_id,
+            sample(&rows[0], &[2, 3], &p).expect("production chooser"),
+            "the empty-draft round must equal the sequential chooser"
+        );
+    }
+
+    /// Verify rows SHORTER than the `draft.len() + 1` contract: only verified
+    /// positions are ever emitted — acceptance caps at the available rows and a
+    /// missing correction row yields NO token, never a fabricated one.
+    #[test]
+    fn short_verify_rows_fail_closed() {
+        let p = params(1000);
+        let draft = [3u32, 4, 2];
+        // 2 rows for a 3-token draft: positions 0 and 1 verifiable, 2 is not.
+        let rows = vec![peak_row(3), peak_row(4)];
+        let emit = resolve_round(&[], &draft, &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 2, "the unverifiable tail is not accepted");
+        assert!(
+            emit.correction.is_none(),
+            "no verify row to correct from -> no token"
+        );
+    }
+
+    /// A MALFORMED (empty) verify row fails CLOSED: acceptance stops before the
+    /// unverifiable position, and a malformed correction row is a hard error —
+    /// the round never emits an unverified token.
+    #[test]
+    fn malformed_verify_row_never_emits_unverified_tokens() {
+        let p = params(1000);
+        // Empty row at the live position: nothing is verifiable and the
+        // correction row itself is malformed -> error, no fabricated token.
+        let r = resolve_round(&[], &[3], &[Mat::from_vec(1, 0, vec![]), peak_row(4)], &p);
+        assert!(r.is_err(), "a malformed correction row must fail closed");
+
+        // Empty row mid-draft: acceptance stops BEFORE the unverifiable position
+        // (position 0 verifies against a well-formed row and is accepted).
+        let good = peak_row(3);
+        let bad = Mat::from_vec(1, 0, vec![]);
+        let rows: Vec<&[f32]> = vec![good.row(0), bad.row(0)];
+        assert_eq!(
+            accept_longest(&[], &[3, 4], &rows, EOS),
+            1,
+            "acceptance must stop at the first unverifiable position"
+        );
     }
 }
