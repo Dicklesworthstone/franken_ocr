@@ -173,16 +173,23 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # ── Native Windows / x86-64 (MSVC) ───────────────────────────────────────────
-  # Built natively on a windows-latest runner: no cargo-xwin, no cross-linking.
-  # windows-latest ships MSVC and nasm, so ring compiles its assembly directly and
-  # the whole stack (asupersync IOCP reactor, frankentorch, frankensqlite, focr)
-  # compiles clean for x86_64-pc-windows-msvc. The resulting focr.exe runs on real
-  # Windows 10 with runtime ISA detection (the avx2 tier is selected). This job
-  # reuses the SAME pinned nightly and the SAME sibling path-dep provisioning as
-  # the `dist` job above (the provisioning step is already PowerShell, so it runs
-  # unchanged here). Only staging differs: the artifact is a raw .exe and the
-  # checksum is produced with Get-FileHash instead of shasum.
+  # ── Native Windows (MSVC): x86-64 + arm64 ────────────────────────────────────
+  # Both Windows targets build natively on their own hosted runners: no
+  # cargo-xwin, no cross-linking — and the smoke step below needs a native host
+  # anyway, because x64 Windows cannot emulate arm64, so a cross-on-x64 arm64
+  # build could never be executed where it was built. windows-latest ships MSVC
+  # and nasm, so ring compiles its x86 assembly directly; windows-11-arm (the
+  # hosted arm64 label, available to public repos) carries the arm64 MSVC
+  # toolchain + LLVM for ring's aarch64 path. The whole stack (asupersync IOCP
+  # reactor, frankentorch, frankensqlite, focr) compiles clean for
+  # x86_64-pc-windows-msvc and the resulting focr.exe runs on real Windows 10
+  # with runtime ISA detection (the avx2 tier is selected); the arm64 row rides
+  # the same fail-fast:false matrix while bd-3u97 proves that stack end-to-end.
+  # Both rows reuse the SAME pinned nightly and the SAME sibling path-dep
+  # provisioning as the `dist` job above (the provisioning step is already
+  # PowerShell, so it runs unchanged here). Only staging differs: the artifact
+  # is a raw .exe and the checksum is produced with Get-FileHash instead of
+  # shasum.
   dist-windows:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
@@ -195,6 +202,15 @@ jobs:
           - name: x86_64-pc-windows-msvc (baseline)
             os: windows-latest
             target: x86_64-pc-windows-msvc
+            rustflags: ""
+
+          # arm64 Windows (Snapdragon/Surface-class hosts, and Windows VMs on
+          # Apple Silicon). Baseline rustflags like the aarch64-linux row in the
+          # `dist` job: runtime dispatch selects SDOT/SMMLA (i8mm) when the
+          # silicon has it, so no target-cpu pinning is needed (bd-1aj1).
+          - name: aarch64-pc-windows-msvc (baseline)
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
             rustflags: ""
     steps:
       - name: Checkout
@@ -244,6 +260,28 @@ jobs:
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
         run: cargo build --release --bin focr --target ${{ matrix.target }}
+
+      # No-weights smoke (bd-wp8.5 contract; scripts/e2e_smoke.sh is the shell
+      # analogue): the freshly built binary must RUN on this host, not just
+      # link, before it is staged. `--version` and every read-only robot
+      # surface must exit 0, and each robot payload must be one parseable JSON
+      # object on stdout (src/cli.rs `emit`: data-only stdout, one object/line).
+      # Runs pre-staging so a broken binary never becomes an artifact. Both
+      # matrix rows execute this natively — the arm64 row is why this job uses
+      # windows-11-arm rather than cross-compiling on x64.
+      - name: Smoke test focr (no weights)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target/${{ matrix.target }}/release/focr.exe"
+          & $exe --version | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "focr --version exited $LASTEXITCODE" }
+          foreach ($cmd in @("schema", "health", "backends")) {
+            $lines = @(& $exe robot $cmd)
+            if ($LASTEXITCODE -ne 0) { throw "focr robot $cmd exited $LASTEXITCODE" }
+            $null = ($lines -join "`n") | ConvertFrom-Json
+            Write-Host "smoke ok: robot $cmd (exit 0, valid JSON)"
+          }
 
       # The Windows artifact is a raw focr.exe (not a zip). Stage it under the
       # canonical per-target name `focr-<target>.exe` and emit a "<hex>  <name>"

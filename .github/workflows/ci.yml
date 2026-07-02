@@ -157,6 +157,16 @@ jobs:
             runnable: true
             skip: false
             skip_reason: ""
+          # arm64 Windows checks natively on the hosted windows-11-arm runner
+          # (available to public repos); advisory only — continue-on-error above
+          # keeps the not-yet-proven arm64 stack (bd-3u97/bd-1aj1) from blocking
+          # the gate while dist.yml ships its artifact.
+          - name: windows-msvc-aarch64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            runnable: true
+            skip: false
+            skip_reason: ""
     timeout-minutes: 45
     steps:
       - name: Checkout
