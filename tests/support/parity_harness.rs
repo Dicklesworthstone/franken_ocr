@@ -799,7 +799,10 @@ fn parse_npy_shape(header: &str) -> Result<Vec<usize>, String> {
     Ok(dims)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase-hex SHA-256 of `bytes` — shared with the ladder rungs (L5 verifies
+/// the golden `decoded_text` hashes to its own recorded `decoded_text_sha256`
+/// before letting it set the bar).
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for b in digest {
