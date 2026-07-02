@@ -177,6 +177,52 @@ fn got_format_requested() -> bool {
         || std::env::var_os(GOT_FORMAT_ENV).is_some()
 }
 
+// ── one-live-forward gauge (bd-1azu.14, the doctrine-#5 conscience) ─────────
+//
+// Every heavy forward (vision tower — per-page or batched — and a page prefill;
+// the batch scheduler's decode step wires in via `enter_forward` too) holds a
+// [`ForwardPass`] token for its duration. The gauge records the maximum number
+// of tokens ever live at once (must stay 1: ONE live forward process-wide) and
+// whether any forward began while the model-cache mutex guard was held (must
+// stay false: NEVER fan out under a held lock). Reading + resetting is a
+// test-only hook; the per-forward cost is two relaxed atomics.
+
+static FORWARDS_LIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FORWARDS_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static CACHE_GUARD_HELD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static FORWARD_UNDER_GUARD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII token for one live forward; dropping it decrements the gauge.
+pub(crate) struct ForwardPass(());
+
+impl Drop for ForwardPass {
+    fn drop(&mut self) {
+        FORWARDS_LIVE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Enter a heavy forward: bump the live count, fold it into the observed max,
+/// and record whether the model-cache guard is currently held by ANY thread
+/// (fanning out under a held lock is the deadlock class doctrine #5 bans).
+pub(crate) fn enter_forward() -> ForwardPass {
+    let live = FORWARDS_LIVE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    FORWARDS_MAX.fetch_max(live, std::sync::atomic::Ordering::SeqCst);
+    if CACHE_GUARD_HELD.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        FORWARD_UNDER_GUARD.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    ForwardPass(())
+}
+
+/// Snapshot + reset the gauge: `(max_concurrent_forwards, forward_began_under_guard)`.
+/// Test-only observability for the `many_pages_without_deadlock` watchdog.
+#[doc(hidden)]
+pub fn forward_gauge_take() -> (usize, bool) {
+    let max = FORWARDS_MAX.swap(0, std::sync::atomic::Ordering::SeqCst);
+    let under = FORWARD_UNDER_GUARD.swap(false, std::sync::atomic::Ordering::SeqCst);
+    (max, under)
+}
+
 /// `FOCR_BATCH_VISION` (bd-1azu.10 / bd-t6a): inside the batch spine, run the
 /// vision tower BATCHED ACROSS PAGES — hydrate the SAM/CLIP weights once per
 /// batch and stack every admitted page's views into one batched SAM forward +
@@ -307,10 +353,37 @@ fn model_cache() -> &'static ModelCache {
     CACHE.get_or_init(|| Mutex::new(None))
 }
 
-fn model_cache_guard() -> FocrResult<MutexGuard<'static, ModelCacheEntry>> {
-    model_cache()
+fn model_cache_guard() -> FocrResult<TrackedCacheGuard> {
+    let guard = model_cache()
         .lock()
-        .map_err(|_| FocrError::Other(anyhow::anyhow!("model cache mutex poisoned")))
+        .map_err(|_| FocrError::Other(anyhow::anyhow!("model cache mutex poisoned")))?;
+    CACHE_GUARD_HELD.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(TrackedCacheGuard(guard))
+}
+
+/// The model-cache guard, instrumented for the one-live-forward gauge
+/// (bd-1azu.14): while ANY thread holds it, a forward beginning trips
+/// [`FORWARD_UNDER_GUARD`] — the rayon-under-lock deadlock class doctrine #5
+/// bans. Derefs to the plain cache entry; the count drops with the guard.
+struct TrackedCacheGuard(MutexGuard<'static, ModelCacheEntry>);
+
+impl std::ops::Deref for TrackedCacheGuard {
+    type Target = ModelCacheEntry;
+    fn deref(&self) -> &ModelCacheEntry {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for TrackedCacheGuard {
+    fn deref_mut(&mut self) -> &mut ModelCacheEntry {
+        &mut self.0
+    }
+}
+
+impl Drop for TrackedCacheGuard {
+    fn drop(&mut self) {
+        CACHE_GUARD_HELD.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 fn looks_like_safetensors_container(bytes: &[u8]) -> bool {
@@ -1313,6 +1386,7 @@ impl OcrModel {
         let (image_w, image_h) = Self::image_dims(pre);
         let (inputs_embeds, prompt_ids) = self.build_inputs_embeds(pre, vision_features)?;
         let prefill_len = inputs_embeds.rows;
+        let _fwd = enter_forward();
         let (hidden, caches) = decoder::prefill_with_cache_i8(wc, &inputs_embeds)?;
         let last_hidden = Self::last_hidden_row(&hidden)?;
         Ok(PagePrefill {
@@ -1366,6 +1440,7 @@ impl OcrModel {
     /// The first vision-stage error (e.g. a missing or mis-shaped tensor surfaced
     /// by the `Weights`-backed SAM/CLIP/bridge entrypoints, or a kernel failure).
     fn vision_tower(&self, pre: &Preprocessed) -> FocrResult<Vec<Mat>> {
+        let _fwd = enter_forward();
         let mut features = Vec::new();
         for view in Self::views(pre) {
             // SAM tower -> [1024, 16*16] x3 feature (flatten(2) layout, OQ-6).
@@ -1401,6 +1476,7 @@ impl OcrModel {
     /// A weight-hydration failure, a non-square view, or any batched-forward
     /// rejection (e.g. a ragged same-side group, which Base mode cannot produce).
     fn vision_tower_batched_pages(&self, pres: &[&Preprocessed]) -> FocrResult<Vec<Vec<Mat>>> {
+        let _fwd = enter_forward();
         // (page, view-slot) inventory, preserving vision_tower's per-page order.
         let mut page_views: Vec<Vec<Mat>> = pres.iter().map(|pre| Self::views(pre)).collect();
         let th = std::time::Instant::now();
@@ -1766,9 +1842,9 @@ impl OcrModel {
         // verify -> accept loop in place of the sequential greedy `while` below; it
         // emits the BYTE-FOR-BYTE-identical token stream. Unset (the default) => the
         // spec loop is skipped and the `while` runs EXACTLY today's code, untouched.
-        let spec_decode = spec_decode_enabled()
-            && params.no_repeat_ngram_size == sampler::DEFAULT_NO_REPEAT_NGRAM_SIZE
-            && params.ngram_window == sampler::NGRAM_WINDOW_SINGLE;
+        // The params half is `DecodeParams::matches_frozen_spec_ban` (sampler.rs),
+        // gated by `tests/spec_decode_gate.rs`, so guard and gate cannot drift.
+        let spec_decode = spec_decode_enabled() && params.matches_frozen_spec_ban();
         if spec_decode {
             self.spec_decode_i8(
                 wc,

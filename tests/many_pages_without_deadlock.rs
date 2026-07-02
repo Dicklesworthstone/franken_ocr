@@ -424,6 +424,131 @@ fn many_sequential_pages_complete_within_budget() {
     }
 }
 
+// ───────────────────────────── scenario 1b: the batched spine ─────────────────────────────
+
+/// bd-1azu.14: the SPINE watchdog. Drives pages ≫ pool through the
+/// continuous-batch scheduler (`recognize_batch` with `FOCR_BATCH_SPINE` armed
+/// by the caller — env is process-immutable here, so the B sweep + spine=0
+/// control run live in `scripts/spine_watchdog_sweep.sh`) and asserts, beyond
+/// completion-within-budget: (a) the PROCESS-WIDE one-live-forward gauge never
+/// exceeded 1 — and it counts vision-encode (per-page AND batched) + page
+/// prefill + every scheduler decode step, so a stray concurrent vision fan-out
+/// fails the gate; (b) no forward began while the model-cache mutex guard was
+/// held (the rayon-under-lock deadlock class).
+///
+/// Model-gated skip-with-SUCCESS: needs `FOCR_MODEL_PATH` (real weights),
+/// `FOCR_BATCH_SPINE` (armed externally), and `FOCR_WATCHDOG_IMAGE` (a real
+/// decodable page); absent any of them it logs `skip_no_model` and passes.
+#[test]
+fn spine_many_pages_one_live_forward_within_budget() {
+    let case = "batched_spine_one_live_forward";
+    let pool = detected_pool();
+
+    let heavy = heavy_model_path();
+    let spine_armed = std::env::var_os("FOCR_BATCH_SPINE").is_some();
+    let image = std::env::var_os("FOCR_WATCHDOG_IMAGE")
+        .map(PathBuf::from)
+        .filter(|p| p.exists());
+    let batch_size = std::env::var("FOCR_BATCH_SIZE").unwrap_or_else(|_| "default".into());
+
+    let (Some(model_path), true, Some(image)) = (heavy, spine_armed, image) else {
+        log_line(
+            case,
+            "skip",
+            "skip_no_model",
+            &format!(
+                r#""reason":"needs FOCR_MODEL_PATH + FOCR_BATCH_SPINE + FOCR_WATCHDOG_IMAGE (env is process-immutable in-test; scripts/spine_watchdog_sweep.sh arms all three and sweeps FOCR_BATCH_SIZE)","native_path_ran":true,"fallback_target":"{ABSENT_MODEL}""#
+            ),
+        );
+        return;
+    };
+
+    // Full real forwards are expensive (~10s+/page): pages ≫ pool is expressed
+    // against the SCHEDULER's admission width (B, from FOCR_BATCH_SIZE), not the
+    // rayon pool — the sweep script runs B ∈ {1, 4, big} so streams retire and
+    // backfill many times at B ≪ pages. 12 pages keeps the heavy run inside the
+    // budget while still churning admission at every swept B.
+    let pages = 12usize;
+
+    log_line(
+        case,
+        "setup",
+        "pass",
+        &format!(
+            r#""seed":0,"pool":{pool},"pages_issued":{pages},"batch_size_env":{bs},"timeout_budget_secs":{budget},"mode":"heavy_spine","model_path":{mp},"image":{img},"native_path_ran":true,"fallback_target":{mp}"#,
+            budget = WATCHDOG_BUDGET_HEAVY.as_secs(),
+            bs = json_str(&batch_size),
+            mp = json_str(&model_path.display().to_string()),
+            img = json_str(&image.display().to_string()),
+        ),
+    );
+
+    // Reset the gauge so this scenario observes only its own forwards.
+    let _ = franken_ocr::native_engine::forward_gauge_take();
+
+    let outcome = run_with_watchdog(WATCHDOG_BUDGET_HEAVY, move || {
+        let engine = OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
+        let page_paths: Vec<PathBuf> = (0..pages).map(|_| image.clone()).collect();
+        let page_refs: Vec<&Path> = page_paths.iter().map(PathBuf::as_path).collect();
+        let results = engine
+            .recognize_batch_with_model(&model_path, &page_refs)
+            .expect("recognize_batch runs");
+        let ok = results.iter().filter(|r| r.is_ok()).count();
+        let err = results.len() - ok;
+        (results.len(), ok, err)
+    });
+
+    match outcome {
+        Watch::TimedOut => {
+            log_line(
+                case,
+                "watchdog",
+                "fail",
+                &format!(
+                    r#""assertion":"completes_within_budget","pass":false,"pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{}"#,
+                    WATCHDOG_BUDGET_HEAVY.as_secs()
+                ),
+            );
+            panic!(
+                "DEADLOCK SUSPECTED: spine batch (pages={pages}, pool={pool}, \
+                 FOCR_BATCH_SIZE={batch_size}) did not complete within {}s",
+                WATCHDOG_BUDGET_HEAVY.as_secs()
+            );
+        }
+        Watch::Finished {
+            payload: (completed, ok, err),
+            elapsed,
+        } => {
+            let (max_forwards, under_guard) = franken_ocr::native_engine::forward_gauge_take();
+            log_line(
+                case,
+                "complete",
+                "pass",
+                &format!(
+                    r#""completed":{completed},"ok":{ok},"err":{err},"elapsed_ms":{},"max_concurrent_forwards":{max_forwards},"guard_held_during_fanout":{under_guard},"batch_size_env":{bs}"#,
+                    elapsed.as_millis(),
+                    bs = json_str(&batch_size),
+                ),
+            );
+            assert_eq!(completed, pages, "every page must produce a result slot");
+            assert_eq!(
+                err, 0,
+                "heavy spine run: every page should decode (got {err} errors)"
+            );
+            assert!(
+                max_forwards <= 1,
+                "ONE-LIVE-FORWARD VIOLATION: the process-wide gauge saw \
+                 {max_forwards} concurrent forwards (vision/prefill/decode-step)"
+            );
+            assert!(
+                !under_guard,
+                "LOCK-DISCIPLINE VIOLATION: a forward began while the \
+                 model-cache mutex guard was held (rayon-under-lock class)"
+            );
+        }
+    }
+}
+
 // ───────────────────────────── scenario 2 ─────────────────────────────
 
 /// Engine-construction-under-concurrency: many threads each build their OWN

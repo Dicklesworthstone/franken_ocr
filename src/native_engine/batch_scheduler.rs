@@ -338,8 +338,9 @@ impl BatchScheduler {
                 .collect();
 
             // ── exactly one live forward over the active set ──
-            self.enter_forward();
+            let fwd = self.enter_forward();
             let result = step.step(&slots);
+            drop(fwd);
             self.exit_forward();
             let outs = result?;
             self.steps += 1;
@@ -387,9 +388,13 @@ impl BatchScheduler {
         }
     }
 
-    fn enter_forward(&self) {
+    fn enter_forward(&self) -> super::ForwardPass {
         let n = self.live_forwards.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_forwards.fetch_max(n, Ordering::SeqCst);
+        // Also joins the PROCESS-WIDE one-live-forward gauge (bd-1azu.14), so a
+        // vision/prefill forward concurrent with a decode step trips the
+        // watchdog even though this scheduler's local counter can't see it.
+        super::enter_forward()
     }
 
     fn exit_forward(&self) {
