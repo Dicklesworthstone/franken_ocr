@@ -130,6 +130,11 @@ pub struct DecoderConfig {
     /// hard-coded upstream in `chat()` — spec §12 OQ-8); `0` disables the guard
     /// (bd-ff4i: unguarded greedy repetition-runs on some real pages).
     pub no_repeat_ngram_size: usize,
+    /// GQA key/value head count (A7, bd-3jo6.1.7): `== num_attention_heads` is
+    /// plain MHA (GOT); `< num_attention_heads` shares each kv head across
+    /// `kv_group()` query heads (SmolVLM2-500M: 15 q heads over 5 kv heads).
+    /// Must divide `num_attention_heads` evenly.
+    pub num_key_value_heads: usize,
 }
 
 impl DecoderConfig {
@@ -147,15 +152,29 @@ impl DecoderConfig {
             rms_norm_eps: 1e-6,
             attn_qkv_bias: true,
             no_repeat_ngram_size: 20,
+            num_key_value_heads: 16,
         }
     }
 
-    /// The q/k/v/o projection width (`num_attention_heads * head_dim`). Equals
-    /// `hidden_size` for GOT (no GQA), but kept distinct so the driver survives a
-    /// GQA model.
+    /// The q / o projection width (`num_attention_heads * head_dim`). Equals
+    /// `hidden_size` for GOT.
     #[must_use]
-    pub fn qkv_dim(&self) -> usize {
+    pub fn q_dim(&self) -> usize {
         self.num_attention_heads * self.head_dim
+    }
+
+    /// The k / v projection width (`num_key_value_heads * head_dim`); equals
+    /// [`Self::q_dim`] for MHA, smaller under GQA.
+    #[must_use]
+    pub fn kv_dim(&self) -> usize {
+        self.num_key_value_heads * self.head_dim
+    }
+
+    /// Query heads per kv head (`1` = MHA; SmolVLM2 = 3). Query head `h` reads
+    /// kv head `h / kv_group()`.
+    #[must_use]
+    pub fn kv_group(&self) -> usize {
+        self.num_attention_heads / self.num_key_value_heads
     }
 }
 
@@ -232,7 +251,8 @@ fn qwen2_layer(
     let p = format!("model.layers.{layer}");
     assert_no_qk_norm(weights, &p)?;
     let eps = cfg.rms_norm_eps;
-    let (hidden, qkv_dim, inter) = (cfg.hidden_size, cfg.qkv_dim(), cfg.intermediate_size);
+    let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
+    let (q_dim, kv_dim) = (cfg.q_dim(), cfg.kv_dim());
 
     // ── attention ────────────────────────────────────────────────────────────
     let input_ln = weights.vec(&format!("{p}.input_layernorm.weight"))?;
@@ -252,7 +272,7 @@ fn qwen2_layer(
         &normed,
         &format!("{p}.self_attn.q_proj.weight"),
         hidden,
-        qkv_dim,
+        q_dim,
         q_b.as_deref(),
     )?;
     let mut k = linear_auto(
@@ -260,7 +280,7 @@ fn qwen2_layer(
         &normed,
         &format!("{p}.self_attn.k_proj.weight"),
         hidden,
-        qkv_dim,
+        kv_dim,
         k_b.as_deref(),
     )?;
     let v = linear_auto(
@@ -268,18 +288,18 @@ fn qwen2_layer(
         &normed,
         &format!("{p}.self_attn.v_proj.weight"),
         hidden,
-        qkv_dim,
+        kv_dim,
         v_b.as_deref(),
     )?;
 
     decoder::apply_rope(&mut q, rope)?;
     decoder::apply_rope(&mut k, rope)?;
-    let ctx = decoder::prefill_attention(&q, &k, &v, cfg.num_attention_heads, cfg.head_dim)?;
+    let ctx = prefill_attention_gqa(&q, &k, &v, cfg)?;
     let attn = linear_auto(
         weights,
         &ctx,
         &format!("{p}.self_attn.o_proj.weight"),
-        qkv_dim,
+        q_dim,
         hidden,
         None,
     )?;
@@ -410,31 +430,34 @@ pub fn generate_greedy(
 // prequant-fused `gemv_i8_bias` is a ledgered perf follow-on; correctness first.
 
 /// One decoder layer's full-causal KV cache: post-RoPE **K** and post-proj **V**,
-/// token-major `[n_kv, qkv_dim]`, grown by one row per decode step. NOT R-SWA — GOT
+/// token-major `[n_kv, kv_dim]`, grown by one row per decode step. NOT R-SWA — GOT
 /// Qwen2 attends the whole prefix (no window, no eviction, f32 KV).
 struct Qwen2KvCache {
     k: Vec<f32>,
     v: Vec<f32>,
     n_kv: usize,
-    qkv_dim: usize,
+    /// Row stride: `num_key_value_heads · head_dim` — the GQA-NATIVE width
+    /// (`== q_dim` for MHA/GOT). The decode per-head reader maps query heads
+    /// onto these lanes.
+    kv_dim: usize,
 }
 
 impl Qwen2KvCache {
-    fn new(qkv_dim: usize, max_positions: usize) -> Self {
+    fn new(kv_dim: usize, max_positions: usize) -> Self {
         Self {
-            k: Vec::with_capacity(max_positions * qkv_dim),
-            v: Vec::with_capacity(max_positions * qkv_dim),
+            k: Vec::with_capacity(max_positions * kv_dim),
+            v: Vec::with_capacity(max_positions * kv_dim),
             n_kv: 0,
-            qkv_dim,
+            kv_dim,
         }
     }
-    /// Seed all `N` prefill rows at once (`k_all`/`v_all` are `[N, qkv_dim]`).
+    /// Seed all `N` prefill rows at once (`k_all`/`v_all` are `[N, kv_dim]`).
     fn seed(&mut self, k_all: &[f32], v_all: &[f32]) {
         self.k.extend_from_slice(k_all);
         self.v.extend_from_slice(v_all);
-        self.n_kv += k_all.len() / self.qkv_dim;
+        self.n_kv += k_all.len() / self.kv_dim;
     }
-    /// Append one decode step's k/v row (each `[qkv_dim]`).
+    /// Append one decode step's k/v row (each `[kv_dim]`).
     fn append(&mut self, k_row: &[f32], v_row: &[f32]) {
         self.k.extend_from_slice(k_row);
         self.v.extend_from_slice(v_row);
@@ -442,7 +465,7 @@ impl Qwen2KvCache {
     }
 }
 
-/// Full-causal m=1 attention: the single new query (`q_row`, `[qkv_dim]`) attends
+/// Full-causal m=1 attention: the single new query (`q_row`, `[q_dim]`) attends
 /// ALL `n_kv` cached keys (every cached position ≤ the current one — no mask needed).
 /// scale `1/√head_dim` = 1/8.
 ///
@@ -457,6 +480,7 @@ fn qwen2_decode_attention(
     q_row: &[f32],
     num_heads: usize,
     head_dim: usize,
+    kv_group: usize,
 ) -> Vec<f32> {
     let dim = num_heads * head_dim;
     let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -468,36 +492,43 @@ fn qwen2_decode_attention(
         // hands head `h` its own output slice + its own scratch.
         out.par_chunks_mut(head_dim)
             .enumerate()
-            .for_each(|(h, oh)| decode_attn_head(cache, q_row, h, head_dim, dim, scale, oh));
+            .for_each(|(h, oh)| decode_attn_head(cache, q_row, h, head_dim, kv_group, scale, oh));
     } else {
         for h in 0..num_heads {
             let oh = &mut out[h * head_dim..(h + 1) * head_dim];
-            decode_attn_head(cache, q_row, h, head_dim, dim, scale, oh);
+            decode_attn_head(cache, q_row, h, head_dim, kv_group, scale, oh);
         }
     }
     out
 }
 
 /// One attention head's decode: `softmax(scale · q_h·Kᵀ) · V`, writing `[head_dim]` into
-/// `oh`. Reads the token-major cache directly; the only per-head temp is `[n_kv]` scores.
-/// Identical math whether called serially or from the rayon fan-out above.
+/// `oh`. Reads the token-major cache directly at its NATIVE `kv_dim` stride —
+/// under GQA (`kv_group > 1`) query head `h` reads shared kv head
+/// `h / kv_group` (A7); `kv_group == 1` reads head `h` verbatim (the certified
+/// MHA path, index arithmetic unchanged: `kv_dim == num_heads·head_dim`). The
+/// only per-head temp is `[n_kv]` scores. Identical math whether called
+/// serially or from the rayon fan-out above.
 #[inline]
 fn decode_attn_head(
     cache: &Qwen2KvCache,
     q_row: &[f32],
     h: usize,
     head_dim: usize,
-    dim: usize,
+    kv_group: usize,
     scale: f32,
     oh: &mut [f32],
 ) {
     let n_kv = cache.n_kv;
+    let kv_dim = cache.kv_dim;
+    let kv_lane = (h / kv_group) * head_dim;
     let qh = &q_row[h * head_dim..h * head_dim + head_dim];
     let mut scores = vec![0.0f32; n_kv];
-    // scores[r] = scale · (q_h · k[r, head h]); track the max for a stable softmax.
+    // scores[r] = scale · (q_h · k[r, kv head h/kv_group]); track the max for a
+    // stable softmax.
     let mut smax = f32::NEG_INFINITY;
     for (r, s) in scores.iter_mut().enumerate() {
-        let base = r * dim + h * head_dim;
+        let base = r * kv_dim + kv_lane;
         let kh = &cache.k[base..base + head_dim];
         let dot: f32 = qh.iter().zip(kh).map(|(&a, &b)| a * b).sum();
         *s = dot * scale;
@@ -510,10 +541,10 @@ fn decode_attn_head(
         denom += *s;
     }
     let inv = 1.0 / denom;
-    // out_h = Σ_r softmax[r] · v[r, head h].
+    // out_h = Σ_r softmax[r] · v[r, kv head h/kv_group].
     for (r, &s) in scores.iter().enumerate() {
         let w = s * inv;
-        let base = r * dim + h * head_dim;
+        let base = r * kv_dim + kv_lane;
         let vh = &cache.v[base..base + head_dim];
         for (o, &vv) in oh.iter_mut().zip(vh) {
             *o += w * vv;
@@ -526,7 +557,7 @@ fn decode_attn_head(
 struct GotLayerW {
     input_ln: Vec<f32>,
     post_attn_ln: Vec<f32>,
-    /// Fused q|k|v projection `[3·qkv_dim, hidden]` (one int8 panel) so the decode
+    /// Fused q|k|v projection `[q_dim + 2·kv_dim, hidden]` (one int8 panel) so the decode
     /// quantizes the normed row ONCE and runs ONE n-parallel GEMV for all three.
     qkv: QInt8,
     qkv_bias: Vec<f32>,
@@ -540,15 +571,17 @@ struct GotLayerW {
 /// `[3·d, h]` [`QInt8`] — bit-identical per-output-channel to the three separate
 /// GEMMs (each output channel keeps its own scale), but one dispatch.
 fn concat_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
-    let mut w = Vec::with_capacity(q.w.len() * 3);
+    // Panels may be UNEQUAL under GQA (q: q_dim rows, k/v: kv_dim rows each).
+    let n = q.n + k.n + v.n;
+    let mut w = Vec::with_capacity(q.w.len() + k.w.len() + v.w.len());
     w.extend_from_slice(&q.w);
     w.extend_from_slice(&k.w);
     w.extend_from_slice(&v.w);
-    let mut scales = Vec::with_capacity(q.n * 3);
+    let mut scales = Vec::with_capacity(n);
     scales.extend_from_slice(&q.scales);
     scales.extend_from_slice(&k.scales);
     scales.extend_from_slice(&v.scales);
-    QInt8::new(w, scales, q.n * 3, q.k)
+    QInt8::new(w, scales, n, q.k)
 }
 
 /// The whole GOT decoder's decode-time weights (pre-loaded once for a generation).
@@ -568,25 +601,17 @@ struct GotDecodeWeights {
 
 impl GotDecodeWeights {
     fn build(weights: &Weights, cfg: &DecoderConfig) -> FocrResult<Self> {
-        let (hidden, qkv_dim, inter) = (cfg.hidden_size, cfg.qkv_dim(), cfg.intermediate_size);
+        let (hidden, inter) = (cfg.hidden_size, cfg.intermediate_size);
+        let (q_dim, kv_dim) = (cfg.q_dim(), cfg.kv_dim());
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
-            let q = decoder::quant_oc_loaded(
-                weights,
-                &format!("{p}.self_attn.q_proj.weight"),
-                qkv_dim,
-            )?;
-            let k = decoder::quant_oc_loaded(
-                weights,
-                &format!("{p}.self_attn.k_proj.weight"),
-                qkv_dim,
-            )?;
-            let v = decoder::quant_oc_loaded(
-                weights,
-                &format!("{p}.self_attn.v_proj.weight"),
-                qkv_dim,
-            )?;
+            let q =
+                decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.q_proj.weight"), q_dim)?;
+            let k =
+                decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.k_proj.weight"), kv_dim)?;
+            let v =
+                decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.v_proj.weight"), kv_dim)?;
             let mut qkv_bias = weights.vec(&format!("{p}.self_attn.q_proj.bias"))?;
             qkv_bias.extend(weights.vec(&format!("{p}.self_attn.k_proj.bias"))?);
             qkv_bias.extend(weights.vec(&format!("{p}.self_attn.v_proj.bias"))?);
@@ -712,16 +737,18 @@ fn forward_prefill_seed(
     let mut x = inputs_embeds.clone();
     let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
     let rope = decoder::RopeTable::build(&positions, cfg.head_dim, cfg.rope_theta);
-    let qkv_dim = cfg.qkv_dim();
+    let (q_dim, kv_dim) = (cfg.q_dim(), cfg.kv_dim());
     for (l, cl) in w.layers.iter().enumerate() {
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         // one fused q|k|v GEMM (m=N, row-parallel), then split the columns.
         let qkv = nn::linear_int8_dynamic(&normed, &cl.qkv, Some(&cl.qkv_bias))?;
-        let (mut q, mut k, v) = split_qkv_rows(&qkv, qkv_dim);
+        let (mut q, mut k, v) = split_qkv_rows(&qkv, q_dim, kv_dim);
         decoder::apply_rope(&mut q, &rope)?;
         decoder::apply_rope(&mut k, &rope)?;
-        caches[l].seed(&k.data, &v.data); // the very K/V prefill_attention consumes
-        let ctx = decoder::prefill_attention(&q, &k, &v, cfg.num_attention_heads, cfg.head_dim)?;
+        // The cache holds the GQA-native (unbroadcast) K/V; the decode step's
+        // per-head kv mapping reads it at kv_dim stride.
+        caches[l].seed(&k.data, &v.data);
+        let ctx = prefill_attention_gqa(&q, &k, &v, cfg)?;
         let attn = nn::linear_int8_dynamic(&ctx, &cl.o, None)?;
         let h = decoder::add_residual(&x, &attn)?;
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
@@ -737,25 +764,68 @@ fn forward_prefill_seed(
     got_lm_head(w, &x_last, eps)
 }
 
-/// Split a fused `[N, 3·d]` q|k|v activation into three `[N, d]` mats (column blocks).
-fn split_qkv_rows(fused: &Mat, d: usize) -> (Mat, Mat, Mat) {
+/// Split a fused `[N, q_dim + 2·kv_dim]` q|k|v activation into `[N, q_dim]` +
+/// two `[N, kv_dim]` mats (column blocks; `kv_dim == q_dim` for MHA).
+fn split_qkv_rows(fused: &Mat, q_dim: usize, kv_dim: usize) -> (Mat, Mat, Mat) {
     let n = fused.rows;
+    let w = q_dim + 2 * kv_dim;
     let (mut q, mut k, mut v) = (
-        vec![0.0f32; n * d],
-        vec![0.0f32; n * d],
-        vec![0.0f32; n * d],
+        vec![0.0f32; n * q_dim],
+        vec![0.0f32; n * kv_dim],
+        vec![0.0f32; n * kv_dim],
     );
     for r in 0..n {
-        let row = &fused.data[r * 3 * d..(r + 1) * 3 * d];
-        q[r * d..(r + 1) * d].copy_from_slice(&row[0..d]);
-        k[r * d..(r + 1) * d].copy_from_slice(&row[d..2 * d]);
-        v[r * d..(r + 1) * d].copy_from_slice(&row[2 * d..3 * d]);
+        let row = &fused.data[r * w..(r + 1) * w];
+        q[r * q_dim..(r + 1) * q_dim].copy_from_slice(&row[0..q_dim]);
+        k[r * kv_dim..(r + 1) * kv_dim].copy_from_slice(&row[q_dim..q_dim + kv_dim]);
+        v[r * kv_dim..(r + 1) * kv_dim].copy_from_slice(&row[q_dim + kv_dim..w]);
     }
     (
-        Mat::from_vec(n, d, q),
-        Mat::from_vec(n, d, k),
-        Mat::from_vec(n, d, v),
+        Mat::from_vec(n, q_dim, q),
+        Mat::from_vec(n, kv_dim, k),
+        Mat::from_vec(n, kv_dim, v),
     )
+}
+
+/// Full-causal prefill attention with GQA head sharing (A7): MHA
+/// (`kv_group() == 1`, the GOT path) calls [`decoder::prefill_attention`]
+/// UNCHANGED — byte-identical to pre-GQA; a grouped config first broadcasts
+/// K/V to the full query-head layout ([`broadcast_kv`]) so the certified MHA
+/// kernel runs verbatim (lossless by construction: query head `h` sees exactly
+/// kv head `h / kv_group()`'s rows).
+fn prefill_attention_gqa(q: &Mat, k: &Mat, v: &Mat, cfg: &DecoderConfig) -> FocrResult<Mat> {
+    if cfg.kv_group() == 1 {
+        return decoder::prefill_attention(q, k, v, cfg.num_attention_heads, cfg.head_dim);
+    }
+    let k_full = broadcast_kv(k, cfg)?;
+    let v_full = broadcast_kv(v, cfg)?;
+    decoder::prefill_attention(q, &k_full, &v_full, cfg.num_attention_heads, cfg.head_dim)
+}
+
+/// Broadcast a GQA `[seq, kv_dim]` K or V to the full `[seq, q_dim]` head
+/// layout: each kv head's `[head_dim]` lane is repeated `kv_group()` times so
+/// query head `h` finds its shared kv head at lane `h`. A pure copy — no math.
+fn broadcast_kv(m: &Mat, cfg: &DecoderConfig) -> FocrResult<Mat> {
+    let (kv_dim, q_dim, hd, group) = (cfg.kv_dim(), cfg.q_dim(), cfg.head_dim, cfg.kv_group());
+    if m.cols != kv_dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "broadcast_kv: cols {} != kv_dim {kv_dim}",
+            m.cols
+        )));
+    }
+    let mut out = vec![0.0f32; m.rows * q_dim];
+    for r in 0..m.rows {
+        let src = &m.data[r * kv_dim..(r + 1) * kv_dim];
+        let dst = &mut out[r * q_dim..(r + 1) * q_dim];
+        for g in 0..cfg.num_key_value_heads {
+            let lane = &src[g * hd..(g + 1) * hd];
+            for rep in 0..group {
+                let h = g * group + rep;
+                dst[h * hd..(h + 1) * hd].copy_from_slice(lane);
+            }
+        }
+    }
+    Ok(Mat::from_vec(m.rows, q_dim, out))
 }
 
 /// One decode step over a single token embedding `x: [1, hidden]` at absolute
@@ -767,8 +837,9 @@ fn qwen2_decode_step(
     position: usize,
 ) -> FocrResult<Vec<f32>> {
     let cfg = &w.cfg;
-    let (hidden, qkv_dim, eps) = (cfg.hidden_size, cfg.qkv_dim(), cfg.rms_norm_eps);
+    let (hidden, eps) = (cfg.hidden_size, cfg.rms_norm_eps);
     let (num_heads, head_dim) = (cfg.num_attention_heads, cfg.head_dim);
+    let (q_dim, kv_dim, kv_group) = (cfg.q_dim(), cfg.kv_dim(), cfg.kv_group());
     let rope = decoder::RopeTable::build(&[position], head_dim, cfg.rope_theta);
     let mut x = x.clone();
     let tlayers = std::time::Instant::now();
@@ -777,14 +848,14 @@ fn qwen2_decode_step(
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
         let qkv = decoder::gemv_i8_bias_prequant(&xq, a, &cl.qkv, Some(&cl.qkv_bias));
-        let mut q = Mat::from_vec(1, qkv_dim, qkv[0..qkv_dim].to_vec());
-        let mut k = Mat::from_vec(1, qkv_dim, qkv[qkv_dim..2 * qkv_dim].to_vec());
-        let v = &qkv[2 * qkv_dim..3 * qkv_dim];
+        let mut q = Mat::from_vec(1, q_dim, qkv[0..q_dim].to_vec());
+        let mut k = Mat::from_vec(1, kv_dim, qkv[q_dim..q_dim + kv_dim].to_vec());
+        let v = &qkv[q_dim + kv_dim..q_dim + 2 * kv_dim];
         decoder::apply_rope(&mut q, &rope)?;
         decoder::apply_rope(&mut k, &rope)?;
         caches[l].append(&k.data, v);
         let ta = std::time::Instant::now();
-        let ctx = qwen2_decode_attention(&caches[l], &q.data, num_heads, head_dim);
+        let ctx = qwen2_decode_attention(&caches[l], &q.data, num_heads, head_dim, kv_group);
         DECODE_ATTN_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let (xqc, ac) = decoder::quantize_row_i8_te(&ctx);
         let attn = decoder::gemv_i8_bias_prequant(&xqc, ac, &cl.o, None);
@@ -832,7 +903,7 @@ pub fn generate_greedy_kvcache(
     let w = GotDecodeWeights::build(weights, cfg)?;
     let n = inputs_embeds.rows;
     let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
-        .map(|_| Qwen2KvCache::new(cfg.qkv_dim(), n + max_new))
+        .map(|_| Qwen2KvCache::new(cfg.kv_dim(), n + max_new))
         .collect();
     let timing = std::env::var_os("FOCR_TIMING").is_some();
     if timing {
@@ -920,12 +991,122 @@ mod tests {
         assert_eq!(c.num_hidden_layers, 24);
         assert_eq!(c.num_attention_heads, 16);
         assert_eq!(c.head_dim, 64);
-        assert_eq!(c.qkv_dim(), 1024);
+        // MHA identity: q_dim == kv_dim == hidden, group 1 (GQA is A7's delta).
+        assert_eq!(c.num_key_value_heads, 16);
+        assert_eq!(c.q_dim(), 1024);
+        assert_eq!(c.kv_dim(), 1024);
+        assert_eq!(c.kv_group(), 1);
         assert_eq!(c.vocab_size, 151_860);
         // full-causal scale must be exactly 1/8 (= 1/sqrt(64), what prefill_attention derives).
         assert!(((1.0 / (c.head_dim as f32).sqrt()) - 0.125).abs() < 1e-7);
         // upstream `chat()` hard-codes the HF global no_repeat_ngram_size=20 (OQ-8).
         assert_eq!(c.no_repeat_ngram_size, 20);
+    }
+
+    /// The SmolVLM2-500M shape (census docs/zoo/smolvlm2-spec.md): 15 q heads
+    /// over 5 kv heads, head_dim 64 — the exact GQA delta A7 exists for.
+    fn smolvlm2_like_cfg() -> DecoderConfig {
+        DecoderConfig {
+            hidden_size: 960,
+            intermediate_size: 2560,
+            num_hidden_layers: 32,
+            num_attention_heads: 15,
+            head_dim: 64,
+            vocab_size: 49_280,
+            rope_theta: 100_000.0,
+            rms_norm_eps: 1e-5,
+            attn_qkv_bias: false,
+            no_repeat_ngram_size: 0,
+            num_key_value_heads: 5,
+        }
+    }
+
+    #[test]
+    fn gqa_dims_and_grouping() {
+        let c = smolvlm2_like_cfg();
+        assert_eq!(c.q_dim(), 960);
+        assert_eq!(c.kv_dim(), 320);
+        assert_eq!(c.kv_group(), 3);
+    }
+
+    #[test]
+    fn broadcast_kv_repeats_each_kv_lane_group_times() {
+        let mut c = smolvlm2_like_cfg();
+        // tiny: 4 q heads over 2 kv heads, head_dim 2 → group 2.
+        c.num_attention_heads = 4;
+        c.num_key_value_heads = 2;
+        c.head_dim = 2;
+        let kv = Mat::from_vec(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let full = broadcast_kv(&kv, &c).expect("broadcast");
+        // row 0: kv heads [1,2] and [3,4] → q lanes [1,2],[1,2],[3,4],[3,4].
+        assert_eq!(full.data[0..8], [1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+        assert_eq!(full.data[8..16], [5.0, 6.0, 5.0, 6.0, 7.0, 8.0, 7.0, 8.0]);
+    }
+
+    /// The decode path's NATIVE GQA head mapping (index arithmetic over the
+    /// kv_dim-stride cache) must equal the independent broadcast-to-MHA
+    /// computation bit-for-bit — two different implementations of the same
+    /// math, so a mapping bug in either cannot self-confirm.
+    #[test]
+    fn gqa_decode_attention_matches_broadcast_mha_reference() {
+        let (num_heads, kv_heads, head_dim, n_kv) = (6usize, 2usize, 4usize, 5usize);
+        let group = num_heads / kv_heads;
+        let (q_dim, kv_dim) = (num_heads * head_dim, kv_heads * head_dim);
+        let f = |i: usize, salt: usize| (((i * 31 + salt * 17) % 97) as f32) * 0.03 - 1.2;
+
+        // GQA-native cache [n_kv, kv_dim] + query row [q_dim].
+        let mut cache = Qwen2KvCache::new(kv_dim, n_kv);
+        let k: Vec<f32> = (0..n_kv * kv_dim).map(|i| f(i, 1)).collect();
+        let v: Vec<f32> = (0..n_kv * kv_dim).map(|i| f(i, 2)).collect();
+        cache.seed(&k, &v);
+        let q_row: Vec<f32> = (0..q_dim).map(|i| f(i, 3)).collect();
+        let native = qwen2_decode_attention(&cache, &q_row, num_heads, head_dim, group);
+
+        // Independent reference: broadcast K/V to the full MHA layout, then run
+        // the SAME attention with kv_group == 1.
+        let mut bcast = Qwen2KvCache::new(q_dim, n_kv);
+        let expand = |src: &[f32]| -> Vec<f32> {
+            let mut out = vec![0.0f32; n_kv * q_dim];
+            for r in 0..n_kv {
+                for h in 0..num_heads {
+                    let s = r * kv_dim + (h / group) * head_dim;
+                    let d = r * q_dim + h * head_dim;
+                    out[d..d + head_dim].copy_from_slice(&src[s..s + head_dim]);
+                }
+            }
+            out
+        };
+        bcast.seed(&expand(&k), &expand(&v));
+        let reference = qwen2_decode_attention(&bcast, &q_row, num_heads, head_dim, 1);
+
+        assert_eq!(native.len(), reference.len());
+        for (i, (a, b)) in native.iter().zip(&reference).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "GQA native decode != broadcast-MHA reference at {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_qkv_rows_handles_unequal_gqa_panels() {
+        // 2 rows of [q_dim=4 | kv_dim=2 | kv_dim=2].
+        let fused = Mat::from_vec(
+            2,
+            8,
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, //
+                9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0,
+            ],
+        );
+        let (q, k, v) = split_qkv_rows(&fused, 4, 2);
+        assert_eq!((q.rows, q.cols), (2, 4));
+        assert_eq!((k.rows, k.cols), (2, 2));
+        assert_eq!((v.rows, v.cols), (2, 2));
+        assert_eq!(q.data, vec![1.0, 2.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0]);
+        assert_eq!(k.data, vec![5.0, 6.0, 13.0, 14.0]);
+        assert_eq!(v.data, vec![7.0, 8.0, 15.0, 16.0]);
     }
 
     #[test]
