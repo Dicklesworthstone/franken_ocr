@@ -316,6 +316,13 @@ fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, 
             let cap = expected_sample_cap(width, height, bpc, color_space);
             let sole_flate = !chained && terminal == "FlateDecode";
             let samples = decompressed_stream(doc, img.id, img.content, sole_flate, cap)?;
+            // /Indexed samples are palette indices, not color components: expand
+            // them through the palette in the color-space array (GH#4 — lopdf's
+            // `color_space` keeps only the array's first name, so the base +
+            // lookup table must be re-read from the stream dict).
+            if color_space == "Indexed" || color_space == "I" {
+                return indexed_to_image(doc, img.id, &samples, width, height, bpc);
+            }
             raw_samples_to_image(samples, width, height, bpc, color_space)
         }
         other => Err(format!("unsupported image filter {other}")),
@@ -450,8 +457,9 @@ fn raw_samples_to_image(
         "DeviceGray" | "CalGray" => 1,
         "DeviceCMYK" => 4,
         // ICCBased streams carry an /N component count; without resolving the
-        // profile we cannot know it here, and Indexed/Separation need a palette.
-        // Punt with a clear message rather than render garbage.
+        // profile we cannot know it here, and Separation needs a tint transform.
+        // (/Indexed is expanded earlier, in `indexed_to_image`.) Punt with a
+        // clear message rather than render garbage.
         other => return Err(format!("unsupported color space {other}")),
     };
 
@@ -523,6 +531,183 @@ fn bilevel_to_gray(samples: &[u8], width: u32, height: u32) -> Result<DynamicIma
         }
     }
     from_raw_gray(width, height, out)
+}
+
+/// Expand an `/Indexed` image XObject's palette indices to a direct-color image
+/// (GH#4: `[/Indexed /DeviceRGB 1 <000000FFFFFF>]` at 1 bpc and kin).
+///
+/// The samples are `bpc`-wide palette indices (1/2/4/8 bits, MSB-first,
+/// byte-padded rows — the same packing as bilevel). Each index selects one
+/// entry of the lookup table declared in the color-space array; the entry's
+/// component values are in the BASE color space. Bases resolved here:
+/// `DeviceGray`/`CalGray` (1 component, renders gray), `DeviceRGB`/`CalRGB`
+/// (3, renders RGB), `DeviceCMYK` (4, palette converted to RGB up front), and
+/// `ICCBased` via its `/N` component count (treated as the matching device
+/// space — adequate for OCR, which needs contrast, not colorimetry).
+fn indexed_to_image(
+    doc: &Document,
+    id: ObjectId,
+    samples: &[u8],
+    width: u32,
+    height: u32,
+    bpc: i64,
+) -> Result<DynamicImage, String> {
+    let (comps, palette) = indexed_palette(doc, id)?;
+    let indices = unpack_indices(samples, width, height, bpc)?;
+    let last = (palette.len() / comps).saturating_sub(1);
+    match comps {
+        1 => {
+            let out: Vec<u8> = indices
+                .iter()
+                .map(|&i| palette[(usize::from(i)).min(last)])
+                .collect();
+            from_raw_gray(width, height, out)
+        }
+        3 => {
+            let mut out = Vec::with_capacity(indices.len() * 3);
+            for &i in &indices {
+                let at = (usize::from(i)).min(last) * 3;
+                out.extend_from_slice(&palette[at..at + 3]);
+            }
+            from_raw_rgb(width, height, out)
+        }
+        other => Err(format!("unsupported Indexed component count {other}")),
+    }
+}
+
+/// Resolve the `[/Indexed base hival lookup]` color-space array of an image
+/// XObject: returns `(base component count, palette bytes)`, with the palette
+/// zero-padded to exactly `(hival + 1) * comps` bytes (some producers truncate
+/// the table; Acrobat treats missing entries as 0) and a `DeviceCMYK` base
+/// already converted to RGB so the caller only sees 1- or 3-component entries.
+fn indexed_palette(doc: &Document, id: ObjectId) -> Result<(usize, Vec<u8>), String> {
+    let deref = |obj: &'_ Object| -> Result<Object, String> {
+        doc.dereference(obj)
+            .map(|(_, o)| o.clone())
+            .map_err(|e| format!("resolve Indexed color space: {e}"))
+    };
+    let stream = doc
+        .get_object(id)
+        .and_then(Object::as_stream)
+        .map_err(|e| format!("read image stream: {e}"))?;
+    let cs = stream
+        .dict
+        .get(b"ColorSpace")
+        .map_err(|e| format!("Indexed image without /ColorSpace: {e}"))?;
+    let cs = deref(cs)?;
+    let arr = cs
+        .as_array()
+        .map_err(|_| "Indexed /ColorSpace is not an array".to_string())?;
+    if arr.len() < 4 {
+        return Err(format!(
+            "Indexed color space array has {} elements, expected 4",
+            arr.len()
+        ));
+    }
+
+    // Base color space: a name, or an array whose head names the family
+    // ([/ICCBased <stream>], [/CalRGB <dict>], ...).
+    let base = deref(&arr[1])?;
+    let (base_name, base_arr): (Vec<u8>, Option<&[Object]>) = match &base {
+        Object::Name(n) => (n.clone(), None),
+        Object::Array(a) => {
+            let head = a
+                .first()
+                .and_then(|o| o.as_name().ok())
+                .ok_or_else(|| "Indexed base color-space array has no name".to_string())?;
+            (head.to_vec(), Some(a.as_slice()))
+        }
+        _ => return Err("unsupported Indexed base color space object".to_string()),
+    };
+    let comps: usize = match base_name.as_slice() {
+        b"DeviceGray" | b"CalGray" | b"G" => 1,
+        b"DeviceRGB" | b"CalRGB" | b"RGB" => 3,
+        b"DeviceCMYK" | b"CMYK" => 4,
+        b"ICCBased" => {
+            // /N of the ICC profile stream: 1, 3, or 4 components.
+            let profile = base_arr
+                .and_then(|a| a.get(1))
+                .ok_or_else(|| "ICCBased Indexed base without a profile stream".to_string())?;
+            let profile = deref(profile)?;
+            let n = profile
+                .as_stream()
+                .ok()
+                .and_then(|s| s.dict.get(b"N").ok())
+                .and_then(|o| o.as_i64().ok())
+                .ok_or_else(|| "ICCBased Indexed base without /N".to_string())?;
+            usize::try_from(n)
+                .ok()
+                .filter(|n| [1, 3, 4].contains(n))
+                .ok_or_else(|| {
+                    format!("ICCBased Indexed base with unsupported component count {n}")
+                })?
+        }
+        other => {
+            return Err(format!(
+                "unsupported Indexed base color space {}",
+                String::from_utf8_lossy(other)
+            ));
+        }
+    };
+
+    // hival: the maximum valid index. Indexed images are at most 8 bpc, so a
+    // conforming hival fits in a byte; clamp a hostile value rather than let it
+    // size the padded palette allocation below.
+    let hival = deref(&arr[2])?
+        .as_i64()
+        .map_err(|_| "Indexed hival is not an integer".to_string())?;
+    if !(0..=255).contains(&hival) {
+        return Err(format!("Indexed hival {hival} outside 0..=255"));
+    }
+    #[allow(clippy::cast_sign_loss)] // 0..=255 checked above
+    let entries = hival as usize + 1;
+
+    // Lookup table: a (possibly hex) string, or a stream of the packed bytes.
+    let lookup = deref(&arr[3])?;
+    let mut palette: Vec<u8> = match &lookup {
+        Object::String(bytes, _) => bytes.clone(),
+        Object::Stream(s) => s
+            .decompressed_content()
+            .map_err(|e| format!("inflate Indexed palette stream: {e}"))?,
+        _ => return Err("Indexed palette is neither a string nor a stream".to_string()),
+    };
+    palette.resize(entries * comps, 0);
+
+    // A CMYK palette is converted once, per entry, so the pixel loop only ever
+    // sees gray or RGB (adequate-for-OCR conversion, same as `cmyk8_to_rgb`).
+    if comps == 4 {
+        let rgb = cmyk8_to_rgb(&palette, u32::try_from(entries).unwrap_or(1), 1)?;
+        return Ok((3, rgb.into_raw()));
+    }
+    Ok((comps, palette))
+}
+
+/// Unpack MSB-first, byte-padded-row index samples (1/2/4/8 bpc — the only
+/// legal depths for `/Indexed` images) to one `u8` index per pixel.
+fn unpack_indices(samples: &[u8], width: u32, height: u32, bpc: i64) -> Result<Vec<u8>, String> {
+    let bits: usize = match bpc {
+        1 | 2 | 4 | 8 => usize::try_from(bpc).expect("bpc in 1..=8"),
+        other => {
+            return Err(format!(
+                "unsupported bits-per-component {other} for Indexed"
+            ));
+        }
+    };
+    let (w, h) = (width as usize, height as usize);
+    let row_bytes = (w * bits).div_ceil(8);
+    if samples.len() < row_bytes * h {
+        return Err("indexed sample count does not match image dimensions".to_string());
+    }
+    let mask = if bits == 8 { 0xFF } else { (1u8 << bits) - 1 };
+    let mut out = Vec::with_capacity(w * h);
+    for y in 0..h {
+        let row = &samples[y * row_bytes..];
+        for x in 0..w {
+            let bit = x * bits;
+            out.push((row[bit / 8] >> (8 - bits - bit % 8)) & mask);
+        }
+    }
+    Ok(out)
 }
 
 /// Decode a CCITT Group 4 (T.6) fax image XObject to an 8-bpc gray image.
@@ -882,6 +1067,147 @@ mod tests {
             .expect_err("chained filter must error");
         assert!(err.to_string().contains("chain"), "got: {err}");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// GH#4 end-to-end: a 1-bpc `[/Indexed /DeviceRGB 1 <000000FFFFFF>]` image —
+    /// the exact shape of the reporter's file — must decode by expanding each
+    /// packed index bit through the palette, not error "unsupported color space
+    /// Indexed".
+    #[test]
+    fn render_indexed_1bpc_rgb_pdf_page_expands_palette() {
+        use lopdf::{Object, Stream, StringFormat, dictionary};
+
+        // 8x2, 1 bpc: row 0 = 0b1010_0000, row 1 = 0b0101_0000 (rows are
+        // byte-padded, so each row is exactly one byte here).
+        let image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 8_i64,
+                "Height" => 2_i64,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Indexed".to_vec()),
+                    Object::Name(b"DeviceRGB".to_vec()),
+                    Object::Integer(1),
+                    // <000000FFFFFF>: index 0 = black, index 1 = white.
+                    Object::String(vec![0, 0, 0, 255, 255, 255], StringFormat::Hexadecimal),
+                ]),
+                "BitsPerComponent" => 1,
+            },
+            vec![0b1010_0000, 0b0101_0000],
+        )
+        .with_compression(false);
+        let path = build_single_page_pdf(Some(image));
+
+        let page = PdfPages::open(&path)
+            .expect("open")
+            .render(0)
+            .expect("indexed 1-bpc page renders");
+        assert_eq!((page.width(), page.height()), (8, 2));
+        let rgb = page.to_rgb8();
+        // Row 0: px0 white, px1 black, px2 white...
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 255, 255]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [0, 0, 0]);
+        assert_eq!(rgb.get_pixel(2, 0).0, [255, 255, 255]);
+        // Row 1 is the complement.
+        assert_eq!(rgb.get_pixel(0, 1).0, [0, 0, 0]);
+        assert_eq!(rgb.get_pixel(1, 1).0, [255, 255, 255]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 8-bpc Indexed with a DeviceGray base and the palette in a REFERENCED
+    /// stream object (both spec-legal forms the string-palette test does not
+    /// cover), plus an out-of-range index that must clamp to hival, not panic.
+    #[test]
+    fn render_indexed_8bpc_gray_palette_stream_clamps_out_of_range() {
+        use lopdf::{Object, Stream, dictionary};
+
+        // Palette: 3 gray entries 10, 128, 250 (hival 2), as a stream object.
+        // Build the PDF manually so the palette can live behind a reference.
+        let mut doc = lopdf::Document::with_version("1.5");
+        let palette_id = doc
+            .add_object(Stream::new(dictionary! {}, vec![10u8, 128, 250]).with_compression(false));
+        let image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 4_i64,
+                "Height" => 1_i64,
+                "ColorSpace" => Object::Array(vec![
+                    Object::Name(b"Indexed".to_vec()),
+                    Object::Name(b"DeviceGray".to_vec()),
+                    Object::Integer(2),
+                    Object::Reference(palette_id),
+                ]),
+                "BitsPerComponent" => 8,
+            },
+            // Index 9 is past hival=2 and must clamp to entry 2 (250).
+            vec![0u8, 1, 2, 9],
+        )
+        .with_compression(false);
+        let image_id = doc.add_object(image);
+        let pages_id = doc.new_object_id();
+        let resources_id = doc.add_object(dictionary! {
+            "XObject" => dictionary! { "Im0" => image_id },
+        });
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0_i64.into(), 0_i64.into(), 100_i64.into(), 100_i64.into()],
+        });
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let path =
+            std::env::temp_dir().join(format!("focr_pdf_indexed_gray_{}.pdf", std::process::id()));
+        doc.save(&path).expect("save synthesized pdf");
+
+        let page = PdfPages::open(&path)
+            .expect("open")
+            .render(0)
+            .expect("indexed gray page renders");
+        let gray = page.to_luma8();
+        assert_eq!(
+            [
+                gray.get_pixel(0, 0).0[0],
+                gray.get_pixel(1, 0).0[0],
+                gray.get_pixel(2, 0).0[0],
+                gray.get_pixel(3, 0).0[0],
+            ],
+            [10, 128, 250, 250], // last pixel: index 9 clamped to hival entry
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn unpack_indices_handles_all_legal_depths() {
+        // 4 bpc, 3px wide: 0xAB 0xC0 -> [0xA, 0xB, 0xC].
+        assert_eq!(
+            unpack_indices(&[0xAB, 0xC0], 3, 1, 4).expect("4 bpc"),
+            vec![0xA, 0xB, 0xC]
+        );
+        // 2 bpc, 5px wide (row pads to 2 bytes): 0b11_10_01_00, 0b01_000000.
+        assert_eq!(
+            unpack_indices(&[0b1110_0100, 0b0100_0000], 5, 1, 2).expect("2 bpc"),
+            vec![3, 2, 1, 0, 1]
+        );
+        // 8 bpc is the identity.
+        assert_eq!(
+            unpack_indices(&[7, 0, 255], 3, 1, 8).expect("8 bpc"),
+            vec![7, 0, 255]
+        );
+        // 16 bpc is not a legal Indexed depth.
+        assert!(unpack_indices(&[0, 0], 1, 1, 16).is_err());
+        // Truncated sample buffers error rather than panic.
+        assert!(unpack_indices(&[0xFF], 8, 2, 1).is_err());
     }
 
     #[test]

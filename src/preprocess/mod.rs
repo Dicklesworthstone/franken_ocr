@@ -1056,6 +1056,33 @@ pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
 
 #[cfg(test)]
 mod tests {
+    /// GH#4 companion check: palette (indexed-color) PNGs need no special
+    /// handling on the raster input path — the `image` crate expands PNG color
+    /// type 3 through its PLTE table during decode. This pins that behavior so
+    /// a decoder swap that regressed it would be caught. (The PDF `/Indexed`
+    /// path is separate and hand-expanded in `crate::pdf`.)
+    #[test]
+    fn palette_png_decodes_expanded_to_rgb() {
+        // A 2x2 PNG, bit depth 8, color type 3 (palette), PLTE = [red, green,
+        // blue]; pixel indices row 0 = [0, 1], row 1 = [2, 0].
+        const PALETTE_PNG: [u8; 92] = [
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x08, 0x03, 0x00, 0x00,
+            0x00, 0x45, 0x68, 0xFD, 0x16, 0x00, 0x00, 0x00, 0x09, 0x50, 0x4C, 0x54, 0x45, 0xFF,
+            0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0xFF, 0x2D, 0x4A, 0xCD, 0x8A, 0x00, 0x00,
+            0x00, 0x0E, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x60, 0x60, 0x64, 0x60, 0x62,
+            0x00, 0x00, 0x00, 0x0E, 0x00, 0x04, 0xC6, 0x88, 0x7C, 0xF8, 0x00, 0x00, 0x00, 0x00,
+            0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        ];
+        let img = super::decode_bytes(&PALETTE_PNG).expect("palette PNG decodes");
+        assert_eq!((img.width(), img.height()), (2, 2));
+        let rgb = img.to_rgb8();
+        assert_eq!(rgb.get_pixel(0, 0).0, [255, 0, 0]);
+        assert_eq!(rgb.get_pixel(1, 0).0, [0, 255, 0]);
+        assert_eq!(rgb.get_pixel(0, 1).0, [0, 0, 255]);
+        assert_eq!(rgb.get_pixel(1, 1).0, [255, 0, 0]);
+    }
+
     #[test]
     fn tromr_alpha_ink_path_fires_only_when_alpha_varies() {
         // DISC-007: the inverted-alpha ink convention applies ONLY to PNGs
