@@ -1,0 +1,89 @@
+{
+  "schema": "focr-gauntlet-row/v1",
+  "created_utc": "2026-07-06T00:04:56Z",
+  "inputs": {
+    "focr_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/onechart/focr/focr_stages.json",
+      "sha256": "679d2bf9449d2639908d4a1dc9c0129011ea40b394366f63a1584d194ea05ba4"
+    },
+    "ref_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/onechart/ref_stages.json",
+      "sha256": "18642240a871279872cbd291f94089f300fcdb617aac06b12d9c1e16d1db8ecc"
+    },
+    "roofline": {
+      "path": "artifacts/perf/bd-3jo6.1.11/onechart/roofline.json",
+      "sha256": "64e293ce4b98e67a1a5938d6c010cc66be33543d775148b9de7ff1f08e98cee4"
+    }
+  },
+  "rows": [
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-onechart-int8-samplechart-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/onechart/claim",
+      "model_commit": "kppkkp/OneChart@sha256:15ab0e997138",
+      "fixture_hash": "page=tests/fixtures/onechart/sample_chart.png sha256=b2487b03dc0cd7e962b5f607aea47c6868245e380493ae928036c96670b3103e; weights=onechart.int8.focrq sha256=618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2 (f32 source model.safetensors sha256=15ab0e9971384db1f17414d6b1e4d9d55bfcdb80d810dfb161b316fb10b6220b)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "prefill",
+      "reference_backend": "hf",
+      "focr_ms": "70.000",
+      "ref_ms": "80.766",
+      "ratio": "1.154",
+      "floor_kind": "compute",
+      "floor_ms": "29.434",
+      "dist_above_floor": "2.38",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/onechart/sample_chart.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/onechart/onechart.int8.focrq --task chart-data --max-length 4096 [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/onechart/sample_chart.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/onechart --backend hf --precision f32 --entry gauntlet_ref_zoo:run_onechart --setup gauntlet_ref_zoo:setup_onechart --pin-torch 2.12.1 --pin-transformers 4.45.2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/onechart/ref_stages.json [torch==2.12.1 transformers==4.45.2]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "OneChart D6 + bd-2lje certs: number head cos 1.0 maxabs 2.4e-7; 6-chart corpus head fires 6/6 mean dist 0.015 int8 / 0.014 f32; decoded text BYTE-IDENTICAL f32-vs-int8 on all 6 corpus charts (src/native_engine/onechart.rs)",
+      "notes": "A11 zoo lane; ref = pinned upstream chat(reliable_check=True) f32 CPU (cert stack torch 2.12.1/transformers 4.45.2 via --pin-*); token counts differ (focr 257 vs ref 179 \u2014 OOD garble trajectories, DISC-003 class), decode-per-token normalizes; focr e2e = process wall INCL 346MB artifact load, ref e2e excludes load (bias favors ref)"
+    },
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-onechart-int8-samplechart-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/onechart/claim",
+      "model_commit": "kppkkp/OneChart@sha256:15ab0e997138",
+      "fixture_hash": "page=tests/fixtures/onechart/sample_chart.png sha256=b2487b03dc0cd7e962b5f607aea47c6868245e380493ae928036c96670b3103e; weights=onechart.int8.focrq sha256=618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2 (f32 source model.safetensors sha256=15ab0e9971384db1f17414d6b1e4d9d55bfcdb80d810dfb161b316fb10b6220b)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "decode-per-token",
+      "reference_backend": "hf",
+      "focr_ms": "4.708",
+      "ref_ms": "12.166",
+      "ratio": "2.584",
+      "floor_kind": "memory",
+      "floor_ms": "2.265",
+      "dist_above_floor": "2.08",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/onechart/sample_chart.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/onechart/onechart.int8.focrq --task chart-data --max-length 4096 [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/onechart/sample_chart.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/onechart --backend hf --precision f32 --entry gauntlet_ref_zoo:run_onechart --setup gauntlet_ref_zoo:setup_onechart --pin-torch 2.12.1 --pin-transformers 4.45.2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/onechart/ref_stages.json [torch==2.12.1 transformers==4.45.2]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "OneChart D6 + bd-2lje certs: number head cos 1.0 maxabs 2.4e-7; 6-chart corpus head fires 6/6 mean dist 0.015 int8 / 0.014 f32; decoded text BYTE-IDENTICAL f32-vs-int8 on all 6 corpus charts (src/native_engine/onechart.rs)",
+      "notes": "A11 zoo lane; ref = pinned upstream chat(reliable_check=True) f32 CPU (cert stack torch 2.12.1/transformers 4.45.2 via --pin-*); token counts differ (focr 257 vs ref 179 \u2014 OOD garble trajectories, DISC-003 class), decode-per-token normalizes; focr e2e = process wall INCL 346MB artifact load, ref e2e excludes load (bias favors ref)"
+    },
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-onechart-int8-samplechart-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/onechart/claim",
+      "model_commit": "kppkkp/OneChart@sha256:15ab0e997138",
+      "fixture_hash": "page=tests/fixtures/onechart/sample_chart.png sha256=b2487b03dc0cd7e962b5f607aea47c6868245e380493ae928036c96670b3103e; weights=onechart.int8.focrq sha256=618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2 (f32 source model.safetensors sha256=15ab0e9971384db1f17414d6b1e4d9d55bfcdb80d810dfb161b316fb10b6220b)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "end-to-end",
+      "reference_backend": "hf",
+      "focr_ms": "6837.452",
+      "ref_ms": "3736.123",
+      "ratio": "0.546",
+      "floor_kind": "compute",
+      "floor_ms": "2268.847",
+      "dist_above_floor": "3.01",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/onechart/sample_chart.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/onechart/onechart.int8.focrq --task chart-data --max-length 4096 [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/onechart/sample_chart.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/onechart --backend hf --precision f32 --entry gauntlet_ref_zoo:run_onechart --setup gauntlet_ref_zoo:setup_onechart --pin-torch 2.12.1 --pin-transformers 4.45.2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/onechart/ref_stages.json [torch==2.12.1 transformers==4.45.2]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "OneChart D6 + bd-2lje certs: number head cos 1.0 maxabs 2.4e-7; 6-chart corpus head fires 6/6 mean dist 0.015 int8 / 0.014 f32; decoded text BYTE-IDENTICAL f32-vs-int8 on all 6 corpus charts (src/native_engine/onechart.rs)",
+      "notes": "A11 zoo lane; ref = pinned upstream chat(reliable_check=True) f32 CPU (cert stack torch 2.12.1/transformers 4.45.2 via --pin-*); token counts differ (focr 257 vs ref 179 \u2014 OOD garble trajectories, DISC-003 class), decode-per-token normalizes; focr e2e = process wall INCL 346MB artifact load, ref e2e excludes load (bias favors ref)"
+    }
+  ]
+}

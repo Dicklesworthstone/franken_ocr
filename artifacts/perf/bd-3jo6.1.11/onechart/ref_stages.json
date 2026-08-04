@@ -1,0 +1,197 @@
+{
+  "schema": "focr-gauntlet-stages/v1",
+  "source": "reference",
+  "created_utc": "2026-07-06T00:00:54Z",
+  "command": [
+    "scripts/gauntlet_reference.py",
+    "--stage",
+    "all",
+    "--page",
+    "tests/fixtures/onechart/sample_chart.png",
+    "--model-dir",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/onechart",
+    "--backend",
+    "hf",
+    "--precision",
+    "f32",
+    "--entry",
+    "gauntlet_ref_zoo:run_onechart",
+    "--setup",
+    "gauntlet_ref_zoo:setup_onechart",
+    "--pin-torch",
+    "2.12.1",
+    "--pin-transformers",
+    "4.45.2",
+    "--threads",
+    "8",
+    "--runs",
+    "3",
+    "--warmup",
+    "1",
+    "--out",
+    "artifacts/perf/bd-3jo6.1.11/onechart/ref_stages.json"
+  ],
+  "env_pins": {
+    "OMP_NUM_THREADS": "8",
+    "MKL_NUM_THREADS": "8",
+    "OPENBLAS_NUM_THREADS": "8",
+    "VECLIB_MAXIMUM_THREADS": "8",
+    "NUMEXPR_NUM_THREADS": "8",
+    "FOCR_THREADS": ""
+  },
+  "page": "tests/fixtures/onechart/sample_chart.png",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/zoo/onechart",
+  "threads": 8,
+  "precision": "f32",
+  "backend": "hf",
+  "allocator": "system",
+  "runs": 3,
+  "warmup": 1,
+  "torch_version": "2.12.1",
+  "transformers_version": "4.45.2",
+  "stages": [
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "preprocess",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        8.339084,
+        8.380834,
+        8.06475
+      ],
+      "best_ms": 8.06475,
+      "p50_ms": 8.339084,
+      "mean_ms": 8.261556,
+      "cv_pct": 2.078,
+      "n": 3,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "vision_encode",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        1417.343916,
+        1403.954959,
+        1414.592625
+      ],
+      "best_ms": 1403.954959,
+      "p50_ms": 1414.592625,
+      "mean_ms": 1411.963833,
+      "cv_pct": 0.501,
+      "n": 3,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "prefill",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        82.505459,
+        82.317416,
+        80.765916
+      ],
+      "best_ms": 80.765916,
+      "p50_ms": 82.317416,
+      "mean_ms": 81.86293,
+      "cv_pct": 1.166,
+      "n": 3,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false,
+      "tokens": 309
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "decode_per_token",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        12.165718,
+        12.2141,
+        12.231959
+      ],
+      "best_ms": 12.165718,
+      "p50_ms": 12.2141,
+      "mean_ms": 12.203926,
+      "cv_pct": 0.281,
+      "n": 3,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false,
+      "tokens": 179
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "end_to_end",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        3738.975709,
+        3736.122542,
+        3748.623041
+      ],
+      "best_ms": 3736.122542,
+      "p50_ms": 3738.975709,
+      "mean_ms": 3741.240431,
+      "cv_pct": 0.175,
+      "n": 3,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false
+    }
+  ],
+  "synthetic": false,
+  "smoke": false,
+  "text_sha256": [
+    "48bc0018604102d907b9a951ba18c8cce604a2c168b3313e08f3b22fdcef9662"
+  ],
+  "text_identical_across_runs": true
+}

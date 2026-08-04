@@ -111,6 +111,7 @@ nohup.out
 /*.txt
 /*.py
 /*.sh
+!/install.sh
 /*.json
 !package.json
 /*.jsonl
@@ -135,6 +136,12 @@ repro_*.rs
 
 # Python tooling cache (scripts/)
 __pycache__/
+
+# Ephemeral, signable release-gauntlet output (must not perturb git HEAD/state)
+/.gauntlet-output/
+
+# Generated agent worktrees are coordination scratch, never release inputs.
+/.claude/worktrees/
 
 # Nested crate build artifacts
 target-codex*/

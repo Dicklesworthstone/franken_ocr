@@ -1,0 +1,25 @@
+schema: focr-exact-torch-corpus-gate/v1
+created_utc: 2026-07-10T18:26:36Z
+source_head: 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus the uncommitted final-tree MoE and loader changes
+cpu: Apple M4 arm64
+threads: FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8
+binary: /Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/focr
+binary_size: 13526704
+binary_sha256: 6a401be3bfd6bfb0a9766e2ff333489a5e02b2a5f0641376b6ab5fc6885e6953
+model: /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq
+model_size: 4157448783
+model_sha256: 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+page_0590_size: 916081
+page_0590_sha256: 6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3
+page_0590_reference_size: 19021
+page_0590_reference_sha256: 6542b1d31b64103e9a56104738bf9038487877e8408b8ac34d8d10d1f5d2c8cd
+reference_transform: strip-unlimited-det-spans-v1
+max_new_tokens_per_page: 12000
+
+sanitized_env: FOCR_DECODE_INT8 FOCR_INT8_ATTN FOCR_INT8_LMHEAD FOCR_INT8_KV FOCR_FORCE_ARCH FOCR_MMAP FOCR_NO_MMAP FOCR_PREFILL_CHUNK FOCR_MOE_SCORE_ORDER FOCR_RUNAWAY_GUARD FOCR_ATTN_GEMM FOCR_LMHEAD_SHARD FOCR_LMHEAD_ROW_INTERLEAVE FOCR_INT8_AUTOVEC FOCR_UNLIMITED_VISION_CACHE FOCR_NO_REPEAT_NGRAM FOCR_RSWA_PARALLEL_ATTN FOCR_BATCH_SPINE
+
+page_command: env <sanitized_env-unset> FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 gtimeout 650 /usr/bin/time -p <binary> ocr <page_0590> --model <model> --max-length 12000 -o page_0590.md
+batch_command: env <sanitized_env-unset> FOCR_MAX_NEW_TOKENS=12000 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 gtimeout 1200 /usr/bin/time -p <binary> ocr-batch <20 sorted pages> --model <model> --json
+comparison_command: python3 scripts/baseline/compare_ocr.py --ref <baseline_out> --hyp <hyp> --json corpus.compare.json --reference-transform strip-unlimited-det-spans-v1 --require-complete
+
+result: all 20 pages present and successful; aggregate normalized CER 0.1930792459 <= 0.25; page_0590 emitted EOS at 4033 tokens with normalized CER 0.6164885983. The hard-page tail remains explicitly documented and is not described as exact.

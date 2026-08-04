@@ -33,7 +33,22 @@ FORBIDDEN_DYNAMIC_TOKENS = (
     "c10",
 )
 C10_ABI_TOKEN = "c" + "10"
-FORBIDDEN_BYTE_TOKENS = tuple(token for token in FORBIDDEN_DYNAMIC_TOKENS if token != C10_ABI_TOKEN)
+# The BYTE scan looks for LINKAGE indicators only. Bare "python"/"torch" are
+# legitimately embedded in a correct binary: OneChart's actual task prompt IS
+# "Convert the key information of the chart to a python dict:" (plus the CLI
+# help describing it), and panic-location paths of the ft-kernel-cpu path dep
+# embed ".../frankentorch/...". Linkage-relevant byte patterns (libpython,
+# libtorch, torch_cpu, the CPython C-ABI) still fail the scan; the dynamic-
+# deps check (otool -L / ldd) keeps the bare tokens for real link entries.
+FORBIDDEN_BYTE_TOKENS = (
+    "libpython",
+    "pytorch",
+    "libtorch",
+    "torch_cpu",
+    "torch_python",
+    "_PyObject",
+    "Py_Initialize",
+)
 
 
 def emit(check: str, ok: bool, **fields: object) -> None:

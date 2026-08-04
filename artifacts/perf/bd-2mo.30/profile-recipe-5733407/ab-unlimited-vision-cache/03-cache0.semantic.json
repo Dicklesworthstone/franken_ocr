@@ -1,0 +1,34 @@
+{
+  "command": "ocr-batch",
+  "count": 5,
+  "decode_mode": "conservative_recipe",
+  "experimental_full_int8": false,
+  "results": [
+    {
+      "image": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+      "markdown": "CONTENTS.\n<|det|>text [357, 255, 524, 273]",
+      "ok": true
+    },
+    {
+      "image": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+      "markdown": "CONTENTS.\n<|det|>text [357, 255, 524, 273]",
+      "ok": true
+    },
+    {
+      "image": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+      "markdown": "CONTENTS.\n<|det|>text [357, 255, 524, 273]",
+      "ok": true
+    },
+    {
+      "image": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+      "markdown": "CONTENTS.\n<|det|>text [357, 255, 524, 273]",
+      "ok": true
+    },
+    {
+      "image": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+      "markdown": "CONTENTS.\n<|det|>text [357, 255, 524, 273]",
+      "ok": true
+    }
+  ],
+  "schema_version": 1
+}

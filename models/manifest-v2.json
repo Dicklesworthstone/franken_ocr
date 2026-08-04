@@ -1,0 +1,304 @@
+{
+  "schema_version": 2,
+  "model": "unlimited-ocr",
+  "license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
+  "quants": {
+    "int8": {
+      "recipe": "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1",
+      "focrq": {
+        "filename": "unlimited-ocr.v0.7.0.int8.focrq",
+        "size": 4157448783,
+        "sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+        "parts": [
+          {
+            "size": 1957046720,
+            "sha256": "a45aa7674f38190974a2e61bdaeb8eca0d5039a6631406c1126f6614140ec7f6",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.7.0/unlimited-ocr.v0.7.0.int8.focrq.part00"
+            ]
+          },
+          {
+            "size": 1957046720,
+            "sha256": "0081dbab8005f9bae0abae32fea6f85d20b507697ee55f2daff8d66137f9d5a8",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.7.0/unlimited-ocr.v0.7.0.int8.focrq.part01"
+            ]
+          },
+          {
+            "size": 243355343,
+            "sha256": "62d34bc6acb431e0b261e8d42c0834886f3b260083c3db2ba46fde5d0d6d2eec",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.7.0/unlimited-ocr.v0.7.0.int8.focrq.part02"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "tokenizer": {
+    "filename": "tokenizer.json",
+    "size": 9979544,
+    "sha256": "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4",
+    "parts": [
+      {
+        "size": 9979544,
+        "sha256": "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4",
+        "urls": [
+          "https://huggingface.co/baidu/Unlimited-OCR/resolve/main/tokenizer.json",
+          "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-v1/tokenizer.json"
+        ]
+      }
+    ]
+  },
+  "models": {
+    "got-ocr2": {
+      "license_notice": "GOT-OCR2.0 - Copyright (c) 2024 Ucas-HaoranWei, Apache-2.0",
+      "quants": {
+        "int8": {
+          "recipe": "got-ocr2-decoder-int8-lmhead-omitted-tied-v1",
+          "focrq": {
+            "filename": "got-ocr2.int8.focrq",
+            "size": 813877416,
+            "sha256": "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f",
+            "parts": [
+              {
+                "size": 813877416,
+                "sha256": "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f",
+                "urls": [
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/got-ocr2.int8.focrq",
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/got-ocr2.int8.focrq"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "tokenizer": {
+        "filename": "qwen.tiktoken",
+        "size": 2561218,
+        "sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186",
+        "parts": [
+          {
+            "size": 2561218,
+            "sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/qwen.tiktoken",
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/qwen.tiktoken"
+            ]
+          }
+        ]
+      }
+    },
+    "smolvlm2": {
+      "license_notice": "SmolVLM2-500M-Video-Instruct (HuggingFaceTB) - Apache-2.0",
+      "quants": {
+        "int8": {
+          "recipe": "smolvlm2-decoder-int8-lmhead-bf16-v1",
+          "focrq": {
+            "filename": "smolvlm2.int8.focrq",
+            "size": 1087397293,
+            "sha256": "4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc",
+            "parts": [
+              {
+                "size": 1087397293,
+                "sha256": "4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc",
+                "urls": [
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-smolvlm2-v1/smolvlm2.int8.focrq",
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/smolvlm2/smolvlm2.int8.focrq"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "tokenizer": {
+        "filename": "tokenizer.json",
+        "size": 3548256,
+        "sha256": "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a",
+        "parts": [
+          {
+            "size": 3548256,
+            "sha256": "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-smolvlm2-v1/tokenizer.json",
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/smolvlm2/tokenizer.json"
+            ]
+          }
+        ]
+      }
+    },
+    "onechart": {
+      "license_notice": "OneChart (kppkkp) - Apache-2.0",
+      "quants": {
+        "int8": {
+          "recipe": "onechart-decoder-int8-lmhead-omitted-tied-v1",
+          "focrq": {
+            "filename": "onechart.int8.focrq",
+            "size": 362863824,
+            "sha256": "618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2",
+            "parts": [
+              {
+                "size": 362863824,
+                "sha256": "618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2",
+                "urls": [
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/onechart.int8.focrq",
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/onechart.int8.focrq"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "tokenizer": {
+        "filename": "vocab.json",
+        "size": 999355,
+        "sha256": "32b29acf82d3333462eb4b13416760f2aef956052e8fea1749fe5b20f866a4bf",
+        "parts": [
+          {
+            "size": 999355,
+            "sha256": "32b29acf82d3333462eb4b13416760f2aef956052e8fea1749fe5b20f866a4bf",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/vocab.json",
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/vocab.json"
+            ]
+          }
+        ]
+      },
+      "sidecars": [
+        {
+          "filename": "merges.txt",
+          "size": 456318,
+          "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+          "parts": [
+            {
+              "size": 456318,
+              "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+              "urls": [
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/merges.txt",
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/merges.txt"
+              ]
+            }
+          ]
+        },
+        {
+          "filename": "added_tokens.json",
+          "size": 82,
+          "sha256": "e1b04af1435ff5b45b9a2b524edd38b2abbb71e9e747e80fb70cf547941c6e87",
+          "parts": [
+            {
+              "size": 82,
+              "sha256": "e1b04af1435ff5b45b9a2b524edd38b2abbb71e9e747e80fb70cf547941c6e87",
+              "urls": [
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/added_tokens.json",
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/added_tokens.json"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "tromr": {
+      "license_notice": "Polyphonic-TrOMR (NetEase) - Apache-2.0",
+      "quants": {
+        "int8": {
+          "recipe": "tromr-decoder-int8-v1",
+          "focrq": {
+            "filename": "tromr.int8.focrq",
+            "size": 61107485,
+            "sha256": "cced11c0f05656dd54cc615a15939c472dc8f916f04ae154ea4a0364839f845a",
+            "parts": [
+              {
+                "size": 61107485,
+                "sha256": "cced11c0f05656dd54cc615a15939c472dc8f916f04ae154ea4a0364839f845a",
+                "urls": [
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tromr.int8.focrq",
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tromr.int8.focrq"
+                ]
+              }
+            ]
+          }
+        },
+        "f32": {
+          "recipe": "tromr-f32-v1",
+          "focrq": {
+            "filename": "tromr.focrq",
+            "size": 86168002,
+            "sha256": "a9d41485a98534ad0a1f7c1ec624f0a92f3f092c7dc30ac5af636b50dc465edc",
+            "parts": [
+              {
+                "size": 86168002,
+                "sha256": "a9d41485a98534ad0a1f7c1ec624f0a92f3f092c7dc30ac5af636b50dc465edc",
+                "urls": [
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tromr.focrq",
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tromr.focrq"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "tokenizer": {
+        "filename": "tokenizer_rhythm.json",
+        "size": 10743,
+        "sha256": "603bfef760e8424f7808acba423532b4beb2d88dbf085f81add6a8e543a34035",
+        "parts": [
+          {
+            "size": 10743,
+            "sha256": "603bfef760e8424f7808acba423532b4beb2d88dbf085f81add6a8e543a34035",
+            "urls": [
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_rhythm.json",
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_rhythm.json"
+            ]
+          }
+        ]
+      },
+      "sidecars": [
+        {
+          "filename": "tokenizer_pitch.json",
+          "size": 2682,
+          "sha256": "2382e8b20c1473290e200789604656b3a06bdf4b55a0818a0f7d175e8cb64ade",
+          "parts": [
+            {
+              "size": 2682,
+              "sha256": "2382e8b20c1473290e200789604656b3a06bdf4b55a0818a0f7d175e8cb64ade",
+              "urls": [
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_pitch.json",
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_pitch.json"
+              ]
+            }
+          ]
+        },
+        {
+          "filename": "tokenizer_lift.json",
+          "size": 979,
+          "sha256": "b61ba09cecd5bc343e6a038a2e26718b54cd3c08e8f9b72013ecf80c3cac86b2",
+          "parts": [
+            {
+              "size": 979,
+              "sha256": "b61ba09cecd5bc343e6a038a2e26718b54cd3c08e8f9b72013ecf80c3cac86b2",
+              "urls": [
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_lift.json",
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_lift.json"
+              ]
+            }
+          ]
+        },
+        {
+          "filename": "tokenizer_note.json",
+          "size": 830,
+          "sha256": "504d886d11e3c1fe92893abd46edfc68dfbe7a8eb83e6b51646532dad8a485e1",
+          "parts": [
+            {
+              "size": 830,
+              "sha256": "504d886d11e3c1fe92893abd46edfc68dfbe7a8eb83e6b51646532dad8a485e1",
+              "urls": [
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_note.json",
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_note.json"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

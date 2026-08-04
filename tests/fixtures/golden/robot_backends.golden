@@ -8,9 +8,13 @@
         "tag": "[simd-tier]"
       }
     ],
+    "hardware_selected": "[simd-tier]",
+    "hardware_selected_feature": "[simd-feature]",
     "override_env": "FOCR_FORCE_ARCH",
     "selected": "[simd-tier]",
     "selected_feature": "[simd-feature]",
-    "status": "runtime detection active"
-  }
+    "selection_scope": "ordinary_dense_int8",
+    "status": "runtime capability and effective-route selection active"
+  },
+  "threads": "[threads]"
 }

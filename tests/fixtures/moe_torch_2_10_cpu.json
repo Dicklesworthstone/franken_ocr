@@ -1,0 +1,122 @@
+{
+  "schema": "focr-moe-topk-oracle/v1",
+  "generated_at": "2026-07-10T16:51:00Z",
+  "runtime": {
+    "torch": "2.10.0",
+    "torch_git_tag": "v2.10.0",
+    "torch_git_commit": "449b1768410104d3ed79d3bcfe4ba1d65c7f22c0",
+    "platform": "macOS-26.5-arm64",
+    "torch_build_compiler": "clang 15.0.0, C++17, NDEBUG",
+    "topk_source": "aten/src/ATen/native/TopKImpl.h:43-93",
+    "topk_source_sha256": "dddf5fc982e7d25f9ba38fe1ebd6645fb8851485f25fd5e975822ae90828635a",
+    "libcxx_nth_element_source": "llvm-project llvmorg-15.0.7 libcxx/include/__algorithm/nth_element.h",
+    "libcxx_nth_element_sha256": "e0152c1647c275c112fea5fb477b6859a2b2f213d905d28183159731d77ffdd9",
+    "libcxx_sort_source": "llvm-project llvmorg-15.0.7 libcxx/include/__algorithm/sort.h",
+    "libcxx_sort_sha256": "33f739d139c79d5467aa69083e696b157c3d73e72711ff7552e6cd66e87d3f36",
+    "libcxx_provenance_scope": "transcription source; torch wheel metadata does not expose the Apple SDK header commit, so the corpus SHA-256 is the behavioral identity proof",
+    "reference_model_source_sha256": "74e36e6bd0ba7bc565ef76464a99baa8e6bccb710ae9c1007b54ac30b855fa4c",
+    "reference_model_source_lines": "modeling_deepseekv2.py:449-453,631-703"
+  },
+  "oracle_command": "uv run --python 3.12 --with torch==2.10.0 python scripts/gen_moe_torch_2_10_cpu_fixture.py --check tests/fixtures/moe_torch_2_10_cpu.json",
+  "generator": {
+    "path": "scripts/gen_moe_torch_2_10_cpu_fixture.py",
+    "sha256": "580c3751753b813cbba99076858e0f5f978c68292a316eaaf3f49113292fde2e",
+    "check_command": "uv run --python 3.12 --with torch==2.10.0 python scripts/gen_moe_torch_2_10_cpu_fixture.py --check tests/fixtures/moe_torch_2_10_cpu.json"
+  },
+  "embedded_generator_test": "src/native_engine/moe.rs::tests::{torch_2_10_topk_matches_2048_case_oracle_corpus,production_six_term_combine_matches_256_case_torch_oracle,moe_policy_env_subprocess_matrix}",
+  "cases": [
+    {
+      "name": "unique_torch_manual_seed_1",
+      "scores_f32_bits": [
+        1061286949, 1049559510, 1053712152, 1060901960, 1022353376, 1061995401,
+        1053513110, 1061232261, 1058130767, 1054910336, 1059291280, 1057378433,
+        1060028364, 1050426510, 1055741402, 1055454200, 1058180486, 1056897586,
+        1064297650, 1059575060, 1050716668, 1045087636, 1054152484, 1049727912,
+        1051588374, 1057366268, 1061965290, 1061524124, 1010296640, 1062164878,
+        1059308082, 1064921668, 1062501591, 1026948464, 1019837728, 1048872418,
+        1064330743, 1054170044, 1060554592, 1049168044, 1065195661, 1049866194,
+        1063255433, 1057063943, 1047676156, 1061276477, 1047541848, 1059431737,
+        1052120066, 1055125248, 1016997760, 1048965538, 1061516552, 1052886448,
+        1065320077, 1063688819, 1056179038, 1042956200, 1062072953, 1059568072,
+        1043662968, 1062413383, 1062057347, 1064404422
+      ],
+      "torch_unsorted_indices": [40, 31, 54, 63, 36, 18],
+      "torch_unsorted_value_bits": [1065195661, 1064921668, 1065320077, 1064404422, 1064330743, 1064297650],
+      "torch_sorted_indices": [54, 40, 31, 63, 36, 18],
+      "torch_sorted_value_bits": [1065320077, 1065195661, 1064921668, 1064404422, 1064330743, 1064297650]
+    },
+    {
+      "name": "exact_ties_i_times_17_mod_7",
+      "score_formula": "(i * 17) % 7 for i in 0..64",
+      "torch_unsorted_indices": [51, 44, 2, 37, 58, 30],
+      "torch_unsorted_value_bits": [1086324736, 1086324736, 1086324736, 1086324736, 1086324736, 1086324736]
+    }
+  ],
+  "topk_corpus": {
+    "case_count": 2048,
+    "expert_count": 64,
+    "top_k": 6,
+    "seed_hex": "6a09e667f3bcc909",
+    "prng": "SplitMix64: state += 0x9e3779b97f4a7c15; z=(state^(state>>30))*0xbf58476d1ce4e5b9; z=(z^(z>>27))*0x94d049bb133111eb; output=z^(z>>31), all u64 wrapping",
+    "generation_order": "case 0..2048, then expert 0..64; consume exactly one PRNG output r per score; mode=case%8",
+    "modes": [
+      "0: f32::from_bits(0x3f000000 | (r & 0x007fffff))",
+      "1: f32(r % 2)",
+      "2: f32(r % 3)",
+      "3: f32(r % 7)",
+      "4: r%11 == 0:+inf, 1:-inf, 2:-0.0, otherwise f32(i64(r%19)-9)",
+      "5: r%13 == 0:canonical NaN, otherwise f32(r%17)",
+      "6: f32((expert*17 + case*13) % 64), while still consuming r",
+      "7: if (expert+case)%9 == 0 then 100.0 else f32(i64(r%5)-2)"
+    ],
+    "output_encoding": "concatenate the six returned expert indices as u8 in case order",
+    "torch_output_bytes": 12288,
+    "torch_output_sha256": "f39d18c1ef6fad5971b01268acd959bb8b559e2f68b0004386daf759a32d8898",
+    "spot_indices": {
+      "0": [36, 9, 51, 26, 25, 58],
+      "1": [63, 59, 2, 3, 4, 5],
+      "2": [0, 1, 63, 3, 60, 5],
+      "3": [25, 24, 44, 35, 31, 8],
+      "4": [34, 57, 55, 39, 48, 23],
+      "5": [42, 21, 47, 39, 13, 14],
+      "6": [63, 33, 14, 48, 29, 44],
+      "7": [20, 56, 2, 47, 11, 29],
+      "255": [42, 60, 24, 15, 51, 33],
+      "1023": [30, 21, 57, 3, 39, 12],
+      "2047": [32, 59, 50, 41, 23, 5]
+    }
+  },
+  "reduction_corpus": {
+    "case_count": 256,
+    "top_k": 6,
+    "hidden": 1280,
+    "seed_hex": "bb67ae8584caa73b",
+    "prng": "the same SplitMix64 transition as topk_corpus",
+    "generation_order": "case 0..256, channel 0..1280, then slot 0..6 where the mode consumes per-slot values; mode=case%4",
+    "modes": [
+      "0: for each slot consume r; bits=(r>>63)<<31 | (125+((r>>60)&3))<<23 | (r&0x007fffff)",
+      "1: consume one r per channel; rotation=r%6; slot value=[16777216,1,-16777216,1,1,1][(slot+rotation)%6]",
+      "2: for each slot consume r; bits=(r>>63)<<31 | (1+((r>>32)%253))<<23 | (r&0x007fffff)",
+      "3: for each slot consume r; value=f32(i64(r%17)-8)"
+    ],
+    "torch_expression": "x.view(256,6,1280).sum(dim=1)",
+    "output_encoding": "all 256*1280 f32 results as little-endian IEEE-754 bytes in row-major order",
+    "torch_output_bytes": 1310720,
+    "torch_output_sha256": "2a0c796a7940c865bfdf9a8d50830467de87e2818697293ac7120c9422a44e2d",
+    "sequential_slot_fold_bit_mismatches": 0,
+    "thread_counts_checked": [1, 2, 4, 8]
+  },
+  "weighted_combine": {
+    "slot_expert_indices": [30, 60, 19, 49, 8, 38],
+    "contribution_f32_bits": [1266679808, 1065353216, 3414163456, 1065353216, 1065353216, 1065353216],
+    "weight_f32_bits": [1065353216, 1065353216, 1065353216, 1065353216, 1065353216, 1065353216],
+    "rust_ascending_left_fold_f32_bits": 1082130432,
+    "rust_ascending_left_fold": 4.0,
+    "slot_order_left_fold_f32_bits": 1077936128,
+    "slot_order_left_fold": 3.0,
+    "torch_scalar_shape_1x6x1_sum_dim_1_f32_bits": 1084227584,
+    "torch_scalar_shape_1x6x1_sum_dim_1": 5.0,
+    "torch_production_shape_1x6x1280_sum_dim_1_f32_bits": 1077936128,
+    "torch_production_shape_1x6x1280_sum_dim_1": 3.0
+  }
+}

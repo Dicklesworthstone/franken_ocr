@@ -1,0 +1,109 @@
+{
+  "schema": "focr-gauntlet-roofline/v1",
+  "created_utc": "2026-07-05T23:59:27Z",
+  "arch": "got-ocr2",
+  "precision": "int8",
+  "machine_profile": {
+    "name": "m4",
+    "dram_gb_s": 120.0,
+    "peak_int8_gmacs": 1126.4,
+    "peak_f32_gflops": 563.2,
+    "note": "P-cores only, SDOT 64 int8-MAC/cycle/core, FMA 32 f32-FLOP/cycle/core"
+  },
+  "stages_json": "artifacts/perf/bd-3jo6.1.11/got/focr/focr_stages.json",
+  "floors": [
+    {
+      "floor_kind": "compute",
+      "floor_ms": 92.925382,
+      "compute_floor_ms": 92.925382,
+      "memory_floor_ms": 2.569011,
+      "int8_macs": 88476745728,
+      "f32_flops": 8097202176,
+      "bytes": 308281344,
+      "assumptions": [
+        "287 prefill tokens \u00d7 dense per-token GEMM MACs (lm_head excluded)",
+        "memory floor = weights streamed once"
+      ],
+      "stage": "prefill",
+      "focr_best_ms": 220.0,
+      "dist_above_floor": 2.3675
+    },
+    {
+      "floor_kind": "memory",
+      "floor_ms": 4.391366,
+      "compute_floor_ms": 0.466375,
+      "memory_floor_ms": 4.391366,
+      "int8_macs": 463785984,
+      "f32_flops": 30769152,
+      "bytes": 526963920,
+      "assumptions": [
+        "dense Qwen2: attn qkvo + SwiGLU MLP + lm_head, all int8",
+        "full-causal K+V read at mean context 313 in f32",
+        "norms/embeds/biases/activations excluded (lower bound)"
+      ],
+      "stage": "decode_per_token",
+      "focr_best_ms": 12.264151,
+      "dist_above_floor": 2.7928
+    },
+    {
+      "floor_kind": "compute",
+      "floor_ms": 1983.132798,
+      "compute_floor_ms": null,
+      "memory_floor_ms": null,
+      "int8_macs": null,
+      "f32_flops": null,
+      "bytes": null,
+      "assumptions": [
+        "sum of modeled stage floors with decode \u00d7 53 measured tokens",
+        "floor_kind = dominant component (vision_encode)"
+      ],
+      "components": {
+        "vision_encode": {
+          "floor_kind": "compute",
+          "floor_ms": 1657.465018,
+          "compute_floor_ms": 1657.465018,
+          "memory_floor_ms": 3.108591,
+          "int8_macs": 0,
+          "f32_flops": 933484298240,
+          "bytes": 373030912,
+          "assumptions": [
+            "SAM-ViT-B blocks + windowed/global attention + Vary neck/compressor convs",
+            "GOT mm_projector_vary 1024\u21921024 over 256 tokens",
+            "f32 weights streamed once; norms/softmax/pos-embeds excluded (lower bound)"
+          ]
+        },
+        "prefill": {
+          "floor_kind": "compute",
+          "floor_ms": 92.925382,
+          "compute_floor_ms": 92.925382,
+          "memory_floor_ms": 2.569011,
+          "int8_macs": 88476745728,
+          "f32_flops": 8097202176,
+          "bytes": 308281344,
+          "assumptions": [
+            "287 prefill tokens \u00d7 dense per-token GEMM MACs (lm_head excluded)",
+            "memory floor = weights streamed once"
+          ]
+        },
+        "decode_per_token": {
+          "floor_kind": "memory",
+          "floor_ms": 4.391366,
+          "compute_floor_ms": 0.466375,
+          "memory_floor_ms": 4.391366,
+          "int8_macs": 463785984,
+          "f32_flops": 30769152,
+          "bytes": 526963920,
+          "assumptions": [
+            "dense Qwen2: attn qkvo + SwiGLU MLP + lm_head, all int8",
+            "full-causal K+V read at mean context 313 in f32",
+            "norms/embeds/biases/activations excluded (lower bound)"
+          ]
+        }
+      },
+      "stage": "end_to_end",
+      "focr_best_ms": 6454.23,
+      "dist_above_floor": 3.2546
+    }
+  ],
+  "synthetic": false
+}

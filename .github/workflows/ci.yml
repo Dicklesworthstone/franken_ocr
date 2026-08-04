@@ -7,17 +7,15 @@
 # the gate sequence ever changes, it changes in ONE place — the script — and CI
 # follows automatically.
 #
-# Toolchain: `rust-toolchain.toml` selects the nightly channel (nightly is
+# Toolchain: `rust-toolchain.toml` selects an exact nightly (nightly is
 # REQUIRED for stdarch i8mm/dotprod intrinsics + portable_simd — Toolchain note).
-# The `dtolnay/rust-toolchain@nightly` action installs that same channel plus the
-# needed components/targets, so CI and local builds stay aligned.
+# CI installs that same dated toolchain plus the needed components/targets, so a
+# later nightly cannot silently change lint, codegen, or intrinsic behavior.
 #
-# Path dependencies: franken_ocr currently consumes sibling checkouts at
-# `../frankentorch`, `../frankensqlite`, and a host-local `/dp/asupersync`.
-# Fresh GitHub runners do not have those paths, and hosted macOS has a read-only
-# root filesystem, so each Cargo job clones the siblings and rewrites the CI-only
-# `/dp/asupersync` paths in this checkout and the cloned `frankensqlite` root to
-# the sibling `../asupersync` checkout.
+# Path dependencies: franken_ocr consumes sibling checkouts at
+# `../frankentorch`, `../frankensqlite`, and `../asupersync`. Fresh GitHub
+# runners do not have those paths, so each Cargo job clones the pinned siblings
+# next to the source checkout before invoking Cargo.
 #
 # Model gating: CI runs WITHOUT the 6.67 GB weights. The model-gated e2e/parity
 # tests resolve `FOCR_MODEL_PATH` (default `models/unlimited-ocr.focrq`, absent
@@ -46,6 +44,13 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: nightly-2026-07-09
+  # Path dependencies are build inputs. Keep these immutable revisions aligned
+  # with the package versions recorded in Cargo.lock; update them deliberately
+  # and together, never by floating each job on sibling `main`.
+  FRANKENTORCH_REV: 062cf3671c194f6ab184da98f0559ebc76cff7c7
+  FRANKENSQLITE_REV: cd9990bb16291d8c7c247b75b47faae8d7701adb
+  ASUPERSYNC_REV: 53aa5c72f855352148c3a88e6961f7f09adb535c
   # Surface full backtraces if a test panics, so failures are self-diagnosing.
   RUST_BACKTRACE: 1
 
@@ -63,59 +68,121 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Provision sibling path dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
-
-          function Rewrite-AsupersyncPath([string] $cargoToml) {
-            $text = Get-Content -Raw -Path $cargoToml
-            $needle = 'path = "/dp/asupersync"'
-            if (-not $text.Contains($needle)) {
-              throw "expected $cargoToml to contain $needle before CI path rewrite"
+          function Checkout-PinnedSibling([string] $repo, [string] $revision) {
+            $destination = Join-Path $parent $repo
+            if (Test-Path $destination) {
+              throw "refusing to overwrite existing sibling checkout: $destination"
             }
-            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+            git init --quiet $destination
+            git -C $destination remote add origin "https://github.com/Dicklesworthstone/$repo.git"
+            git -C $destination fetch --quiet --depth 1 origin $revision
+            git -C $destination checkout --quiet --detach FETCH_HEAD
+            $actual = (git -C $destination rev-parse HEAD).Trim()
+            if ($actual -ne $revision) {
+              throw "$repo checkout mismatch: expected $revision, got $actual"
+            }
+            Write-Host "$repo pinned at $actual"
           }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
+          Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
+          Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
+          Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
 
       # Python 3 is needed by the pre-cargo ledger/format/oracle self-tests that
       # `scripts/check.sh` runs first (stdlib only — no pip install required).
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
 
       # Install the repo's nightly channel plus the components declared for the
       # local gate.
-      - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Distinct cache per OS so the aarch64 and x86_64 artifacts never mix.
           key: ${{ matrix.os }}
           # The script builds --all-targets (lib, both bins, tests); cache them.
           cache-all-crates: true
 
+      # gum gives the installer e2e (tests/installer_e2e.sh, run by check.sh) its
+      # teeth: its gum/TTY render gates SKIP without gum, so install it here on
+      # both runners (Homebrew ships on macOS and ubuntu-latest). Best-effort — a
+      # transient install hiccup must not fail the gate; the test then just skips.
+      - name: Install gum (installer e2e render path)
+        run: brew install gum || echo "gum install failed; installer e2e gum gates will skip"
+
       # The one and only test step: the same gate humans run locally. We do NOT
       # duplicate its commands here — the script is the single source of truth.
+      # The full stdout/stderr is captured and uploaded as a CI artifact (the
+      # evidence-graph capture, bd-4yks item 10) even when the gate fails.
       - name: Run the gate (scripts/check.sh)
-        run: ./scripts/check.sh
+        shell: bash
+        run: |
+          set -o pipefail
+          ./scripts/check.sh 2>&1 | tee gate-log-${{ matrix.os }}.txt
+
+      - name: Bind successful gate evidence
+        run: |
+          python3 scripts/gauntlet_cert.py \
+            --ci-gate-evidence "gate (${{ matrix.os }})" \
+            --ci-gate-log "gate-log-${{ matrix.os }}.txt" \
+            --workflow-artifact-name "gate-log-${{ matrix.os }}"
+
+      - name: Upload gate log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: gate-log-${{ matrix.os }}
+          path: |
+            gate-log-${{ matrix.os }}.txt
+            .gauntlet-output/ci-gate-${{ matrix.os }}-workflow-evidence.json
+            .gauntlet-output/bundle/ci/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  # Advisory bench-guardrail (bd-4yks item 5, non-blocking by design): compares
+  # stage records against the frozen benches/.bench-history/baseline.json when
+  # bench fixtures exist, and SKIPS-GREEN on a runner without them (no weights,
+  # no timed stages in CI — the guardrail's own posture/receipt refusals are the
+  # honest behavior). continue-on-error keeps it flag-only until a quiet
+  # dedicated runner exists.
+  bench-guardrail:
+    name: bench guardrail (advisory)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Guardrail self-test + skip-green check
+        run: |
+          python3 scripts/bench_guardrail.py --self-test
+          python3 scripts/bench_guardrail.py || echo "guardrail reported (advisory; non-blocking)"
 
   advisory-targets:
-    name: advisory target (${{ matrix.name }})
+    name: target (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
+    continue-on-error: false
     strategy:
       fail-fast: false
       matrix:
@@ -150,16 +217,25 @@ jobs:
             runnable: true
             skip: false
             skip_reason: ""
+          # arm64 Windows checks natively on the hosted windows-11-arm runner.
+          # The binary build/no-weights smoke passed in dist run 29048523156;
+          # Full model OCR remains covered by the separate weighted parity gate.
+          - name: windows-msvc-aarch64
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            runnable: true
+            skip: false
+            skip_reason: ""
     timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      - name: Explain advisory skip
+      - name: Explain target skip
         if: ${{ matrix.skip }}
         shell: bash
         run: |
-          echo "Advisory target '${{ matrix.name }}' is not built in Phase 0:"
+          echo "Target '${{ matrix.name }}' is not built in Phase 0:"
           echo "${{ matrix.skip_reason }}"
 
       - name: Provision sibling path dependencies
@@ -168,43 +244,48 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
-
-          function Rewrite-AsupersyncPath([string] $cargoToml) {
-            $text = Get-Content -Raw -Path $cargoToml
-            $needle = 'path = "/dp/asupersync"'
-            if (-not $text.Contains($needle)) {
-              throw "expected $cargoToml to contain $needle before CI path rewrite"
+          function Checkout-PinnedSibling([string] $repo, [string] $revision) {
+            $destination = Join-Path $parent $repo
+            if (Test-Path $destination) {
+              throw "refusing to overwrite existing sibling checkout: $destination"
             }
-            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+            git init --quiet $destination
+            git -C $destination remote add origin "https://github.com/Dicklesworthstone/$repo.git"
+            git -C $destination fetch --quiet --depth 1 origin $revision
+            git -C $destination checkout --quiet --detach FETCH_HEAD
+            $actual = (git -C $destination rev-parse HEAD).Trim()
+            if ($actual -ne $revision) {
+              throw "$repo checkout mismatch: expected $revision, got $actual"
+            }
+            Write-Host "$repo pinned at $actual"
           }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
+          Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
+          Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
+          Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
 
-      - name: Install nightly toolchain
+      - name: Install pinned nightly toolchain
         if: ${{ !matrix.skip }}
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
           components: clippy, rustfmt
 
       - name: Cache cargo registry + build
         if: ${{ !matrix.skip }}
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: advisory-${{ matrix.name }}-${{ matrix.target }}
+          key: target-${{ matrix.name }}-${{ matrix.target }}
           cache-all-crates: true
 
       - name: Cargo check target
         if: ${{ !matrix.skip }}
-        run: cargo check --target ${{ matrix.target }} --all-targets
+        run: cargo check --locked --target ${{ matrix.target }} --all-targets
 
       - name: Build focr target
         if: ${{ !matrix.skip }}
-        run: cargo build --target ${{ matrix.target }} --bin focr
+        run: cargo build --locked --target ${{ matrix.target }} --bin focr
 
       - name: Run target lib tests where executable
         if: ${{ !matrix.skip && matrix.runnable }}
-        run: cargo test --target ${{ matrix.target }} --lib
+        run: cargo test --locked --target ${{ matrix.target }} --lib

@@ -1,32 +1,28 @@
-# franken_ocr — Cross-architecture release distribution (the `focr` binary).
+# franken_ocr: cross-architecture release distribution (the `focr` binary).
 #
 # Builds the optimized `focr` binary for every target arch in the mission
 # (AGENTS.md "Project Mission" + Toolchain), one artifact per (target, feature)
-# variant. CPU is the priority — these variants enable the int8-matmul paths the
+# variant. CPU is the priority; these variants enable the int8-matmul paths the
 # whole project is built around:
 #
 #   Apple Silicon / ARM64 (aarch64-apple-darwin)
 #     NEON (baseline on Apple Silicon) + FEAT_DotProd (SDOT) + FEAT_MATMUL_INT8
-#     (SMMLA / i8mm). The stdarch dotprod/i8mm intrinsics are NIGHTLY-only — this
+#     (SMMLA / i8mm). The stdarch dotprod/i8mm intrinsics are NIGHTLY-only; this
 #     is one reason the toolchain is pinned to nightly (Toolchain note). Apple M-
 #     series ship dotprod+i8mm, so we target-cpu=apple-m1 to light them up.
 #
-#   Intel / AMD x86-64 (x86_64-unknown-linux-gnu), THREE feature variants, since
-#   the int8 GEMM kernel dispatches on the widest VNNI available at runtime but we
-#   want a build that can be -C target-feature compiled for each tier:
-#     • avx2        — AVX2 baseline (no VNNI; SDOT-equivalent emulated). Widest
-#                     portability floor for older/cloud hosts.
-#     • avx-vnni    — AVX-VNNI (VPDPBUSD on 256-bit, Alder Lake+ / Zen4+). The
-#                     mainstream int8 dot-product path.
-#     • avx512-vnni — AVX-512-VNNI (512-bit VPDPBUSD, server Ice Lake+/Zen4+).
-#                     Highest-throughput int8 accumulation tier.
+#   Intel / AMD x86-64 (x86_64-unknown-linux-gnu): one portable baseline binary.
+#   The audited runtime dispatch selects AVX2, AVX-VNNI, or AVX-512-VNNI only
+#   after CPUID detection. Compiling the whole installer-served binary with a
+#   global `+avx2` (or wider) feature would allow LLVM to emit unsupported
+#   instructions outside those guarded kernels and can SIGILL on older hosts.
 #
-#   Phase-0 CI also tracks linux arm64, darwin x86-64, and windows-msvc x86-64 as
-#   advisory targets. This release workflow builds the Unix/macOS targets whose
-#   sibling path dependencies can be provisioned in Actions today. Because hosted
-#   macOS has a read-only root filesystem, the workflow rewrites the CI-only
-#   `/dp/asupersync` paths in this checkout and the cloned `frankensqlite` root
-#   to the sibling `../asupersync` checkout.
+#   Phase-0 CI tracked linux arm64, darwin x86-64, and windows-msvc x86-64 as
+#   advisory targets; this workflow now ships real artifacts for all of them. The
+#   Unix/macOS variants build in the `dist` job below and native Windows builds in
+#   the `dist-windows` job. Every runner clones the three pinned path dependencies
+#   beside the source checkout, matching the repository's portable
+#   `../{frankentorch,frankensqlite,asupersync}` layout.
 #
 # Branch policy (AGENTS.md): release builds run on `main` ONLY. `master` is never
 # referenced. Tag pushes (v*) cut a versioned set of artifacts.
@@ -40,8 +36,16 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-  # Allow a manual cross-arch build from the Actions tab (main only).
+  # Allow a manual cross-arch build from main. source_ref lets the current
+  # workflow repair a compatible immutable tag; tag-owned build-input drift is
+  # rejected before sibling provisioning.
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "Optional compatible vX.Y.Z source tag to rebuild"
+        required: false
+        type: string
+        default: ""
 
 concurrency:
   group: dist-${{ github.workflow }}-${{ github.ref }}
@@ -52,6 +56,12 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: nightly-2026-07-09
+  # The sibling path dependencies are part of the release input. Keep these
+  # immutable revisions aligned with the package versions in Cargo.lock.
+  FRANKENTORCH_REV: 062cf3671c194f6ab184da98f0559ebc76cff7c7
+  FRANKENSQLITE_REV: cd9990bb16291d8c7c247b75b47faae8d7701adb
+  ASUPERSYNC_REV: 53aa5c72f855352148c3a88e6961f7f09adb535c
 
 jobs:
   dist:
@@ -68,106 +78,606 @@ jobs:
           - name: aarch64-apple-darwin (neon+sdot+i8mm)
             os: macos-15
             target: aarch64-apple-darwin
+            asset: focr-aarch64-apple-darwin-neon-sdot-i8mm
             rustflags: "-C target-cpu=apple-m1"
+            glibc_floor: ""
 
           # ── Intel macOS / x86-64 portability build ─────────────────────────
           - name: x86_64-apple-darwin (baseline)
             os: macos-15-intel
             target: x86_64-apple-darwin
+            asset: focr-x86_64-apple-darwin
             rustflags: ""
+            glibc_floor: ""
 
           # ── Linux ARM64 / baseline AArch64 build ───────────────────────────
           - name: aarch64-linux (baseline)
             os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            asset: focr-aarch64-unknown-linux-gnu
             rustflags: ""
+            glibc_floor: "2.17"
 
-          # ── x86-64 / AVX2 baseline ─────────────────────────────────────────
-          # Portability floor: AVX2 + FMA, no VNNI. Runs on the broadest set of
-          # x86 hosts (incl. older cloud instances).
-          - name: x86_64-linux (avx2)
+          # ── x86-64 / portable baseline ─────────────────────────────────────
+          # Keep global target features empty. Runtime CPUID dispatch reaches the
+          # guarded AVX2/VNNI kernels without raising the process-wide ISA floor.
+          - name: x86_64-linux (baseline + runtime dispatch)
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            rustflags: "-C target-feature=+avx2,+fma"
-
-          # ── x86-64 / AVX-VNNI ──────────────────────────────────────────────
-          # 256-bit VPDPBUSD int8 dot product (Alder Lake+ / Zen4+). The
-          # mainstream int8 path. avxvnni implies avx2; name fma explicitly.
-          - name: x86_64-linux (avx-vnni)
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            rustflags: "-C target-feature=+avx2,+fma,+avxvnni"
-
-          # ── x86-64 / AVX-512-VNNI ──────────────────────────────────────────
-          # 512-bit VPDPBUSD (server Ice Lake+ / Zen4+). Highest int8 throughput
-          # tier. avx512vnni pulls in avx512f/bw/dq; list them so the binary's
-          # required-feature set is explicit and auditable.
-          - name: x86_64-linux (avx512-vnni)
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            rustflags: "-C target-feature=+avx2,+fma,+avx512f,+avx512bw,+avx512dq,+avx512vnni"
+            asset: focr-x86_64-unknown-linux-gnu
+            rustflags: ""
+            glibc_floor: "2.17"
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python for evidence receipts
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate release ref and Cargo version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'src/native_engine/unlimited_ocr_manifest.json'
+          $manifestSha = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedManifestSha = '24ff1cfffe71eec6f07bfae8e8eb12b342877bccc43ad6ae4a4a4ceffb76edd3'
+          if ($manifestSha -ne $expectedManifestSha) {
+            throw "embedded census manifest bytes differ from Git: expected $expectedManifestSha, got $manifestSha"
+          }
+          $sourceRef = '${{ inputs.source_ref }}'
+          $workflowSha = $env:GITHUB_SHA
+          $evidenceScript = (Resolve-Path -LiteralPath 'scripts/gauntlet_cert.py').Path
+          if ($sourceRef) {
+            if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or
+                $env:GITHUB_REF_TYPE -ne 'branch' -or
+                $env:GITHUB_REF_NAME -ne 'main') {
+              throw 'source_ref repairs must be dispatched from main'
+            }
+            $env:GITHUB_REF_TYPE = 'tag'
+            $env:GITHUB_REF_NAME = $sourceRef
+          }
+          python scripts/gauntlet_cert.py --dist-ref-preflight
+          if ($LASTEXITCODE -ne 0) { throw "dist ref preflight exited $LASTEXITCODE" }
+          if ($sourceRef) {
+            $head = (git rev-parse HEAD).Trim()
+            $tagHead = (git rev-parse "refs/tags/${sourceRef}^{commit}").Trim()
+            $originMain = (git rev-parse refs/remotes/origin/main).Trim()
+            if ($head -ne $tagHead) {
+              throw "source_ref checkout mismatch: expected $tagHead, got $head"
+            }
+            if ($workflowSha -ne $originMain) {
+              throw "repair workflow is not current origin/main: expected $originMain, got $workflowSha"
+            }
+            $evidenceScript = Join-Path $env:GITHUB_WORKSPACE 'scripts/gauntlet_cert.workflow-repair.py'
+            $blobSpec = "${workflowSha}:scripts/gauntlet_cert.py"
+            python -c 'import pathlib, subprocess, sys; pathlib.Path(sys.argv[2]).write_bytes(subprocess.check_output(["git", "cat-file", "blob", sys.argv[1]]))' $blobSpec $evidenceScript
+            if ($LASTEXITCODE -ne 0) { throw "failed to extract authenticated evidence producer" }
+            $expectedScriptBlob = (git rev-parse $blobSpec).Trim()
+            $actualScriptBlob = (git hash-object $evidenceScript).Trim()
+            if ($actualScriptBlob -ne $expectedScriptBlob) {
+              throw "repair evidence producer blob mismatch: expected $expectedScriptBlob, got $actualScriptBlob"
+            }
+            python $evidenceScript --dist-ref-preflight
+            if ($LASTEXITCODE -ne 0) { throw "authenticated dist ref preflight exited $LASTEXITCODE" }
+            Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
+          }
+          "FOCR_DIST_EVIDENCE_SCRIPT=$evidenceScript" >> $env:GITHUB_ENV
 
       - name: Provision sibling path dependencies
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
-          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
-          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
-
-          function Rewrite-AsupersyncPath([string] $cargoToml) {
-            $text = Get-Content -Raw -Path $cargoToml
-            $needle = 'path = "/dp/asupersync"'
-            if (-not $text.Contains($needle)) {
-              throw "expected $cargoToml to contain $needle before CI path rewrite"
+          function Checkout-PinnedSibling([string] $repo, [string] $revision) {
+            $destination = Join-Path $parent $repo
+            if (Test-Path $destination) {
+              throw "refusing to overwrite existing sibling checkout: $destination"
             }
-            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+            git init --quiet $destination
+            git -C $destination remote add origin "https://github.com/Dicklesworthstone/$repo.git"
+            git -C $destination fetch --quiet --depth 1 origin $revision
+            git -C $destination checkout --quiet --detach FETCH_HEAD
+            $actual = (git -C $destination rev-parse HEAD).Trim()
+            if ($actual -ne $revision) {
+              throw "$repo checkout mismatch: expected $revision, got $actual"
+            }
+            Write-Host "$repo pinned at $actual"
           }
-          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml")
-          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml")
+          Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
+          Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
+          Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
 
       # Honor the pinned nightly from `rust-toolchain.toml` (REQUIRED for the
       # stdarch i8mm/dotprod intrinsics). Add the explicit compile target.
       - name: Install pinned nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
       - name: Cache cargo registry + build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           # Cache keyed per variant so feature-divergent artifacts never collide.
-          key: ${{ matrix.target }}-${{ matrix.rustflags }}
+          key: ${{ matrix.target }}-${{ matrix.rustflags }}-${{ matrix.glibc_floor }}
+
+      - name: Install pinned glibc-floor linker
+        if: ${{ matrix.glibc_floor != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check 'ziglang==0.14.1'
+          (
+            cd "$RUNNER_TEMP"
+            cargo install --locked --version 0.23.0 cargo-zigbuild
+          )
+          mkdir -p "$RUNNER_TEMP/zig-bin"
+          printf '#!/usr/bin/env bash\nexec python3 -m ziglang "$@"\n' > "$RUNNER_TEMP/zig-bin/zig"
+          chmod +x "$RUNNER_TEMP/zig-bin/zig"
+          echo "$RUNNER_TEMP/zig-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/zig-bin/zig" version
 
       # Release build of ONLY the `focr` binary for this target+feature variant.
       # RUSTFLAGS carries the arch-feature rationale documented in the matrix.
       - name: Build focr (release)
+        shell: bash
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
-        run: cargo build --release --bin focr --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          if [ -n '${{ matrix.glibc_floor }}' ]; then
+            cargo zigbuild --locked --release --bin focr \
+              --target '${{ matrix.target }}.${{ matrix.glibc_floor }}'
+          else
+            cargo build --locked --release --bin focr --target '${{ matrix.target }}'
+          fi
 
-      # Stage the binary under a per-variant name so artifacts are unambiguous.
-      # The variant tag (everything after the first space in matrix.name, minus
-      # parens) distinguishes same-target x86 feature builds.
+      # Every Unix artifact is built on its native architecture. Execute the
+      # exact binary that will be staged, and parse the read-only robot payloads,
+      # before allowing it into the release artifact set.
+      - name: Smoke test focr (no weights)
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe="target/${{ matrix.target }}/release/focr"
+          "$exe" --version
+          for cmd in schema health backends; do
+            payload=$("$exe" robot "$cmd")
+            python3 -c 'import json,sys; lines=[x for x in sys.stdin if x.strip()]; assert lines; [json.loads(x) for x in lines]' <<<"$payload"
+            echo "smoke ok: robot $cmd (exit 0, valid JSON)"
+          done
+
+      # Stage under the explicit release-contract name. Do not derive an asset
+      # name from the human-facing job label: installers consume these literals.
       - name: Stage artifact
         shell: bash
         run: |
           set -euo pipefail
-          variant="$(echo '${{ matrix.name }}' | sed -E 's/[^(]*\(([^)]*)\)/\1/; s/[^a-zA-Z0-9._-]+/-/g')"
-          out="focr-${{ matrix.target }}-${variant}"
+          out="${{ matrix.asset }}"
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/focr" "dist/${out}"
           ( cd dist && shasum -a 256 "${out}" > "${out}.sha256" )
           ls -l dist
 
+      - name: Bind successful target evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 "$FOCR_DIST_EVIDENCE_SCRIPT" \
+            --dist-target-evidence '${{ matrix.name }}' \
+            --dist-asset 'dist/${{ matrix.asset }}' \
+            --dist-glibc-floor '${{ matrix.glibc_floor }}' \
+            --workflow-artifact-name '${{ matrix.asset }}'
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: focr-${{ matrix.target }}-${{ strategy.job-index }}
-          path: dist/*
+          name: ${{ matrix.asset }}
+          path: |
+            dist/*
+            .gauntlet-output/dist-*-workflow-evidence.json
+            .gauntlet-output/bundle/dist/**
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Native Windows (MSVC): x86-64 + arm64 ────────────────────────────────────
+  # Both Windows targets build natively on their own hosted runners: no
+  # cargo-xwin, no cross-linking — and the smoke step below needs a native host
+  # anyway, because x64 Windows cannot emulate arm64, so a cross-on-x64 arm64
+  # build could never be executed where it was built. windows-latest ships MSVC
+  # and nasm, so ring compiles its x86 assembly directly; windows-11-arm (the
+  # hosted arm64 label, available to public repos) carries the arm64 MSVC
+  # toolchain + LLVM for ring's aarch64 path. The whole stack (asupersync IOCP
+  # reactor, frankentorch, frankensqlite, focr) compiles clean for
+  # x86_64-pc-windows-msvc and the resulting focr.exe runs on real Windows 10
+  # with runtime ISA detection (the avx2 tier is selected); the arm64 row rides
+  # the same fail-fast:false matrix. Native build/no-weights smoke is proven by
+  # dist run 29048523156; full model OCR remains a separate release obligation.
+  # Both rows reuse the SAME pinned nightly and the SAME sibling path-dep
+  # provisioning as the `dist` job above (the provisioning step is already
+  # PowerShell, so it runs unchanged here). Only staging differs: the artifact
+  # is a raw .exe and the checksum is produced with Get-FileHash instead of
+  # shasum.
+  dist-windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86-64 is the required Windows release target (proven on Windows 10).
+          - name: x86_64-pc-windows-msvc (baseline)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: focr-x86_64-pc-windows-msvc.exe
+            rustflags: ""
+
+          # arm64 Windows (Snapdragon/Surface-class hosts, and Windows VMs on
+          # Apple Silicon). Baseline rustflags like the aarch64-linux row in the
+          # `dist` job: runtime dispatch selects SDOT/SMMLA (i8mm) when the
+          # silicon has it, so no target-cpu pinning is needed (bd-1aj1).
+          - name: aarch64-pc-windows-msvc (baseline)
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            asset: focr-aarch64-pc-windows-msvc.exe
+            rustflags: ""
+    steps:
+      # v0.7.0 predates the repository .gitattributes policy. Configure the
+      # ephemeral runner before checkout so exact-tag repairs embed Git's LF
+      # bytes instead of Git-for-Windows CRLF translations.
+      - name: Preserve canonical Git line endings
+        shell: pwsh
+        run: git config --global core.autocrlf false
+
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python for evidence receipts
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate release ref and Cargo version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $manifestPath = Join-Path $env:GITHUB_WORKSPACE 'src/native_engine/unlimited_ocr_manifest.json'
+          $manifestSha = (Get-FileHash -LiteralPath $manifestPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $expectedManifestSha = '24ff1cfffe71eec6f07bfae8e8eb12b342877bccc43ad6ae4a4a4ceffb76edd3'
+          if ($manifestSha -ne $expectedManifestSha) {
+            throw "embedded census manifest bytes differ from Git: expected $expectedManifestSha, got $manifestSha"
+          }
+          $sourceRef = '${{ inputs.source_ref }}'
+          $workflowSha = $env:GITHUB_SHA
+          $evidenceScript = (Resolve-Path -LiteralPath 'scripts/gauntlet_cert.py').Path
+          if ($sourceRef) {
+            if ($env:GITHUB_EVENT_NAME -ne 'workflow_dispatch' -or
+                $env:GITHUB_REF_TYPE -ne 'branch' -or
+                $env:GITHUB_REF_NAME -ne 'main') {
+              throw 'source_ref repairs must be dispatched from main'
+            }
+            $env:GITHUB_REF_TYPE = 'tag'
+            $env:GITHUB_REF_NAME = $sourceRef
+          }
+          python scripts/gauntlet_cert.py --dist-ref-preflight
+          if ($LASTEXITCODE -ne 0) { throw "dist ref preflight exited $LASTEXITCODE" }
+          if ($sourceRef) {
+            $head = (git rev-parse HEAD).Trim()
+            $tagHead = (git rev-parse "refs/tags/${sourceRef}^{commit}").Trim()
+            $originMain = (git rev-parse refs/remotes/origin/main).Trim()
+            if ($head -ne $tagHead) {
+              throw "source_ref checkout mismatch: expected $tagHead, got $head"
+            }
+            if ($workflowSha -ne $originMain) {
+              throw "repair workflow is not current origin/main: expected $originMain, got $workflowSha"
+            }
+            $evidenceScript = Join-Path $env:GITHUB_WORKSPACE 'scripts/gauntlet_cert.workflow-repair.py'
+            $blobSpec = "${workflowSha}:scripts/gauntlet_cert.py"
+            python -c 'import pathlib, subprocess, sys; pathlib.Path(sys.argv[2]).write_bytes(subprocess.check_output(["git", "cat-file", "blob", sys.argv[1]]))' $blobSpec $evidenceScript
+            if ($LASTEXITCODE -ne 0) { throw "failed to extract authenticated evidence producer" }
+            $expectedScriptBlob = (git rev-parse $blobSpec).Trim()
+            $actualScriptBlob = (git hash-object $evidenceScript).Trim()
+            if ($actualScriptBlob -ne $expectedScriptBlob) {
+              throw "repair evidence producer blob mismatch: expected $expectedScriptBlob, got $actualScriptBlob"
+            }
+            python $evidenceScript --dist-ref-preflight
+            if ($LASTEXITCODE -ne 0) { throw "authenticated dist ref preflight exited $LASTEXITCODE" }
+            Write-Host "repair workflow $workflowSha building exact tag $sourceRef at $head"
+          }
+          "FOCR_DIST_EVIDENCE_SCRIPT=$evidenceScript" >> $env:GITHUB_ENV
+
+      # Identical to the `dist` job: clone the three path-dep siblings. On Windows
+      # the checkout lives at e.g. D:\a\franken_ocr\franken_ocr, so the siblings
+      # land next to it and the `../{frankentorch,frankensqlite,asupersync}` path
+      # deps resolve exactly as they do on Unix.
+      - name: Provision sibling path dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          function Checkout-PinnedSibling([string] $repo, [string] $revision) {
+            $destination = Join-Path $parent $repo
+            if (Test-Path $destination) {
+              throw "refusing to overwrite existing sibling checkout: $destination"
+            }
+            git init --quiet $destination
+            git -C $destination remote add origin "https://github.com/Dicklesworthstone/$repo.git"
+            git -C $destination fetch --quiet --depth 1 origin $revision
+            git -C $destination checkout --quiet --detach FETCH_HEAD
+            $actual = (git -C $destination rev-parse HEAD).Trim()
+            if ($actual -ne $revision) {
+              throw "$repo checkout mismatch: expected $revision, got $actual"
+            }
+            Write-Host "$repo pinned at $actual"
+          }
+          Checkout-PinnedSibling "frankentorch" $env:FRANKENTORCH_REV
+          Checkout-PinnedSibling "frankensqlite" $env:FRANKENSQLITE_REV
+          Checkout-PinnedSibling "asupersync" $env:ASUPERSYNC_REV
+
+      # Same pinned nightly as the Unix/macOS jobs (REQUIRED for the stdarch
+      # int8 intrinsics), plus the explicit MSVC compile target.
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@efcb852328a9f50117170cc43094fb6f09eaf1ae
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          # Distinct target keeps this cache from colliding with the Unix jobs.
+          key: ${{ matrix.target }}-${{ matrix.rustflags }}
+
+      # Native release build of ONLY the `focr` binary. No cargo-xwin: this is a
+      # first-class MSVC host build.
+      - name: Build focr (release)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --locked --release --bin focr --target ${{ matrix.target }}
+
+      # No-weights smoke (bd-wp8.5 contract; scripts/e2e_smoke.sh is the shell
+      # analogue): the freshly built binary must RUN on this host, not just
+      # link, before it is staged. `--version` and every read-only robot
+      # surface must exit 0, and each robot payload must be one parseable JSON
+      # object on stdout (src/cli.rs `emit`: data-only stdout, one object/line).
+      # Runs pre-staging so a broken binary never becomes an artifact. Both
+      # matrix rows execute this natively — the arm64 row is why this job uses
+      # windows-11-arm rather than cross-compiling on x64.
+      - name: Smoke test focr (no weights)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target/${{ matrix.target }}/release/focr.exe"
+          & $exe --version | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "focr --version exited $LASTEXITCODE" }
+          foreach ($cmd in @("schema", "health", "backends")) {
+            $lines = @(& $exe robot $cmd)
+            if ($LASTEXITCODE -ne 0) { throw "focr robot $cmd exited $LASTEXITCODE" }
+            $null = ($lines -join "`n") | ConvertFrom-Json
+            Write-Host "smoke ok: robot $cmd (exit 0, valid JSON)"
+          }
+
+      # The Windows artifact is a raw focr.exe (not a zip). Stage it under the
+      # canonical per-target name `focr-<target>.exe` and emit a "<hex>  <name>"
+      # sidecar that matches the shasum/sha256sum format used by the Unix jobs:
+      # lowercase hex, two spaces, basename only, trailing newline. Get-FileHash
+      # returns uppercase hex, so lower it.
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "${{ matrix.target }}"
+          $asset = "${{ matrix.asset }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/$target/release/focr.exe" (Join-Path "dist" $asset)
+          $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path "dist" $asset)).Hash.ToLower()
+          $line = "$hash  ${asset}`n"
+          [System.IO.File]::WriteAllText((Join-Path (Resolve-Path "dist") "${asset}.sha256"), $line)
+          Get-ChildItem dist
+
+      - name: Test exact staged asset through offline install.ps1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $asset = (Resolve-Path 'dist/${{ matrix.asset }}').Path
+          $releaseDir = (Resolve-Path dist).Path
+          $versionOutput = @(& $asset --version)
+          $versionExit = $LASTEXITCODE
+          $versionLine = if ($versionOutput.Count -gt 0) { ([string]$versionOutput[0]).Trim() } else { '' }
+          if ($versionExit -ne 0 -or $versionLine -notmatch '^focr ([0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$') {
+            throw "staged asset returned a noncanonical version: $versionLine"
+          }
+          $version = "v$($Matches[1])"
+          $installDir = Join-Path $env:RUNNER_TEMP 'focr-offline-install-${{ matrix.target }}'
+          New-Item -ItemType Directory -Force -Path $installDir | Out-Null
+          $caseFailureLog = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.version-case-failure.log'
+          $uppercaseVersion = "V$($version.Substring(1))"
+          & pwsh -NoLogo -NoProfile -NonInteractive -File ./install.ps1 `
+            -Version $uppercaseVersion -Dir $installDir -OfflineAssetDir $releaseDir `
+            -NoPull -Quiet -Force *> $caseFailureLog
+          if ($LASTEXITCODE -eq 0) {
+            throw 'installer accepted a release tag with a noncanonical uppercase V prefix'
+          }
+          $installed = Join-Path $installDir 'focr.exe'
+          Copy-Item -LiteralPath $asset -Destination $installed
+          $oldStream = [System.IO.File]::Open(
+            $installed,
+            [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None
+          )
+          try {
+            $null = $oldStream.Seek(0, [System.IO.SeekOrigin]::End)
+            $oldStream.WriteByte(0)
+          } finally {
+            $oldStream.Dispose()
+          }
+          $before = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
+          $stagedHash = (Get-FileHash -LiteralPath $asset -Algorithm SHA256).Hash
+          if ($before -eq $stagedHash) {
+            throw 'preservation fixture is not distinct from the staged release asset'
+          }
+
+          $failureLog = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.atomic-failure.log'
+          $partialFailureLog = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.partial-replace-failure.log'
+          function Assert-FailedReplacementPreservesOld([string] $failpoint, [string] $logPath) {
+            try {
+              $env:FOCR_INSTALL_TEST_MODE = '1'
+              $env:FOCR_INSTALL_TEST_FAILPOINT = $failpoint
+              & pwsh -NoLogo -NoProfile -NonInteractive -File ./install.ps1 `
+                -Version $version -Dir $installDir -OfflineAssetDir $releaseDir `
+                -NoPull -Quiet -Force *> $logPath
+              $failureExit = $LASTEXITCODE
+            } finally {
+              Remove-Item Env:FOCR_INSTALL_TEST_FAILPOINT -ErrorAction SilentlyContinue
+              Remove-Item Env:FOCR_INSTALL_TEST_MODE -ErrorAction SilentlyContinue
+            }
+            if ($failureExit -eq 0) { throw "injected $failpoint failure unexpectedly passed" }
+            if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+              throw "injected $failpoint failure removed the previously working executable"
+            }
+            $afterFailure = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
+            if ($afterFailure -ne $before) {
+              throw "injected $failpoint failure changed the previously working executable"
+            }
+          }
+          Assert-FailedReplacementPreservesOld 'before-replace' $failureLog
+          Assert-FailedReplacementPreservesOld 'replace-target-missing' $partialFailureLog
+
+          $successLog = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.install-success.log'
+          & pwsh -NoLogo -NoProfile -NonInteractive -File ./install.ps1 `
+            -Version $version -Dir $installDir -OfflineAssetDir $releaseDir `
+            -NoPull -Quiet -Force -Verify *> $successLog
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content -LiteralPath $successLog | Write-Host
+            throw "offline install.ps1 exited $LASTEXITCODE"
+          }
+          $installedHash = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
+          if ($installedHash -ne $stagedHash) {
+            throw 'offline install.ps1 output differs from the exact staged asset'
+          }
+
+          $lockReady = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.lock-ready'
+          $lockHolderOut = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.lock-holder.out.log'
+          $lockHolderErr = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.lock-holder.err.log'
+          $lockContentionLog = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.lock-contention.log'
+          $scriptPath = (Resolve-Path ./install.ps1).Path
+          $pwshPath = (Get-Command pwsh).Source
+          try {
+            $env:FOCR_INSTALL_TEST_MODE = '1'
+            $env:FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS = '10'
+            $env:FOCR_INSTALL_TEST_LOCK_READY_PATH = $lockReady
+            $holder = Start-Process -FilePath $pwshPath -PassThru `
+              -RedirectStandardOutput $lockHolderOut -RedirectStandardError $lockHolderErr `
+              -ArgumentList @(
+                '-NoLogo', '-NoProfile', '-NonInteractive', '-File', $scriptPath,
+                '-Version', $version, '-Dir', $installDir,
+                '-OfflineAssetDir', $releaseDir, '-NoPull', '-Quiet'
+              )
+          } finally {
+            Remove-Item Env:FOCR_INSTALL_TEST_LOCK_READY_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:FOCR_INSTALL_TEST_HOLD_LOCK_SECONDS -ErrorAction SilentlyContinue
+            Remove-Item Env:FOCR_INSTALL_TEST_MODE -ErrorAction SilentlyContinue
+          }
+          function Write-LockHolderLogs {
+            foreach ($path in @($lockHolderOut, $lockHolderErr)) {
+              if (Test-Path -LiteralPath $path -PathType Leaf) {
+                Get-Content -LiteralPath $path | Write-Host
+              }
+            }
+          }
+          for ($attempt = 0; $attempt -lt 300 -and -not (Test-Path -LiteralPath $lockReady); $attempt++) {
+            if ($holder.HasExited) {
+              Write-LockHolderLogs
+              throw "lock holder exited before acquiring the lock: $($holder.ExitCode)"
+            }
+            Start-Sleep -Milliseconds 100
+          }
+          if (-not (Test-Path -LiteralPath $lockReady -PathType Leaf)) {
+            if (-not $holder.HasExited) { Stop-Process -Id $holder.Id -Force }
+            $holder.WaitForExit()
+            Write-LockHolderLogs
+            throw 'lock holder did not publish deterministic readiness within 30 seconds'
+          }
+          try {
+            & pwsh -NoLogo -NoProfile -NonInteractive -File ./install.ps1 `
+              -Version $version -Dir $installDir -OfflineAssetDir $releaseDir `
+              -NoPull -Quiet *> $lockContentionLog
+            $contentionExit = $LASTEXITCODE
+            if ($contentionExit -eq 0) {
+              throw 'concurrent install unexpectedly bypassed the destination lock'
+            }
+          } finally {
+            if (-not $holder.HasExited) { Stop-Process -Id $holder.Id -Force }
+            $holder.WaitForExit()
+          }
+
+          $fastPathLog = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.verified-fast-path.log'
+          & pwsh -NoLogo -NoProfile -NonInteractive -File ./install.ps1 `
+            -Version $version -Dir $installDir -OfflineAssetDir $releaseDir `
+            -NoPull -Quiet -Verify *> $fastPathLog
+          if ($LASTEXITCODE -ne 0) {
+            Get-Content -LiteralPath $fastPathLog | Write-Host
+            throw "verified exact-version fast path exited $LASTEXITCODE after lock-owner death"
+          }
+          $selftestEvent = $null
+          foreach ($line in (Get-Content -LiteralPath $fastPathLog)) {
+            try { $event = $line | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            if ($event.command -eq 'robot.selftest') { $selftestEvent = $event }
+          }
+          if ($null -eq $selftestEvent -or $selftestEvent.verdict -ne 'pass' -or
+              $selftestEvent.all_ok -ne $true) {
+            throw 'exact-version -Verify path did not emit a passing robot.selftest event'
+          }
+
+          $combinedLog = Join-Path $env:RUNNER_TEMP '${{ matrix.asset }}.installer-e2e.log'
+          @(
+            '=== case-sensitive release-version rejection proof ==='
+            (Get-Content -LiteralPath $caseFailureLog)
+            '=== injected atomic-failure preservation proof ==='
+            (Get-Content -LiteralPath $failureLog)
+            '=== injected partial-replace restoration proof ==='
+            (Get-Content -LiteralPath $partialFailureLog)
+            '=== successful offline install proof ==='
+            (Get-Content -LiteralPath $successLog)
+            '=== cross-process contention rejection proof ==='
+            (Get-Content -LiteralPath $lockContentionLog)
+            '=== crash-release + exact-version verification proof ==='
+            (Get-Content -LiteralPath $fastPathLog)
+          ) | Set-Content -LiteralPath $combinedLog -Encoding utf8
+          "FOCR_DIST_INSTALLED_ASSET=$installed" >> $env:GITHUB_ENV
+          "FOCR_DIST_INSTALLER_LOG=$combinedLog" >> $env:GITHUB_ENV
+
+      - name: Bind successful target evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python $env:FOCR_DIST_EVIDENCE_SCRIPT `
+            --dist-target-evidence '${{ matrix.name }}' `
+            --dist-asset 'dist/${{ matrix.asset }}' `
+            --dist-installed-asset $env:FOCR_DIST_INSTALLED_ASSET `
+            --dist-installer-e2e-log $env:FOCR_DIST_INSTALLER_LOG `
+            --workflow-artifact-name '${{ matrix.asset }}'
+          if ($LASTEXITCODE -ne 0) { throw "dist evidence producer exited $LASTEXITCODE" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/*
+            .gauntlet-output/dist-*-workflow-evidence.json
+            .gauntlet-output/bundle/dist/**
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 14

@@ -3,16 +3,16 @@
 # check.sh — the franken_ocr mandatory-check gate, in one command.
 #
 # Runs the same sequence AGENTS.md ("Mandatory Checks After Substantive Changes")
-# requires, in order, stopping on the first failure. This is the repo's stand-in
-# for a Makefile/CI `test` target until CI exists; when CI is added, wire THIS
-# script as the test job rather than duplicating the commands.
+# requires, in order, stopping on the first failure. This is the repository's
+# one-command local gate, and `.github/workflows/ci.yml` invokes this same script
+# as its single test step rather than duplicating the commands.
 #
-#   scripts/check.sh            # fmt + check + clippy + test (the full gate)
+#   scripts/check.sh            # fmt + locked check/clippy/test (the full gate)
 #   scripts/check.sh --fast     # skip clippy (still runs fmt + check + test)
 #   scripts/check.sh --ubs-only # run only the bounded UBS lane
 #
-# `cargo test` is a HARD gate: a green bar (exit 0) is required before any change
-# is handed off or a bead is closed. `cargo check --all-targets` must also be free
+# `cargo test --locked` is a HARD gate: a green bar (exit 0) is required before
+# any change is handed off or a bead is closed. `cargo check --locked --all-targets` must also be free
 # of the "src/main.rs present in multiple build targets" warning — both binaries
 # (`focr`, `franken_ocr`) build from their own thin shims over `cli_main()`.
 #
@@ -89,9 +89,12 @@ run_ubs() {
     return 0
   fi
 
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
-    ! git diff --quiet --diff-filter=ACMRTUXB --; then
-    run_ubs_bounded ubs --diff
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! git diff --quiet --diff-filter=ACMRTUXB HEAD --; then
+      run_ubs_bounded ubs --diff
+      return 0
+    fi
+    echo "==> ubs (no changed files to scan)"
     return 0
   fi
 
@@ -106,6 +109,7 @@ fi
 
 run python3 scripts/check_ledgers.py
 run python3 scripts/check_test_logs.py --self-test
+run python3 scripts/check_fixture_manifest.py
 run python3 scripts/check_focrq_format.py
 run python3 scripts/check_oracle_provenance.py --self-test
 run python3 scripts/check_oracle_provenance.py
@@ -113,12 +117,16 @@ run python3 scripts/check_oracle_provenance.py --live-replay
 run python3 scripts/oracle_bridge.py --self-test
 run python3 scripts/check_release_linkage.py
 run python3 scripts/gauntlet_cert.py --self-test
+# Installer end-to-end gate: drives install.sh through its gum/TTY render path
+# (which only runs interactively, so nothing else exercises it) and a full
+# fake-release install. Gum/pty sub-gates SKIP cleanly when gum/script are absent.
+run bash tests/installer_e2e.sh
 run cargo fmt --check
-run cargo check --all-targets
+run cargo check --locked --all-targets
 if [ "$FAST" -eq 0 ]; then
-  run cargo clippy --all-targets -- -D warnings
+  run cargo clippy --locked --all-targets -- -D warnings
 fi
-run cargo test
+run cargo test --locked
 run_ubs
 
 echo "OK: all gates passed."

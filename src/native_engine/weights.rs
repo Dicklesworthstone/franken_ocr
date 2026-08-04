@@ -10,9 +10,11 @@
 //!   byte_len, scales_offset, scales_len, group_size?, tier?}`) indexing one
 //!   contiguous payload by byte range. Quantized tensors carry their scales
 //!   inline (int8 per-output-channel, int4 per-group). The container is read
-//!   with the `franken_whisper` ggml/safetensors parser pattern: read the whole
-//!   file into one `Vec<u8>`, validate the magic, parse the header, then index
-//!   the payload by byte range — no per-tensor copies until an accessor asks.
+//!   with the `franken_whisper` ggml/safetensors parser pattern: keep one
+//!   backing blob, validate the magic, parse the header, then index the payload
+//!   by byte range — no per-tensor copies until an accessor asks. The backing is
+//!   an owned `Vec<u8>` by default. `FOCR_MMAP=1` explicitly opts into a read-only
+//!   mmap for immutable, trusted artifacts.
 //!
 //! * The **safetensors fallback**: the upstream 6.67 GB bf16 shard, so weights
 //!   can load before the quantizer/converter exists. Standard safetensors
@@ -33,19 +35,20 @@
 //! checkpoint is rejected at load time with [`FocrError::FormatMismatch`], not
 //! surfaced later as garbage OCR output.
 //!
-//! Memory mapping note: the `memmap2` crate is **not** a dependency
-//! (Cargo.toml is owned centrally and not editable from this module), so the
-//! loader falls back to reading the file fully into one `Vec<u8>` — the same
-//! pattern `franken_whisper` uses. The accessor API is mmap-shaped (byte-range
-//! views into the backing buffer), so swapping in an mmap later is a backing
-//! store change, not an API change.
+//! Memory mapping note: `Weights::load` defaults to owned bytes because a mapped
+//! file that another process truncates can fault the process. `FOCR_MMAP=1` opts
+//! into `memmap2` only for deployment envelopes where the artifact inode is
+//! immutable for the lifetime of the process. Mapping failures still fall back
+//! to owned bytes.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use half::bf16;
 use serde::Deserialize;
 
+use super::model_arch;
 use super::tensor::{Mat, QInt4, QInt8};
 use crate::FOCR_MODEL_LICENSE_NOTICE;
 use crate::error::{FocrError, FocrResult};
@@ -59,15 +62,63 @@ fn checked_shape_len(name: &str, lhs: usize, rhs: usize, expr: &str) -> FocrResu
     })
 }
 
-fn validate_license_notice(notice: &str) -> FocrResult<()> {
-    if notice == FOCR_MODEL_LICENSE_NOTICE
-        || (notice.contains("Copyright (c) 2026 Baidu") && notice.contains("MIT License"))
-    {
-        Ok(())
-    } else {
-        Err(FocrError::FormatMismatch(
-            ".focrq license_notice must include Copyright (c) 2026 Baidu and MIT License".into(),
-        ))
+/// Resolve the architecture id a `.focrq` declares against the model registry.
+///
+/// An **absent** `model_id` (`""`, the v1 form, since `model_id` is a v2 header
+/// addition) resolves to the default architecture — Unlimited-OCR — so every
+/// pre-existing v1 artifact keeps loading unchanged. A **non-empty** id that is
+/// not in the registry is a forward-incompatible artifact and is **refused**
+/// loudly (mirroring the `format_version > max` rejection), rather than silently
+/// loaded as the default model.
+fn resolve_model_id(declared: &str) -> FocrResult<&'static str> {
+    if declared.is_empty() {
+        return Ok(model_arch::default_arch().id());
+    }
+    model_arch::arch_by_id(declared)
+        .map(|arch| arch.id())
+        .ok_or_else(|| {
+            FocrError::FormatMismatch(format!(
+                ".focrq declares unknown model_id {declared:?} \
+                 (not in the model registry; this binary cannot load it)"
+            ))
+        })
+}
+
+/// Validate the `.focrq` license notice against the notice the *declared
+/// architecture* requires.
+///
+/// * **Unlimited-OCR** (and every v1 artifact, which resolves to it): the Baidu
+///   MIT contract, accepting any semantically-equivalent notice that carries the
+///   required copyright + MIT-license tokens (back-compat with the historical
+///   check — the `model_config`/notice text was hand-authored in early artifacts).
+/// * **Any other registered arch** (e.g. GOT-OCR2 → Apache-2.0/StepFun): the
+///   notice must equal that arch's declared [`model_arch::ModelArch::license_notice`] exactly.
+///
+/// `model_id` is the already-resolved (registry-known) id from
+/// [`resolve_model_id`], so the lookup here cannot miss.
+fn validate_license_notice(notice: &str, model_id: &str) -> FocrResult<()> {
+    if model_id == model_arch::default_arch().id() {
+        return if notice == FOCR_MODEL_LICENSE_NOTICE
+            || (notice.contains("Copyright (c) 2026 Baidu") && notice.contains("MIT License"))
+        {
+            Ok(())
+        } else {
+            Err(FocrError::FormatMismatch(
+                ".focrq license_notice must include Copyright (c) 2026 Baidu and MIT License"
+                    .into(),
+            ))
+        };
+    }
+    match model_arch::arch_by_id(model_id) {
+        Some(arch) if notice == arch.license_notice() => Ok(()),
+        Some(arch) => Err(FocrError::FormatMismatch(format!(
+            ".focrq license_notice does not match the registered {model_id} notice \
+             (expected {:?})",
+            arch.license_notice()
+        ))),
+        None => Err(FocrError::FormatMismatch(format!(
+            ".focrq license_notice: unknown model_id {model_id:?}"
+        ))),
     }
 }
 
@@ -94,6 +145,19 @@ pub const FOCRQ_MAGIC: &[u8; 6] = b"FOCRQ\0";
 /// layout than this binary understands), per the plan's
 /// "loader refuses version > binary's".
 pub const FOCRQ_FORMAT_VERSION: u32 = 1;
+
+/// Highest defined `.focrq` architecture-target byte in format v1.
+const MAX_ARCH_TARGET: u8 = 3;
+
+/// Validate that an on-disk architecture target is one of the closed v1 enum.
+pub(super) fn validate_arch_target(arch_target: u8) -> FocrResult<()> {
+    if arch_target <= MAX_ARCH_TARGET {
+        return Ok(());
+    }
+    Err(FocrError::FormatMismatch(format!(
+        ".focrq arch_target {arch_target} is unsupported; format v1 defines only 0..={MAX_ARCH_TARGET}"
+    )))
+}
 
 /// On-disk element dtype of a stored tensor ([SPEC §7] dtype set).
 ///
@@ -248,6 +312,13 @@ struct FocrqHeader {
     /// notices that include the required copyright and MIT-license tokens.
     #[serde(default)]
     license_notice: String,
+    /// The model-architecture id (`ModelArch::id`, e.g. `"got-ocr2"`) this
+    /// artifact declares, so the loader selects the right arch from the registry.
+    /// **Absent in v1 artifacts** (the field is a v2 addition) ⇒ deserializes to
+    /// `""` ⇒ [`resolve_model_id`] defaults it to `unlimited-ocr` (the only model
+    /// v1 ever produced), so every existing `.focrq` keeps loading unchanged.
+    #[serde(default)]
+    model_id: String,
 }
 
 /// A zero-copy view of one stored tensor: its dtype, shape, and the raw payload
@@ -294,15 +365,16 @@ impl TensorView<'_> {
 /// The loaded weight set for one model: the whole backing blob plus the tensor
 /// directory indexing it by byte range (PROPOSED_ARCHITECTURE.md §6.12).
 ///
-/// `bytes` holds the entire file (the read-to-`Vec` fallback for an absent
-/// `memmap2`). For `.focrq` the directory's byte offsets are payload-relative,
-/// so `payload_base` records where the payload begins inside `bytes`; for
+/// `bytes` holds one backing blob: an owned buffer by default, or an explicitly
+/// opted-in read-only mmap for trusted immutable artifacts.
+/// For `.focrq` the directory's byte offsets are payload-relative, so
+/// `payload_base` records where the payload begins inside `bytes`; for
 /// safetensors the same field points just past the header. Every accessor
 /// resolves `bytes[payload_base + off .. payload_base + off + len]`.
 #[derive(Debug)]
 pub struct Weights {
-    /// The entire on-disk blob, read once.
-    bytes: Vec<u8>,
+    /// The entire on-disk blob — owned bytes or a read-only mmap ([`Backing`]).
+    bytes: Backing,
     /// Offset of the payload region within `bytes`.
     payload_base: usize,
     /// `name -> record` directory.
@@ -313,8 +385,71 @@ pub struct Weights {
     source_sha256: String,
     /// The `.focrq` license notice (MIT/Baidu; `""` for safetensors).
     license_notice: String,
+    /// The resolved model-architecture id (`ModelArch::id`). A v2 `.focrq`
+    /// declares it; a v1 `.focrq` or raw safetensors resolves to the default
+    /// `unlimited-ocr`. Always a registry-known id (validated at load).
+    model_id: &'static str,
     /// Whether this came from a `.focrq` container (vs. a raw safetensors shard).
     is_focrq: bool,
+}
+
+/// The weight blob's storage: an owned buffer (the safe default) or a read-only
+/// memory map explicitly requested with `FOCR_MMAP=1`. Both deref to `&[u8]`;
+/// every reader below is backing-agnostic.
+enum Backing {
+    /// Fully-owned bytes (`std::fs::read` / in-memory blobs).
+    Owned(Vec<u8>),
+    /// Read-only file mapping.
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for Backing {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Backing::Owned(v) => v,
+            Backing::Mapped(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Debug for Backing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backing::Owned(v) => write!(f, "Backing::Owned({} bytes)", v.len()),
+            Backing::Mapped(m) => write!(f, "Backing::Mapped({} bytes)", m.len()),
+        }
+    }
+}
+
+/// The ONE unsafe call in the loader — the read-only mmap island, mirroring
+/// the `simd::arm`/`simd::x86` island pattern (crate policy is
+/// `deny(unsafe_code)` with documented, minimal islands).
+#[allow(unsafe_code)]
+mod mmap_island {
+    /// Map `file` read-only.
+    ///
+    /// # Safety argument
+    /// `Mmap::map` is `unsafe` because another process truncating the file
+    /// mid-use can fault later accesses. Production does not enter this island
+    /// by default. `FOCR_MMAP=1` is an explicit operator assertion that the
+    /// already-open artifact inode is trusted and immutable for the process
+    /// lifetime (for example, a read-only image layer). Mapping is read-only and
+    /// callers retain the descriptor-backed mapping for its full use.
+    pub(super) fn map_readonly(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
+        // SAFETY: the explicit opt-in asserts an immutable artifact inode; see
+        // the function doc for the complete deployment envelope.
+        unsafe { memmap2::Mmap::map(file) }
+    }
+}
+
+pub(super) fn mmap_requested() -> bool {
+    std::env::var("FOCR_MMAP").ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        )
+    })
 }
 
 impl Default for Weights {
@@ -326,12 +461,13 @@ impl Default for Weights {
     /// cleanly errors rather than panicking.
     fn default() -> Self {
         Self {
-            bytes: Vec::new(),
+            bytes: Backing::Owned(Vec::new()),
             payload_base: 0,
             directory: BTreeMap::new(),
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
+            model_id: model_arch::default_arch().id(),
             is_focrq: false,
         }
     }
@@ -341,11 +477,13 @@ impl Weights {
     /// Load a `.focrq` blob, or fall back to a raw safetensors shard, from
     /// `path`.
     ///
-    /// The whole file is read into one `Vec<u8>`; the magic decides the format
-    /// (`b"FOCRQ\0"` → `.focrq`, the safetensors `u64` header-length prefix
-    /// otherwise). The census is NOT run here (the caller supplies the expected
-    /// name set via [`Weights::load_with_census`]); a bare `load` just parses
-    /// and indexes.
+    /// The safe default reads an owned `Vec<u8>`. `FOCR_MMAP=1` attempts a
+    /// read-only mmap for a trusted immutable artifact; any mmap failure still
+    /// falls back to owned bytes. The magic decides the
+    /// format (`b"FOCRQ\0"` → `.focrq`, the safetensors `u64`
+    /// header-length prefix otherwise). The census is NOT run here (the caller
+    /// supplies the expected name set via [`Weights::load_with_census`]); a
+    /// bare `load` just parses and indexes.
     ///
     /// # Errors
     /// * [`FocrError::ModelNotFound`] if the file can't be read.
@@ -353,10 +491,47 @@ impl Weights {
     ///   version newer than this binary, or a directory that overruns the
     ///   payload.
     pub fn load(path: &Path) -> FocrResult<Self> {
-        let bytes = std::fs::read(path).map_err(|e| {
+        let file = std::fs::File::open(path).map_err(|e| {
             FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
         })?;
-        Self::from_bytes(bytes)
+        Self::load_opened(file, path)
+    }
+
+    /// Load from an already-open model file without consulting `path` again.
+    ///
+    /// Production model loading uses this after validating the same descriptor's
+    /// bounded header. Keeping the descriptor pinned across validation and mmap /
+    /// owned fallback prevents a path or symlink swap from substituting different
+    /// bytes between those two steps.
+    pub(super) fn load_opened(file: std::fs::File, path: &Path) -> FocrResult<Self> {
+        Self::load_opened_with_mmap_policy(file, path, mmap_requested())
+    }
+
+    fn load_opened_with_mmap_policy(
+        mut file: std::fs::File,
+        path: &Path,
+        mmap_requested: bool,
+    ) -> FocrResult<Self> {
+        if mmap_requested && let Ok(map) = mmap_island::map_readonly(&file) {
+            return Self::from_backing(Backing::Mapped(map));
+        }
+
+        // Header validation advances the descriptor offset. Rewind this SAME
+        // open file before the owned fallback; reopening `path` here would
+        // reintroduce the validation/load TOCTOU that this API exists to close.
+        file.seek(SeekFrom::Start(0)).map_err(|e| {
+            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+        })?;
+        let capacity = file
+            .metadata()
+            .ok()
+            .and_then(|metadata| usize::try_from(metadata.len()).ok())
+            .unwrap_or(0);
+        let mut bytes = Vec::with_capacity(capacity);
+        file.read_to_end(&mut bytes).map_err(|e| {
+            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+        })?;
+        Self::from_backing(Backing::Owned(bytes))
     }
 
     /// Load and immediately run the WeightsManifest census against
@@ -384,6 +559,18 @@ impl Weights {
     /// # Errors
     /// [`FocrError::FormatMismatch`] on any structural problem.
     pub fn from_bytes(bytes: Vec<u8>) -> FocrResult<Self> {
+        Self::from_backing(Backing::Owned(bytes))
+    }
+
+    /// Test-only probe: did this load take the mmap backing?
+    #[cfg(test)]
+    pub(super) fn is_mapped(&self) -> bool {
+        matches!(self.bytes, Backing::Mapped(_))
+    }
+
+    /// Parse + index a blob in either backing (the shared core of
+    /// [`Weights::load`] / [`Weights::from_bytes`]).
+    fn from_backing(bytes: Backing) -> FocrResult<Self> {
         if bytes.len() >= FOCRQ_MAGIC.len() && &bytes[..FOCRQ_MAGIC.len()] == FOCRQ_MAGIC {
             Self::from_focrq_bytes(bytes)
         } else {
@@ -398,7 +585,7 @@ impl Weights {
     /// payload`. The provenance/config and the tensor directory all live in the
     /// header JSON (the byte fields before it are the fixed-size preamble that a
     /// reader can validate before parsing JSON).
-    fn from_focrq_bytes(bytes: Vec<u8>) -> FocrResult<Self> {
+    fn from_focrq_bytes(bytes: Backing) -> FocrResult<Self> {
         // Fixed preamble: magic(6) + version(4) + arch(1) + sha256(32) +
         // header_len(8) = 51 bytes minimum.
         const PREAMBLE: usize = 6 + 4 + 1 + 32 + 8;
@@ -439,14 +626,17 @@ impl Weights {
         }
         let header: FocrqHeader = serde_json::from_slice(&bytes[cur..header_end])
             .map_err(|e| FocrError::FormatMismatch(format!(".focrq header JSON invalid: {e}")))?;
-        validate_license_notice(&header.license_notice)?;
+        // Resolve the declared architecture FIRST (absent ⇒ v1 default unlimited-ocr;
+        // unknown non-empty id ⇒ loud refusal) so the license check below can demand
+        // the right notice for that arch (Baidu/MIT vs e.g. GOT-OCR2 Apache-2.0).
+        let model_id = resolve_model_id(&header.model_id)?;
+        validate_license_notice(&header.license_notice, model_id)?;
         if !header.source_sha256.is_empty() {
             validate_source_sha256_hex(&header.source_sha256)?;
         }
 
         let payload_base = header_end;
         let payload_len = bytes.len() - payload_base;
-        validate_directory(&header.tensors, payload_len)?;
 
         // Prefer the header's own fields; the preamble bytes are a cheap
         // pre-JSON sanity surface (and the source of truth if the header omits
@@ -456,6 +646,8 @@ impl Weights {
         } else {
             preamble_arch
         };
+        validate_arch_target(arch_target)?;
+        validate_directory(&header.tensors, payload_len, arch_target)?;
         let source_sha256 = if header.source_sha256.is_empty() {
             preamble_sha
         } else {
@@ -469,6 +661,7 @@ impl Weights {
             arch_target,
             source_sha256,
             license_notice: header.license_notice,
+            model_id,
             is_focrq: true,
         })
     }
@@ -477,7 +670,7 @@ impl Weights {
     /// payload`. The JSON maps `name -> {dtype, shape, data_offsets:[beg,end]}`
     /// (offsets are payload-relative); a `__metadata__` key, if present, is
     /// skipped.
-    fn from_safetensors_bytes(bytes: Vec<u8>) -> FocrResult<Self> {
+    fn from_safetensors_bytes(bytes: Backing) -> FocrResult<Self> {
         if bytes.len() < 8 {
             return Err(FocrError::FormatMismatch(format!(
                 "safetensors truncated: {} bytes < 8-byte header length prefix",
@@ -541,7 +734,7 @@ impl Weights {
 
         let payload_base = header_end;
         let payload_len = bytes.len() - payload_base;
-        validate_directory(&directory, payload_len)?;
+        validate_directory(&directory, payload_len, 0)?;
 
         Ok(Self {
             bytes,
@@ -550,6 +743,8 @@ impl Weights {
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
+            // A raw safetensors shard is the upstream Unlimited-OCR checkpoint.
+            model_id: model_arch::default_arch().id(),
             is_focrq: false,
         })
     }
@@ -639,6 +834,16 @@ impl Weights {
         &self.license_notice
     }
 
+    /// The resolved model-architecture id ([`model_arch::ModelArch::id`]) this
+    /// artifact declares — e.g. `"unlimited-ocr"` or `"got-ocr2"`. A v1 `.focrq` (no
+    /// `model_id` header) and a raw safetensors shard both report the default
+    /// `"unlimited-ocr"`. Always a registry-known id (validated at load), so the
+    /// engine can look the arch up with [`model_arch::arch_by_id`] infallibly.
+    #[must_use]
+    pub fn model_id(&self) -> &'static str {
+        self.model_id
+    }
+
     /// Iterate the tensor names (sorted, since the directory is a `BTreeMap`).
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.directory.keys().map(String::as_str)
@@ -705,6 +910,18 @@ impl Weights {
                 )));
             }
         };
+        if view.dtype == DType::QInt8PerChan {
+            // Transparent dequant-on-access (bd-av64.12): an int8-stored
+            // GEMM read through the f32 accessor reconstructs
+            // `w[o][j] = qw[o][j] * scale[o]` — the DEFINED meaning of the
+            // record. `qint8()` already un-permutes any offline packing, so
+            // row-major holds here. Consumers that want int8 COMPUTE keep
+            // calling `qint8()` directly; this arm only makes f32 engines
+            // (TrOMR's Seq2SeqDense forward) able to run quantized-storage
+            // artifacts.
+            let q = self.qint8(name)?;
+            return Ok(Mat::from_vec(q.n, q.k, dequant_qint8(&q)));
+        }
         let data = view
             .to_f32_vec()
             .map_err(|e| FocrError::FormatMismatch(format!("tensor {name:?}: {e}")))?;
@@ -727,8 +944,13 @@ impl Weights {
     /// [`FocrError::FormatMismatch`] if `name` is absent or the tensor is
     /// quantized.
     pub fn vec(&self, name: &str) -> FocrResult<Vec<f32>> {
-        self.tensor(name)?
-            .to_f32_vec()
+        let view = self.tensor(name)?;
+        if view.dtype == DType::QInt8PerChan {
+            // See `mat()`: transparent per-channel dequant of int8 records.
+            let q = self.qint8(name)?;
+            return Ok(dequant_qint8(&q));
+        }
+        view.to_f32_vec()
             .map_err(|e| FocrError::FormatMismatch(format!("tensor {name:?}: {e}")))
     }
 
@@ -755,17 +977,57 @@ impl Weights {
             )));
         }
         let (n, k) = (view.shape[0], view.shape[1]);
-        let expected_len = checked_shape_len(name, n, k, "n*k")?;
+        let expected_len = if self.arch_target == 1 {
+            crate::simd::pack::smmla_packed_len(n, k)
+        } else {
+            checked_shape_len(name, n, k, "n*k")?
+        };
         if view.data.len() != expected_len {
             return Err(FocrError::FormatMismatch(format!(
-                "QInt8 tensor {name:?}: {} payload bytes != n*k {}",
+                "QInt8 tensor {name:?}: {} payload bytes != expected {} (arch_target {})",
                 view.data.len(),
-                expected_len
+                expected_len,
+                self.arch_target
             )));
         }
         // int8 payload is a direct byte→i8 reinterpret (little-endian-agnostic;
         // one byte per element).
-        let w: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
+        //
+        // An `--arch aarch64-smmla` artifact (arch_target 1, bd-2mo.3) stores
+        // SMMLA panels. When the host actually dispatches the SMMLA tier the
+        // panels are kept AS-IS — the decode GEMV hands them to `vmmlaq_s32`
+        // with zero runtime shuffle (the whole point of the offline packing).
+        // Any other tier un-permutes back to canonical row-major here — a
+        // one-time load cost, lossless by construction, so every consumer
+        // keeps its row-major contract (degrade to generic, never UB).
+        if self.arch_target == 1 && crate::simd::detected_tier() == crate::simd::IsaTier::Smmla {
+            let packed: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
+            let scales = decode_f32_le(view.scales)?;
+            if scales.len() != n {
+                return Err(FocrError::FormatMismatch(format!(
+                    "QInt8 tensor {name:?}: {} scales != n {}",
+                    scales.len(),
+                    n
+                )));
+            }
+            return Ok(QInt8::new_smmla_panels(packed, scales, n, k));
+        }
+        let w: Vec<i8> = if self.arch_target == 1 {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                crate::progress::stderr_message(format_args!(
+                    "[focr] arch mismatch: .focrq is packed for aarch64-smmla but this \
+                     host dispatches {}; un-permuting to the generic layout at load \
+                     (correct, but the offline packing buys nothing here)",
+                    crate::simd::tier_string()
+                ));
+            });
+            let packed: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
+            crate::simd::pack::smmla_unpack_panels(&packed, n, k)
+                .map_err(|e| FocrError::FormatMismatch(format!("QInt8 tensor {name:?}: {e}")))?
+        } else {
+            view.data.iter().map(|&b| b as i8).collect()
+        };
         let scales = decode_f32_le(view.scales)?;
         if scales.len() != n {
             return Err(FocrError::FormatMismatch(format!(
@@ -871,6 +1133,7 @@ impl Weights {
 fn validate_directory(
     directory: &BTreeMap<String, TensorRecord>,
     payload_len: usize,
+    arch_target: u8,
 ) -> FocrResult<()> {
     for (name, rec) in directory {
         let end = rec.byte_offset.checked_add(rec.byte_len).ok_or_else(|| {
@@ -881,7 +1144,15 @@ fn validate_directory(
                 "tensor {name:?} ends at {end} but payload is {payload_len} bytes"
             )));
         }
-        let expected = rec.expected_byte_len(name)?;
+        // `--arch aarch64-smmla` (arch_target 1, bd-2mo.3) stores int8 payloads
+        // as SMMLA panels: `ceil(n/2)*ceil(k/8)*16` bytes (== n*k whenever the
+        // shape tiles cleanly). Every other dtype is arch-independent.
+        let expected =
+            if arch_target == 1 && rec.dtype == DType::QInt8PerChan && rec.shape.len() == 2 {
+                crate::simd::pack::smmla_packed_len(rec.shape[0], rec.shape[1])
+            } else {
+                rec.expected_byte_len(name)?
+            };
         if rec.byte_len != expected {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?}: byte_len {} != shape×dtype {} ({:?}, shape {:?})",
@@ -900,6 +1171,61 @@ fn validate_directory(
             )));
         }
     }
+    validate_non_overlapping_ranges(directory)?;
+    Ok(())
+}
+
+/// Reject aliased tensor-data and quantization-scale intervals.
+///
+/// The v1 format has no `alias_of` field, so every non-empty payload range must
+/// be disjoint. Keeping this check shared ensures the bounded production header
+/// probe and the full mmap/owned parser enforce the same structural contract.
+pub(super) fn validate_non_overlapping_ranges(
+    directory: &BTreeMap<String, TensorRecord>,
+) -> FocrResult<()> {
+    let mut ranges = Vec::with_capacity(directory.len().saturating_mul(2));
+    for (name, record) in directory {
+        let data_end = record
+            .byte_offset
+            .checked_add(record.byte_len)
+            .ok_or_else(|| {
+                FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows"))
+            })?;
+        if record.byte_len != 0 {
+            ranges.push((record.byte_offset, data_end, name.as_str(), "data"));
+        }
+
+        let scales_end = record
+            .scales_offset
+            .checked_add(record.scales_len)
+            .ok_or_else(|| {
+                FocrError::FormatMismatch(format!("tensor {name:?} scales range overflows"))
+            })?;
+        if record.scales_len != 0 {
+            ranges.push((record.scales_offset, scales_end, name.as_str(), "scales"));
+        }
+    }
+
+    ranges.sort_unstable_by(|left, right| {
+        (left.0, left.1, left.2, left.3).cmp(&(right.0, right.1, right.2, right.3))
+    });
+    for pair in ranges.windows(2) {
+        let previous = pair[0];
+        let current = pair[1];
+        if current.0 < previous.1 {
+            return Err(FocrError::FormatMismatch(format!(
+                "payload ranges overlap: tensor {:?} {} [{}, {}) overlaps tensor {:?} {} [{}, {})",
+                previous.2,
+                previous.3,
+                previous.0,
+                previous.1,
+                current.2,
+                current.3,
+                current.0,
+                current.1,
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -908,6 +1234,20 @@ fn validate_directory(
 /// # Errors
 /// [`FocrError::FormatMismatch`] for a quantized dtype or a length that is not a
 /// whole number of elements.
+/// Reconstruct the f32 weights a symmetric per-output-channel int8 record
+/// denotes: `w[o][j] = qw[o][j] * scale[o]` (bd-av64.12 dequant-on-access).
+fn dequant_qint8(q: &QInt8) -> Vec<f32> {
+    let mut out = Vec::with_capacity(q.w.len());
+    for (o, &scale) in q.scales.iter().enumerate() {
+        out.extend(
+            q.w[o * q.k..(o + 1) * q.k]
+                .iter()
+                .map(|&v| f32::from(v) * scale),
+        );
+    }
+    out
+}
+
 fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
     match dtype {
         DType::F32 => decode_f32_le(data),
@@ -919,8 +1259,10 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
                 )));
             }
             Ok(data
-                .chunks_exact(2)
-                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
                 .collect())
         }
         DType::BF16 => {
@@ -933,8 +1275,10 @@ fn decode_f32(dtype: DType, data: &[u8]) -> FocrResult<Vec<f32>> {
             // half::bf16 -> f32 is exact (bf16 is the high 16 bits of f32);
             // PROPOSED_ARCHITECTURE.md §6.12: widen BF16→f32, never narrow.
             Ok(data
-                .chunks_exact(2)
-                .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| bf16::from_le_bytes(*c).to_f32())
                 .collect())
         }
         DType::QInt8PerChan | DType::QInt4PerGroup => Err(FocrError::FormatMismatch(format!(
@@ -952,8 +1296,10 @@ fn decode_f32_le(data: &[u8]) -> FocrResult<Vec<f32>> {
         )));
     }
     Ok(data
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
@@ -1072,6 +1418,33 @@ mod tests {
         blob
     }
 
+    /// Hand-assemble a v2 `.focrq` blob that declares a `model_id` (the A2 arch
+    /// tag), with an arbitrary license notice so the arch-aware license check can
+    /// be exercised independently of the tensor payload.
+    fn build_focrq_with_model_id(
+        directory_json: &str,
+        payload: &[u8],
+        license_notice: &str,
+        model_id: &str,
+    ) -> Vec<u8> {
+        let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let header = format!(
+            "{{\"tensors\":{directory_json},\"arch_target\":0,\"source_sha256\":\"\",\
+             \"license_notice\":\"{}\",\"model_id\":\"{}\"}}",
+            esc(license_notice),
+            esc(model_id),
+        );
+        let mut blob = Vec::new();
+        blob.extend_from_slice(FOCRQ_MAGIC);
+        blob.extend_from_slice(&FOCRQ_FORMAT_VERSION.to_le_bytes());
+        blob.push(0);
+        blob.extend_from_slice(&[0u8; 32]);
+        blob.extend_from_slice(&(header.len() as u64).to_le_bytes());
+        blob.extend_from_slice(header.as_bytes());
+        blob.extend_from_slice(payload);
+        blob
+    }
+
     /// Hand-assemble a minimal safetensors blob from `(name, dtype, shape,
     /// bytes)` tensors laid out contiguously in directory order.
     fn build_safetensors(tensors: &[(&str, &str, Vec<usize>, Vec<u8>)]) -> Vec<u8> {
@@ -1107,12 +1480,13 @@ mod tests {
 
     fn synthetic_weights(record: TensorRecord, bytes: Vec<u8>) -> Weights {
         Weights {
-            bytes,
+            bytes: Backing::Owned(bytes),
             payload_base: 0,
             directory: BTreeMap::from([("x".to_owned(), record)]),
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
+            model_id: model_arch::default_arch().id(),
             is_focrq: true,
         }
     }
@@ -1155,6 +1529,72 @@ mod tests {
         assert!(matches!(err, FocrError::FormatMismatch(_)));
         assert!(format!("{err}").contains("license_notice"));
         assert!(format!("{err}").contains("MIT License"));
+    }
+
+    // ── model_id arch tag (A2) ──────────────────────────────────────────────
+
+    /// The GOT-OCR2 notice the registry declares (used so the test never drifts
+    /// from `model_arch`'s source of truth).
+    fn got_ocr2_notice() -> &'static str {
+        crate::native_engine::model_arch::arch_by_id("got-ocr2")
+            .expect("got-ocr2 is a registered arch")
+            .license_notice()
+    }
+
+    #[test]
+    fn focrq_absent_model_id_resolves_to_unlimited_ocr() {
+        // A v1 blob (no model_id key at all) loads and reports the default arch.
+        let blob = build_focrq(1, 0, [0u8; 32], "{}", &[]);
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "unlimited-ocr");
+    }
+
+    #[test]
+    fn focrq_empty_model_id_string_resolves_to_unlimited_ocr() {
+        // The key physically present but empty (serde-default equivalent) also
+        // resolves to the default, and still demands the Baidu/MIT notice.
+        let blob = build_focrq_with_model_id("{}", &[], FOCR_MODEL_LICENSE_NOTICE, "");
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "unlimited-ocr");
+    }
+
+    #[test]
+    fn focrq_declares_got_ocr2_with_apache_notice_loads() {
+        // A planned (not-yet-implemented) arch's weights still LOAD — only the
+        // forward is gated — and the arch-specific Apache-2.0 notice is accepted.
+        let blob = build_focrq_with_model_id("{}", &[], got_ocr2_notice(), "got-ocr2");
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "got-ocr2");
+    }
+
+    #[test]
+    fn focrq_unknown_model_id_is_refused() {
+        // A forward-incompatible artifact (id this binary's registry lacks) is a
+        // loud rejection, not a silent fallback to the default model.
+        let blob =
+            build_focrq_with_model_id("{}", &[], FOCR_MODEL_LICENSE_NOTICE, "totally-bogus-model");
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("unknown model_id"));
+    }
+
+    #[test]
+    fn focrq_got_ocr2_with_wrong_notice_is_refused() {
+        // got-ocr2 declared but carrying the Baidu/MIT notice (not its Apache-2.0
+        // one) ⇒ the arch-aware license check refuses it.
+        let blob = build_focrq_with_model_id("{}", &[], FOCR_MODEL_LICENSE_NOTICE, "got-ocr2");
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("does not match the registered got-ocr2 notice"));
+    }
+
+    #[test]
+    fn safetensors_reports_default_model_id() {
+        // A raw upstream shard is the Unlimited-OCR checkpoint.
+        let blob = build_safetensors(&[("w", "BF16", vec![1], bf16_le_bytes(&[1.0]))]);
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "unlimited-ocr");
+        assert!(!w.is_focrq());
     }
 
     #[test]
@@ -1258,6 +1698,34 @@ mod tests {
         assert_eq!(q.k, 3);
         assert_eq!(q.w, vec![1i8, -2, 3, 4, -5, 6]);
         assert_eq!(q.scales, vec![0.1, 0.2]);
+    }
+
+    #[test]
+    fn qint8_records_dequant_on_access_via_mat_and_vec() {
+        // bd-av64.12: an int8-stored GEMM read through the f32 accessors must
+        // reconstruct `w[o][j] = qw[o][j] * scale[o]` EXACTLY (same arithmetic
+        // as the expectation below), so f32 engines run quantized-storage
+        // artifacts transparently.
+        let w_bytes: Vec<u8> = [1i8, -2, 3, 4, -5, 6].iter().map(|&v| v as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2]);
+        let mut payload = w_bytes;
+        payload.extend_from_slice(&scale_bytes);
+        let dir = "{\"q\":{\"dtype\":\"QInt8PerChan\",\"shape\":[2,3],\
+             \"byte_offset\":0,\"byte_len\":6,\"scales_offset\":6,\"scales_len\":8}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
+        let w = Weights::from_bytes(blob).unwrap();
+        let expect = vec![
+            1.0f32 * 0.1,
+            -2.0f32 * 0.1,
+            3.0f32 * 0.1,
+            4.0f32 * 0.2,
+            -5.0f32 * 0.2,
+            6.0f32 * 0.2,
+        ];
+        let m = w.mat("q").unwrap();
+        assert_eq!((m.rows, m.cols), (2, 3), "mat keeps the [n, k] shape");
+        assert_eq!(m.data, expect, "mat dequantizes per output channel");
+        assert_eq!(w.vec("q").unwrap(), expect, "vec dequantizes identically");
     }
 
     #[test]
@@ -1505,6 +1973,19 @@ mod tests {
     }
 
     #[test]
+    fn rejects_unknown_arch_target() {
+        let payload = bf16_le_bytes(&[1.0]);
+        let dir = format!(
+            "{{\"x\":{{\"dtype\":\"BF16\",\"shape\":[1],\"byte_offset\":0,\"byte_len\":{}}}}}",
+            payload.len()
+        );
+        let blob = build_focrq(1, MAX_ARCH_TARGET + 1, [0u8; 32], &dir, &payload);
+        let err = Weights::from_bytes(blob).expect_err("unknown arch target must fail");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(err.to_string().contains("arch_target 4 is unsupported"));
+    }
+
+    #[test]
     fn rejects_directory_overrunning_payload() {
         // byte_len claims 100 bytes but payload only has 4.
         let payload = bf16_le_bytes(&[1.0, 2.0]); // 4 bytes
@@ -1522,6 +2003,32 @@ mod tests {
         let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
         let err = Weights::from_bytes(blob).unwrap_err();
         assert!(format!("{err}").contains("shape×dtype") || format!("{err}").contains("overruns"));
+    }
+
+    #[test]
+    fn rejects_overlapping_tensor_data_ranges_at_load_time() {
+        let dir = "{\"a\":{\"dtype\":\"BF16\",\"shape\":[2],\"byte_offset\":0,\"byte_len\":4},\
+             \"b\":{\"dtype\":\"BF16\",\"shape\":[2],\"byte_offset\":0,\"byte_len\":4}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &[0u8; 4]);
+        let err = Weights::from_bytes(blob).expect_err("aliased tensor data must fail");
+        let text = err.to_string();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(text.contains("payload ranges overlap"), "{text}");
+        assert!(text.contains("\"a\" data"), "{text}");
+        assert!(text.contains("\"b\" data"), "{text}");
+    }
+
+    #[test]
+    fn rejects_tensor_data_and_scale_alias_at_load_time() {
+        let dir = "{\"q\":{\"dtype\":\"QInt8PerChan\",\"shape\":[1,4],\
+             \"byte_offset\":0,\"byte_len\":4,\"scales_offset\":0,\"scales_len\":4}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &[0u8; 4]);
+        let err = Weights::from_bytes(blob).expect_err("aliased data/scales must fail");
+        let text = err.to_string();
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(text.contains("payload ranges overlap"), "{text}");
+        assert!(text.contains("\"q\" data"), "{text}");
+        assert!(text.contains("\"q\" scales"), "{text}");
     }
 
     #[test]
@@ -1639,18 +2146,137 @@ mod tests {
     }
 
     #[test]
-    fn mat_rejects_quantized_tensor() {
-        let w_bytes: Vec<u8> = [1i8, 2, 3, 4].iter().map(|&v| v as u8).collect();
-        let scale_bytes = f32_le_bytes(&[0.1, 0.2]);
-        let mut payload = w_bytes.clone();
+    fn mat_rejects_qint4_tensor() {
+        let packed: Vec<u8> = (0u8..8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1]);
+        let mut payload = packed.clone();
         payload.extend_from_slice(&scale_bytes);
-        let dir = "{\"q\":{\"dtype\":\"QInt8PerChan\",\"shape\":[2,2],\
-             \"byte_offset\":0,\"byte_len\":4,\"scales_offset\":4,\"scales_len\":8}}";
+        let dir = "{\"q\":{\"dtype\":\"QInt4PerGroup\",\"shape\":[1,16],\
+             \"byte_offset\":0,\"byte_len\":8,\"scales_offset\":8,\"scales_len\":4,\
+             \"group_size\":16,\"tier\":3}}";
         let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
         let w = Weights::from_bytes(blob).unwrap();
-        // mat() refuses quantized; qint8() succeeds.
+        // qint8 now transparently dequantizes through mat()/vec(); qint4 stays
+        // a typed quantized accessor only until that path has a proven f32
+        // meaning.
         assert!(w.mat("q").is_err());
-        assert!(w.qint8("q").is_ok());
+        assert!(w.vec("q").is_err());
+        assert!(w.qint4("q").is_ok());
+    }
+
+    /// bd-2mo.3: an `--arch aarch64-smmla` artifact (arch_target 1, panel
+    /// payload) loads per the DISPATCHED tier — panels kept verbatim
+    /// (zero-shuffle) when SMMLA is selected, un-permuted to canonical
+    /// row-major otherwise. Tier-portable: this pins whichever branch this
+    /// host takes, and the OTHER branch's correctness is gated by the
+    /// packed-B kernel parity + decoder layout-parity tests.
+    #[test]
+    fn packed_focrq_loads_per_dispatched_tier() {
+        let (n, k) = (3usize, 5usize); // odd n + k off the 8-boundary (padding)
+        let w_rm: Vec<i8> = (0..n * k).map(|i| (i as i8) - 7).collect();
+        let (panels, _, _) = crate::simd::pack::smmla_pack_panels(&w_rm, 0, n, k, k);
+        let panel_bytes: Vec<u8> = panels.iter().map(|&v| v as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2, 0.3]);
+        let mut payload = panel_bytes.clone();
+        payload.extend_from_slice(&scale_bytes);
+        let dir = format!(
+            "{{\"q\":{{\"dtype\":\"QInt8PerChan\",\"shape\":[{n},{k}],             \"byte_offset\":0,\"byte_len\":{},\"scales_offset\":{},\"scales_len\":12}}}}",
+            panel_bytes.len(),
+            panel_bytes.len()
+        );
+        let blob = build_focrq(1, 1, [0u8; 32], &dir, &payload);
+        let w =
+            Weights::from_bytes(blob).expect("packed artifact loads (census accepts panel len)");
+        assert_eq!(w.arch_target(), 1);
+        let q = w.qint8("q").expect("qint8 readback");
+        assert_eq!((q.n, q.k), (n, k));
+        assert_eq!(q.scales, vec![0.1, 0.2, 0.3]);
+        if crate::simd::detected_tier() == crate::simd::IsaTier::Smmla {
+            assert_eq!(
+                q.layout,
+                crate::native_engine::tensor::WeightLayout::SmmlaPanels,
+                "SMMLA host must keep the offline panels (zero-shuffle)"
+            );
+            assert_eq!(q.w, panels, "panel bytes verbatim");
+        } else {
+            assert_eq!(
+                q.layout,
+                crate::native_engine::tensor::WeightLayout::RowMajor,
+                "non-SMMLA host must un-permute to canonical row-major"
+            );
+            assert_eq!(q.w, w_rm, "un-permute is lossless");
+        }
+        println!(
+            r#"{{"check":"packed_focrq_load","tier":"{}","layout":"{:?}","result":"pass"}}"#,
+            crate::simd::tier_string(),
+            q.layout
+        );
+    }
+
+    /// A corrupt panel payload (length disagreeing with the packed rule)
+    /// fails the census loudly instead of mis-slicing.
+    #[test]
+    fn packed_focrq_rejects_wrong_panel_length() {
+        let (n, k) = (3usize, 5usize);
+        // Deliberately store the ROW-MAJOR length (15) under arch_target 1;
+        // the packed rule wants ceil(3/2)*ceil(5/8)*16 = 32.
+        let w_bytes: Vec<u8> = (0..n * k).map(|i| i as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2, 0.3]);
+        let mut payload = w_bytes.clone();
+        payload.extend_from_slice(&scale_bytes);
+        let dir = format!(
+            "{{\"q\":{{\"dtype\":\"QInt8PerChan\",\"shape\":[{n},{k}],             \"byte_offset\":0,\"byte_len\":{},\"scales_offset\":{},\"scales_len\":12}}}}",
+            w_bytes.len(),
+            w_bytes.len()
+        );
+        let blob = build_focrq(1, 1, [0u8; 32], &dir, &payload);
+        let err = Weights::from_bytes(blob).unwrap_err();
+        assert!(
+            matches!(err, FocrError::FormatMismatch(_)),
+            "wrong panel length must FormatMismatch, got {err:?}"
+        );
+    }
+
+    /// bd-2mo.22: the explicitly opted-in mapped view is BYTE-IDENTICAL to the
+    /// safe default owned read — every tensor, every scale, the whole directory.
+    #[test]
+    fn mmap_load_is_byte_identical_to_owned_read() {
+        let (n, k) = (3usize, 5usize);
+        let w_rm: Vec<i8> = (0..n * k).map(|i| (i as i8) - 7).collect();
+        let w_bytes: Vec<u8> = w_rm.iter().map(|&v| v as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2, 0.3]);
+        let mut payload = w_bytes.clone();
+        payload.extend_from_slice(&scale_bytes);
+        let dir = format!(
+            "{{\"q\":{{\"dtype\":\"QInt8PerChan\",\"shape\":[{n},{k}],             \"byte_offset\":0,\"byte_len\":{},\"scales_offset\":{},\"scales_len\":12}}}}",
+            w_bytes.len(),
+            w_bytes.len()
+        );
+        let blob = build_focrq(1, 0, [0u8; 32], &dir, &payload);
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("focr_mmap_eq_{}.focrq", std::process::id()));
+        std::fs::write(&tmp, &blob).expect("write temp artifact");
+
+        let owned_default = Weights::load(&tmp).expect("default owned load");
+        assert!(
+            !owned_default.is_mapped() || mmap_requested(),
+            "load may map only after explicit opt-in"
+        );
+        let file = std::fs::File::open(&tmp).expect("reopen temp artifact");
+        let mapped =
+            Weights::load_opened_with_mmap_policy(file, &tmp, true).expect("explicit mmap load");
+        assert!(mapped.is_mapped(), "explicit mmap policy must map");
+        let owned = Weights::from_bytes(blob).expect("owned parse");
+
+        let a: Vec<&str> = mapped.names().collect();
+        let b: Vec<&str> = owned.names().collect();
+        assert_eq!(a, b, "directory identical");
+        let qa = mapped.qint8("q").expect("mapped qint8");
+        let qb = owned.qint8("q").expect("owned qint8");
+        assert_eq!(qa.w, qb.w);
+        assert_eq!(qa.scales, qb.scales);
+        println!(r#"{{"check":"mmap_owned_equivalence","result":"pass"}}"#);
     }
 
     #[test]

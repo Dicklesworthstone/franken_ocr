@@ -1,0 +1,9 @@
+# BEFORE — got-ocr2.int8.focrq, page_0107.png, M4 (aarch64+neon+dotprod), 2026-07-01
+# focr @ HEAD before the lm_head pretranspose fix (naive per-token linear_no_bias transpose).
+
+[focr-timing]   got.vision+splice 5.74s
+[focr-timing]   decode 688 tok in 475.89s (1.4 tok/s) | seed(prefill) 1.13s | layers 12.09s (attn 4.79s, gemv+misc 7.30s) | lm_head 463.74s
+[focr-timing]   got.generate 688 tokens 477.09s
+[focr-timing] got forward 482.85s
+PAGE107_TOTAL_SECONDS=487
+OUTPUT_IDENTICAL=yes

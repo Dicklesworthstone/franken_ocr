@@ -28,6 +28,7 @@ use super::nn;
 use super::tensor::Mat;
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
+use rayon::prelude::*;
 
 fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
     lhs.checked_mul(rhs).ok_or_else(|| {
@@ -116,21 +117,56 @@ pub struct LayerNormParams {
     pub bias: Vec<f32>,
 }
 
-/// A `nn.Linear(in, out)` weight in PyTorch `[out, in]` row-major layout plus an
-/// optional bias of length `out`.
+/// A `nn.Linear(in, out)` weight pre-transposed to `[in, out]` row-major plus
+/// an optional bias of length `out`.
 ///
-/// `y = x · Wᵀ + b`. Stored exactly as PyTorch ships it (no pre-transpose), so
-/// the matmul transposes the weight at apply time.
+/// `y = x · Wᵀ + b`. PyTorch ships `W` as `[out, in]`; [`Self::from_row_major`]
+/// transposes it ONCE at hydration so every forward is a straight GEMM —
+/// bd-av64.10 measured the old apply-time transpose at 96 full-weight
+/// transposes (~1.2 GB of pure data movement) per CLIP forward. The stored
+/// floats are the exact same values in a different order, so outputs are
+/// byte-identical to the transpose-at-apply-time layout.
 #[derive(Debug, Clone)]
 pub struct LinearParams {
-    /// Row-major `[out, in]` weights.
-    pub weight: Vec<f32>,
+    /// Weights transposed to `[in_features, out_features]` row-major.
+    pub weight_t: Mat,
     /// Optional length-`out` bias.
     pub bias: Option<Vec<f32>>,
     /// Output features.
     pub out_features: usize,
     /// Input features.
     pub in_features: usize,
+}
+
+impl LinearParams {
+    /// Build from a PyTorch `[out, in]` row-major weight, transposing once.
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] when `weight.len() != out_features * in_features`
+    /// or `bias` is present with length `!= out_features`.
+    pub fn from_row_major(
+        weight: &[f32],
+        bias: Option<Vec<f32>>,
+        out_features: usize,
+        in_features: usize,
+    ) -> FocrResult<Self> {
+        let wt = transpose(weight, out_features, in_features)?;
+        if let Some(b) = &bias
+            && b.len() != out_features
+        {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_clip linear: bias len {} != out_features {}",
+                b.len(),
+                out_features
+            )));
+        }
+        Ok(Self {
+            weight_t: Mat::from_vec(in_features, out_features, wt),
+            bias,
+            out_features,
+            in_features,
+        })
+    }
 }
 
 /// Weights of one `NoTPTransformerBlock` ([SPEC-049]).
@@ -152,10 +188,10 @@ pub struct ClipBlockWeights {
 
 /// All CLIP tower weights needed for [`forward_with`].
 ///
-/// This is the in-memory view the `.focrq` loader (bd-1es.3) will hydrate; the
-/// public [`forward`] entrypoint will pull these out of [`Weights`] once that
-/// reader exists. Keeping it explicit lets the tower be exercised end-to-end in
-/// unit tests with no model present.
+/// This is the in-memory view the `.focrq` loader (bd-1es.3) hydrates; the
+/// public [`forward`] entrypoint pulls these out of [`Weights`] through that
+/// reader's named-tensor accessors. Keeping it explicit lets the tower be
+/// exercised end-to-end in unit tests with no model present.
 #[derive(Debug, Clone)]
 pub struct ClipWeights {
     /// Learned class token, length `hidden_size` (`class_embedding`).
@@ -174,29 +210,59 @@ pub struct ClipWeights {
 /// Run the CLIP tower over the image with the SAM features as `patch_embeds`,
 /// returning the per-patch CLIP hidden states (class token included at row 0).
 ///
-/// This is the [`Weights`]-backed entrypoint the engine wires; until the
-/// `.focrq` reader (bd-1es.3) exposes typed tensor accessors there is nothing to
-/// hydrate a [`ClipWeights`] from, so it currently reports
-/// [`FocrError::NotImplemented`]. The real math lives in [`forward_with`], which
-/// is fully exercised by the unit tests below.
+/// This is the [`Weights`]-backed entrypoint the engine wires: the `.focrq`
+/// reader (bd-1es.3) exposes typed tensor accessors, so it hydrates a
+/// [`ClipWeights`] from [`Weights`] and runs the real math in [`forward_with`],
+/// which is fully exercised by the unit tests below.
 ///
 /// # Errors
-/// [`FocrError::NotImplemented`] until the weight loader lands; thereafter
-/// whatever [`forward_with`] returns.
+/// Propagates accessor errors from building the [`ClipWeights`] (e.g. a missing
+/// or mis-shaped `model.vision_model.*` tensor) and whatever [`forward_with`]
+/// returns.
 pub fn forward(weights: &Weights, _image: &Mat, sam_features: &Mat) -> FocrResult<Mat> {
-    let cfg = ClipConfig::default();
+    // Fail fast on a malformed input BEFORE the (heavy) weight hydration —
+    // pinned by `forward_rejects_malformed_sam_features_before_weight_hydration`.
+    ensure_mat_data_len(sam_features, "vision_clip forward sam_features")?;
+    let th = std::time::Instant::now();
+    let cw = clip_weights_from(weights)?;
+    super::timing_log(&format!(
+        "    clip.hydrate {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    forward_from_sam(&ClipConfig::default(), &cw, sam_features)
+}
+
+/// [`forward`] over PRE-HYDRATED weights (bd-av64.10): the engine caches one
+/// [`ClipWeights`] on the model (like the int8 decoder cache), so per-view /
+/// per-page forwards skip the ~0.6 s hydrate+transpose and pay only the
+/// blocks. Byte-identical to [`forward`] by construction — same transpose,
+/// same [`forward_with`].
+///
+/// # Errors
+/// See [`forward`].
+pub(crate) fn forward_from_sam(
+    cfg: &ClipConfig,
+    cw: &ClipWeights,
+    sam_features: &Mat,
+) -> FocrResult<Mat> {
     ensure_mat_data_len(sam_features, "vision_clip forward sam_features")?;
     // SAM `x3` is [OUT_CH, num_patches] channel-major; CLIP consumes
     // [num_patches, hidden] (flatten(2).transpose(1,2)), so transpose it.
     let sam_t = transpose(&sam_features.data, sam_features.rows, sam_features.cols)?;
     let sam_mat = Mat::from_vec(sam_features.cols, sam_features.rows, sam_t);
-    let cw = clip_weights_from(weights)?;
-    forward_with(&cfg, &cw, &sam_mat)
+    let tb = std::time::Instant::now();
+    let out = forward_with(cfg, cw, &sam_mat);
+    super::timing_log(&format!(
+        "    clip.blocks {:.2}s",
+        tb.elapsed().as_secs_f64()
+    ));
+    out
 }
 
 /// Build a [`ClipWeights`] from the `model.vision_model.*` tensors (note the
 /// preserved upstream `pre_layrnorm` typo). Dims read from each tensor shape.
-fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
+/// `pub(crate)` so the batch spine (bd-1azu.10) hydrates ONCE per batch.
+pub(crate) fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
     let p = "model.vision_model";
     let ln = |n: &str| -> FocrResult<LayerNormParams> {
         Ok(LayerNormParams {
@@ -204,12 +270,30 @@ fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
             bias: weights.vec(&format!("{n}.bias"))?,
         })
     };
-    let lin = |n: &str| -> FocrResult<LinearParams> {
+    // Raw `[out, in]` weight bytes; the (heavy) one-time transpose into the
+    // GEMM-ready `[in, out]` layout runs AFTER the sequential `Weights` reads,
+    // parallel across blocks (pure data movement on owned buffers — no nested
+    // reader access, one live forward untouched).
+    struct RawLinear {
+        weight: Vec<f32>,
+        bias: Vec<f32>,
+        out_features: usize,
+        in_features: usize,
+    }
+    struct RawBlock {
+        layer_norm1: LayerNormParams,
+        qkv_proj: RawLinear,
+        out_proj: RawLinear,
+        layer_norm2: LayerNormParams,
+        fc1: RawLinear,
+        fc2: RawLinear,
+    }
+    let lin = |n: &str| -> FocrResult<RawLinear> {
         let weight_name = format!("{n}.weight");
         let (out_features, in_features) = tensor_rank2_shape(weights, &weight_name)?;
-        Ok(LinearParams {
+        Ok(RawLinear {
             weight: weights.vec(&weight_name)?,
-            bias: Some(weights.vec(&format!("{n}.bias"))?),
+            bias: weights.vec(&format!("{n}.bias"))?,
             out_features,
             in_features,
         })
@@ -217,10 +301,10 @@ fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
     let cfg = ClipConfig::default();
     let pos_name = format!("{p}.embeddings.position_embedding.weight");
     let (num_positions, _pos_dim) = tensor_rank2_shape(weights, &pos_name)?;
-    let mut blocks = Vec::with_capacity(cfg.num_layers);
+    let mut raw_blocks = Vec::with_capacity(cfg.num_layers);
     for l in 0..cfg.num_layers {
         let b = format!("{p}.transformer.layers.{l}");
-        blocks.push(ClipBlockWeights {
+        raw_blocks.push(RawBlock {
             layer_norm1: ln(&format!("{b}.layer_norm1"))?,
             qkv_proj: lin(&format!("{b}.self_attn.qkv_proj"))?,
             out_proj: lin(&format!("{b}.self_attn.out_proj"))?,
@@ -229,6 +313,22 @@ fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
             fc2: lin(&format!("{b}.mlp.fc2"))?,
         });
     }
+    let finish = |r: RawLinear| -> FocrResult<LinearParams> {
+        LinearParams::from_row_major(&r.weight, Some(r.bias), r.out_features, r.in_features)
+    };
+    let blocks = raw_blocks
+        .into_par_iter()
+        .map(|r| {
+            Ok(ClipBlockWeights {
+                layer_norm1: r.layer_norm1,
+                qkv_proj: finish(r.qkv_proj)?,
+                out_proj: finish(r.out_proj)?,
+                layer_norm2: r.layer_norm2,
+                fc1: finish(r.fc1)?,
+                fc2: finish(r.fc2)?,
+            })
+        })
+        .collect::<FocrResult<Vec<_>>>()?;
     Ok(ClipWeights {
         class_embedding: weights.vec(&format!("{p}.embeddings.class_embedding"))?,
         position_embedding: weights.vec(&pos_name)?,
@@ -429,6 +529,30 @@ pub fn forward_with_batched(
         ));
     }
     Ok(out)
+}
+
+/// [`forward_with_batched`] fed directly with raw SAM `x3` outputs
+/// (`[OUT_CH, num_patches]` channel-major, exactly what [`super::vision_sam`]
+/// produces): applies to each view the SAME `flatten(2).transpose(1,2)`
+/// transpose [`forward`] performs, then runs the batched stack. Keeps the
+/// SAM→CLIP layout knowledge inside this module so the batch spine
+/// (bd-1azu.10) cannot drift from the per-view path.
+///
+/// # Errors
+/// A transpose shape rejection, or anything [`forward_with_batched`] returns.
+pub(crate) fn forward_batched_from_sam(
+    cfg: &ClipConfig,
+    weights: &ClipWeights,
+    sam_features_per_view: &[&Mat],
+) -> FocrResult<Vec<Mat>> {
+    let mut transposed = Vec::with_capacity(sam_features_per_view.len());
+    for sf in sam_features_per_view {
+        ensure_mat_data_len(sf, "vision_clip forward_batched_from_sam sam_features")?;
+        let t = transpose(&sf.data, sf.rows, sf.cols)?;
+        transposed.push(Mat::from_vec(sf.cols, sf.rows, t));
+    }
+    let refs: Vec<&Mat> = transposed.iter().collect();
+    forward_with_batched(cfg, weights, &refs)
 }
 
 /// Batched analogue of [`transformer_block`]: every stage is row-wise except the
@@ -719,10 +843,11 @@ fn feed_forward(w: &ClipBlockWeights, x: &Mat) -> FocrResult<Mat> {
 
 /// Apply a PyTorch `nn.Linear`: `y = x · Wᵀ + b`.
 ///
-/// `W` is `[out, in]` row-major; `nn::matmul` contracts the inner dims, so we
-/// transpose `W` to `[in, out]` first, then add the optional bias per row. (The
-/// facade has no fused linear-with-bias for f32 activations — only the int8
-/// dynamic path — so the bias add is inline; see `facade_gaps`.)
+/// The weight arrives already transposed to `[in, out]`
+/// ([`LinearParams::from_row_major`], bd-av64.10), so this is one GEMM plus
+/// the bias add. (The facade has no fused linear-with-bias for f32
+/// activations — only the int8 dynamic path — so the bias add is inline; see
+/// `facade_gaps`.)
 fn linear(w: &LinearParams, x: &Mat) -> FocrResult<Mat> {
     if x.cols != w.in_features {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -732,22 +857,15 @@ fn linear(w: &LinearParams, x: &Mat) -> FocrResult<Mat> {
         )));
     }
     ensure_mat_data_len(x, "vision_clip linear input")?;
-    let expected_weight_len = checked_shape_mul(
-        "vision_clip linear",
-        w.out_features,
-        w.in_features,
-        "out*in",
-    )?;
-    if w.weight.len() != expected_weight_len {
+    if w.weight_t.rows != w.in_features || w.weight_t.cols != w.out_features {
         return Err(FocrError::Other(anyhow::anyhow!(
-            "vision_clip linear: weight len {} != out*in {}",
-            w.weight.len(),
-            expected_weight_len
+            "vision_clip linear: weight_t shape {:?} != [in {}, out {}]",
+            w.weight_t.shape(),
+            w.in_features,
+            w.out_features
         )));
     }
-    let wt = transpose(&w.weight, w.out_features, w.in_features)?;
-    let wt_mat = Mat::from_vec(w.in_features, w.out_features, wt);
-    let mut y = nn::matmul(x, &wt_mat)?;
+    let mut y = nn::matmul(x, &w.weight_t)?;
     if let Some(b) = &w.bias {
         if b.len() != w.out_features {
             return Err(FocrError::Other(anyhow::anyhow!(
@@ -1037,17 +1155,15 @@ mod tests {
     }
 
     /// An identity-ish linear: weight = I (square) or zero-padded, bias 0.
+    /// Built in the PyTorch `[out, in]` layout through `from_row_major`, so the
+    /// tests keep writing weights the way the reference model ships them.
     fn linear_identity(dim: usize) -> LinearParams {
         let mut w = vec![0.0f32; dim * dim];
         for i in 0..dim {
             w[i * dim + i] = 1.0;
         }
-        LinearParams {
-            weight: w,
-            bias: Some(vec![0.0; dim]),
-            out_features: dim,
-            in_features: dim,
-        }
+        LinearParams::from_row_major(&w, Some(vec![0.0; dim]), dim, dim)
+            .expect("identity linear builds")
     }
 
     /// qkv that yields q=k=v=x for every head (stacked three identities of dim).
@@ -1060,12 +1176,8 @@ mod tests {
                 w[out_row * dim + i] = 1.0;
             }
         }
-        LinearParams {
-            weight: w,
-            bias: Some(vec![0.0; 3 * dim]),
-            out_features: 3 * dim,
-            in_features: dim,
-        }
+        LinearParams::from_row_major(&w, Some(vec![0.0; 3 * dim]), 3 * dim, dim)
+            .expect("identity qkv builds")
     }
 
     fn fc1_identity_padded(dim: usize, ffn: usize) -> LinearParams {
@@ -1074,12 +1186,8 @@ mod tests {
         for i in 0..dim {
             w[i * dim + i] = 1.0;
         }
-        LinearParams {
-            weight: w,
-            bias: Some(vec![0.0; ffn]),
-            out_features: ffn,
-            in_features: dim,
-        }
+        LinearParams::from_row_major(&w, Some(vec![0.0; ffn]), ffn, dim)
+            .expect("identity fc1 builds")
     }
 
     fn fc2_identity_padded(dim: usize, ffn: usize) -> LinearParams {
@@ -1088,12 +1196,8 @@ mod tests {
         for i in 0..dim {
             w[i * ffn + i] = 1.0;
         }
-        LinearParams {
-            weight: w,
-            bias: Some(vec![0.0; dim]),
-            out_features: dim,
-            in_features: ffn,
-        }
+        LinearParams::from_row_major(&w, Some(vec![0.0; dim]), dim, ffn)
+            .expect("identity fc2 builds")
     }
 
     fn block_identity(dim: usize, ffn: usize) -> ClipBlockWeights {
@@ -1203,12 +1307,12 @@ mod tests {
     #[test]
     fn linear_applies_weight_and_bias() -> FocrResult<()> {
         // W = [[1,0,0],[0,1,0]] (out=2,in=3), b=[10,20]; x=[1,2,3] -> [11,22].
-        let w = LinearParams {
-            weight: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            bias: Some(vec![10.0, 20.0]),
-            out_features: 2,
-            in_features: 3,
-        };
+        let w = LinearParams::from_row_major(
+            &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            Some(vec![10.0, 20.0]),
+            2,
+            3,
+        )?;
         let x = Mat::from_vec(1, 3, vec![1.0, 2.0, 3.0]);
         let y = linear(&w, &x)?;
         assert_eq!(y.shape(), (1, 2));
@@ -1225,25 +1329,53 @@ mod tests {
     }
 
     #[test]
-    fn linear_rejects_weight_shape_product_overflow_without_panic() {
+    fn from_row_major_stores_the_exact_transpose() {
+        // bd-av64.10 bit-identity anchor: the hoisted layout must hold the
+        // SAME float values with weight_t[i][o] == weight[o][i] — the GEMM
+        // then contracts identically to the old transpose-at-apply-time path.
+        let (out, inn) = (3usize, 2usize);
+        let w: Vec<f32> = (0..out * inn).map(|v| v as f32 * 0.5 - 1.0).collect();
+        let p = LinearParams::from_row_major(&w, None, out, inn).expect("builds");
+        assert_eq!(p.weight_t.shape(), (inn, out));
+        for o in 0..out {
+            for i in 0..inn {
+                assert_eq!(
+                    p.weight_t.data[i * out + o].to_bits(),
+                    w[o * inn + i].to_bits(),
+                    "weight_t[{i}][{o}] must be bit-equal to weight[{o}][{i}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn from_row_major_rejects_shape_product_overflow_without_panic() {
+        // The overflow guard moved to construction time with the transpose
+        // hoist (bd-av64.10): a poisoned out*in product must error, not panic.
+        assert_err_contains(
+            LinearParams::from_row_major(&[], None, usize::MAX, 2),
+            "rows*cols",
+        );
+    }
+
+    #[test]
+    fn linear_rejects_mismatched_pretransposed_weight_shape() {
+        // A hand-built LinearParams whose weight_t disagrees with its declared
+        // features must be refused by linear() (defense in depth — the
+        // constructor makes this unrepresentable through the normal path).
         let w = LinearParams {
-            weight: Vec::new(),
+            weight_t: Mat::zeros(1, 1),
             bias: None,
-            out_features: usize::MAX,
+            out_features: 3,
             in_features: 2,
         };
         let x = Mat::zeros(1, 2);
-        assert_err_contains(linear(&w, &x), "out*in");
+        assert_err_contains(linear(&w, &x), "weight_t shape");
     }
 
     #[test]
     fn linear_rejects_malformed_input_mat_without_panic() {
-        let w = LinearParams {
-            weight: vec![1.0, 1.0],
-            bias: None,
-            out_features: 1,
-            in_features: 2,
-        };
+        let w = LinearParams::from_row_major(&[1.0, 1.0], None, 1, 2).expect("tiny linear builds");
         let x = Mat {
             rows: 2,
             cols: 2,
@@ -1412,20 +1544,20 @@ mod tests {
         let x = Mat::zeros(3, dim);
 
         let mut bad_qkv = block_identity(dim, cfg.ffn_hidden_size);
-        bad_qkv.qkv_proj.out_features = 3 * dim - 1;
-        bad_qkv.qkv_proj.weight =
-            vec![0.0; bad_qkv.qkv_proj.out_features * bad_qkv.qkv_proj.in_features];
-        bad_qkv.qkv_proj.bias = Some(vec![0.0; bad_qkv.qkv_proj.out_features]);
+        let wrong_out = 3 * dim - 1;
+        bad_qkv.qkv_proj =
+            LinearParams::from_row_major(&vec![0.0; wrong_out * dim], None, wrong_out, dim)
+                .expect("wrong-shaped qkv builds");
         assert_err_contains(
             self_attention(&cfg, &bad_qkv, &x),
             "self_attention qkv output",
         );
 
         let mut bad_proj = block_identity(dim, cfg.ffn_hidden_size);
-        bad_proj.out_proj.out_features = dim - 1;
-        bad_proj.out_proj.weight =
-            vec![0.0; bad_proj.out_proj.out_features * bad_proj.out_proj.in_features];
-        bad_proj.out_proj.bias = Some(vec![0.0; bad_proj.out_proj.out_features]);
+        let wrong_out = dim - 1;
+        bad_proj.out_proj =
+            LinearParams::from_row_major(&vec![0.0; wrong_out * dim], None, wrong_out, dim)
+                .expect("wrong-shaped out_proj builds");
         assert_err_contains(
             self_attention(&cfg, &bad_proj, &x),
             "self_attention projection output",
@@ -1568,12 +1700,14 @@ mod tests {
         (x as f32) / 1000.0 - 0.5
     }
     fn rand_lin(out: usize, inn: usize, salt: usize) -> LinearParams {
-        LinearParams {
-            weight: (0..out * inn).map(|i| det(i, salt)).collect(),
-            bias: Some((0..out).map(|i| det(i, salt + 1)).collect()),
-            out_features: out,
-            in_features: inn,
-        }
+        let w: Vec<f32> = (0..out * inn).map(|i| det(i, salt)).collect();
+        LinearParams::from_row_major(
+            &w,
+            Some((0..out).map(|i| det(i, salt + 1)).collect()),
+            out,
+            inn,
+        )
+        .expect("rand linear builds")
     }
     fn rand_ln(dim: usize, salt: usize) -> LayerNormParams {
         LayerNormParams {
@@ -1658,6 +1792,32 @@ mod tests {
     }
 
     #[test]
+    fn batched_from_sam_equals_per_view_forward_path() -> FocrResult<()> {
+        // Feed CHANNEL-MAJOR sam-style features ([dim, num_patches], what
+        // vision_sam emits) through the from-sam wrapper and assert bit-equality
+        // with the per-view path (the same transpose + forward_with) — the exact
+        // seam the batch spine (bd-1azu.10) rides.
+        let cfg = parity_cfg();
+        let num_patches = 5;
+        let w = rand_weights(&cfg, num_patches);
+        let sams: Vec<Mat> = (0..3)
+            .map(|vi| parity_view(cfg.hidden_size, num_patches, vi))
+            .collect();
+        let refs: Vec<&Mat> = sams.iter().collect();
+        let batched = forward_batched_from_sam(&cfg, &w, &refs)?;
+        assert_eq!(batched.len(), sams.len());
+        for (vi, sam) in sams.iter().enumerate() {
+            let t = transpose(&sam.data, sam.rows, sam.cols)?;
+            let per_view = forward_with(&cfg, &w, &Mat::from_vec(sam.cols, sam.rows, t))?;
+            assert_eq!(
+                batched[vi].data, per_view.data,
+                "view {vi}: from-sam batched CLIP != per-view transpose+forward_with"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn batched_clip_rejects_ragged_and_empty() {
         let cfg = parity_cfg();
         let w = rand_weights(&cfg, 4);
@@ -1737,11 +1897,17 @@ mod tests {
         let cfg = tiny_cfg();
         let dim = cfg.hidden_size;
         let mut block = block_identity(dim, cfg.ffn_hidden_size);
-        // Zero out_proj weight+bias -> attention contributes 0.
-        block.out_proj.weight.iter_mut().for_each(|v| *v = 0.0);
+        // Zero out_proj weight+bias -> attention contributes 0. (Zeroing the
+        // pre-transposed weight IS zeroing the weight.)
+        block
+            .out_proj
+            .weight_t
+            .data
+            .iter_mut()
+            .for_each(|v| *v = 0.0);
         block.out_proj.bias = Some(vec![0.0; dim]);
         // Zero fc2 weight+bias -> mlp contributes 0.
-        block.fc2.weight.iter_mut().for_each(|v| *v = 0.0);
+        block.fc2.weight_t.data.iter_mut().for_each(|v| *v = 0.0);
         block.fc2.bias = Some(vec![0.0; dim]);
         let x = Mat::from_vec(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let out = transformer_block(&cfg, &block, &x)?;

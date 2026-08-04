@@ -1,0 +1,89 @@
+{
+  "schema": "focr-gauntlet-row/v1",
+  "created_utc": "2026-07-06T00:04:29Z",
+  "inputs": {
+    "focr_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/got/focr/focr_stages.json",
+      "sha256": "4bb262f1a0730906f4f8fffc4881fc5c85186177a438ec7f7cb4191b7d2aee54"
+    },
+    "ref_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/got/ref_stages.json",
+      "sha256": "d6da85aa0f818b7e96a1e330e1583d5c7024a7bb04232f5ed0dd4747a367dc35"
+    },
+    "roofline": {
+      "path": "artifacts/perf/bd-3jo6.1.11/got/roofline.json",
+      "sha256": "9c383a5d982aed8fd186e8e87675a0991917ddd4e05c450be31c22d615146320"
+    }
+  },
+  "rows": [
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-got-int8-sampletext-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/got/claim",
+      "model_commit": "stepfun-ai/GOT-OCR2_0@sha256:77d614403954",
+      "fixture_hash": "page=tests/fixtures/got/sample_text.png sha256=9eab4707e571d389c3fcb5777caebb093a7e682f4e3caa7cab14a706ae118e18; weights=got-ocr2.int8.focrq sha256=4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f (f32 source model.safetensors sha256=77d6144039548b14253176b6eb264896bc39eba532f8894700f210a7fd2a5956)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "prefill",
+      "reference_backend": "hf",
+      "focr_ms": "220.000",
+      "ref_ms": "255.172",
+      "ratio": "1.160",
+      "floor_kind": "compute",
+      "floor_ms": "92.925",
+      "dist_above_floor": "2.37",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/got/sample_text.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2/got-ocr2.int8.focrq [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/got/sample_text.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2 --backend hf --precision f32 --entry gauntlet_ref_zoo:run_got --setup gauntlet_ref_zoo:setup_got --pin-torch 2.12.1 --pin-transformers 4.45.2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/got/ref_stages.json [torch==2.12.1 transformers==4.45.2]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "GOT B8 parity certs green (bd-3jo6.2.8): prefill/kvcache vs torch oracle cos~1.0 + format-corpus certs (src/native_engine/got.rs); spec_gate_e2e.sh PASS incl this sample_text.png",
+      "notes": "A11 zoo lane; ref = pinned upstream chat() f32 CPU (cert stack torch 2.12.1/transformers 4.45.2 via --pin-*; 4.57 cache API breaks the pinned GOT modeling); focr e2e = process wall INCL 776MB artifact load, ref e2e excludes load (bias favors ref)"
+    },
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-got-int8-sampletext-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/got/claim",
+      "model_commit": "stepfun-ai/GOT-OCR2_0@sha256:77d614403954",
+      "fixture_hash": "page=tests/fixtures/got/sample_text.png sha256=9eab4707e571d389c3fcb5777caebb093a7e682f4e3caa7cab14a706ae118e18; weights=got-ocr2.int8.focrq sha256=4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f (f32 source model.safetensors sha256=77d6144039548b14253176b6eb264896bc39eba532f8894700f210a7fd2a5956)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "decode-per-token",
+      "reference_backend": "hf",
+      "focr_ms": "12.264",
+      "ref_ms": "41.378",
+      "ratio": "3.374",
+      "floor_kind": "memory",
+      "floor_ms": "4.391",
+      "dist_above_floor": "2.79",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/got/sample_text.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2/got-ocr2.int8.focrq [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/got/sample_text.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2 --backend hf --precision f32 --entry gauntlet_ref_zoo:run_got --setup gauntlet_ref_zoo:setup_got --pin-torch 2.12.1 --pin-transformers 4.45.2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/got/ref_stages.json [torch==2.12.1 transformers==4.45.2]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "GOT B8 parity certs green (bd-3jo6.2.8): prefill/kvcache vs torch oracle cos~1.0 + format-corpus certs (src/native_engine/got.rs); spec_gate_e2e.sh PASS incl this sample_text.png",
+      "notes": "A11 zoo lane; ref = pinned upstream chat() f32 CPU (cert stack torch 2.12.1/transformers 4.45.2 via --pin-*; 4.57 cache API breaks the pinned GOT modeling); focr e2e = process wall INCL 776MB artifact load, ref e2e excludes load (bias favors ref)"
+    },
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-got-int8-sampletext-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/got/claim",
+      "model_commit": "stepfun-ai/GOT-OCR2_0@sha256:77d614403954",
+      "fixture_hash": "page=tests/fixtures/got/sample_text.png sha256=9eab4707e571d389c3fcb5777caebb093a7e682f4e3caa7cab14a706ae118e18; weights=got-ocr2.int8.focrq sha256=4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f (f32 source model.safetensors sha256=77d6144039548b14253176b6eb264896bc39eba532f8894700f210a7fd2a5956)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "end-to-end",
+      "reference_backend": "hf",
+      "focr_ms": "6454.230",
+      "ref_ms": "4030.232",
+      "ratio": "0.624",
+      "floor_kind": "compute",
+      "floor_ms": "1983.133",
+      "dist_above_floor": "3.25",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/got/sample_text.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2/got-ocr2.int8.focrq [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/got/sample_text.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2 --backend hf --precision f32 --entry gauntlet_ref_zoo:run_got --setup gauntlet_ref_zoo:setup_got --pin-torch 2.12.1 --pin-transformers 4.45.2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/got/ref_stages.json [torch==2.12.1 transformers==4.45.2]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "GOT B8 parity certs green (bd-3jo6.2.8): prefill/kvcache vs torch oracle cos~1.0 + format-corpus certs (src/native_engine/got.rs); spec_gate_e2e.sh PASS incl this sample_text.png",
+      "notes": "A11 zoo lane; ref = pinned upstream chat() f32 CPU (cert stack torch 2.12.1/transformers 4.45.2 via --pin-*; 4.57 cache API breaks the pinned GOT modeling); focr e2e = process wall INCL 776MB artifact load, ref e2e excludes load (bias favors ref)"
+    }
+  ]
+}

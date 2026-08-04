@@ -1,0 +1,35 @@
+{
+  "tag": "warmup_1",
+  "command": [
+    "/private/tmp/cc_tgt_dev/release/focr",
+    "ocr",
+    "tests/fixtures/onechart/sample_chart.png",
+    "--model",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/onechart/onechart.int8.focrq",
+    "--task",
+    "chart-data",
+    "--max-length",
+    "4096"
+  ],
+  "exit_code": 0,
+  "wall_ms": 6865.1,
+  "stdout": "warmup_1.stdout",
+  "stderr": "warmup_1.stderr",
+  "binary": "/private/tmp/cc_tgt_dev/release/focr",
+  "binary_sha256": "ce670b644f987abc1fc258e864a9c49850309cdf66ace98b9f837a84b428fed2",
+  "page": "tests/fixtures/onechart/sample_chart.png",
+  "page_sha256": "b2487b03dc0cd7e962b5f607aea47c6868245e380493ae928036c96670b3103e",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/zoo/onechart/onechart.int8.focrq",
+  "threads": 8,
+  "warmup": 1,
+  "env_pins": {
+    "FOCR_TIMING": "1",
+    "FOCR_THREADS": "8",
+    "OMP_NUM_THREADS": "8",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "focr_env": {
+    "FOCR_THREADS": "8",
+    "FOCR_TIMING": "1"
+  }
+}

@@ -1,0 +1,157 @@
+{
+  "schema": "focr-gauntlet-roofline/v1",
+  "created_utc": "2026-07-08T07:50:59Z",
+  "arch": "unlimited-ocr",
+  "precision": "int8",
+  "machine_profile": {
+    "name": "m4",
+    "dram_gb_s": 120.0,
+    "peak_int8_gmacs": 1126.4,
+    "peak_f32_gflops": 563.2,
+    "note": "P-cores only, SDOT 64 int8-MAC/cycle/core, FMA 32 f32-FLOP/cycle/core"
+  },
+  "stages_json": "/Users/jemanuel/projects/franken_ocr/artifacts/perf/bd-2mo.26/focr_page_0014/focr_stages.json",
+  "floors": [
+    {
+      "floor_kind": "memory",
+      "floor_ms": 0.104858,
+      "compute_floor_ms": 0.0,
+      "memory_floor_ms": 0.104858,
+      "int8_macs": 0,
+      "f32_flops": 0,
+      "bytes": 12582912,
+      "assumptions": [
+        "memory floor only: the normalized 3\u00d71024\u00d71024 f32 input tensor must be written",
+        "source decode/resize excluded (image dims not in the timing evidence)"
+      ],
+      "stage": "preprocess",
+      "focr_best_ms": 20.0,
+      "dist_above_floor": 190.7341
+    },
+    {
+      "floor_kind": "compute",
+      "floor_ms": 1934.503564,
+      "compute_floor_ms": 1934.503564,
+      "memory_floor_ms": 13.227349,
+      "int8_macs": 0,
+      "f32_flops": 1089512407040,
+      "bytes": 1587281920,
+      "assumptions": [
+        "SAM-ViT-B blocks + windowed/global attention + Vary neck/compressor convs",
+        "CLIP-L NoTP tower (24\u00d71024/4096 over 257 tokens) + 2048\u21921280 bridge",
+        "f32 weights streamed once; norms/softmax/pos-embeds excluded (lower bound)"
+      ],
+      "stage": "vision_encode",
+      "focr_best_ms": 4720.0,
+      "dist_above_floor": 2.4399
+    },
+    {
+      "floor_kind": "compute",
+      "floor_ms": 108.634364,
+      "compute_floor_ms": 108.634364,
+      "memory_floor_ms": 3.397632,
+      "int8_macs": 112937287680,
+      "f32_flops": 4714229760,
+      "bytes": 407715840,
+      "assumptions": [
+        "277 prefill tokens \u00d7 active per-token GEMM MACs (lm_head excluded)",
+        "memory floor = weights streamed once (identical-routing MoE lower bound)",
+        "attention scores/context counted full-causal in f32"
+      ],
+      "stage": "prefill",
+      "focr_best_ms": 490.0,
+      "dist_above_floor": 4.5105
+    },
+    {
+      "floor_kind": "memory",
+      "floor_ms": 4.953126,
+      "compute_floor_ms": 0.526036,
+      "memory_floor_ms": 4.953126,
+      "int8_macs": 573194240,
+      "f32_flops": 9666560,
+      "bytes": 594375168,
+      "assumptions": [
+        "active set: attn qkvo + dense-L0 MLP + top-6 routed + fused shared expert + lm_head",
+        "per-out-channel f32 scales counted; norms/embeds/activations excluded (lower bound)",
+        "R-SWA ring window 128 K+V rows read per layer in f32"
+      ],
+      "stage": "decode_per_token",
+      "focr_best_ms": 18.0,
+      "dist_above_floor": 3.6341
+    },
+    {
+      "floor_kind": "memory",
+      "floor_ms": 4495.040156,
+      "compute_floor_ms": null,
+      "memory_floor_ms": null,
+      "int8_macs": null,
+      "f32_flops": null,
+      "bytes": null,
+      "assumptions": [
+        "sum of modeled stage floors with decode \u00d7 495 measured tokens",
+        "floor_kind = dominant component (decode_per_token)"
+      ],
+      "components": {
+        "preprocess": {
+          "floor_kind": "memory",
+          "floor_ms": 0.104858,
+          "compute_floor_ms": 0.0,
+          "memory_floor_ms": 0.104858,
+          "int8_macs": 0,
+          "f32_flops": 0,
+          "bytes": 12582912,
+          "assumptions": [
+            "memory floor only: the normalized 3\u00d71024\u00d71024 f32 input tensor must be written",
+            "source decode/resize excluded (image dims not in the timing evidence)"
+          ]
+        },
+        "vision_encode": {
+          "floor_kind": "compute",
+          "floor_ms": 1934.503564,
+          "compute_floor_ms": 1934.503564,
+          "memory_floor_ms": 13.227349,
+          "int8_macs": 0,
+          "f32_flops": 1089512407040,
+          "bytes": 1587281920,
+          "assumptions": [
+            "SAM-ViT-B blocks + windowed/global attention + Vary neck/compressor convs",
+            "CLIP-L NoTP tower (24\u00d71024/4096 over 257 tokens) + 2048\u21921280 bridge",
+            "f32 weights streamed once; norms/softmax/pos-embeds excluded (lower bound)"
+          ]
+        },
+        "prefill": {
+          "floor_kind": "compute",
+          "floor_ms": 108.634364,
+          "compute_floor_ms": 108.634364,
+          "memory_floor_ms": 3.397632,
+          "int8_macs": 112937287680,
+          "f32_flops": 4714229760,
+          "bytes": 407715840,
+          "assumptions": [
+            "277 prefill tokens \u00d7 active per-token GEMM MACs (lm_head excluded)",
+            "memory floor = weights streamed once (identical-routing MoE lower bound)",
+            "attention scores/context counted full-causal in f32"
+          ]
+        },
+        "decode_per_token": {
+          "floor_kind": "memory",
+          "floor_ms": 4.953126,
+          "compute_floor_ms": 0.526036,
+          "memory_floor_ms": 4.953126,
+          "int8_macs": 573194240,
+          "f32_flops": 9666560,
+          "bytes": 594375168,
+          "assumptions": [
+            "active set: attn qkvo + dense-L0 MLP + top-6 routed + fused shared expert + lm_head",
+            "per-out-channel f32 scales counted; norms/embeds/activations excluded (lower bound)",
+            "R-SWA ring window 128 K+V rows read per layer in f32"
+          ]
+        }
+      },
+      "stage": "end_to_end",
+      "focr_best_ms": 18539.433,
+      "dist_above_floor": 4.1244
+    }
+  ],
+  "synthetic": false
+}

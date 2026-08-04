@@ -1,0 +1,177 @@
+{
+  "schema": "focr-gauntlet-stages/v1",
+  "source": "reference",
+  "created_utc": "2026-07-06T21:25:52Z",
+  "command": [
+    "scripts/gauntlet_reference.py",
+    "--stage",
+    "all",
+    "--backend",
+    "hf-torch",
+    "--precision",
+    "f32",
+    "--entry",
+    "gauntlet_ref_zoo:run_tromr",
+    "--setup",
+    "gauntlet_ref_zoo:setup_tromr",
+    "--page",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr-upstream/examples/1.png",
+    "--model-dir",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr-upstream",
+    "--threads",
+    "8",
+    "--runs",
+    "5",
+    "--warmup",
+    "1",
+    "--pin-torch",
+    "2.12.1",
+    "--pin-transformers",
+    "4.45.2",
+    "--out",
+    "artifacts/perf/bd-2sez/ref_tromr.json"
+  ],
+  "env_pins": {
+    "OMP_NUM_THREADS": "8",
+    "MKL_NUM_THREADS": "8",
+    "OPENBLAS_NUM_THREADS": "8",
+    "VECLIB_MAXIMUM_THREADS": "8",
+    "NUMEXPR_NUM_THREADS": "8",
+    "FOCR_THREADS": ""
+  },
+  "page": "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr-upstream/examples/1.png",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr-upstream",
+  "threads": 8,
+  "precision": "f32",
+  "backend": "hf-torch",
+  "allocator": "system",
+  "runs": 5,
+  "warmup": 1,
+  "torch_version": "2.12.1",
+  "transformers_version": "4.45.2",
+  "stages": [
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "preprocess",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        3.907667,
+        5.931083,
+        3.735791,
+        4.11275,
+        3.666958
+      ],
+      "best_ms": 3.666958,
+      "p50_ms": 3.907667,
+      "mean_ms": 4.27085,
+      "cv_pct": 22.102,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf-torch",
+      "allocator": "system",
+      "synthetic": false
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "vision_encode",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        87.592333,
+        181.340417,
+        157.653666,
+        61.684542,
+        62.584
+      ],
+      "best_ms": 61.684542,
+      "p50_ms": 87.592333,
+      "mean_ms": 110.170992,
+      "cv_pct": 50.629,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf-torch",
+      "allocator": "system",
+      "synthetic": false
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "decode_per_token",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        14.793256,
+        17.818083,
+        18.88517,
+        16.091343,
+        21.07901
+      ],
+      "best_ms": 14.793256,
+      "p50_ms": 17.818083,
+      "mean_ms": 17.733373,
+      "cv_pct": 13.775,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf-torch",
+      "allocator": "system",
+      "synthetic": false,
+      "tokens": 68
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "end_to_end",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        1097.444292,
+        1398.902166,
+        1445.581958,
+        1160.009292,
+        1499.624291
+      ],
+      "best_ms": 1097.444292,
+      "p50_ms": 1398.902166,
+      "mean_ms": 1320.3124,
+      "cv_pct": 13.622,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "f32",
+      "backend": "hf-torch",
+      "allocator": "system",
+      "synthetic": false
+    }
+  ],
+  "synthetic": false,
+  "smoke": false,
+  "text_sha256": [
+    "2eae3843e151d5eb055e91e81e3a42c652907db5e7dbd6715bee768177572b87"
+  ],
+  "text_identical_across_runs": true
+}

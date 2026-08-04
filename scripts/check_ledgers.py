@@ -228,12 +228,30 @@ def check_negative_evidence(path: Path, text: str, failures: list[str]) -> None:
     unfenced = strip_fenced_blocks(text)
     entries = list(
         re.finditer(
-            r"^(?P<date>\d{4}-\d{2}-\d{2}) \| (?P<outcome>WIN|NEGATIVE\(reverted\)) \| (?P<lever>.+)$",
+            r"^(?P<date>\d{4}-\d{2}-\d{2}) \| (?P<outcome>[^|]+?) \| (?P<lever>.+)$",
             unfenced,
             flags=re.MULTILINE,
         )
     )
     emit("negative-entry-count", True, count=len(entries))
+
+    allowed_outcomes = {
+        "WIN",
+        "PROVISIONAL_LOCAL_WIN",
+        "NEGATIVE(reverted)",
+        "NEGATIVE(retained-for-proof)",
+    }
+    for entry in entries:
+        outcome = entry.group("outcome")
+        allowed = outcome in allowed_outcomes
+        emit(
+            "negative-outcome",
+            allowed,
+            line=unfenced.count("\n", 0, entry.start()) + 1,
+            outcome=outcome,
+        )
+        if not allowed:
+            failures.append(f"{path}: unsupported negative-evidence outcome {outcome!r}")
 
     required_fields = [
         "claim_id:",
@@ -289,10 +307,17 @@ def check_negative_evidence(path: Path, text: str, failures: list[str]) -> None:
 
 def check_discrepancies(path: Path, text: str, failures: list[str]) -> None:
     unfenced = strip_fenced_blocks(text)
-    headings = list(re.finditer(r"^## DISC-\d+:", unfenced, flags=re.MULTILINE))
+    headings = list(re.finditer(r"^## (?P<id>DISC-\d+):", unfenced, flags=re.MULTILINE))
     emit("disc-entry-count", True, count=len(headings))
     if not headings:
         return
+
+    ids = [heading.group("id") for heading in headings]
+    duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
+    unique = not duplicates
+    emit("disc-id-unique", unique, duplicates=duplicates)
+    if not unique:
+        failures.append(f"{path}: duplicate discrepancy IDs: {', '.join(duplicates)}")
 
     required_fields = [
         "- claim_id / evidence_id:",
@@ -307,7 +332,14 @@ def check_discrepancies(path: Path, text: str, failures: list[str]) -> None:
         "- Tests affected:",
         "- Review date:",
     ]
-    src_text = "\n".join(p.read_text(encoding="utf-8") for p in (ROOT / "src").rglob("*.rs"))
+    # Skip AppleDouble junk: an exFAT working copy (or an exFAT $TMPDIR shadow
+    # repo — the gauntlet_row shadow check) grows binary `._*.rs` resource-fork
+    # siblings beside every real file; reading one as UTF-8 crashes the scan.
+    src_text = "\n".join(
+        p.read_text(encoding="utf-8")
+        for p in (ROOT / "src").rglob("*.rs")
+        if not p.name.startswith("._")
+    )
 
     for index, heading in enumerate(headings):
         end = headings[index + 1].start() if index + 1 < len(headings) else len(unfenced)

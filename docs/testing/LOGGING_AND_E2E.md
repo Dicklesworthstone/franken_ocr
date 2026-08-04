@@ -11,6 +11,11 @@
 > **Status.** LIVING DOCUMENT. The schemas below are **frozen contracts**:
 > `TEST_LOG_SCHEMA_VERSION` is bumped (never silently changed) on any breaking
 > change, exactly like `ROBOT_SCHEMA_VERSION` in [`src/robot.rs`](../../src/robot.rs).
+> The current always-on gate runs `scripts/check_test_logs.py --self-test` before
+> Cargo. It validates the schema fixture and embedded accept/reject examples; CI
+> does not currently capture a repository-wide `TEST_LOG_DIR` stream or validate
+> emitted test logs after `cargo test`. File-sink and post-capture text below is
+> the target contract until that wiring lands.
 >
 > **Why this exists.** AGENTS.md and the master plan are explicit: the user wants
 > *comprehensive unit tests AND end-to-end test scripts with great detailed
@@ -105,9 +110,9 @@ These bind every contract below.
   `serde_json::from_str` per line.
 - **Two sinks.** During `cargo test`, lines are written to:
   1. `stderr` of the test process (so a developer watching the run sees them), and
-  2. a file under `$TEST_LOG_DIR/<test_binary>.<pid>.ndjson` when `TEST_LOG_DIR`
-     is set (CI sets it so the validator + artifact capture can run over the whole
-     captured stream — plan §8.4).
+  2. in the target contract, a file under
+     `$TEST_LOG_DIR/<test_binary>.<pid>.ndjson` when `TEST_LOG_DIR` is set. The
+     current CI gate does not provide that sink or capture the resulting files.
   The *data surface* compared by golden tests (e2e `--json` output, robot NDJSON)
   goes to **stdout**; `TestLog` telemetry never pollutes stdout (TL2).
 - **Scrubbable time.** `ts` is **monotonic-relative microseconds since the test
@@ -258,12 +263,22 @@ and enforces:
 5. The TL8 rule: a `parity` line whose nearest `stage` line has `simd_tier:"avx2"`
    and that asserts a bit-identity must carry `avx2_exception`.
 
-**CI ordering (plan, `bd-4yks`):** the `TEST_LOG_DIR` NDJSON is captured *during*
-`cargo test`, then the validator runs over the **whole captured stream** as its
-own step and fails CI on any malformed line — the ordering matters so the
-validator sees a complete stream. A self-test feeds the validator a deliberately
-malformed line (missing required field / unknown enum / mismatched
-`schema_version`) and asserts rejection.
+**Current gate:** `scripts/check.sh` runs
+`python3 scripts/check_test_logs.py --self-test` before Cargo. The self-test feeds
+the validator deliberately malformed lines (missing required field, unknown
+enum, and mismatched `schema_version`) and asserts rejection. It does not inspect
+records emitted by the subsequent test run.
+
+To validate already captured NDJSON manually, pass the files explicitly after
+the producing process exits:
+
+```bash
+python3 scripts/check_test_logs.py path/to/test-logs/*.ndjson
+```
+
+The planned full-stream CI lane must first implement the `TEST_LOG_DIR` file
+sink, capture during `cargo test`, and only then invoke that command over the
+complete stream.
 
 ---
 
@@ -499,9 +514,9 @@ self-test lives in the scheduled meta-test lane.
   `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
   `cargo test`, `ubs $(git diff --name-only)`. Model-gated tests **skip-with-
   SUCCESS** (logged `skip_no_model`); CI is **green without weights**.
-- **Log-schema validation** runs **after** capture: `cargo test` writes
-  `$TEST_LOG_DIR/*.ndjson`, then the §3.6 validator runs over the whole captured
-  stream and **fails CI on any malformed line**.
+- **Log-schema validation currently self-tests only:** `scripts/check.sh` runs
+  `python3 scripts/check_test_logs.py --self-test` before Cargo. There is no
+  current CI claim that `cargo test` output is captured or post-validated.
 - **`many_pages_without_deadlock`** runs with a **hard job timeout** (the deadlock
   signal) against the real-topology stub variant (no weights).
 - **Bench-guardrail** is a separate **flag-only** job (skips-green without
@@ -515,8 +530,9 @@ self-test lives in the scheduled meta-test lane.
   a CUDA host for the oracle) runs the real model-gated e2e + the gauntlet
   head-to-head — clearly separated from the always-on no-weights CI (the official
   `infer()` is CUDA-oriented, OQ-17).
-- **Artifact capture:** archive `TEST_LOG_DIR` NDJSON + `artifacts/perf/<bead>/`
-  logs as CI artifacts for the §8.4 evidence graph.
+- **Planned artifact capture:** after the file sink is implemented, archive
+  `TEST_LOG_DIR` NDJSON plus `artifacts/perf/<bead>/` logs as CI artifacts for
+  the §8.4 evidence graph.
 
 ---
 

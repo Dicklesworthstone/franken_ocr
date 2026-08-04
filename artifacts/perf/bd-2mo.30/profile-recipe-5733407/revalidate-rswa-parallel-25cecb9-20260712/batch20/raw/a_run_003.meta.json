@@ -1,0 +1,209 @@
+{
+  "tag": "a_run_003",
+  "command": [
+    "/home/ubuntu/focr-perf-25cecb9-batch20-20260712T2227Z/subject/release-perf/focr",
+    "ocr-batch",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0009.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0019.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0023.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0086.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0091.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0105.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0107.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0108.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0126.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0136.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0179.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0250.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0358.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0400.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0437.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0547.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0557.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0590.png",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0645.png",
+    "--model",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq"
+  ],
+  "exit_code": 0,
+  "wall_ms": 327421.619,
+  "stdout": "a_run_003.stdout",
+  "stderr": "a_run_003.stderr",
+  "binary": "/home/ubuntu/focr-perf-25cecb9-batch20-20260712T2227Z/subject/release-perf/focr",
+  "binary_sha256": "0e50d513e60956d544af4e7cd707e76888a00de83598563dffd4b0cbc94961c6",
+  "binary_size": 96506416,
+  "binary_origin": "/home/ubuntu/focr-perf-25cecb9-build-20260712T2203Z/build/focr",
+  "build_receipt": "/home/ubuntu/focr-perf-25cecb9-batch20-20260712T2227Z/subject/build_receipt.json",
+  "build_receipt_sha256": "31df05098b3671d1efaf4f6eb357fb1b5aecc7bedfdf3333aa6cd7f685beef08",
+  "page": null,
+  "page_sha256": null,
+  "pages": [
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0009.png",
+      "sha256": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+      "size": 544258
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png",
+      "sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+      "size": 297844
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0019.png",
+      "sha256": "ad98fcc10f580bfa2271cc7ce3b581806d0392844d41201db95eaaa4713a1c1c",
+      "size": 603286
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0023.png",
+      "sha256": "a74adb4f437d7955f5f75d3e4f053562c9b7e20cd54840d4488ac2f61ef3f761",
+      "size": 1020638
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0086.png",
+      "sha256": "016c23bad4ce37739a29efe88b4aa955593bcb116b330d479a436d805c138dc3",
+      "size": 994332
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0091.png",
+      "sha256": "34f732f9adc386fb43b69e3befc8f103f83f3ba5f55592e1050f7e343ecd5bfd",
+      "size": 967101
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0105.png",
+      "sha256": "90d94f3b6ec19810251866cd40f778866c129d87594592f1cbc68d9577af6040",
+      "size": 843714
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0107.png",
+      "sha256": "e2b86f2fd70a80cf2ae5c17c96055446db378bebb2eb1a02d4aedd000ef2cf5f",
+      "size": 1053989
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0108.png",
+      "sha256": "7a808477b32e565daa998b644c842394d416bd5177bc7c392bfb29b8b94589eb",
+      "size": 996080
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0126.png",
+      "sha256": "c7a368051bc12557d7dd34eb9a92c56d48f1afa19a2bc963f97a912d0a9d7ed0",
+      "size": 953139
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0136.png",
+      "sha256": "8d5351e578187eb95efa98dcfefc20d74f774c62fc3d539595bd4cadc298fbaa",
+      "size": 941533
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0179.png",
+      "sha256": "960f985de0e4470eaa7330c5b2017b4a8887e3f9fb3f50b7bac3a1eaf658a115",
+      "size": 1019156
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0250.png",
+      "sha256": "d966d4e5b7069a879dd5c5216136c2a55bf09f3bc15302ff4d75299a73fb1d15",
+      "size": 1015614
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0358.png",
+      "sha256": "6e5e3ae68ee7ff4d3dc8d8e15923eae2915cedfe1c05578284524aaeb387f4fa",
+      "size": 922902
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0400.png",
+      "sha256": "194d5b3825ac67a7290689f7cfa40f4acf1b648c008a91f599aa0bde740d3790",
+      "size": 1071964
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0437.png",
+      "sha256": "5af3eb515d920952bc2a28dfdce0bc9bbd186eda9fd78dc50f907c05c870eed0",
+      "size": 907098
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0547.png",
+      "sha256": "a386db4dacfdfe5f3c2ee10140b83aaf62bd2c1ec86fc0fb566fd7fd1f48f8e8",
+      "size": 1093636
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0557.png",
+      "sha256": "c0df8d381521bcbf7244a48ec119be695e4591b6ccde97fdff5c15eb336ac47f",
+      "size": 1053457
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0590.png",
+      "sha256": "6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3",
+      "size": 916081
+    },
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0645.png",
+      "sha256": "cf72a678d549955aeb2d011bc90b129a2094ddbc18c608586c6f79134eee2fb2",
+      "size": 1085047
+    }
+  ],
+  "workload": {
+    "label": "20-page",
+    "command": "ocr-batch",
+    "page_count": 20
+  },
+  "model": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq",
+  "model_kind": "file",
+  "model_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+  "model_size": 4157448783,
+  "model_identity": {
+    "dev": 66308,
+    "ino": 46278308,
+    "size": 4157448783,
+    "mtime_ns": 1783652647330000000,
+    "ctime_ns": 1783892393733883688
+  },
+  "quant_recipe": "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1",
+  "threads": 8,
+  "warmup": 1,
+  "env_pins": {
+    "FOCR_TIMING": "1",
+    "FOCR_PROFILE_DECODE": "1",
+    "FOCR_THREADS": "8",
+    "OMP_NUM_THREADS": "8",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "focr_env": {
+    "FOCR_DECODE_INT8": "0",
+    "FOCR_INT8_ATTN": "0",
+    "FOCR_INT8_LMHEAD": "0",
+    "FOCR_MAX_NEW_TOKENS": "32",
+    "FOCR_MODEL_PATH": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq",
+    "FOCR_PROFILE_DECODE": "1",
+    "FOCR_THREADS": "8",
+    "FOCR_TIMING": "1"
+  },
+  "precision_gate_states": {
+    "FOCR_DECODE_INT8": "0",
+    "FOCR_INT8_ATTN": "0",
+    "FOCR_INT8_LMHEAD": "0",
+    "FOCR_ATTN_GEMM": "<unset>",
+    "FOCR_INT8_KV": "<unset>",
+    "FOCR_SPEC_DECODE": "<unset>",
+    "FOCR_DECODE_STATELESS": "<unset>"
+  },
+  "performance_switch_states": {
+    "FOCR_RSWA_PARALLEL_ATTN": "<unset>",
+    "FOCR_MMAP": "<unset>",
+    "FOCR_SOFTMAX_COPY": "<unset>",
+    "FOCR_UNLIMITED_VISION_CACHE": "<unset>",
+    "FOCR_INT8_AUTOVEC": "<unset>",
+    "FOCR_BATCHED_MOE": "<unset>",
+    "FOCR_BATCH_PACK": "<unset>",
+    "FOCR_BATCH_SIZE": "<unset>",
+    "FOCR_BATCH_SPINE": "<unset>",
+    "FOCR_BATCH_VISION": "<unset>",
+    "FOCR_MAX_NEW_TOKENS": "32"
+  },
+  "ab": {
+    "env": "FOCR_RSWA_PARALLEL_ATTN",
+    "arm": "a",
+    "label": "shipped-parallel",
+    "value": "<unset>",
+    "schedule_index": 6,
+    "arm_run": 3
+  }
+}

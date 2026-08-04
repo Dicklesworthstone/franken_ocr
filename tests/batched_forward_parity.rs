@@ -67,15 +67,14 @@ impl Rng {
 }
 
 /// Replica of `decoder::quantize_row_i8` (private): dynamic per-row symmetric int8,
-/// `a_scale = max|x|/127`, round-half-to-even via `f32::round`, clamp to `[-127,
-/// 127]`. Byte-for-byte the activation quantize the decode GEMV performs.
+/// `a_scale = max|x|/127`, true division, ties-to-even rounding, clamp to
+/// `[-127, 127]`. Byte-for-byte the activation quantize the decode GEMV performs.
 fn quantize_row_i8(x: &[f32]) -> (Vec<i8>, f32) {
     let amax = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let a_scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-    let inv = 1.0 / a_scale;
     let xq: Vec<i8> = x
         .iter()
-        .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8)
+        .map(|&v| (v / a_scale).round_ties_even().clamp(-127.0, 127.0) as i8)
         .collect();
     (xq, a_scale)
 }

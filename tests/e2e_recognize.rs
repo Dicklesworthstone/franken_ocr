@@ -48,6 +48,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+#[path = "support/parity_harness.rs"]
+mod parity_harness;
+
 use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
 use franken_ocr::{DEFAULT_MODEL_PATH, FocrError, MODEL_PATH_ENV, OcrEngine};
 
@@ -121,10 +124,32 @@ fn searched_dirs() -> Vec<String> {
 /// the 6.67 GB blob just to decide whether to skip, per §4.1). `None` ⇒
 /// skip-with-SUCCESS.
 fn resolve_present_model() -> Option<PathBuf> {
-    // `OcrEngine::model_path()` is the single source of truth for resolution
-    // (the `FOCR_MODEL_PATH` override, else `DEFAULT_MODEL_PATH`).
-    let p = OcrEngine::model_path();
-    if p.exists() { Some(p) } else { None }
+    // `recognize()` resolves through the FULL model-resolution policy — the
+    // `FOCR_MODEL_PATH` override, then the search dirs including the
+    // quant-suffixed names a `focr pull` installs (`unlimited-ocr.int8.focrq`,
+    // bd-3u6x) — so this guard must use the same surface. A bare
+    // `model_path().exists()` check misses a pulled artifact and lets the
+    // without-weights branch run against a resolvable model (surfaced
+    // 2026-07-06 when a dev cache was repopulated: recognize() found the int8
+    // artifact and failed with InputDecode instead of ModelNotFound).
+    franken_ocr::native_engine::OcrModel::resolve_model(&OcrEngine::model_path()).ok()
+}
+
+/// Env that arms the REAL-FORWARD e2e branches. A resolvable model alone
+/// must not arm them: a debug-profile full vision+decode forward is a
+/// multi-minute affair per test (measured 2026-07-06: a repopulated dev
+/// cache sent three present-model branches into the 600s forward budget on
+/// an M4 — exit 5, `cargo test` red for ~30 minutes). Set
+/// `FOCR_E2E_REAL_MODEL=1` — typically with a release-built harness — to
+/// run them; unset ⇒ skip-with-SUCCESS even when a model is cached.
+const REAL_MODEL_ARM_ENV: &str = "FOCR_E2E_REAL_MODEL";
+
+/// The model path for the real-forward branches: resolvable AND armed.
+fn armed_present_model() -> Option<PathBuf> {
+    match std::env::var_os(REAL_MODEL_ARM_ENV) {
+        Some(v) if !v.is_empty() && v != "0" => resolve_present_model(),
+        _ => None,
+    }
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -648,13 +673,185 @@ fn public_recognize_without_weights_is_model_not_found_or_defers() {
 ///   * A `ModelNotFound` here means the developer set `FOCR_MODEL_PATH` to a path
 ///     that does not resolve — a **misconfiguration FAIL** (§4.3: a model that
 ///     was *expected present* but does not resolve is not a silent skip).
+/// bd-1gv.25 S3: the MULTI-PAGE cross-page pass end-to-end over the real
+/// model (gated exactly like the single-image e2e): two tiny pages become ONE
+/// document — Base-640 preprocess ×2, one fused cross-page prefill, one AR
+/// decode, `finalize_multi` assembly. Asserts the public facade returns a
+/// well-formed `<PAGE>`-assembled markdown and that BOTH non-Unlimited
+/// refusal modes stay typed (the /nonexistent-model leg is covered by the CLI
+/// golden). Absent/unarmed ⇒ skip-with-SUCCESS (§4.3).
+#[test]
+fn recognize_multi_page_real_model_when_present_else_skip_with_success() {
+    let test = "recognize_multi_page_real_model_when_present_else_skip_with_success";
+    let case = "two_tiny_pages_one_document";
+
+    let Some(model_path) = armed_present_model() else {
+        log_line(
+            test,
+            case,
+            "skip",
+            "skip_no_model",
+            &format!("searched_dirs={:?}", searched_dirs()),
+        );
+        log_success(
+            test,
+            case,
+            &format!(
+                "multi-page e2e skipped: model not present or {REAL_MODEL_ARM_ENV} unarmed; \
+                 cross-page path unverified"
+            ),
+        );
+        return;
+    };
+
+    let page_a = write_tiny_png();
+    let page_b = write_tiny_png();
+    log_line(
+        test,
+        case,
+        "setup",
+        "pass",
+        &format!(
+            "model={} pages=2 note=\"one cross-page pass over two 4x4 RGB PNGs (Base-640)\"",
+            model_path.display(),
+        ),
+    );
+
+    let engine = OcrEngine::new().expect("OcrEngine::new builds");
+    let started = Instant::now();
+    let result = engine.recognize_multi_page(&[page_a.as_path(), page_b.as_path()]);
+    let elapsed_ms = started.elapsed().as_millis();
+
+    match result {
+        Ok(markdown) => {
+            assert!(
+                markdown.starts_with("<PAGE>"),
+                "finalize_multi assembly must lead with the page marker; got: {:?}",
+                &markdown[..markdown.len().min(120)]
+            );
+            let seps = markdown.matches("<PAGE>").count();
+            log_line(
+                test,
+                case,
+                "result",
+                "pass",
+                &format!(
+                    "elapsed_ms={elapsed_ms} markdown_bytes={} page_markers={seps} \
+                     note=\"cross-page pass completed; ngram_window=1024 in force\"",
+                    markdown.len(),
+                ),
+            );
+        }
+        Err(FocrError::NotImplemented(what)) => {
+            log_line(
+                test,
+                case,
+                "result",
+                "xfail",
+                &format!("elapsed_ms={elapsed_ms} stage_gap={what:?}"),
+            );
+            log_success(
+                test,
+                case,
+                "multi-page forward hit a documented NotImplemented stage gap (XFAIL)",
+            );
+        }
+        Err(other) => {
+            log_line(
+                test,
+                case,
+                "result",
+                "fail",
+                &format!("elapsed_ms={elapsed_ms} error={other:?}"),
+            );
+            panic!("multi-page e2e failed on a present model: {other:?}");
+        }
+    }
+}
+
+/// bd-2z0y: the STREAMING multi-page pass end-to-end over the real model —
+/// the per-page sink fires from the decode driver at `<PAGE>` boundaries,
+/// pages arrive in order starting at 1, the stream's page count equals the
+/// terminal assembly's marker count, and the terminal markdown is byte-equal
+/// to the non-streaming pass (streaming adds visibility, never changes the
+/// result). Absent/unarmed ⇒ skip-with-SUCCESS.
+#[test]
+fn multi_page_streaming_matches_terminal_assembly_when_armed() {
+    let test = "multi_page_streaming_matches_terminal_assembly_when_armed";
+    let case = "two_tiny_pages_streamed";
+
+    let Some(model_path) = armed_present_model() else {
+        log_success(
+            test,
+            case,
+            &format!("streaming e2e skipped: model not present or {REAL_MODEL_ARM_ENV} unarmed"),
+        );
+        return;
+    };
+
+    let load = |p: &PathBuf| image::open(p).expect("tiny fixture decodes");
+    let page_a = write_tiny_png();
+    let page_b = write_tiny_png();
+    let engine = OcrEngine::new().expect("OcrEngine::new builds");
+
+    // Streaming pass: collect (page, body) events.
+    let events: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink_events = events.clone();
+    let sink = Box::new(move |page: usize, body: &str| {
+        sink_events
+            .lock()
+            .expect("sink mutex")
+            .push((page, body.to_string()));
+    });
+    let streamed = engine
+        .recognize_multi_page_dynamic_streaming_with_model(
+            &model_path,
+            vec![load(&page_a), load(&page_b)],
+            sink,
+        )
+        .expect("streaming multi-page pass");
+
+    // Non-streaming pass over the SAME pages must assemble byte-identically.
+    let plain = engine
+        .recognize_multi_page_dynamic_with_model(&model_path, vec![load(&page_a), load(&page_b)])
+        .expect("plain multi-page pass");
+    assert_eq!(
+        streamed, plain,
+        "streaming must not change the terminal assembly"
+    );
+
+    let events = events.lock().expect("events mutex").clone();
+    let markers = streamed.matches("<PAGE>").count();
+    assert_eq!(
+        events.len(),
+        markers,
+        "one streamed page per terminal <PAGE> marker; events: {events:?}"
+    );
+    for (i, (page, _)) in events.iter().enumerate() {
+        assert_eq!(*page, i + 1, "pages must stream in order from 1");
+    }
+    log_line(
+        test,
+        case,
+        "result",
+        "pass",
+        &format!(
+            "streamed_pages={} markers={} markdown_bytes={} note=\"stream == terminal assembly\"",
+            events.len(),
+            markers,
+            streamed.len(),
+        ),
+    );
+}
+
 #[test]
 fn recognize_real_model_when_present_else_skip_with_success() {
     let test = "recognize_real_model_when_present_else_skip_with_success";
     let case = "tiny_fixture";
 
     // ── GUARD 1: absent ⇒ skip-with-SUCCESS ─────────────────────────────────
-    let Some(model_path) = resolve_present_model() else {
+    let Some(model_path) = armed_present_model() else {
         let target = OcrEngine::model_path();
         log_line(
             test,
@@ -667,7 +864,7 @@ fn recognize_real_model_when_present_else_skip_with_success() {
             test,
             case,
             &format!(
-                "e2e skipped: model not present at {}; native path unverified",
+                "e2e skipped: model not present or {REAL_MODEL_ARM_ENV} unarmed (target {}); native path unverified",
                 target.display()
             ),
         );
@@ -698,6 +895,20 @@ fn recognize_real_model_when_present_else_skip_with_success() {
 
     match result {
         Ok(markdown) => {
+            // bd-3kge: the SHARED determinism gate over the public entrypoint
+            // — a second recognize() of the same image must be BYTE-IDENTICAL
+            // under greedy (our-engine determinism; a divergence is a real
+            // bug, never noise).
+            let second = engine
+                .recognize(&image)
+                .expect("second recognize for the determinism gate");
+            parity_harness::assert_outputs_deterministic(
+                test,
+                case,
+                1,
+                markdown.as_bytes(),
+                second.as_bytes(),
+            );
             // Real output: assert non-empty + well-formed; log markdown + token
             // count + timing (the §4.3 mandate).
             let token_count = markdown.split_whitespace().count();
@@ -825,6 +1036,310 @@ fn recognize_real_model_when_present_else_skip_with_success() {
                 other.exit_code()
             );
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Model-gated e2e for `focr ocr -o/--output FILE` (bd-sreb). Drives the STABLE
+// CLI surface end-to-end and asserts the on-disk file contract the user asked
+// for: `.md` => markdown body, `.json` => structured JSON carrying the bounding
+// boxes. Skip-with-SUCCESS when the model or the binary is absent (§4.1).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A unique temp output path with the given extension (we never delete fixtures
+/// proactively — AGENTS.md RULE 1 — but a freshly-stamped name can't collide, and
+/// the test clears it before each run so the existence check is meaningful).
+fn unique_output_path(ext: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "focr_e2e_out_{}_{}.{ext}",
+        std::process::id(),
+        nanos
+    ))
+}
+
+/// Assert the structured-JSON output contract: a top-level string `markdown` plus
+/// a `layout` array whose entries are `{label: string, boxes: [[i64; 4], …]}`.
+/// Returns the number of layout spans for the SUCCESS log.
+fn assert_layout_json_contract(raw: &str) -> usize {
+    let v: serde_json::Value = serde_json::from_str(raw)
+        .unwrap_or_else(|e| panic!("`-o out.json` produced invalid JSON: {e}; body:\n{raw}"));
+    assert!(
+        v.get("markdown")
+            .and_then(serde_json::Value::as_str)
+            .is_some(),
+        "json output must carry a string `markdown`; body:\n{raw}"
+    );
+    let Some(layout) = v.get("layout").and_then(serde_json::Value::as_array) else {
+        panic!("json output must carry a `layout` array; body:\n{raw}");
+    };
+    for span in layout {
+        assert!(
+            span.get("label")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "every layout span must carry a string `label`: {span}"
+        );
+        let Some(boxes) = span.get("boxes").and_then(serde_json::Value::as_array) else {
+            panic!("every layout span must carry a `boxes` array: {span}");
+        };
+        for b in boxes {
+            let Some(coords) = b.as_array() else {
+                panic!("each box must be a JSON array: {b}");
+            };
+            assert_eq!(coords.len(), 4, "each box must be [x1, y1, x2, y2]: {b}");
+            assert!(
+                coords.iter().all(|c| c.is_i64() || c.is_u64()),
+                "box coordinates must be integers (model pixel grid): {b}"
+            );
+        }
+    }
+    layout.len()
+}
+
+/// `focr ocr <img> --model <real> -o out.<md|json>` end-to-end over a present
+/// model. `.md` must yield a non-empty markdown file; `.json` must yield valid
+/// JSON carrying `markdown` + a `layout` array of `{label, boxes}` with integer
+/// `[x1,y1,x2,y2]` boxes — the exact structured-output contract the CLI promises.
+/// A documented Phase forward gap (exit 1 `not yet implemented`) is an
+/// XFAIL-with-SUCCESS that tightens in automatically once the forward lands.
+#[test]
+fn cli_ocr_output_file_contract_when_model_present_else_skip() {
+    let test = "cli_ocr_output_file_contract_when_model_present_else_skip";
+    let case = "output_flag";
+
+    let Some(model_path) = armed_present_model() else {
+        log_line(
+            test,
+            case,
+            "skip",
+            "skip_no_model",
+            &format!("searched_dirs={:?}", searched_dirs()),
+        );
+        log_success(
+            test,
+            case,
+            "e2e skipped: no model present; `-o` file contract unverified",
+        );
+        return;
+    };
+    let Some(bin) = focr_bin() else {
+        log_success(
+            test,
+            case,
+            "focr binary not built in this `cargo test` invocation (CARGO_BIN_EXE_focr \
+             unset) — `-o` file contract unverified",
+        );
+        return;
+    };
+
+    let image = write_tiny_png();
+    let img = image.to_string_lossy().into_owned();
+    let model = model_path.to_string_lossy().into_owned();
+
+    // ── markdown output ─────────────────────────────────────────────────────
+    let md_out = unique_output_path("md");
+    let _ = std::fs::remove_file(&md_out);
+    let md_arg = md_out.to_string_lossy().into_owned();
+    let out = run_focr(&bin, &["ocr", &img, "--model", &model, "-o", &md_arg]);
+    match out.code {
+        Some(0) => {
+            let body = std::fs::read_to_string(&md_out).unwrap_or_else(|e| {
+                panic!("`-o out.md` exited 0 but no markdown file at {md_out:?}: {e}")
+            });
+            assert!(
+                !body.trim().is_empty(),
+                "`-o out.md` wrote an empty markdown file"
+            );
+            log_success(
+                test,
+                "output_md",
+                &format!(
+                    "`-o out.md` wrote {} chars of markdown",
+                    body.chars().count()
+                ),
+            );
+        }
+        Some(1) if out.stderr.contains("not yet implemented") => {
+            log_xfail(
+                test,
+                "output_md",
+                "exit 1 not-implemented",
+                "exit 0 + markdown file",
+            );
+            log_success(
+                test,
+                "output_md",
+                "forward still NotImplemented (documented phase gap); the file assertion \
+                 tightens in once the forward lands",
+            );
+        }
+        other => panic!(
+            "`focr ocr -o out.md` over a present model exited {other:?}; stderr:\n{}",
+            out.stderr
+        ),
+    }
+
+    // ── json output (must carry bounding boxes) ─────────────────────────────
+    let json_out = unique_output_path("json");
+    let _ = std::fs::remove_file(&json_out);
+    let json_arg = json_out.to_string_lossy().into_owned();
+    let out = run_focr(&bin, &["ocr", &img, "--model", &model, "-o", &json_arg]);
+    match out.code {
+        Some(0) => {
+            let raw = std::fs::read_to_string(&json_out).unwrap_or_else(|e| {
+                panic!("`-o out.json` exited 0 but no json file at {json_out:?}: {e}")
+            });
+            let spans = assert_layout_json_contract(&raw);
+            log_success(
+                test,
+                "output_json",
+                &format!(
+                    "`-o out.json` wrote valid JSON with `markdown` + a {spans}-span `layout` \
+                     carrying integer bounding boxes"
+                ),
+            );
+        }
+        Some(1) if out.stderr.contains("not yet implemented") => {
+            log_xfail(
+                test,
+                "output_json",
+                "exit 1 not-implemented",
+                "exit 0 + json file with boxes",
+            );
+            log_success(
+                test,
+                "output_json",
+                "forward still NotImplemented (documented phase gap); the JSON-with-boxes \
+                 assertion tightens in once the forward lands",
+            );
+        }
+        other => panic!(
+            "`focr ocr -o out.json` over a present model exited {other:?}; stderr:\n{}",
+            out.stderr
+        ),
+    }
+}
+
+/// Assert `path` is a non-empty PNG or JPEG by magic bytes (the two formats the
+/// figure extractor writes).
+fn assert_is_png_or_jpeg(path: &Path) {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read figure {path:?}: {e}"));
+    assert!(!bytes.is_empty(), "figure {path:?} is empty");
+    let is_png = bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    let is_jpeg = bytes.starts_with(&[0xFF, 0xD8, 0xFF]);
+    assert!(
+        is_png || is_jpeg,
+        "figure {path:?} is neither PNG nor JPEG (magic {:02X?})",
+        &bytes[..bytes.len().min(8)]
+    );
+}
+
+/// Model-gated e2e for `focr ocr --extract-figures` (bd-23s8). With a real model,
+/// `-o out.md --extract-figures` must exit clean and write a non-empty markdown
+/// file; if the model grounds any figure regions, every file it wrote into
+/// `out_figures/` is a valid PNG/JPEG AND is referenced by the markdown. (A 4×4
+/// fixture rarely yields figures, so figure PRESENCE is not asserted — the path
+/// running clean and any written figure being valid + referenced is.)
+/// Skip-with-SUCCESS when the model or binary is absent.
+#[test]
+fn cli_ocr_extract_figures_when_model_present_else_skip() {
+    let test = "cli_ocr_extract_figures_when_model_present_else_skip";
+    let case = "extract_figures";
+
+    let Some(model_path) = armed_present_model() else {
+        log_success(
+            test,
+            case,
+            "e2e skipped: no model present; --extract-figures path unverified",
+        );
+        return;
+    };
+    let Some(bin) = focr_bin() else {
+        log_success(
+            test,
+            case,
+            "focr binary not built (CARGO_BIN_EXE_focr unset); --extract-figures unverified",
+        );
+        return;
+    };
+
+    let image = write_tiny_png();
+    let img = image.to_string_lossy().into_owned();
+    let model = model_path.to_string_lossy().into_owned();
+    let md_out = unique_output_path("md");
+    let stem = md_out
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("doc")
+        .to_string();
+    let figdir = md_out.with_file_name(format!("{stem}_figures"));
+    let _ = std::fs::remove_file(&md_out);
+    let _ = std::fs::remove_dir_all(&figdir);
+    let md_arg = md_out.to_string_lossy().into_owned();
+
+    let out = run_focr(
+        &bin,
+        &[
+            "ocr",
+            &img,
+            "--model",
+            &model,
+            "-o",
+            &md_arg,
+            "--extract-figures",
+        ],
+    );
+    match out.code {
+        Some(0) => {
+            let body = std::fs::read_to_string(&md_out).unwrap_or_else(|e| {
+                panic!("--extract-figures exited 0 but no md at {md_out:?}: {e}")
+            });
+            assert!(
+                !body.trim().is_empty(),
+                "--extract-figures wrote an empty markdown file"
+            );
+            let mut n = 0usize;
+            if figdir.is_dir() {
+                for entry in std::fs::read_dir(&figdir).expect("read figures dir") {
+                    let p = entry.expect("figures dir entry").path();
+                    if p.is_file() {
+                        assert_is_png_or_jpeg(&p);
+                        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+                        assert!(
+                            body.contains(name),
+                            "figure file {name} is not referenced by the markdown:\n{body}"
+                        );
+                        n += 1;
+                    }
+                }
+            }
+            log_success(
+                test,
+                case,
+                &format!("--extract-figures ran clean; {n} valid figure(s) written + referenced"),
+            );
+        }
+        Some(1) if out.stderr.contains("not yet implemented") => {
+            log_xfail(
+                test,
+                case,
+                "exit 1 not-implemented",
+                "exit 0 + figures path",
+            );
+            log_success(
+                test,
+                case,
+                "forward still NotImplemented (documented phase gap); tightens in once it lands",
+            );
+        }
+        other => panic!(
+            "`focr ocr --extract-figures` over a present model exited {other:?}; stderr:\n{}",
+            out.stderr
+        ),
     }
 }
 

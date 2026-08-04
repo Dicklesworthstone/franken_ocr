@@ -120,13 +120,13 @@ fixtures + engine land.
 
 | Rung | Always-on coverage (runs today) | Gated coverage (needs fixtures + engine) | Status |
 |------|----------------------------------|-------------------------------------------|--------|
-| **L0** preprocess (EXACT) | gray-pad-127, `[-1,1]` normalize bounds, 273-token-census constants | full value-exact preprocessed-tensor + image-token-id-stream compare | **partial** — anchors live; tensor compare gated on the Phase-1 preprocess front end (`bd-1gv.2/3`) |
-| **L1** per-op (cosine) | cosine/ULP comparator math (synthetic) | per-stage `.npy` vs engine seam, cosine ≥ 0.9999 + ULP | **gated** — fixture+engine pending |
-| **L2** per-layer (cosine + ledger) | 12-decoder-layer + 3-vision-seam census; max-abs ledger shape | all 12 `decoder_layer_NN_hidden` + vision seams, per-layer max-abs ledger | **gated** |
-| **L3** logits (MEASURED + argmax) | the §2-floor → L3-tolerance derivation (synthetic two-run pair); argmax-stability | `lm_head_logits` within measured budget + argmax-match-where-deterministic | **gated** |
-| **L4** token (EXACT prefix) | exact-prefix logic over the reproducible prefix (synthetic) | greedy token stream EXACT over the §2 prefix per doc | **gated** |
-| **L5** e2e (exact-where-det + CER budget) | CER metric (Levenshtein) on synthetic strings | `focr ocr --json` vs golden text+bbox; CER/TEDS/Formula-CDM budget | **gated** (model-gated e2e) |
-| **differential** per-op (vs bf16) | row-shape contract + EngineIdentity-distinct guard | per-op + e2e diff vs the bf16 oracle through the ULP / L3–L5 tolerances | **gated** |
+| **L0** preprocess (EXACT target) | gray-pad-127, `[-1,1]` normalize bounds, 273-token-census constants | `preprocess::preprocess_image(<doc>)` global view vs oracle `sam_input`, EXACT-first with the documented `bd-30me`/DISC-001 resample envelope ledgered on the default kernel; `FOCR_RESAMPLE=pil-bicubic` is the EXACT path (also needs the source page image — `FOCR_CORPUS_DIR` / `pages/` beside the fixtures) | **wired** (bd-2ksr; EXACT via the DISC-001 kill-switch) |
+| **L1** per-op (cosine) | cosine/ULP comparator math (synthetic) | SAM (`sam_input`→`sam_output`), CLIP (oracle `sam_output`→`clip_output`), projector (oracle `clip+sam`→`projector_output`), each cosine ≥ 0.9999 + ULP ledger | **wired** (bd-2ksr, unlocked by bd-3s7v) |
+| **L2** per-layer (cosine + ledger) | 12-decoder-layer + 3-vision-seam census; max-abs ledger shape | projector stage + the layer-0 `inputs_embeds` splice (vision + `embed_tokens` + `fuse_no_crop`) with per-stage max-abs ledger; the 12-layer STACK ledgered via L4's prefill hidden vs `decoder_layer_11_hidden` | **wired** — per-layer 00..10 still needs a public single-layer engine entry (named in-rung) |
+| **L3** logits (MEASURED + argmax) | the §2-floor → L3-tolerance derivation (synthetic two-run pair); argmax-stability | `lm_head(decoder_layer_11_hidden)` vs `lm_head_logits`: argmax EXACT + cosine gate, max-abs ledgered | **wired** |
+| **L4** token (EXACT prefix) | exact-prefix logic over the reproducible prefix (synthetic) | engine greedy AR decode seeded from the oracle `inputs_embeds` vs `token_stream.generated_ids`, EXACT (the committed oracle run is fully deterministic ⇒ the prefix is the full stream) | **wired** (bd-2ksr, unlocked by bd-3s7v) |
+| **L5** text (exact-where-det + CER budget) | CER metric (Levenshtein) on synthetic strings | detokenize + `postprocess::finalize` over the L4 subject ids vs golden `decoded_text`, CER ≤ the documented 0.01 detok/postprocess budget (exact-match ledgered); the full-image `focr ocr` e2e lives in `tests/e2e_recognize.rs` + the off-repo CER harness | **wired** (bd-2ksr) |
+| **differential** per-op (vs bf16) | row-shape contract + EngineIdentity-distinct guard | projector §6.2 differential row (cosine-gated vs the bf16 oracle, f32-ULP ledgered); broader per-module matrix accretes with the remaining seams | **partial** — projector row wired |
 | **surface** (always-on anchors) | stable exit codes, robot schema self-describe, scrubber, comparator-normalize-first | — | **present** |
 
 The harness emits a coverage rollup implicitly via every rung's terminal
@@ -230,6 +230,36 @@ conforms to `tests/fixtures/test_log_schema.json` — the suite's own
 `validate_event` contract test asserts that conformance, so the log contract
 cannot drift unnoticed.
 
+### 7.5 The scorecard runner (bd-re8.19) — the per-commit parity receipt
+
+`scripts/ladder_scorecard.sh` is the single entry the phase exit gates and the
+three-pillar cert call. It runs the whole ladder **in order** in one process
+(`--test-threads=1`; the rungs are named `l0_..l5_` so alphabetical == ladder
+order), captures the rungs' own NDJSON, and folds it into ONE artifact:
+
+```bash
+# Unarmed: skip-honest scorecard (all_green:false, skipped_no_model:true).
+scripts/ladder_scorecard.sh --out scorecard.json
+
+# Armed: the real receipt (env exactly as §7 above).
+FOCR_FIXTURES_DIR=... FOCR_MODEL_PATH=... scripts/ladder_scorecard.sh --out scorecard.json
+
+# Fold self-test (synthetic NDJSON; no cargo, sub-second):
+scripts/ladder_scorecard.sh --self-test
+```
+
+Scorecard schema `focr-ladder-scorecard/v1`: per-gate
+`{gate, outcome, meaningful, parity_rows, worst:{metric,value,tolerance}}` +
+`all_green` + `skipped_no_model` + a one-line `receipt` string (the per-commit
+parity receipt, e.g. `L4 token_exact_fraction=1; L5 cer=0`). Short-circuit
+semantics: every rung still RUNS, but rungs above the first failure are marked
+`not_meaningful:below_LN` so a single lower-gate break reads as ONE failure,
+not six. A skipped ladder is NEVER green: `all_green` requires
+`skipped_no_model:false`. The raw NDJSON is preserved beside `--out` (`.json`
+swapped for `.raw.ndjson`) — the fold is a summary; the rows are the evidence.
+Canonical shapes (armed all-green + unarmed skip) are committed under
+`tests/fixtures/ladder_scorecard/`.
+
 ---
 
 ## 8. Relationship to the rest of the conformance pillar
@@ -245,3 +275,47 @@ Differential = "same as reference (any input)"; metamorphic = "self-consistent
 under transforms (no oracle)"; golden = "no regression vs frozen good output". This
 harness is the L0–L5 spine all three hang off, and its comparator is the single
 shared kernel.
+
+---
+
+## 9. The per-model generalization (model zoo, `bd-3jo6.1.10`)
+
+`tests/parity_ladder.rs` is the **Unlimited-OCR** instantiation. Every zoo
+model re-instantiates the same ladder, but its rungs live **in the module that
+implements the model** (armed `#[test]`s, env-gated) rather than in a second
+top-level harness file — the module owns its own conformance the same way it
+owns its math. Four instantiations exist; B8/C8/D6 each closed against this
+pattern with measured budgets:
+
+| Model | Oracle fixtures (own floor FIRST) | Rungs live in | e2e NDJSON script | Arming env |
+|-------|-----------------------------------|---------------|-------------------|------------|
+| Unlimited-OCR | `scripts/gen_reference_fixtures.py` | `tests/parity_ladder.rs` | `scripts/e2e_smoke.sh` | `FOCR_FIXTURES_DIR` + `FOCR_MODEL_PATH` |
+| GOT-OCR2 | `scripts/gen_reference_fixtures_got.py`, `gen_got_token_id_fixtures.py`, `gen_got_format_corpus.py` | `src/native_engine/got.rs`, `vision_sam.rs`, `decoder_qwen2.rs`, `postprocess.rs` | `scripts/spec_gate_e2e.sh` | `FOCR_GOT_DIR` |
+| SmolVLM2-500M | `scripts/gen_reference_fixtures_smolvlm2.py`, `…_smolvlm2_vision.py`, `gen_smolvlm2_token_id_fixtures.py`, `gen_smolvlm2_vqa_fixtures.py` | `src/native_engine/smolvlm2.rs`, `vision_siglip.rs`, `token_compress.rs` | `scripts/smolvlm2_convert_e2e.sh`, `smolvlm2_describe_e2e.sh` | `FOCR_SMOLVLM2_DIR` |
+| OneChart | `scripts/gen_reference_fixtures_onechart.py` | `src/native_engine/onechart.rs`, `decoder_qwen2.rs` | `scripts/onechart_chart_e2e.sh` | `FOCR_ONECHART_DIR` |
+
+**The recipe a new model lane (TrOMR E, TrOCR/pix2tex F) follows:**
+
+1. **Census spec first** (`docs/zoo/<model>-spec.md`) — architecture, seams,
+   prompt contract, quant policy. No rung ships against an unresolved `[OPEN]`.
+2. **Oracle fixture script** `scripts/gen_reference_fixtures_<model>.py` — runs
+   the pinned torch oracle **twice** (two thread counts) and records the
+   model's **own** nondeterminism floor in the fixture JSON *before* any
+   tolerance exists (§6 applies per model; floors are NOT transferable between
+   models).
+3. **Armed in-module rungs**, mirroring the L0–L5 ladder: L0 preprocess exact →
+   prompt ids exact (tokenizer conformance gate) → per-op/per-seam cosine ≈ 1 →
+   prefill logits/argmax vs oracle → greedy decode token-exact over the
+   **measured** exact-prefix (near-tie flips are ledger-gated — see
+   DISCREPANCIES DISC-003: same-precision kvcache-vs-prefill reduction-order
+   divergence compounds autoregressively) → task-quality budget (CER / VQA
+   containment / number-head distance) measured in BOTH precisions.
+4. **Skip-with-SUCCESS gating**: without the model dir the rung logs a skip
+   and passes; with it, the rung is a hard gate. Negative-path proof via a
+   `/nonexistent` model (clean `ModelNotFound`, never a fallback).
+5. **e2e NDJSON script** `scripts/<model>_*_e2e.sh` — versioned schema,
+   data-only stdout, gate/bin/negative/task steps (D8's
+   `onechart_chart_e2e.sh` is the current template).
+6. **Budget provenance**: every numeric tolerance in a rung cites the
+   measurement that produced it (fixture floor, ledger entry, or an
+   in-test comment with the measured value and date). Never `0.055`.

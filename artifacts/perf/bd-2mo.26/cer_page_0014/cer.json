@@ -1,0 +1,22 @@
+{
+  "aggregate": {
+    "pages_total": 1,
+    "pages_with_hyp": 1,
+    "exact_raw": 0,
+    "exact_norm": 0,
+    "cer_raw": 0.03718,
+    "cer_norm": 0.03529
+  },
+  "pages": [
+    {
+      "page": "page_0014.md",
+      "status": "OK",
+      "ref_chars": 511,
+      "hyp_chars": 530,
+      "cer_raw": 0.03718,
+      "cer_norm": 0.03529,
+      "exact": false,
+      "exact_norm": false
+    }
+  ]
+}

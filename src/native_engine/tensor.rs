@@ -147,7 +147,8 @@ impl Mat {
 /// quantized by default; attention/lm_head int8 is opt-in behind kill-switches.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QInt8 {
-    /// Row-major `[n, k]` int8 weights.
+    /// Int8 weights in the byte order [`Self::layout`] declares (row-major
+    /// `[n, k]` unless an offline-packed artifact kept its panels).
     pub w: Vec<i8>,
     /// Per-output-channel scales, length `n`.
     pub scales: Vec<f32>,
@@ -155,6 +156,26 @@ pub struct QInt8 {
     pub n: usize,
     /// Input dimension (contraction length / number of columns).
     pub k: usize,
+    /// Byte order of `w`. [`WeightLayout::RowMajor`] everywhere except when
+    /// the loader keeps an `--arch aarch64-smmla` artifact's offline panels
+    /// because the SMMLA tier is dispatched (bd-2mo.3 zero-shuffle path).
+    pub layout: WeightLayout,
+}
+
+/// Byte order of a [`QInt8`]'s weight buffer.
+///
+/// The quantized VALUES are identical in either layout (the packing is a pure
+/// zero-padded permutation — [`crate::simd::pack`]); only the byte order
+/// differs. Every GEMV entry point in `decoder.rs` accepts both and produces
+/// bit-identical i32 accumulations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightLayout {
+    /// Canonical PyTorch `[out, in]` row-major (`n * k` bytes).
+    RowMajor,
+    /// Offline SMMLA `[2 rows × 8 cols]` panels
+    /// (`ceil(n/2) * ceil(k/8) * 16` bytes; see
+    /// [`crate::simd::pack::smmla_pack_panels`]).
+    SmmlaPanels,
 }
 
 impl QInt8 {
@@ -174,7 +195,56 @@ impl QInt8 {
             scales.len(),
             n
         );
-        Self { w, scales, n, k }
+        Self {
+            w,
+            scales,
+            n,
+            k,
+            layout: WeightLayout::RowMajor,
+        }
+    }
+
+    /// Construct from OFFLINE-packed SMMLA panels (`focr convert --arch
+    /// aarch64-smmla`, kept packed by the loader when the SMMLA tier is
+    /// dispatched — bd-2mo.3).
+    ///
+    /// # Panics
+    /// Panics on a length mismatch (`w.len() !=
+    /// [`crate::simd::pack::smmla_packed_len`]` or `scales.len() != n`).
+    #[must_use]
+    pub fn new_smmla_panels(w: Vec<i8>, scales: Vec<f32>, n: usize, k: usize) -> Self {
+        let len = crate::simd::pack::smmla_packed_len(n, k);
+        assert_eq!(
+            w.len(),
+            len,
+            "QInt8: panel len {} != ceil(n/2)*ceil(k/8)*16 {}",
+            w.len(),
+            len
+        );
+        assert_eq!(
+            scales.len(),
+            n,
+            "QInt8: scales len {} != n {}",
+            scales.len(),
+            n
+        );
+        Self {
+            w,
+            scales,
+            n,
+            k,
+            layout: WeightLayout::SmmlaPanels,
+        }
+    }
+
+    /// The weight-buffer byte length [`Self::layout`] implies (`n*k` row-major;
+    /// `ceil(n/2)*ceil(k/8)*16` for offline SMMLA panels).
+    #[must_use]
+    pub fn expected_w_len(&self) -> usize {
+        match self.layout {
+            WeightLayout::RowMajor => self.n * self.k,
+            WeightLayout::SmmlaPanels => crate::simd::pack::smmla_packed_len(self.n, self.k),
+        }
     }
 }
 

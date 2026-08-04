@@ -1,0 +1,3 @@
+[focr-timing]   tromr.encode 0.22s (w 800, 401 ctx tokens)
+[focr-timing]   tromr.generate 68 steps 2.32s
+[focr-timing] tromr forward 2.56s (1/1 staves recognized, semantic 726 chars total)

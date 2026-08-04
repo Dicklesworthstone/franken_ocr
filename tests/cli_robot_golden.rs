@@ -20,7 +20,8 @@
 //!   [R2] that line canonicalizes BYTE-FOR-BYTE to the frozen
 //!        `tests/fixtures/robot_schema_v1.json` contract fixture.               -> robot_schema_matches_frozen_contract_fixture
 //!   [R3] `schema_version` == `ROBOT_SCHEMA_VERSION` (== 1).                    -> robot_schema_advertises_version_and_all_events
-//!   [R4] every `EVENT_KIND` (`run_start,stage,page,run_complete,run_error`)
+//!   [R4] every `EVENT_KIND`
+//!        (`run_start,stage,page,staff,music_warning,run_complete,run_error`)
 //!        is present in the advertised `events`.                                -> robot_schema_advertises_version_and_all_events
 //!   [R5] `robot health` is a single JSON line carrying `schema_version`.       -> robot_health_golden
 //!   [R6] `robot backends` is a single JSON line; host CPU/SIMD fields scrubbed. -> robot_backends_golden
@@ -28,7 +29,7 @@
 //!   [R8] `ocr --robot` errors emit run_start then run_error.code from
 //!        FocrError::exit_code.                                                -> ocr_robot_error_stream_matches_exit_code
 //! CLI surface (`src/cli.rs`):
-//!   [C1] `--help` (root/tree) renders the frozen help golden and excludes pdf. -> cli_root_help_golden / full_help_tree_has_no_pdf
+//!   [C1] `--help` renders the frozen root golden; `ocr --help` documents PDF.   -> cli_root_help_golden / ocr_help_documents_pdf_input
 //!   [C2] `--version` renders `focr <version>` (version scrubbed).             -> cli_version_golden
 //!   [C3] `ocr`    -> env/default model resolver; missing default exits 3.      -> exit_code_conformance / ocr_default_model_not_found_golden
 //!   [C4] `convert`-> NotImplemented, exit 1.                                   -> exit_code_conformance / convert_not_implemented_golden
@@ -59,10 +60,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use franken_ocr::FOCR_MODEL_LICENSE_NOTICE;
+use franken_ocr::native_engine::model_arch::arch_by_id;
 use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
+use franken_ocr::quant::focrq::{FocrqBuilder, WriteDType};
 
 const FORCE_TEST_ERROR_ENV: &str = "FOCR_TEST_FORCE_ERROR";
 const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
+const RUN_STORE_ENV: &str = "FOCR_RUN_STORE";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Structured NDJSON test logging (docs/conformance/GOLDEN.md §6; the shape mirrors
@@ -105,6 +109,21 @@ fn run_focr_command(mut command: Command, _args: &[&str]) -> Output {
     command.output().expect("failed to spawn focr binary")
 }
 
+/// A hermetic HOME for every golden invocation: the engine's model resolver
+/// searches the USER CACHE (`$HOME/.cache/franken_ocr/models`) as a default
+/// dir, so a developer box with a pulled artifact would flip `model_present`
+/// and every model-not-found golden. Pointing HOME (and the Windows
+/// equivalents) at an empty per-process temp dir makes "no model" true by
+/// construction instead of by hope.
+fn hermetic_home() -> &'static PathBuf {
+    static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("focr_golden_home_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
 /// Run `focr <args...>` with a hermetic environment (no `FOCR_*` / golden-update
 /// leakage from the dev shell into the captured output) and return the raw output.
 fn run_focr(args: &[&str]) -> Output {
@@ -113,7 +132,12 @@ fn run_focr(args: &[&str]) -> Output {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env_remove(MODEL_DIR_ENV)
+        .env(RUN_STORE_ENV, fresh_run_store_path())
+        .env("HOME", hermetic_home())
+        .env("LOCALAPPDATA", hermetic_home())
+        .env("USERPROFILE", hermetic_home())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
 }
@@ -124,7 +148,9 @@ fn run_focr_with_model_path(args: &[&str], model_path: &Path) -> Output {
         .args(args)
         .env("FOCR_MODEL_PATH", model_path.as_os_str())
         .env_remove(MODEL_DIR_ENV)
+        .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
 }
@@ -135,7 +161,9 @@ fn run_focr_with_model_dir(args: &[&str], model_dir: &Path) -> Output {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env(MODEL_DIR_ENV, model_dir.as_os_str())
+        .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env_remove(FORCE_TEST_ERROR_ENV);
     run_focr_command(command, args)
 }
@@ -146,9 +174,23 @@ fn run_focr_with_forced_error(args: &[&str], forced_error: &str) -> Output {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env_remove(MODEL_DIR_ENV)
+        .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
+        .env_remove("FOCR_INT8_AUTOVEC")
         .env(FORCE_TEST_ERROR_ENV, forced_error);
     run_focr_command(command, args)
+}
+
+fn fresh_run_store_path() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "focr_golden_run_store_{}_{}.db",
+        std::process::id(),
+        nanos
+    ))
 }
 
 fn future_focrq_preamble() -> Vec<u8> {
@@ -191,6 +233,56 @@ fn write_future_focrq_in_temp_model_dir(file_name: &str) -> PathBuf {
     dir
 }
 
+fn compatible_focrq_blob() -> Vec<u8> {
+    // The health tests exercise path resolution + bounded header compatibility,
+    // not the 2,710-entry Unlimited-OCR production census. Use a registered
+    // non-default model id so the tiny fixture remains truthful instead of
+    // impersonating a complete Unlimited-OCR artifact.
+    let arch = arch_by_id("got-ocr2").expect("GOT-OCR2 test arch is registered");
+    let mut builder = FocrqBuilder::new()
+        .with_model_id(arch.id())
+        .with_license_notice(arch.license_notice());
+    builder
+        .add_tensor(
+            "model.embed_tokens.weight",
+            WriteDType::Bf16,
+            vec![1, 1],
+            vec![0; 2],
+        )
+        .expect("add minimal compatible high-precision tensor");
+    builder.build()
+}
+
+fn write_compatible_focrq() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let path = std::env::temp_dir().join(format!(
+        "focr_golden_compatible_{}_{}.focrq",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::write(&path, compatible_focrq_blob()).expect("write compatible .focrq fixture");
+    path
+}
+
+fn write_compatible_focrq_in_temp_model_dir(file_name: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = std::env::temp_dir().join(format!(
+        "focr_golden_compatible_model_dir_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    std::fs::create_dir_all(&dir).expect("create compatible model dir fixture");
+    std::fs::write(dir.join(file_name), compatible_focrq_blob())
+        .expect("write compatible .focrq fixture in model dir");
+    dir
+}
+
 /// `stdout` of `focr <args...>` as a UTF-8 string (lossy is fine; these surfaces
 /// are ASCII/UTF-8 by contract).
 fn stdout_of(args: &[&str]) -> String {
@@ -228,6 +320,9 @@ fn scrub(s: &str) -> String {
     out = out.replace(pkg_version(), "[version]");
     // host logical-cpu count in `robot backends` -> [cpus]
     out = scrub_json_int_field(&out, "logical_cpus");
+    // the resolved FOCR_THREADS/physical-core budget (bd-223.2) is equally
+    // host-dependent -> scrubbed the same way
+    out = scrub_json_int_field(&out, "threads");
     // host-specific model search paths in model-not-found stderr -> stable token
     out = scrub_model_search_dirs(&out);
     out
@@ -305,6 +400,14 @@ fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
 
     assert_nonempty_string(tiers.get("selected"), "simd_tiers.selected");
     assert_nonempty_string(tiers.get("selected_feature"), "simd_tiers.selected_feature");
+    assert_nonempty_string(
+        tiers.get("hardware_selected"),
+        "simd_tiers.hardware_selected",
+    );
+    assert_nonempty_string(
+        tiers.get("hardware_selected_feature"),
+        "simd_tiers.hardware_selected_feature",
+    );
     assert_eq!(
         tiers
             .get("override_env")
@@ -314,8 +417,15 @@ fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
     );
     assert_eq!(
         tiers.get("status").and_then(serde_json::Value::as_str),
-        Some("runtime detection active"),
+        Some("runtime capability and effective-route selection active"),
         "robot backends must not regress to the stale Phase-3 placeholder"
+    );
+    assert_eq!(
+        tiers
+            .get("selection_scope")
+            .and_then(serde_json::Value::as_str),
+        Some("ordinary_dense_int8"),
+        "the effective route must not overclaim packed-int4 or packed-SMMLA dispatch"
     );
 
     let available = tiers.get("available").and_then(serde_json::Value::as_array);
@@ -337,6 +447,11 @@ fn scrub_robot_backend_tiers(v: &mut serde_json::Value) {
     tiers.insert("selected".into(), serde_json::json!("[simd-tier]"));
     tiers.insert(
         "selected_feature".into(),
+        serde_json::json!("[simd-feature]"),
+    );
+    tiers.insert("hardware_selected".into(), serde_json::json!("[simd-tier]"));
+    tiers.insert(
+        "hardware_selected_feature".into(),
         serde_json::json!("[simd-feature]"),
     );
     tiers.insert(
@@ -601,7 +716,15 @@ fn unified_diff(expected: &str, actual: &str) -> String {
 /// `robot::ROBOT_SCHEMA_VERSION`.
 const EXPECTED_SCHEMA_VERSION: u64 = 1;
 /// `robot::EVENT_KINDS` — every kind MUST appear in the advertised `events`.
-const EXPECTED_EVENT_KINDS: &[&str] = &["run_start", "stage", "page", "run_complete", "run_error"];
+const EXPECTED_EVENT_KINDS: &[&str] = &[
+    "run_start",
+    "stage",
+    "page",
+    "staff",
+    "music_warning",
+    "run_complete",
+    "run_error",
+];
 
 // ════════════════════════════════════════════════════════════════════════════
 // [R1]–[R4] ROBOT-SCHEMA CONTRACT TEST (the agent-ergonomics contract — bd-zc1o)
@@ -812,7 +935,7 @@ fn robot_health_golden() {
 #[test]
 fn robot_health_reports_model_present_for_sniffable_model_path() {
     let test = "robot_health_reports_model_present_for_sniffable_model_path";
-    let model = write_future_focrq();
+    let model = write_compatible_focrq();
     let raw = stdout_of_with_model_path(&["robot", "health"], &model);
     let line = raw
         .lines()
@@ -837,7 +960,7 @@ fn robot_health_reports_model_present_for_sniffable_model_path() {
 #[test]
 fn robot_health_reports_model_present_for_model_dir_direct_artifact() {
     let test = "robot_health_reports_model_present_for_model_dir_direct_artifact";
-    let model = write_future_focrq();
+    let model = write_compatible_focrq();
     let raw = stdout_of_with_model_dir(&["robot", "health"], &model);
     let line = raw
         .lines()
@@ -871,7 +994,7 @@ fn robot_health_reports_model_present_for_model_dir_direct_artifact() {
 #[test]
 fn robot_health_reports_model_present_for_model_dir_default_basename() {
     let test = "robot_health_reports_model_present_for_model_dir_default_basename";
-    let dir = write_future_focrq_in_temp_model_dir("unlimited-ocr.focrq");
+    let dir = write_compatible_focrq_in_temp_model_dir("unlimited-ocr.focrq");
     let raw = stdout_of_with_model_dir(&["robot", "health"], &dir);
     let line = raw
         .lines()
@@ -938,6 +1061,270 @@ fn robot_backends_golden() {
         "logical_cpus field must be present (scrubbed); got:\n{scrubbed}"
     );
     assert_golden(test, "robot_backends", &format!("{scrubbed}\n"));
+}
+
+/// [A12/bd-3jo6.1.12] `focr robot selftest` e2e: EVERY registered int8-decoder
+/// model gets a machine-readable parity verdict against the scalar oracle on
+/// this host, each with its own worst-case-K overflow row (doctrine #6 per
+/// model). Runs weight-free by design (synthetic operands), so this e2e needs
+/// no model gating. Subprocess legs force every host-available ISA tier and
+/// prove the named branch executed; unknown and unavailable tags must leave the
+/// native route unchanged.
+#[test]
+fn robot_selftest_proves_per_model_kernel_parity_e2e() {
+    let test = "robot_selftest_proves_per_model_kernel_parity_e2e";
+    let out = run_focr(&["robot", "selftest"]);
+    assert!(
+        out.status.success(),
+        "robot selftest must exit 0 on a parity-clean host; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .expect("selftest line");
+    let v = parse_json_line(line, "robot selftest");
+
+    assert_eq!(
+        v["schema_version"].as_u64(),
+        Some(EXPECTED_SCHEMA_VERSION),
+        "selftest must carry schema_version; line: {line}"
+    );
+    assert_eq!(v["command"].as_str(), Some("robot.selftest"));
+    assert_eq!(v["verdict"].as_str(), Some("pass"));
+    assert_eq!(v["all_ok"].as_bool(), Some(true));
+    assert_eq!(v["route_consistent"].as_bool(), Some(true));
+    let selected = v["selected"].as_str().expect("selected effective route");
+    let hardware_selected = v["hardware_selected"]
+        .as_str()
+        .expect("selected hardware tier");
+    assert_nonempty_string(v.get("selected_feature"), "selftest.selected_feature");
+    assert_nonempty_string(
+        v.get("hardware_selected_feature"),
+        "selftest.hardware_selected_feature",
+    );
+    assert_eq!(
+        v["executed_routes"],
+        serde_json::json!([selected]),
+        "the native selftest must observe exactly the selected effective route"
+    );
+    assert_eq!(
+        v["oracle_independent"].as_bool(),
+        Some(!matches!(selected, "autovec" | "scalar")),
+        "scalar/autovec compare the same scalar implementation; intrinsic tiers are independent"
+    );
+    let available_tiers: Vec<String> = v["available"]
+        .as_array()
+        .expect("available tier array")
+        .iter()
+        .map(|tier| tier.as_str().expect("available tier tag").to_owned())
+        .collect();
+    assert!(
+        available_tiers.iter().any(|tier| tier == hardware_selected),
+        "selected hardware tier must be available"
+    );
+    let total = v["cases_total"].as_u64().expect("cases_total");
+    assert_eq!(
+        v["cases_passed"].as_u64(),
+        Some(total),
+        "every case must pass on the build host; line: {line}"
+    );
+    assert!(total > 0, "selftest must actually run cases");
+
+    // The per-model rollup: every registered int8 decoder, stable ids, all pass.
+    let models = v["models"].as_array().expect("models array");
+    let ids: Vec<&str> = models
+        .iter()
+        .map(|m| m["id"].as_str().expect("model id"))
+        .collect();
+    assert_eq!(
+        ids,
+        ["unlimited-ocr", "got-ocr2", "smolvlm2", "onechart"],
+        "the rollup must enumerate every registered int8 decoder (TrOMR is f32-only by design)"
+    );
+    for m in models {
+        assert_eq!(
+            m["verdict"].as_str(),
+            Some("pass"),
+            "model {} must pass on the build host",
+            m["id"]
+        );
+    }
+
+    // Doctrine #6 PER MODEL: each zoo decoder carries its own worst-case-K
+    // overflow row (constant-extreme operands at that model's largest K).
+    let cases = v["cases"].as_array().expect("cases array");
+    for want in [
+        "overflow:max_mag_k6848",
+        "got-ocr2:overflow_k2816",
+        "smolvlm2:overflow_k2560",
+        "onechart:overflow_k3072",
+    ] {
+        assert!(
+            cases.iter().any(|c| c["label"].as_str() == Some(want)),
+            "worst-case-K overflow row {want} must be present; labels: {:?}",
+            cases
+                .iter()
+                .map(|c| c["label"].as_str().unwrap_or(""))
+                .collect::<Vec<_>>()
+        );
+    }
+    tlog!(test,
+        "case": "native_tier",
+        "event": "stage",
+        "stage": "selftest_native",
+        "inputs": {"argv": ["robot", "selftest"]},
+        "result": "pass",
+        "detail": {
+            "selected": v["selected"].clone(),
+            "cases_total": total,
+            "models": ids,
+        },
+    );
+
+    let run_with_force = |force: &str| {
+        let mut command = Command::new(focr_bin());
+        command
+            .args(["robot", "selftest"])
+            .env_remove("FOCR_MODEL_PATH")
+            .env_remove(MODEL_DIR_ENV)
+            .env(RUN_STORE_ENV, fresh_run_store_path())
+            .env("HOME", hermetic_home())
+            .env("LOCALAPPDATA", hermetic_home())
+            .env("USERPROFILE", hermetic_home())
+            .env_remove("FOCR_INT8_AUTOVEC")
+            .env_remove(FORCE_TEST_ERROR_ENV)
+            .env("FOCR_FORCE_ARCH", force);
+        let out = run_focr_command(command, &["robot", "selftest"]);
+        assert!(
+            out.status.success(),
+            "{force}-forced selftest must exit 0; stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .expect("forced selftest line");
+        parse_json_line(line, &format!("robot selftest ({force})"))
+    };
+
+    // Leg 2: force EVERY host-available ISA tier end-to-end. The execution trace
+    // is branch-derived, so a metadata-only override cannot satisfy this proof.
+    for tier in &available_tiers {
+        let forced = run_with_force(tier);
+        assert_eq!(forced["selected"].as_str(), Some(tier.as_str()));
+        assert_eq!(
+            forced["hardware_selected"].as_str(),
+            Some(tier.as_str()),
+            "forced ISA selection must match the requested available tier"
+        );
+        assert_eq!(
+            forced["executed_routes"],
+            serde_json::json!([tier.as_str()])
+        );
+        assert_eq!(forced["route_consistent"].as_bool(), Some(true));
+        assert_eq!(forced["verdict"].as_str(), Some("pass"));
+        assert_eq!(
+            forced["oracle_independent"].as_bool(),
+            Some(tier != "scalar")
+        );
+        tlog!(test,
+            "case": format!("forced_{tier}"),
+            "event": "result",
+            "stage": "selftest_forced_route",
+            "inputs": {"argv": ["robot", "selftest"], "env": {"FOCR_FORCE_ARCH": tier}},
+            "result": "pass",
+            "detail": "override and branch-derived execution route agree",
+        );
+    }
+
+    // Leg 3: unknown and host-unavailable tags are true no-ops. On Apple this
+    // specifically proves they do not disable the default autovec route merely
+    // because FOCR_FORCE_ARCH is present.
+    let unavailable_known = ["sdot", "smmla", "avx2", "avxvnni", "avx512vnni"]
+        .into_iter()
+        .find(|candidate| !available_tiers.iter().any(|tier| tier == candidate))
+        .expect("every host must lack at least one tier from the other architecture");
+    for ignored in ["definitely-unsupported", unavailable_known] {
+        let forced = run_with_force(ignored);
+        assert_eq!(forced["selected"].as_str(), Some(selected));
+        assert_eq!(
+            forced["hardware_selected"].as_str(),
+            Some(hardware_selected)
+        );
+        assert_eq!(forced["executed_routes"], serde_json::json!([selected]));
+        assert_eq!(forced["route_consistent"].as_bool(), Some(true));
+    }
+}
+
+/// bd-2z0y: `focr ocr --multi-page` is PDF-only and refuses non-composable
+/// flags with clean Usage errors (exit 2) — never a panic, never a silent
+/// per-page fallback.
+#[test]
+fn ocr_multi_page_flag_guards_are_typed_usage_errors() {
+    let test = "ocr_multi_page_flag_guards_are_typed_usage_errors";
+    // Non-PDF input: --multi-page is a usage error naming the batch alternative.
+    let out = run_focr(&["ocr", "scan.png", "--multi-page"]);
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "--multi-page on a non-PDF must be Usage exit 2; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ocr-batch --multi-page"),
+        "the error must point at the image-list alternative; got: {stderr}"
+    );
+    tlog!(test,
+        "case": "non_pdf_guard",
+        "event": "result",
+        "inputs": {"argv": ["ocr", "scan.png", "--multi-page"]},
+        "exit_code": out.status.code(),
+        "result": "pass",
+    );
+}
+
+/// bd-1gv.25 S2: `focr batch --multi-page` parses, routes to the cross-page
+/// pass, and (hermetically, with no model present) fails with the CLEAN
+/// ModelNotFound contract (exit 3) — proving the flag reaches the engine
+/// facade rather than being ignored or panicking. The /nonexistent-model leg
+/// proves the same via an explicit --model path.
+#[test]
+fn batch_multi_page_flag_routes_to_the_cross_page_pass() {
+    let test = "batch_multi_page_flag_routes_to_the_cross_page_pass";
+    let out = run_focr(&["ocr-batch", "a.png", "b.png", "--multi-page", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "no model in a hermetic HOME must be ModelNotFound exit 3; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let out2 = run_focr(&[
+        "ocr-batch",
+        "a.png",
+        "b.png",
+        "--multi-page",
+        "--model",
+        "/nonexistent-model.focrq",
+        "--json",
+    ]);
+    assert_eq!(
+        out2.status.code(),
+        Some(3),
+        "an explicit missing model must be ModelNotFound exit 3; stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+    tlog!(test,
+        "case": "multi_page_flag",
+        "event": "result",
+        "inputs": {"argv": ["ocr-batch", "a.png", "b.png", "--multi-page", "--json"]},
+        "exit_code": out.status.code(),
+        "result": "pass",
+        "detail": "flag parses + routes; hermetic no-model and /nonexistent-model both exit 3 cleanly",
+    );
 }
 
 /// [R7] Robot mode is DATA-ONLY on stdout: every `robot <cmd>` writes a single
@@ -1150,7 +1537,7 @@ fn ocr_robot_future_focrq_stream_matches_exit_code() {
         run_error["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("format_version")
+            .contains("format version")
     );
     assert!(
         stderr.trim().is_empty(),
@@ -1277,12 +1664,13 @@ fn cli_root_help_golden() {
     assert_golden_capture(test, "cli_help_root", &scrubbed);
 }
 
-/// The CLI surface is v1 image-only. Plan §7.7 explicitly says the excluded
-/// document format must not appear anywhere in the help tree until native
-/// rasterization is deliberately scoped and parity-tested.
+/// Native PDF rasterization shipped (bd-0a7): plan §7.7's gate — "excluded until
+/// native rasterization is deliberately scoped and parity-tested" — has been met,
+/// so `focr ocr --help` MUST now document PDF as an accepted input, and every help
+/// screen in the tree must still render and exit 0.
 #[test]
-fn full_help_tree_has_no_pdf() {
-    let test = "full_help_tree_has_no_pdf";
+fn ocr_help_documents_pdf_input() {
+    let test = "ocr_help_documents_pdf_input";
     let help_cases: &[&[&str]] = &[
         &["--help"],
         &["ocr", "--help"],
@@ -1296,17 +1684,15 @@ fn full_help_tree_has_no_pdf() {
         &["doctor", "--help"],
     ];
 
+    // Every help screen renders cleanly and exits 0.
     for argv in help_cases {
         let out = run_focr(argv);
-        let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let combined = format!("{stdout}\n{stderr}");
-        let lower = combined.to_ascii_lowercase();
-        let pass = out.status.code() == Some(0) && !lower.contains("pdf");
+        let pass = out.status.code() == Some(0);
         tlog!(test,
             "case": format!("help:{argv:?}"),
             "event": "assert",
-            "assertion": "help exits 0 and does not mention the excluded document format",
+            "assertion": "help renders and exits 0",
             "inputs": {"argv": argv},
             "exit_code": out.status.code(),
             "pass": pass,
@@ -1317,11 +1703,28 @@ fn full_help_tree_has_no_pdf() {
             Some(0),
             "{argv:?} --help must exit 0; stderr:\n{stderr}"
         );
-        assert!(
-            !lower.contains("pdf"),
-            "{argv:?} help must not contain the excluded document format token; output:\n{combined}"
-        );
     }
+
+    // `ocr --help` documents PDF as a now-supported input format.
+    let out = run_focr(&["ocr", "--help"]);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let documents_pdf = combined.to_ascii_lowercase().contains("pdf");
+    tlog!(test,
+        "case": "ocr_help_documents_pdf",
+        "event": "assert",
+        "assertion": "ocr --help documents PDF as a supported input",
+        "pass": documents_pdf,
+        "result": if documents_pdf { "pass" } else { "fail" },
+    );
+    assert!(
+        documents_pdf,
+        "ocr --help must document PDF as a supported input now that native \
+         rasterization shipped; output:\n{combined}"
+    );
 }
 
 /// `focr ocr --help` must expose the Phase-1 request parameters from the pinned
@@ -1340,6 +1743,9 @@ fn ocr_help_lists_reference_infer_args() {
         "--no-repeat-ngram",
         "--ngram-window",
         "--json",
+        "--output",
+        "--extract-figures",
+        "--figures-dir",
         "--robot",
     ];
     for flag in required {
@@ -1505,13 +1911,257 @@ fn ocr_env_model_path_without_cli_model_reaches_resolver() {
     );
 }
 
-/// [C4] `focr convert -o out.focrq in.safetensors` -> NotImplemented golden.
+/// **Regression for the fresh-install UX bug (bd-3u6x).** `focr pull` installs the
+/// model as `unlimited-ocr.int8.focrq`, but the default `focr ocr` lookup
+/// historically only searched the bare `unlimited-ocr.focrq` basename — so a
+/// freshly-pulled model was invisible without a manual `--model`, and the happy
+/// path broke on a clean machine. The resolver now also probes the quant-suffixed
+/// names (`.int8.focrq`, `.int4.focrq`). A future-version `unlimited-ocr.int8.focrq`
+/// dropped into `FOCR_MODEL_DIR` must therefore be RESOLVED by a bare
+/// `focr ocr <img>` (NO `--model`): proven by reaching the loader and failing
+/// FormatMismatch (exit 7), NOT ModelNotFound (exit 3, which is what the bug
+/// produced).
 #[test]
-fn convert_not_implemented_golden() {
+fn ocr_default_resolves_pulled_int8_artifact_without_explicit_model() {
+    let test = "ocr_default_resolves_pulled_int8_artifact_without_explicit_model";
+    let dir = write_future_focrq_in_temp_model_dir("unlimited-ocr.int8.focrq");
+    let out = run_focr_with_model_dir(&["ocr", "/some/document.png"], &dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = out.status.code();
+    let pass = code == Some(7) && stderr.contains("format/version mismatch");
+    tlog!(test,
+        "case": "default_resolves_pulled_int8",
+        "event": "assert",
+        "assertion": "bare `focr ocr` resolves a pulled unlimited-ocr.int8.focrq in FOCR_MODEL_DIR",
+        "inputs": {"argv": ["ocr", "/some/document.png"], "FOCR_MODEL_DIR": "[int8-future-focrq]"},
+        "exit_code": code,
+        "stderr_head": stderr.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+        "detail": "exit 3 (ModelNotFound) here would mean the int8 artifact is still invisible to the default lookup — the original bug",
+    );
+    assert_eq!(
+        code,
+        Some(7),
+        "a pulled `unlimited-ocr.int8.focrq` must resolve from FOCR_MODEL_DIR without --model \
+         (exit 7 FormatMismatch = resolved+loaded; exit 3 = still not found); stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("format/version mismatch"),
+        "stderr must show the loader was reached (FormatMismatch), got:\n{stderr}"
+    );
+}
+
+/// Run `focr ocr <img> -o <out> --model <model_path>` (the output-flag plumbing)
+/// and report the exit code plus whether the output file now exists. The output
+/// path is cleared first so the existence check reflects only this run.
+fn run_focr_ocr_to_output(out_path: &Path, model_path: &Path) -> (Option<i32>, bool) {
+    let _ = std::fs::remove_file(out_path);
+    let out_str = out_path.to_string_lossy().into_owned();
+    let out = run_focr_with_model_path(
+        &["ocr", "/some/document.png", "-o", out_str.as_str()],
+        model_path,
+    );
+    (out.status.code(), out_path.exists())
+}
+
+/// **`-o/--output` plumbing reaches the engine and writes nothing on failure
+/// (bd-sreb).** The output flag is wired through `run_ocr` for both `.json` and
+/// `.md`; when the model fails to load (future-version `.focrq` ⇒ FormatMismatch,
+/// exit 7) the recognition errors BEFORE any write, so no empty/partial output
+/// file is left behind. (The success-path file *contents* — valid JSON carrying
+/// the bounding boxes, non-empty markdown — are covered model-gated in
+/// `e2e_recognize`.)
+#[test]
+fn ocr_output_flag_is_plumbed_and_writes_nothing_on_failure() {
+    let test = "ocr_output_flag_is_plumbed_and_writes_nothing_on_failure";
+    let model = write_future_focrq();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    for ext in ["json", "md"] {
+        let out_path = std::env::temp_dir().join(format!(
+            "focr_out_fail_{}_{}.{}",
+            std::process::id(),
+            nanos,
+            ext
+        ));
+        let (code, exists) = run_focr_ocr_to_output(&out_path, &model);
+        let pass = code == Some(7) && !exists;
+        tlog!(test,
+            "case": format!("output_{ext}_on_failure"),
+            "event": "assert",
+            "assertion": "`-o out.<ext>` is accepted end-to-end; a load failure writes no output file",
+            "inputs": {"argv": ["ocr", "/some/document.png", "-o", format!("[out.{ext}]")], "FOCR_MODEL_PATH": "[future-focrq]"},
+            "exit_code": code,
+            "output_exists": exists,
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert_eq!(
+            code,
+            Some(7),
+            "`-o out.{ext}` must still surface FormatMismatch (exit 7); got {code:?}"
+        );
+        assert!(
+            !exists,
+            "a failed OCR run must not leave a stray output file at {out_path:?}"
+        );
+        let _ = std::fs::remove_file(&out_path);
+    }
+}
+
+/// **`--extract-figures` without a destination is a clean usage error (bd-23s8).**
+/// The figure subfolder is derived from `-o`; with neither `-o` nor `--figures-dir`
+/// there is nowhere to put it, so the run must fail fast with a usage error (exit 2)
+/// BEFORE any model load — proven here with no model present at all.
+#[test]
+fn ocr_extract_figures_without_output_is_usage_error() {
+    let test = "ocr_extract_figures_without_output_is_usage_error";
+    let out = run_focr(&["ocr", "/some/document.png", "--extract-figures"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let code = out.status.code();
+    let mentions = stderr.contains("extract-figures") || stderr.contains("usage error");
+    let pass = code == Some(2) && mentions;
+    tlog!(test,
+        "case": "extract_figures_no_output",
+        "event": "assert",
+        "assertion": "--extract-figures with no -o/--figures-dir is a usage error (exit 2), fired before any forward",
+        "inputs": {"argv": ["ocr", "/some/document.png", "--extract-figures"]},
+        "exit_code": code,
+        "stderr_head": stderr.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        code,
+        Some(2),
+        "--extract-figures without a destination must exit 2 (usage); stderr:\n{stderr}"
+    );
+    assert!(
+        mentions,
+        "the usage error should name the flag; got:\n{stderr}"
+    );
+}
+
+/// **`--extract-figures` is plumbed end-to-end and writes NOTHING on a load
+/// failure (bd-23s8).** With a future-version `.focrq` (FormatMismatch, exit 7) the
+/// forward errors before any figure crop, so neither the output file nor the
+/// derived `<stem>_figures/` subfolder is created. (A real model writing real
+/// figures is covered model-gated in `e2e_recognize`.)
+#[test]
+fn ocr_extract_figures_plumbed_and_writes_no_files_on_failure() {
+    let test = "ocr_extract_figures_plumbed_and_writes_no_files_on_failure";
+    let model = write_future_focrq();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let work = std::env::temp_dir().join(format!("focr_fig_fail_{}_{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&work).expect("mk workdir");
+    let out_md = work.join("doc.md");
+    let figures_dir = work.join("doc_figures"); // the auto-derived subfolder
+    let out_str = out_md.to_string_lossy().into_owned();
+
+    let out = run_focr_with_model_path(
+        &[
+            "ocr",
+            "/some/document.png",
+            "-o",
+            out_str.as_str(),
+            "--extract-figures",
+        ],
+        &model,
+    );
+    let code = out.status.code();
+    let md_exists = out_md.exists();
+    let figdir_exists = figures_dir.exists();
+    let pass = code == Some(7) && !md_exists && !figdir_exists;
+    tlog!(test,
+        "case": "extract_figures_on_failure",
+        "event": "assert",
+        "assertion": "`-o doc.md --extract-figures` is plumbed; a load failure writes neither the md nor the figures dir",
+        "inputs": {"argv": ["ocr", "/some/document.png", "-o", "[doc.md]", "--extract-figures"], "FOCR_MODEL_PATH": "[future-focrq]"},
+        "exit_code": code,
+        "md_exists": md_exists,
+        "figures_dir_exists": figdir_exists,
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        code,
+        Some(7),
+        "must surface FormatMismatch (exit 7); got {code:?}"
+    );
+    assert!(!md_exists, "no output file on failure: {out_md:?}");
+    assert!(
+        !figdir_exists,
+        "no figures subfolder on failure: {figures_dir:?}"
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
+/// **`focr models` lists the model zoo (bd-3jo6).** The discovery command surfaces
+/// every architecture this build can run — today the implemented Baidu
+/// Unlimited-OCR model — as a human table and as machine JSON. Always-on (no
+/// weights needed): it reads the static registry, not a loaded model.
+#[test]
+fn models_lists_the_registered_archs_human_and_json() {
+    let test = "models_lists_the_registered_archs_human_and_json";
+
+    let out = run_focr(&["models"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let human_ok = out.status.code() == Some(0)
+        && stdout.contains("unlimited-ocr")
+        && stdout.contains("ready");
+
+    let jout = run_focr(&["models", "--json"]);
+    let jstdout = String::from_utf8_lossy(&jout.stdout);
+    let v = parse_json_line(jstdout.trim(), "focr models --json");
+    let json_ok = jout.status.code() == Some(0)
+        && v["models"][0]["id"] == serde_json::json!("unlimited-ocr")
+        && v["models"][0]["implemented"] == serde_json::json!(true);
+
+    tlog!(test,
+        "case": "models_discovery",
+        "event": "assert",
+        "assertion": "`focr models` lists the registry (human table + machine JSON), exit 0",
+        "human_ok": human_ok,
+        "json_ok": json_ok,
+        "result": if human_ok && json_ok { "pass" } else { "fail" },
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "focr models exits 0; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("unlimited-ocr") && stdout.contains("ready"),
+        "human table lists the default model as ready:\n{stdout}"
+    );
+    assert_eq!(jout.status.code(), Some(0), "focr models --json exits 0");
+    assert_eq!(v["models"][0]["id"], serde_json::json!("unlimited-ocr"));
+    assert_eq!(v["models"][0]["implemented"], serde_json::json!(true));
+}
+
+/// [C4] `focr convert --quant int4` -> NotImplemented golden. The int8 path is
+/// now implemented (it writes a real `.focrq`); int4 remains the unvalidated
+/// lossy path that refuses BEFORE any file I/O (doctrine #1), so this stays a
+/// deterministic NotImplemented surface regardless of the input's existence.
+#[test]
+fn convert_int4_not_implemented_golden() {
     assert_not_implemented_golden(
-        "convert_not_implemented_golden",
+        "convert_int4_not_implemented_golden",
         "convert_not_implemented",
-        &["convert", "in.safetensors", "-o", "out.focrq"],
+        &[
+            "convert",
+            "in.safetensors",
+            "-o",
+            "out.focrq",
+            "--quant",
+            "int4",
+        ],
     );
 }
 
@@ -1556,49 +2206,54 @@ fn convert_arch_json_surface_accepts_targets() {
 /// [C5] `focr doctor` -> NotImplemented golden (message points at Phase 5).
 #[test]
 fn doctor_not_implemented_golden() {
-    assert_not_implemented_golden(
-        "doctor_not_implemented_golden",
-        "doctor_not_implemented",
-        &["doctor"],
-    );
-}
-
-/// Phase 0 exposes the future doctor contract shape under `--json` while the
-/// actual repair/check body remains a Phase-5 NotImplemented.
-#[test]
-fn doctor_json_emits_scaffold_contract() {
-    let test = "doctor_json_emits_scaffold_contract";
-    let out = run_focr(&["doctor", "--json"]);
+    // LIVE since bd-wp8.4: detect-only doctor. Hermetic env has no model, so
+    // the run reports the model_not_resolvable finding and exits 1 (the
+    // doctor exit contract, declared in `doctor capabilities`).
+    let out = run_focr(&["doctor"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let line = stdout
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .expect("doctor --json scaffold line");
-    let v = parse_json_line(line, "doctor --json");
-    let capabilities = v["capabilities"].as_array().map(Vec::len).unwrap_or(0);
-    let checks = v["checks"].as_array().map(Vec::len).unwrap_or(0);
-    let pass = out.status.code() == Some(1)
-        && v["status"].as_str() == Some("scaffold")
-        && capabilities >= 3
-        && checks >= 3
-        && stderr.contains("Phase 5");
-    tlog!(test,
-        "case": "doctor_json",
+    let pass = out.status.code() == Some(1) && stdout.contains("model_not_resolvable");
+    tlog!("doctor_not_implemented_golden",
+        "case": "doctor_detect_only",
         "event": "assert",
-        "assertion": "doctor --json emits scaffold capabilities/checks and exits NotImplemented",
-        "inputs": {"argv": ["doctor", "--json"]},
+        "assertion": "detect-only doctor reports findings and exits 1 (live contract)",
+        "inputs": {"argv": ["doctor"]},
         "exit_code": out.status.code(),
-        "capabilities": capabilities,
-        "checks": checks,
-        "stderr": stderr.trim(),
         "pass": pass,
         "result": if pass { "pass" } else { "fail" },
     );
     assert!(
         pass,
-        "unexpected doctor --json result; stdout:\n{stdout}\nstderr:\n{stderr}"
+        "doctor detect-only: {:?}
+{stdout}",
+        out.status.code()
     );
+}
+
+/// The live doctor `--json` contract: ONE JSON object, versioned, findings
+/// carried with their fixability; hermetic no-model env exits 1.
+#[test]
+fn doctor_json_emits_scaffold_contract() {
+    let test = "doctor_json_emits_scaffold_contract";
+    let out = run_focr(&["doctor", "--json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v = parse_json_line(stdout.trim(), "doctor --json");
+    let findings = v["findings"].as_array().map(Vec::len).unwrap_or(0);
+    let pass = out.status.code() == Some(1)
+        && v["schema_version"].as_i64() == Some(1)
+        && v["healthy"].as_bool() == Some(false)
+        && findings >= 1
+        && v["findings"][0]["fixability"]["kind"].as_str().is_some();
+    tlog!(test,
+        "case": "doctor_json_live",
+        "event": "assert",
+        "assertion": "doctor --json emits one versioned JSON object with typed findings (live contract)",
+        "inputs": {"argv": ["doctor", "--json"]},
+        "exit_code": out.status.code(),
+        "findings": findings,
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "doctor --json live contract failed:\n{stdout}");
 }
 
 /// `focr robot run <image>` is the agent-facing alias for `focr ocr <image>
@@ -1640,28 +2295,23 @@ fn robot_run_routes_to_streaming() {
     );
 }
 
-/// The run-history / audit-sync scaffold surfaces already obey the Phase-0
-/// exit-category split: malformed args are Usage(exit 2), valid but unlanded
-/// bodies are NotImplemented(exit 1).
+/// The run-history / audit-sync surfaces are live: malformed args are
+/// Usage(exit 2), valid queries/JSONL sync commands succeed, and all test
+/// invocations point `FOCR_RUN_STORE` at temp paths rather than the user's
+/// real cache.
 #[test]
 fn runs_and_sync_args_obey_exit_categories() {
     let test = "runs_and_sync_args_obey_exit_categories";
-    let cases: &[(&str, &[&str], i32)] = &[
+    let usage_cases: &[(&str, &[&str], i32)] = &[
         ("runs_negative_limit", &["runs", "--limit=-1"], 2),
-        ("runs_json_stub", &["runs", "--format", "json"], 1),
         ("sync_unknown_subcommand", &["sync", "frobnicate"], 2),
         (
-            "sync_export_json_stub",
-            &["sync", "--json", "export-jsonl"],
-            1,
-        ),
-        (
-            "sync_import_json_stub",
+            "sync_import_missing_file",
             &["sync", "--json", "import-jsonl"],
-            1,
+            2,
         ),
     ];
-    for (name, argv, expected) in cases {
+    for (name, argv, expected) in usage_cases {
         let out = run_focr(argv);
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1685,6 +2335,73 @@ fn runs_and_sync_args_obey_exit_categories() {
             "{name} expected exit {expected}; stdout:\n{stdout}\nstderr:\n{stderr}"
         );
     }
+
+    let out = run_focr(&["runs", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let runs = parse_json_line(&stdout, "runs --format json");
+    let pass = out.status.code() == Some(0)
+        && runs["command"].as_str() == Some("runs")
+        && runs["count"].as_u64() == Some(0)
+        && runs["runs"].as_array().is_some_and(Vec::is_empty);
+    tlog!(test,
+        "case": "runs_json_live",
+        "event": "assert",
+        "assertion": "runs --format json reads the hermetic run store and exits zero",
+        "inputs": {"argv": ["runs", "--format", "json"], "env": {RUN_STORE_ENV: "[temp]"}},
+        "exit_code": out.status.code(),
+        "stdout_head": stdout.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "unexpected runs JSON output:\n{stdout}");
+
+    let out = run_focr(&["sync", "--json", "export-jsonl"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let exported = parse_json_line(&stdout, "sync export-jsonl --json");
+    let pass = out.status.code() == Some(0)
+        && exported["command"].as_str() == Some("sync")
+        && exported["subcommand"].as_str() == Some("export-jsonl")
+        && exported["records"].as_u64() == Some(0);
+    tlog!(test,
+        "case": "sync_export_json_live",
+        "event": "assert",
+        "assertion": "sync export-jsonl writes an empty hermetic audit file and exits zero",
+        "inputs": {"argv": ["sync", "--json", "export-jsonl"], "env": {RUN_STORE_ENV: "[temp]"}},
+        "exit_code": out.status.code(),
+        "stdout_head": stdout.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "unexpected sync export JSON output:\n{stdout}");
+
+    let input = std::env::temp_dir().join(format!(
+        "focr_golden_import_empty_{}_{}.jsonl",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::write(&input, "").expect("write empty sync import fixture");
+    let input_s = input.to_string_lossy().into_owned();
+    let out = run_focr(&["sync", "--json", "import-jsonl", "--file", &input_s]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let imported = parse_json_line(&stdout, "sync import-jsonl --json");
+    let pass = out.status.code() == Some(0)
+        && imported["command"].as_str() == Some("sync")
+        && imported["subcommand"].as_str() == Some("import-jsonl")
+        && imported["records"].as_u64() == Some(0);
+    tlog!(test,
+        "case": "sync_import_json_live",
+        "event": "assert",
+        "assertion": "sync import-jsonl replays an empty audit file and exits zero",
+        "inputs": {"argv": ["sync", "--json", "import-jsonl", "--file", "[temp]"], "env": {RUN_STORE_ENV: "[temp]"}},
+        "exit_code": out.status.code(),
+        "stdout_head": stdout.lines().next().unwrap_or_default(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "unexpected sync import JSON output:\n{stdout}");
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1813,10 +2530,18 @@ fn exit_code_conformance() {
             clause: "E3",
             xfail: None,
         },
-        // [E1] not-implemented -> 1
+        // [E1] not-implemented -> 1. int8 convert is implemented; the int4 lossy
+        // path is the remaining NotImplemented surface (refuses before I/O).
         ExitRow {
-            label: "convert -> 1 (NotImplemented)",
-            argv: &["convert", "in.safetensors", "-o", "out.focrq"],
+            label: "convert --quant int4 -> 1 (NotImplemented)",
+            argv: &[
+                "convert",
+                "in.safetensors",
+                "-o",
+                "out.focrq",
+                "--quant",
+                "int4",
+            ],
             expect: 1,
             clause: "E1",
             xfail: None,
@@ -1844,9 +2569,12 @@ fn exit_code_conformance() {
         },
         // The forward-dependent documented codes are process-covered in Phase 0
         // through the debug/test producer seam that feeds the real CLI
-        // dispatcher and robot error path. Convert-side format mismatch is still
-        // blocked on `convert`, while the `.focrq` reader path itself is
-        // live-covered by ocr_robot_future_focrq_stream_matches_exit_code.
+        // dispatcher and robot error path. int8 `convert` is now implemented, but
+        // this static-argv row points at a NON-EXISTENT input, so it resolves to
+        // ModelNotFound (3) before the parser; reaching convert-side
+        // FormatMismatch(7) needs a malformed but EXISTING container, while the
+        // `.focrq` reader path itself is live-covered by
+        // ocr_robot_future_focrq_stream_matches_exit_code.
         ExitRow {
             label: "forced input-decode -> 4",
             argv: &["ocr", "/some/document.png"],
@@ -1874,7 +2602,7 @@ fn exit_code_conformance() {
             expect: 7,
             clause: "E7",
             xfail: Some(
-                "Convert-side FormatMismatch(exit 7) is unreachable until `convert` lands; the path-explicit .focrq reader coverage lives in ocr_robot_future_focrq_stream_matches_exit_code.",
+                "Convert-side FormatMismatch(exit 7) needs a malformed but EXISTING container; this static-argv row's non-existent input resolves to ModelNotFound(3) first. The path-explicit .focrq reader coverage lives in ocr_robot_future_focrq_stream_matches_exit_code.",
             ),
         },
     ];
@@ -2117,4 +2845,182 @@ fn scrub_canonicalizer_unit() {
         "result": "pass",
         "detail": "scrubber + canonicalizer + diff helpers verified",
     );
+}
+
+/// bd-wp8.11: the FROZEN `runs`/`sync` record contract, exercised over a
+/// POPULATED store through the real binary. `tests/fixtures/runs_schema.json`
+/// is the versioned-by-hand contract (the robot_schema discipline): the
+/// wrapper keys, the record keys (shared verbatim by `runs --format json`,
+/// `runs --format ndjson`, and every `sync export-jsonl` line), and the
+/// one-way sync direction. Drift against the fixture fails HERE.
+#[test]
+fn runs_schema_contract_over_populated_store() {
+    let test = "runs_schema_contract_over_populated_store";
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/runs_schema.json"),
+        )
+        .expect("frozen runs schema fixture"),
+    )
+    .expect("runs schema parses");
+    let record_keys: Vec<&str> = schema["record"]["required"]
+        .as_array()
+        .expect("record.required")
+        .iter()
+        .map(|v| v.as_str().expect("key"))
+        .collect();
+    let wrapper_keys: Vec<&str> = schema["runs_json_wrapper"]["required"]
+        .as_array()
+        .expect("wrapper.required")
+        .iter()
+        .map(|v| v.as_str().expect("key"))
+        .collect();
+
+    // ONE shared hermetic store across every invocation in this test.
+    let store = fresh_run_store_path();
+    let run = |args: &[&str]| -> Output {
+        let mut command = Command::new(focr_bin());
+        command
+            .args(args)
+            .env_remove("FOCR_MODEL_PATH")
+            .env_remove(MODEL_DIR_ENV)
+            .env(RUN_STORE_ENV, &store)
+            .env_remove("FOCR_FORCE_ARCH")
+            .env_remove("FOCR_INT8_AUTOVEC")
+            .env_remove(FORCE_TEST_ERROR_ENV);
+        command.output().expect("failed to spawn focr binary")
+    };
+
+    // Seed two records through the public import surface (records shaped
+    // exactly as export writes them — the fixture's `record` contract).
+    let seed = store.with_extension("seed.jsonl");
+    std::fs::write(
+        &seed,
+        concat!(
+            r#"{"schema_version":1,"run_id":"run-alpha","started_at":100,"finished_at":150,"input_path":"a.png","mode":"base","quant":"int8","model_version_tag":"test","exit_code":0,"status":"ok"}"#,
+            "\n",
+            r#"{"schema_version":1,"run_id":"run-beta","started_at":200,"finished_at":260,"input_path":"b.png","mode":"gundam","quant":"f32","model_version_tag":"test","exit_code":4,"status":"error"}"#,
+            "\n",
+        ),
+    )
+    .expect("write seed jsonl");
+    let out = run(&[
+        "sync",
+        "--json",
+        "import-jsonl",
+        "--file",
+        seed.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "seed import failed: {out:?}");
+
+    let assert_record = |v: &serde_json::Value, ctx: &str| {
+        for k in &record_keys {
+            assert!(
+                !v[*k].is_null(),
+                "{ctx}: record missing frozen key {k:?}: {v}"
+            );
+        }
+    };
+
+    // `runs --format json`: wrapper + records match the frozen contract.
+    let out = run(&["runs", "--format", "json"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc = parse_json_line(&stdout, "runs --format json (populated)");
+    for k in &wrapper_keys {
+        assert!(
+            !doc[*k].is_null(),
+            "wrapper missing frozen key {k:?}: {doc}"
+        );
+    }
+    let records = doc["runs"].as_array().expect("runs array");
+    let count_ok = doc["count"].as_u64() == Some(2) && records.len() == 2;
+    for r in records {
+        assert_record(r, "runs --format json");
+    }
+
+    // `runs --format ndjson`: one record object per line, same contract.
+    let out = run(&["runs", "--format", "ndjson"]);
+    let ndjson = String::from_utf8_lossy(&out.stdout);
+    let nd_lines: Vec<serde_json::Value> = ndjson
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("ndjson line parses"))
+        .collect();
+    assert_eq!(
+        nd_lines.len(),
+        2,
+        "ndjson emits one object per run:\n{ndjson}"
+    );
+    for r in &nd_lines {
+        assert_record(r, "runs --format ndjson");
+    }
+
+    // `--id` selects exactly one; `--limit 1` returns the most recent.
+    let out = run(&["runs", "--id", "run-alpha", "--format", "json"]);
+    let one = parse_json_line(&String::from_utf8_lossy(&out.stdout), "runs --id");
+    let id_ok =
+        one["count"].as_u64() == Some(1) && one["runs"][0]["run_id"].as_str() == Some("run-alpha");
+    let out = run(&["runs", "--limit", "1", "--format", "json"]);
+    let lim = parse_json_line(&String::from_utf8_lossy(&out.stdout), "runs --limit 1");
+    let limit_ok =
+        lim["count"].as_u64() == Some(1) && lim["runs"][0]["run_id"].as_str() == Some("run-beta");
+
+    // Plain format on a populated store: exit 0, one line per run.
+    let out = run(&["runs"]);
+    let plain_ok = out.status.code() == Some(0)
+        && String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| l.contains("run-"))
+            .count()
+            == 2;
+
+    // Export lines carry the SAME frozen record contract (one contract,
+    // three carriers) and a re-export is byte-identical (idempotent).
+    let audit = store.with_extension("audit.jsonl");
+    let out = run(&[
+        "sync",
+        "--json",
+        "export-jsonl",
+        "--file",
+        audit.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "export failed: {out:?}");
+    let first = std::fs::read_to_string(&audit).expect("audit written");
+    for line in first.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).expect("export line parses");
+        assert_record(&v, "sync export-jsonl");
+    }
+    let out = run(&[
+        "sync",
+        "--json",
+        "export-jsonl",
+        "--file",
+        audit.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "re-export failed: {out:?}");
+    let second = std::fs::read_to_string(&audit).expect("audit re-written");
+    let idempotent = first == second;
+
+    let pass = count_ok && id_ok && limit_ok && plain_ok && idempotent;
+    tlog!(test,
+        "case": "populated_matrix",
+        "event": "assert",
+        "assertion": "runs json/ndjson/--id/--limit/plain + export match the frozen runs_schema.json contract; re-export byte-identical",
+        "inputs": {"store": "[temp]", "seeded_runs": 2},
+        "count_ok": count_ok,
+        "id_ok": id_ok,
+        "limit_ok": limit_ok,
+        "plain_ok": plain_ok,
+        "export_idempotent": idempotent,
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(
+        pass,
+        "runs/sync frozen-contract matrix failed (see NDJSON line above)"
+    );
+
+    let _ = std::fs::remove_file(&seed);
+    let _ = std::fs::remove_file(&audit);
+    let _ = std::fs::remove_file(&store);
 }

@@ -1,0 +1,144 @@
+{
+  "_meta": {
+    "purpose": "SmolVLM2 VQA INFORMATIONAL quality fixtures (C8, spec §13 L5) — oracle greedy answers over the committed sample photo",
+    "script": "scripts/gen_smolvlm2_vqa_fixtures.py",
+    "model_dir": "/Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2",
+    "sample_photo": "tests/fixtures/smolvlm2/sample_photo.png",
+    "max_new_tokens": 24,
+    "eos_id": 49279,
+    "scoring": "normalized exact-match, else content-word containment >= 0.5 (vs the ORACLE's own greedy output — parity, not benchmark)"
+  },
+  "cases": [
+    {
+      "question": "What color is the sky?",
+      "ids": [
+        378,
+        6376,
+        314,
+        4461,
+        30,
+        49279
+      ],
+      "answer": "The sky is blue."
+    },
+    {
+      "question": "Is there a sun in the image?",
+      "ids": [
+        9230,
+        30,
+        49279
+      ],
+      "answer": "Yes."
+    },
+    {
+      "question": "Are there any buildings in the image?",
+      "ids": [
+        9230,
+        28,
+        665,
+        359,
+        4789,
+        281,
+        260,
+        2443,
+        30,
+        49279
+      ],
+      "answer": "Yes, there are buildings in the image."
+    },
+    {
+      "question": "Is there a tree in the image?",
+      "ids": [
+        9230,
+        30,
+        49279
+      ],
+      "answer": "Yes."
+    },
+    {
+      "question": "What time of day does it appear to be?",
+      "ids": [
+        378,
+        655,
+        282,
+        1194,
+        4541,
+        288,
+        325,
+        1584,
+        5738,
+        28,
+        347,
+        260,
+        6376,
+        314,
+        1361,
+        3605,
+        284,
+        260,
+        2388,
+        314,
+        441,
+        6178,
+        30,
+        49279
+      ],
+      "answer": "The time of day appears to be early morning, as the sky is still dark and the sun is not visible."
+    },
+    {
+      "question": "Is this a photo of the ocean?",
+      "ids": [
+        378,
+        2443,
+        1072,
+        441,
+        1538,
+        2001,
+        1096,
+        288,
+        3346,
+        585,
+        357,
+        314,
+        253,
+        8003,
+        282,
+        260,
+        5065,
+        30,
+        49279
+      ],
+      "answer": "The image does not provide enough information to determine if it is a photo of the ocean."
+    },
+    {
+      "question": "What kind of scene is shown in this image?",
+      "ids": [
+        378,
+        2443,
+        21559,
+        253,
+        2240,
+        32742,
+        351,
+        1545,
+        4789,
+        30,
+        378,
+        4789,
+        359,
+        6780,
+        284,
+        18896,
+        28,
+        351,
+        2701,
+        8393,
+        335,
+        971,
+        6289,
+        30
+      ],
+      "answer": "The image depicts a cityscape with several buildings. The buildings are tall and rectangular, with multiple windows on each floor."
+    }
+  ]
+}

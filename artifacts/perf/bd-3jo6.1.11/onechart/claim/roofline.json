@@ -1,0 +1,109 @@
+{
+  "schema": "focr-gauntlet-roofline/v1",
+  "created_utc": "2026-07-05T23:59:27Z",
+  "arch": "onechart",
+  "precision": "int8",
+  "machine_profile": {
+    "name": "m4",
+    "dram_gb_s": 120.0,
+    "peak_int8_gmacs": 1126.4,
+    "peak_f32_gflops": 563.2,
+    "note": "P-cores only, SDOT 64 int8-MAC/cycle/core, FMA 32 f32-FLOP/cycle/core"
+  },
+  "stages_json": "artifacts/perf/bd-3jo6.1.11/onechart/focr/focr_stages.json",
+  "floors": [
+    {
+      "floor_kind": "compute",
+      "floor_ms": 29.4336,
+      "compute_floor_ms": 29.4336,
+      "memory_floor_ms": 0.707789,
+      "int8_macs": 26159874048,
+      "f32_flops": 3497066496,
+      "bytes": 84934656,
+      "assumptions": [
+        "308 prefill tokens \u00d7 dense per-token GEMM MACs (head excluded)",
+        "memory floor = int8 weights streamed once"
+      ],
+      "stage": "prefill",
+      "focr_best_ms": 70.0,
+      "dist_above_floor": 2.3782
+    },
+    {
+      "floor_kind": "memory",
+      "floor_ms": 2.265318,
+      "compute_floor_ms": 0.241039,
+      "memory_floor_ms": 2.265318,
+      "int8_macs": 84934656,
+      "f32_flops": 93285888,
+      "bytes": 271838208,
+      "assumptions": [
+        "dense onechart: attn qkvo + ReLU fc1/fc2 int8; the head is an f32 GEMM (model_arch.rs: lm_head_stored_int8 false / tied f32 embed)",
+        "full-causal K+V read at mean context 436 in f32 (kv_dim 768)",
+        "norms/embeds/biases/activations excluded (lower bound)"
+      ],
+      "stage": "decode_per_token",
+      "focr_best_ms": 4.708171,
+      "dist_above_floor": 2.0784
+    },
+    {
+      "floor_kind": "compute",
+      "floor_ms": 2268.847031,
+      "compute_floor_ms": null,
+      "memory_floor_ms": null,
+      "int8_macs": null,
+      "f32_flops": null,
+      "bytes": null,
+      "assumptions": [
+        "sum of modeled stage floors with decode \u00d7 257 measured tokens",
+        "floor_kind = dominant component (vision_encode)"
+      ],
+      "components": {
+        "vision_encode": {
+          "floor_kind": "compute",
+          "floor_ms": 1657.226705,
+          "compute_floor_ms": 1657.226705,
+          "memory_floor_ms": 3.099853,
+          "int8_macs": 0,
+          "f32_flops": 933350080512,
+          "bytes": 371982336,
+          "assumptions": [
+            "SAM-ViT-B blocks + windowed/global attention + Vary neck/compressor convs",
+            "OneChart mm_projector 1024\u2192768 over 256 tokens (same SAM tower)",
+            "f32 weights streamed once; norms/softmax/pos-embeds excluded (lower bound)"
+          ]
+        },
+        "prefill": {
+          "floor_kind": "compute",
+          "floor_ms": 29.4336,
+          "compute_floor_ms": 29.4336,
+          "memory_floor_ms": 0.707789,
+          "int8_macs": 26159874048,
+          "f32_flops": 3497066496,
+          "bytes": 84934656,
+          "assumptions": [
+            "308 prefill tokens \u00d7 dense per-token GEMM MACs (head excluded)",
+            "memory floor = int8 weights streamed once"
+          ]
+        },
+        "decode_per_token": {
+          "floor_kind": "memory",
+          "floor_ms": 2.265318,
+          "compute_floor_ms": 0.241039,
+          "memory_floor_ms": 2.265318,
+          "int8_macs": 84934656,
+          "f32_flops": 93285888,
+          "bytes": 271838208,
+          "assumptions": [
+            "dense onechart: attn qkvo + ReLU fc1/fc2 int8; the head is an f32 GEMM (model_arch.rs: lm_head_stored_int8 false / tied f32 embed)",
+            "full-causal K+V read at mean context 436 in f32 (kv_dim 768)",
+            "norms/embeds/biases/activations excluded (lower bound)"
+          ]
+        }
+      },
+      "stage": "end_to_end",
+      "focr_best_ms": 6837.452,
+      "dist_above_floor": 3.0136
+    }
+  ],
+  "synthetic": false
+}

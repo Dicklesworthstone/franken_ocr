@@ -1,0 +1,27 @@
+label=batch20-before
+utc=2026-07-12T22:26:18Z
+host=sensedemobox
+uname=Linux sensedemobox 6.17.0-35-generic #35-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 13:10:28 UTC 2026 x86_64 GNU/Linux
+proc_loadavg=0.58 3.00 3.25 1/1845 2912758
+tokenizer_sha256=a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4
+page_order:
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0009.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0019.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0023.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0086.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0091.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0105.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0107.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0108.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0126.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0136.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0179.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0250.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0358.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0400.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0437.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0547.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0557.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0590.png
+/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0645.png

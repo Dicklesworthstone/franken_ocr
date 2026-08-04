@@ -1,0 +1,31 @@
+{
+  "schema": "focr-exact-torch-corpus-gate/v1",
+  "created_utc": "2026-07-10T18:26:36Z",
+  "source_head": "58cf4e196e787fff8a2e83b2d5478541c64a3ee4+uncommitted-final-tree",
+  "binary_sha256": "6a401be3bfd6bfb0a9766e2ff333489a5e02b2a5f0641376b6ab5fc6885e6953",
+  "model_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+  "decode_mode": "conservative_recipe",
+  "moe_policy": "torch-2.10-topk-sorted-false-slot-order",
+  "max_new_tokens_per_page": 12000,
+  "reference_transform": "strip-unlimited-det-spans-v1",
+  "corpus": {
+    "pages_total": 20,
+    "pages_with_hypothesis": 20,
+    "pages_ok": 20,
+    "cer_raw": 0.19733794408377647,
+    "cer_norm": 0.19307924589896353,
+    "cer_norm_budget": 0.25,
+    "seconds_total": 535.919100834,
+    "batch_sha256": "7d6e1f5d7823c4a297b5fcc07f7ade44a0ce36f0cd89a14f4d6a424345db572c",
+    "comparison_sha256": "38680e64677ab30f4842aa53fa98eb9c1ef0caefca3e293163f1e34b501d9f43"
+  },
+  "page_0590": {
+    "terminated_by_eos": true,
+    "generated_tokens": 4033,
+    "decode_seconds": 97.43,
+    "cer_raw": 0.6297772816669325,
+    "cer_norm": 0.6164885983096795,
+    "output_sha256": "57d9b5a6686e4c8f877b42390c74b85f77ef789036351cfbd0f373194d10997a"
+  },
+  "verdict": "pass_corpus_budget_and_termination_with_documented_page0590_tail"
+}

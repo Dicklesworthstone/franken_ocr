@@ -1,0 +1,3 @@
+conservative recipe: FFN/expert int8 only; attention and lm_head high precision
+threads: FOCR/RAYON/OMP=8
+training corpus: page_0009 full, page_0014 full, 10-page batch capped at 128 generated tokens/page

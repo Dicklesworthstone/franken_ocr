@@ -25,9 +25,7 @@
 | SHA-256 | File | Bytes | Role |
 |---------|------|-------|------|
 | `a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4` | `tokenizer.json` | 9979544 | byte-level **BPE** (base vocab 128000 + 830 added tokens), merges, pre-tokenizer `Sequence` (OQ-16) |
-
-**Not yet hashed:** `model-00001-of-000001.safetensors` (6.67 GB bf16 weights, needed
-for parity fixtures — out-of-band via `scripts/fetch_model.sh`; hash recorded when fetched).
+| `2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6` | `model-00001-of-000001.safetensors` | 6672547120 | pinned bf16 weight shard used by parity fixtures and conservative `.focrq` conversion |
 
 ## Verify
 

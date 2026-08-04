@@ -269,7 +269,7 @@ franken_ocr/                          (crate: franken_ocr)
 ├── Cargo.toml                        # two [[bin]]: focr + franken_ocr, both -> src/main.rs
 │                                     # [lints.rust] unsafe_code = "deny"; #![forbid(unsafe_code)] in lib.rs/main.rs
 │                                     # path deps: ../frankentorch/crates/ft-kernel-cpu, ft-core, ft-serialize
-│                                     #            asupersync = {version=">=0.3.5,<0.4", default-features=false}  (local /dp/asupersync = 0.3.5)
+│                                     #            asupersync = {version=">=0.3.5,<0.4", default-features=false}  (sibling ../asupersync = 0.3.8)
 │                                     #            fsqlite (frankensqlite) — NEVER rusqlite
 │                                     #            image / fast_image_resize (preproc), clap, serde_json
 ├── rust-toolchain.toml               # channel = "nightly" (REQUIRED for stdarch i8mm/dotprod)  [already present]

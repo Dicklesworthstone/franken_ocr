@@ -1,0 +1,203 @@
+{
+  "schema": "focr-gauntlet-stages/v1",
+  "source": "reference",
+  "created_utc": "2026-07-08T07:46:33Z",
+  "command": [
+    "scripts/gauntlet_reference.py",
+    "--stage",
+    "all",
+    "--page",
+    "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0009.png",
+    "--model-dir",
+    "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model",
+    "--backend",
+    "hf",
+    "--precision",
+    "bf16",
+    "--entry",
+    "gauntlet_ref_unlimited:run_stage",
+    "--setup",
+    "gauntlet_ref_unlimited:setup",
+    "--runs",
+    "5",
+    "--warmup",
+    "1",
+    "--threads",
+    "8",
+    "--out",
+    "/Users/jemanuel/projects/franken_ocr/artifacts/perf/bd-2mo.26/ref_page_0009/ref_stages.json"
+  ],
+  "env_pins": {
+    "OMP_NUM_THREADS": "8",
+    "MKL_NUM_THREADS": "8",
+    "OPENBLAS_NUM_THREADS": "8",
+    "VECLIB_MAXIMUM_THREADS": "8",
+    "NUMEXPR_NUM_THREADS": "8",
+    "FOCR_THREADS": "8"
+  },
+  "page": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0009.png",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model",
+  "threads": 8,
+  "precision": "bf16",
+  "backend": "hf",
+  "allocator": "system",
+  "runs": 5,
+  "warmup": 1,
+  "torch_version": "2.10.0",
+  "transformers_version": "4.57.1",
+  "stages": [
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "preprocess",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        27.973667,
+        27.405542,
+        27.758208,
+        28.5965,
+        28.517042
+      ],
+      "best_ms": 27.405542,
+      "p50_ms": 27.973667,
+      "mean_ms": 28.050192,
+      "cv_pct": 1.803,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "bf16",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "vision_encode",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        23521.777833,
+        23640.518041,
+        23462.257166,
+        23581.656708,
+        23448.849249
+      ],
+      "best_ms": 23448.849249,
+      "p50_ms": 23521.777833,
+      "mean_ms": 23531.011799,
+      "cv_pct": 0.343,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "bf16",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "prefill",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        2283.32375,
+        2266.239584,
+        2262.721876,
+        2261.349834,
+        2270.423376
+      ],
+      "best_ms": 2261.349834,
+      "p50_ms": 2266.239584,
+      "mean_ms": 2268.811684,
+      "cv_pct": 0.39,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "bf16",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false,
+      "tokens": 277
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "decode_per_token",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        31.166736,
+        31.43616,
+        31.325648,
+        31.46728,
+        31.327706
+      ],
+      "best_ms": 31.166736,
+      "p50_ms": 31.327706,
+      "mean_ms": 31.344706,
+      "cv_pct": 0.377,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "bf16",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false,
+      "tokens": 98
+    },
+    {
+      "schema": "focr-gauntlet-stage/v1",
+      "source": "reference",
+      "stage": "end_to_end",
+      "ledger_stage": true,
+      "unit": "ms",
+      "samples_ms": [
+        28931.062333,
+        29058.365458,
+        28865.439416,
+        28998.796209,
+        28862.024583
+      ],
+      "best_ms": 28862.024583,
+      "p50_ms": 28931.062333,
+      "mean_ms": 28943.1376,
+      "cv_pct": 0.295,
+      "n": 5,
+      "warmup_discarded": 1,
+      "threads": 8,
+      "thread_proof": {
+        "budget": 8,
+        "torch_num_threads": 8
+      },
+      "precision": "bf16",
+      "backend": "hf",
+      "allocator": "system",
+      "synthetic": false
+    }
+  ],
+  "synthetic": false,
+  "smoke": false,
+  "text_sha256": [
+    "64d6c3cc4cb63722792fdd36a3648f357e48b8c0d66f90f2dec6a87870067328"
+  ],
+  "text_identical_across_runs": true
+}

@@ -28,6 +28,16 @@
 //! the richer `docs/focrq-format.md` provenance/config/manifest fields for
 //! forward-compatible artifacts without breaking the committed reader.
 //!
+//! ## Model-architecture tag (`model_id`, v2)
+//!
+//! A `.focrq` may declare a `model_id` (the [`crate::native_engine::model_arch::ModelArch::id`],
+//! e.g. `"got-ocr2"`) so the loader selects the right architecture from the model
+//! registry. The reader treats an **absent** `model_id` as the default
+//! `unlimited-ocr`, so every pre-`model_id` (v1) artifact keeps loading unchanged.
+//! This writer therefore **omits** the key for the default architecture — a
+//! re-converted Unlimited-OCR `.focrq` stays byte-identical to its v1 form — and
+//! writes it only for a non-default arch (see [`FocrqBuilder::with_model_id`]).
+//!
 //! ## Determinism (`docs/focrq-format.md` §"Writer Determinism")
 //!
 //! For a fixed input the output is byte-identical across runs: tensors are
@@ -41,6 +51,7 @@ use std::path::Path;
 
 use crate::FOCR_MODEL_LICENSE_NOTICE;
 use crate::error::{FocrError, FocrResult};
+use crate::native_engine::model_arch;
 
 use super::int4::VALID_GROUP_SIZES;
 
@@ -173,6 +184,12 @@ pub struct FocrqBuilder {
     provenance_json: Option<String>,
     model_config_json: Option<String>,
     packing_manifest_json: Option<String>,
+    /// The model-architecture id (`ModelArch::id`) this artifact declares. `None`
+    /// (and the default `unlimited-ocr`) ⇒ the `model_id` header key is **omitted**,
+    /// so a re-converted Unlimited-OCR `.focrq` stays byte-identical to the v1
+    /// artifact (which never had the field). A non-default id (e.g. `"got-ocr2"`)
+    /// is emitted so the loader selects that arch from the registry.
+    model_id: Option<String>,
     align: bool,
     /// `name -> staged tensor`. `BTreeMap` ⇒ deterministic sorted emission.
     tensors: BTreeMap<String, PendingTensor>,
@@ -196,6 +213,7 @@ impl FocrqBuilder {
             provenance_json: None,
             model_config_json: None,
             packing_manifest_json: None,
+            model_id: None,
             align: false,
             tensors: BTreeMap::new(),
         }
@@ -245,6 +263,19 @@ impl FocrqBuilder {
     #[must_use]
     pub fn with_packing_manifest_json(mut self, json: impl Into<String>) -> Self {
         self.packing_manifest_json = Some(json.into());
+        self
+    }
+
+    /// Declare the model-architecture id (`ModelArch::id`) this artifact carries,
+    /// so the loader selects the right arch from the registry.
+    ///
+    /// Setting the **default** id (`unlimited-ocr`) — or never calling this — emits
+    /// **no** `model_id` header key, so a re-converted Unlimited-OCR `.focrq` is
+    /// byte-identical to the v1 artifact. A non-default id (e.g. `"got-ocr2"`) is
+    /// written into the header.
+    #[must_use]
+    pub fn with_model_id(mut self, id: impl Into<String>) -> Self {
+        self.model_id = Some(id.into());
         self
     }
 
@@ -333,7 +364,15 @@ impl FocrqBuilder {
             )));
         }
         let numel = checked_numel(&name, &shape)?;
-        let expected = dtype.expected_byte_len(&name, &shape, numel)?;
+        // `--arch aarch64-smmla` (arch_target 1, bd-2mo.3): QInt8 payloads are
+        // SMMLA panels (`ceil(n/2)*ceil(k/8)*16` bytes); mirror the reader's
+        // `validate_directory` rule so writer and loader agree byte-for-byte.
+        let expected =
+            if self.arch_target == 1 && dtype == WriteDType::QInt8PerChan && shape.len() == 2 {
+                crate::simd::pack::smmla_packed_len(shape[0], shape[1])
+            } else {
+                dtype.expected_byte_len(&name, &shape, numel)?
+            };
         if data.len() != expected {
             return Err(FocrError::FormatMismatch(format!(
                 "tensor {name:?}: data len {} != shape×dtype {} ({:?}, shape {:?})",
@@ -548,6 +587,21 @@ impl FocrqBuilder {
         if let Some(mc) = &self.model_config_json {
             s.push_str("\"model_config\":");
             s.push_str(mc);
+            s.push(',');
+        }
+
+        // model_id (v2 arch tag). Emitted only for a NON-default architecture, so a
+        // re-converted Unlimited-OCR artifact omits it and stays byte-identical to
+        // its v1 form (which never had the key). The reader treats an absent
+        // model_id as the default `unlimited-ocr`.
+        let default_id = model_arch::default_arch().id();
+        if let Some(id) = self
+            .model_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && *id != default_id)
+        {
+            s.push_str("\"model_id\":");
+            push_json_string(&mut s, id);
             s.push(',');
         }
 
@@ -838,6 +892,92 @@ mod tests {
                 .with_arch_target(1)
                 .with_source_sha256([5u8; 32]);
             // Insert in non-sorted order; sorted emission must make output equal.
+            b.add_tensor("zeta", WriteDType::Bf16, vec![2], bf16_le(&[3.0, 4.0]))
+                .unwrap();
+            b.add_tensor("alpha", WriteDType::F32, vec![2], f32_le(&[1.0, 2.0]))
+                .unwrap();
+            b.build()
+        };
+        assert_eq!(make(), make());
+    }
+
+    // ── model_id arch tag (A2) ──────────────────────────────────────────────
+
+    /// The GOT-OCR2 notice the registry declares — what a `got-ocr2` artifact
+    /// must carry for the arch-aware license check to accept it.
+    fn got_ocr2_notice() -> &'static str {
+        crate::native_engine::model_arch::arch_by_id("got-ocr2")
+            .expect("got-ocr2 is a registered arch")
+            .license_notice()
+    }
+
+    #[test]
+    fn model_id_roundtrips_through_reader() {
+        // A non-default arch tag (got-ocr2) is written into the header and the
+        // reader resolves it back, carrying the arch's own Apache-2.0 notice.
+        let mut b = FocrqBuilder::new()
+            .with_model_id("got-ocr2")
+            .with_license_notice(got_ocr2_notice());
+        b.add_tensor("w", WriteDType::Bf16, vec![2], bf16_le(&[1.0, 2.0]))
+            .unwrap();
+        let blob = b.build();
+        // The key is physically present in the header bytes.
+        let header_text = String::from_utf8_lossy(&blob);
+        assert!(header_text.contains("\"model_id\":\"got-ocr2\""));
+
+        let w = Weights::from_bytes(blob).unwrap();
+        assert_eq!(w.model_id(), "got-ocr2");
+        assert_eq!(w.mat("w").unwrap().data, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn default_model_id_is_omitted_and_byte_identical_to_unset() {
+        // Re-converting Unlimited-OCR must stay byte-identical to the v1 artifact:
+        // setting the default id emits NO model_id key, exactly like never setting it.
+        let make = |set_default: bool| {
+            let mut b = FocrqBuilder::new()
+                .with_arch_target(1)
+                .with_source_sha256([9u8; 32]);
+            if set_default {
+                b = b.with_model_id("unlimited-ocr");
+            }
+            b.add_tensor("t", WriteDType::Bf16, vec![2], bf16_le(&[3.0, 4.0]))
+                .unwrap();
+            b.build()
+        };
+        let unset = make(false);
+        let set_default = make(true);
+        assert_eq!(unset, set_default, "default model_id must not change bytes");
+        assert!(
+            !String::from_utf8_lossy(&unset).contains("model_id"),
+            "the default arch must omit the model_id key entirely"
+        );
+        // And it still loads, resolving to the default arch.
+        let w = Weights::from_bytes(unset).unwrap();
+        assert_eq!(w.model_id(), "unlimited-ocr");
+    }
+
+    #[test]
+    fn empty_model_id_is_omitted() {
+        // An explicitly-empty id is treated like unset (omitted), never written as
+        // an empty string the reader would have to special-case.
+        let mut b = FocrqBuilder::new().with_model_id("");
+        b.add_tensor("t", WriteDType::F32, vec![1], f32_le(&[1.0]))
+            .unwrap();
+        let blob = b.build();
+        assert!(!String::from_utf8_lossy(&blob).contains("model_id"));
+        assert_eq!(
+            Weights::from_bytes(blob).unwrap().model_id(),
+            "unlimited-ocr"
+        );
+    }
+
+    #[test]
+    fn build_with_model_id_is_byte_deterministic() {
+        let make = || {
+            let mut b = FocrqBuilder::new()
+                .with_model_id("got-ocr2")
+                .with_license_notice(got_ocr2_notice());
             b.add_tensor("zeta", WriteDType::Bf16, vec![2], bf16_le(&[3.0, 4.0]))
                 .unwrap();
             b.add_tensor("alpha", WriteDType::F32, vec![2], f32_le(&[1.0, 2.0]))

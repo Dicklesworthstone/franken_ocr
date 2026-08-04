@@ -1,0 +1,141 @@
+{
+ "_meta": {
+  "purpose": "E6 detokenize goldens (bd-3jo6.5.6)",
+  "oracle": "HF tokenizers WordLevel over the committed upstream tables",
+  "arithmetic": "staff2score.py::detokenize \u2014 None->'' , G-with-dot->space, strip, drop [BOS]/[EOS]/[PAD]",
+  "generated": "2026-07-05, scripts inline (see bead)"
+ },
+ "rhythm": {
+  "n_vocab": 260,
+  "probe_ids": [
+   1,
+   0,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   259
+  ],
+  "raw_tokens": [
+   "[BOS]",
+   "[PAD]",
+   "[EOS]",
+   "+",
+   "|",
+   "barline",
+   "clef-C1",
+   "clef-C2",
+   "clef-C3",
+   "timeSignature-C/"
+  ],
+  "detokenized": [
+   "+",
+   "|",
+   "barline",
+   "clef-C1",
+   "clef-C2",
+   "clef-C3",
+   "timeSignature-C/"
+  ],
+  "oor_token_is_none": true
+ },
+ "pitch": {
+  "n_vocab": 71,
+  "probe_ids": [
+   1,
+   0,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   70
+  ],
+  "raw_tokens": [
+   "note-C0",
+   "nonote",
+   "note-D0",
+   "note-E0",
+   "note-F0",
+   "note-G0",
+   "note-A0",
+   "note-B0",
+   "note-C1",
+   "note-B9"
+  ],
+  "detokenized": [
+   "note-C0",
+   "nonote",
+   "note-D0",
+   "note-E0",
+   "note-F0",
+   "note-G0",
+   "note-A0",
+   "note-B0",
+   "note-C1",
+   "note-B9"
+  ],
+  "oor_token_is_none": true
+ },
+ "lift": {
+  "n_vocab": 7,
+  "probe_ids": [
+   1,
+   0,
+   2,
+   3,
+   4,
+   5,
+   6,
+   6
+  ],
+  "raw_tokens": [
+   "lift_null",
+   "nonote",
+   "lift_##",
+   "lift_#",
+   "lift_bb",
+   "lift_b",
+   "lift_N",
+   "lift_N"
+  ],
+  "detokenized": [
+   "lift_null",
+   "nonote",
+   "lift_##",
+   "lift_#",
+   "lift_bb",
+   "lift_b",
+   "lift_N",
+   "lift_N"
+  ],
+  "oor_token_is_none": true
+ },
+ "note": {
+  "n_vocab": 2,
+  "probe_ids": [
+   1,
+   0,
+   2,
+   1
+  ],
+  "raw_tokens": [
+   "note",
+   "nonote",
+   null,
+   "note"
+  ],
+  "detokenized": [
+   "note",
+   "nonote",
+   "",
+   "note"
+  ],
+  "oor_token_is_none": true
+ }
+}

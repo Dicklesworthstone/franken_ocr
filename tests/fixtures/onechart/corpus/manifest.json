@@ -1,0 +1,82 @@
+{
+  "_meta": {
+    "purpose": "OneChart in-distribution quality corpus (SCRM proxy, bd-2lje): matplotlib default-style charts with exact known values",
+    "generator": "inline matplotlib (session 2026-07-05), dpi 80"
+  },
+  "charts": [
+    {
+      "file": "bar_revenue.png",
+      "kind": "bar",
+      "values": {
+        "Q1": 120,
+        "Q2": 150,
+        "Q3": 90,
+        "Q4": 180
+      },
+      "sha256": "c49364d73d22b50004ae558a145859714a00f1d014688a6803b9b9ff9051b8b6"
+    },
+    {
+      "file": "bar_population.png",
+      "kind": "bar",
+      "values": {
+        "USA": 332,
+        "China": 1412,
+        "India": 1408,
+        "Brazil": 214,
+        "Japan": 125
+      },
+      "sha256": "e6b387cf46e08ff9cfd26510ea51e8c4a1da1abcdea2452294aca43cd70d5f9b"
+    },
+    {
+      "file": "line_users.png",
+      "kind": "line",
+      "values": {
+        "2019": 45,
+        "2020": 52,
+        "2021": 61,
+        "2022": 58,
+        "2023": 70
+      },
+      "sha256": "cd11b46f0d86005a4f4dcd749d289e2312e2a06f4e98274c119838dfdd8ac65d"
+    },
+    {
+      "file": "pie_budget.png",
+      "kind": "pie",
+      "values": {
+        "Rent": 40,
+        "Food": 30,
+        "Transport": 20,
+        "Other": 10
+      },
+      "sha256": "0104016cee8dccc87c86346528ef040fb61582537eedf30cfee388e95fc0390c"
+    },
+    {
+      "file": "grouped_sales.png",
+      "kind": "grouped_bar",
+      "values": {
+        "Product A": {
+          "Jan": 25,
+          "Feb": 40,
+          "Mar": 35
+        },
+        "Product B": {
+          "Jan": 30,
+          "Feb": 20,
+          "Mar": 45
+        }
+      },
+      "sha256": "9e37b26b11301bc8095959fbec11d6b5e661f8997c2be0d3787b691d5b5c2e5d"
+    },
+    {
+      "file": "hbar_satisfaction.png",
+      "kind": "hbar",
+      "values": {
+        "Python": 67,
+        "Rust": 85,
+        "Go": 72,
+        "Java": 55
+      },
+      "sha256": "28a9c070103040dcd159af17029e02f5e3184b30486f657365af633c13750c8f"
+    }
+  ]
+}

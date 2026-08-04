@@ -40,8 +40,8 @@
 use super::moe;
 use super::nn;
 use super::rswa::{self, BatchedRingCache, RingCache};
-use super::tensor::{Mat, QInt8};
-use super::weights::Weights;
+use super::tensor::{Mat, QInt8, WeightLayout};
+use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
 use crate::simd;
 use rayon::prelude::*;
@@ -315,7 +315,7 @@ pub fn dense_mlp(
 ///
 /// # Errors
 /// [`FocrError::Other`] if `x.cols != in_` or `w.len() != out * in_`.
-fn linear_no_bias(x: &Mat, w: &[f32], in_: usize, out: usize) -> FocrResult<Mat> {
+pub(crate) fn linear_no_bias(x: &Mat, w: &[f32], in_: usize, out: usize) -> FocrResult<Mat> {
     checked_mat_len("linear_no_bias x", x)?;
     if x.cols != in_ {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -364,6 +364,30 @@ pub fn norm_and_lm_head(
 ) -> FocrResult<Mat> {
     let normed = nn::rms_norm(hidden, Some(norm_w), eps)?;
     lm_head_proj(&normed, head_w, vocab)
+}
+
+/// [`norm_and_lm_head`] with the head weight **already transposed** to a matmul-ready
+/// `[hidden, vocab]` [`Mat`] — **bit-identical** logits (same `rms_norm`, same
+/// `nn::matmul`), but WITHOUT re-transposing the (large, tied) embedding on every call.
+///
+/// The naive [`lm_head_proj`]/[`linear_no_bias`] path transposes the whole
+/// `[vocab, hidden]` head matrix per call (~0.6 GB for GOT's 151860×1024). The
+/// O(n)-per-token KV-cache decode invokes the head once per generated token, so that
+/// redundant transpose measured as **~95% of decode wall-clock** (463 s of a 487 s
+/// page). Loop callers build the transpose ONCE and pass it here; the one-shot seeding
+/// prefill keeps the naive path. Numerically identical, so parity/oracle gates hold.
+///
+/// # Errors
+/// [`FocrError::Other`] on any `rms_norm`/`matmul` shape mismatch (e.g.
+/// `head_wt.rows != hidden.cols`).
+pub(crate) fn norm_and_lm_head_pretransposed(
+    hidden: &Mat,
+    norm_w: &[f32],
+    head_wt: &Mat,
+    eps: f32,
+) -> FocrResult<Mat> {
+    let normed = nn::rms_norm(hidden, Some(norm_w), eps)?;
+    nn::matmul(&normed, head_wt)
 }
 
 /// Project (already-normed) hidden states to vocab logits — the bare
@@ -766,28 +790,25 @@ fn token_major_to_head_major(
     Ok((kh, vh))
 }
 
-// ── Dequant-once decoder weight cache (decode-throughput lever) ──────────────
+// ── Conservative mixed-precision decoder cache ──────────────────────────────
 //
-// The `&Weights` decode path re-dequantized ~10 GB of bf16 expert weights from
-// the payload EVERY token: `moe::forward` loads ALL 64 routed experts per MoE
-// layer (x11 layers) even though only 6 of 64 are used per token, plus the
-// attention projections and the [vocab, hidden] lm_head — the dominant decode
-// cost (memory-bandwidth bound). This cache dequantizes every decoder tensor
-// ONCE into an owned f32 image (~10.5 GB) that the (unchanged) kernels borrow by
-// reference, so each subsequent step is pure GEMM. No math changes — only the
-// weight source — so the cached output is identical to the `&Weights` path.
+// Doctrine #2 quantizes only the dense/FFN/expert GEMMs. Attention q/k/v/o and
+// `lm_head` stay high precision. This cache mirrors that recipe exactly: it
+// widens the relatively small gated/high-precision set once and keeps the 2,148
+// FFN/expert matrices in their per-channel int8 form. It therefore avoids the
+// former ~10.5 GB all-f32 cache without silently opting gated tensors into int8.
 
-/// Owned, pre-dequantized decoder weights — built ONCE, borrowed by every prefill
-/// and decode step. See module note above; this is the decode-throughput lever.
+/// Owned conservative-recipe decoder weights, built once and borrowed by every
+/// prefill/decode step.
 pub struct DecoderWeightCache {
     layers: Vec<CachedLayer>,
     /// Final `model.norm.weight` (RMSNorm before the head).
     final_norm: Vec<f32>,
-    /// `lm_head.weight`, row-major `[vocab, hidden]`.
+    /// `lm_head.weight`, widened once to row-major f32 `[vocab, hidden]`.
     lm_head: Vec<f32>,
 }
 
-/// One decoder layer's dequantized weights.
+/// One decoder layer's mixed-precision weights.
 struct CachedLayer {
     input_ln: Vec<f32>,
     post_attn_ln: Vec<f32>,
@@ -795,30 +816,12 @@ struct CachedLayer {
     k_proj: Vec<f32>,
     v_proj: Vec<f32>,
     o_proj: Vec<f32>,
-    mlp: CachedMlp,
-}
-
-/// A layer's dequantized MLP weights — dense (layer 0) or MoE (layers 1..11).
-enum CachedMlp {
-    Dense {
-        gate: Vec<f32>,
-        up: Vec<f32>,
-        down: Vec<f32>,
-    },
-    Moe {
-        /// Router gate `[N_ROUTED_EXPERTS, HIDDEN]`.
-        gate: Vec<f32>,
-        /// 64 routed experts, each `[gate_proj, up_proj, down_proj]`.
-        experts: Vec<[Vec<f32>; 3]>,
-        /// Fused shared expert `[gate_proj, up_proj, down_proj]`.
-        shared: [Vec<f32>; 3],
-    },
+    mlp: CachedMlpI8,
 }
 
 impl DecoderWeightCache {
-    /// Dequantize every decoder tensor ONCE from [`Weights`]. Allocates ~10.5 GB
-    /// of f32 for the 12-layer DeepSeek-V2 MoE decoder (64 experts/layer); the
-    /// prefill + decode loop then run entirely off these owned buffers.
+    /// Build the fixed validated recipe from [`Weights`]: attention and
+    /// `lm_head` high precision, FFN/expert projections int8, router/norms f32.
     ///
     /// # Errors
     /// [`FocrError::FormatMismatch`] if any expected tensor is absent/mis-shaped.
@@ -842,40 +845,59 @@ impl DecoderWeightCache {
                 .data;
             let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
                 let p = format!("{prefix}.mlp");
-                CachedMlp::Dense {
-                    gate: weights.mat(&format!("{p}.gate_proj.weight"))?.data,
-                    up: weights.mat(&format!("{p}.up_proj.weight"))?.data,
-                    down: weights.mat(&format!("{p}.down_proj.weight"))?.data,
+                let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
+                CachedMlpI8::Dense {
+                    gate: quant_oc_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
+                    up: quant_oc_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
+                    down: quant_oc_loaded(
+                        weights,
+                        &format!("{p}.down_proj.weight"),
+                        config::HIDDEN_SIZE,
+                    )?,
                 }
             } else {
                 let p = format!("{prefix}.mlp");
                 let gate = weights.mat(&format!("{p}.gate.weight"))?.data;
+                let inter = moe::config::MOE_INTERMEDIATE_SIZE;
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        weights
-                            .mat(&format!("{p}.experts.{e}.gate_proj.weight"))?
-                            .data,
-                        weights
-                            .mat(&format!("{p}.experts.{e}.up_proj.weight"))?
-                            .data,
-                        weights
-                            .mat(&format!("{p}.experts.{e}.down_proj.weight"))?
-                            .data,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.gate_proj.weight"),
+                            inter,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.up_proj.weight"),
+                            inter,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.down_proj.weight"),
+                            config::HIDDEN_SIZE,
+                        )?,
                     ]);
                 }
+                let shared_inter = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    weights
-                        .mat(&format!("{p}.shared_experts.gate_proj.weight"))?
-                        .data,
-                    weights
-                        .mat(&format!("{p}.shared_experts.up_proj.weight"))?
-                        .data,
-                    weights
-                        .mat(&format!("{p}.shared_experts.down_proj.weight"))?
-                        .data,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.gate_proj.weight"),
+                        shared_inter,
+                    )?,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.up_proj.weight"),
+                        shared_inter,
+                    )?,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.down_proj.weight"),
+                        config::HIDDEN_SIZE,
+                    )?,
                 ];
-                CachedMlp::Moe {
+                CachedMlpI8::Moe {
                     gate,
                     experts,
                     shared,
@@ -917,46 +939,9 @@ fn cached_layer_weights(cl: &CachedLayer) -> LayerWeights<'_> {
     }
 }
 
-/// Run one cached layer's MLP — dense (layer 0) or MoE — over the
-/// `post_attention_layernorm`'d hidden, borrowing the dequantized weights (the
-/// MoE router still selects top-k; only the GEMM runs, no dequant).
-fn cached_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Mat> {
-    match mlp {
-        CachedMlp::Dense { gate, up, down } => {
-            let w = moe::MlpWeights {
-                gate_proj: gate,
-                up_proj: up,
-                down_proj: down,
-                hidden: moe::config::HIDDEN_SIZE,
-                intermediate: moe::config::DENSE_INTERMEDIATE_SIZE,
-            };
-            moe::dense_mlp(normed, &w)
-        }
-        CachedMlp::Moe {
-            gate,
-            experts,
-            shared,
-        } => {
-            let exp: Vec<moe::MlpWeights<'_>> = experts
-                .iter()
-                .map(|e| moe::MlpWeights {
-                    gate_proj: &e[0],
-                    up_proj: &e[1],
-                    down_proj: &e[2],
-                    hidden: moe::config::HIDDEN_SIZE,
-                    intermediate: moe::config::MOE_INTERMEDIATE_SIZE,
-                })
-                .collect();
-            let sh = moe::MlpWeights {
-                gate_proj: &shared[0],
-                up_proj: &shared[1],
-                down_proj: &shared[2],
-                hidden: moe::config::HIDDEN_SIZE,
-                intermediate: moe::config::SHARED_INTERMEDIATE_SIZE,
-            };
-            moe::moe_block_default(normed, gate, &exp, &sh)
-        }
-    }
+/// Run the recipe-approved int8 MLP/MoE for one prefill activation block.
+fn cached_mlp(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Mat> {
+    prefill_mlp_i8(mlp, normed)
 }
 
 // ── Decode phase profiler (FOCR_PROFILE_DECODE) ──────────────────────────────
@@ -1058,79 +1043,9 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// One SwiGLU expert over a single decode row `x[hidden]`, off cached weights:
-/// `down( silu(gate·x) * (up·x) )`. `inter` is the expert's intermediate width.
-fn expert_gemv(
-    x: &[f32],
-    gate_w: &[f32],
-    up_w: &[f32],
-    down_w: &[f32],
-    hidden: usize,
-    inter: usize,
-) -> Vec<f32> {
-    let g = gemv(x, gate_w, inter, hidden);
-    let u = gemv(x, up_w, inter, hidden);
-    let mut act = vec![0.0f32; inter];
-    for i in 0..inter {
-        act[i] = silu(g[i]) * u[i];
-    }
-    gemv(&act, down_w, hidden, inter)
-}
-
-/// Decode MoE/MLP over a single `post_attention_layernorm`'d row, off the cached
-/// weights — mirrors [`moe::moe_block_default`] (route top-k, weighted expert
-/// sum, + shared expert) but specialized to `m == 1` with [`gemv`]. Bit-parity
-/// with the GEMM path is gated by the cached-vs-stateless decode check.
-fn decode_mlp(mlp: &CachedMlp, normed: &Mat) -> FocrResult<Vec<f32>> {
-    let hidden = config::HIDDEN_SIZE;
-    let row = normed.row(0);
-    match mlp {
-        CachedMlp::Dense { gate, up, down } => Ok(expert_gemv(
-            row,
-            gate,
-            up,
-            down,
-            hidden,
-            moe::config::DENSE_INTERMEDIATE_SIZE,
-        )),
-        CachedMlp::Moe {
-            gate,
-            experts,
-            shared,
-        } => {
-            let routing = moe::route_default(normed, gate)?;
-            let inter = moe::config::MOE_INTERMEDIATE_SIZE;
-            let mut out = vec![0.0f32; hidden];
-            for j in 0..moe::config::NUM_EXPERTS_PER_TOK {
-                let e = routing.indices[0][j];
-                let w = routing.weights[0][j];
-                let y = expert_gemv(
-                    row,
-                    &experts[e][0],
-                    &experts[e][1],
-                    &experts[e][2],
-                    hidden,
-                    inter,
-                );
-                for c in 0..hidden {
-                    out[c] += w * y[c];
-                }
-            }
-            // Shared expert (weight 1.0 over every token).
-            let s = expert_gemv(
-                row,
-                &shared[0],
-                &shared[1],
-                &shared[2],
-                hidden,
-                moe::config::SHARED_INTERMEDIATE_SIZE,
-            );
-            for c in 0..hidden {
-                out[c] += s[c];
-            }
-            Ok(out)
-        }
-    }
+/// Decode the recipe-approved int8 MLP/MoE for one normalized token row.
+fn decode_mlp(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
+    decode_mlp_i8(mlp, normed)
 }
 
 /// Final RMSNorm + `lm_head` over the decode hidden (`[1, hidden]`), off the
@@ -1146,14 +1061,171 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
             hidden.rows
         )));
     }
+    let t = prof::enabled().then(std::time::Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
-    let logits = gemv(
-        normed.row(0),
-        &wc.lm_head,
-        config::VOCAB_SIZE,
-        config::HIDDEN_SIZE,
-    );
+    let row = normed.row(0);
+    // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv`).
+    // Byte-for-byte identical either way — each logit is an independent dot.
+    let logits = if lmhead_shard_enabled() {
+        gemv_sharded(
+            row,
+            &wc.lm_head,
+            config::VOCAB_SIZE,
+            config::HIDDEN_SIZE,
+            lmhead_shard_tiles(),
+        )
+    } else {
+        gemv(row, &wc.lm_head, config::VOCAB_SIZE, config::HIDDEN_SIZE)
+    };
+    if let Some(t) = t {
+        prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
+    }
     Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
+}
+
+// ── Chunked prefill (FOCR_PREFILL_CHUNK, bd-1azu.9) ──────────────────────────
+//
+// Chunked prefill co-schedules a slice of the prompt into the decode batch as a
+// "mixed prefill/decode forward": instead of running the WHOLE prefill through
+// each layer in one monolithic SDPA, it consumes `C` tokens at a time, pushing
+// each chunk through all 12 layers (writing its K/V into the per-layer rings)
+// before the next chunk. This is the front end of the continuous-batch spine —
+// a prefill chunk is processed like a decode step, one pass through the layers,
+// so it can later share the batched per-layer GEMMs with in-flight decode rows.
+//
+// LOSSLESS by construction: chunking is a pure TILING of the SAME causal
+// attention. Every per-token op outside attention (RMSNorm, the q/k/v/o
+// projections, RoPE at the TRUE absolute position, the dense/MoE MLP, the
+// residual adds) is independent ROW-by-ROW, so a chunk's rows are byte-identical
+// whether projected alone or as part of the whole sequence. The only cross-token
+// op is attention, and for chunk `[c0, c1)` each new query at global position
+// `t ∈ [c0, c1)` attends EXACTLY the prior tokens it would monolithically —
+// keys `[0, t]` (earlier chunks already written into the running K/V, plus this
+// chunk up to `t`) — in the SAME ascending reduction order. The trailing
+// (future) keys a monolithic SDPA carries are masked to 0 for row `t` and add
+// exact `0.0`, so restricting the key set to `[0, c1)` is byte-for-byte the same
+// reduction (see [`chunk_prefill_attention`]). Hence the final hidden AND every
+// layer's ring K/V equal the monolithic [`prefill_with_cache`] output exactly.
+
+/// `FOCR_PREFILL_CHUNK`: kill-switch arming chunked prefill. UNSET ⇒ today's
+/// monolithic [`prefill_with_cache`] / [`prefill_with_cache_i8`] path, byte-for-
+/// byte. When present its value is the chunk size `C` (tokens consumed per
+/// pass); present-but-invalid (`empty`/unparseable/`0`) falls back to
+/// [`DEFAULT_PREFILL_CHUNK`] so mere presence still arms the lever, exactly like
+/// [`BATCH_SIZE_ENV`].
+const PREFILL_CHUNK_ENV: &str = "FOCR_PREFILL_CHUNK";
+
+/// Fallback chunk size when [`PREFILL_CHUNK_ENV`] is present but unparseable/`0`.
+const DEFAULT_PREFILL_CHUNK: usize = 256;
+
+/// The configured prefill chunk size ([`PREFILL_CHUNK_ENV`], read ONCE into a
+/// process-global per doctrine — never re-read per prefill). `None` ⇒ the
+/// monolithic path (the unset default); `Some(C)` ⇒ chunk `C > 0` tokens per
+/// pass. A chunk `>=` the sequence length collapses to a single chunk, which is
+/// itself byte-for-byte the monolithic path.
+#[must_use]
+pub fn prefill_chunk_size() -> Option<usize> {
+    static SIZE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        // unset ⇒ monolithic prefill, byte-for-byte
+        std::env::var_os(PREFILL_CHUNK_ENV)?;
+        Some(
+            std::env::var(PREFILL_CHUNK_ENV)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_PREFILL_CHUNK),
+        )
+    })
+}
+
+/// Tile `[0, seq)` into CONTIGUOUS, gap-free, ascending `[c0, c1)` chunks of at
+/// most `chunk` tokens (the last is the `seq % chunk` remainder). `chunk` is
+/// clamped to `>= 1`. The ascending coverage is what lets chunk `g`'s attention
+/// see exactly the keys earlier chunks already wrote — and preserves token order.
+fn prefill_chunk_bounds(seq: usize, chunk: usize) -> Vec<(usize, usize)> {
+    let chunk = chunk.max(1);
+    let mut bounds = Vec::with_capacity(seq.div_ceil(chunk));
+    let mut c0 = 0usize;
+    while c0 < seq {
+        let c1 = (c0 + chunk).min(seq);
+        bounds.push((c0, c1));
+        c0 = c1;
+    }
+    bounds
+}
+
+/// Causal self-attention for ONE prefill chunk: the `cs = c1 - c0` new queries
+/// `q_chunk` (global positions `[c0, c1)`, already RoPE'd) attend over the
+/// running reference keys/values `k_prefix`/`v_prefix` — the FULL `[0, c1)`
+/// prefix (earlier chunks ++ this chunk's own K/V) — under the triangular causal
+/// mask, returning the `[cs, num_heads*head_dim]` context (pre-`o_proj`).
+///
+/// BYTE-FOR-BYTE identical to the corresponding rows of the monolithic
+/// [`prefill_attention`] over the whole sequence. The trick: front-pad the
+/// queries to the `c1` rows the prefix spans (rows `[0, c0)` are scratch and
+/// discarded) so [`prefill_attention`]'s top-left causal mask (`limit = row+1`)
+/// lands each REAL query row `t` on keys `[0, t]` — exactly its monolithic
+/// reach. Each kept row's score dot (over `head_dim`), softmax (ascending over
+/// `[0, t]`), and `P·V` (ascending, with the future keys a monolithic pass would
+/// carry contributing exact `0.0`) are unchanged, and the scratch rows are
+/// row-independent in SDPA, so they never perturb a kept row.
+///
+/// # Errors
+/// [`FocrError::Other`] on a shape mismatch (`q_chunk`/`k_prefix`/`v_prefix`
+/// widths disagree, `c0 + cs != c1`, or `c0 > c1`).
+pub fn chunk_prefill_attention(
+    q_chunk: &Mat,
+    k_prefix: &Mat,
+    v_prefix: &Mat,
+    num_heads: usize,
+    head_dim: usize,
+    c0: usize,
+) -> FocrResult<Mat> {
+    checked_mat_len("chunk_prefill_attention q_chunk", q_chunk)?;
+    checked_mat_len("chunk_prefill_attention k_prefix", k_prefix)?;
+    checked_mat_len("chunk_prefill_attention v_prefix", v_prefix)?;
+    let dim = checked_shape_mul(
+        "chunk_prefill_attention",
+        num_heads,
+        head_dim,
+        "num_heads*head_dim",
+    )?;
+    let c1 = k_prefix.rows;
+    let cs = q_chunk.rows;
+    if q_chunk.cols != dim || k_prefix.cols != dim || v_prefix.cols != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "chunk_prefill_attention: q/k/v cols ({},{},{}) != num_heads*head_dim {dim}",
+            q_chunk.cols,
+            k_prefix.cols,
+            v_prefix.cols
+        )));
+    }
+    if v_prefix.rows != c1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "chunk_prefill_attention: k/v prefix rows disagree ({}, {})",
+            c1,
+            v_prefix.rows
+        )));
+    }
+    if c0 > c1 || c0 + cs != c1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "chunk_prefill_attention: chunk [{c0}, {}) of {cs} rows does not fit prefix {c1}",
+            c0 + cs
+        )));
+    }
+    // Front-pad the chunk's queries to the prefix length so SDPA's top-left
+    // causal mask aligns each real query row to its TRUE global position. The
+    // scratch rows `[0, c0)` are discarded (their masked attention over the
+    // zero query never feeds back into a kept row).
+    let mut q_padded = Mat::zeros(c1, dim);
+    q_padded.data[c0 * dim..c1 * dim].copy_from_slice(&q_chunk.data);
+    let ctx_full = prefill_attention(&q_padded, k_prefix, v_prefix, num_heads, head_dim)?;
+    Ok(Mat::from_vec(
+        cs,
+        dim,
+        ctx_full.data[c0 * dim..c1 * dim].to_vec(),
+    ))
 }
 
 /// Run the full 12-layer prefill over `inputs_embeds` exactly like [`forward`],
@@ -1168,6 +1240,10 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
 /// MLP/MoE re-processes all prior tokens); here we pay the prefill ONCE and then
 /// extend by a single token per step.
 ///
+/// `FOCR_PREFILL_CHUNK` ([`prefill_chunk_size`]) arms the chunked path
+/// ([`prefill_with_cache_chunked`]); unset ⇒ the monolithic loop, byte-for-byte
+/// the original.
+///
 /// # Errors
 /// As [`forward`], plus a [`RingCache::record_prefill`] error if `seq` exceeds
 /// the cache capacity (it is sized to `seq`, so only an internal inconsistency
@@ -1175,6 +1251,22 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
 pub fn prefill_with_cache(
     wc: &DecoderWeightCache,
     inputs_embeds: &Mat,
+) -> FocrResult<(Mat, Vec<RingCache>)> {
+    prefill_with_cache_chunked(wc, inputs_embeds, prefill_chunk_size())
+}
+
+/// [`prefill_with_cache`] with the chunk decision made explicit (so the parity
+/// test can exercise both schedules in one process without re-reading the
+/// kill-switch). `chunk = None` runs the monolithic loop — the exact original
+/// path; `chunk = Some(C)` tiles the prefill into `C`-token chunks (lossless, see
+/// the module note above [`PREFILL_CHUNK_ENV`]).
+///
+/// # Errors
+/// As [`prefill_with_cache`].
+pub fn prefill_with_cache_chunked(
+    wc: &DecoderWeightCache,
+    inputs_embeds: &Mat,
+    chunk: Option<usize>,
 ) -> FocrResult<(Mat, Vec<RingCache>)> {
     checked_mat_len("decoder::prefill_with_cache inputs_embeds", inputs_embeds)?;
     let hidden = config::HIDDEN_SIZE;
@@ -1195,13 +1287,67 @@ pub fn prefill_with_cache(
     }
     let seq = inputs_embeds.rows;
 
-    // Absolute positions 0..seq, one shared RoPE table ([SPEC-095]).
-    let positions: Vec<usize> = (0..seq).collect();
-    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
-
     let mut caches: Vec<RingCache> = (0..config::NUM_HIDDEN_LAYERS)
         .map(|_| RingCache::new(seq.max(1)))
         .collect();
+
+    if let Some(chunk) = chunk {
+        // ── Chunked schedule: push each `chunk`-token slice through all layers,
+        //    growing the per-layer K/V, then seed the rings ONCE at the end. ──
+        let mut out = Mat::zeros(seq, hidden);
+        let mut k_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        let mut v_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        for (c0, c1) in prefill_chunk_bounds(seq, chunk) {
+            // RoPE over THIS chunk's TRUE absolute positions [c0, c1) ([SPEC-095]).
+            let positions: Vec<usize> = (c0..c1).collect();
+            let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
+            let mut x = Mat::from_vec(
+                c1 - c0,
+                hidden,
+                inputs_embeds.data[c0 * hidden..c1 * hidden].to_vec(),
+            );
+            for layer in 0..config::NUM_HIDDEN_LAYERS {
+                let cl = &wc.layers[layer];
+                let lw = cached_layer_weights(cl);
+                let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
+                let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
+                // Append this chunk's K/V into the running reference block.
+                k_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&k.data);
+                v_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&v.data);
+                let kpre = Mat::from_vec(c1, qkv_dim, k_full[layer].data[..c1 * qkv_dim].to_vec());
+                let vpre = Mat::from_vec(c1, qkv_dim, v_full[layer].data[..c1 * qkv_dim].to_vec());
+                let context = chunk_prefill_attention(&q, &kpre, &vpre, num_heads, head_dim, c0)?;
+                let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
+                let h = add_residual(&x, &attn_out)?;
+                let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
+                let mlp_out = cached_mlp(&cl.mlp, &normed2)?;
+                x = add_residual(&h, &mlp_out)?;
+            }
+            out.data[c0 * hidden..c1 * hidden].copy_from_slice(&x.data);
+        }
+        // Seed each ring with the full accumulated reference block — byte-for-byte
+        // the monolithic `record_prefill` (same K/V, same order).
+        for layer in 0..config::NUM_HIDDEN_LAYERS {
+            let (kh, vh) = token_major_to_head_major(
+                &k_full[layer],
+                &v_full[layer],
+                seq,
+                num_heads,
+                head_dim,
+            )?;
+            caches[layer].record_prefill(&kh, &vh, seq)?;
+        }
+        return Ok((out, caches));
+    }
+
+    // ── Monolithic schedule (the unset default): one SDPA over the whole seq. ──
+    // Absolute positions 0..seq, one shared RoPE table ([SPEC-095]).
+    let positions: Vec<usize> = (0..seq).collect();
+    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
 
     let mut x = inputs_embeds.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
@@ -1278,9 +1424,11 @@ pub fn decode_step_with_cache(
     // RoPE at the single TRUE absolute position (one row, one shared table).
     let rope = RopeTable::build(&[position], config::HEAD_DIM, config::ROPE_THETA);
 
+    let profiling = prof::enabled();
     let mut x = token_embed.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
+        let t_attn = profiling.then(std::time::Instant::now);
 
         // Attention via the bespoke m=1 GEMV: project q/k/v, RoPE q/k at the true
         // `position`, push K/V into the ring (the query attends to itself as the
@@ -1298,6 +1446,9 @@ pub fn decode_step_with_cache(
         let context = rswa::decode_attention(&caches[layer], &q.data)?;
         let attn_out = Mat::from_vec(1, hidden, gemv(&context.data, &cl.o_proj, hidden, qkv_dim));
         let h = add_residual(&x, &attn_out)?;
+        if let Some(t) = t_attn {
+            prof::add(&prof::ATTN_NS, t.elapsed().as_nanos() as u64);
+        }
 
         // MLP / MoE via the bespoke GEMV (routed top-k experts + shared).
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
@@ -1308,15 +1459,15 @@ pub fn decode_step_with_cache(
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  INT8 DECODE ENGINE — per-output-channel symmetric S8S8, NEON SDOT / VNNI  ║
+// ║  INT8 DECODE ENGINE — per-output-channel symmetric S8S8 dense contractions  ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 //
 // The f32 cache above dequantizes the whole 12-layer MoE decoder to ~10.5 GB of
 // f32 and reads ~1.9 GB/token at decode — memory-bound on the ~120 GB/s M4 bus.
 // This int8 engine stores the SAME weights as per-output-channel symmetric int8
 // (~2.8 GB, 4x less traffic) and runs the hot GEMV/GEMM through the bespoke
-// `simd::igemm_s8s8` backend (NEON `vdotq_s32` SDOT on Apple Silicon; AVX-512 /
-// AVX-VNNI / AVX2 on x86 — the exact "fastest per-ISA" doctrine for THIS model).
+// `simd::igemm_s8s8` backend (measured LLVM autovec by default on Apple, with
+// forced SDOT/SMMLA routes; AVX-512 / AVX-VNNI / AVX2 on x86).
 //
 // Precision: weights quantize as `w_scale[o] = max|W[o,:]|/127` (symmetric, the
 // proven `nn::quantize_int8` / `ft_kernel_cpu::quantize_per_output_channel_i8`
@@ -1327,7 +1478,7 @@ pub fn decode_step_with_cache(
 // Accuracy is VERIFIED end-to-end against the f32-stateless oracle + baidu CER.
 
 /// Block of int8 GEMV output rows fanned to one rayon task (each a single
-/// `simd::igemm_s8s8` SDOT call). Matches the f32 `gemv`'s 64-row blocking.
+/// `simd::igemm_s8s8` dense contraction). Matches the f32 `gemv`'s 64-row blocking.
 const I8_GEMV_BLOCK: usize = 64;
 
 /// Dynamically quantize a single activation row `x[k]` to symmetric int8
@@ -1337,10 +1488,9 @@ const I8_GEMV_BLOCK: usize = 64;
 fn quantize_row_i8(x: &[f32]) -> (Vec<i8>, f32) {
     let amax = x.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
     let a_scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-    let inv = 1.0 / a_scale;
     let xq: Vec<i8> = x
         .iter()
-        .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8)
+        .map(|&v| (v / a_scale).round_ties_even().clamp(-127.0, 127.0) as i8)
         .collect();
     (xq, a_scale)
 }
@@ -1351,15 +1501,55 @@ fn quantize_row_i8(x: &[f32]) -> (Vec<i8>, f32) {
 /// activation `x[k]` dynamically int8-quantized once, and the pre-quantized
 /// weight `qw` in `[n,k]` output-channel-major int8 (the native `[out,in]`
 /// checkpoint layout — no transpose). The `n` output rows fan across the rayon
-/// pool in `I8_GEMV_BLOCK` chunks, each a single `simd::igemm_s8s8` SDOT/VNNI
+/// pool in `I8_GEMV_BLOCK` chunks, each a single dispatched `simd::igemm_s8s8`
 /// call; i32 accumulation is exact (proven `K ≤ 6848 < i32::MAX`, `src/simd`).
 fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
+    debug_assert_eq!(x.len(), qw.k);
+    let (xq, a_scale) = quantize_row_i8(x);
+    gemv_i8_prequant(&xq, a_scale, qw)
+}
+
+/// Block-parallel int8 GEMV from a PRE-QUANTIZED activation row `(xq, a_scale)` —
+/// the body of [`gemv_i8`] hoisted out of the per-call activation quantize so a
+/// caller that already produced `(xq, a_scale)` (the fused norm->quant epilogue,
+/// [`FUSE_NORM_QUANT_ENV`]) can feed the SAME int8 row to several weights without
+/// re-quantizing. BYTE-FOR-BYTE identical to [`gemv_i8`]: each of the `n` output
+/// channels is an independent i32 dot dequantized by `a_scale · scale[o]`, so the
+/// rayon row-chunking never changes a per-channel value (the same N-independence
+/// the 64-row blocking and `fuse_qkv` already rely on).
+/// Layout-aware channel-block int8 GEMM: contract `xq [m, k]` against weight
+/// rows `[base, base + cnt)` of `qw` into `acc [m, cnt]` (zeroed here).
+///
+/// `RowMajor` slices the canonical `[n, k]` buffer exactly as before;
+/// `SmmlaPanels` (an `--arch aarch64-smmla` artifact kept packed by the
+/// loader, bd-2mo.3) slices the offline panel stream — pair-aligned because
+/// every caller blocks by the even `I8_GEMV_BLOCK` (or passes base 0) — and
+/// feeds the i8mm kernel with ZERO runtime shuffle. Bit-identical either way:
+/// the packing is a pure zero-padded permutation and integer accumulation is
+/// exact, so each output channel's i32 is the same in both layouts.
+fn igemm_i8_block(qw: &QInt8, xq: &[i8], m: usize, base: usize, cnt: usize, acc: &mut [i32]) {
+    let k = qw.k;
+    match qw.layout {
+        WeightLayout::RowMajor => {
+            acc.fill(0);
+            simd::igemm_s8s8(xq, &qw.w[base * k..(base + cnt) * k], m, k, cnt, acc);
+        }
+        WeightLayout::SmmlaPanels => {
+            debug_assert_eq!(base % 2, 0, "channel blocks must be pair-aligned");
+            let kb = k.div_ceil(8);
+            let start = (base / 2) * kb * 16;
+            let len = cnt.div_ceil(2) * kb * 16;
+            simd::igemm_s8s8_packed_b(xq, &qw.w[start..start + len], m, k, cnt, acc);
+        }
+    }
+}
+
+fn gemv_i8_prequant(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     let k = qw.k;
     let n = qw.n;
-    debug_assert_eq!(x.len(), k);
-    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(xq.len(), k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
     debug_assert_eq!(qw.scales.len(), n);
-    let (xq, a_scale) = quantize_row_i8(x);
     let mut y = vec![0.0f32; n];
     y.par_chunks_mut(I8_GEMV_BLOCK)
         .enumerate()
@@ -1367,12 +1557,132 @@ fn gemv_i8(x: &[f32], qw: &QInt8) -> Vec<f32> {
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len();
             let mut acc = vec![0i32; cnt];
-            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], 1, k, cnt, &mut acc);
+            igemm_i8_block(qw, xq, 1, base, cnt, &mut acc);
             for (j, slot) in ys.iter_mut().enumerate() {
                 *slot = acc[j] as f32 * a_scale * qw.scales[base + j];
             }
         });
     y
+}
+
+/// `M=B` batched twin of [`gemv_i8_bias_prequant`] for the DENSE decoder's batch
+/// spine (A7.5, bd-3jo6.1.7.5): every stream's activation row arrives ALREADY
+/// quantized on its own ties-to-even `(xq, a_scale)` (exactly what the m=1 dense
+/// decode step produces), the i32 contraction runs as ONE `M=B`
+/// [`simd::igemm_s8s8`] per channel block (M-independent — the weight panel is
+/// read once and reused across all `B` rows), and the dequant
+/// `acc as f32 * a_scale[r] * scales[o]` plus the optional per-output f32 bias
+/// use the SAME operands in the SAME order as [`gemv_i8_prequant`] +
+/// [`gemv_i8_bias_prequant`] — so row `r` is BYTE-FOR-BYTE the m=1 result for
+/// stream `r` alone (the lossless contract; gated in-module and by the dense
+/// bit-identity suite).
+pub(crate) fn gemm_i8_bias_prequant_batched(
+    rows: &[(&[i8], f32)],
+    qw: &QInt8,
+    bias: Option<&[f32]>,
+) -> Vec<Vec<f32>> {
+    let b = rows.len();
+    let k = qw.k;
+    let n = qw.n;
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
+    debug_assert_eq!(qw.scales.len(), n);
+    if b == 0 {
+        return Vec::new();
+    }
+    // Pack the prequantized rows `[b, k]` (no re-quantize — the scales are the
+    // streams' own ties-to-even scales).
+    let mut xq = vec![0i8; b * k];
+    for (r, (row, _)) in rows.iter().enumerate() {
+        debug_assert_eq!(row.len(), k);
+        xq[r * k..(r + 1) * k].copy_from_slice(row);
+    }
+    // Channel-major `[n, b]` scratch: disjoint contiguous chunks per channel
+    // block, race-free fan-out (the gemv_i8_batched pattern).
+    let mut ycm = vec![0.0f32; n * b];
+    ycm.par_chunks_mut(I8_GEMV_BLOCK * b)
+        .enumerate()
+        .for_each(|(blk, ys)| {
+            let base = blk * I8_GEMV_BLOCK;
+            let cnt = ys.len() / b;
+            let mut acc = vec![0i32; b * cnt];
+            igemm_i8_block(qw, &xq, b, base, cnt, &mut acc);
+            for j in 0..cnt {
+                let scale_o = qw.scales[base + j];
+                let bias_o = bias.map_or(0.0, |bb| bb[base + j]);
+                for (r, &(_, a_scale)) in rows.iter().enumerate() {
+                    // Same expression shape as gemv_i8_prequant (+ the bias add
+                    // gemv_i8_bias_prequant performs after dequant).
+                    ys[j * b + r] = acc[r * cnt + j] as f32 * a_scale * scale_o + bias_o;
+                }
+            }
+        });
+    // Transpose channel-major `[n, b]` -> per-stream rows `[b][n]`.
+    let mut out: Vec<Vec<f32>> = (0..b).map(|_| vec![0.0f32; n]).collect();
+    for o in 0..n {
+        let col = o * b;
+        for (r, row) in out.iter_mut().enumerate() {
+            row[o] = ycm[col + r];
+        }
+    }
+    out
+}
+
+/// Shared dynamic activation quantizer for the dense-model decode paths. Uses
+/// true division plus ties-to-even, matching [`quantize_row_i8`], the prefill's
+/// `nn::linear_int8_dynamic`, and the frozen `.focrq` numeric contract.
+#[inline]
+pub(crate) fn quantize_row_i8_te(x: &[f32]) -> (Vec<i8>, f32) {
+    quantize_row_i8(x)
+}
+
+/// n-parallel m=1 int8 GEMV from a PRE-QUANTIZED activation `(xq, a_scale)`, adding
+/// an optional per-output f32 `bias` after dequant. Reuses [`gemv_i8_prequant`] (the
+/// output channels fan across the rayon pool — the decode kernel that keeps m=1 fast,
+/// vs `nn::linear_int8_dynamic` which parallelizes over the m=1 row = single-thread).
+/// The fused-qkv decode quantizes the normed row ONCE and feeds q/k/v (one `[3·d, h]`
+/// panel + concatenated biases) through a single call.
+pub(crate) fn gemv_i8_bias_prequant(
+    xq: &[i8],
+    a_scale: f32,
+    qw: &QInt8,
+    bias: Option<&[f32]>,
+) -> Vec<f32> {
+    let mut y = gemv_i8_prequant(xq, a_scale, qw);
+    if let Some(b) = bias {
+        debug_assert_eq!(b.len(), y.len());
+        for (v, &bb) in y.iter_mut().zip(b) {
+            *v += bb;
+        }
+    }
+    y
+}
+
+/// `FOCR_FUSE_NORM_QUANT` (bd-1azu.54, Lever 1): fold the decode-row int8
+/// activation quantize into the `input_layernorm` RMSNorm epilogue so the
+/// normalized row is quantized ONCE as it is produced and the same int8 row feeds
+/// q/k/v, instead of `nn::rms_norm` -> f32 `Mat` -> a re-quantize inside each
+/// [`gemv_i8`]. DEFAULT OFF — unset reproduces the norm-then-gemv path
+/// byte-for-byte. Read ONCE into a process-wide bool.
+const FUSE_NORM_QUANT_ENV: &str = "FOCR_FUSE_NORM_QUANT";
+
+fn fuse_norm_quant_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(FUSE_NORM_QUANT_ENV).is_some())
+}
+
+/// Fused RMSNorm + per-row int8 quantize (FOCR_FUSE_NORM_QUANT): returns the SAME
+/// `(xq, a_scale)` that `quantize_row_i8(nn::rms_norm(x, weight, eps).row(0))`
+/// produces. The normalized values come from the SAME `nn::rms_norm` kernel call,
+/// then the quantize (amax/scale/round/clamp of [`quantize_row_i8`]) is applied in
+/// the epilogue — so the int8 bytes + scale are byte-for-byte the separate
+/// norm-then-quantize, while the int8 GEMV ([`gemv_i8_prequant`]) no longer
+/// re-reads an f32 row to re-quantize it. `x` is a single decode row (`rows == 1`).
+///
+/// # Errors
+/// Propagates [`nn::rms_norm`]'s shape error.
+fn rms_norm_quant_i8(x: &Mat, weight: Option<&[f32]>, eps: f32) -> FocrResult<(Vec<i8>, f32)> {
+    let normed = nn::rms_norm(x, weight, eps)?;
+    Ok(quantize_row_i8(normed.row(0)))
 }
 
 /// One SwiGLU expert over a single decode row `x[hidden]`, int8: `down(silu(gate·x) *
@@ -1390,18 +1700,18 @@ fn expert_gemv_i8(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32>
 }
 
 /// SERIAL int8 GEMV from a pre-quantized activation — a single `simd::igemm_s8s8`
-/// SDOT/VNNI call over all `n` rows, NO rayon. Used inside the per-expert rayon
+/// dense-int8 call over all `n` rows, NO rayon. Used inside the per-expert rayon
 /// tasks below, where parallelism is ACROSS experts (one task each) rather than
 /// within: 6 routed experts is the right granularity to saturate the pool with
 /// ONE dispatch, vs the 18 tiny internally-parallel GEMVs the per-row `gemv_i8`
-/// would spawn (measured: MoE experts were 56% of decode, ~10% of SDOT peak —
+/// would spawn (measured: MoE experts were 56% of decode and dispatch-bound —
 /// dispatch-bound, not compute-bound).
 fn gemv_i8_serial(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     let k = qw.k;
     let n = qw.n;
     debug_assert_eq!(xq.len(), k);
     let mut acc = vec![0i32; n];
-    simd::igemm_s8s8(xq, &qw.w, 1, k, n, &mut acc);
+    igemm_i8_block(qw, xq, 1, 0, n, &mut acc);
     let mut y = vec![0.0f32; n];
     for (o, slot) in y.iter_mut().enumerate() {
         *slot = acc[o] as f32 * a_scale * qw.scales[o];
@@ -1424,10 +1734,209 @@ fn expert_gemv_i8_serial(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> V
     gemv_i8_serial(&aq, a_scale2, down)
 }
 
-/// Quantize a `[out, in]` row-major f32 weight to per-output-channel symmetric
-/// int8 (`in` inferred from `w.len()/out`). Thin wrapper over [`nn::quantize_int8`].
-fn quant_oc(w: &[f32], out: usize) -> QInt8 {
-    nn::quantize_int8(w, out, w.len() / out)
+/// Quantize an exact `[out, in_]` row-major f32 weight to per-output-channel
+/// symmetric int8.
+fn quant_oc(w: &[f32], out: usize, in_: usize, name: &str) -> FocrResult<QInt8> {
+    let expected = out.checked_mul(in_).ok_or_else(|| {
+        FocrError::FormatMismatch(format!(
+            "tensor {name:?}: output/input shape [{out}, {in_}] overflows usize"
+        ))
+    })?;
+    if w.len() != expected {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?}: {} elements != expected output/input shape [{out}, {in_}] ({expected})",
+            w.len()
+        )));
+    }
+    Ok(nn::quantize_int8(w, out, in_))
+}
+
+/// Resolve `name` to a per-output-channel int8 weight, from EITHER source:
+///
+/// * a raw bf16/f32 safetensors record → widen the `[out, in]` mat and
+///   [`quant_oc`] it at load time (the original path), OR
+/// * a pre-quantized `.focrq` record (`QInt8PerChan`, produced by `focr convert`)
+///   → read it back verbatim via [`Weights::qint8`], skipping the re-quantize.
+///
+/// For recipe-approved FFN/expert tensors the two are byte-identical: `focr
+/// convert` uses the same [`nn::quantize_int8`] as this fallback. Attention and
+/// `lm_head` remain high precision in the default artifact and reach this helper
+/// only when the separately gated experimental all-int8 cache is requested.
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if `name` is absent or mis-shaped.
+pub(crate) fn quant_oc_loaded(weights: &Weights, name: &str, out: usize) -> FocrResult<QInt8> {
+    if matches!(
+        weights.record(name).map(|rec| rec.dtype),
+        Some(DType::QInt8PerChan)
+    ) {
+        let q = weights.qint8(name)?;
+        if q.n != out {
+            return Err(FocrError::FormatMismatch(format!(
+                "QInt8 tensor {name:?} has {} output rows; expected {out}",
+                q.n
+            )));
+        }
+        return Ok(q);
+    }
+
+    let record = weights.record(name).ok_or_else(|| {
+        FocrError::FormatMismatch(format!("tensor {name:?} not found in weights directory"))
+    })?;
+    let [rows, in_] = record.shape.as_slice() else {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected 2 ([out, in])",
+            record.shape.len()
+        )));
+    };
+    if *rows != out {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has {rows} output rows; expected {out}"
+        )));
+    }
+    let mat = weights.mat(name)?;
+    quant_oc(&mat.data, out, *in_, name)
+}
+
+// ── CCD-sharded / L3-tiled lm_head (FOCR_LMHEAD_SHARD, bd-1azu.25) ────────────
+//
+// The `lm_head` projects the final hidden `[1, 1280]` against the `[129280, 1280]`
+// vocab weight to `[1, 129280]` logits. Each logit `o` is a SELF-CONTAINED dot
+// `Σ_i x[i]·w[o,i]` (int8: `(Σ_i xq[i]·w[o,i])·a_scale·scale[o]`) — the vocab
+// columns never reduce into one another. So splitting the 129280 output columns
+// into CONTIGUOUS tiles, computing each tile, and writing it back into its own
+// `[.., tile]` column span is BYTE-FOR-BYTE identical to the single monolithic
+// GEMV: same single activation quantize, same per-logit i32 contraction
+// (N-independent — already relied on by [`gemv_i8`]'s 64-row blocking and
+// [`fuse_qkv`]), same per-channel dequant operands in the same order, and the
+// ascending tile order preserves the vocab column order — so argmax/sampling are
+// unchanged. This is the L3-resident weight-tiling seam (read one vocab tile of
+// the 660 MB int8 panel at a time); DEFAULT OFF keeps the exact monolithic path.
+
+/// `FOCR_LMHEAD_SHARD`: kill-switch arming the vocab-tiled (`lm_head`-sharded)
+/// projection ([`gemv_i8_sharded`] / [`gemv_sharded`]). DEFAULT OFF — the head
+/// stays the single monolithic [`gemv_i8`]/[`gemv`]; armed, the 129280 vocab
+/// columns are computed in [`lmhead_shard_tiles`] CONTIGUOUS tiles, byte-for-byte
+/// identical. Consulted ONCE per `lm_head` call, never inside the math, exactly
+/// like [`QKV_FUSED_ENV`].
+const LMHEAD_SHARD_ENV: &str = "FOCR_LMHEAD_SHARD";
+
+/// `FOCR_LMHEAD_SHARD_TILES`: number of CONTIGUOUS vocab tiles the sharded
+/// `lm_head` splits its output columns into. Parsed ONCE; defaults to
+/// [`DEFAULT_LMHEAD_SHARD_TILES`] when unset, empty, unparseable, or `0`. The tile
+/// count never changes a logit value or the column order — only how the columns
+/// are grouped into kernel calls.
+const LMHEAD_SHARD_TILES_ENV: &str = "FOCR_LMHEAD_SHARD_TILES";
+
+/// Fallback vocab-tile count when [`LMHEAD_SHARD_TILES_ENV`] is unset/invalid.
+const DEFAULT_LMHEAD_SHARD_TILES: usize = 16;
+
+/// Whether the vocab-tiled `lm_head` is armed (the [`LMHEAD_SHARD_ENV`]
+/// kill-switch, read ONCE into a process-wide bool — never touched inside the
+/// per-logit math). The sharded kernels are pure and testable regardless of this
+/// flag; only the head's decision to route through them is gated here.
+#[must_use]
+pub fn lmhead_shard_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(LMHEAD_SHARD_ENV).is_some())
+}
+
+/// The configured contiguous vocab-tile count ([`LMHEAD_SHARD_TILES_ENV`], read
+/// ONCE). Always `>= 1`.
+#[must_use]
+pub fn lmhead_shard_tiles() -> usize {
+    static TILES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TILES.get_or_init(|| {
+        std::env::var(LMHEAD_SHARD_TILES_ENV)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DEFAULT_LMHEAD_SHARD_TILES)
+    })
+}
+
+/// Partition `n` output channels (vocab columns) into `tiles` CONTIGUOUS,
+/// gap-free, non-overlapping ranges covering `[0, n)` in fixed ascending order
+/// (the `n % tiles` remainder is spread one-per-tile across the leading tiles).
+/// `tiles` is clamped to `[1, n.max(1)]` so every emitted range is in-bounds.
+/// The ascending coverage is what preserves the vocab column order — and hence
+/// argmax/sampling — under sharding.
+fn vocab_tile_ranges(n: usize, tiles: usize) -> Vec<(usize, usize)> {
+    let tiles = tiles.clamp(1, n.max(1));
+    let base = n / tiles;
+    let rem = n % tiles;
+    let mut ranges = Vec::with_capacity(tiles);
+    let mut start = 0usize;
+    for t in 0..tiles {
+        let len = base + usize::from(t < rem);
+        let end = start + len;
+        ranges.push((start, end));
+        start = end;
+    }
+    debug_assert_eq!(start, n, "vocab_tile_ranges must cover [0, n)");
+    ranges
+}
+
+/// Vocab-tiled f32 `lm_head` GEMV — the `FOCR_LMHEAD_SHARD` twin of [`gemv`].
+/// Splits the `n` output channels into [`vocab_tile_ranges`] CONTIGUOUS tiles and
+/// computes each tile's logit slice into its own `y[start..end]` span. BYTE-FOR-
+/// BYTE identical to [`gemv`]: every channel `o`'s value is `dot_f32(x, w[o,:])`
+/// regardless of which tile (or 64-row rayon chunk) it lands in — tiling only
+/// repartitions the column ranges, never a per-logit reduction or the order.
+fn gemv_sharded(x: &[f32], w: &[f32], n: usize, k: usize, tiles: usize) -> Vec<f32> {
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(w.len(), n * k);
+    let mut y = vec![0.0f32; n];
+    for (start, end) in vocab_tile_ranges(n, tiles) {
+        // Same 64-row rayon chunking as `gemv`, confined to this tile's columns.
+        y[start..end]
+            .par_chunks_mut(64)
+            .enumerate()
+            .for_each(|(blk, ys)| {
+                let base = start + blk * 64;
+                for (j, slot) in ys.iter_mut().enumerate() {
+                    let o = base + j;
+                    *slot = dot_f32(x, &w[o * k..o * k + k]);
+                }
+            });
+    }
+    y
+}
+
+/// Vocab-tiled int8 `lm_head` GEMV — the `FOCR_LMHEAD_SHARD` twin of [`gemv_i8`].
+/// The activation is dynamically int8-quantized ONCE (the same `(xq, a_scale)`
+/// [`gemv_i8`] would produce), then the `n` output channels are computed in
+/// [`vocab_tile_ranges`] CONTIGUOUS tiles, each tile's slice written into its own
+/// `y[start..end]` span. BYTE-FOR-BYTE identical to [`gemv_i8`]: each channel
+/// `o`'s i32 dot `Σ_i xq[i]·w[o,i]` is independent of how the columns are grouped
+/// into [`simd::igemm_s8s8`] calls (the N-independence [`gemv_i8`] already exploits
+/// with its 64-row blocking), and the dequant `acc·a_scale·scales[o]` uses the
+/// SAME operands in the SAME left-associative order.
+fn gemv_i8_sharded(x: &[f32], qw: &QInt8, tiles: usize) -> Vec<f32> {
+    let k = qw.k;
+    let n = qw.n;
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
+    debug_assert_eq!(qw.scales.len(), n);
+    let (xq, a_scale) = quantize_row_i8(x);
+    let mut y = vec![0.0f32; n];
+    for (start, end) in vocab_tile_ranges(n, tiles) {
+        // Same `I8_GEMV_BLOCK` rayon chunking as `gemv_i8`, confined to this
+        // tile's columns; `base`/`scales` index the ABSOLUTE channel.
+        y[start..end]
+            .par_chunks_mut(I8_GEMV_BLOCK)
+            .enumerate()
+            .for_each(|(blk, ys)| {
+                let base = start + blk * I8_GEMV_BLOCK;
+                let cnt = ys.len();
+                let mut acc = vec![0i32; cnt];
+                igemm_i8_block(qw, &xq, 1, base, cnt, &mut acc);
+                for (j, slot) in ys.iter_mut().enumerate() {
+                    *slot = acc[j] as f32 * a_scale * qw.scales[base + j];
+                }
+            });
+    }
+    y
 }
 
 /// `FOCR_QKV_FUSED`: at cache-build, STACK q/k/v into ONE `[3*qkv_dim, hidden]`
@@ -1437,10 +1946,23 @@ fn quant_oc(w: &[f32], out: usize) -> QInt8 {
 const QKV_FUSED_ENV: &str = "FOCR_QKV_FUSED";
 
 /// Read [`QKV_FUSED_ENV`] ONCE into a process-wide bool (build-time only; never
-/// touched per-token).
+/// touched per-token). DEFAULT **ON** since 2026-07-07 (bd-241s): the fused
+/// path is the ledgered LOSSLESS win (NEGATIVE_EVIDENCE 2026-06-27 KEPT entry:
+/// M4 −8.9% / x86-avx2 −21% decode; byte-identical proven by the unit gate +
+/// page_0590 sha + 20-page CER; re-confirmed 2026-07-07: 0.072→0.052 s/tok
+/// best-of-3 on page_0009 @8T, outputs byte-identical). `FOCR_QKV_FUSED=0`
+/// restores the three-call path — now the kill-switch, no longer the default.
 fn qkv_fused_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os(QKV_FUSED_ENV).is_some())
+    *FLAG.get_or_init(|| {
+        !matches!(
+            std::env::var(QKV_FUSED_ENV)
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "off" | "false" | "no")
+        )
+    })
 }
 
 /// Stack three same-shaped `[n, k]` per-output-channel int8 weights into ONE
@@ -1449,7 +1971,7 @@ fn qkv_fused_enabled() -> bool {
 /// block-parallel [`gemv_i8`] yields output rows `[0,n)`, `[n,2n)`, `[2n,3n)`
 /// that are BYTE-IDENTICAL to three separate `gemv_i8(x, {q,k,v})` calls: the
 /// activation is quantized once to the same `(xq, a_scale)`, and each output row
-/// `o` is an independent i32 SDOT of the SAME `xq` against the SAME `w[o,:]`
+/// `o` is an independent i32 dot of the SAME `xq` against the SAME `w[o,:]`
 /// dequantized by the SAME `scales[o]` — the rayon row-chunking only changes
 /// which rows share a task, never a per-row reduction.
 fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
@@ -1458,7 +1980,7 @@ fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
     debug_assert_eq!(q.n, k.n, "fuse_qkv: q/k output dim mismatch");
     debug_assert_eq!(q.n, v.n, "fuse_qkv: q/v output dim mismatch");
     let (n, kk) = (q.n, q.k);
-    let mut w = Vec::with_capacity(n * kk * 3);
+    let mut w = Vec::with_capacity(q.w.len() + k.w.len() + v.w.len());
     w.extend_from_slice(&q.w);
     w.extend_from_slice(&k.w);
     w.extend_from_slice(&v.w);
@@ -1466,6 +1988,24 @@ fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
     scales.extend_from_slice(&q.scales);
     scales.extend_from_slice(&k.scales);
     scales.extend_from_slice(&v.scales);
+    // Offline SMMLA panels concatenate exactly like rows: each segment's row
+    // count is even (every registered attention dim), so segment boundaries
+    // land on pair boundaries and the concatenated stream IS the panel pack
+    // of the concatenated matrix.
+    if q.layout == WeightLayout::SmmlaPanels
+        && k.layout == WeightLayout::SmmlaPanels
+        && v.layout == WeightLayout::SmmlaPanels
+        && q.n.is_multiple_of(2)
+        && k.n.is_multiple_of(2)
+    {
+        return QInt8::new_smmla_panels(w, scales, 3 * n, kk);
+    }
+    debug_assert!(
+        q.layout == WeightLayout::RowMajor
+            && k.layout == WeightLayout::RowMajor
+            && v.layout == WeightLayout::RowMajor,
+        "fuse_qkv: mixed or odd-row packed layouts are unreachable from the loader"
+    );
     QInt8::new(w, scales, 3 * n, kk)
 }
 
@@ -1527,30 +2067,26 @@ impl DecoderWeightCacheI8 {
             let prefix = format!("model.layers.{layer}");
             let input_ln = weights.vec(&format!("{prefix}.input_layernorm.weight"))?;
             let post_attn_ln = weights.vec(&format!("{prefix}.post_attention_layernorm.weight"))?;
-            let q_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.q_proj.weight"))?
-                    .data,
+            let q_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.q_proj.weight"),
                 qkv_dim,
-            );
-            let k_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.k_proj.weight"))?
-                    .data,
+            )?;
+            let k_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.k_proj.weight"),
                 qkv_dim,
-            );
-            let v_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.v_proj.weight"))?
-                    .data,
+            )?;
+            let v_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.v_proj.weight"),
                 qkv_dim,
-            );
-            let o_proj = quant_oc(
-                &weights
-                    .mat(&format!("{prefix}.self_attn.o_proj.weight"))?
-                    .data,
+            )?;
+            let o_proj = quant_oc_loaded(
+                weights,
+                &format!("{prefix}.self_attn.o_proj.weight"),
                 hidden,
-            );
+            )?;
             // Fused q/k/v stack (FOCR_QKV_FUSED): built ONCE here so decode runs a
             // single block-parallel GEMV. Byte-identical to the 3 separate calls.
             let qkv = qkv_fused_enabled().then(|| fuse_qkv(&q_proj, &k_proj, &v_proj));
@@ -1558,9 +2094,9 @@ impl DecoderWeightCacheI8 {
                 let p = format!("{prefix}.mlp");
                 let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
                 CachedMlpI8::Dense {
-                    gate: quant_oc(&weights.mat(&format!("{p}.gate_proj.weight"))?.data, inter),
-                    up: quant_oc(&weights.mat(&format!("{p}.up_proj.weight"))?.data, inter),
-                    down: quant_oc(&weights.mat(&format!("{p}.down_proj.weight"))?.data, hidden),
+                    gate: quant_oc_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
+                    up: quant_oc_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
+                    down: quant_oc_loaded(weights, &format!("{p}.down_proj.weight"), hidden)?,
                 }
             } else {
                 let p = format!("{prefix}.mlp");
@@ -1569,46 +2105,32 @@ impl DecoderWeightCacheI8 {
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        quant_oc(
-                            &weights
-                                .mat(&format!("{p}.experts.{e}.gate_proj.weight"))?
-                                .data,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.gate_proj.weight"),
                             inter,
-                        ),
-                        quant_oc(
-                            &weights
-                                .mat(&format!("{p}.experts.{e}.up_proj.weight"))?
-                                .data,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.up_proj.weight"),
                             inter,
-                        ),
-                        quant_oc(
-                            &weights
-                                .mat(&format!("{p}.experts.{e}.down_proj.weight"))?
-                                .data,
+                        )?,
+                        quant_oc_loaded(
+                            weights,
+                            &format!("{p}.experts.{e}.down_proj.weight"),
                             hidden,
-                        ),
+                        )?,
                     ]);
                 }
                 let si = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    quant_oc(
-                        &weights
-                            .mat(&format!("{p}.shared_experts.gate_proj.weight"))?
-                            .data,
-                        si,
-                    ),
-                    quant_oc(
-                        &weights
-                            .mat(&format!("{p}.shared_experts.up_proj.weight"))?
-                            .data,
-                        si,
-                    ),
-                    quant_oc(
-                        &weights
-                            .mat(&format!("{p}.shared_experts.down_proj.weight"))?
-                            .data,
+                    quant_oc_loaded(weights, &format!("{p}.shared_experts.gate_proj.weight"), si)?,
+                    quant_oc_loaded(weights, &format!("{p}.shared_experts.up_proj.weight"), si)?,
+                    quant_oc_loaded(
+                        weights,
+                        &format!("{p}.shared_experts.down_proj.weight"),
                         hidden,
-                    ),
+                    )?,
                 ];
                 CachedMlpI8::Moe {
                     gate,
@@ -1628,7 +2150,7 @@ impl DecoderWeightCacheI8 {
             });
         }
         let final_norm = weights.vec("model.norm.weight")?;
-        let lm_head = quant_oc(&weights.mat("lm_head.weight")?.data, config::VOCAB_SIZE);
+        let lm_head = quant_oc_loaded(weights, "lm_head.weight", config::VOCAB_SIZE)?;
         Ok(Self {
             layers,
             final_norm,
@@ -1639,7 +2161,7 @@ impl DecoderWeightCacheI8 {
 
 /// One SwiGLU expert over a `[n_tok, hidden]` activation, int8 — `down(silu(gate·x)
 /// * (up·x))` via [`nn::linear_int8_dynamic`]. The int8 twin of [`moe::expert_mlp`].
-fn expert_mlp_i8(x: &Mat, gate: &QInt8, up: &QInt8, down: &QInt8) -> FocrResult<Mat> {
+pub(crate) fn expert_mlp_i8(x: &Mat, gate: &QInt8, up: &QInt8, down: &QInt8) -> FocrResult<Mat> {
     let mut g = nn::linear_int8_dynamic(x, gate, None)?;
     nn::silu(&mut g);
     let u = nn::linear_int8_dynamic(x, up, None)?;
@@ -1671,10 +2193,20 @@ fn moe_block_i8(
     let h = hidden.cols;
     let routing = moe::route_default(hidden, gate)?;
     let mut out = Mat::zeros(n_tok, h);
-    let mut per_expert: Vec<Vec<(usize, f32)>> = vec![Vec::new(); moe::config::N_ROUTED_EXPERTS];
+    let contribution_len = n_tok
+        .checked_mul(moe::config::NUM_EXPERTS_PER_TOK)
+        .and_then(|rows| rows.checked_mul(h))
+        .ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "decoder::moe_block_i8: n_tok*top_k*hidden overflow"
+            ))
+        })?;
+    let mut contributions = vec![0.0f32; contribution_len];
+    let mut per_expert: Vec<Vec<(usize, usize, f32)>> =
+        vec![Vec::new(); moe::config::N_ROUTED_EXPERTS];
     for t in 0..n_tok {
         for j in 0..moe::config::NUM_EXPERTS_PER_TOK {
-            per_expert[routing.indices[t][j]].push((t, routing.weights[t][j]));
+            per_expert[routing.indices[t][j]].push((t, j, routing.weights[t][j]));
         }
     }
     for (e, members) in per_expert.iter().enumerate() {
@@ -1683,17 +2215,26 @@ fn moe_block_i8(
         }
         let m = members.len();
         let mut sub = Mat::zeros(m, h);
-        for (r, &(t, _w)) in members.iter().enumerate() {
+        for (r, &(t, _slot, _w)) in members.iter().enumerate() {
             sub.row_mut(r).copy_from_slice(hidden.row(t));
         }
         let y = expert_mlp_i8(&sub, &experts[e][0], &experts[e][1], &experts[e][2])?;
-        for (r, &(t, w)) in members.iter().enumerate() {
+        for (r, &(t, slot, w)) in members.iter().enumerate() {
             let yr = y.row(r);
-            let outr = out.row_mut(t);
-            for c in 0..h {
-                outr[c] += w * yr[c];
+            let base = (t * moe::config::NUM_EXPERTS_PER_TOK + slot) * h;
+            let dst = &mut contributions[base..base + h];
+            for (value, &expert_value) in dst.iter_mut().zip(yr.iter()) {
+                *value = w * expert_value;
             }
         }
+    }
+    for t in 0..n_tok {
+        let token_base = t * moe::config::NUM_EXPERTS_PER_TOK * h;
+        let rows: [&[f32]; moe::config::NUM_EXPERTS_PER_TOK] = std::array::from_fn(|slot| {
+            let base = token_base + slot * h;
+            &contributions[base..base + h]
+        });
+        moe::combine_routed_rows(rows, &routing.indices[t], out.row_mut(t))?;
     }
     let shared_out = expert_mlp_i8(hidden, &shared[0], &shared[1], &shared[2])?;
     for (o, &s) in out.data.iter_mut().zip(shared_out.data.iter()) {
@@ -1773,11 +2314,9 @@ fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
                 || expert_gemv_i8(row, &shared[0], &shared[1], &shared[2]),
             );
             let mut out = vec![0.0f32; hidden];
-            for p in &partials {
-                for c in 0..hidden {
-                    out[c] += p[c];
-                }
-            }
+            let rows: [&[f32]; moe::config::NUM_EXPERTS_PER_TOK] =
+                std::array::from_fn(|slot| partials[slot].as_slice());
+            moe::combine_routed_rows(rows, &idx, &mut out)?;
             for c in 0..hidden {
                 out[c] += s[c];
             }
@@ -1803,7 +2342,118 @@ pub fn lm_head_cached_i8(wc: &DecoderWeightCacheI8, hidden: &Mat) -> FocrResult<
     }
     let t = prof::enabled().then(std::time::Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
-    let logits = gemv_i8(normed.row(0), &wc.lm_head);
+    let row = normed.row(0);
+    // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv_i8`).
+    // Byte-for-byte identical either way — each logit is an independent int8 dot.
+    let logits = if lmhead_shard_enabled() {
+        gemv_i8_sharded(row, &wc.lm_head, lmhead_shard_tiles())
+    } else {
+        gemv_i8(row, &wc.lm_head)
+    };
+    if let Some(t) = t {
+        prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
+    }
+    Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
+}
+
+// ── ngram-ban into the int8 lm_head epilogue (FOCR_FUSE_NGRAM_LMHEAD, bd-1azu.54) ──
+//
+// The greedy decode loop produces `[1, vocab]` lm_head logits, then the sampler's
+// `masked_sliding_window_logits_if_needed` COPIES the whole 129280-wide row and
+// sets every sliding-window no-repeat-ngram-banned token to -inf before argmax.
+// Because the ban SET is a pure function of the generated sequence (independent of
+// the logit values), it can be folded into the lm_head dequant epilogue: as each
+// output channel `o` is dequantized, a banned `o` is written -inf instead of its
+// dot product. This produces a logits row BYTE-FOR-BYTE identical to `gemv_i8`
+// followed by `masked_sliding_window_logits_if_needed` — non-banned channels keep
+// the same `acc·a_scale·scale[o]`, banned channels are -inf in both — so the argmax
+// (and the chosen token) is unchanged, with no separate full-row copy/mask pass.
+
+/// `FOCR_FUSE_NGRAM_LMHEAD` (bd-1azu.54, Lever 3): fold the sliding-window
+/// no-repeat-ngram ban into the int8 lm_head dequant epilogue (mask as logits are
+/// produced) instead of the sampler's separate copy-then-mask pass. DEFAULT OFF —
+/// unset reproduces the `lm_head_cached_i8` -> `sampler::decode_step` path
+/// byte-for-byte. Read ONCE into a process-wide bool.
+const FUSE_NGRAM_LMHEAD_ENV: &str = "FOCR_FUSE_NGRAM_LMHEAD";
+
+/// Read [`FUSE_NGRAM_LMHEAD_ENV`] ONCE into a process-wide bool (consulted by the
+/// decode driver, never inside a per-channel loop).
+pub fn fuse_ngram_lmhead_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(FUSE_NGRAM_LMHEAD_ENV).is_some())
+}
+
+/// Int8 lm_head GEMV with the no-repeat-ngram ban folded into the dequant epilogue
+/// (FOCR_FUSE_NGRAM_LMHEAD). `banned` is the set of vocab ids to mask to -inf
+/// (from [`sampler::collect_sliding_window_ngram_bans`]); out-of-range ids are
+/// ignored, and a repeated id is idempotent. With `banned` empty this is exactly
+/// [`gemv_i8`]. BYTE-FOR-BYTE identical to `gemv_i8(x, qw)` then setting `y[b] =
+/// -inf` for each in-range `b`: non-banned channels are the SAME
+/// `acc·a_scale·scale[o]`, banned channels are `f32::NEG_INFINITY`.
+fn gemv_i8_ngram_masked(x: &[f32], qw: &QInt8, banned: &[u32]) -> Vec<f32> {
+    let n = qw.n;
+    if banned.is_empty() {
+        // No ban this step ⇒ byte-for-byte the unmasked head (matches the sampler's
+        // `masked_sliding_window_logits_if_needed` returning `None`).
+        return gemv_i8(x, qw);
+    }
+    let mut ban_mask = vec![false; n];
+    for &b in banned {
+        let bi = b as usize;
+        if bi < n {
+            ban_mask[bi] = true;
+        }
+    }
+    let k = qw.k;
+    debug_assert_eq!(x.len(), k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
+    debug_assert_eq!(qw.scales.len(), n);
+    let (xq, a_scale) = quantize_row_i8(x);
+    let mut y = vec![0.0f32; n];
+    y.par_chunks_mut(I8_GEMV_BLOCK)
+        .enumerate()
+        .for_each(|(blk, ys)| {
+            let base = blk * I8_GEMV_BLOCK;
+            let cnt = ys.len();
+            let mut acc = vec![0i32; cnt];
+            igemm_i8_block(qw, &xq, 1, base, cnt, &mut acc);
+            for (j, slot) in ys.iter_mut().enumerate() {
+                *slot = if ban_mask[base + j] {
+                    f32::NEG_INFINITY
+                } else {
+                    acc[j] as f32 * a_scale * qw.scales[base + j]
+                };
+            }
+        });
+    y
+}
+
+/// Final RMSNorm + int8 lm_head with the no-repeat-ngram ban folded into the
+/// dequant epilogue — the FOCR_FUSE_NGRAM_LMHEAD twin of [`lm_head_cached_i8`].
+/// Returns `[1, vocab]` logits already masked, so the caller argmaxes directly
+/// (no separate sampler masking pass; see [`sampler::decode_step_premasked`]). The
+/// masked row is byte-for-byte the [`lm_head_cached_i8`] logits with
+/// `masked_sliding_window_logits_if_needed` applied — the monolithic head is itself
+/// byte-identical to the `FOCR_LMHEAD_SHARD` tiling, so this matches regardless of
+/// that flag.
+///
+/// # Errors
+/// [`FocrError::Other`] on a shape mismatch (mirrors [`lm_head_cached_i8`]).
+pub fn lm_head_cached_i8_ngram_masked(
+    wc: &DecoderWeightCacheI8,
+    hidden: &Mat,
+    banned: &[u32],
+) -> FocrResult<Mat> {
+    if hidden.rows != 1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::lm_head_cached_i8_ngram_masked: expected a single decode row, got {} rows",
+            hidden.rows
+        )));
+    }
+    let t = prof::enabled().then(std::time::Instant::now);
+    let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
+    let row = normed.row(0);
+    let logits = gemv_i8_ngram_masked(row, &wc.lm_head, banned);
     if let Some(t) = t {
         prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
     }
@@ -1811,15 +2461,35 @@ pub fn lm_head_cached_i8(wc: &DecoderWeightCacheI8, hidden: &Mat) -> FocrResult<
 }
 
 /// Int8 prefill: the [`prefill_with_cache`] structure with the GEMMs routed through
-/// [`nn::linear_int8_dynamic`] (threaded SDOT/VNNI). Captures each layer's RoPE'd
+/// [`nn::linear_int8_dynamic`] (threaded dense-int8 dispatch). Captures each layer's RoPE'd
 /// K/V into the R-SWA ring just like the f32 path. Returns the final
 /// `model.norm`-ready hidden `[seq, hidden]` + the 12 populated caches.
+///
+/// `FOCR_PREFILL_CHUNK` ([`prefill_chunk_size`]) arms the chunked schedule
+/// ([`prefill_with_cache_i8_chunked`]); unset ⇒ the monolithic loop, byte-for-byte.
 ///
 /// # Errors
 /// As [`prefill_with_cache`].
 pub fn prefill_with_cache_i8(
     wc: &DecoderWeightCacheI8,
     inputs_embeds: &Mat,
+) -> FocrResult<(Mat, Vec<RingCache>)> {
+    prefill_with_cache_i8_chunked(wc, inputs_embeds, prefill_chunk_size())
+}
+
+/// [`prefill_with_cache_i8`] with the chunk decision made explicit (the int8 twin
+/// of [`prefill_with_cache_chunked`]). `chunk = None` is the exact monolithic
+/// int8 path; `chunk = Some(C)` tiles the prefill into `C`-token chunks. The
+/// attention is the SAME f32 [`chunk_prefill_attention`] as the f32 path — only
+/// the projections/MLP run int8 — and every chunked op is row-independent, so it
+/// is byte-for-byte the monolithic int8 prefill.
+///
+/// # Errors
+/// As [`prefill_with_cache_i8`].
+pub fn prefill_with_cache_i8_chunked(
+    wc: &DecoderWeightCacheI8,
+    inputs_embeds: &Mat,
+    chunk: Option<usize>,
 ) -> FocrResult<(Mat, Vec<RingCache>)> {
     checked_mat_len(
         "decoder::prefill_with_cache_i8 inputs_embeds",
@@ -1828,9 +2498,9 @@ pub fn prefill_with_cache_i8(
     let hidden = config::HIDDEN_SIZE;
     let num_heads = config::NUM_ATTENTION_HEADS;
     let head_dim = config::HEAD_DIM;
-    // Validate num_heads*head_dim doesn't overflow (the int8 linears infer the
-    // qkv width from `q_proj.n`, so the product itself isn't threaded through).
-    let _ = checked_shape_mul(
+    // qkv width = num_heads*head_dim (the int8 linears infer it from `q_proj.n`,
+    // so it isn't threaded through; we still need it for the chunked K/V buffers).
+    let qkv_dim = checked_shape_mul(
         "decoder::prefill_with_cache_i8",
         num_heads,
         head_dim,
@@ -1844,11 +2514,64 @@ pub fn prefill_with_cache_i8(
         )));
     }
     let seq = inputs_embeds.rows;
-    let positions: Vec<usize> = (0..seq).collect();
-    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
     let mut caches: Vec<RingCache> = (0..config::NUM_HIDDEN_LAYERS)
         .map(|_| RingCache::new(seq.max(1)))
         .collect();
+
+    if let Some(chunk) = chunk {
+        // ── Chunked schedule (int8 projections/MLP; f32 chunked attention). ──
+        let mut out = Mat::zeros(seq, hidden);
+        let mut k_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        let mut v_full: Vec<Mat> = (0..config::NUM_HIDDEN_LAYERS)
+            .map(|_| Mat::zeros(seq, qkv_dim))
+            .collect();
+        for (c0, c1) in prefill_chunk_bounds(seq, chunk) {
+            let positions: Vec<usize> = (c0..c1).collect();
+            let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
+            let mut x = Mat::from_vec(
+                c1 - c0,
+                hidden,
+                inputs_embeds.data[c0 * hidden..c1 * hidden].to_vec(),
+            );
+            for layer in 0..config::NUM_HIDDEN_LAYERS {
+                let cl = &wc.layers[layer];
+                let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+                let mut q = nn::linear_int8_dynamic(&normed, &cl.q_proj, None)?;
+                let mut k = nn::linear_int8_dynamic(&normed, &cl.k_proj, None)?;
+                let v = nn::linear_int8_dynamic(&normed, &cl.v_proj, None)?;
+                apply_rope(&mut q, &rope)?;
+                apply_rope(&mut k, &rope)?;
+                k_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&k.data);
+                v_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&v.data);
+                let kpre = Mat::from_vec(c1, qkv_dim, k_full[layer].data[..c1 * qkv_dim].to_vec());
+                let vpre = Mat::from_vec(c1, qkv_dim, v_full[layer].data[..c1 * qkv_dim].to_vec());
+                let context = chunk_prefill_attention(&q, &kpre, &vpre, num_heads, head_dim, c0)?;
+                let attn_out = nn::linear_int8_dynamic(&context, &cl.o_proj, None)?;
+                let h = add_residual(&x, &attn_out)?;
+                let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+                let mlp_out = prefill_mlp_i8(&cl.mlp, &normed2)?;
+                x = add_residual(&h, &mlp_out)?;
+            }
+            out.data[c0 * hidden..c1 * hidden].copy_from_slice(&x.data);
+        }
+        for layer in 0..config::NUM_HIDDEN_LAYERS {
+            let (kh, vh) = token_major_to_head_major(
+                &k_full[layer],
+                &v_full[layer],
+                seq,
+                num_heads,
+                head_dim,
+            )?;
+            caches[layer].record_prefill(&kh, &vh, seq)?;
+        }
+        return Ok((out, caches));
+    }
+
+    // ── Monolithic schedule (the unset default). ──
+    let positions: Vec<usize> = (0..seq).collect();
+    let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
 
     let mut x = inputs_embeds.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
@@ -1873,7 +2596,7 @@ pub fn prefill_with_cache_i8(
 
 /// One int8 incremental decode step over the per-layer [`RingCache`]s. Int8 twin
 /// of [`decode_step_with_cache`] — every projection via the bespoke m=1 [`gemv_i8`]
-/// (NEON SDOT / x86 VNNI), R-SWA attention and ring contract identical.
+/// (Apple autovec or forced NEON routes / x86 VNNI), with identical R-SWA and ring contracts.
 ///
 /// # Errors
 /// As [`decode_step_with_cache`].
@@ -1911,22 +2634,42 @@ pub fn decode_step_with_cache_i8(
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
         let t_attn = profiling.then(std::time::Instant::now);
-        let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
-        let nrow = normed.row(0);
-        let (mut q, mut k, v) = if let Some(qkv) = &cl.qkv {
-            // FOCR_QKV_FUSED: ONE quantize of `nrow`, ONE block-parallel GEMV over
-            // all 3*qkv_dim output rows, then slice into q/k/v. Byte-identical to
-            // the three-call `else` branch (each output row is an independent dot).
-            let out = gemv_i8(nrow, qkv);
-            let q = Mat::from_vec(1, qkv_dim, out[0..qkv_dim].to_vec());
-            let k = Mat::from_vec(1, qkv_dim, out[qkv_dim..2 * qkv_dim].to_vec());
-            let v = out[2 * qkv_dim..3 * qkv_dim].to_vec();
-            (q, k, v)
+        let (mut q, mut k, v) = if fuse_norm_quant_enabled() {
+            // FOCR_FUSE_NORM_QUANT (Lever 1): quantize the `input_layernorm` output
+            // ONCE in the norm epilogue and reuse that int8 row across q/k/v —
+            // byte-identical to re-quantizing `normed.row(0)` inside each `gemv_i8`
+            // (the quantize is deterministic, so once-then-reuse == thrice).
+            let (xq, a_scale) = rms_norm_quant_i8(&x, Some(&cl.input_ln), eps)?;
+            if let Some(qkv) = &cl.qkv {
+                let out = gemv_i8_prequant(&xq, a_scale, qkv);
+                let q = Mat::from_vec(1, qkv_dim, out[0..qkv_dim].to_vec());
+                let k = Mat::from_vec(1, qkv_dim, out[qkv_dim..2 * qkv_dim].to_vec());
+                let v = out[2 * qkv_dim..3 * qkv_dim].to_vec();
+                (q, k, v)
+            } else {
+                let q = Mat::from_vec(1, qkv_dim, gemv_i8_prequant(&xq, a_scale, &cl.q_proj));
+                let k = Mat::from_vec(1, qkv_dim, gemv_i8_prequant(&xq, a_scale, &cl.k_proj));
+                let v = gemv_i8_prequant(&xq, a_scale, &cl.v_proj);
+                (q, k, v)
+            }
         } else {
-            let q = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.q_proj));
-            let k = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.k_proj));
-            let v = gemv_i8(nrow, &cl.v_proj);
-            (q, k, v)
+            let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
+            let nrow = normed.row(0);
+            if let Some(qkv) = &cl.qkv {
+                // FOCR_QKV_FUSED: ONE quantize of `nrow`, ONE block-parallel GEMV over
+                // all 3*qkv_dim output rows, then slice into q/k/v. Byte-identical to
+                // the three-call `else` branch (each output row is an independent dot).
+                let out = gemv_i8(nrow, qkv);
+                let q = Mat::from_vec(1, qkv_dim, out[0..qkv_dim].to_vec());
+                let k = Mat::from_vec(1, qkv_dim, out[qkv_dim..2 * qkv_dim].to_vec());
+                let v = out[2 * qkv_dim..3 * qkv_dim].to_vec();
+                (q, k, v)
+            } else {
+                let q = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.q_proj));
+                let k = Mat::from_vec(1, qkv_dim, gemv_i8(nrow, &cl.k_proj));
+                let v = gemv_i8(nrow, &cl.v_proj);
+                (q, k, v)
+            }
         };
         apply_rope(&mut q, &rope)?;
         apply_rope(&mut k, &rope)?;
@@ -1979,10 +2722,23 @@ const DEFAULT_BATCH_SIZE: usize = 8;
 /// read ONCE into a process-wide bool — never touched per-token). The batched
 /// kernels themselves are pure and testable regardless of this flag; only the
 /// driver's decision to route through them is gated here.
+///
+/// Value-parsed, NOT presence-parsed (fresh-eyes fix): every doc site
+/// (`batch_scheduler`, `cli.rs`, the watchdog sweep) teaches `FOCR_BATCH_SPINE=0`
+/// as "spine off" — the old `is_some()` parse ARMED the spine on exactly the
+/// value users set to kill it, and made the sweep's `=0` control leg
+/// meaningless. `0`/`off`/`false`/`no` (any case) now disable; any other
+/// present value arms; unset stays off.
 #[must_use]
 pub fn batch_spine_enabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var_os(BATCH_SPINE_ENV).is_some())
+    *FLAG.get_or_init(|| match std::env::var(BATCH_SPINE_ENV) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "off" | "false" | "no"
+        ),
+        Err(_) => false,
+    })
 }
 
 /// The configured in-flight stream cap `B` ([`BATCH_SIZE_ENV`], read ONCE).
@@ -2022,7 +2778,7 @@ fn gemv_i8_batched(rows: &[&[f32]], qw: &QInt8) -> Vec<Vec<f32>> {
     let b = rows.len();
     let k = qw.k;
     let n = qw.n;
-    debug_assert_eq!(qw.w.len(), n * k);
+    debug_assert_eq!(qw.w.len(), qw.expected_w_len());
     debug_assert_eq!(qw.scales.len(), n);
     if b == 0 {
         return Vec::new();
@@ -2045,7 +2801,7 @@ fn gemv_i8_batched(rows: &[&[f32]], qw: &QInt8) -> Vec<Vec<f32>> {
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len() / b;
             let mut acc = vec![0i32; b * cnt];
-            simd::igemm_s8s8(&xq, &qw.w[base * k..(base + cnt) * k], b, k, cnt, &mut acc);
+            igemm_i8_block(qw, &xq, b, base, cnt, &mut acc);
             for j in 0..cnt {
                 let scale_o = qw.scales[base + j];
                 for r in 0..b {
@@ -2282,11 +3038,614 @@ pub fn batched_lm_head_i8(wc: &DecoderWeightCacheI8, hiddens: &[Mat]) -> FocrRes
     Ok(logits)
 }
 
+// ── Batched K-token speculative VERIFY forward (Lever D/K, bd-1azu.30) ────────
+//
+// Speculative decode proposes `K` draft tokens after the current sequence; the
+// verify half must compute the `K` next-token logits rows — one per draft
+// position — in ONE forward, BIT-EXACT to running `K` sequential single-token
+// decode steps. The win is QUERY-dim batching: the LINEAR projections that share
+// a weight panel across the `K` draft queries (the fused q/k/v stack and
+// `o_proj`) become ONE `M=K` int8 GEMM (read each weight row once, reuse across
+// all `K` queries — bd-1azu.2's M-independent i32 contraction), while the
+// attention stays a faithful per-position fold.
+//
+// LOSSLESS by construction, and NOT the rejected key-batch (docs/NEGATIVE_EVIDENCE.md):
+//  * the only cross-token coupling in a decode forward is the KV cache, so
+//    processing the `K` positions LAYER-major (all `K` through layer L, then
+//    layer L+1) over a SHARED evolving ring reproduces the token-major sequential
+//    KV evolution exactly — draft `i` at layer L writes its K/V then attends over
+//    reference ++ ring ++ draft[0..=i] at L, precisely as the sequential step
+//    would (draft[0..i] already written, draft[i+1..] not yet);
+//  * that per-position causal attention is delegated to
+//    [`rswa::verify_attention`], which replays the draft writes into a PRIVATE
+//    clone of the layer's ring (the caller's caches are never mutated) — so each
+//    context row is byte-for-byte the matching sequential [`rswa::attention`];
+//  * every per-position op outside attention (RMSNorm, RoPE at the TRUE absolute
+//    position `base_position + i`, the dense/MoE MLP, the residual adds, the final
+//    RMSNorm + `lm_head`) is the SAME single-token kernel the sequential decode
+//    runs, invoked once per draft position — row-independent, hence identical.
+// The per-projection `M=K`-vs-`m=1` byte-identity is the bd-1azu.2 gate
+// (`tests/batched_igemm_parity.rs` / `tests/batched_forward_parity.rs`); the
+// per-position verify attention + no-mutation is the bd-1azu.30 gate
+// (`tests/spec_verify_forward_parity.rs`).
+
+/// `FOCR_SPEC_VERIFY`: presence kill-switch that ARMS the bd-1azu.30 batched
+/// speculative verify forward ([`verify_forward`] / [`verify_forward_i8`]) at the
+/// (future) decode driver. DEFAULT OFF — when unset the verify forwards are simply
+/// unused and the live decode path is byte-for-byte today's. Consulted ONCE by the
+/// speculative-decode driver (bd-1azu.35), NEVER inside the verify math, exactly
+/// like [`BATCH_SPINE_ENV`] / [`QKV_FUSED_ENV`].
+const SPEC_VERIFY_ENV: &str = "FOCR_SPEC_VERIFY";
+
+/// Whether the batched speculative verify forward is armed (the [`SPEC_VERIFY_ENV`]
+/// kill-switch, read ONCE into a process-wide bool — never touched per-token). The
+/// verify kernels are pure and testable regardless of this flag; only the (later)
+/// driver's decision to route through them is gated here.
+#[must_use]
+pub fn spec_verify_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os(SPEC_VERIFY_ENV).is_some())
+}
+
+/// Validate the `K` draft `token_embeds` against `[1, hidden]` and the per-layer
+/// `caches` count — the shared prologue of [`verify_forward`] / [`verify_forward_i8`].
+#[allow(dead_code)] // bd-1azu.30 verify seam: used only by the (gated) verify forwards.
+fn check_verify_inputs(
+    context: &str,
+    caches: &[RingCache],
+    token_embeds: &[Mat],
+) -> FocrResult<()> {
+    let hidden = config::HIDDEN_SIZE;
+    if caches.len() != config::NUM_HIDDEN_LAYERS {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::{context}: {} caches != {} layers",
+            caches.len(),
+            config::NUM_HIDDEN_LAYERS
+        )));
+    }
+    for (i, te) in token_embeds.iter().enumerate() {
+        if te.rows != 1 || te.cols != hidden {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "decoder::{context}: token_embeds[{i}] shape [{}, {}] != [1, {hidden}]",
+                te.rows,
+                te.cols
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Batched `K`-token speculative VERIFY forward (f32) — bd-1azu.30. Given the `K`
+/// draft tokens' embeddings `token_embeds` (each `[1, hidden]`) proposed after the
+/// sequence whose KV is in `caches`, with draft position `i` at TRUE absolute
+/// position `base_position + i`, return the `K` next-token logits rows. Row `i` is
+/// BYTE-FOR-BYTE the logits running `i+1` sequential [`decode_step_with_cache`]
+/// calls (then [`lm_head_cached`]) would emit for draft position `i` — the
+/// lossless verify contract (see the section note above).
+///
+/// `caches` is READ-ONLY: [`rswa::verify_attention`] folds each draft token into a
+/// private clone of the per-layer ring, so the caller's caches are left untouched
+/// (no checkpoint/rollback needed).
+///
+/// # Errors
+/// [`FocrError::Other`] if `caches` is not `NUM_HIDDEN_LAYERS` long or any
+/// `token_embeds[i]` is not `[1, hidden]`; propagates the per-layer kernel errors.
+#[allow(dead_code)] // bd-1azu.30 verify seam: consumed by the speculative decode loop (later bead).
+pub(crate) fn verify_forward(
+    wc: &DecoderWeightCache,
+    caches: &[RingCache],
+    token_embeds: &[Mat],
+    base_position: usize,
+) -> FocrResult<Vec<Mat>> {
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::verify_forward",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
+    check_verify_inputs("verify_forward", caches, token_embeds)?;
+    let k = token_embeds.len();
+
+    // Per-draft-position running hidden `x[i]` (`[1, hidden]`), seeded from embeds.
+    let mut x: Vec<Mat> = token_embeds.to_vec();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let cl = &wc.layers[layer];
+        // 1. Per-position pre-attn RMSNorm + q/k/v projection (the bespoke f32
+        //    `gemv`, identical to the sequential `decode_step_with_cache`) + RoPE
+        //    at the draft position's TRUE absolute position.
+        let mut q_mats: Vec<Mat> = Vec::with_capacity(k);
+        let mut k_mats: Vec<Mat> = Vec::with_capacity(k);
+        let mut v_rows: Vec<Vec<f32>> = Vec::with_capacity(k);
+        for i in 0..k {
+            let normed = nn::rms_norm(&x[i], Some(&cl.input_ln), eps)?;
+            let nrow = normed.row(0);
+            let mut q = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.q_proj, qkv_dim, hidden));
+            let mut kk = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.k_proj, qkv_dim, hidden));
+            let v = gemv(nrow, &cl.v_proj, qkv_dim, hidden);
+            let rope = RopeTable::build(&[base_position + i], config::HEAD_DIM, config::ROPE_THETA);
+            apply_rope(&mut q, &rope)?;
+            apply_rope(&mut kk, &rope)?;
+            q_mats.push(q);
+            k_mats.push(kk);
+            v_rows.push(v);
+        }
+        // 2. Query-batched verify attention: per draft position, fold its K/V into a
+        //    private clone of THIS layer's ring then attend (causal among draft) —
+        //    `caches[layer]` is not mutated.
+        let q_refs: Vec<&[f32]> = q_mats.iter().map(|m| m.data.as_slice()).collect();
+        let k_refs: Vec<&[f32]> = k_mats.iter().map(|m| m.data.as_slice()).collect();
+        let v_refs: Vec<&[f32]> = v_rows.iter().map(|r| r.as_slice()).collect();
+        let contexts = rswa::verify_attention(&caches[layer], &q_refs, &k_refs, &v_refs)?;
+        // 3. Per-position `o_proj`, residual, post-attn RMSNorm, MLP, residual.
+        for i in 0..k {
+            let o = gemv(&contexts[i].data, &cl.o_proj, hidden, qkv_dim);
+            let attn_out = Mat::from_vec(1, hidden, o);
+            let h = add_residual(&x[i], &attn_out)?;
+            let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+            let mlp_out = Mat::from_vec(1, hidden, decode_mlp(&cl.mlp, &normed2)?);
+            x[i] = add_residual(&h, &mlp_out)?;
+        }
+    }
+    // Final RMSNorm + lm_head per draft position (each row-independent).
+    x.iter().map(|h| lm_head_cached(wc, h)).collect()
+}
+
+/// Batched `K`-token speculative VERIFY forward (int8) — the int8 twin of
+/// [`verify_forward`] (bd-1azu.30). The q/k/v stack and `o_proj` run as ONE `M=K`
+/// [`gemv_i8_batched`] each (the shared weight panel read once, reused across all
+/// `K` draft queries — byte-identical per row to the `m=1` [`gemv_i8`] the
+/// sequential [`decode_step_with_cache_i8`] runs, bd-1azu.2); RoPE, the verify
+/// attention, the MoE dispatch, and the `lm_head` stay a faithful per-position
+/// loop over the existing single-token kernels. Row `i` is BYTE-FOR-BYTE the
+/// logits `i+1` sequential [`decode_step_with_cache_i8`] + [`lm_head_cached_i8`]
+/// calls would emit.
+///
+/// `caches` is READ-ONLY (see [`verify_forward`]).
+///
+/// # Errors
+/// As [`verify_forward`].
+#[allow(dead_code)] // bd-1azu.30 verify seam: consumed by the speculative decode loop (later bead).
+pub(crate) fn verify_forward_i8(
+    wc: &DecoderWeightCacheI8,
+    caches: &[RingCache],
+    token_embeds: &[Mat],
+    base_position: usize,
+) -> FocrResult<Vec<Mat>> {
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::verify_forward_i8",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
+    check_verify_inputs("verify_forward_i8", caches, token_embeds)?;
+    let k = token_embeds.len();
+
+    let mut x: Vec<Mat> = token_embeds.to_vec();
+    for layer in 0..config::NUM_HIDDEN_LAYERS {
+        let cl = &wc.layers[layer];
+        // 1. Per-position pre-attn RMSNorm.
+        let mut normed: Vec<Mat> = Vec::with_capacity(k);
+        for i in 0..k {
+            normed.push(nn::rms_norm(&x[i], Some(&cl.input_ln), eps)?);
+        }
+        let nrows: Vec<&[f32]> = normed.iter().map(|m| m.row(0)).collect();
+        // 2. ONE `M=K` int8 GEMM per q/k/v projection (the fused stack when armed,
+        //    else three) — byte-identical per draft position to the matching branch
+        //    of `decode_step_with_cache_i8`.
+        let (mut q_mats, mut k_mats, v_rows): (Vec<Mat>, Vec<Mat>, Vec<Vec<f32>>) =
+            if let Some(qkv) = &cl.qkv {
+                let outs = gemv_i8_batched(&nrows, qkv);
+                let mut qm = Vec::with_capacity(k);
+                let mut km = Vec::with_capacity(k);
+                let mut vr = Vec::with_capacity(k);
+                for row in outs {
+                    qm.push(Mat::from_vec(1, qkv_dim, row[0..qkv_dim].to_vec()));
+                    km.push(Mat::from_vec(
+                        1,
+                        qkv_dim,
+                        row[qkv_dim..2 * qkv_dim].to_vec(),
+                    ));
+                    vr.push(row[2 * qkv_dim..3 * qkv_dim].to_vec());
+                }
+                (qm, km, vr)
+            } else {
+                let q_out = gemv_i8_batched(&nrows, &cl.q_proj);
+                let k_out = gemv_i8_batched(&nrows, &cl.k_proj);
+                let v_out = gemv_i8_batched(&nrows, &cl.v_proj);
+                let qm: Vec<Mat> = q_out
+                    .into_iter()
+                    .map(|r| Mat::from_vec(1, qkv_dim, r))
+                    .collect();
+                let km: Vec<Mat> = k_out
+                    .into_iter()
+                    .map(|r| Mat::from_vec(1, qkv_dim, r))
+                    .collect();
+                (qm, km, v_out)
+            };
+        // 3. RoPE each q/k at the draft position's TRUE absolute position.
+        for i in 0..k {
+            let rope = RopeTable::build(&[base_position + i], config::HEAD_DIM, config::ROPE_THETA);
+            apply_rope(&mut q_mats[i], &rope)?;
+            apply_rope(&mut k_mats[i], &rope)?;
+        }
+        // 4. Query-batched verify attention over a private clone of the ring.
+        let q_refs: Vec<&[f32]> = q_mats.iter().map(|m| m.data.as_slice()).collect();
+        let k_refs: Vec<&[f32]> = k_mats.iter().map(|m| m.data.as_slice()).collect();
+        let v_refs: Vec<&[f32]> = v_rows.iter().map(|r| r.as_slice()).collect();
+        let contexts = rswa::verify_attention(&caches[layer], &q_refs, &k_refs, &v_refs)?;
+        // 5. ONE `M=K` `o_proj` over the stacked per-position contexts.
+        let ctx_refs: Vec<&[f32]> = contexts.iter().map(|m| m.row(0)).collect();
+        let attn_rows = gemv_i8_batched(&ctx_refs, &cl.o_proj);
+        // 6. Per-position residual, post-attn RMSNorm, MoE dispatch, residual.
+        for (i, attn) in attn_rows.into_iter().enumerate() {
+            let attn_out = Mat::from_vec(1, hidden, attn);
+            let h = add_residual(&x[i], &attn_out)?;
+            let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
+            let mlp_out = Mat::from_vec(1, hidden, decode_mlp_i8(&cl.mlp, &normed2)?);
+            x[i] = add_residual(&h, &mlp_out)?;
+        }
+    }
+    x.iter().map(|h| lm_head_cached_i8(wc, h)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const MOE_POLICY_CHILD_ENV: &str = "FOCR_MOE_POLICY_TEST_CASE";
+
+    fn moe_policy_child_case() -> Option<(&'static str, bool)> {
+        match std::env::var(MOE_POLICY_CHILD_ENV).ok().as_deref() {
+            None => None,
+            Some("unset") => Some(("unset", false)),
+            Some("zero") => Some(("zero", false)),
+            Some("one") => Some(("one", true)),
+            Some(other) => {
+                eprintln!("unknown MoE policy subprocess case {other:?}");
+                None
+            }
+        }
+    }
+
+    fn int8_moe_policy_fixture(
+        rollback: bool,
+    ) -> (Mat, Vec<f32>, Vec<[QInt8; 3]>, [QInt8; 3], moe::Routing) {
+        const TARGETS: [f32; moe::config::NUM_EXPERTS_PER_TOK] =
+            [16_777_216.0, 1.0, -16_777_216.0, 1.0, 1.0, 1.0];
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/moe_torch_2_10_cpu.json"))
+                .expect("valid pinned torch MoE oracle fixture");
+        let unique = &fixture["cases"][0];
+        let scores = unique["scores_f32_bits"]
+            .as_array()
+            .expect("fixture score bits")
+            .iter()
+            .map(|bits| f32::from_bits(bits.as_u64().expect("fixture f32 bits") as u32))
+            .collect::<Vec<_>>();
+
+        let hidden_size = moe::config::HIDDEN_SIZE;
+        let mut hidden_data = vec![0.0f32; hidden_size];
+        hidden_data[0] = 1.0;
+        let hidden = Mat::from_vec(1, hidden_size, hidden_data);
+        let mut gate = vec![0.0f32; moe::config::N_ROUTED_EXPERTS * hidden_size];
+        for (expert, score) in scores.into_iter().enumerate() {
+            gate[expert * hidden_size] = score;
+        }
+        let routing = moe::route_default(&hidden, &gate).expect("public route_default succeeds");
+        let expected_field = if rollback {
+            "torch_sorted_indices"
+        } else {
+            "torch_unsorted_indices"
+        };
+        let expected = unique[expected_field]
+            .as_array()
+            .expect("fixture route indices")
+            .iter()
+            .map(|item| item.as_u64().expect("fixture expert index") as usize)
+            .collect::<Vec<_>>();
+        assert_eq!(routing.indices[0].as_slice(), expected.as_slice());
+
+        let mut unit_weights = vec![0i8; hidden_size];
+        unit_weights[0] = 127;
+        let unit = QInt8::new(unit_weights, vec![1.0 / 127.0], 1, hidden_size);
+        let zero = QInt8::new(vec![0; hidden_size], vec![1.0], 1, hidden_size);
+        let silu_one = 1.0f32 / (1.0 + (-1.0f32).exp());
+        let mut expert_outputs = vec![0.0f32; moe::config::N_ROUTED_EXPERTS];
+        for (slot, &expert) in routing.indices[0].iter().enumerate() {
+            expert_outputs[expert] = TARGETS[slot] / routing.weights[0][slot];
+        }
+        let experts = expert_outputs
+            .into_iter()
+            .map(|expert_output| {
+                let down = if expert_output == 0.0 {
+                    QInt8::new(vec![0; hidden_size], vec![1.0; hidden_size], hidden_size, 1)
+                } else {
+                    QInt8::new(
+                        vec![127; hidden_size],
+                        vec![expert_output / (127.0 * silu_one); hidden_size],
+                        hidden_size,
+                        1,
+                    )
+                };
+                [unit.clone(), unit.clone(), down]
+            })
+            .collect::<Vec<_>>();
+        let shared = [
+            zero.clone(),
+            zero,
+            QInt8::new(vec![0; hidden_size], vec![1.0; hidden_size], hidden_size, 1),
+        ];
+        (hidden, gate, experts, shared, routing)
+    }
+
+    fn fold_int8_moe_contributions(
+        contributions: &[Vec<f32>; moe::config::NUM_EXPERTS_PER_TOK],
+        indices: &[usize; moe::config::NUM_EXPERTS_PER_TOK],
+        ascending_expert: bool,
+    ) -> Vec<f32> {
+        let mut slots: [usize; moe::config::NUM_EXPERTS_PER_TOK] = std::array::from_fn(|slot| slot);
+        if ascending_expert {
+            slots.sort_unstable_by_key(|&slot| indices[slot]);
+        }
+        let mut out = vec![0.0f32; moe::config::HIDDEN_SIZE];
+        for slot in slots {
+            for (dst, &value) in out.iter_mut().zip(contributions[slot].iter()) {
+                *dst += value;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn moe_policy_subprocess_probe_int8() -> FocrResult<()> {
+        let Some((case, rollback)) = moe_policy_child_case() else {
+            return Ok(());
+        };
+        let (hidden, gate, experts, shared, routing) = int8_moe_policy_fixture(rollback);
+        let indices = routing.indices[0];
+        let weights = routing.weights[0];
+
+        let mut prefill_contributions: [Vec<f32>; moe::config::NUM_EXPERTS_PER_TOK] =
+            std::array::from_fn(|_| vec![0.0; moe::config::HIDDEN_SIZE]);
+        let mut decode_contributions: [Vec<f32>; moe::config::NUM_EXPERTS_PER_TOK] =
+            std::array::from_fn(|_| vec![0.0; moe::config::HIDDEN_SIZE]);
+        for slot in 0..moe::config::NUM_EXPERTS_PER_TOK {
+            let expert = indices[slot];
+            let prefill = expert_mlp_i8(
+                &hidden,
+                &experts[expert][0],
+                &experts[expert][1],
+                &experts[expert][2],
+            )?;
+            let decode = expert_gemv_i8_serial(
+                hidden.row(0),
+                &experts[expert][0],
+                &experts[expert][1],
+                &experts[expert][2],
+            );
+            for channel in 0..moe::config::HIDDEN_SIZE {
+                prefill_contributions[slot][channel] = weights[slot] * prefill.data[channel];
+                decode_contributions[slot][channel] = weights[slot] * decode[channel];
+            }
+        }
+        let expected_prefill =
+            fold_int8_moe_contributions(&prefill_contributions, &indices, rollback);
+        let alternate_prefill =
+            fold_int8_moe_contributions(&prefill_contributions, &indices, !rollback);
+        let expected_decode =
+            fold_int8_moe_contributions(&decode_contributions, &indices, rollback);
+        let alternate_decode =
+            fold_int8_moe_contributions(&decode_contributions, &indices, !rollback);
+        assert_ne!(
+            expected_prefill[0].to_bits(),
+            alternate_prefill[0].to_bits()
+        );
+        assert_ne!(expected_decode[0].to_bits(), alternate_decode[0].to_bits());
+
+        let mut batched_data = hidden.data.clone();
+        batched_data.extend_from_slice(&hidden.data);
+        let batched_hidden = Mat::from_vec(2, moe::config::HIDDEN_SIZE, batched_data);
+        let prefill = moe_block_i8(&batched_hidden, &gate, &experts, &shared)?;
+        assert_eq!(prefill.row(0), expected_prefill.as_slice());
+        assert_eq!(prefill.row(1), expected_prefill.as_slice());
+
+        let mlp = CachedMlpI8::Moe {
+            gate,
+            experts,
+            shared,
+        };
+        let decode = decode_mlp_i8(&mlp, &hidden)?;
+        assert_eq!(decode, expected_decode);
+        eprintln!("FOCR_MOE_POLICY_PROBE_INT8={case}");
+        Ok(())
+    }
+
+    fn quant_oc_fixture_builder() -> crate::quant::focrq::FocrqBuilder {
+        let arch = crate::native_engine::model_arch::arch_by_id("got-ocr2")
+            .expect("got-ocr2 test architecture must be registered");
+        crate::quant::focrq::FocrqBuilder::new()
+            .with_model_id(arch.id())
+            .with_license_notice(arch.license_notice())
+    }
+
+    #[test]
+    fn quant_oc_loaded_rejects_prequantized_output_row_mismatch() {
+        let mut builder = quant_oc_fixture_builder();
+        builder
+            .add_quantized(
+                "w",
+                crate::quant::focrq::WriteDType::QInt8PerChan,
+                vec![3, 2],
+                vec![0; 6],
+                vec![0; 3 * std::mem::size_of::<f32>()],
+                0,
+                0,
+            )
+            .expect("valid synthetic QInt8 record");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact loads");
+
+        let q = quant_oc_loaded(&weights, "w", 3).expect("matching output rows load");
+        assert_eq!((q.n, q.k), (3, 2), "input/K dimension must be preserved");
+
+        let err = quant_oc_loaded(&weights, "w", 2).expect_err("row mismatch must fail");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("3 output rows; expected 2"));
+    }
+
+    #[test]
+    fn quant_oc_loaded_rejects_high_precision_output_row_mismatch_and_wrong_rank() {
+        let mut builder = quant_oc_fixture_builder();
+        builder
+            .add_tensor(
+                "matrix",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![3, 2],
+                vec![0; 3 * 2 * std::mem::size_of::<u16>()],
+            )
+            .expect("valid synthetic BF16 matrix");
+        builder
+            .add_tensor(
+                "vector",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![6],
+                vec![0; 6 * std::mem::size_of::<u16>()],
+            )
+            .expect("valid synthetic BF16 vector");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact loads");
+
+        let q = quant_oc_loaded(&weights, "matrix", 3).expect("matching matrix loads");
+        assert_eq!((q.n, q.k), (3, 2), "input/K dimension must be preserved");
+
+        let err = quant_oc_loaded(&weights, "matrix", 2).expect_err("row mismatch must fail");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("3 output rows; expected 2"));
+
+        let err = quant_oc_loaded(&weights, "vector", 1)
+            .expect_err("a rank-1 vector is not an [out, in] weight");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("rank 1; expected 2"));
+    }
+
+    #[test]
+    fn activation_quantization_uses_true_division_and_ties_to_even() {
+        let ties = [127.0, 0.5, 2.5, -0.5, -2.5];
+        let (q, scale) = quantize_row_i8(&ties);
+        assert_eq!(scale, 1.0);
+        assert_eq!(q, [127, 0, 2, 0, -2]);
+
+        // This f32 pair sits on a boundary where true division yields
+        // -125.49999 while reciprocal multiplication yields exactly -125.5.
+        // The contract requires the former, so this keeps the division rule live.
+        let boundary = [f32::from_bits(0x3cdd_67c9), f32::from_bits(0xbcda_ca56)];
+        let (q, scale) = quantize_row_i8(&boundary);
+        assert_eq!(scale.to_bits(), 0x395f_2615);
+        assert_eq!(q, [127, -125]);
+        let reciprocal = (boundary[1] * (1.0 / scale)).round_ties_even() as i8;
+        assert_eq!(
+            reciprocal, -126,
+            "test vector must distinguish the two formulas"
+        );
+    }
+
     // ── Fused q/k/v GEMV bit-identity (FOCR_QKV_FUSED, bd-241s) ──────────────────
+
+    /// bd-2mo.3: a [`WeightLayout::SmmlaPanels`] weight (the offline `--arch
+    /// aarch64-smmla` packing kept by the loader on an SMMLA host) produces
+    /// BYTE-IDENTICAL f32 output to the same weight in row-major layout,
+    /// through the REAL decode entry points: [`gemv_i8`] (fresh quantize),
+    /// [`gemv_i8_prequant`], and the batched prequant GEMM. `n` deliberately
+    /// exceeds `I8_GEMV_BLOCK` so the even-base panel slicing at block
+    /// boundaries is exercised, and includes an odd tail block (n = 130).
+    #[test]
+    fn smmla_panel_layout_is_byte_identical_through_the_gemv_paths() {
+        let (n, k) = (130usize, 96usize);
+        let mut w = vec![0i8; n * k];
+        for (i, v) in w.iter_mut().enumerate() {
+            *v = (((i as i64 * 37 + 5) % 255) - 127) as i8;
+        }
+        let scales: Vec<f32> = (0..n).map(|o| 1.0e-3 + o as f32 * 3.0e-5).collect();
+        let row_major = QInt8::new(w.clone(), scales.clone(), n, k);
+        let (panels, _, _) = crate::simd::pack::smmla_pack_panels(&w, 0, n, k, k);
+        let packed = QInt8::new_smmla_panels(panels, scales, n, k);
+
+        // gemv_i8: fresh activation quantize inside.
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.11 - 4.0).collect();
+        let a = gemv_i8(&x, &row_major);
+        let b = gemv_i8(&x, &packed);
+        assert_eq!(a, b, "gemv_i8 must be layout-invariant (bit-exact)");
+
+        // gemv_i8_prequant: caller-provided int8 row.
+        let xq: Vec<i8> = (0..k)
+            .map(|i| (((i * 91) % 255) as i32 - 127) as i8)
+            .collect();
+        let a = gemv_i8_prequant(&xq, 0.017, &row_major);
+        let b = gemv_i8_prequant(&xq, 0.017, &packed);
+        assert_eq!(
+            a, b,
+            "gemv_i8_prequant must be layout-invariant (bit-exact)"
+        );
+        println!(r#"{{"check":"smmla_panel_gemv_parity","n":{n},"k":{k},"result":"pass"}}"#);
+    }
+
+    /// bd-2mo.3: [`fuse_qkv`] over three panel-layout weights produces the
+    /// panel pack of the fused matrix — i.e. fusing THEN packing equals
+    /// packing THEN fusing — and the fused panel weight GEMVs bit-identically
+    /// to the fused row-major weight.
+    #[test]
+    fn fuse_qkv_concatenates_smmla_panels_losslessly() {
+        let (qkv_dim, hidden) = (64usize, 48usize);
+        let mk = |salt: i64| -> (Vec<i8>, Vec<f32>) {
+            let mut w = vec![0i8; qkv_dim * hidden];
+            for (i, v) in w.iter_mut().enumerate() {
+                *v = (((i as i64 * 31 + salt * 101) % 255) - 127) as i8;
+            }
+            let scales: Vec<f32> = (0..qkv_dim)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            (w, scales)
+        };
+        let (qw, qs) = mk(1);
+        let (kw, ks) = mk(2);
+        let (vw, vs) = mk(3);
+        let pack = |w: &[i8]| crate::simd::pack::smmla_pack_panels(w, 0, qkv_dim, hidden, hidden).0;
+
+        let fused_rm = fuse_qkv(
+            &QInt8::new(qw.clone(), qs.clone(), qkv_dim, hidden),
+            &QInt8::new(kw.clone(), ks.clone(), qkv_dim, hidden),
+            &QInt8::new(vw.clone(), vs.clone(), qkv_dim, hidden),
+        );
+        let fused_pk = fuse_qkv(
+            &QInt8::new_smmla_panels(pack(&qw), qs, qkv_dim, hidden),
+            &QInt8::new_smmla_panels(pack(&kw), ks, qkv_dim, hidden),
+            &QInt8::new_smmla_panels(pack(&vw), vs, qkv_dim, hidden),
+        );
+        assert_eq!(fused_pk.layout, WeightLayout::SmmlaPanels);
+        // fuse-then-pack == pack-then-fuse (byte equality of the panel stream)
+        let repacked = crate::simd::pack::smmla_pack_panels(
+            &fused_rm.w,
+            0,
+            fused_rm.n,
+            fused_rm.k,
+            fused_rm.k,
+        )
+        .0;
+        assert_eq!(
+            fused_pk.w, repacked,
+            "panel concat must equal pack of the fused matrix"
+        );
+        // and the GEMV agrees bitwise
+        let x: Vec<f32> = (0..hidden).map(|i| (i as f32) * 0.07 - 1.5).collect();
+        assert_eq!(
+            gemv_i8(&x, &fused_rm),
+            gemv_i8(&x, &fused_pk),
+            "fused panel GEMV must be bit-exact"
+        );
+        println!(r#"{{"check":"smmla_panel_fuse_qkv","result":"pass"}}"#);
+    }
 
     /// The fused `[3*qkv_dim, hidden]` GEMV must reproduce, BYTE-FOR-BYTE, the q/k/v
     /// that three separate [`gemv_i8`] calls produce. `qkv_dim` is deliberately NOT
@@ -2340,6 +3699,128 @@ mod tests {
             bits(&y[2 * qkv_dim..3 * qkv_dim]),
             "v mismatch"
         );
+    }
+
+    // ── Fused norm->quant epilogue bit-identity (FOCR_FUSE_NORM_QUANT, bd-1azu.54) ──
+
+    /// Lever 1: folding the per-row int8 quantize into the RMSNorm epilogue and
+    /// reusing that ONE int8 row across q/k/v must reproduce, BYTE-FOR-BYTE, the
+    /// default `nn::rms_norm` -> f32 row -> per-`gemv_i8` re-quantize path — both
+    /// the dequantized projection outputs AND the intermediate `(xq, a_scale)`.
+    /// `qkv_dim` crosses a 64-row [`I8_GEMV_BLOCK`] boundary so the block fan-out is
+    /// exercised; the input row spans negatives/positives (dynamic amax/clamp/round).
+    #[test]
+    fn fused_norm_quant_is_byte_identical_to_norm_then_gemv() {
+        let hidden = 96usize;
+        let qkv_dim = 70usize; // crosses a 64-row I8_GEMV_BLOCK boundary
+        let mk = |salt: i32| -> QInt8 {
+            let mut w = vec![0i8; qkv_dim * hidden];
+            for o in 0..qkv_dim {
+                for i in 0..hidden {
+                    let raw = ((o as i32 * 29 + i as i32 * 11 + salt * 97) % 255) - 127;
+                    w[o * hidden + i] = raw as i8;
+                }
+            }
+            let scales: Vec<f32> = (0..qkv_dim)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            QInt8::new(w, scales, qkv_dim, hidden)
+        };
+        let q_proj = mk(0);
+        let k_proj = mk(1);
+        let v_proj = mk(2);
+        let ln_w: Vec<f32> = (0..hidden).map(|i| 0.5 + (i as f32) * 0.03).collect();
+        let x = Mat::from_vec(
+            1,
+            hidden,
+            (0..hidden)
+                .map(|i| (i as f32 * 0.41).cos() * 3.0 - 0.7)
+                .collect(),
+        );
+        let eps = config::RMS_NORM_EPS;
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+
+        // Default path: norm -> f32 row -> three re-quantizing `gemv_i8`.
+        let normed = nn::rms_norm(&x, Some(&ln_w), eps).unwrap();
+        let nrow = normed.row(0);
+        let q_def = gemv_i8(nrow, &q_proj);
+        let k_def = gemv_i8(nrow, &k_proj);
+        let v_def = gemv_i8(nrow, &v_proj);
+
+        // Fused path: quantize ONCE in the norm epilogue, reuse for q/k/v.
+        let (xq, a_scale) = rms_norm_quant_i8(&x, Some(&ln_w), eps).unwrap();
+        let q_fused = gemv_i8_prequant(&xq, a_scale, &q_proj);
+        let k_fused = gemv_i8_prequant(&xq, a_scale, &k_proj);
+        let v_fused = gemv_i8_prequant(&xq, a_scale, &v_proj);
+
+        assert_eq!(bits(&q_def), bits(&q_fused), "q mismatch");
+        assert_eq!(bits(&k_def), bits(&k_fused), "k mismatch");
+        assert_eq!(bits(&v_def), bits(&v_fused), "v mismatch");
+
+        // The fused `(xq, a_scale)` themselves equal the separate norm-then-quantize.
+        let (xq_ref, a_ref) = quantize_row_i8(nrow);
+        assert_eq!(xq, xq_ref, "int8 activation bytes mismatch");
+        assert_eq!(a_scale.to_bits(), a_ref.to_bits(), "a_scale bits mismatch");
+    }
+
+    // ── Fused ngram->lm_head epilogue bit-identity (FOCR_FUSE_NGRAM_LMHEAD, .54) ──
+
+    /// Lever 3: folding the sliding-window no-repeat-ngram ban into the int8 lm_head
+    /// dequant epilogue must reproduce, BYTE-FOR-BYTE, the default `gemv_i8` then
+    /// the sampler's `masked_sliding_window_logits_if_needed` copy-mask. `vocab`
+    /// crosses several [`I8_GEMV_BLOCK`] (64) boundaries. The sequence `[3,7,3]`
+    /// bans the bigram completion `7` (current_prefix `[3]`, bigram `(3,7)` in
+    /// window) — so the masked path is genuinely exercised — and the empty-ban case
+    /// must be byte-identical to the plain head.
+    #[test]
+    fn fused_ngram_lmhead_is_byte_identical_to_separate_mask() {
+        use super::super::sampler;
+        let vocab = 130usize;
+        let hidden = 48usize;
+        let mut w = vec![0i8; vocab * hidden];
+        for o in 0..vocab {
+            for i in 0..hidden {
+                let raw = ((o as i32 * 13 + i as i32 * 7 + 5) % 255) - 127;
+                w[o * hidden + i] = raw as i8;
+            }
+        }
+        let scales: Vec<f32> = (0..vocab).map(|o| 1.0e-3 + o as f32 * 1.0e-4).collect();
+        let qw = QInt8::new(w, scales, vocab, hidden);
+        let x: Vec<f32> = (0..hidden)
+            .map(|i| (i as f32 * 0.31).sin() * 2.0 - 0.3)
+            .collect();
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+
+        let ngram_size = 2usize;
+        let window = 16usize;
+        let seq: Vec<u32> = vec![3, 7, 3];
+
+        // Default path: full head, then the sampler's copy-then-mask.
+        let logits = gemv_i8(&x, &qw);
+        let expected =
+            sampler::masked_sliding_window_logits_if_needed(&logits, &seq, ngram_size, window, &[])
+                .unwrap_or_else(|| logits.clone());
+
+        // Fused path: ban set folded into the lm_head dequant epilogue.
+        let banned =
+            sampler::collect_sliding_window_ngram_bans(&seq, ngram_size, window, &[], vocab);
+        let fused = gemv_i8_ngram_masked(&x, &qw, &banned);
+
+        assert!(
+            !banned.is_empty(),
+            "test sequence should ban at least one token"
+        );
+        // token 7 is the bigram completion the sequence bans → its logit is -inf.
+        assert_eq!(
+            fused[7].to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            "banned token 7 should be masked to -inf"
+        );
+        assert_eq!(bits(&fused), bits(&expected), "masked logits row mismatch");
+
+        // No-ban case: empty bans ⇒ byte-for-byte the plain head.
+        let none = gemv_i8_ngram_masked(&x, &qw, &[]);
+        assert_eq!(bits(&none), bits(&logits), "no-ban head must equal gemv_i8");
     }
 
     // ── Batched M=B projection GEMV bit-identity (bd-1azu.3) ─────────────────────
@@ -2400,6 +3881,187 @@ mod tests {
             assert!(!batch_spine_enabled());
         }
         assert!(batch_size_cap() >= 1);
+    }
+
+    // ── Chunked prefill kill-switch + tiling (FOCR_PREFILL_CHUNK, bd-1azu.9) ──────
+
+    /// `FOCR_PREFILL_CHUNK` defaults to the monolithic schedule (`None`) when the
+    /// environment is unset — the lever is additive, default-OFF (Doctrine #3).
+    /// Guarded behind the env presence so a host that exports it does not flake.
+    #[test]
+    fn prefill_chunk_defaults_off() {
+        if std::env::var_os("FOCR_PREFILL_CHUNK").is_none() {
+            assert_eq!(prefill_chunk_size(), None);
+        }
+    }
+
+    /// [`prefill_chunk_bounds`] tiles `[0, seq)` into CONTIGUOUS, gap-free,
+    /// ascending `[c0, c1)` chunks of at most `chunk` tokens, covering exactly
+    /// `[0, seq)` for every chunk size — including `1`, primes, sizes that do not
+    /// divide `seq`, and sizes `>= seq` (a single chunk). This ascending coverage
+    /// is what lets chunk `g` attend exactly the keys earlier chunks wrote.
+    #[test]
+    fn prefill_chunk_bounds_cover_contiguously_in_order() {
+        for &seq in &[0usize, 1, 2, 5, 7, 16, 17] {
+            for &chunk in &[1usize, 2, 3, 5, 7, 16, 64] {
+                let bounds = prefill_chunk_bounds(seq, chunk);
+                let mut cursor = 0usize;
+                for &(c0, c1) in &bounds {
+                    assert_eq!(c0, cursor, "seq={seq} chunk={chunk}: gap/overlap");
+                    assert!(c1 > c0, "seq={seq} chunk={chunk}: empty/reversed chunk");
+                    assert!(c1 - c0 <= chunk, "seq={seq} chunk={chunk}: chunk too wide");
+                    assert!(c1 <= seq, "seq={seq} chunk={chunk}: chunk past seq");
+                    cursor = c1;
+                }
+                assert_eq!(cursor, seq, "seq={seq} chunk={chunk}: must cover [0, seq)");
+            }
+        }
+    }
+
+    /// The assembled chunked attention is BYTE-FOR-BYTE the monolithic
+    /// [`prefill_attention`] over the whole sequence, for every chunk size — the
+    /// crux of the chunked-prefill lossless claim, exercised on the REAL
+    /// [`chunk_prefill_attention`] kernel at a small synthetic head shape (a model
+    /// is not needed: attention is shape-parametrized).
+    #[test]
+    fn chunked_attention_is_byte_identical_to_monolithic() {
+        let (num_heads, head_dim, seq) = (3usize, 4usize, 11usize);
+        let dim = num_heads * head_dim;
+        // Deterministic synthetic q/k/v spanning negatives/positives.
+        let mk = |salt: f32| -> Mat {
+            let data: Vec<f32> = (0..seq * dim)
+                .map(|i| ((i as f32 + salt) * 0.37).sin() * 1.7 - 0.2)
+                .collect();
+            Mat::from_vec(seq, dim, data)
+        };
+        let (q, k, v) = (mk(0.0), mk(11.0), mk(23.0));
+        let monolithic = prefill_attention(&q, &k, &v, num_heads, head_dim).unwrap();
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        // chunk 1, 2, a prime (3), and the full length (single chunk).
+        for &chunk in &[1usize, 2, 3, seq] {
+            let mut assembled = Mat::zeros(seq, dim);
+            for (c0, c1) in prefill_chunk_bounds(seq, chunk) {
+                let q_chunk = Mat::from_vec(c1 - c0, dim, q.data[c0 * dim..c1 * dim].to_vec());
+                let kpre = Mat::from_vec(c1, dim, k.data[..c1 * dim].to_vec());
+                let vpre = Mat::from_vec(c1, dim, v.data[..c1 * dim].to_vec());
+                let ctx = chunk_prefill_attention(&q_chunk, &kpre, &vpre, num_heads, head_dim, c0)
+                    .unwrap();
+                assembled.data[c0 * dim..c1 * dim].copy_from_slice(&ctx.data);
+            }
+            assert_eq!(
+                bits(&monolithic.data),
+                bits(&assembled.data),
+                "chunk={chunk}: chunked attention != monolithic prefill_attention"
+            );
+        }
+    }
+
+    // ── Vocab-tiled lm_head bit-identity (FOCR_LMHEAD_SHARD, bd-1azu.25) ──────────
+
+    /// [`vocab_tile_ranges`] partitions `[0, n)` into CONTIGUOUS, gap-free,
+    /// ascending tiles for every tile count — including counts that do not divide
+    /// `n` and counts larger than `n` (which must clamp, never emit out-of-bounds
+    /// or empty-then-restart ranges). The ascending coverage is what preserves the
+    /// vocab column order under sharding.
+    #[test]
+    fn vocab_tile_ranges_cover_contiguously_in_order() {
+        for &n in &[0usize, 1, 7, 64, 65, 129_280] {
+            for &tiles in &[1usize, 2, 3, 7, 16, 1000, 200_000] {
+                let ranges = vocab_tile_ranges(n, tiles);
+                // Contiguous from 0, gap-free, non-overlapping, covering [0, n).
+                let mut cursor = 0usize;
+                for &(start, end) in &ranges {
+                    assert_eq!(start, cursor, "n={n} tiles={tiles}: tile gap/overlap");
+                    assert!(end >= start, "n={n} tiles={tiles}: reversed tile");
+                    assert!(end <= n, "n={n} tiles={tiles}: tile end out of bounds");
+                    cursor = end;
+                }
+                assert_eq!(cursor, n, "n={n} tiles={tiles}: ranges must cover [0, n)");
+                // Tile count is clamped into `[1, n.max(1)]`.
+                assert!(!ranges.is_empty(), "n={n} tiles={tiles}: at least one tile");
+                assert!(
+                    ranges.len() <= n.max(1),
+                    "n={n} tiles={tiles}: more tiles than channels"
+                );
+            }
+        }
+    }
+
+    /// [`gemv_i8_sharded`] must reproduce, BYTE-FOR-BYTE, what the monolithic
+    /// [`gemv_i8`] produces — for several contiguous-tile counts INCLUDING ones
+    /// that do not evenly divide the vocab and one larger than a 64-row block.
+    /// `n` is a deliberately awkward small synthetic vocab (not a multiple of
+    /// [`I8_GEMV_BLOCK`]) so tile and 64-row chunk boundaries straddle, proving
+    /// each logit is an independent dot whose value is invariant to grouping.
+    #[test]
+    fn lmhead_shard_i8_is_byte_identical_to_monolithic() {
+        let mk = |n: usize, k: usize, salt: i32| -> QInt8 {
+            let mut w = vec![0i8; n * k];
+            for o in 0..n {
+                for i in 0..k {
+                    let raw = ((o as i32 * 13 + i as i32 * 7 + salt * 101) % 255) - 127;
+                    w[o * k + i] = raw as i8;
+                }
+            }
+            let scales: Vec<f32> = (0..n)
+                .map(|o| 1.0e-3 + (o as f32 + salt as f32 * 0.5) * 1.0e-4)
+                .collect();
+            QInt8::new(w, scales, n, k)
+        };
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        // Small synthetic vocab `n=150` (crosses two 64-blocks, not a multiple of 64).
+        let (n, k) = (150usize, 96usize);
+        let qw = mk(n, k, 3);
+        let x: Vec<f32> = (0..k)
+            .map(|i| (i as f32 * 0.41).sin() * 2.5 - 0.4)
+            .collect();
+        let monolithic = gemv_i8(&x, &qw);
+        // 7 does not divide 150; 13 does not divide 150; 1 is the trivial tile;
+        // 200 > n exercises the clamp; 150 is one-column-per-tile.
+        for &tiles in &[1usize, 2, 7, 13, 64, 150, 200] {
+            let sharded = gemv_i8_sharded(&x, &qw, tiles);
+            assert_eq!(
+                bits(&monolithic),
+                bits(&sharded),
+                "int8 lm_head: {tiles}-tile shard != monolithic gemv_i8 (n={n} k={k})"
+            );
+        }
+    }
+
+    /// [`gemv_sharded`] must reproduce, BYTE-FOR-BYTE, what the monolithic
+    /// [`gemv`] produces — the f32-head twin of the int8 check, across non-dividing
+    /// tile counts on a small synthetic vocab.
+    #[test]
+    fn lmhead_shard_f32_is_byte_identical_to_monolithic() {
+        let (n, k) = (150usize, 96usize);
+        let w: Vec<f32> = (0..n * k)
+            .map(|idx| ((idx as f32 * 0.013).sin() * 1.7) - 0.3)
+            .collect();
+        let x: Vec<f32> = (0..k)
+            .map(|i| (i as f32 * 0.29).cos() * 2.1 + 0.2)
+            .collect();
+        let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let monolithic = gemv(&x, &w, n, k);
+        for &tiles in &[1usize, 2, 7, 13, 64, 150, 200] {
+            let sharded = gemv_sharded(&x, &w, n, k, tiles);
+            assert_eq!(
+                bits(&monolithic),
+                bits(&sharded),
+                "f32 lm_head: {tiles}-tile shard != monolithic gemv (n={n} k={k})"
+            );
+        }
+    }
+
+    /// The vocab-shard env kill-switch defaults OFF and the tile count defaults to
+    /// a positive value when the environment is unset — an additive, default-OFF
+    /// lever (Doctrine #3). Guarded behind the env so a host that exports
+    /// `FOCR_LMHEAD_SHARD` does not flake.
+    #[test]
+    fn lmhead_shard_defaults_off_with_positive_tiles() {
+        if std::env::var_os("FOCR_LMHEAD_SHARD").is_none() {
+            assert!(!lmhead_shard_enabled());
+        }
+        assert!(lmhead_shard_tiles() >= 1);
     }
 
     fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {

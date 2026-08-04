@@ -1,0 +1,108 @@
+{
+  "schema": "focr-gauntlet-roofline/v1",
+  "created_utc": "2026-07-05T23:59:27Z",
+  "arch": "smolvlm2",
+  "precision": "int8",
+  "machine_profile": {
+    "name": "m4",
+    "dram_gb_s": 120.0,
+    "peak_int8_gmacs": 1126.4,
+    "peak_f32_gflops": 563.2,
+    "note": "P-cores only, SDOT 64 int8-MAC/cycle/core, FMA 32 f32-FLOP/cycle/core"
+  },
+  "stages_json": "artifacts/perf/bd-3jo6.1.11/smolvlm2/focr/focr_stages.json",
+  "floors": [
+    {
+      "floor_kind": "compute",
+      "floor_ms": 412.0704,
+      "compute_floor_ms": 412.0704,
+      "memory_floor_ms": 2.62144,
+      "int8_macs": 275565772800,
+      "f32_flops": 94295162880,
+      "bytes": 314572800,
+      "assumptions": [
+        "876 prefill tokens \u00d7 dense per-token GEMM MACs (head excluded)",
+        "memory floor = int8 weights streamed once"
+      ],
+      "stage": "prefill",
+      "focr_best_ms": 910.0,
+      "dist_above_floor": 2.2084
+    },
+    {
+      "floor_kind": "memory",
+      "floor_ms": 4.912128,
+      "compute_floor_ms": 0.672436,
+      "memory_floor_ms": 4.912128,
+      "int8_macs": 314572800,
+      "f32_flops": 221429760,
+      "bytes": 589455360,
+      "assumptions": [
+        "dense smolvlm2: attn qkvo + SwiGLU gate/up/down int8; the head is an f32 GEMM (model_arch.rs: lm_head_stored_int8 false / tied f32 embed)",
+        "full-causal K+V read at mean context 1032 in f32 (kv_dim 320)",
+        "norms/embeds/biases/activations excluded (lower bound)"
+      ],
+      "stage": "decode_per_token",
+      "focr_best_ms": 20.641026,
+      "dist_above_floor": 4.2021
+    },
+    {
+      "floor_kind": "compute",
+      "floor_ms": 6886.843252,
+      "compute_floor_ms": null,
+      "memory_floor_ms": null,
+      "int8_macs": null,
+      "f32_flops": null,
+      "bytes": null,
+      "assumptions": [
+        "sum of modeled stage floors with decode \u00d7 312 measured tokens",
+        "floor_kind = dominant component (vision_encode)"
+      ],
+      "components": {
+        "vision_encode": {
+          "floor_kind": "compute",
+          "floor_ms": 4942.188916,
+          "compute_floor_ms": 4942.188916,
+          "memory_floor_ms": 3.244032,
+          "int8_macs": 0,
+          "f32_flops": 2783440797696,
+          "bytes": 389283840,
+          "assumptions": [
+            "SigLIP-B/16 blocks + full attention over 1024 tokens \u00d7 13 frames + the 12288\u2192960 modality_projection",
+            "f32 weights streamed once; norms/softmax/pos-embeds excluded (lower bound)"
+          ]
+        },
+        "prefill": {
+          "floor_kind": "compute",
+          "floor_ms": 412.0704,
+          "compute_floor_ms": 412.0704,
+          "memory_floor_ms": 2.62144,
+          "int8_macs": 275565772800,
+          "f32_flops": 94295162880,
+          "bytes": 314572800,
+          "assumptions": [
+            "876 prefill tokens \u00d7 dense per-token GEMM MACs (head excluded)",
+            "memory floor = int8 weights streamed once"
+          ]
+        },
+        "decode_per_token": {
+          "floor_kind": "memory",
+          "floor_ms": 4.912128,
+          "compute_floor_ms": 0.672436,
+          "memory_floor_ms": 4.912128,
+          "int8_macs": 314572800,
+          "f32_flops": 221429760,
+          "bytes": 589455360,
+          "assumptions": [
+            "dense smolvlm2: attn qkvo + SwiGLU gate/up/down int8; the head is an f32 GEMM (model_arch.rs: lm_head_stored_int8 false / tied f32 embed)",
+            "full-causal K+V read at mean context 1032 in f32 (kv_dim 320)",
+            "norms/embeds/biases/activations excluded (lower bound)"
+          ]
+        }
+      },
+      "stage": "end_to_end",
+      "focr_best_ms": 19074.781,
+      "dist_above_floor": 2.7697
+    }
+  ],
+  "synthetic": false
+}

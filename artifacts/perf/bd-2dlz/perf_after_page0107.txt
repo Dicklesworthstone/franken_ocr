@@ -1,0 +1,23 @@
+# AFTER bd-2dlz — new default: int8 lm_head + top-K f32 refine, PARALLEL per-head attn, last-row seed.
+# Same model/page/host. Output BYTE-IDENTICAL to the f32 head; env-gated oracle certs pass (== L4).
+
+## New default (int8+refine head, parallel attn) — the shipped config [measure2 B, 2 passes]:
+[focr-timing]   got.vision+splice 5.69s
+[focr-timing]   decode 688 tok in 10.63s (64.7 tok/s) | seed(prefill) 0.23s | layers 8.64s (attn 2.29s, gemv+misc 6.35s) | lm_head 1.94s
+[focr-timing]   got.generate 688 tokens 10.95s
+[focr-timing] got forward 16.66s
+[focr-timing]   got.vision+splice 5.66s
+[focr-timing]   decode 688 tok in 10.63s (64.7 tok/s) | seed(prefill) 0.23s | layers 8.65s (attn 2.29s, gemv+misc 6.35s) | lm_head 1.92s
+[focr-timing]   got.generate 688 tokens 10.95s
+[focr-timing] got forward 16.63s
+
+## Lossless-only default (f32 head, parallel attn, last-row seed) [measure2 A] — isolates attn+seed:
+[focr-timing]   got.vision+splice 5.73s
+[focr-timing]   decode 688 tok in 24.68s (27.9 tok/s) | seed(prefill) 0.25s | layers 8.78s (attn 2.33s, gemv+misc 6.46s) | lm_head 15.84s
+[focr-timing]   got.generate 688 tokens 25.08s
+[focr-timing] got forward 30.83s
+
+## Serial-attn isolation (f32 head, SERIAL attn) [measure.log C] — shows parallel-attn = 5.02->2.43s:
+[focr-timing]   got.vision+splice 5.88s
+[focr-timing]   decode 688 tok in 29.71s (23.2 tok/s) | seed(prefill) 0.27s | layers 12.59s (attn 5.02s, gemv+misc 7.56s) | lm_head 17.05s
+[focr-timing]   got.generate 688 tokens 30.14s

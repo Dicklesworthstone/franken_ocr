@@ -1,0 +1,1 @@
+env -i HOME="$HOME" PATH="$PATH" TMPDIR=/private/tmp LC_ALL=C FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 /usr/bin/time -lp /private/tmp/focr-perf-98f2099 ocr /private/tmp/focr-attribution-98f2099/page_0014.png --model /private/tmp/franken_ocr-models/unlimited-ocr.recipe-v1.20260709T2304.focrq -o "$OUT/dense.md"

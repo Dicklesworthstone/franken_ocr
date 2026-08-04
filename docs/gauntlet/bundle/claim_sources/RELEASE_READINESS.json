@@ -1,0 +1,157 @@
+{
+ "artifact": "franken_ocr.release_readiness.v1",
+ "blocking_cells": [
+  "surface_parity",
+  "perf_vs_reference",
+  "hypothesis_ledgers",
+  "certification_bundle",
+  "gauntlet_convergence"
+ ],
+ "cell_set_sha256": "c1258427b328e3ff91e05c00aa73c65568fdef2850b05d2134038ce3f662b1d3",
+ "cells": [
+  {
+   "cell": "parity_l0_l5",
+   "detail": "L0 max_abs_diff=0.0078432; L1 cosine=1; L2 max_abs_diff=8.76188e-05; L3 cosine=1; L4 token_exact_fraction=1; L5 cer=0",
+   "evidence": "tests/fixtures/ladder_scorecard/scorecard_armed.json",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/tests/fixtures/ladder_scorecard/scorecard_armed.json"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "surface_parity",
+   "detail": "MUST rows=43; non-present debt: ['`focr ocr --task format|music|describe|vqa|chart-data` (zoo lanes)=partial', 'Three-pillar release certification (perf/conformance/surface)=partial', 'Head-to-head gauntlet bench vs CPU reference (per-stage, fair)=partial', 'Release-readiness scorecard (all-green ship gate)=partial']",
+   "evidence": "docs/FEATURE_PARITY.md \u00a712-\u00a715 (lock: tests/surface_matrix.rs)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/docs/FEATURE_PARITY.md"
+   ],
+   "status": "red"
+  },
+  {
+   "cell": "perf_vs_reference",
+   "detail": "check_ledgers exit 0; no eligible current Unlimited-OCR decode-per-token evidence; rejected candidates: [\"G2-unlimited-int8-0014-20260708: subject was not measured from the release-perf profile, correctness proof is not a structured hash-bound pass receipt, row.json schema is not focr-gauntlet-row/v2, row.json is stale (44.4h > 24h), performance evidence git_head None != current HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4, hashed row: correctness proof is not a structured hash-bound pass receipt, row.json inputs must bind exactly: correctness_receipt, focr_stages, ref_stages, roofline, row.json inputs.focr_stages.bundle_path is not canonical: None, row.json inputs.ref_stages.bundle_path is not canonical: None, row.json inputs.roofline.bundle_path is not canonical: None, manifest omits bound input: roofline.json, bound input is missing or unsafe: roofline.json, row.json inputs.correctness_receipt is missing, row.json inputs.correctness_receipt.bundle_path is not canonical: None, manifest omits bound input: correctness_receipt.json, bound input is missing or unsafe: correctness_receipt.json, focr stage measurement is stale (44.5h > 24h), reference stage measurement is stale (44.4h > 24h), reference page_sha256 does not match the ledger fixture hash, roofline evidence is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/artifacts/perf/bd-re8.17/G2-unlimited-int8-0014-20260708/__missing__', roofline evidence has an unsupported schema, roofline evidence is synthetic or unstamped, roofline must contain exactly one decode-per-token floor, structured correctness claim is unavailable\", \"G2-unlimited-int8-0009-20260708: subject was not measured from the release-perf profile, correctness proof is not a structured hash-bound pass receipt, row.json schema is not focr-gauntlet-row/v2, row.json is stale (44.4h > 24h), performance evidence git_head None != current HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4, hashed row: correctness proof is not a structured hash-bound pass receipt, row.json inputs must bind exactly: correctness_receipt, focr_stages, ref_stages, roofline, row.json inputs.focr_stages.bundle_path is not canonical: None, row.json inputs.ref_stages.bundle_path is not canonical: None, row.json inputs.roofline.bundle_path is not canonical: None, manifest omits bound input: roofline.json, bound input is missing or unsafe: roofline.json, row.json inputs.correctness_receipt is missing, row.json inputs.correctness_receipt.bundle_path is not canonical: None, manifest omits bound input: correctness_receipt.json, bound input is missing or unsafe: correctness_receipt.json, focr stage measurement is stale (45.6h > 24h), reference stage measurement is stale (44.4h > 24h), reference page_sha256 does not match the ledger fixture hash, roofline evidence is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/artifacts/perf/bd-re8.17/G2-unlimited-int8-0009-20260708/__missing__', roofline evidence has an unsupported schema, roofline evidence is synthetic or unstamped, roofline must contain exactly one decode-per-token floor, structured correctness claim is unavailable\", \"G2-unlimited-int8-0014-20260702: subject was not measured from the release-perf profile, correctness proof is not a structured hash-bound pass receipt, row.json schema is not focr-gauntlet-row/v2, row.json is stale (179.0h > 24h), performance evidence git_head None != current HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4, hashed row: correctness proof is not a structured hash-bound pass receipt, row.json inputs must bind exactly: correctness_receipt, focr_stages, ref_stages, roofline, row.json inputs.focr_stages.bundle_path is not canonical: None, row.json inputs.ref_stages.bundle_path is not canonical: None, row.json inputs.roofline.bundle_path is not canonical: None, manifest omits bound input: roofline.json, bound input is missing or unsafe: roofline.json, row.json inputs.correctness_receipt is missing, row.json inputs.correctness_receipt.bundle_path is not canonical: None, manifest omits bound input: correctness_receipt.json, bound input is missing or unsafe: correctness_receipt.json, focr stage measurement is stale (179.1h > 24h), reference stage measurement is stale (179.0h > 24h), reference page_sha256 does not match the ledger fixture hash, roofline evidence is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/artifacts/perf/bd-re8.17/G2-unlimited-int8-0014-20260702/__missing__', roofline evidence has an unsupported schema, roofline evidence is synthetic or unstamped, roofline must contain exactly one decode-per-token floor, structured correctness claim is unavailable\", \"G2-unlimited-int8-0009-20260702: subject was not measured from the release-perf profile, correctness proof is not a structured hash-bound pass receipt, row.json schema is not focr-gauntlet-row/v2, row.json is stale (179.0h > 24h), performance evidence git_head None != current HEAD 58cf4e196e787fff8a2e83b2d5478541c64a3ee4, hashed row: correctness proof is not a structured hash-bound pass receipt, row.json inputs must bind exactly: correctness_receipt, focr_stages, ref_stages, roofline, row.json inputs.focr_stages.bundle_path is not canonical: None, row.json inputs.ref_stages.bundle_path is not canonical: None, row.json inputs.roofline.bundle_path is not canonical: None, manifest omits bound input: roofline.json, bound input is missing or unsafe: roofline.json, row.json inputs.correctness_receipt is missing, row.json inputs.correctness_receipt.bundle_path is not canonical: None, manifest omits bound input: correctness_receipt.json, bound input is missing or unsafe: correctness_receipt.json, focr stage measurement is stale (179.2h > 24h), reference stage measurement is stale (179.1h > 24h), reference page_sha256 does not match the ledger fixture hash, roofline evidence is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/artifacts/perf/bd-re8.17/G2-unlimited-int8-0009-20260702/__missing__', roofline evidence has an unsupported schema, roofline evidence is synthetic or unstamped, roofline must contain exactly one decode-per-token floor, structured correctness claim is unavailable\"]",
+   "evidence": "docs/PERF_LEDGER.md + scripts/check_ledgers.py",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/docs/PERF_LEDGER.md",
+    "docs/gauntlet/bundle/source_evidence/scripts/check_ledgers.py"
+   ],
+   "status": "red"
+  },
+  {
+   "cell": "determinism",
+   "detail": "obs=1 e=0.001 rejected=None",
+   "evidence": "docs/gauntlet/EPROCESS_STATE.json (INV-DETERMINISM)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/docs/gauntlet/EPROCESS_STATE.json"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "deadlock_watchdog",
+   "detail": "armed capacity cert p50/p95/p99 = 6.83/7.41/9.58 s/page (bd-re8.18)",
+   "evidence": "tests/many_pages_without_deadlock.rs (+ cancel_and_panic_faults.rs)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/tests/many_pages_without_deadlock.rs",
+    "docs/gauntlet/bundle/source_evidence/tests/cancel_and_panic_faults.rs"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "robot_schema",
+   "evidence": "tests/fixtures/robot_schema_v1.json + runs_schema.json (tests: cli_robot_golden, surface_matrix)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/tests/fixtures/robot_schema_v1.json",
+    "docs/gauntlet/bundle/source_evidence/tests/fixtures/runs_schema.json",
+    "docs/gauntlet/bundle/source_evidence/tests/cli_robot_golden.rs",
+    "docs/gauntlet/bundle/source_evidence/tests/surface_matrix.rs"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "build_matrix",
+   "detail": "release-history cell; re-verified at each release cut",
+   "evidence": "v0.3.0 GH release (tag f4796b3): darwin x2, linux x2, win-msvc + shasum sidecars",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/.github/workflows/dist.yml"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "installer",
+   "evidence": "install.sh (+ published checksum sidecars per release)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/install.sh"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "ledger_completeness",
+   "detail": "exit 0",
+   "evidence": "scripts/check_ledgers.py over DISCREPANCIES.md + NEGATIVE_EVIDENCE.md + PERF_LEDGER.md",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/scripts/check_ledgers.py",
+    "docs/gauntlet/bundle/source_evidence/docs/DISCREPANCIES.md",
+    "docs/gauntlet/bundle/source_evidence/docs/NEGATIVE_EVIDENCE.md",
+    "docs/gauntlet/bundle/source_evidence/docs/PERF_LEDGER.md"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "hypothesis_ledgers",
+   "detail": "missing=['docs/gauntlet/GAUNTLET_EXPERIMENT_DESIGNS.md', 'docs/gauntlet/PERF_HYPOTHESIS_LEDGER.md', 'docs/gauntlet/CONFORMANCE_HYPOTHESIS_LEDGER.md', 'docs/gauntlet/SURFACE_PARITY_HYPOTHESIS_LEDGER.md']; unresolved=[]; entries=0",
+   "evidence": "docs/gauntlet/GAUNTLET_EXPERIMENT_DESIGNS.md, docs/gauntlet/PERF_HYPOTHESIS_LEDGER.md, docs/gauntlet/CONFORMANCE_HYPOTHESIS_LEDGER.md, docs/gauntlet/SURFACE_PARITY_HYPOTHESIS_LEDGER.md",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/claim_sources/GAUNTLET_EXPERIMENT_DESIGNS.md",
+    "docs/gauntlet/bundle/claim_sources/PERF_HYPOTHESIS_LEDGER.md",
+    "docs/gauntlet/bundle/claim_sources/CONFORMANCE_HYPOTHESIS_LEDGER.md",
+    "docs/gauntlet/bundle/claim_sources/SURFACE_PARITY_HYPOTHESIS_LEDGER.md"
+   ],
+   "status": "red"
+  },
+  {
+   "cell": "agent_ergonomics",
+   "detail": "median uplift +550 across 5 dimensions; heatmap debt filed (doctor fixtures, ocr-batch golden)",
+   "evidence": "docs/ergonomics/AUDIT.md + tests/agent_ergonomics_regression.rs (6 pinned changes; 11 landed)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/docs/ergonomics/AUDIT.md",
+    "docs/gauntlet/bundle/source_evidence/tests/agent_ergonomics_regression.rs"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "doctor",
+   "evidence": "src/doctor.rs + tests/doctor_fixtures.rs (8 fixture roundtrips: fix/undo byte-identical, dry-run zero-blast, lock, chokepoint code-search)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/source_evidence/src/doctor.rs",
+    "docs/gauntlet/bundle/source_evidence/tests/doctor_fixtures.rs"
+   ],
+   "status": "green"
+  },
+  {
+   "cell": "certification_bundle",
+   "detail": "certificate verdict is not certified; git worktree is dirty (110 status entries); certificate readiness is not an all-green ship decision; certificate convergence claim is incomplete or false; certificate observed required-pass values do not satisfy the strict constants; certificate has a nonzero or unknown high-severity counterexample count; a certified certificate must have no refusal reasons; selected bundle contains unmanifested evidence files: docs/gauntlet/bundle/benchmark_summary.json, docs/gauntlet/bundle/claim_sources/ROUNDS.jsonl, docs/gauntlet/bundle/scorecards.json, docs/gauntlet/bundle/source_evidence/.github/workflows/dist.yml, docs/gauntlet/bundle/source_evidence/benches/.bench-history/baseline.json, docs/gauntlet/bundle/source_evidence/docs/DISCREPANCIES.md, docs/gauntlet/bundle/source_evidence/docs/FEATURE_PARITY.md, docs/gauntlet/bundle/source_evidence/docs/NEGATIVE_EVIDENCE.md, docs/gauntlet/bundle/source_evidence/docs/PERF_LEDGER.md, docs/gauntlet/bundle/source_evidence/docs/ergonomics/AUDIT.md, docs/gauntlet/bundle/source_evidence/docs/gauntlet/EPROCESS_STATE.json, docs/gauntlet/bundle/source_evidence/docs/gauntlet/RELEASE_SCORECARD.json, docs/gauntlet/bundle/source_evidence/install.sh, docs/gauntlet/bundle/source_evidence/scripts/check_ledgers.py, docs/gauntlet/bundle/source_evidence/scripts/gauntlet_cert.py, docs/gauntlet/bundle/source_evidence/scripts/gauntlet_reference.py, docs/gauntlet/bundle/source_evidence/scripts/gauntlet_row.py, docs/gauntlet/bundle/source_evidence/src/doctor.rs, docs/gauntlet/bundle/source_evidence/tests/agent_ergonomics_regression.rs, docs/gauntlet/bundle/source_evidence/tests/cancel_and_panic_faults.rs, docs/gauntlet/bundle/source_evidence/tests/cli_robot_golden.rs, docs/gauntlet/bundle/source_evidence/tests/doctor_fixtures.rs, docs/gauntlet/bundle/source_evidence/tests/fixtures/ladder_scorecard/scorecard_armed.json, docs/gauntlet/bundle/source_evidence/tests/fixtures/robot_schema_v1.json, docs/gauntlet/bundle/source_evidence/tests/fixtures/runs_schema.json, docs/gauntlet/bundle/source_evidence/tests/many_pages_without_deadlock.rs, docs/gauntlet/bundle/source_evidence/tests/surface_matrix.rs; bundle root cannot be computed from the manifest; bundle manifest omits evidence class: confidence_gate (docs/gauntlet/bundle/confidence_gate.json); bundle manifest omits evidence class: verification_contract (docs/gauntlet/bundle/verification_contract.json); bundle manifest omits evidence class: ci_manifest (docs/gauntlet/bundle/ci_manifest.json); bundle manifest omits evidence class: benchmark_summary (docs/gauntlet/bundle/benchmark_summary.json); bundle manifest omits evidence class: scorecards (docs/gauntlet/bundle/scorecards.json); bundle manifest omits evidence class: critical_path_report (docs/gauntlet/bundle/critical_path_report.json); bundle manifest omits evidence class: ratchet_state (docs/gauntlet/bundle/ratchet_state.json); bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/benches/.bench-history/baseline.json; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/benches/.bench-history/baseline.json; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/docs/DISCREPANCIES.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/docs/DISCREPANCIES.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/docs/FEATURE_PARITY.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/docs/FEATURE_PARITY.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/docs/NEGATIVE_EVIDENCE.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/docs/NEGATIVE_EVIDENCE.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/docs/PERF_LEDGER.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/docs/PERF_LEDGER.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/claim_sources/CONFORMANCE_HYPOTHESIS_LEDGER.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/claim_sources/CONFORMANCE_HYPOTHESIS_LEDGER.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/docs/gauntlet/EPROCESS_STATE.json; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/docs/gauntlet/EPROCESS_STATE.json; bundle manifest omits signed claim source: docs/gauntlet/bundle/claim_sources/GAUNTLET_EXPERIMENT_DESIGNS.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/claim_sources/GAUNTLET_EXPERIMENT_DESIGNS.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/claim_sources/PERF_HYPOTHESIS_LEDGER.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/claim_sources/PERF_HYPOTHESIS_LEDGER.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/claim_sources/RELEASE_READINESS.json; signed claim source is outside the selected bundle: docs/gauntlet/bundle/claim_sources/RELEASE_READINESS.json; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/docs/gauntlet/RELEASE_SCORECARD.json; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/docs/gauntlet/RELEASE_SCORECARD.json; bundle manifest omits signed claim source: docs/gauntlet/bundle/claim_sources/ROUNDS.jsonl; signed claim source is outside the selected bundle: docs/gauntlet/bundle/claim_sources/ROUNDS.jsonl; bundle manifest omits signed claim source: docs/gauntlet/bundle/claim_sources/SURFACE_PARITY_HYPOTHESIS_LEDGER.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/claim_sources/SURFACE_PARITY_HYPOTHESIS_LEDGER.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/scripts/gauntlet_cert.py; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/scripts/gauntlet_cert.py; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/scripts/gauntlet_reference.py; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/scripts/gauntlet_reference.py; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/scripts/gauntlet_row.py; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/scripts/gauntlet_row.py; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/fixtures/ladder_scorecard/scorecard_armed.json; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/fixtures/ladder_scorecard/scorecard_armed.json; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/.github/workflows/dist.yml; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/.github/workflows/dist.yml; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/docs/ergonomics/AUDIT.md; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/docs/ergonomics/AUDIT.md; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/install.sh; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/install.sh; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/scripts/check_ledgers.py; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/scripts/check_ledgers.py; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/src/doctor.rs; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/src/doctor.rs; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/agent_ergonomics_regression.rs; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/agent_ergonomics_regression.rs; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/cancel_and_panic_faults.rs; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/cancel_and_panic_faults.rs; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/cli_robot_golden.rs; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/cli_robot_golden.rs; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/doctor_fixtures.rs; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/doctor_fixtures.rs; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/fixtures/robot_schema_v1.json; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/fixtures/robot_schema_v1.json; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/fixtures/runs_schema.json; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/fixtures/runs_schema.json; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/many_pages_without_deadlock.rs; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/many_pages_without_deadlock.rs; bundle manifest omits signed claim source: docs/gauntlet/bundle/source_evidence/tests/surface_matrix.rs; signed claim source is outside the selected bundle: docs/gauntlet/bundle/source_evidence/tests/surface_matrix.rs; release-readiness claim source is unreadable: [Errno 2] No such file or directory: '/Volumes/USBNVME16TB/temp_agent_space/tmp/focr-cert-evidence-snapshot-rskyy6fk/docs/gauntlet/bundle/claim_sources/RELEASE_READINESS.json'; release-readiness claim source is not a JSON object; round-history claim source is unreadable: [Errno 2] No such file or directory: '/Volumes/USBNVME16TB/temp_agent_space/tmp/focr-cert-evidence-snapshot-rskyy6fk/docs/gauntlet/bundle/claim_sources/ROUNDS.jsonl'; certificate convergence does not match hashed rounds and hypothesis ledgers; certificate must declare exactly three distinct signers; certificate must declare exactly three detached signatures; release trust artifact is missing: docs/gauntlet/TRUSTED_SIGNERS.json; release trust artifact is missing: docs/gauntlet/signing/trusted-release-keys.gpg; certificate signed claim cannot be canonicalized; fewer than three independent detached signatures verified; detached signatures do not cover the exact required roles; detached signatures do not cover three trusted fingerprints",
+   "evidence": "docs/gauntlet/bundle/release_certificate.json (bd-wp8.9)",
+   "evidence_paths": [],
+   "status": "red"
+  },
+  {
+   "cell": "gauntlet_convergence",
+   "detail": "rounds=11/10, tail_clean=True, hypotheses_resolved=False",
+   "evidence": "docs/gauntlet/ROUNDS.jsonl (bd-wp8.8)",
+   "evidence_paths": [
+    "docs/gauntlet/bundle/claim_sources/ROUNDS.jsonl",
+    "docs/gauntlet/bundle/claim_sources/GAUNTLET_EXPERIMENT_DESIGNS.md",
+    "docs/gauntlet/bundle/claim_sources/PERF_HYPOTHESIS_LEDGER.md",
+    "docs/gauntlet/bundle/claim_sources/CONFORMANCE_HYPOTHESIS_LEDGER.md",
+    "docs/gauntlet/bundle/claim_sources/SURFACE_PARITY_HYPOTHESIS_LEDGER.md"
+   ],
+   "status": "red"
+  }
+ ],
+ "generated_at_utc": "2026-07-10T04:13:11.822559Z",
+ "generated_by": "scripts/gauntlet_cert.py --release-readiness",
+ "green": 9,
+ "red": 5,
+ "schema_version": "gauntlet.release_readiness.v1",
+ "ship": false
+}

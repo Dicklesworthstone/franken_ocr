@@ -1,0 +1,4 @@
+[focr-timing]   got.vision+splice 5.54s
+[focr-timing]   decode 53 tok in 0.68s (77.9 tok/s) | seed(prefill 287 tok) 0.23s | layers 0.53s (attn 0.09s, gemv+misc 0.44s) | lm_head 0.15s
+[focr-timing]   got.generate 53 tokens 1.02s
+[focr-timing] got forward 6.58s

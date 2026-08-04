@@ -1,0 +1,61 @@
+[focr-timing] preprocess 0.08s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.60s
+[focr-timing]       sam.block attn(win) 0.102s
+[focr-timing]       sam.block mlp 0.237s
+[focr-timing]       sam.block attn(win) 0.096s
+[focr-timing]       sam.block mlp 0.254s
+[focr-timing]       sam.block attn(GLOBAL) 0.711s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(win) 0.109s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(win) 0.086s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(GLOBAL) 0.685s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.236s
+[focr-timing]       sam.block attn(GLOBAL) 0.696s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.237s
+[focr-timing]       sam.block attn(win) 0.087s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(GLOBAL) 0.696s
+[focr-timing]       sam.block mlp 0.238s
+[focr-timing]     sam.blocks 6.55s
+[focr-timing]   vision.sam 6.82s
+[focr-timing]     clip.hydrate(cached) 1.24s
+[focr-timing]     clip.blocks 0.79s
+[focr-timing]   vision.clip 2.04s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 9.47s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 2.66s
+[focr-timing] prefill 4.14s (277 tokens)
+[focr-timing] decode 24.54s (495 tokens, 0.050s/tok)
+[focr-timing] decode phases (ms): lm_head 7203  attn 6149  experts 10172  route 860
+	Command being timed: "/home/ubuntu/focr-perf-25cecb9-dense-20260712T2214Z/subject/release-perf/focr ocr /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png --model /home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq"
+	User time (seconds): 209.02
+	System time (seconds): 36.61
+	Percent of CPU this job got: 535%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:45.85
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 9886776
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 6202684
+	Voluntary context switches: 277893
+	Involuntary context switches: 3053
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 56
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

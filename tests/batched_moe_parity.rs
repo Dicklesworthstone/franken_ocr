@@ -11,9 +11,9 @@
 //! because the grouping only M-batches the GEMMs: every output row's per-key f32
 //! reduction order is fixed regardless of how many rows are stacked (the same
 //! M-independence the int8 spine proves in `batched_igemm_parity`, bd-1azu.2),
-//! and a token's 6 routed contributions are combined in ascending-expert-index
-//! order identically batched vs. standalone (bd-1waa). This file is the executing
-//! proof of that invariant.
+//! and a token's 6 routed contributions are restored to the pinned torch-2.10
+//! `topk(sorted=False)` slots and combined in that same order identically batched
+//! vs. standalone (bd-1waa). This file is the executing proof of that invariant.
 //!
 //! The oracle is the SAME tested `moe_block` the batched dispatch wraps, fed the
 //! SAME gate / 64 experts / shared expert and the SAME stacked rows — only the
@@ -156,8 +156,9 @@ fn batched_moe_block_matches_per_stream_moe_block() {
     }
 }
 
-/// The maximal grouped-GEMM case: an all-zero gate makes every stream's greedy
-/// top-6 exactly experts 0..5 (uniform softmax, ties break to the lower index),
+/// The maximal grouped-GEMM case: an all-zero gate makes every stream's pinned
+/// torch-2.10 CPU top-6 exactly experts 0..5 (the already-equivalent input range
+/// exits libc++'s partition without swaps),
 /// so experts 0..5 each group ALL B streams (`m = B`) into one `[B, hidden]`
 /// SwiGLU GEMM. Row `s` of that grouped GEMM MUST still byte-match the standalone
 /// `[1, hidden]` GEMM for stream `s` — the strongest M-independence assertion.
@@ -166,8 +167,8 @@ fn batched_moe_block_all_streams_same_experts_bit_exact() {
     let mut rng = Rng(0xd1b5_4a32_0c7e_91af);
     let (hidden, inter, shared_inter) = (8usize, 4usize, 6usize);
     let mut fx = Fixture::new(&mut rng, hidden, inter, shared_inter);
-    // Force a uniform router so the top-6 set is identical (experts 0..5) for
-    // every stream; the experts/shared stay random so outputs differ per stream.
+    // Force a uniform router so the pinned top-6 set is identical (experts 0..5)
+    // for every stream; experts/shared stay random so outputs differ per stream.
     fx.gate = vec![0.0f32; config::N_ROUTED_EXPERTS * hidden];
     let experts = fx.experts();
     let shared = fx.shared();

@@ -1,6 +1,6 @@
 [package]
 name = "franken_ocr"
-version = "0.0.0"
+version = "0.7.2"
 edition = "2024"
 license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 description = "Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model (single-binary CLI: focr)"
@@ -34,8 +34,17 @@ anyhow = "1"
 #
 # asupersync: orchestration/cancellation/IO only — the engine owns exactly one
 # Runtime below the sync public API (plan §3.3). default-features=false keeps the
-# surface minimal. Local /dp/asupersync = 0.3.5 satisfies ">=0.3.5,<0.4".
-asupersync = { version = ">=0.3.5, <0.4", default-features = false }
+# surface minimal. The sibling ../asupersync checkout at 0.3.8 satisfies
+# ">=0.3.5,<0.4".
+asupersync = { version = ">=0.3.5, <0.4", default-features = false, features = [
+    "tls-webpki-roots",
+] }
+# Ctrl+C -> cooperative shutdown (bd-223.2): the CLI installs the handler; the
+# library exposes request_shutdown() so embedders can drive it themselves.
+ctrlc = "3.4"
+# Physical-core count for the FOCR_THREADS budget (hyperthreads oversubscribe
+# the int8 GEMMs — plan §7.5; logical count stays a robot diagnostic only).
+num_cpus = "1.16"
 # FrankenTorch compute kernels for the in-process native OCR engine: int8 dynamic
 # linear (SDOT/VNNI), GEMM/sgemm, conv2d (im2col), sdpa, rms_norm, layer_norm.
 ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu" }
@@ -50,37 +59,66 @@ fsqlite = { path = "../frankensqlite/crates/fsqlite" }
 fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
 # Image decode/resize/normalize/pad/tile — the preprocess front end (plan §6.2).
 image = "0.25"
+# Native PDF page rasterization (src/pdf.rs): `focr ocr file.pdf` extracts each
+# page's image XObject and decodes it through the same pipeline a PNG takes — no
+# out-of-band poppler/pdftoppm. `lopdf` is the container/xref/object/stream parser
+# (pure Rust, no FFI); we write the image-codec dispatch ourselves. default-features
+# are off to drop the date/serde/tokio surface (chrono/jiff/time/rayon) the
+# scanned-image path never touches; the mandatory parser+crypto core stays.
+lopdf = { version = "0.43", default-features = false }
+# Pure-Rust CCITT Group 4 (T.6) fax decoder for bilevel scanned PDFs (the common
+# black-and-white scan filter). Already in the lock graph; no FFI.
+fax = "0.2"
+# Bounded zlib inflate for the sole-FlateDecode image path (src/pdf.rs): lopdf's
+# `Stream::decompressed_content` materializes the FULL inflated output before any
+# length check, so a tiny "zip bomb" stream (KBs inflating to GBs) is an OOM/DoS
+# vector. For a sole FlateDecode with no predictor we inflate it ourselves under an
+# explicit cap and reject overruns. Already in the lock graph (via lopdf/png/tiff);
+# declaring it a direct dep unifies on the same 1.x — no new crate, no FFI
+# (pure-Rust miniz_oxide backend).
+flate2 = "1"
 # Data-parallel fan-out for the bespoke single-token (m=1) decode GEMV kernels
 # (src/native_engine/decoder.rs `gemv`): the prefill GEMM is already threaded in
 # ft-kernel-cpu, but the decode GEMV falls below its threading threshold and was
 # running single-threaded. Already in the lock graph via ft-kernel-cpu.
 rayon = "1"
+# Provenance hashing for `focr convert`: the deterministic sha256 of the source
+# safetensors shard, stamped into the `.focrq` header (`source_sha256`) so a
+# converted artifact is traceable to its bf16 origin. Pure-Rust RustCrypto, no
+# framework. Used by lib code (src/quant/convert.rs) — must be a normal dependency,
+# not dev-only, or the lib fails to build outside the test profile.
+sha2 = "0.10"
+# RunStore run ids (bd-223.4).
+uuid = { version = "1", features = ["v4"] }
 
 # Currently-unwired opt-in: declaring the feature makes `#[cfg(feature =
 # "mimalloc")]` in benches/support/perf_harness.rs a KNOWN cfg (no unexpected-cfg
 # warning). Empty on purpose — no dependency is pulled in until the allocator is
 # actually wired behind `--features mimalloc`.
+# Opt-in read-only weight mmap (bd-2mo.22): `FOCR_MMAP=1` lets deployments with
+# trusted immutable artifact inodes page multi-GB blobs lazily. Owned bytes are
+# the safe default; the single unsafe map call lives in weights.rs's audited
+# island.
+memmap2 = "0.9"
+
+[dev-dependencies]
+# Property-based test plumbing (bd-10sb.1): generator-driven invariants for
+# the SIMD==scalar / i32-overflow / preprocess-geometry / parser-robustness
+# properties in tests/property_suite.rs. Dev-only — the shipping binary's
+# dependency block is unchanged.
+proptest = "1"
+
 [features]
 mimalloc = []
 
-[dev-dependencies]
-sha2 = "0.10"
-
-# The `>=0.3.5,<0.4` asupersync the engine needs is not yet on crates.io (the
-# index tops out at 0.3.4); it lives as the local sibling crate `/dp/asupersync`
-# (version 0.3.5). Patch crates-io to that path so the whole dependency graph —
+# The current asupersync 0.3.8 build input is not yet on crates.io (the index
+# tops out at 0.3.6); it lives in the sibling `../asupersync` checkout.
+# Patch crates-io to that path so the whole dependency graph —
 # franken_ocr's direct dep AND the fsqlite/frankentorch path-deps that pin
-# `0.3.4` — unifies on the single local 0.3.5 (which satisfies both ^0.3.4 and
+# `0.3.4` — unifies on the single local 0.3.8 (which satisfies both ^0.3.4 and
 # >=0.3.5,<0.4). One asupersync in the tree; no version skew.
-#
-# The path is spelled `/dp/asupersync` (not the `../asupersync` symlink) to match
-# fsqlite's direct path-dep spelling byte-for-byte. `[patch.crates-io]` only
-# rewrites the crates.io deps; fsqlite path-deps `/dp/asupersync` directly, so the
-# patch must use the IDENTICAL string or cargo records two distinct packages
-# (`.../projects/asupersync` vs `/dp/asupersync`) and aborts re-resolution with a
-# "package collision in the lockfile" error even though both symlink to one dir.
 [patch.crates-io]
-asupersync = { path = "/dp/asupersync" }
+asupersync = { path = "../asupersync" }
 
 [lints.rust]
 unsafe_code = "deny"
@@ -102,3 +140,13 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Dev/test builds: keep OUR crate at opt-level 0 (fast rebuilds, full debug),
+# but compile the kernel backend optimized — an unoptimized ft-kernel-cpu makes
+# every real-geometry vision/decoder unit test ~50x slower (a single synthetic
+# SigLIP forward took ~87s at opt0 vs ~2s at opt3). debug_assertions stay ON
+# (the dev profile flag, independent of opt-level), and opt-level changes no
+# IEEE semantics — no numerics drift vs release.
+[profile.dev.package.ft-kernel-cpu]
+opt-level = 3
+debug-assertions = false

@@ -1,0 +1,17 @@
+{
+  "pages": [
+    "page_0009.png",
+    "page_0014.png"
+  ],
+  "prompt": "<image>Multi page parsing.",
+  "image_size": 640,
+  "no_repeat_ngram_size": 35,
+  "ngram_window": 1024,
+  "max_length": 32768,
+  "chars": 257,
+  "output_tokens": 103,
+  "page_markers": 1,
+  "sha256": "6fad1a5e0dbb22257f95c805c8ee0e053f9bc8a014737d10bcec8615e72ee54d",
+  "seconds": 23.28,
+  "raw": "multi_raw.md"
+}

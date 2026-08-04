@@ -1,0 +1,52 @@
+[package]
+name = "franken_ocr-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.franken_ocr]
+path = ".."
+
+# Mirror the parent's asupersync unification (see the root Cargo.toml): the
+# fuzz crate resolves franken_ocr's whole graph itself, so the same
+# crates-io patch must apply here. This manifest is one directory below the
+# repository root, so the shared sibling checkout is `../../asupersync`.
+[patch.crates-io]
+asupersync = { path = "../../asupersync" }
+
+# focrq_parse lives in the init stub's file name (fuzz_target_1.rs) — RULE 1
+# (no file deletion without permission) keeps the generated path; the BIN name
+# is the meaningful one.
+[[bin]]
+name = "focrq_parse"
+path = "fuzz_targets/fuzz_target_1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "safetensors_parse"
+path = "fuzz_targets/safetensors_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "image_decode"
+path = "fuzz_targets/image_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pretok_split"
+path = "fuzz_targets/pretok_split.rs"
+test = false
+doc = false
+bench = false

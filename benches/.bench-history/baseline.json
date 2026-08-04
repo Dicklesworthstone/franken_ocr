@@ -1,0 +1,89 @@
+{
+ "note": "frozen baseline \u2014 moves ONLY via --ratchet under review, never in CI",
+ "regime": "tromr_staff",
+ "schema": "focr-bench-baseline/v1",
+ "source": "artifacts/perf/bd-2sez/claim/focr_stages.json",
+ "stages": {
+  "decode_per_token": {
+   "allocator": "system",
+   "backend": "focr",
+   "best_ms": 34.558824,
+   "cv_pct": 1.419,
+   "ledger_stage": true,
+   "mean_ms": 35.147059,
+   "n": 5,
+   "occurrences": 1,
+   "p50_ms": 35.147059,
+   "precision": "f32",
+   "samples_ms": [
+    35.147059,
+    35.294118,
+    34.558824,
+    35.882353,
+    34.852941
+   ],
+   "schema": "focr-gauntlet-stage/v1",
+   "source": "focr",
+   "stage": "decode_per_token",
+   "synthetic": false,
+   "threads": 8,
+   "tokens": 68,
+   "tokens_consistent": true,
+   "unit": "ms",
+   "warmup_discarded": 1
+  },
+  "end_to_end": {
+   "allocator": "system",
+   "backend": "focr",
+   "best_ms": 2586.465,
+   "cv_pct": 1.656,
+   "ledger_stage": true,
+   "mean_ms": 2634.8362,
+   "n": 5,
+   "note": "process wall clock: includes binary startup + model load + weight-cache build",
+   "occurrences": 1,
+   "p50_ms": 2629.139,
+   "precision": "f32",
+   "samples_ms": [
+    2629.139,
+    2657.039,
+    2586.465,
+    2696.845,
+    2604.693
+   ],
+   "schema": "focr-gauntlet-stage/v1",
+   "source": "focr",
+   "stage": "end_to_end",
+   "synthetic": false,
+   "threads": 8,
+   "unit": "ms",
+   "warmup_discarded": 1
+  },
+  "vision_encode": {
+   "allocator": "system",
+   "backend": "focr",
+   "best_ms": 200.0,
+   "cv_pct": 4.342,
+   "ledger_stage": true,
+   "mean_ms": 206.0,
+   "n": 5,
+   "occurrences": 1,
+   "p50_ms": 200.0,
+   "precision": "f32",
+   "samples_ms": [
+    200.0,
+    220.0,
+    200.0,
+    210.0,
+    200.0
+   ],
+   "schema": "focr-gauntlet-stage/v1",
+   "source": "focr",
+   "stage": "vision_encode",
+   "synthetic": false,
+   "threads": 8,
+   "unit": "ms",
+   "warmup_discarded": 1
+  }
+ }
+}

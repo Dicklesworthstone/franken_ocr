@@ -1,0 +1,23 @@
+{
+  "attribution_only": true,
+  "decode_wall_s": 13.25,
+  "instrumented_coverage_pct": 99.268,
+  "instrumented_phase_share_pct": {
+    "attention": 35.634,
+    "experts": 21.143,
+    "lm_head": 39.74,
+    "route": 3.482
+  },
+  "instrumented_phase_sum_s": 13.153,
+  "phase_seconds": {
+    "attention": 4.687,
+    "experts": 2.781,
+    "lm_head": 5.227,
+    "route": 0.458
+  },
+  "precision": "focr-mixed-ffn-int8",
+  "publishable_timing": false,
+  "quiet_host_gate": "not_claimed",
+  "schema": "focr-attribution-only/v1",
+  "tokens": 495
+}

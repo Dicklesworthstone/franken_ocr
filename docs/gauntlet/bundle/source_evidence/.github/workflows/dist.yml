@@ -1,0 +1,324 @@
+# franken_ocr: cross-architecture release distribution (the `focr` binary).
+#
+# Builds the optimized `focr` binary for every target arch in the mission
+# (AGENTS.md "Project Mission" + Toolchain), one artifact per (target, feature)
+# variant. CPU is the priority; these variants enable the int8-matmul paths the
+# whole project is built around:
+#
+#   Apple Silicon / ARM64 (aarch64-apple-darwin)
+#     NEON (baseline on Apple Silicon) + FEAT_DotProd (SDOT) + FEAT_MATMUL_INT8
+#     (SMMLA / i8mm). The stdarch dotprod/i8mm intrinsics are NIGHTLY-only; this
+#     is one reason the toolchain is pinned to nightly (Toolchain note). Apple M-
+#     series ship dotprod+i8mm, so we target-cpu=apple-m1 to light them up.
+#
+#   Intel / AMD x86-64 (x86_64-unknown-linux-gnu), THREE feature variants, since
+#   the int8 GEMM kernel dispatches on the widest VNNI available at runtime but we
+#   want a build that can be -C target-feature compiled for each tier:
+#     • avx2: AVX2 baseline (no VNNI; SDOT-equivalent emulated). Widest
+#                     portability floor for older/cloud hosts.
+#     • avx-vnni: AVX-VNNI (VPDPBUSD on 256-bit, Alder Lake+ / Zen4+). The
+#                     mainstream int8 dot-product path.
+#     • avx512-vnni: AVX-512-VNNI (512-bit VPDPBUSD, server Ice Lake+/Zen4+).
+#                     Highest-throughput int8 accumulation tier.
+#
+#   Phase-0 CI tracked linux arm64, darwin x86-64, and windows-msvc x86-64 as
+#   advisory targets; this workflow now ships real artifacts for all of them. The
+#   Unix/macOS variants build in the `dist` job below and native Windows builds in
+#   the `dist-windows` job. Because hosted macOS has a read-only root filesystem,
+#   the workflow rewrites the CI-only `/dp/asupersync` paths in this checkout and
+#   the cloned `frankensqlite` root to the sibling `../asupersync` checkout; the
+#   identical rewrite (already written in PowerShell) also runs on Windows.
+#
+# Branch policy (AGENTS.md): release builds run on `main` ONLY. `master` is never
+# referenced. Tag pushes (v*) cut a versioned set of artifacts.
+#
+# This workflow BUILDS and uploads artifacts; it does not publish a GitHub Release
+# (that is a separate, gated step). Nightly is selected via `rust-toolchain.toml`.
+
+name: dist
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  # Allow a manual cross-arch build from the Actions tab (main only).
+  workflow_dispatch:
+
+concurrency:
+  group: dist-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  dist:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Apple Silicon / ARM64 ──────────────────────────────────────────
+          # NEON+SDOT+SMMLA via target-cpu=apple-m1 (dotprod + i8mm). Built on a
+          # native arm64 macOS runner (macos-15), so no cross-linking needed.
+          - name: aarch64-apple-darwin (neon+sdot+i8mm)
+            os: macos-15
+            target: aarch64-apple-darwin
+            rustflags: "-C target-cpu=apple-m1"
+
+          # ── Intel macOS / x86-64 portability build ─────────────────────────
+          - name: x86_64-apple-darwin (baseline)
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            rustflags: ""
+
+          # ── Linux ARM64 / baseline AArch64 build ───────────────────────────
+          - name: aarch64-linux (baseline)
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            rustflags: ""
+
+          # ── x86-64 / AVX2 baseline ─────────────────────────────────────────
+          # Portability floor: AVX2 + FMA, no VNNI. Runs on the broadest set of
+          # x86 hosts (incl. older cloud instances).
+          - name: x86_64-linux (avx2)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rustflags: "-C target-feature=+avx2,+fma"
+
+          # ── x86-64 / AVX-VNNI ──────────────────────────────────────────────
+          # 256-bit VPDPBUSD int8 dot product (Alder Lake+ / Zen4+). The
+          # mainstream int8 path. avxvnni implies avx2; name fma explicitly.
+          - name: x86_64-linux (avx-vnni)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rustflags: "-C target-feature=+avx2,+fma,+avxvnni"
+
+          # ── x86-64 / AVX-512-VNNI ──────────────────────────────────────────
+          # 512-bit VPDPBUSD (server Ice Lake+ / Zen4+). Highest int8 throughput
+          # tier. avx512vnni pulls in avx512f/bw/dq; list them so the binary's
+          # required-feature set is explicit and auditable.
+          - name: x86_64-linux (avx512-vnni)
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            rustflags: "-C target-feature=+avx2,+fma,+avx512f,+avx512bw,+avx512dq,+avx512vnni"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision sibling path dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
+
+          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
+            $text = Get-Content -Raw -Path $cargoToml
+            $needle = 'path = "/dp/asupersync"'
+            if (-not $text.Contains($needle)) {
+              if ($required) {
+                throw "expected $cargoToml to contain $needle before CI path rewrite"
+              }
+              # frankensqlite migrated to a crates.io asupersync dep
+              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
+              # root [patch.crates-io] (rewritten above) unifies its graph.
+              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
+              return
+            }
+            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+          }
+          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
+          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
+
+      # Honor the pinned nightly from `rust-toolchain.toml` (REQUIRED for the
+      # stdarch i8mm/dotprod intrinsics). Add the explicit compile target.
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Cache keyed per variant so feature-divergent artifacts never collide.
+          key: ${{ matrix.target }}-${{ matrix.rustflags }}
+
+      # Release build of ONLY the `focr` binary for this target+feature variant.
+      # RUSTFLAGS carries the arch-feature rationale documented in the matrix.
+      - name: Build focr (release)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --bin focr --target ${{ matrix.target }}
+
+      # Stage the binary under a per-variant name so artifacts are unambiguous.
+      # The variant tag (everything after the first space in matrix.name, minus
+      # parens) distinguishes same-target x86 feature builds.
+      - name: Stage artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          variant="$(echo '${{ matrix.name }}' | sed -E 's/[^(]*\(([^)]*)\)/\1/; s/[^a-zA-Z0-9._-]+/-/g')"
+          out="focr-${{ matrix.target }}-${variant}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/focr" "dist/${out}"
+          ( cd dist && shasum -a 256 "${out}" > "${out}.sha256" )
+          ls -l dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: focr-${{ matrix.target }}-${{ strategy.job-index }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── Native Windows (MSVC): x86-64 + arm64 ────────────────────────────────────
+  # Both Windows targets build natively on their own hosted runners: no
+  # cargo-xwin, no cross-linking — and the smoke step below needs a native host
+  # anyway, because x64 Windows cannot emulate arm64, so a cross-on-x64 arm64
+  # build could never be executed where it was built. windows-latest ships MSVC
+  # and nasm, so ring compiles its x86 assembly directly; windows-11-arm (the
+  # hosted arm64 label, available to public repos) carries the arm64 MSVC
+  # toolchain + LLVM for ring's aarch64 path. The whole stack (asupersync IOCP
+  # reactor, frankentorch, frankensqlite, focr) compiles clean for
+  # x86_64-pc-windows-msvc and the resulting focr.exe runs on real Windows 10
+  # with runtime ISA detection (the avx2 tier is selected); the arm64 row rides
+  # the same fail-fast:false matrix while bd-3u97 proves that stack end-to-end.
+  # Both rows reuse the SAME pinned nightly and the SAME sibling path-dep
+  # provisioning as the `dist` job above (the provisioning step is already
+  # PowerShell, so it runs unchanged here). Only staging differs: the artifact
+  # is a raw .exe and the checksum is produced with Get-FileHash instead of
+  # shasum.
+  dist-windows:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x86-64 is the required Windows release target (proven on Windows 10).
+          - name: x86_64-pc-windows-msvc (baseline)
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            rustflags: ""
+
+          # arm64 Windows (Snapdragon/Surface-class hosts, and Windows VMs on
+          # Apple Silicon). Baseline rustflags like the aarch64-linux row in the
+          # `dist` job: runtime dispatch selects SDOT/SMMLA (i8mm) when the
+          # silicon has it, so no target-cpu pinning is needed (bd-1aj1).
+          - name: aarch64-pc-windows-msvc (baseline)
+            os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            rustflags: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Identical to the `dist` job: clone the three path-dep siblings and rewrite
+      # the CI-only `/dp/asupersync` paths to `../asupersync`. On Windows the
+      # checkout lives at e.g. D:\a\franken_ocr\franken_ocr, so the siblings land
+      # next to it and the `../{frankentorch,frankensqlite,asupersync}` path deps
+      # resolve exactly as they do on Unix.
+      - name: Provision sibling path dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $parent = Split-Path -Parent $env:GITHUB_WORKSPACE
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankentorch.git (Join-Path $parent "frankentorch")
+          git clone --depth 1 https://github.com/Dicklesworthstone/frankensqlite.git (Join-Path $parent "frankensqlite")
+          git clone --depth 1 https://github.com/Dicklesworthstone/asupersync.git (Join-Path $parent "asupersync")
+
+          function Rewrite-AsupersyncPath([string] $cargoToml, [bool] $required) {
+            $text = Get-Content -Raw -Path $cargoToml
+            $needle = 'path = "/dp/asupersync"'
+            if (-not $text.Contains($needle)) {
+              if ($required) {
+                throw "expected $cargoToml to contain $needle before CI path rewrite"
+              }
+              # frankensqlite migrated to a crates.io asupersync dep
+              # (asupersync = "0.3.5", no path) — nothing to rewrite; the
+              # root [patch.crates-io] (rewritten above) unifies its graph.
+              Write-Host "skip: $cargoToml has no /dp/asupersync path dep (crates.io dep; patch covers it)"
+              return
+            }
+            [System.IO.File]::WriteAllText($cargoToml, $text.Replace($needle, 'path = "../asupersync"'))
+          }
+          Rewrite-AsupersyncPath (Join-Path $env:GITHUB_WORKSPACE "Cargo.toml") $true
+          Rewrite-AsupersyncPath (Join-Path (Join-Path $parent "frankensqlite") "Cargo.toml") $false
+
+      # Same pinned nightly as the Unix/macOS jobs (REQUIRED for the stdarch
+      # int8 intrinsics), plus the explicit MSVC compile target.
+      - name: Install pinned nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct target keeps this cache from colliding with the Unix jobs.
+          key: ${{ matrix.target }}-${{ matrix.rustflags }}
+
+      # Native release build of ONLY the `focr` binary. No cargo-xwin: this is a
+      # first-class MSVC host build.
+      - name: Build focr (release)
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        run: cargo build --release --bin focr --target ${{ matrix.target }}
+
+      # No-weights smoke (bd-wp8.5 contract; scripts/e2e_smoke.sh is the shell
+      # analogue): the freshly built binary must RUN on this host, not just
+      # link, before it is staged. `--version` and every read-only robot
+      # surface must exit 0, and each robot payload must be one parseable JSON
+      # object on stdout (src/cli.rs `emit`: data-only stdout, one object/line).
+      # Runs pre-staging so a broken binary never becomes an artifact. Both
+      # matrix rows execute this natively — the arm64 row is why this job uses
+      # windows-11-arm rather than cross-compiling on x64.
+      - name: Smoke test focr (no weights)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $exe = "target/${{ matrix.target }}/release/focr.exe"
+          & $exe --version | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "focr --version exited $LASTEXITCODE" }
+          foreach ($cmd in @("schema", "health", "backends")) {
+            $lines = @(& $exe robot $cmd)
+            if ($LASTEXITCODE -ne 0) { throw "focr robot $cmd exited $LASTEXITCODE" }
+            $null = ($lines -join "`n") | ConvertFrom-Json
+            Write-Host "smoke ok: robot $cmd (exit 0, valid JSON)"
+          }
+
+      # The Windows artifact is a raw focr.exe (not a zip). Stage it under the
+      # canonical per-target name `focr-<target>.exe` and emit a "<hex>  <name>"
+      # sidecar that matches the shasum/sha256sum format used by the Unix jobs:
+      # lowercase hex, two spaces, basename only, trailing newline. Get-FileHash
+      # returns uppercase hex, so lower it.
+      - name: Stage artifact
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $target = "${{ matrix.target }}"
+          $asset = "focr-$target.exe"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/$target/release/focr.exe" (Join-Path "dist" $asset)
+          $hash = (Get-FileHash -Algorithm SHA256 -Path (Join-Path "dist" $asset)).Hash.ToLower()
+          $line = "$hash  ${asset}`n"
+          [System.IO.File]::WriteAllText((Join-Path (Resolve-Path "dist") "${asset}.sha256"), $line)
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: focr-${{ matrix.target }}-${{ strategy.job-index }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14

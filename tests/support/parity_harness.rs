@@ -517,7 +517,10 @@ impl FixtureLoader {
                 && path
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.ends_with("_reference.json"))
+                    // Hidden files are never goldens — macOS writes AppleDouble
+                    // sidecars ("._<doc>_reference.json", not JSON) next to every
+                    // file on external volumes, where the off-repo fixtures live.
+                    .is_some_and(|n| n.ends_with("_reference.json") && !n.starts_with('.'))
             {
                 out.push(path);
             }
@@ -767,8 +770,8 @@ pub fn read_npy_f32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<f32>), String> {
         ));
     }
     let mut data = Vec::with_capacity(numel);
-    for chunk in data_bytes[..numel * 4].chunks_exact(4) {
-        data.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    for chunk in data_bytes[..numel * 4].as_chunks::<4>().0 {
+        data.push(f32::from_le_bytes(*chunk));
     }
     Ok((shape, data))
 }
@@ -796,7 +799,10 @@ fn parse_npy_shape(header: &str) -> Result<Vec<usize>, String> {
     Ok(dims)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase-hex SHA-256 of `bytes` — shared with the ladder rungs (L5 verifies
+/// the golden `decoded_text` hashes to its own recorded `decoded_text_sha256`
+/// before letting it set the bar).
+pub fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(64);
     for b in digest {
@@ -1263,6 +1269,78 @@ pub fn validate_event(schema: &Value, event: &Value) -> Result<(), String> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 8b. The shared determinism gate (bd-3kge) — ONE helper, used everywhere.
+//
+// G5/§7.3: our engine MUST be byte-deterministic under greedy (temperature 0).
+// This is DISTINCT from the ORACLE's bf16 nondeterminism (§8.2, measured via
+// `establish_floor`): a divergence here is a REAL BUG in our engine, never
+// test noise — no tolerance may paper over it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Run `run` `n` times (n ≥ 2) and assert every output is BYTE-IDENTICAL to
+/// the first. The closure receives the attempt index (callers that vary
+/// thread counts do so via subprocess env — `FOCR_THREADS` latches once per
+/// process — and can instead collect outputs themselves and call
+/// [`assert_outputs_deterministic`]).
+///
+/// Emits one structured `parity`/`token_exact` TestLog line per comparison
+/// (`value` = `"identical"` or the first-divergence byte offset).
+///
+/// # Panics
+/// On any byte divergence — with the attempt index, the first-divergence
+/// offset, and both lengths.
+pub fn assert_deterministic<F>(test: &str, case: &str, n: usize, mut run: F)
+where
+    F: FnMut(usize) -> Vec<u8>,
+{
+    assert!(n >= 2, "determinism needs at least two runs");
+    let reference = run(0);
+    for attempt in 1..n {
+        let output = run(attempt);
+        assert_outputs_deterministic(test, case, attempt, &reference, &output);
+    }
+}
+
+/// The comparison half of [`assert_deterministic`], for callers that collect
+/// outputs out-of-process (e.g. the same CLI invocation at two
+/// `FOCR_THREADS` settings): assert `output` is byte-identical to
+/// `reference`, logging the structured parity line.
+///
+/// # Panics
+/// On divergence, with the first-divergence offset and both lengths.
+pub fn assert_outputs_deterministic(
+    test: &str,
+    case: &str,
+    attempt: usize,
+    reference: &[u8],
+    output: &[u8],
+) {
+    let divergence = reference
+        .iter()
+        .zip(output.iter())
+        .position(|(a, b)| a != b)
+        .or_else(|| (reference.len() != output.len()).then(|| reference.len().min(output.len())));
+    let value = divergence.map_or_else(|| "identical".to_owned(), |off| off.to_string());
+    eprintln!(
+        "{{\"schema_version\":1,\"test\":\"{test}\",\"case\":\"{case}\",\"event\":\"parity\",\
+         \"metric\":\"token_exact\",\"attempt\":{attempt},\"value\":\"{value}\",\
+         \"result\":\"{}\"}}",
+        if divergence.is_none() { "pass" } else { "fail" }
+    );
+    if let Some(off) = divergence {
+        assert_eq!(
+            reference,
+            output,
+            "DETERMINISM VIOLATION ({test}/{case}): attempt {attempt} diverges from the \
+             reference at byte {off} (lens {} vs {}) — a real engine bug under greedy, \
+             never test noise",
+            reference.len(),
+            output.len()
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 9. Inline unit tests — the comparator MATH, on SYNTHETIC vectors only.
 //    These run with no weights and no fixtures (the task contract: "the
 //    comparator MATH is unit-tested inline with synthetic vectors").
@@ -1271,6 +1349,35 @@ pub fn validate_event(schema: &Value, event: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// bd-3kge acceptance: a deterministic closure passes; an INJECTED
+    /// nondeterministic source (RandomState-hashed iteration order leaking
+    /// into the output) FAILS the gate.
+    #[test]
+    fn determinism_gate_passes_stable_and_fails_injected() {
+        assert_deterministic("harness_self", "stable", 3, |attempt| {
+            let _ = attempt; // deliberately attempt-independent output
+            b"page text, attempt-independent (7 inputs)".to_vec()
+        });
+
+        let injected = std::panic::catch_unwind(|| {
+            assert_deterministic("harness_self", "injected", 2, |_| {
+                // HashMap iteration order depends on RandomState per map —
+                // exactly the class of bug the gate exists to catch.
+                let map: std::collections::HashMap<String, u32> =
+                    (0..64).map(|i| (format!("k{i}"), i)).collect();
+                map.keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(",")
+                    .into_bytes()
+            });
+        });
+        assert!(
+            injected.is_err(),
+            "the gate must FAIL on hash-order nondeterminism"
+        );
+    }
 
     #[test]
     fn cosine_identical_is_one() {
@@ -1498,6 +1605,53 @@ mod tests {
     }
 
     #[test]
+    fn golden_carries_bd3s7v_seam_inputs_and_token_stream() {
+        // The extended oracle dump (bd-3s7v) adds two seam-INPUT activations
+        // (sam_input, inputs_embeds) and a `token_stream` block to the golden.
+        // The loader must expose the inputs through the same manifest path the
+        // output seams use, and the token stream through `raw` (L4 reads it).
+        let raw = json!({
+            "doc": "page_0009.png",
+            "decoded_text": "<|det|>",
+            "decoded_text_sha256": "deadbeef",
+            "activations": {
+                "sam_input": { "file": "sam_input.npy", "shape": [1, 3, 1024, 1024],
+                               "dtype": "float32", "sha256": "aa",
+                               "file_sha256": "cc".repeat(32) },
+                "inputs_embeds": { "file": "inputs_embeds.npy", "shape": [1, 277, 1280],
+                                   "dtype": "float32", "sha256": "bb",
+                                   "file_sha256": "dd".repeat(32) }
+            },
+            "token_stream": {
+                "schema_version": 1,
+                "prompt_ids": [0, 128815, 128815, 1],
+                "n_prompt": 4,
+                "generated_ids": [128818, 1],
+                "n_generated": 2
+            },
+            "provenance": {
+                "hf_commit": HF_COMMIT,
+                "pinned_torch": PIN_TORCH,
+                "pinned_transformers": PIN_TRANSFORMERS
+            }
+        });
+        let g = FixtureLoader::golden_from_value(raw).expect("parse golden");
+        assert_eq!(g.activations["sam_input"].shape, vec![1, 3, 1024, 1024]);
+        assert_eq!(g.activations["inputs_embeds"].shape, vec![1, 277, 1280]);
+        assert!(
+            FixtureLoader::check_provenance(&g).is_ok(),
+            "pinned provenance resolves"
+        );
+        let stream = &g.raw["token_stream"];
+        assert_eq!(stream["n_generated"], json!(2));
+        assert_eq!(
+            stream["generated_ids"].as_array().map(Vec::len),
+            Some(2),
+            "generated token-id stream is reachable through raw (the L4 bar)"
+        );
+    }
+
+    #[test]
     fn golden_from_value_rejects_malformed_activation_shape() {
         let non_integer_dim = json!({
             "doc": "doc01.png",
@@ -1642,6 +1796,37 @@ mod tests {
         let loader = FixtureLoader::at("/nonexistent/franken_ocr/fixtures");
         assert!(!loader.any_present(), "absent root ⇒ no goldens present");
         assert!(loader.list_goldens().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fixture_loader_skips_hidden_sidecar_goldens() {
+        // macOS writes AppleDouble sidecars ("._<doc>_reference.json", not JSON)
+        // next to every file on external volumes — exactly where the off-repo
+        // oracle fixtures live. The loader must never treat one as a golden (it
+        // would surface as a FixtureParse error and fail a rung spuriously).
+        let root = std::env::temp_dir().join("franken_ocr_hidden_golden_test");
+        fs::create_dir_all(&root).expect("create fixture test root");
+        fs::write(
+            root.join("doc01_reference.json"),
+            b"{\"doc\":\"doc01.png\"}",
+        )
+        .expect("write golden");
+        fs::write(
+            root.join("._doc01_reference.json"),
+            b"\x00\x05\x16\x07not json",
+        )
+        .expect("write sidecar");
+        let loader = FixtureLoader::at(&root);
+        let goldens = loader.list_goldens().expect("list goldens");
+        assert_eq!(
+            goldens.len(),
+            1,
+            "only the real golden is listed, got {goldens:?}"
+        );
+        assert!(
+            goldens[0].file_name().and_then(|n| n.to_str()) == Some("doc01_reference.json"),
+            "the visible golden survives"
+        );
     }
 
     #[test]

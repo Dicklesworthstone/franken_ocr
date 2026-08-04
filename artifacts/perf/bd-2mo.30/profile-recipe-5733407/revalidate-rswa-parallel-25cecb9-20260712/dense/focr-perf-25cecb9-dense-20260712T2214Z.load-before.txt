@@ -1,0 +1,6 @@
+label=dense-before
+utc=2026-07-12T22:14:13Z
+host=sensedemobox
+uname=Linux sensedemobox 6.17.0-35-generic #35-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 13:10:28 UTC 2026 x86_64 GNU/Linux
+proc_loadavg=0.44 1.85 2.63 1/1834 2907354
+tokenizer_sha256=a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4

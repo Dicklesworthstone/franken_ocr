@@ -1,3 +1,7 @@
 # UBS ignore list: test-only helpers use panic/unwrap/serde expect for assertions.
 # These are safe in tests and cause UBS false positives. Add test files here as
 # the suite grows (e.g. tests/robot_contract_tests.rs, tests/conformance_*.rs).
+artifacts/**
+docs/gauntlet/bundle/source_evidence/**
+target*/**
+tests/**

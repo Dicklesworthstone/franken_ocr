@@ -1,0 +1,41 @@
+[focr-timing] preprocess 0.02s
+[focr-timing]     sam.hydrate 0.11s
+[focr-timing]       sam.block attn(win) 0.073s
+[focr-timing]       sam.block mlp 0.123s
+[focr-timing]       sam.block attn(win) 0.076s
+[focr-timing]       sam.block mlp 0.126s
+[focr-timing]       sam.block attn(GLOBAL) 0.302s
+[focr-timing]       sam.block mlp 0.129s
+[focr-timing]       sam.block attn(win) 0.077s
+[focr-timing]       sam.block mlp 0.125s
+[focr-timing]       sam.block attn(win) 0.071s
+[focr-timing]       sam.block mlp 0.126s
+[focr-timing]       sam.block attn(GLOBAL) 0.296s
+[focr-timing]       sam.block mlp 0.127s
+[focr-timing]       sam.block attn(win) 0.075s
+[focr-timing]       sam.block mlp 0.131s
+[focr-timing]       sam.block attn(win) 0.074s
+[focr-timing]       sam.block mlp 0.133s
+[focr-timing]       sam.block attn(GLOBAL) 0.295s
+[focr-timing]       sam.block mlp 0.129s
+[focr-timing]       sam.block attn(win) 0.074s
+[focr-timing]       sam.block mlp 0.126s
+[focr-timing]       sam.block attn(win) 0.084s
+[focr-timing]       sam.block mlp 0.129s
+[focr-timing]       sam.block attn(GLOBAL) 0.303s
+[focr-timing]       sam.block mlp 0.124s
+[focr-timing]     sam.blocks 3.37s
+[focr-timing]     sam.forward 3.44s
+[focr-timing]   vision.sam 3.56s
+[focr-timing]     clip.hydrate(cached) 0.40s
+[focr-timing]     clip.blocks 0.59s
+[focr-timing]   vision.clip 1.00s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 4.56s
+[focr-timing] weight_cache_build 0.42s
+[focr-timing] prefill 0.60s (277 tokens)
+[focr-timing] decode 0.82s (32 tokens, 0.026s/tok)
+[focr-timing] decode phases (ms): lm_head 326  attn 285  experts 180  route 27
+real 6.66
+user 32.29
+sys 2.62

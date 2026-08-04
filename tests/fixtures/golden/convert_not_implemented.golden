@@ -1,1 +1,1 @@
-focr: not yet implemented: focr convert — the weight transformer lands in Phase 2 (see plan §5)
+focr: not yet implemented: focr convert --quant int4 is not yet supported; the int4 group-quantized path is unvalidated (use --quant int8)

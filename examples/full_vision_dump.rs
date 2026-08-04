@@ -21,8 +21,10 @@ fn read_sam_input(path: &str) -> Result<Mat> {
     }
 
     let data: Vec<f32> = buf
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     if !data.len().is_multiple_of(3) {
         bail!(

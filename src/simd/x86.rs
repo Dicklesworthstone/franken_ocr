@@ -85,6 +85,21 @@
 /// Panics if `a.len() != m*k`, `b.len() != n*k`, or `out.len() != m*n` (a
 /// shape/length contract violation is a programming error).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let _ = igemm_s8s8_with_route(a, b, m, k, n, out);
+}
+
+/// [`igemm_s8s8`] plus the implementation branch that actually produced the
+/// result. The shared dispatch snapshot owns `FOCR_FORCE_ARCH`, so this helper
+/// also makes a forced x86 tier reach the named kernel rather than merely
+/// changing capability-reporting metadata.
+pub(crate) fn igemm_s8s8_with_route(
+    a: &[i8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [i32],
+) -> super::dispatch::EffectiveI8Route {
     let a_len = super::scalar::checked_len("igemm_s8s8", m, k, "m*k");
     let b_len = super::scalar::checked_len("igemm_s8s8", n, k, "n*k");
     let out_len = super::scalar::checked_len("igemm_s8s8", m, n, "m*n");
@@ -110,36 +125,38 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
         out_len
     );
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512f")
-        {
+    match super::dispatch::detected_tier() {
+        super::dispatch::IsaTier::Avx512Vnni => {
             // SAFETY: guarded by the feature detection immediately above; the
-            // fn enables exactly these features via `#[target_feature]`.
+            // shared dispatch only selects this tier after confirming all three
+            // AVX-512 features required by the kernel.
             unsafe {
                 x86_avx512vnni::igemm_s8s8_avx512vnni(a, b, m, k, n, out);
             }
-            return;
+            super::dispatch::EffectiveI8Route::Avx512Vnni
         }
-        if is_x86_feature_detected!("avxvnni") {
-            // SAFETY: `avxvnni` confirmed present by the guard above.
+        super::dispatch::IsaTier::AvxVnni => {
+            // SAFETY: `avxvnni` was confirmed by the shared dispatch snapshot.
             unsafe {
                 x86_avxvnni::igemm_s8s8_avxvnni(a, b, m, k, n, out);
             }
-            return;
+            super::dispatch::EffectiveI8Route::AvxVnni
         }
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: `avx2` confirmed present by the guard above.
+        super::dispatch::IsaTier::Avx2 => {
+            // SAFETY: `avx2` was confirmed by the shared dispatch snapshot.
             unsafe {
                 x86_avx2::igemm_s8s8_avx2(a, b, m, k, n, out);
             }
-            return;
+            super::dispatch::EffectiveI8Route::Avx2
+        }
+        super::dispatch::IsaTier::Scalar => {
+            scalar_s8s8(a, b, m, k, n, out);
+            super::dispatch::EffectiveI8Route::Scalar
+        }
+        super::dispatch::IsaTier::Sdot | super::dispatch::IsaTier::Smmla => {
+            unreachable!("ARM ISA tier cannot be selected by an x86-64 build")
         }
     }
-
-    scalar_s8s8(a, b, m, k, n, out);
 }
 
 /// `C[M,N] += A[M,K] (u8) · B[N,K] (i8, OC-major)` into `out` (i32, row-major
@@ -149,6 +166,19 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// Panics if `a.len() != m*k`, `b.len() != n*k`, or `out.len() != m*n`.
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
+    let _ = igemm_u8s8_with_route(a, b, m, k, n, out);
+}
+
+/// [`igemm_u8s8`] plus the implementation branch that actually produced the
+/// result. See [`igemm_s8s8_with_route`] for the forced-tier contract.
+pub(crate) fn igemm_u8s8_with_route(
+    a: &[u8],
+    b: &[i8],
+    m: usize,
+    k: usize,
+    n: usize,
+    out: &mut [i32],
+) -> super::dispatch::EffectiveI8Route {
     let a_len = super::scalar::checked_len("igemm_u8s8", m, k, "m*k");
     let b_len = super::scalar::checked_len("igemm_u8s8", n, k, "n*k");
     let out_len = super::scalar::checked_len("igemm_u8s8", m, n, "m*n");
@@ -174,35 +204,36 @@ pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
         out_len
     );
 
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx512vnni")
-            && is_x86_feature_detected!("avx512bw")
-            && is_x86_feature_detected!("avx512f")
-        {
-            // SAFETY: guarded by the feature detection immediately above.
+    match super::dispatch::detected_tier() {
+        super::dispatch::IsaTier::Avx512Vnni => {
+            // SAFETY: the shared dispatch confirmed the required AVX-512 set.
             unsafe {
                 x86_avx512vnni::igemm_u8s8_avx512vnni(a, b, m, k, n, out);
             }
-            return;
+            super::dispatch::EffectiveI8Route::Avx512Vnni
         }
-        if is_x86_feature_detected!("avxvnni") {
-            // SAFETY: `avxvnni` confirmed present by the guard above.
+        super::dispatch::IsaTier::AvxVnni => {
+            // SAFETY: `avxvnni` was confirmed by the shared dispatch snapshot.
             unsafe {
                 x86_avxvnni::igemm_u8s8_avxvnni(a, b, m, k, n, out);
             }
-            return;
+            super::dispatch::EffectiveI8Route::AvxVnni
         }
-        if is_x86_feature_detected!("avx2") {
-            // SAFETY: `avx2` confirmed present by the guard above.
+        super::dispatch::IsaTier::Avx2 => {
+            // SAFETY: `avx2` was confirmed by the shared dispatch snapshot.
             unsafe {
                 x86_avx2::igemm_u8s8_avx2(a, b, m, k, n, out);
             }
-            return;
+            super::dispatch::EffectiveI8Route::Avx2
+        }
+        super::dispatch::IsaTier::Scalar => {
+            scalar_u8s8(a, b, m, k, n, out);
+            super::dispatch::EffectiveI8Route::Scalar
+        }
+        super::dispatch::IsaTier::Sdot | super::dispatch::IsaTier::Smmla => {
+            unreachable!("ARM ISA tier cannot be selected by an x86-64 build")
         }
     }
-
-    scalar_u8s8(a, b, m, k, n, out);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

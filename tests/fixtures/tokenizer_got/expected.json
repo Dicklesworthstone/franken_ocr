@@ -1,0 +1,60 @@
+{
+  "_meta": {
+    "purpose": "GOT-OCR2 (got-ocr2) tokenizer token-id-EXACT conformance golden fixtures",
+    "model_id": "got-ocr2",
+    "tokenizer_class": "QWenTokenizer (qwen.tiktoken byte-BPE, NOT a HF tokenizer.json)",
+    "tokenizer_file_sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186",
+    "backend": "tiktoken.Encoding (built directly from the QWenTokenizer recipe)",
+    "tiktoken_version": "0.13.0",
+    "transformers_version": null,
+    "torch_loaded": false,
+    "pat_str": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    "special_start_id": 151643,
+    "num_extras": 205,
+    "n_vocab": 151860,
+    "special_tokens_count": 217,
+    "grounding_image_special_tokens": {
+      "<ref>": 151851,
+      "</ref>": 151852,
+      "<box>": 151853,
+      "</box>": 151854,
+      "<quad>": 151855,
+      "</quad>": 151856,
+      "<img>": 151857,
+      "</img>": 151858,
+      "<imgpad>": 151859
+    },
+    "encode_flags": {
+      "allowed_special": "all",
+      "disallowed_special": "()"
+    },
+    "nfc": "QWenTokenizer.tokenize applies unicodedata.normalize('NFC'); all corpus strings asserted NFC-stable",
+    "num_cases": 24
+  },
+  "fixtures": {
+    "Hello, world!": [9707, 11, 1879, 0],
+    "The quick brown fox jumps over the lazy dog.": [785, 3974, 13876, 38835, 34208, 916, 279, 15678, 5562, 13],
+    "OCR: ": [93495, 25, 220],
+    "OCR with format: ": [93495, 448, 3561, 25, 220],
+    "1234567890": [16, 17, 18, 19, 20, 21, 22, 23, 24, 15],
+    "Price: $1,234.56 (USD) -42%": [6972, 25, 400, 16, 11, 17, 18, 19, 13, 20, 21, 320, 26749, 8, 481, 19, 17, 4],
+    "    leading and  multiple   spaces": [262, 6388, 323, 220, 5248, 256, 12621],
+    "tab\there\tand\nnewline": [6192, 197, 6739, 52477, 198, 89202],
+    "Line1\nLine2\nLine3\n": [2460, 16, 198, 2460, 17, 198, 2460, 18, 198],
+    "snake_case camelCase PascalCase kebab-case": [72139, 19096, 49152, 4207, 57359, 4207, 1962, 47722, 38485],
+    "fn main() { println!(\"{}\", x + 1); }": [8822, 1887, 368, 314, 13751, 79878, 856, 488, 220, 16, 1215, 335],
+    "你好，世界！这是一个测试。": [108386, 3837, 99489, 6313, 105464, 81705, 1773],
+    "日本語のテスト": [101059, 102819, 15767, 140592],
+    "café naïve résumé Straße": [924, 58858, 94880, 586, 9333, 1242, 963, 26647, 23455],
+    "Здравствуй, мир": [35451, 6949, 26988, 20200, 82580, 11, 137144],
+    "emoji: 😀🚀🇺🇸👩‍💻": [37523, 25, 90316, 145836, 145526, 145383, 145233, 378, 235, 145851],
+    "x²+y²=z² ∀x∈ℝ, ∑_{i=1}^{n} i": [87, 29456, 43010, 29456, 82570, 29456, 54700, 87, 145690, 149021, 11, 11995, 239, 15159, 72, 28, 16, 92, 47822, 77, 92, 600],
+    "<|im_end|>": [151645],
+    "<|im_start|>assistant\n": [151644, 77091, 198],
+    "<img><imgpad></img>\nOCR: ": [151857, 151859, 151858, 198, 93495, 25, 220],
+    "<ref>text</ref><box>(1,2),(3,4)</box>": [151851, 1318, 151852, 151853, 7, 16, 11, 17, 23547, 18, 11, 19, 8, 151854],
+    "<quad>region</quad>": [151855, 3943, 151856],
+    "https://example.com/path?q=1&r=2#frag-2": [2428, 1110, 8687, 905, 50976, 43782, 28, 16, 60617, 28, 17, 2, 33198, 12, 17],
+    "MixedCASE123abc!@#": [86433, 40371, 16, 17, 18, 13683, 0, 31, 2]
+  }
+}

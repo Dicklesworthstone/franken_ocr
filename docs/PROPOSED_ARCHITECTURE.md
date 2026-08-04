@@ -140,7 +140,7 @@ The forward is a hand-written model over a **`Mat`/slice currency**, not a tenso
 | Sampler + no_repeat_ngram(35) ([SPEC-100..103]) | §4.3 | `decode.rs` | bd-1gv.22 |
 
 ### 5.3 BUILD (the perf wedge — Phase 3+, behind kill-switches)
-The tiled register-blocked int8 GEMM that frankentorch has only *named* (verified absent at frankentorch `a84674c8`): **SMMLA/i8mm prefill GEMM** (bd-2mo.4), **AVX-512-VNNI** (bd-2mo.6), AVX-VNNI/AVX2/AMX tiers, SDOT decode GEMV (bd-2mo.5), all behind a runtime ISA dispatch (`OnceLock<IsaTier>`, bd-2mo.1) with a bit-identical scalar floor (bd-2mo.10). `nn.rs` exposes one `int8_gemm`/`int8_gemv` entrypoint; the dispatch and the +128 U8S8 correction live inside the SIMD island.
+The tiled register-blocked int8 GEMM that frankentorch has only *named* (verified absent at frankentorch `a84674c8`): **SMMLA/i8mm prefill GEMM** (bd-2mo.4), **AVX-512-VNNI** (bd-2mo.6), AVX-VNNI/AVX2 tiers, and SDOT decode GEMV (bd-2mo.5), all behind runtime ISA capability selection (`OnceLock<IsaTier>`, bd-2mo.1) with a bit-identical scalar floor (bd-2mo.10). Ordinary Apple dense int8 currently selects LLVM autovec above that capability layer because it wins real-decode A/Bs; packed-int4 and offline-SMMLA retain separate dispatch. `nn.rs` exposes one `int8_gemm`/`int8_gemv` entrypoint; dispatch and the +128 U8S8 correction live inside the SIMD island. AMX is not advertised until an implementation exists.
 
 > **The facade is what keeps P1 honest:** the f32 path (5.1+5.2) is the parity spine; 5.3 is an additive, bit-identical-where-integer layer. A perf kernel that drifts OCR output is reverted at the facade, the rest of the model untouched.
 
@@ -179,6 +179,57 @@ MoEGate: `logits = linear(hidden.f32, gate.f32)` → softmax(f32) → top-6 gree
 
 ### 6.10 `decode.rs` — [SPEC-100..103]
 The frozen `DecodeParams`/`DecodeOutput` contract + AR loop. Greedy by default (`do_sample = temperature>0`, default 0.0 ⇒ argmax) [SPEC-100]; EOS=1, max_length 32768, use_cache [SPEC-101]; **`no_repeat_ngram_size=35`** with `ngram_window` **128 single / 1024 multi** [SPEC-102/103], OQ-18 — the custom `SlidingWindowNoRepeatNgramProcessor` (these are first-class generation semantics, not just CLI flags). lm_head→argmax-only fused under greedy (§6.10/bd-2mo.24). Delivered by bd-1gv.22, parity bd-1gv.22.1.
+
+#### Provisional runaway-token controller (bd-2mo.30.12; default OFF)
+
+The conservative FFN/expert-only int8 recipe can enter a no-EOS, repetitive
+table trajectory on the page_0590 sentinel. The diagnostic controller is a
+bounded finite-state monitor over **generated token ids**, never decoded strings:
+
+- **State space:** `(next_checkpoint, consecutive_hits, last_metrics,
+  terminal_evidence)` plus the caller-owned append-only token history.
+  `last_metrics` is the exact witness `(token_count, best_period,
+  period_matches/comparisons, unique_token_4grams/total_token_4grams)` over a
+  fixed suffix. `terminal_evidence` makes Abort sticky: no later observation
+  can transition back to Continue. No logits, markup, language, or
+  precision-route state participates.
+- **Actions:** `Continue` leaves sampling and EOS behavior byte-for-byte
+  untouched; `Abort(evidence)` returns `FocrError::Timeout` (stable exit 5).
+  Abort never inserts EOS and never returns a truncated output as success. A
+  just-emitted real EOS observed before a terminal trigger bypasses the monitor
+  and retains reference stop semantics.
+- **Bounded deterministic trigger:** when explicitly armed with
+  `FOCR_RUNAWAY_GUARD=1`, inspect the last 2,048 tokens every 256 emitted tokens,
+  starting at token 8,192. Search periods `1..=256` (at least eight cycles).
+  One checkpoint is suspicious only when lag agreement is at least `15/16` and
+  exact token-4gram novelty is at most `1/4`; abort after three consecutive
+  suspicious checkpoints. All comparisons are integer-exact, and checkpoints
+  are replayed at their fixed token prefix so polling cadence cannot change the
+  verdict. Unset or `=0` is disabled and performs no analysis/allocation.
+
+The failure-cost matrix uses ordinal decision units (not measured dollars):
+
+| latent state | Continue | Abort with typed timeout |
+|---|---:|---:|
+| normal decode | 0 | 1000 (false abort / lost valid OCR) |
+| runaway decode | 100 (corrupt output + wasted decode) | 5 (explicit failed request) |
+
+Let `p = P(runaway | trigger)`. Under this matrix the expected-loss crossover is
+`p > 1000/1095 = 0.91324`; the hard token thresholds are only a deterministic
+candidate signal, **not** a claim that this posterior bound has been met. The
+offline calibration ledger must report a Beta posterior for trigger precision
+`Beta(1+TP, 1+FP)`, a Beta upper bound for normal-stream false-trigger rate
+`Beta(1+FP, 1+TN)`, page0590 detection latency, retained-prefix CER, and corpus
+CVaR/tail impact. Until the lower 95% precision bound clears the loss crossover,
+the normal corpus has zero observed triggers, and the CER/tail gates pass, the
+controller stays default-OFF and bd-2mo.30.12 stays open.
+
+The evidence artifact extends
+`artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass13-page0590-precision-20260710T082044Z/`
+with armed page0590 token metrics plus frozen normal-corpus token replays and a
+hash manifest; the accepted/rejected outcome must be ledgered in
+`docs/NEGATIVE_EVIDENCE.md`. No acceptance may rely on experimental int8
+attention or int8 `lm_head` (OQ-14 remains unresolved).
 
 ### 6.11 `postprocess.rs` — [SPEC-110..119]
 Decode+strip EOS `<｜end▁of▁sentence｜>` [SPEC-110]; ref/det regex extraction [SPEC-111]; coordinate parse [SPEC-112]; **bbox /999 rescale** to pixels [SPEC-113]; image-label crops → `![](images/{idx}.jpg)` [SPEC-114]; other-label cleanup + `\coloneqq`→`:=` [SPEC-115]; multi-page `<PAGE>` split/rejoin [SPEC-118]. (Box-overlay drawing [SPEC-116] and the geometry/`line_type` special case [SPEC-117] are excluded from v1 — visualization-only; see [`FEATURE_PARITY.md`](FEATURE_PARITY.md).) Delivered by bd-1gv.23, parity bd-1gv.23.1.
@@ -237,7 +288,7 @@ Decode/Load image → Preprocess (resize/pad/normalize/tile) → Tokenize prompt
 
 - **The frankensearch lesson (doctrine #3, §6.2):** hand-wide-SIMD over scalar inner loops measured **5× SLOWER** than LLVM autovectorization. So: (a) write norm/softmax/dequant/elementwise *glue* as tight scalar loops (f64 accumulation where precision matters) and let LLVM autovectorize; (b) write tight int8 GEMM/GEMV micro-kernels with **native matmul intrinsics** only. The one measured exception is vectorized transcendentals (poly `exp` for softmax/SiLU/quick_gelu — LLVM won't autovectorize `libm`), gated behind `FOCR_VEC_EXP` + a parity gate (§6.11, bd-2mo.20).
 - **The edge (doctrine #4, §3.2):** the gap to ONNX/MLAS is *kernels below peak*, NOT framework overhead. The win is the combination franken_ocr has by construction — fused, tape-free, zero-per-op-alloc single-model forward, every op at peak (register-blocked SMMLA/VNNI + int8 attention where accuracy allows + vectorized norms), plus the int4 bandwidth win on the expert bulk. **Un-blocked SMMLA is a TRAP** (load-bound, slower than SDOT); the micro-kernel must reach compute:load ≥ 2:1 via register/cache blocking + offline pre-packing.
-- **Per-arch dispatch catalog (§6.6, bd-2mo.1..10):** one `int8_gemm`/`int8_gemv` entrypoint, dispatched once (`OnceLock<IsaTier>`), bit-identical across paths (i32 accumulation is exact). Order: **x86** AMX > AVX512-VNNI > AVX-VNNI > AVX2 > scalar; **ARM** SDOT > SMMLA > scalar on Apple Silicon, SMMLA > SDOT > scalar on other aarch64. `focr robot backends` reflects the dispatched tier (bd-2mo.2). ⚠ AVX2 `vpmaddubsw` saturates at i16 → carries its own overflow proof (split-accumulate, bd-2mo.9.1) or a ledgered divergence.
+- **Per-arch dispatch catalog (§6.6, bd-2mo.1..10):** one `int8_gemm`/`int8_gemv` entrypoint, bit-identical across paths (i32 accumulation is exact). Hardware order: **x86** AVX512-VNNI > AVX-VNNI > AVX2 > scalar; **ARM** SDOT > SMMLA > scalar on Apple Silicon, SMMLA > SDOT > scalar on other aarch64. The effective ordinary Apple dense route defaults to LLVM autovec by measurement, while valid `FOCR_FORCE_ARCH` overrides reach the named branch. `focr robot backends` separates hardware selection from effective route; `robot selftest` records executed routes (bd-2mo.2 / bd-2mo.30.10). Packed-int4 and offline-SMMLA dispatch are separate. AVX2 deliberately uses non-saturating widened arithmetic rather than `vpmaddubsw`.
 - **Mixed int4/int8 (§6.3, Phase 4 / bd-3gaa):** decode is bandwidth-bound → int4 group-quant (g=16–32) on the expert bulk halves bytes/token (~2× decode); accuracy-sensitive tensors (`v_proj`, expert `down_proj`, `lm_head`) stay one tier higher. No CPU int4 instruction → unpack int4→int8 in-register, feed the same MAC. The per-tensor int4/int8/bf16 split is chosen by the rate-distortion water-filling allocator (AF-1, §9.7, bd-ksps / bd-1xfa.1), bounded by the tail-risk CER gate (AF-2, bd-3upw / bd-1xfa.2).
 - **MoE dispatch (§6.7):** prefill = counting-sort tokens by expert → one dense GEMM per active expert (bd-2mo.12); decode = cache-contiguous per-(layer,expert) packing + prefetch (bd-2mo.13). **R-SWA (§6.8):** online-softmax over the reference block, int8 attention behind `FOCR_INT8_ATTN` + CVaR tail gate (bd-2mo.15).
 - **Many-core (§6.9 / AF-5, bd-2mo.21):** prefill scales with cores, decode does NOT (bandwidth-bound) — cap each pool at its **USL peak**, not `num_cpus`. NUMA: replicate the read-only weight blob per node (`FOCR_NUMA`). Apple Silicon: pin GEMM pool to P-cores. **Concurrency discipline (§6.5, P6):** single model, sequential outer loop, internal fan-out, one live forward.

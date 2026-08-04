@@ -1,0 +1,36 @@
+{
+  "schema": "focr-page0590-precision-attribution/v1",
+  "page_sha256": "6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3",
+  "reference_sha256": "6542b1d31b64103e9a56104738bf9038487877e8408b8ac34d8d10d1f5d2c8cd",
+  "model_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+  "binary_sha256": "68990f7361e8763b19e0135e55e61a0ac54e7942b887162b0dfe6bf7dc78cfe8",
+  "max_length": 12000,
+  "threads": 8,
+  "conservative": {
+    "output_sha256": "283e3dfac229f81d151bbe355d61483edb2b6462f7adb35b3dec54fb19998aa2",
+    "output_chars": 32694,
+    "tokens": 12000,
+    "terminated_by_eos": false,
+    "cer_raw": 1.25622,
+    "cer_norm": 1.24286,
+    "decode_seconds": 318.23,
+    "wall_seconds": 323.92
+  },
+  "full_int8": {
+    "output_sha256": "c7f4a1bc31016256471d8283f58fcd63bd7cce62fcc6be47fda51f43ac5bc220",
+    "output_chars": 41531,
+    "tokens": 12000,
+    "terminated_by_eos": false,
+    "cer_raw": 1.63878,
+    "cer_norm": 1.63831,
+    "decode_seconds": 144.63,
+    "wall_seconds": 151.28
+  },
+  "full_int8_vs_conservative": {
+    "cer_norm_absolute_regression": 0.39545,
+    "cer_norm_relative_regression_pct": 31.82,
+    "decode_speedup": 2.20,
+    "wall_speedup": 2.14
+  },
+  "verdict": "reject_full_int8_and_keep_bd-2mo.30.12_open"
+}

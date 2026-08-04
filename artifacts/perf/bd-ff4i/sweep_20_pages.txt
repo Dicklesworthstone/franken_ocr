@@ -1,0 +1,21 @@
+page_0009 rc=0 bytes=76 ok 1.013
+page_0014 rc=0 bytes=642 ok 0.322
+page_0019 rc=0 bytes=1460 ok 0.55
+page_0023 rc=0 bytes=2510 ok 0.672
+page_0086 rc=0 bytes=2421 ok 0.625
+page_0091 rc=0 bytes=2389 ok 0.64
+page_0105 rc=0 bytes=1961 ok 0.622
+page_0107 rc=0 bytes=2648 ok 0.657
+page_0108 rc=0 bytes=2597 ok 0.623
+page_0126 rc=0 bytes=2744 ok 0.65
+page_0136 rc=0 bytes=1726 ok 0.705
+page_0179 rc=0 bytes=2544 ok 0.627
+page_0250 rc=0 bytes=2530 ok 0.603
+page_0358 rc=0 bytes=2670 ok 0.6
+page_0400 rc=0 bytes=2863 ok 0.667
+page_0437 rc=0 bytes=1473 ok 0.608
+page_0547 rc=0 bytes=2820 ok 0.655
+page_0557 rc=0 bytes=2554 ok 0.612
+page_0590 rc=0 bytes=2846 ok 0.273
+page_0645 rc=0 bytes=3171 ok 0.605
+SWEEP COMPLETE

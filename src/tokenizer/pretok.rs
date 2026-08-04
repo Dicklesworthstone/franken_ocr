@@ -142,6 +142,39 @@ pub fn pretokenize(text: &str) -> Vec<String> {
     pieces.iter().map(|p| byte_level_map(p)).collect()
 }
 
+/// Pre-tokenize `text` for the SmolLM2 / GPT-2 scheme (C6, bd-3jo6.3.6) —
+/// verbatim from the SmolVLM2 `tokenizer.json .pre_tokenizer`:
+///
+/// ```text
+/// 1. Digits    individual_digits=true                       Isolated
+/// 2. ByteLevel add_prefix_space=false trim_offsets=true use_regex=true
+/// ```
+///
+/// Stage 1 isolates every `\p{N}` char as its own piece (HF `Digits` splits on
+/// Rust `char::is_numeric`, which is exactly general-category N — the same set
+/// as [`is_n`]). Stage 2 is the classic GPT-2 word regex (`use_regex=true`,
+/// unlike the DeepSeek sequence above which pre-splits itself and sets
+/// `use_regex=false`), then the byte→unicode remap. Same leftmost-first
+/// alternation semantics as [`pretokenize`].
+pub fn pretokenize_smollm2(text: &str) -> Vec<String> {
+    let mut pieces = vec![text.to_string()];
+    pieces = split_stage(&pieces, split_digits_individual);
+    pieces = split_stage(&pieces, split_gpt2_word);
+    pieces.iter().map(|p| byte_level_map(p)).collect()
+}
+
+/// Pre-tokenize `text` for the plain GPT-2 scheme (OneChart / OPT, D9):
+/// JUST the classic GPT-2 word regex + the byte-level remap — no Digits
+/// stage (the slow `GPT2Tokenizer` over `vocab.json`+`merges.txt`; the
+/// fixture `_meta.pat_str` pins the exact pattern [`split_gpt2_word`]
+/// implements).
+pub fn pretokenize_gpt2(text: &str) -> Vec<String> {
+    split_gpt2_word(text)
+        .iter()
+        .map(|p| byte_level_map(p))
+        .collect()
+}
+
 /// Run one split stage over every input piece, concatenating the results.
 fn split_stage(pieces: &[String], f: fn(&str) -> Vec<String>) -> Vec<String> {
     let mut out = Vec::with_capacity(pieces.len());
@@ -188,6 +221,28 @@ fn split_digit_groups(s: &str) -> Vec<String> {
 /// Stage 2: `Split [一-龥぀-ゟ゠-ヿ]+` Isolated — isolate maximal runs of CJK/Kana.
 fn split_cjk_kana(s: &str) -> Vec<String> {
     isolate_runs(s, is_cjk_kana)
+}
+
+/// SmolLM2 stage 1: `Digits(individual_digits=true)` Isolated — every `\p{N}`
+/// char becomes its own piece (HF `Digits` splits on Rust `char::is_numeric`,
+/// which is general-category N — the same set as [`is_n`]).
+fn split_digits_individual(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    for c in s.chars() {
+        if is_n(c) {
+            if !buf.is_empty() {
+                out.push(std::mem::take(&mut buf));
+            }
+            out.push(c.to_string());
+        } else {
+            buf.push(c);
+        }
+    }
+    if !buf.is_empty() {
+        out.push(buf);
+    }
+    out
 }
 
 /// Generic "isolate maximal runs where `pred` holds" splitter (a `[…]+`
@@ -370,6 +425,149 @@ fn match_word(chars: &[char], i: usize) -> Option<usize> {
     None
 }
 
+/// SmolLM2 stage 2: the classic GPT-2 word regex, applied by
+/// `ByteLevel(use_regex=true)` (Isolated):
+///
+/// ```text
+/// 's|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+
+/// ```
+///
+/// Same scan shape as [`split_gpt_word`] but with the GPT-2 alternatives: the
+/// lowercase contraction suffixes come FIRST, letters are plain `\p{L}+` (no
+/// `\p{M}` — unlike the DeepSeek variant), numbers are an unbounded ` ?\p{N}+`
+/// (the 1-per-piece Digits stage has already run), the "other" class takes
+/// everything that is not whitespace/letter/number, and there is no
+/// `\s*[\r\n]+` alternative. The regex covers every char (any non-(ws|L|N)
+/// char matches alternative 4), so Isolated leaves no gaps.
+fn split_gpt2_word(s: &str) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut gap = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if let Some(len) = match_gpt2_word(&chars, i) {
+            if !gap.is_empty() {
+                out.push(std::mem::take(&mut gap));
+            }
+            let tok: String = chars[i..i + len].iter().collect();
+            out.push(tok);
+            i += len;
+        } else {
+            gap.push(chars[i]);
+            i += 1;
+        }
+    }
+    if !gap.is_empty() {
+        out.push(gap);
+    }
+    out
+}
+
+/// Try the six ordered alternatives of the GPT-2 word regex at `chars[i..]`
+/// (leftmost-first). Returns the char length of the first match, or `None`.
+fn match_gpt2_word(chars: &[char], i: usize) -> Option<usize> {
+    let n = chars.len();
+
+    // Alt 1: '(s|t|re|ve|m|ll|d) — ASCII apostrophe + lowercase suffix, tried
+    // in source order (case-sensitive: "'S" falls through to alt 4).
+    if chars[i] == '\'' {
+        for suf in ["s", "t", "re", "ve", "m", "ll", "d"] {
+            let sl = suf.len(); // all-ASCII → char count == byte count
+            if i + 1 + sl <= n && chars[i + 1..i + 1 + sl].iter().collect::<String>() == *suf {
+                return Some(1 + sl);
+            }
+        }
+    }
+
+    // Alt 2: ` ?\p{L}+` — optional single ASCII space, then ≥1 Letter.
+    {
+        let mut j = i;
+        if chars[j] == ' '
+            && let Some(&c1) = chars.get(j + 1)
+            && is_l(c1)
+        {
+            j += 1;
+        }
+        let start = j;
+        while j < n && is_l(chars[j]) {
+            j += 1;
+        }
+        if j > start {
+            return Some(j - i);
+        }
+    }
+
+    // Alt 3: ` ?\p{N}+` — optional single ASCII space, then ≥1 Number.
+    {
+        let mut j = i;
+        if chars[j] == ' '
+            && let Some(&c1) = chars.get(j + 1)
+            && is_n(c1)
+        {
+            j += 1;
+        }
+        let start = j;
+        while j < n && is_n(chars[j]) {
+            j += 1;
+        }
+        if j > start {
+            return Some(j - i);
+        }
+    }
+
+    // Alt 4: ` ?[^\s\p{L}\p{N}]+` — optional space, then ≥1 char that is not
+    // whitespace/Letter/Number (punctuation, symbols, marks, …).
+    {
+        let other = |c: char| !is_ws(c) && !is_l(c) && !is_n(c);
+        let mut j = i;
+        if chars[j] == ' '
+            && let Some(&c1) = chars.get(j + 1)
+            && other(c1)
+        {
+            j += 1;
+        }
+        let start = j;
+        while j < n && other(chars[j]) {
+            j += 1;
+        }
+        if j > start {
+            return Some(j - i);
+        }
+    }
+
+    // Alt 5: `\s+(?!\S)` — same backtracking semantics as [`match_word`]'s
+    // alt 5: a maximal whitespace run of length w matches all w chars when it
+    // reaches end-of-piece, else w-1 chars (only if w ≥ 2).
+    {
+        let mut j = i;
+        while j < n && is_ws(chars[j]) {
+            j += 1;
+        }
+        let w = j - i;
+        if w >= 1 {
+            if j == n {
+                return Some(w);
+            } else if w >= 2 {
+                return Some(w - 1);
+            }
+        }
+    }
+
+    // Alt 6: `\s+` — the leftover whitespace run (a single space before a
+    // non-space).
+    {
+        let mut j = i;
+        while j < n && is_ws(chars[j]) {
+            j += 1;
+        }
+        if j > i {
+            return Some(j - i);
+        }
+    }
+
+    None
+}
+
 /// The GPT-2 / HF ByteLevel `bytes_to_unicode` map, applied to the UTF-8 bytes
 /// of `s`. 188 printable bytes map to themselves (as the corresponding
 /// codepoint); the other 68 control/space bytes map into the U+0100.. region so
@@ -533,5 +731,93 @@ mod tests {
         // " a" → [" a"] → "Ġa".
         let p2 = pretokenize(" a");
         assert_eq!(p2, vec!["Ġa"]);
+    }
+
+    // ── SmolLM2 / GPT-2 scheme (C6) ──────────────────────────────────────────
+
+    #[test]
+    fn smollm2_digits_are_individual() {
+        // Digits(individual_digits=true): every \p{N} char is its own piece.
+        assert_eq!(split_digits_individual("1234"), vec!["1", "2", "3", "4"]);
+        assert_eq!(
+            split_digits_individual("ab12cd"),
+            vec!["ab", "1", "2", "cd"]
+        );
+        assert_eq!(split_digits_individual("²x"), vec!["²", "x"]); // No (superscript) counts
+        assert_eq!(split_digits_individual("abc"), vec!["abc"]);
+    }
+
+    #[test]
+    fn gpt2_contractions_match_first() {
+        // "it's" → "it" (alt 2), "'s" (alt 1).
+        assert_eq!(split_gpt2_word("it's"), vec!["it", "'s"]);
+        // "we'll've" → "we", "'ll", "'ve".
+        assert_eq!(split_gpt2_word("we'll've"), vec!["we", "'ll", "'ve"]);
+        // Uppercase suffix does NOT match alt 1: "'S" → "'" (alt 4), "S" (alt 2).
+        assert_eq!(split_gpt2_word("IT'S"), vec!["IT", "'", "S"]);
+        // Trailing bare apostrophe → alt 4.
+        assert_eq!(split_gpt2_word("dogs'"), vec!["dogs", "'"]);
+    }
+
+    #[test]
+    fn gpt2_letters_have_no_mark_class() {
+        // A combining mark after letters is NOT part of \p{L}+ in GPT-2 (no
+        // \p{M} in alt 2, unlike the DeepSeek regex): the mark is an alt-4
+        // "other" run of its own, and the following letter restarts alt 2.
+        assert_eq!(split_gpt2_word("e\u{0301}x"), vec!["e", "\u{0301}", "x"]);
+        assert_eq!(split_gpt2_word("e\u{0301}"), vec!["e", "\u{0301}"]);
+    }
+
+    #[test]
+    fn gpt2_number_runs_after_digit_stage() {
+        // Alt 3 with a leading space: " 5" is one piece when it reaches the
+        // regex intact (single-digit, so the Digits stage's per-char split
+        // yields the same boundary anyway for multi-digit runs).
+        assert_eq!(split_gpt2_word(" 5"), vec![" 5"]);
+        // Full scheme: digits isolated FIRST, so "a 12" → "a", " 1"? No — the
+        // Digits stage cuts before the regex ever sees " 12": pieces are
+        // ["a ", "1", "2"], and the regex runs per piece.
+        assert_eq!(pretokenize_smollm2("a 12"), vec!["a", "Ġ", "1", "2"]);
+    }
+
+    #[test]
+    fn gpt2_whitespace_backtracking() {
+        // "a  b": maximal run of 2 spaces before 'b' → alt 5 yields w-1=1
+        // space, then " b" via alt 2's optional leading space.
+        assert_eq!(split_gpt2_word("a  b"), vec!["a", " ", " b"]);
+        // Trailing run reaches end → alt 5 takes it whole.
+        assert_eq!(split_gpt2_word("a  "), vec!["a", "  "]);
+        // "\n\n" at end of piece stays ONE pretoken (BPE may merge to ĊĊ —
+        // the OQ-4 image-expansion tail case).
+        assert_eq!(split_gpt2_word("a\n\n"), vec!["a", "\n\n"]);
+        // "\n\n" mid-piece: alt 5 cedes one char, alt 6 takes the second
+        // (alt 2's optional lead is strictly ' ', so '\n' can't join 'b').
+        assert_eq!(split_gpt2_word("a\n\nb"), vec!["a", "\n", "\n", "b"]);
+    }
+
+    #[test]
+    fn gpt2_punct_and_symbols() {
+        // " !!!" → alt 4 with leading space, one piece.
+        assert_eq!(split_gpt2_word(" !!!"), vec![" !!!"]);
+        // "a..." → "a", "..." (alt 4).
+        assert_eq!(split_gpt2_word("a..."), vec!["a", "..."]);
+        // Mixed symbol run: "+=<>" is one alt-4 run.
+        assert_eq!(split_gpt2_word("+=<>"), vec!["+=<>"]);
+    }
+
+    #[test]
+    fn smollm2_full_scheme_byte_mapped() {
+        // "Hi 42!" → Digits: ["Hi ", "4", "2", "!"] → regex per piece →
+        // ["Hi", " ", "4", "2", "!"]  (the space: alt-2 lookahead fails at
+        // piece end after "Hi", so "Hi" then " " via alt 5 w=1-at-end)
+        // → byte map: space becomes Ġ.
+        assert_eq!(
+            pretokenize_smollm2("Hi 42!"),
+            vec!["Hi", "Ġ", "4", "2", "!"]
+        );
+        // Contraction survives the full scheme.
+        assert_eq!(pretokenize_smollm2("it's"), vec!["it", "'s"]);
+        // UTF-8 goes through the byte map ('é' → Ã©).
+        assert_eq!(pretokenize_smollm2("é"), vec!["Ã©"]);
     }
 }

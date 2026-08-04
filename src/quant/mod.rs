@@ -23,6 +23,11 @@
 //! * [`int4`] — group-quantized int4 packing (two signed nibbles per byte,
 //!   per-group scales) and the in-register unpack to the exact int8 values the
 //!   int8 GEMM consumes (AGENTS.md doctrine #4 — the int4 *bandwidth* win).
+//! * [`convert`] — the `focr convert` driver: enumerate every tensor of a raw
+//!   bf16 safetensors [`crate::native_engine::weights::Weights`], int8-quantize
+//!   the recipe-approved decoder FFN/expert set with
+//!   [`crate::native_engine::nn::quantize_int8`], copy everything else verbatim,
+//!   and serialize via [`focrq::FocrqBuilder`].
 //! * `recipe` / `bit_allocator` — the per-tensor quant policy + rate-distortion
 //!   bit allocator, authored by a sibling agent. Declared here so the module
 //!   tree is whole; their contents are owned elsewhere.
@@ -37,6 +42,7 @@
 //! tensor gets which tier) is `recipe`/`bit_allocator`.
 
 pub mod bit_allocator;
+pub mod convert;
 pub mod focrq;
 pub mod int4;
 pub mod int8;

@@ -41,6 +41,15 @@ pub const PROJ_OUT: usize = 1280;
 /// Vision tokens emitted per 1024-view (16x16 SAM/CLIP grid).
 pub const TOKENS_PER_VIEW: usize = 256;
 
+/// Immutable projector parameters in the layout consumed by the GEMM facade.
+/// Hydrating this once avoids widening and transposing the 2048x1280 weight for
+/// every page while retaining the exact affine operation.
+#[derive(Debug)]
+pub(crate) struct ProjectorWeights {
+    weight_t: Mat,
+    bias: Vec<f32>,
+}
+
 fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
     lhs.checked_mul(rhs).ok_or_else(|| {
         FocrError::Other(anyhow::anyhow!(
@@ -81,12 +90,25 @@ fn ensure_mat_data_len(mat: &Mat, context: &str) -> FocrResult<()> {
 /// * [`FocrError::FormatMismatch`] when the loaded artifact does not expose the
 ///   projector tensors.
 pub fn forward(weights: &Weights, clip: &Mat, sam: &Mat) -> FocrResult<Mat> {
+    let hybrid = hybrid_from_raw(clip, sam)?;
+    let projector = projector_weights_from(weights)?;
+    project_transposed(&hybrid, &projector.weight_t, Some(&projector.bias))
+}
+
+/// [`forward`] using an already-hydrated projector bundle.
+///
+/// # Errors
+/// The same shape errors as [`forward`].
+pub(crate) fn forward_with(projector: &ProjectorWeights, clip: &Mat, sam: &Mat) -> FocrResult<Mat> {
+    let hybrid = hybrid_from_raw(clip, sam)?;
+    project_transposed(&hybrid, &projector.weight_t, Some(&projector.bias))
+}
+
+fn hybrid_from_raw(clip: &Mat, sam: &Mat) -> FocrResult<Mat> {
     // `sam` is the raw vision_sam output [OUT_CH=1024, N=256] (channel-major);
     // the concat wants the flattened [N, 1024] (flatten(2).permute(0,2,1)).
     let sam_t = transpose(sam)?;
-    let hybrid = concat_hybrid(clip, &sam_t)?;
-    let (w, b) = projector_params(weights)?;
-    project(&hybrid, &w, b.as_deref())
+    concat_hybrid(clip, &sam_t)
 }
 
 /// Build the `[N, 2048]` hybrid feature from the CLIP and SAM tower outputs.
@@ -182,7 +204,31 @@ pub fn project(x: &Mat, w: &Mat, bias: Option<&[f32]>) -> FocrResult<Mat> {
     // PyTorch Linear stores weight as [out, in] and computes x @ w^T. The GEMM
     // facade wants [m,k] x [k,n], so transpose w -> [in, out] = [2048, 1280].
     let wt = transpose(w)?;
-    let mut y = nn::matmul(x, &wt)?;
+    project_transposed(x, &wt, bias)
+}
+
+fn project_transposed(x: &Mat, wt: &Mat, bias: Option<&[f32]>) -> FocrResult<Mat> {
+    if x.cols != PROJ_IN || wt.shape() != (PROJ_IN, PROJ_OUT) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_bridge::project_transposed: shapes [{}, {}] x [{}, {}] incompatible; \
+             expected [N, {PROJ_IN}] x [{PROJ_IN}, {PROJ_OUT}]",
+            x.rows,
+            x.cols,
+            wt.rows,
+            wt.cols
+        )));
+    }
+    if let Some(b) = bias
+        && b.len() != PROJ_OUT
+    {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_bridge::project_transposed: bias len {} != {PROJ_OUT}",
+            b.len()
+        )));
+    }
+    ensure_mat_data_len(x, "vision_bridge::project_transposed input")?;
+    ensure_mat_data_len(wt, "vision_bridge::project_transposed weight")?;
+    let mut y = nn::matmul(x, wt)?;
 
     if let Some(b) = bias {
         for r in 0..y.rows {
@@ -220,15 +266,37 @@ fn transpose(m: &Mat) -> FocrResult<Mat> {
 /// tensor-directory accessors surface a clean [`FocrError::FormatMismatch`] when
 /// the tensors are absent. The numeric path ([`project`]) is fully implemented
 /// and tested independently of the loader.
-fn projector_params(weights: &Weights) -> FocrResult<(Mat, Option<Vec<f32>>)> {
+fn projector_params(weights: &Weights) -> FocrResult<(Mat, Vec<f32>)> {
     let w = weights.mat("model.projector.layers.weight")?;
-    let b = weights.vec("model.projector.layers.bias").ok();
+    let b = weights.vec("model.projector.layers.bias")?;
+    if b.len() != PROJ_OUT {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor \"model.projector.layers.bias\" has {} elements; expected {PROJ_OUT}",
+            b.len()
+        )));
+    }
+    if w.shape() != (PROJ_OUT, PROJ_IN) {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor \"model.projector.layers.weight\" has shape [{}, {}]; expected [{PROJ_OUT}, {PROJ_IN}]",
+            w.rows, w.cols
+        )));
+    }
     Ok((w, b))
+}
+
+/// Hydrate and pretranspose the immutable Unlimited-OCR projector once.
+pub(crate) fn projector_weights_from(weights: &Weights) -> FocrResult<ProjectorWeights> {
+    let (weight, bias) = projector_params(weights)?;
+    Ok(ProjectorWeights {
+        weight_t: transpose(&weight)?,
+        bias,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quant::focrq::{FocrqBuilder, WriteDType};
 
     fn assert_err_contains<T>(res: FocrResult<T>, needle: &str) {
         let message = match res {
@@ -239,6 +307,29 @@ mod tests {
             message.contains(needle),
             "error {message:?} did not contain {needle:?}"
         );
+    }
+
+    fn weights_with_tiny_projector(bias_len: Option<usize>) -> Weights {
+        let mut builder = FocrqBuilder::new();
+        builder
+            .add_tensor(
+                "model.projector.layers.weight",
+                WriteDType::F32,
+                vec![1, 1],
+                0.0f32.to_le_bytes().to_vec(),
+            )
+            .expect("add projector weight");
+        if let Some(len) = bias_len {
+            builder
+                .add_tensor(
+                    "model.projector.layers.bias",
+                    WriteDType::F32,
+                    vec![len],
+                    vec![0; len * std::mem::size_of::<f32>()],
+                )
+                .expect("add projector bias");
+        }
+        Weights::from_bytes(builder.build()).expect("synthetic projector weights load")
     }
 
     /// Concat order is CLIP-first / SAM-second, with the CLIP CLS row dropped.
@@ -393,6 +484,13 @@ mod tests {
 
         let y = project(&x, &w, Some(&bias))?;
         assert_eq!(y.shape(), (n, PROJ_OUT));
+        let wt = transpose(&w)?;
+        let cached = project_transposed(&x, &wt, Some(&bias))?;
+        assert_eq!(
+            y.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            cached.data.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "pretransposing once must preserve every projector output bit"
+        );
 
         // y[r, o] = x[r, o] (+ bias[o]).
         assert!((y.get(0, 0) - 1.0).abs() < 1e-5);
@@ -498,6 +596,22 @@ mod tests {
         let sam = Mat::zeros(SAM_WIDTH, TOKENS_PER_VIEW);
         let r = forward(&w, &clip, &sam);
         assert!(matches!(r, Err(FocrError::FormatMismatch(_))));
+    }
+
+    #[test]
+    fn projector_params_requires_bias_tensor() {
+        let weights = weights_with_tiny_projector(None);
+        let err = projector_params(&weights).expect_err("missing affine bias must fail closed");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(err.to_string().contains("model.projector.layers.bias"));
+    }
+
+    #[test]
+    fn projector_params_rejects_wrong_bias_length() {
+        let weights = weights_with_tiny_projector(Some(PROJ_OUT - 1));
+        let err = projector_params(&weights).expect_err("malformed affine bias must fail closed");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(err.to_string().contains("expected 1280"));
     }
 
     #[test]

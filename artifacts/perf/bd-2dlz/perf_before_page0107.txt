@@ -1,0 +1,7 @@
+# BEFORE bd-2dlz — committed HEAD (bd-3bom): f32 lm_head, SERIAL per-head attn, full-N seed head.
+# got-ocr2.int8.focrq, page_0107.png, Apple M4 (aarch64+neon+dotprod), 688 tokens.
+
+[focr-timing]   got.vision+splice 5.84s
+[focr-timing]   decode 688 tok in 28.74s (23.9 tok/s) | seed(prefill) 1.16s | layers 12.49s (attn 4.90s, gemv+misc 7.59s) | lm_head 16.18s
+[focr-timing]   got.generate 688 tokens 30.07s
+[focr-timing] got forward 35.93s

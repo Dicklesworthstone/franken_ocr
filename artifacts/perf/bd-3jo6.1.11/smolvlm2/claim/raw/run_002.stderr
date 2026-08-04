@@ -1,0 +1,4 @@
+[focr-timing]   smolvlm2.vision+splice 11.52s (13 frames, 876 prompt ids)
+[focr-timing]   decode 312 tok in 6.49s (48.1 tok/s) | seed(prefill 876 tok) 0.91s | layers 4.62s (attn 1.66s, gemv+misc 2.96s) | lm_head 1.86s
+[focr-timing]   smolvlm2.generate 312 tokens 7.53s
+[focr-timing] smolvlm2 forward 19.06s

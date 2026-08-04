@@ -1,0 +1,31 @@
+{
+  "tag": "warmup_1",
+  "command": [
+    "/private/tmp/cc_tgt_dev/release/focr",
+    "ocr",
+    "tests/fixtures/got/sample_text.png",
+    "--model",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2/got-ocr2.int8.focrq"
+  ],
+  "exit_code": 0,
+  "wall_ms": 7010.581,
+  "stdout": "warmup_1.stdout",
+  "stderr": "warmup_1.stderr",
+  "binary": "/private/tmp/cc_tgt_dev/release/focr",
+  "binary_sha256": "ce670b644f987abc1fc258e864a9c49850309cdf66ace98b9f837a84b428fed2",
+  "page": "tests/fixtures/got/sample_text.png",
+  "page_sha256": "9eab4707e571d389c3fcb5777caebb093a7e682f4e3caa7cab14a706ae118e18",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2/got-ocr2.int8.focrq",
+  "threads": 8,
+  "warmup": 1,
+  "env_pins": {
+    "FOCR_TIMING": "1",
+    "FOCR_THREADS": "8",
+    "OMP_NUM_THREADS": "8",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "focr_env": {
+    "FOCR_THREADS": "8",
+    "FOCR_TIMING": "1"
+  }
+}

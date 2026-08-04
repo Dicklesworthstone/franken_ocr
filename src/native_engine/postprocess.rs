@@ -385,13 +385,64 @@ fn assemble_page(text: &str, img_base: &str) -> String {
 
     let mut out = text.to_string();
     for (idx, m) in images.iter().enumerate() {
-        let replacement = format!("![](images/{img_base}{idx}.jpg)\n");
+        let replacement = format!("{}\n", image_md_token(img_base, idx));
         out = out.replace(&m.full, &replacement);
     }
     for m in &others {
         out = out.replace(&m.full, "");
     }
     normalize_colon_equals(&out)
+}
+
+/// The exact markdown image token `assemble_page` emits for the `idx`-th image
+/// span of a page (its trailing `\n` is added by the caller). The ONE place the
+/// `images/{img_base}{idx}.jpg` path shape is defined, so the figure-extraction
+/// enumerator ([`figure_refs`]) and the markdown writer can never disagree.
+fn image_md_token(img_base: &str, idx: usize) -> String {
+    format!("![](images/{img_base}{idx}.jpg)")
+}
+
+/// One image/figure span the model grounded but did NOT transcribe to text — the
+/// regions [`finalize`] renders as `![](images/…)` placeholders. Surfaced so a
+/// caller can crop the region out of the source image and write a real file
+/// ([`OcrModel::recognize_with_figures`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FigureRef {
+    /// 0-based index among the page's image spans — the `idx` in the markdown
+    /// reference, matching [`assemble_page`]'s enumeration exactly.
+    pub index: usize,
+    /// The ref label (`image` for the standard figure span).
+    pub label: String,
+    /// Pixel boxes `[x1, y1, x2, y2]` rescaled to the source `(image_w, image_h)`.
+    pub boxes: Vec<[i64; 4]>,
+    /// The exact markdown token the rendered document uses for this figure
+    /// (`![](images/{img_base}{index}.jpg)`), so a writer can string-replace it
+    /// with a real `![alt](path)` reference without re-deriving the path.
+    pub markdown_ref: String,
+}
+
+/// Enumerate a page's image/figure spans (the `is_image()` ref spans) in the SAME
+/// order [`assemble_page`] indexes them, returning each one's pixel boxes (rescaled
+/// to `(image_w, image_h)`) and the exact markdown token it appears as. `img_base`
+/// must match the value passed to `assemble_page` for this page (`""` single-page,
+/// `"page_{n}_"` multi-page) so `markdown_ref` lands on the right token.
+///
+/// This shares [`re_match`] + [`RefMatch::is_image`] with `assemble_page`, so the
+/// figures a caller crops are byte-for-byte the ones the markdown references.
+#[must_use]
+pub fn figure_refs(decoded: &str, image_w: u32, image_h: u32, img_base: &str) -> Vec<FigureRef> {
+    let stripped = strip_eos(decoded);
+    re_match(&stripped)
+        .into_iter()
+        .filter(RefMatch::is_image)
+        .enumerate()
+        .map(|(index, m)| FigureRef {
+            index,
+            boxes: m.rescaled_boxes(image_w, image_h),
+            label: m.label,
+            markdown_ref: image_md_token(img_base, index),
+        })
+        .collect()
 }
 
 fn normalize_colon_equals(text: &str) -> String {
@@ -452,6 +503,71 @@ pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
     }
     let body = processed.join("\n<PAGE>\n");
     Ok(format!("<PAGE>\n{body}"))
+}
+
+/// Incremental `<PAGE>`-boundary scanner for STREAMING multi-page decodes
+/// (bd-2z0y): fed the full decoded-so-far text, it emits each page body as
+/// soon as the NEXT page's marker arrives (page k is complete when marker
+/// k+1 appears; the final page completes at end-of-decode via
+/// [`PageStream::finish`]).
+///
+/// Pure string logic — the token→text decode happens in the caller — so the
+/// boundary semantics are unit-tested without a tokenizer. Mirrors
+/// [`finalize_multi`]'s split contract: text before the FIRST marker is
+/// discarded (the reference `split('<PAGE>')[1:]`), and streamed bodies are
+/// `.trim()`-ed raw model text (the polished per-page markdown still comes
+/// from the terminal [`finalize_multi`] assembly).
+#[derive(Debug, Default)]
+pub struct PageStream {
+    /// Byte offset just past the last CONSUMED marker (the current page's
+    /// body starts here). `None` until the first marker arrives.
+    body_start: Option<usize>,
+    /// 1-based index of the page currently being decoded.
+    current_page: usize,
+}
+
+impl PageStream {
+    /// Fresh scanner (no marker seen yet).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Scan `full_text` (the ENTIRE decoded text so far — the caller may call
+    /// this as often or as rarely as it likes; the scanner is idempotent over
+    /// already-seen prefixes) and emit every newly COMPLETED page body.
+    pub fn feed(&mut self, full_text: &str, mut on_page: impl FnMut(usize, &str)) {
+        loop {
+            match self.body_start {
+                None => {
+                    // Waiting for the FIRST marker (page 1's start).
+                    let Some(pos) = full_text.find(PAGE_MARKER) else {
+                        return;
+                    };
+                    self.body_start = Some(pos + PAGE_MARKER.len());
+                    self.current_page = 1;
+                }
+                Some(start) => {
+                    let Some(rel) = full_text[start..].find(PAGE_MARKER) else {
+                        return;
+                    };
+                    let end = start + rel;
+                    on_page(self.current_page, full_text[start..end].trim());
+                    self.body_start = Some(end + PAGE_MARKER.len());
+                    self.current_page += 1;
+                }
+            }
+        }
+    }
+
+    /// End of decode: emit the final in-flight page (marker seen, no
+    /// successor marker). A decode that never emitted a marker emits nothing
+    /// (matching [`finalize_multi`] discarding pre-marker text).
+    pub fn finish(self, full_text: &str, mut on_page: impl FnMut(usize, &str)) {
+        if let Some(start) = self.body_start {
+            on_page(self.current_page, full_text[start..].trim());
+        }
+    }
 }
 
 /// Parse the layout (ref/det spans) from raw decoded text and return each span's
@@ -671,6 +787,53 @@ mod tests {
     }
 
     #[test]
+    fn page_stream_streams_bodies_as_markers_arrive() {
+        let mut ps = PageStream::new();
+        let mut got: Vec<(usize, String)> = Vec::new();
+        // Incremental growth: nothing before the first marker; page 1 lands
+        // only when marker 2 arrives; idempotent over re-fed prefixes.
+        ps.feed("preamble ", |i, s| got.push((i, s.to_string())));
+        assert!(got.is_empty());
+        ps.feed("preamble <PAGE>\nalpha", |i, s| {
+            got.push((i, s.to_string()))
+        });
+        assert!(got.is_empty(), "page 1 is still in flight");
+        let text = "preamble <PAGE>\nalpha\n<PAGE>\nbeta";
+        ps.feed(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(got, vec![(1, "alpha".to_string())]);
+        ps.feed(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(got.len(), 1, "re-feeding the same text must not re-emit");
+        ps.finish(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(
+            got,
+            vec![(1, "alpha".to_string()), (2, "beta".to_string())],
+            "finish flushes the final in-flight page"
+        );
+        println!(r#"{{"check":"page_stream_boundaries","pages":2,"result":"pass"}}"#);
+    }
+
+    #[test]
+    fn page_stream_without_markers_streams_nothing() {
+        // Mirrors finalize_multi's split()[1:] — pre-marker text is discarded.
+        let ps = PageStream::new();
+        let mut got = 0usize;
+        ps.finish("no markers at all", |_, _| got += 1);
+        assert_eq!(got, 0);
+    }
+
+    #[test]
+    fn page_stream_marker_split_across_feeds_is_caught() {
+        // The caller re-feeds the FULL text, so a marker that was previously
+        // truncated mid-bytes ("<PA") completes on a later feed.
+        let mut ps = PageStream::new();
+        let mut got: Vec<usize> = Vec::new();
+        ps.feed("<PAGE>one <PA", |i, _| got.push(i));
+        assert!(got.is_empty());
+        ps.feed("<PAGE>one <PAGE>two", |i, _| got.push(i));
+        assert_eq!(got, vec![1]);
+    }
+
+    #[test]
     fn finalize_multi_splits_and_rejoins_pages() {
         // leading text before first <PAGE> is dropped; two pages rejoined.
         let raw = format!("preamble<PAGE>page one text<PAGE>page two text{EOS_MARKER}");
@@ -732,5 +895,48 @@ mod tests {
         let raw = format!("# Title\n\nSome **markdown** body.\n{EOS_MARKER}");
         let md = finalize(&raw, 640, 480).unwrap();
         assert_eq!(md, "# Title\n\nSome **markdown** body.");
+    }
+
+    #[test]
+    fn figure_refs_enumerate_image_spans_with_tokens_matching_assemble_page() {
+        // A non-image span (dropped) + two image spans (the figures), with DISTINCT
+        // boxes (real pages never repeat a box; identical spans would collapse under
+        // assemble_page's Python `str.replace` semantics). The full-frame box
+        // `[0,0,999,999]` rescales EXACTLY to the image dims.
+        let decoded = concat!(
+            "<|ref|>title<|/ref|><|det|>[[0,0,500,500]]<|/det|>",
+            "<|ref|>image<|/ref|><|det|>[[0,0,999,999]]<|/det|>",
+            "<|ref|>image<|/ref|><|det|>[[0,0,499,499]]<|/det|>",
+        );
+        let refs = figure_refs(decoded, 200, 100, "");
+        assert_eq!(refs.len(), 2, "only the two image spans are figures");
+        assert_eq!(refs[0].index, 0);
+        assert_eq!(refs[0].label, "image");
+        assert_eq!(refs[0].markdown_ref, "![](images/0.jpg)");
+        assert_eq!(refs[0].boxes, vec![[0, 0, 200, 100]]);
+        assert_eq!(refs[1].index, 1);
+        assert_eq!(refs[1].markdown_ref, "![](images/1.jpg)");
+
+        // The tokens are EXACTLY what the rendered markdown contains.
+        let md = finalize(decoded, 200, 100).unwrap();
+        assert!(md.contains(&refs[0].markdown_ref), "md: {md}");
+        assert!(md.contains(&refs[1].markdown_ref), "md: {md}");
+    }
+
+    #[test]
+    fn figure_refs_multipage_prefix_matches_assemble_page() {
+        let decoded = "<|ref|>image<|/ref|><|det|>[[1,2,3,4]]<|/det|>";
+        let refs = figure_refs(decoded, 999, 999, "page_0_");
+        assert_eq!(refs.len(), 1);
+        assert_eq!(refs[0].markdown_ref, "![](images/page_0_0.jpg)");
+        // Matches the multi-page markdown emitter.
+        let md = finalize_multi(&format!("<PAGE>\n{decoded}"), 1).unwrap();
+        assert!(md.contains("![](images/page_0_0.jpg)"), "md: {md}");
+    }
+
+    #[test]
+    fn figure_refs_empty_without_image_spans() {
+        let decoded = "<|ref|>title<|/ref|><|det|>[[0,0,9,9]]<|/det|>plain text";
+        assert!(figure_refs(decoded, 100, 100, "").is_empty());
     }
 }

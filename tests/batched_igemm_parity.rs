@@ -31,7 +31,7 @@
 //! the force actually changed the dispatched kernel, so the sweep is
 //! self-verifying rather than silently testing the same tier N times.
 
-use franken_ocr::simd::{IsaTier, detected_tier, igemm_s8s8, igemm_u8s8};
+use franken_ocr::simd::{IsaTier, detected_tier, effective_dense_route, igemm_s8s8, igemm_u8s8};
 
 /// Deterministic xorshift64 PRNG — reproducible, no dev-dependency.
 struct Rng(u64);
@@ -141,7 +141,7 @@ fn batched_m_equals_per_row_gemv_s8s8() {
                         &batched[r * n..(r + 1) * n],
                         &single[..],
                         "S8S8 batched row {r} != standalone m=1 GEMV (tier {}, m={m} k={k} n={n})",
-                        detected_tier().tag()
+                        effective_dense_route().tag()
                     );
                 }
 
@@ -150,7 +150,10 @@ fn batched_m_equals_per_row_gemv_s8s8() {
                 assert_fits_and_matches(
                     &batched,
                     &oracle,
-                    &format!("S8S8 m={m} k={k} n={n} tier={}", detected_tier().tag()),
+                    &format!(
+                        "S8S8 m={m} k={k} n={n} route={}",
+                        effective_dense_route().tag()
+                    ),
                 );
             }
         }
@@ -177,7 +180,7 @@ fn batched_m_equals_per_row_gemv_u8s8() {
                         &batched[r * n..(r + 1) * n],
                         &single[..],
                         "U8S8 batched row {r} != standalone m=1 GEMV (tier {}, m={m} k={k} n={n})",
-                        detected_tier().tag()
+                        effective_dense_route().tag()
                     );
                 }
 
@@ -185,7 +188,10 @@ fn batched_m_equals_per_row_gemv_u8s8() {
                 assert_fits_and_matches(
                     &batched,
                     &oracle,
-                    &format!("U8S8 m={m} k={k} n={n} tier={}", detected_tier().tag()),
+                    &format!(
+                        "U8S8 m={m} k={k} n={n} route={}",
+                        effective_dense_route().tag()
+                    ),
                 );
             }
         }
@@ -237,7 +243,7 @@ fn batched_worst_case_k_i64_oracle_s8s8() {
                 &oracle,
                 &format!(
                     "S8S8 worst-K random m={m} n={n} tier={}",
-                    detected_tier().tag()
+                    effective_dense_route().tag()
                 ),
             );
 
@@ -274,7 +280,7 @@ fn batched_worst_case_k_i64_oracle_u8s8() {
                 &oracle,
                 &format!(
                     "U8S8 worst-K random m={m} n={n} tier={}",
-                    detected_tier().tag()
+                    effective_dense_route().tag()
                 ),
             );
 
@@ -305,7 +311,12 @@ fn batched_worst_case_k_i64_oracle_u8s8() {
 #[test]
 fn forced_tier_takes_effect() {
     let tier = detected_tier();
-    eprintln!("[batched_igemm_parity] dispatched tier = {}", tier.tag());
+    let route = effective_dense_route();
+    eprintln!(
+        "[batched_igemm_parity] hardware tier = {}; effective route = {}",
+        tier.tag(),
+        route.tag()
+    );
     let Ok(force) = std::env::var("FOCR_FORCE_ARCH") else {
         return; // natural selection — nothing to assert.
     };
@@ -316,6 +327,11 @@ fn forced_tier_takes_effect() {
             tier,
             IsaTier::Scalar,
             "FOCR_FORCE_ARCH=scalar must dispatch the scalar floor"
+        );
+        assert_eq!(
+            route.tag(),
+            "scalar",
+            "FOCR_FORCE_ARCH=scalar must execute the scalar floor"
         );
         return;
     }
@@ -329,6 +345,11 @@ fn forced_tier_takes_effect() {
             tier.tag(),
             want,
             "FOCR_FORCE_ARCH={want} is host-available but was not dispatched"
+        );
+        assert_eq!(
+            route.tag(),
+            want,
+            "FOCR_FORCE_ARCH={want} is available but did not reach that implementation"
         );
     }
 }

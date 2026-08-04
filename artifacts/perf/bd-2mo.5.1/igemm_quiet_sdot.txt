@@ -1,0 +1,6 @@
+test s8s8_attn_proj_decode_m1   ... bench:      93,774.81 ns/iter (+/- 2,061.47)
+test s8s8_attn_proj_prefill_m16 ... bench:     672,147.90 ns/iter (+/- 7,286.70)
+test s8s8_down_decode_m1        ... bench:     511,095.05 ns/iter (+/- 30,133.39)
+test s8s8_down_prefill_m16      ... bench:   3,590,179.20 ns/iter (+/- 171,746.61)
+test s8s8_gate_up_decode_m1     ... bench:     505,927.34 ns/iter (+/- 6,612.71)
+test s8s8_gate_up_prefill_m16   ... bench:   3,613,625.00 ns/iter (+/- 61,874.30)

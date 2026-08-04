@@ -1,0 +1,89 @@
+{
+  "schema": "focr-gauntlet-row/v1",
+  "created_utc": "2026-07-06T00:04:56Z",
+  "inputs": {
+    "focr_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/smolvlm2/focr/focr_stages.json",
+      "sha256": "ce36702c62e033013dc839df9cceeda052ad85dc6739f0c011c946f3bdf4a6fd"
+    },
+    "ref_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/smolvlm2/ref_stages.json",
+      "sha256": "1a8b94ab9b1ac595b39fb44133ea960218d2e205405f07f290a3c6c40eff2e9a"
+    },
+    "roofline": {
+      "path": "artifacts/perf/bd-3jo6.1.11/smolvlm2/roofline.json",
+      "sha256": "45076430538676c2d016c49445f57575115e126414ac637e354d78926be04019"
+    }
+  },
+  "rows": [
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-smolvlm2-int8-samplephoto-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/smolvlm2/claim",
+      "model_commit": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct@sha256:b9bfd456c947",
+      "fixture_hash": "page=tests/fixtures/smolvlm2/sample_photo.png sha256=c69c42d3ff66849c8e3d45170484f4e133dc00552d5049c7e2b13ee232bed9f6; weights=smolvlm2.int8.focrq sha256=4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc (f32 source model.safetensors sha256=b9bfd456c9472c0acd5719d6e514c4b859891af205ee1a736552fd3497b8b0c3)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "prefill",
+      "reference_backend": "hf",
+      "focr_ms": "910.000",
+      "ref_ms": "526.144",
+      "ratio": "0.578",
+      "floor_kind": "compute",
+      "floor_ms": "412.070",
+      "dist_above_floor": "2.21",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/smolvlm2/sample_photo.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2/smolvlm2.int8.focrq [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/smolvlm2/sample_photo.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2 --backend hf --precision f32 --entry gauntlet_ref_zoo:run_smolvlm2 --setup gauntlet_ref_zoo:setup_smolvlm2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/smolvlm2/ref_stages.json [torch==2.10.0 transformers==4.57.1]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "SmolVLM2 C8 certs (bd-3jo6.3.8): L4 describe ledger-gated (DISC-003 attribution gate) + L5 VQA 7/7 BOTH precisions (src/native_engine/smolvlm2.rs); smolvlm2_describe_e2e.sh PASS on this sample_photo.png",
+      "notes": "A11 zoo lane; ref = HF AutoModelForImageTextToText f32 CPU greedy describe under the truth-pack stack (certs used 4.57.6; 4.57.1 same minor, recorded); token counts differ (focr 312 vs ref 388 \u2014 DISC-002/003 near-tie trajectories), decode-per-token normalizes; focr e2e = process wall INCL 1.0GB artifact load, ref e2e excludes load (bias favors ref)"
+    },
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-smolvlm2-int8-samplephoto-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/smolvlm2/claim",
+      "model_commit": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct@sha256:b9bfd456c947",
+      "fixture_hash": "page=tests/fixtures/smolvlm2/sample_photo.png sha256=c69c42d3ff66849c8e3d45170484f4e133dc00552d5049c7e2b13ee232bed9f6; weights=smolvlm2.int8.focrq sha256=4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc (f32 source model.safetensors sha256=b9bfd456c9472c0acd5719d6e514c4b859891af205ee1a736552fd3497b8b0c3)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "decode-per-token",
+      "reference_backend": "hf",
+      "focr_ms": "20.641",
+      "ref_ms": "34.544",
+      "ratio": "1.674",
+      "floor_kind": "memory",
+      "floor_ms": "4.912",
+      "dist_above_floor": "4.20",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/smolvlm2/sample_photo.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2/smolvlm2.int8.focrq [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/smolvlm2/sample_photo.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2 --backend hf --precision f32 --entry gauntlet_ref_zoo:run_smolvlm2 --setup gauntlet_ref_zoo:setup_smolvlm2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/smolvlm2/ref_stages.json [torch==2.10.0 transformers==4.57.1]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "SmolVLM2 C8 certs (bd-3jo6.3.8): L4 describe ledger-gated (DISC-003 attribution gate) + L5 VQA 7/7 BOTH precisions (src/native_engine/smolvlm2.rs); smolvlm2_describe_e2e.sh PASS on this sample_photo.png",
+      "notes": "A11 zoo lane; ref = HF AutoModelForImageTextToText f32 CPU greedy describe under the truth-pack stack (certs used 4.57.6; 4.57.1 same minor, recorded); token counts differ (focr 312 vs ref 388 \u2014 DISC-002/003 near-tie trajectories), decode-per-token normalizes; focr e2e = process wall INCL 1.0GB artifact load, ref e2e excludes load (bias favors ref)"
+    },
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-smolvlm2-int8-samplephoto-20260705",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/smolvlm2/claim",
+      "model_commit": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct@sha256:b9bfd456c947",
+      "fixture_hash": "page=tests/fixtures/smolvlm2/sample_photo.png sha256=c69c42d3ff66849c8e3d45170484f4e133dc00552d5049c7e2b13ee232bed9f6; weights=smolvlm2.int8.focrq sha256=4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc (f32 source model.safetensors sha256=b9bfd456c9472c0acd5719d6e514c4b859891af205ee1a736552fd3497b8b0c3)",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "end-to-end",
+      "reference_backend": "hf",
+      "focr_ms": "19074.781",
+      "ref_ms": "16749.504",
+      "ratio": "0.878",
+      "floor_kind": "compute",
+      "floor_ms": "6886.843",
+      "dist_above_floor": "2.77",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/smolvlm2/sample_photo.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2/smolvlm2.int8.focrq [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/smolvlm2/sample_photo.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2 --backend hf --precision f32 --entry gauntlet_ref_zoo:run_smolvlm2 --setup gauntlet_ref_zoo:setup_smolvlm2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/smolvlm2/ref_stages.json [torch==2.10.0 transformers==4.57.1]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "SmolVLM2 C8 certs (bd-3jo6.3.8): L4 describe ledger-gated (DISC-003 attribution gate) + L5 VQA 7/7 BOTH precisions (src/native_engine/smolvlm2.rs); smolvlm2_describe_e2e.sh PASS on this sample_photo.png",
+      "notes": "A11 zoo lane; ref = HF AutoModelForImageTextToText f32 CPU greedy describe under the truth-pack stack (certs used 4.57.6; 4.57.1 same minor, recorded); token counts differ (focr 312 vs ref 388 \u2014 DISC-002/003 near-tie trajectories), decode-per-token normalizes; focr e2e = process wall INCL 1.0GB artifact load, ref e2e excludes load (bias favors ref)"
+    }
+  ]
+}

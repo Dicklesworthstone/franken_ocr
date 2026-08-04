@@ -1,0 +1,20 @@
+{
+  "generator": "scripts/gen_got_format_corpus.py",
+  "seed": 3141,
+  "versions": {
+    "python": "3.12.12",
+    "matplotlib": "3.11.0",
+    "pillow": "12.3.0",
+    "rdkit": "2026.03.3",
+    "cairosvg": "2.9.0",
+    "verovio": "6.2.1-8d42439"
+  },
+  "sha256": {
+    "formula.png": "6839f439acb5f2a9df1c1df76fd37f70c78f7387c21a2cfcdf86ebb62bdb6307",
+    "table.png": "c36ebbb1d90159521795dc8fde835a3bed5a63eb1878a6aa65a9fcb3beb42042",
+    "chart.png": "ea4daacb78dfafd60259def5e000bef48ecc12922248ebdfade15ae7cbc068df",
+    "molecule.png": "cf587909a4c1c553504bf35b77c93ec7332a627cfb1458a40359555800e31d4c",
+    "music.png": "0a0a292aa3211e0e690dc1b81c34858407b5bb0a195dc7e179c2d570a69a93fd"
+  },
+  "skipped": []
+}

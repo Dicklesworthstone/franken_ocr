@@ -1,0 +1,30 @@
+schema: focr-page0590-precision-attribution/v1
+date_utc: 2026-07-10T08:20:44Z
+source_head: 58cf4e196e787fff8a2e83b2d5478541c64a3ee4 plus bd-2mo.30 worktree
+cpu: Apple M4 arm64
+threads: FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8
+model_recipe: conservative FFN/expert-only int8; attention and lm_head high precision
+max_length: 12000
+
+inputs:
+  binary: /Volumes/USBNVME16TB/temp_agent_space/pgo-base-20260710T073736Z/release-perf/focr
+  binary_size: 18184232
+  binary_sha256: 68990f7361e8763b19e0135e55e61a0ac54e7942b887162b0dfe6bf7dc78cfe8
+  model: /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model/unlimited-ocr.recipe-v1.20260709T2304.focrq
+  model_size: 4157448783
+  model_sha256: 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+  page: /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0590.png
+  page_size: 916081
+  page_sha256: 6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3
+  bf16_reference: /Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/baseline_out/page_0590.md
+  bf16_reference_size: 19021
+  bf16_reference_sha256: 6542b1d31b64103e9a56104738bf9038487877e8408b8ac34d8d10d1f5d2c8cd
+
+common_env: FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000
+sanitized_env: FOCR_DECODE_INT8 FOCR_INT8_ATTN FOCR_INT8_LMHEAD FOCR_INT8_KV FOCR_FORCE_ARCH FOCR_NO_MMAP FOCR_PREFILL_CHUNK
+
+conservative_command: env -u FOCR_DECODE_INT8 -u FOCR_INT8_ATTN -u FOCR_INT8_LMHEAD -u FOCR_INT8_KV -u FOCR_FORCE_ARCH -u FOCR_NO_MMAP -u FOCR_PREFILL_CHUNK FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 gtimeout 650 /usr/bin/time -p <binary> ocr <page> --model <model> --max-length 12000 -o conservative.md
+full_int8_command: env -u FOCR_INT8_KV -u FOCR_FORCE_ARCH -u FOCR_NO_MMAP -u FOCR_PREFILL_CHUNK FOCR_DECODE_INT8=1 FOCR_INT8_ATTN=1 FOCR_INT8_LMHEAD=1 FOCR_THREADS=8 RAYON_NUM_THREADS=8 OMP_NUM_THREADS=8 FOCR_RSWA_PARALLEL_ATTN=1 FOCR_TIMING=1 FOCR_PROFILE_DECODE=1 FOCR_STAGE_BUDGET_FORWARD_MS=7200000 gtimeout 650 /usr/bin/time -p <binary> ocr <page> --model <model> --max-length 12000 -o full-int8.md
+comparison_command: python3 scripts/baseline/compare_ocr.py --ref <bf16_reference> --hyp <output.md> --json <comparison.json>
+
+interpretation: diagnostic attribution only; full-int8 is experimental and cannot be promoted while OQ-14 is unresolved.

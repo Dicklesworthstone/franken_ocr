@@ -25,7 +25,15 @@
 //! **L0 parity = exact.** Where a Rust image-op cannot be bit-identical to PIL
 //! (the resampling kernel), the divergence is named in a comment and routed to
 //! the closest available filter; the *geometry* (tile counts, sizes, placeholder
-//! census) is exact.
+//! census) is exact. The one non-geometric divergence — CatmullRom in place of
+//! PIL BICUBIC — is ledgered as DISC-001 (`docs/DISCREPANCIES.md`, bd-30me) and
+//! carries a kill-switch: `FOCR_RESAMPLE=pil-bicubic` swaps every resize site
+//! onto [`pil_resample`], a Pillow-bit-exact fixed-point BICUBIC, for L0 EXACT
+//! oracle comparison. The default stays CatmullRom (byte-identical to the
+//! pre-DISC-001 pipeline, doctrine #2).
+
+pub mod pil_resample;
+pub mod staff_detect;
 
 use std::path::Path;
 
@@ -300,8 +308,10 @@ pub fn preprocess_bytes(bytes: &[u8], mode: PreprocessMode) -> FocrResult<Prepro
 /// Core pipeline over an already-decoded (EXIF-applied, any color) image.
 ///
 /// Split out from the I/O so the tiling/normalization math is unit-testable
-/// without touching the filesystem ([SPEC-022..031]).
-fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Preprocessed> {
+/// without touching the filesystem ([SPEC-022..031]), and so an in-memory image
+/// (e.g. a PDF page rasterized by [`crate::pdf`]) can enter the pipeline without
+/// a temp file, identically to a decoded file.
+pub fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Preprocessed> {
     let original_size = img.dimensions();
     let validated = validate_mode(mode)?;
 
@@ -319,6 +329,41 @@ fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Pre
         global,
         tiles,
         crop_grid,
+        original_size,
+    })
+}
+
+/// Multi-page per-page preprocess (bd-1gv.25/bd-1gv.26): the reference
+/// `infer_multi` SQUASHES each page to `size × size` when `image_size <= 640`
+/// (`image.resize((image_size, image_size))` — aspect-DESTROYING, unlike the
+/// single-image Base mode's aspect-preserving `ImageOps.pad`), then the
+/// already-square view passes the pad untouched. The multi-page oracle run
+/// caught this divergence: padding instead of squashing garbles the glyph
+/// geometry the model was trained to read in multi-page mode.
+///
+/// Same normalize as Base mode (the 0.5/0.5 transform in [`view_tensor`]);
+/// the resample kernel follows [`resample_kind`] (CatmullRom shipped,
+/// `FOCR_RESAMPLE=pil-bicubic` for oracle-exact comparison — DISC-001).
+///
+/// # Errors
+/// Rejects a non-positive `base_size` exactly like [`preprocess_dynamic`].
+pub fn preprocess_dynamic_squash(img: DynamicImage, base_size: usize) -> FocrResult<Preprocessed> {
+    let mode = PreprocessMode::Base { base_size };
+    let validated = validate_mode(mode)?;
+    let original_size = img.dimensions();
+    // PIL-faithful bicubic UNCONDITIONALLY at this site (not the
+    // env-keyed [`resample_exact`]): at the multi-page 2.9x squash the
+    // shipped CatmullRom kernel measurably garbles glyphs into OCR junk,
+    // while the PIL kernel reproduces the reference plate text byte-exactly
+    // (bd-1gv.26 oracle run, page_0009+page_0014). Parity outranks the
+    // kernel-uniformity nicety (doctrine #1).
+    let squashed =
+        pil_resample::resize_bicubic(&img.to_rgb8(), validated.base_size, validated.base_size);
+    Ok(Preprocessed {
+        mode,
+        global: view_tensor(&squashed.into()),
+        tiles: Vec::new(),
+        crop_grid: CropGrid::single(),
         original_size,
     })
 }
@@ -367,7 +412,12 @@ fn validate_edge(name: &str, value: usize, max: usize) -> FocrResult<u32> {
 }
 
 /// Decode an image file into an EXIF-transposed [`DynamicImage`] ([SPEC-020]).
-fn decode_path(path: &Path) -> FocrResult<DynamicImage> {
+///
+/// `pub(crate)` so the figure-extraction path
+/// ([`crate::native_engine::OcrModel::recognize_with_figures`]) can re-decode the
+/// source with the EXACT same EXIF transform the forward used — the layout boxes
+/// are in this image's pixel space, so the crop must come from this same decode.
+pub(crate) fn decode_path(path: &Path) -> FocrResult<DynamicImage> {
     let reader = ImageReader::open(path)
         .map_err(|e| FocrError::InputDecode(format!("open {}: {e}", path.display())))?
         .with_guessed_format()
@@ -392,10 +442,90 @@ fn decode_reader<R: std::io::BufRead + std::io::Seek>(
     reader: ImageReader<R>,
 ) -> image::ImageResult<DynamicImage> {
     let mut decoder = reader.into_decoder()?;
+    // Decompression-bomb bound (bd-10sb.1 — found by the image_decode fuzz
+    // target on its FIRST bounded smoke): a 100-byte PNG declaring a 2^31+4
+    // height made `from_decoder` attempt a 38.6 GB allocation. Same 1 Gpx
+    // policy as the PDF raster path (`pdf.rs` MAX_PIXELS), enforced BEFORE
+    // any pixel allocation, plus the decoder's own internal limits.
+    const MAX_PIXELS: u64 = 1 << 30; // 1 Gpx (matches pdf.rs)
+    let (w, h) = decoder.dimensions();
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err(image::ImageError::Limits(
+            image::error::LimitError::from_kind(image::error::LimitErrorKind::DimensionError),
+        ));
+    }
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(1 << 17);
+    limits.max_image_height = Some(1 << 17);
+    limits.max_alloc = Some(4 << 30);
+    decoder.set_limits(limits)?;
     let orientation = decoder.orientation()?;
     let mut img = DynamicImage::from_decoder(decoder)?;
     img.apply_orientation(orientation);
     Ok(img)
+}
+
+// ── resample kernel selection (bd-30me, DISC-001) ───────────────────────────
+
+/// Kill-switch for the L0 resampling kernel (DISC-001, bd-30me). Unset (the
+/// default) keeps the shipped [`FilterType::CatmullRom`]; `pil-bicubic`
+/// restores the reference-bit-exact Pillow BICUBIC ([`pil_resample`]) at every
+/// resize site, for L0 EXACT comparison against the torch/PIL oracle.
+pub const RESAMPLE_ENV: &str = "FOCR_RESAMPLE";
+
+/// Which resampling kernel the preprocess resize sites use (see
+/// [`RESAMPLE_ENV`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResampleKind {
+    /// The shipped default: the `image` crate's Catmull-Rom cubic — the same
+    /// `a = -0.5` continuous kernel as PIL BICUBIC, but with clamp-at-edge
+    /// sampling and float accumulation, so NOT bit-identical (DISC-001).
+    CatmullRom,
+    /// The reference path: Pillow-bit-exact fixed-point BICUBIC
+    /// ([`pil_resample::resize_bicubic`]), for oracle-exact preprocessing.
+    PilBicubic,
+}
+
+/// Read the kernel selection from [`RESAMPLE_ENV`]. Re-read per resize (the
+/// pipeline resizes a handful of times per image, so there is no `OnceLock`
+/// cache to fight in tests or long-lived engine processes).
+#[must_use]
+pub fn resample_kind() -> ResampleKind {
+    resample_kind_from(std::env::var(RESAMPLE_ENV).ok().as_deref())
+}
+
+/// [`resample_kind`] over an explicit raw value (unit-testable without
+/// mutating the process environment). Unknown values keep the default — the
+/// same forgiving parse as the other `FOCR_*` toggles (`env_tristate`).
+fn resample_kind_from(raw: Option<&str>) -> ResampleKind {
+    match raw.map(str::trim) {
+        Some("pil-bicubic" | "pil_bicubic") => ResampleKind::PilBicubic,
+        _ => ResampleKind::CatmullRom,
+    }
+}
+
+/// Every preprocess resize funnels through here: `resize_exact` semantics
+/// with the kernel chosen by [`resample_kind`] ([SPEC-022/024], spec §13b).
+fn resample_exact(img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
+    resample_exact_with(resample_kind(), img, w, h)
+}
+
+/// [`resample_exact`] with the kernel pinned by the caller (unit-testable
+/// without env mutation).
+///
+/// The CatmullRom arm is the pre-DISC-001 call verbatim — same filter, same
+/// color-type behavior — so the default output is byte-identical (doctrine
+/// #2). The PIL arm converts to RGB *first*, because the oracle does: both
+/// `load_images` (`modeling_unlimitedocr.py:303`) and `GOTImageEvalProcessor`
+/// `.convert("RGB")` before resizing, so reference resampling happens in RGB
+/// space.
+fn resample_exact_with(kind: ResampleKind, img: &DynamicImage, w: u32, h: u32) -> DynamicImage {
+    match kind {
+        ResampleKind::CatmullRom => img.resize_exact(w, h, FilterType::CatmullRom),
+        ResampleKind::PilBicubic => {
+            DynamicImage::ImageRgb8(pil_resample::resize_bicubic(&img.to_rgb8(), w, h))
+        }
+    }
 }
 
 // ── global view: aspect-preserving resize + gray pad ([SPEC-022]) ───────────
@@ -404,9 +534,10 @@ fn decode_reader<R: std::io::BufRead + std::io::Seek>(
 /// center-pad the short axis with the mean gray color `(127,127,127)`
 /// ([SPEC-022], `modeling_unlimitedocr.py:872-873`).
 ///
-/// PIL `ImageOps.pad` uses `BICUBIC` resampling by default; we route to
-/// `CatmullRom` (the crate's cubic filter) — the closest available kernel. The
-/// pad geometry (fit + centered placement + gray fill) is exact.
+/// PIL `ImageOps.pad` uses `BICUBIC` resampling by default; the default kernel
+/// here is `CatmullRom` (DISC-001; `FOCR_RESAMPLE=pil-bicubic` restores the
+/// bit-exact reference). The pad geometry (fit + centered placement + gray
+/// fill) is exact.
 fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
     let (w, h) = img.dimensions();
     // Aspect-preserving fit: scale so the longer side == size.
@@ -420,7 +551,7 @@ fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
         let rw = pillow_fit_edge(w, h, size);
         (rw, size)
     };
-    let resized = img.resize_exact(rw, rh, FilterType::CatmullRom).to_rgb8();
+    let resized = resample_exact(img, rw, rh).to_rgb8();
 
     // Center on a gray canvas.
     let mut canvas = image::RgbImage::from_pixel(size, size, image::Rgb([PAD_FILL; 3]));
@@ -487,9 +618,10 @@ fn build_gundam_tiles(img: &DynamicImage, tile: u32) -> FocrResult<(Vec<ViewTens
     // Resize to (tile*W, tile*H), then crop a row-major W×H grid of tiles.
     let target_w = checked_tile_extent(tile, wc, "width")?;
     let target_h = checked_tile_extent(tile, hc, "height")?;
-    // PIL `image.resize((W,H))` default resample is BICUBIC; CatmullRom is the
-    // closest crate cubic. Tile geometry (crop boxes) is exact.
-    let resized = img.resize_exact(target_w, target_h, FilterType::CatmullRom);
+    // PIL `image.resize((W,H))` default resample is BICUBIC; the default kernel
+    // here is CatmullRom (DISC-001; FOCR_RESAMPLE=pil-bicubic restores the
+    // bit-exact reference). Tile geometry (crop boxes) is exact.
+    let resized = resample_exact(img, target_w, target_h);
 
     let cols = wc; // target_width // tile
     let blocks = wc * hc;
@@ -592,6 +724,215 @@ pub fn find_closest_aspect_ratio(
 /// `ToTensor` scales `u8` `[0,255]` -> `f32` `[0,1]`; `Normalize(mean=0.5,
 /// std=0.5)` maps to `[-1,1]` as `(v - 0.5) / 0.5 = 2v - 1`. Layout is
 /// channel-major (`rows=3`, `cols=H*W`), element `(c, y*W + x)`.
+/// GOT-OCR2's OpenAI/CLIP normalization mean (`GOTImageEvalProcessor`, spec §13b).
+pub const CLIP_MEAN: [f32; 3] = [0.481_454_66, 0.457_827_5, 0.408_210_73];
+/// GOT-OCR2's OpenAI/CLIP normalization std.
+pub const CLIP_STD: [f32; 3] = [0.268_629_54, 0.261_302_6, 0.275_777_1];
+/// GOT-OCR2 fixed input side (`image_size=1024`).
+pub const GOT_SIZE: u32 = 1024;
+
+/// GOT-OCR2 preprocess (`GOTImageEvalProcessor(image_size=1024)`): **squash**
+/// bicubic resize to 1024×1024 (NO aspect-preserve, NO pad) + CLIP-norm →
+/// `[3, 1024*1024]` channel-major, the exact tensor `vision_sam::forward` reads.
+///
+/// `CatmullRom ≈ PIL bicubic` is the one known sub-L0 divergence (spec §13b,
+/// DISC-001): the stats match the torch oracle to ~1e-4 but the resample is not
+/// bit-identical. `FOCR_RESAMPLE=pil-bicubic` restores the bit-exact kernel.
+///
+/// # Errors
+/// [`FocrError`] if the image cannot be decoded.
+pub fn preprocess_got(path: &Path) -> FocrResult<crate::native_engine::tensor::Mat> {
+    Ok(got_view_tensor(&decode_path(path)?))
+}
+
+// ── SmolVLM2 preprocess (C7, bd-3jo6.3.7) ───────────────────────────────────
+
+/// SmolVLM2 frame side (`preprocessor_config.json max_image_size.longest_edge`).
+const SMOLVLM2_FRAME: u32 = 512;
+/// SmolVLM2 step-1 long-side target (`size.longest_edge`) — always rescaled TO
+/// this, so still images are always split (spec §6).
+const SMOLVLM2_LONGEST: u32 = 2048;
+
+/// SmolVLM2 preprocess output: `n_frames` normalized 512² frames (tiles
+/// row-major, the global thumbnail LAST) + the tile grid the prompt builder
+/// needs for the `<row_r_col_c>` expansion.
+#[derive(Debug, Clone)]
+pub struct Smolvlm2Preprocessed {
+    /// `[n_frames, 3, 512, 512]` flat f32 (CHW per frame), the `x/255 → ±1`
+    /// normalized rail the SigLIP tower reads.
+    pub frames: Vec<f32>,
+    /// Tile grid + global frame count (`rows * cols + 1`).
+    pub n_frames: usize,
+    /// Tile rows (`R` in the `<row_r_col_c>` markers).
+    pub rows: usize,
+    /// Tile cols.
+    pub cols: usize,
+}
+
+/// SmolVLM2 preprocess (`SmolVLMImageProcessor`, spec §6) — an exact
+/// transcription of `image_processing_smolvlm.py`, every resize
+/// Pillow-bit-exact LANCZOS ([`pil_resample::resize_lanczos`]; `resample: 1`):
+///
+/// 1. `_resize_output_size_rescale_to_max_len`: longest edge → exactly 2048
+///    (up- OR down-scale), short edge `int()`-truncated then `+1 if odd`.
+/// 2. `resize_for_vision_encoder`: ceil each side to a 512 multiple (long
+///    side first, short side recomputed from the aspect then ceiled).
+/// 3. `split_image`: `R×C` exact 512² crops row-major, then the step-2 image
+///    resized (squashed) to 512×512 appended as the global frame LAST — the
+///    upstream global is the image split_image was handed, i.e. the
+///    512-multiple step-2 result.
+/// 4. Per frame: `u8 → f64·(1/255) → f32` (numpy `rescale` casts to f32),
+///    then `(x - 0.5) / 0.5` in f32 (numpy `normalize` runs at image dtype).
+///
+/// # Errors
+/// [`FocrError::Other`] on a degenerate (zero-sized) input image.
+pub fn preprocess_smolvlm2(img: &DynamicImage) -> FocrResult<Smolvlm2Preprocessed> {
+    let rgb = img.to_rgb8();
+    let (w0, h0) = rgb.dimensions();
+    if w0 == 0 || h0 == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "smolvlm2 preprocess: degenerate {w0}x{h0} input image"
+        )));
+    }
+
+    // Step 1: longest edge → exactly 2048 (aspect preserved; int() truncation
+    // + `+1 if odd` on the derived edge; min clamp 1). Transcribed from
+    // `_resize_output_size_rescale_to_max_len`.
+    let aspect = f64::from(w0) / f64::from(h0);
+    let (w2, h2) = if w0 >= h0 {
+        let w = SMOLVLM2_LONGEST;
+        let mut h = (f64::from(w) / aspect) as u32; // Python int() truncates
+        if !h.is_multiple_of(2) {
+            h += 1;
+        }
+        (w, h.max(1))
+    } else {
+        let h = SMOLVLM2_LONGEST;
+        let mut w = (f64::from(h) * aspect) as u32;
+        if !w.is_multiple_of(2) {
+            w += 1;
+        }
+        (w.max(1), h)
+    };
+    let long2048 = pil_resample::resize_lanczos(&rgb, w2, h2);
+
+    // Step 2: ceil to 512 multiples (`resize_for_vision_encoder` — long side
+    // ceiled first, short side recomputed from the SAME aspect then ceiled).
+    let ceil512 = |v: u32| v.div_ceil(SMOLVLM2_FRAME) * SMOLVLM2_FRAME;
+    let aspect2 = f64::from(w2) / f64::from(h2);
+    let (w3, h3) = if w2 >= h2 {
+        let w = ceil512(w2);
+        let h = ceil512((f64::from(w) / aspect2) as u32);
+        (w, h)
+    } else {
+        let h = ceil512(h2);
+        let w = ceil512((f64::from(h) * aspect2) as u32);
+        (w, h)
+    };
+    let ceiled512 = if (w3, h3) == (w2, h2) {
+        long2048.clone()
+    } else {
+        pil_resample::resize_lanczos(&long2048, w3, h3)
+    };
+
+    // Step 3: split into exact 512² tiles row-major + the global frame LAST.
+    // Step 1 always makes the long side 2048 > 512, so the split always
+    // engages (`split_image`'s no-split branch is unreachable here).
+    let rows = (h3 / SMOLVLM2_FRAME) as usize;
+    let cols = (w3 / SMOLVLM2_FRAME) as usize;
+    let n_frames = rows * cols + 1;
+    let side = SMOLVLM2_FRAME as usize;
+    let frame_len = 3 * side * side;
+    let mut frames = vec![0.0f32; n_frames * frame_len];
+
+    // The exact numpy rescale→normalize chain (f64 mul, f32 cast, f32 affine).
+    let norm = |px: u8| -> f32 {
+        let r = (f64::from(px) * (1.0 / 255.0)) as f32;
+        (r - 0.5) / 0.5
+    };
+    let mut write_frame = |idx: usize, tile: &image::RgbImage, ox: u32, oy: u32| {
+        let dst = &mut frames[idx * frame_len..(idx + 1) * frame_len];
+        for y in 0..side {
+            for x in 0..side {
+                let px = tile.get_pixel(ox + x as u32, oy + y as u32).0;
+                let s = y * side + x;
+                dst[s] = norm(px[0]);
+                dst[side * side + s] = norm(px[1]);
+                dst[2 * side * side + s] = norm(px[2]);
+            }
+        }
+    };
+    for r in 0..rows {
+        for c in 0..cols {
+            write_frame(
+                r * cols + c,
+                &ceiled512,
+                c as u32 * SMOLVLM2_FRAME,
+                r as u32 * SMOLVLM2_FRAME,
+            );
+        }
+    }
+    let global = pil_resample::resize_lanczos(&ceiled512, SMOLVLM2_FRAME, SMOLVLM2_FRAME);
+    write_frame(n_frames - 1, &global, 0, 0);
+
+    Ok(Smolvlm2Preprocessed {
+        frames,
+        n_frames,
+        rows,
+        cols,
+    })
+}
+
+/// [`preprocess_smolvlm2`] from an image file path.
+///
+/// # Errors
+/// [`FocrError`] if the image cannot be decoded, plus [`preprocess_smolvlm2`]'s.
+pub fn preprocess_smolvlm2_path(path: &Path) -> FocrResult<Smolvlm2Preprocessed> {
+    preprocess_smolvlm2(&decode_path(path)?)
+}
+
+/// OneChart preprocess (census §6, D3): the SAME squash-bicubic 1024² resize
+/// as GOT, but the Normalize is a NO-OP — pixels stay raw `[0,1]` (mean 0,
+/// std 1; the CLIP constants are NOT used). Returns `[3, 1024*1024]`
+/// channel-major. Shares GOT's CatmullRom≈PIL-bicubic sub-L0 divergence
+/// class (`FOCR_RESAMPLE=pil-bicubic` restores exactness; OQ-D3 re-derives
+/// the tolerance at raw-pixel scale).
+pub fn onechart_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
+    let rgb = resample_exact(img, GOT_SIZE, GOT_SIZE).to_rgb8();
+    let side = GOT_SIZE as usize;
+    let n = side * side;
+    let mut data = vec![0.0f32; 3 * n];
+    for y in 0..side {
+        for x in 0..side {
+            let px = rgb.get_pixel(x as u32, y as u32).0;
+            let s = y * side + x;
+            for c in 0..3 {
+                data[c * n + s] = f32::from(px[c]) / 255.0;
+            }
+        }
+    }
+    crate::native_engine::tensor::Mat::from_vec(3, n, data)
+}
+
+/// [`preprocess_got`] over an already-decoded image (shared with the CLI/tests).
+pub fn got_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
+    let rgb = resample_exact(img, GOT_SIZE, GOT_SIZE).to_rgb8();
+    let side = GOT_SIZE as usize;
+    let n = side * side;
+    let mut data = vec![0.0f32; 3 * n];
+    for y in 0..side {
+        for x in 0..side {
+            let px = rgb.get_pixel(x as u32, y as u32).0;
+            let s = y * side + x;
+            for c in 0..3 {
+                let v = f32::from(px[c]) / 255.0;
+                data[c * n + s] = (v - CLIP_MEAN[c]) / CLIP_STD[c];
+            }
+        }
+    }
+    crate::native_engine::tensor::Mat::from_vec(3, n, data)
+}
+
 fn view_tensor(img: &DynamicImage) -> ViewTensor {
     let rgb = img.to_rgb8();
     let (w, h) = rgb.dimensions();
@@ -615,10 +956,188 @@ fn view_tensor(img: &DynamicImage) -> ViewTensor {
     }
 }
 
+// ───────────────── TrOMR staff preprocess (E9, tromr-spec §6) ─────────────────
+
+/// The `readimg` normalize constants (albumentations `Normalize(mean=0.7931,
+/// std=0.1738, max_pixel_value=255)` — spec §6).
+const TROMR_MEAN: f32 = 0.7931 * 255.0;
+const TROMR_STD: f32 = 0.1738 * 255.0;
+
+/// Half-pixel-center bilinear resize of one u8 plane (the cv2 `INTER_LINEAR`
+/// sampling geometry: `sx = (dx+0.5)·w/nw − 0.5`, edge-clamped, NO area
+/// averaging on downscale — upstream resizes staves this way, quality
+/// warts and all). Float weights + round; cv2's 11-bit fixed-point
+/// arithmetic can differ by ±1 LSB — a MEASURED envelope, ledgered in the
+/// armed cert (the DISC-001 resample precedent).
+fn bilinear_u8(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> {
+    let mut out = vec![0u8; nw * nh];
+    let sx_ratio = w as f32 / nw as f32;
+    let sy_ratio = h as f32 / nh as f32;
+    for dy in 0..nh {
+        let fy = ((dy as f32 + 0.5) * sy_ratio - 0.5).max(0.0);
+        let y0 = (fy as usize).min(h - 1);
+        let y1 = (y0 + 1).min(h - 1);
+        let wy = fy - y0 as f32;
+        for dx in 0..nw {
+            let fx = ((dx as f32 + 0.5) * sx_ratio - 0.5).max(0.0);
+            let x0 = (fx as usize).min(w - 1);
+            let x1 = (x0 + 1).min(w - 1);
+            let wx = fx - x0 as f32;
+            let top = f32::from(src[y0 * w + x0]) * (1.0 - wx) + f32::from(src[y0 * w + x1]) * wx;
+            let bot = f32::from(src[y1 * w + x0]) * (1.0 - wx) + f32::from(src[y1 * w + x1]) * wx;
+            out[dy * nw + dx] = (top * (1.0 - wy) + bot * wy).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+/// TrOMR staff preprocess (`staff2score.py::readimg`, spec §6): the ink gray
+/// plane (RGBA ⇒ `255 − alpha`, the rendered-PNG convention; RGB ⇒ the cv2
+/// fixed-point luma `(4899·R + 9617·G + 1868·B + 8192) >> 14`; gray ⇒ as-is)
+/// → half-pixel-center bilinear resize to `h=128, w = ⌊(128/h)·w⌋` floored to
+/// a multiple of 16 → normalize `(px − 0.7931·255)/(0.1738·255)`. Returns
+/// `(pixels[128·W], W)` ready for [`crate::native_engine::tromr::encode`].
+///
+/// Channel-order note: upstream converts to gray AFTER the resize, but the
+/// RGBA path resizes three REPLICATED gray channels (identical results) and
+/// the RGB path's luma-then-resize vs resize-then-luma differ only through
+/// the same ±1-LSB rounding envelope the armed cert measures.
+///
+/// # Errors
+/// A degenerate image, or a resized width of 0 or past the 1280 position
+/// clamp (the E5 front end guarantees the bound; a raw over-wide crop is a
+/// clean error, never undefined crop-indexing — spec §2b).
+pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr preprocess: degenerate {w}x{h} input"
+        )));
+    }
+    // The ink gray plane. The inverted-alpha convention applies ONLY when
+    // the alpha channel varies: upstream applies 255−alpha to EVERY
+    // 4-channel input, which BLANKS fully-opaque PNGs (their own demo
+    // staves are opaque RGBA — measured 2026-07-06, DISC-007). A deliberate,
+    // documented divergence; opaque-alpha images take the RGB luma path.
+    let alpha_is_ink = img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p.0[3] < 255);
+    let gray: Vec<u8> = if alpha_is_ink {
+        img.to_rgba8().pixels().map(|p| 255 - p.0[3]).collect()
+    } else {
+        img.to_rgb8()
+            .pixels()
+            .map(|p| {
+                let [r, g, b] = p.0;
+                ((4899 * u32::from(r) + 9617 * u32::from(g) + 1868 * u32::from(b) + 8192) >> 14)
+                    .min(255) as u8
+            })
+            .collect()
+    };
+    let new_h = crate::native_engine::tromr::IMG_H;
+    let new_w = ((new_h as f64 / h as f64 * w as f64) as usize) / 16 * 16;
+    if new_w == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr preprocess: {w}x{h} resizes to zero width (image too narrow)"
+        )));
+    }
+    if new_w > crate::native_engine::tromr::POS_COLS * crate::native_engine::tromr::PATCH {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr preprocess: resized width {new_w} exceeds the 1280 position clamp — \
+             pass a single-staff crop (aspect ≤ 10:1 at h=128; the staff-detection \
+             front end enforces this)"
+        )));
+    }
+    let resized = bilinear_u8(&gray, w, h, new_w, new_h);
+    let pixels = resized
+        .iter()
+        .map(|&v| (f32::from(v) - TROMR_MEAN) / TROMR_STD)
+        .collect();
+    Ok((pixels, new_w))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tromr_alpha_ink_path_fires_only_when_alpha_varies() {
+        // DISC-007: the inverted-alpha ink convention applies ONLY to PNGs
+        // whose alpha channel varies (rendered transparent-background
+        // staves); fully-opaque RGBA takes the luma path.
+        use image::{DynamicImage, Rgba, RgbaImage};
+        // Varying alpha: ink strip (alpha 255) on transparent paper (alpha 0),
+        // RGB deliberately garbage — the ink must come from alpha alone.
+        let mut var = RgbaImage::from_pixel(64, 128, Rgba([9, 9, 9, 0]));
+        for y in 60..68 {
+            for x in 0..64 {
+                var.put_pixel(x, y, Rgba([200, 200, 200, 255]));
+            }
+        }
+        let (px, w) = super::tromr_staff_tensor(&DynamicImage::ImageRgba8(var))
+            .expect("varying-alpha preprocess runs");
+        assert_eq!(w, 64);
+        // 255 − alpha: the strip (alpha 255) is INK (dark, 0), the rest paper
+        // (255). Normalized: dark << 0 << light region values.
+        let dark = (0.0f32 - 0.7931 * 255.0) / (0.1738 * 255.0);
+        let light = (255.0f32 - 0.7931 * 255.0) / (0.1738 * 255.0);
+        let mid = px[64 * 64 + 32]; // row 64 (inside the strip), col 32
+        let top = px[10 * 64 + 32];
+        assert!((mid - dark).abs() < 1e-4, "strip is ink: {mid} vs {dark}");
+        assert!(
+            (top - light).abs() < 1e-4,
+            "background is paper: {top} vs {light}"
+        );
+
+        // Fully-opaque RGBA: the luma path (alpha ignored); a dark-RGB strip
+        // must be the ink instead.
+        let mut opaque = RgbaImage::from_pixel(64, 128, Rgba([250, 250, 250, 255]));
+        for y in 60..68 {
+            for x in 0..64 {
+                opaque.put_pixel(x, y, Rgba([10, 10, 10, 255]));
+            }
+        }
+        let (px, _) = super::tromr_staff_tensor(&DynamicImage::ImageRgba8(opaque))
+            .expect("opaque-alpha preprocess runs");
+        let mid = px[64 * 64 + 32];
+        let top = px[10 * 64 + 32];
+        assert!(
+            mid < top,
+            "opaque path reads RGB ink: strip {mid} vs paper {top}"
+        );
+        assert!(mid < -3.0, "the dark strip is strongly negative: {mid}");
+    }
+
     use super::*;
     use image::{Rgb, RgbImage};
+
+    /// **L0b — GOT preprocess vs the torch oracle.** `preprocess_got` on the shared
+    /// `sample_text.png` must match `GOTImageEvalProcessor`'s output stats (from
+    /// `oracle_fixtures.json` `l0b_preprocess`). The CatmullRom-vs-PIL-bicubic
+    /// resample is the one known sub-L0 divergence, so aggregate stats match to a
+    /// small tolerance (not bit-exact).
+    #[test]
+    fn got_preprocess_matches_oracle_l0b() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/sample_text.png"
+        );
+        let m = preprocess_got(std::path::Path::new(path)).expect("got preprocess");
+        assert_eq!(m.rows, 3);
+        assert_eq!(m.cols, (GOT_SIZE * GOT_SIZE) as usize);
+
+        let d: Vec<f64> = m.data.iter().map(|&v| f64::from(v)).collect();
+        let mean = d.iter().sum::<f64>() / d.len() as f64;
+        let var = d.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / d.len() as f64;
+        let std = var.sqrt();
+        let min = d.iter().copied().fold(f64::INFINITY, f64::min);
+        let max = d.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        eprintln!("[L0b] mean={mean:.4} std={std:.4} min={min:.4} max={max:.4}");
+
+        // oracle l0b_preprocess (transformers 4.45.2, f32 CPU).
+        let (o_mean, o_std, o_min, o_max) = (2.046_326_7, 0.138_841_3, -1.777_664_1, 2.145_897);
+        assert!((mean - o_mean).abs() < 5e-3, "mean {mean} vs {o_mean}");
+        assert!((std - o_std).abs() < 5e-3, "std {std} vs {o_std}");
+        // CLIP-normalized extremes: white→(1-mean)/std, black→-mean/std; robust to resample.
+        assert!((min - o_min).abs() < 1e-2, "min {min} vs {o_min}");
+        assert!((max - o_max).abs() < 1e-2, "max {max} vs {o_max}");
+    }
 
     /// Build a tiny synthetic RGB image (no weights/tokenizer needed).
     fn solid(w: u32, h: u32, color: [u8; 3]) -> DynamicImage {
@@ -646,6 +1165,25 @@ mod tests {
         };
         assert_eq!(p.placeholder_token_count(), 273);
         assert_eq!(p.num_views(), 1);
+    }
+
+    /// The multi-page per-page census (bd-1gv.25): `infer_multi` runs every
+    /// page at Base 640 ⇒ `num_queries(640) = 10` ⇒ `(10+1)·10 + 1 = 111`
+    /// placeholder slots per page — the exact per-page block the reference
+    /// concatenates at the prompt's single `<image>` position.
+    #[test]
+    fn multi_page_base_640_placeholder_is_111() {
+        assert_eq!(num_queries(640), 10);
+        let p = Preprocessed {
+            mode: PreprocessMode::Base { base_size: 640 },
+            global: view_tensor(&solid(8, 8, [0, 0, 0])),
+            tiles: Vec::new(),
+            crop_grid: CropGrid::single(),
+            original_size: (8, 8),
+        };
+        assert_eq!(p.placeholder_token_count(), 111);
+        assert_eq!(p.num_views(), 1);
+        println!(r#"{{"check":"multi_page_census_640","per_page":111,"result":"pass"}}"#);
     }
 
     /// The Gundam multi-tile totals from the OQ-18 census table:
@@ -806,6 +1344,34 @@ mod tests {
         assert!((p.global.pixels.get(0, 0) - gray).abs() < 1e-6);
     }
 
+    /// The image_decode fuzz target's day-one find (bd-10sb.1): this exact
+    /// 100-byte PNG declares 6 x 2^31+4 dimensions — pre-fix, decode
+    /// attempted a 38.6 GB allocation (a DoS on any untrusted-image ingest).
+    /// The decode funnel's 1 Gpx bound must reject it as a typed
+    /// InputDecode error BEFORE any pixel allocation.
+    #[test]
+    fn decompression_bomb_png_is_rejected_before_allocation() {
+        const BOMB: [u8; 100] = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x06, 0x80, 0x00, 0x00, 0x04, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0x22, 0x66, 0xd9, 0x14, 0x00, 0x00, 0x00, 0x56, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x01, 0xed, 0xc0, 0x03, 0xa0, 0x24, 0x3b, 0x6b, 0xd5, 0xaf, 0xc2, 0x67, 0x3f, 0x1a,
+            0x1e, 0x0d, 0x8f, 0x86, 0x47, 0xc3, 0xa3, 0xa1, 0xf2, 0xea, 0x3c, 0x10, 0x50, 0x79,
+            0x75, 0x1e, 0x08, 0xa8, 0xbc, 0x3a, 0x0f, 0x04, 0xfc, 0x23, 0x74, 0xa4, 0x02, 0x0d,
+            0x6a, 0x18, 0x6a, 0x6a, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42,
+            0x60, 0x82,
+        ];
+        let err = decode_bytes(&BOMB).expect_err("2^31-height PNG must be rejected");
+        assert!(
+            matches!(err, crate::FocrError::InputDecode(_)),
+            "bomb must be a typed InputDecode, got {err:?}"
+        );
+        // And the whole preprocess entry stays total on it too.
+        let err = preprocess_bytes(&BOMB, PreprocessMode::base()).expect_err("rejected");
+        assert!(matches!(err, crate::FocrError::InputDecode(_)));
+        println!(r#"{{"check":"decompression_bomb_bound","bytes":100,"result":"pass"}}"#);
+    }
+
     #[test]
     fn pad_to_square_matches_pillow_rounding_geometry() {
         // Pillow ImageOps.contain rounds the fitted short edge, and ImageOps.pad
@@ -829,6 +1395,76 @@ mod tests {
         assert_eq!(rounded_offset.get_pixel(0, 20).0, color);
         assert_eq!(rounded_offset.get_pixel(0, 44).0, color);
         assert_eq!(rounded_offset.get_pixel(0, 45).0, pad);
+    }
+
+    // ── resample kernel selection (bd-30me / DISC-001) ──────────────────────
+
+    #[test]
+    fn resample_kind_default_and_kill_switch_parse() {
+        // Kill-switch OFF by default (doctrine #2): unset, empty, the default
+        // spelled out, and unknown junk all stay CatmullRom.
+        assert_eq!(resample_kind_from(None), ResampleKind::CatmullRom);
+        assert_eq!(resample_kind_from(Some("")), ResampleKind::CatmullRom);
+        assert_eq!(
+            resample_kind_from(Some("catmullrom")),
+            ResampleKind::CatmullRom
+        );
+        assert_eq!(resample_kind_from(Some("bogus")), ResampleKind::CatmullRom);
+        // The documented value (and its underscore spelling, trimmed) arms
+        // the PIL-bit-exact reference path.
+        assert_eq!(
+            resample_kind_from(Some("pil-bicubic")),
+            ResampleKind::PilBicubic
+        );
+        assert_eq!(
+            resample_kind_from(Some("pil_bicubic")),
+            ResampleKind::PilBicubic
+        );
+        assert_eq!(
+            resample_kind_from(Some(" pil-bicubic ")),
+            ResampleKind::PilBicubic
+        );
+    }
+
+    /// Doctrine #2 regression: the CatmullRom arm of the resample dispatch is
+    /// byte-identical to the pre-DISC-001 direct `resize_exact` call — same
+    /// bytes AND same color-type behavior (an RGBA input stays RGBA, exactly
+    /// as the old inline call left it for the later `to_rgb8()`).
+    #[test]
+    fn default_resample_is_catmullrom_byte_identical() {
+        let mut rgba = image::RgbaImage::new(13, 7);
+        for (x, y, p) in rgba.enumerate_pixels_mut() {
+            *p = image::Rgba([(x * 19 + y * 3) as u8, (x * 7) as u8, (y * 31) as u8, 255]);
+        }
+        let img = DynamicImage::ImageRgba8(rgba);
+        let via_dispatch = resample_exact_with(ResampleKind::CatmullRom, &img, 8, 5);
+        let direct = img.resize_exact(8, 5, FilterType::CatmullRom);
+        assert_eq!(
+            via_dispatch.color(),
+            direct.color(),
+            "default resample changed the color type"
+        );
+        assert_eq!(
+            via_dispatch.as_bytes(),
+            direct.as_bytes(),
+            "default resample output moved (doctrine #2 violation)"
+        );
+    }
+
+    /// The armed kill-switch routes to [`pil_resample::resize_bicubic`] over
+    /// the RGB-converted image (PIL converts to RGB before resizing) and
+    /// yields an RGB8 result.
+    #[test]
+    fn pil_kill_switch_dispatch_routes_to_pil_resampler() {
+        let mut rgb = RgbImage::new(5, 4);
+        for (x, y, p) in rgb.enumerate_pixels_mut() {
+            *p = Rgb([(x * 40) as u8, (y * 60) as u8, (x * y * 13) as u8]);
+        }
+        let img = DynamicImage::ImageRgb8(rgb.clone());
+        let via_dispatch = resample_exact_with(ResampleKind::PilBicubic, &img, 3, 6);
+        let direct = pil_resample::resize_bicubic(&rgb, 3, 6);
+        assert_eq!(via_dispatch.color(), image::ColorType::Rgb8);
+        assert_eq!(via_dispatch.as_bytes(), direct.as_raw().as_slice());
     }
 
     // ── Gundam tiling geometry ([SPEC-023/024]) ─────────────────────────────
@@ -1017,5 +1653,104 @@ mod tests {
         // Channel 2 (B): [px0=+1, px1=-1].
         assert!((vt.pixels.get(2, 0) - 1.0).abs() < 1e-6);
         assert!((vt.pixels.get(2, 1) - (-1.0)).abs() < 1e-6);
+    }
+
+    // ── SmolVLM2 preprocess (C7) ─────────────────────────────────────────────
+
+    /// Layout math across aspect ratios (spec §6 / OQ-3): landscape,
+    /// portrait, square, and the odd-derived-edge `+1` bump.
+    #[test]
+    fn smolvlm2_layout_across_aspects() {
+        let mk = |w, h| DynamicImage::ImageRgb8(RgbImage::new(w, h));
+        // 1024×768 → 2048×1536 → 2048×1536 (multiples) → 3 rows × 4 cols + 1.
+        let p = preprocess_smolvlm2(&mk(1024, 768)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (3, 4, 13));
+        assert_eq!(p.frames.len(), 13 * 3 * 512 * 512);
+        // Portrait mirror: 768×1024 → 4 rows × 3 cols.
+        let p = preprocess_smolvlm2(&mk(768, 1024)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (4, 3, 13));
+        // Square: 640×640 → 2048×2048 → 4×4 + 1 = 17 frames (the cap shape).
+        let p = preprocess_smolvlm2(&mk(640, 640)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (4, 4, 17));
+        // Odd derived edge: 999×500 → aspect 1.998; h=int(2048/1.998)=1025
+        // → odd → 1026 → ceil512 → 1536 → 3 rows.
+        let p = preprocess_smolvlm2(&mk(999, 500)).unwrap();
+        assert_eq!((p.rows, p.cols), (3, 4));
+        // Tiny image upscales (long side ALWAYS → 2048; still splits).
+        let p = preprocess_smolvlm2(&mk(10, 10)).unwrap();
+        assert_eq!((p.rows, p.cols, p.n_frames), (4, 4, 17));
+    }
+
+    /// The normalize rail: a mid-gray 128 maps to (128/255 - 0.5)/0.5 and a
+    /// solid image survives every resize (solid-color invariance), so every
+    /// frame is exactly that constant.
+    #[test]
+    fn smolvlm2_normalize_rail() {
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(800, 600, Rgb([128, 0, 255])));
+        let p = preprocess_smolvlm2(&img).unwrap();
+        let want_r = ((128.0f64 * (1.0 / 255.0)) as f32 - 0.5) / 0.5;
+        let n = 512 * 512;
+        for f in 0..p.n_frames {
+            let fr = &p.frames[f * 3 * n..(f + 1) * 3 * n];
+            assert!((fr[0] - want_r).abs() < 1e-7, "frame {f} R rail");
+            assert!((fr[n] - (-1.0)).abs() < 1e-7, "frame {f} G rail");
+            assert!((fr[2 * n] - 1.0).abs() < 1e-7, "frame {f} B rail");
+        }
+    }
+
+    #[test]
+    fn smolvlm2_degenerate_image_errors() {
+        // A zero-dimension image cannot come from a decoder, but the guard
+        // must fail loud, not panic in the resampler.
+        let img = DynamicImage::ImageRgb8(RgbImage::new(0, 5));
+        assert!(preprocess_smolvlm2(&img).is_err());
+    }
+
+    /// **C7 L0b — preprocess EXACT vs the torch oracle** (skip-with-SUCCESS
+    /// without `FOCR_SMOLVLM2_DIR`): our LANCZOS+split+normalize pipeline on
+    /// the committed sample photo must reproduce the oracle's
+    /// `pixel_values.bin` — the resample is Pillow-bit-exact by construction,
+    /// so the only allowed drift is the final f32 normalize ULP.
+    #[test]
+    fn smolvlm2_preprocess_matches_torch_oracle() {
+        let Ok(dir) = std::env::var("FOCR_SMOLVLM2_DIR") else {
+            return;
+        };
+        let pv_path = format!("{dir}/smolvlm2_pixel_values.bin");
+        if !std::path::Path::new(&pv_path).is_file() {
+            eprintln!("skip-with-SUCCESS: {pv_path} absent (run the vision oracle script)");
+            return;
+        }
+        let want: Vec<f32> = std::fs::read(&pv_path)
+            .expect("oracle blob reads")
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let photo = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/smolvlm2/sample_photo.png"
+        );
+        let p = preprocess_smolvlm2_path(std::path::Path::new(photo)).expect("preprocess");
+        assert_eq!((p.rows, p.cols, p.n_frames), (3, 4, 13), "tile layout");
+        assert_eq!(p.frames.len(), want.len(), "frame count/shape");
+        let mut max_abs = 0.0f32;
+        let mut n_diff = 0usize;
+        for (a, b) in p.frames.iter().zip(&want) {
+            let d = (a - b).abs();
+            if d > 0.0 {
+                n_diff += 1;
+            }
+            max_abs = max_abs.max(d);
+        }
+        eprintln!(
+            "[C7 L0b] maxabs={max_abs:.3e} n_diff={n_diff}/{}",
+            want.len()
+        );
+        assert!(
+            max_abs <= 1e-6,
+            "preprocess maxabs {max_abs:.3e} > 1e-6 — the resample or normalize drifted"
+        );
     }
 }

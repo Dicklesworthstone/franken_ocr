@@ -1,0 +1,222 @@
+{
+ "artifact": "franken_ocr.certification_bundle.v1",
+ "bundle_root_sha256": null,
+ "generated_at_utc": "2026-07-10T04:13:11.822559Z",
+ "manifest": [
+  {
+   "age_hours": 0.0,
+   "artifact": "docs/gauntlet/bundle/claim_sources/RELEASE_READINESS.json",
+   "sha256": "dd9cb170b4524b9294874209973a721ddaa5668ac801b92bd02cd83358607c18",
+   "timestamp_source": "json:generated_at_utc",
+   "timestamp_utc": "2026-07-10T04:13:11.822559Z"
+  },
+  {
+   "age_hours": 52.22,
+   "artifact": "docs/gauntlet/bundle/claim_sources/ROUNDS.jsonl",
+   "sha256": "cd5b138ce22e1536dc87a958df2b76278eb5aae6e221749b087059473b048c40",
+   "timestamp_source": "jsonl:native",
+   "timestamp_utc": "2026-07-08T00:00:00Z"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/source_evidence/docs/gauntlet/EPROCESS_STATE.json",
+   "error": "JSON artifact has no valid native timestamp"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/source_evidence/docs/gauntlet/RELEASE_SCORECARD.json",
+   "error": "JSON artifact has no valid native timestamp"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/fixtures/ladder_scorecard/scorecard_armed.json",
+   "error": "JSON artifact has no valid native timestamp"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/source_evidence/benches/.bench-history/baseline.json",
+   "error": "JSON artifact has no valid native timestamp"
+  },
+  {
+   "age_hours": 53.16,
+   "artifact": "docs/gauntlet/bundle/source_evidence/docs/DISCREPANCIES.md",
+   "sha256": "1451dcbc7375ed93c2624329ef6de2def47dfb7cda00e6d636c524b6cc1b25a9",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-07T23:03:36.781871Z"
+  },
+  {
+   "age_hours": 0.69,
+   "artifact": "docs/gauntlet/bundle/source_evidence/docs/NEGATIVE_EVIDENCE.md",
+   "sha256": "a7ee4ba0aef2f450fd3ceab1be892419f07e2c0fd3c61e99af067385e72e35e5",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-10T03:32:05.090037Z"
+  },
+  {
+   "age_hours": 44.35,
+   "artifact": "docs/gauntlet/bundle/source_evidence/docs/PERF_LEDGER.md",
+   "sha256": "bef8e6cc3adf4f2f6c5462fbdedcf5033244a4587e2a42cf89c619c609f9907f",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-08T07:52:02.616715Z"
+  },
+  {
+   "age_hours": 1.35,
+   "artifact": "docs/gauntlet/bundle/source_evidence/docs/FEATURE_PARITY.md",
+   "sha256": "52d2420cd03752b89e0a58d9db34eb4993d07092a59cffd97ca76729b5939ef1",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-10T02:52:19.125402Z"
+  },
+  {
+   "age_hours": 0.02,
+   "artifact": "docs/gauntlet/bundle/source_evidence/scripts/gauntlet_cert.py",
+   "sha256": "99204ef7519abfaea564060484922b281701469dea4efadd3abe865ad220034f",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-10T04:11:45.749642Z"
+  },
+  {
+   "age_hours": 0.51,
+   "artifact": "docs/gauntlet/bundle/source_evidence/scripts/gauntlet_row.py",
+   "sha256": "c0844ba6f6d1b3fbbdc660712b78de7daed8f48748d1f828670db6f796c1f14a",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-10T03:42:41.269981Z"
+  },
+  {
+   "age_hours": 0.51,
+   "artifact": "docs/gauntlet/bundle/source_evidence/scripts/gauntlet_reference.py",
+   "sha256": "4bf21918eac9503cee96be7f72b03d62208f734f270268f24d30f504aa3a8b4f",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-10T03:42:41.269703Z"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/claim_sources/GAUNTLET_EXPERIMENT_DESIGNS.md",
+   "error": "[Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/claim_sources/GAUNTLET_EXPERIMENT_DESIGNS.md'"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/claim_sources/PERF_HYPOTHESIS_LEDGER.md",
+   "error": "[Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/claim_sources/PERF_HYPOTHESIS_LEDGER.md'"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/claim_sources/CONFORMANCE_HYPOTHESIS_LEDGER.md",
+   "error": "[Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/claim_sources/CONFORMANCE_HYPOTHESIS_LEDGER.md'"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/claim_sources/SURFACE_PARITY_HYPOTHESIS_LEDGER.md",
+   "error": "[Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/claim_sources/SURFACE_PARITY_HYPOTHESIS_LEDGER.md'"
+  },
+  {
+   "age_hours": 45.63,
+   "artifact": "docs/gauntlet/bundle/source_evidence/scripts/check_ledgers.py",
+   "sha256": "32d16a109412e655a0c22af86f40b52725251131f3ede53e0b11722e65e7afc8",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-08T06:35:39.916015Z"
+  },
+  {
+   "age_hours": 82.62,
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/many_pages_without_deadlock.rs",
+   "sha256": "96c57a83b3c35c26d14177872cb2398e1a54d704c352b270d106376c53cfda51",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-06T17:35:45.358632Z"
+  },
+  {
+   "age_hours": 80.92,
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/cancel_and_panic_faults.rs",
+   "sha256": "1fda082d211a5fac34d84ffc30074caab70cd76f328e496cc193ee65f7cea70e",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-06T19:18:08.679246Z"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/fixtures/robot_schema_v1.json",
+   "error": "JSON artifact has no valid native timestamp"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/fixtures/runs_schema.json",
+   "error": "JSON artifact has no valid native timestamp"
+  },
+  {
+   "age_hours": 57.26,
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/cli_robot_golden.rs",
+   "sha256": "7927602525ad7fc6ce331bc6690d82b7d353a508a995e8ab88ec055dce81654e",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-07T18:57:39.422107Z"
+  },
+  {
+   "age_hours": 82.11,
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/surface_matrix.rs",
+   "sha256": "95b06701fe9033d6a120a843e6ed439106753e0975d1819e39fd9d6dbacd700a",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-06T18:06:22.053657Z"
+  },
+  {
+   "age_hours": 53.01,
+   "artifact": "docs/gauntlet/bundle/source_evidence/.github/workflows/dist.yml",
+   "sha256": "1a9f9e2ac93498cb312a4647ffb426afe0ded3f8c3f1332d172d5e906610af27",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-07T23:12:30.681798Z"
+  },
+  {
+   "age_hours": 74.68,
+   "artifact": "docs/gauntlet/bundle/source_evidence/install.sh",
+   "sha256": "33680e9bc27e7edb0865aaac98d5a04592ec397a5591513a5c4d288cfd469087",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-07T01:32:12.657588Z"
+  },
+  {
+   "age_hours": 79.42,
+   "artifact": "docs/gauntlet/bundle/source_evidence/docs/ergonomics/AUDIT.md",
+   "sha256": "05f5ec5a166c010220bb9f3de1f561630bcb661703ff2e64b4bd36f847ed3e9b",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-06T20:47:54.828804Z"
+  },
+  {
+   "age_hours": 79.42,
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/agent_ergonomics_regression.rs",
+   "sha256": "1c18f3b9d8cb91bbda141b1ab56f6deabe119585ba3df4dc6f74e646408ff345",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-06T20:47:52.195035Z"
+  },
+  {
+   "age_hours": 79.22,
+   "artifact": "docs/gauntlet/bundle/source_evidence/src/doctor.rs",
+   "sha256": "b8ce30898d617274eafaa376d6b2d54872da33475e5fcaaf6487ca1ccffc5a67",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-06T20:59:55.827624Z"
+  },
+  {
+   "age_hours": 79.25,
+   "artifact": "docs/gauntlet/bundle/source_evidence/tests/doctor_fixtures.rs",
+   "sha256": "ac64ef2c605346eae1264e9b48bd5686a8501ccb2d33fd40d0eb0b213b2595d3",
+   "timestamp_source": "filesystem:mtime",
+   "timestamp_utc": "2026-07-06T20:58:14.172352Z"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/confidence_gate.json",
+   "error": "JSON artifact is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/confidence_gate.json'"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/verification_contract.json",
+   "error": "JSON artifact is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/verification_contract.json'"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/ci_manifest.json",
+   "error": "JSON artifact is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/ci_manifest.json'"
+  },
+  {
+   "age_hours": 0.0,
+   "artifact": "docs/gauntlet/bundle/benchmark_summary.json",
+   "sha256": "74dd1e84d04af3592372ee3ca103451900874555a9542d4dc43e04b98616a79d",
+   "timestamp_source": "json:generated_at_utc",
+   "timestamp_utc": "2026-07-10T04:13:11.822559Z"
+  },
+  {
+   "age_hours": 0.0,
+   "artifact": "docs/gauntlet/bundle/scorecards.json",
+   "sha256": "a5e9ca5785fc8420cca182adfccffd24efd97d9937b390ddcbfbe21a9a00eb47",
+   "timestamp_source": "json:generated_at_utc",
+   "timestamp_utc": "2026-07-10T04:13:11.822559Z"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/critical_path_report.json",
+   "error": "JSON artifact is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/critical_path_report.json'"
+  },
+  {
+   "artifact": "docs/gauntlet/bundle/ratchet_state.json",
+   "error": "JSON artifact is unreadable: [Errno 2] No such file or directory: '/Users/jemanuel/projects/franken_ocr/docs/gauntlet/bundle/ratchet_state.json'"
+  }
+ ],
+ "schema_version": "gauntlet.certification_bundle_manifest.v1"
+}

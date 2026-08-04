@@ -1,0 +1,43 @@
+{
+  "schema": "focr-gauntlet-row/v1",
+  "created_utc": "2026-07-06T00:02:53Z",
+  "inputs": {
+    "focr_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/got/focr/focr_stages.json",
+      "sha256": "4bb262f1a0730906f4f8fffc4881fc5c85186177a438ec7f7cb4191b7d2aee54"
+    },
+    "ref_stages": {
+      "path": "artifacts/perf/bd-3jo6.1.11/got/ref_stages.json",
+      "sha256": "d6da85aa0f818b7e96a1e330e1583d5c7024a7bb04232f5ed0dd4747a367dc35"
+    },
+    "roofline": {
+      "path": "artifacts/perf/bd-3jo6.1.11/got/roofline.json",
+      "sha256": "9c383a5d982aed8fd186e8e87675a0991917ddd4e05c450be31c22d615146320"
+    }
+  },
+  "rows": [
+    {
+      "date": "2026-07-05",
+      "claim_id": "G2-test",
+      "evidence_id": "artifacts/perf/bd-3jo6.1.11/got/rowdbg",
+      "model_commit": "y",
+      "fixture_hash": "x",
+      "arch/cpu_features": "aarch64+neon+dotprod",
+      "stage": "decode-per-token",
+      "reference_backend": "hf",
+      "focr_ms": "12.264",
+      "ref_ms": "41.378",
+      "ratio": "3.374",
+      "floor_kind": "memory",
+      "floor_ms": "4.391",
+      "dist_above_floor": "2.79",
+      "precision (focr vs ref)": "focr-int8 vs hf-f32",
+      "threads (focr=ref N)": "focr=ref=8",
+      "allocator": "system",
+      "command/env": "focr: /private/tmp/cc_tgt_dev/release/focr ocr tests/fixtures/got/sample_text.png --model /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2/got-ocr2.int8.focrq [threads=8 FOCR_TIMING=1]; ref: scripts/gauntlet_reference.py --stage all --page tests/fixtures/got/sample_text.png --model-dir /Volumes/USBNVME16TB/temp_agent_space/zoo/got-ocr2 --backend hf --precision f32 --entry gauntlet_ref_zoo:run_got --setup gauntlet_ref_zoo:setup_got --pin-torch 2.12.1 --pin-transformers 4.45.2 --threads 8 --runs 3 --warmup 1 --out artifacts/perf/bd-3jo6.1.11/got/ref_stages.json [torch==2.12.1 transformers==4.45.2]",
+      "fallback/kill-switch state": "FOCR_THREADS=8 FOCR_TIMING=1",
+      "correctness_proof": "z",
+      "notes": "best-of-5 (cv 0.0% / ref 1.753%)"
+    }
+  ]
+}

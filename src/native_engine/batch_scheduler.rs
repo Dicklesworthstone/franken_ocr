@@ -139,6 +139,10 @@ pub struct PageStream {
     pub done: bool,
     /// Retired specifically because EOS was emitted.
     pub eos: bool,
+    /// Optional PER-STREAM emission cap (A7.5: e.g. a page whose position
+    /// budget binds tighter than the batch cap). `None` = the scheduler's
+    /// global `max_length` alone.
+    pub max_emit: Option<usize>,
 }
 
 impl PageStream {
@@ -160,7 +164,15 @@ impl PageStream {
             last_hidden,
             done: false,
             eos: false,
+            max_emit: None,
         }
+    }
+
+    /// Set a per-stream emission cap (see [`Self::max_emit`]).
+    #[must_use]
+    pub fn with_max_emit(mut self, cap: usize) -> Self {
+        self.max_emit = Some(cap);
+        self
     }
 
     /// Tokens emitted by decode (excludes the prompt/reference context).
@@ -338,8 +350,9 @@ impl BatchScheduler {
                 .collect();
 
             // ── exactly one live forward over the active set ──
-            self.enter_forward();
+            let fwd = self.enter_forward();
             let result = step.step(&slots);
+            drop(fwd);
             self.exit_forward();
             let outs = result?;
             self.steps += 1;
@@ -352,7 +365,10 @@ impl BatchScheduler {
                 let s = &mut streams[i];
                 s.generated.push(out.token);
                 s.position += 1;
-                if out.is_eos || s.emitted().len() >= self.max_length {
+                let cap = s
+                    .max_emit
+                    .map_or(self.max_length, |m| m.min(self.max_length));
+                if out.is_eos || s.emitted().len() >= cap {
                     s.done = true;
                     s.eos = out.is_eos;
                     retire.push(k);
@@ -387,9 +403,13 @@ impl BatchScheduler {
         }
     }
 
-    fn enter_forward(&self) {
+    fn enter_forward(&self) -> super::ForwardPass {
         let n = self.live_forwards.fetch_add(1, Ordering::SeqCst) + 1;
         self.max_forwards.fetch_max(n, Ordering::SeqCst);
+        // Also joins the PROCESS-WIDE one-live-forward gauge (bd-1azu.14), so a
+        // vision/prefill forward concurrent with a decode step trips the
+        // watchdog even though this scheduler's local counter can't see it.
+        super::enter_forward()
     }
 
     fn exit_forward(&self) {
@@ -488,7 +508,7 @@ mod tests {
 
     /// A weights-free [`BatchStep`] that exercises the scheduler's lifecycle.
     /// Each stream's `last_hidden` encodes `[stream_tag, eos_after]`; the mock
-    /// emits `token = history_len` (so a stream emits 0,1,2,…) and signals EOS on
+    /// emits `token_id = history_len` (so a stream emits 0,1,2,…) and signals EOS on
     /// the `eos_after`-th emitted token. `eos_after == 0` ⇒ never EOS (so the
     /// scheduler's `max_length` cap is what retires it).
     struct MockStep {
@@ -513,10 +533,10 @@ mod tests {
                     let tag = s.hidden.data[0];
                     let eos_after = s.hidden.data[1] as usize;
                     let emitted_before = s.history.len(); // prompt is empty in tests
-                    let token = emitted_before as u32;
+                    let token_id = emitted_before as u32;
                     let is_eos = eos_after != 0 && emitted_before + 1 >= eos_after;
                     StreamOut {
-                        token,
+                        token: token_id,
                         is_eos,
                         // carry the [tag, eos_after] identity forward
                         new_hidden: Mat::from_vec(1, 2, vec![tag, eos_after as f32]),

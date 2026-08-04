@@ -1,0 +1,48 @@
+{
+ "artifact": "franken_ocr.gauntlet.scorecard.v1",
+ "band_note": "no residual history yet: bootstrap band 1.0 -> lower bound 0 (maximally conservative, \u00a73.2)",
+ "conformal_halfwidth": 1.0,
+ "excluded_weight_debt": {
+  "\u00a71 Modeling features": 0.055556,
+  "\u00a78 Modeling features": 0.214286
+ },
+ "parity_score_lower_bound": 0.0,
+ "per_category_lower": {
+  "\u00a71 Modeling features": 0.0,
+  "\u00a710 Op map": 0.0,
+  "\u00a711 `.focrq` weight transformation & quant recipe": 0.0,
+  "\u00a712 CLI surface": 0.0,
+  "\u00a713 Robot / NDJSON event contract": 0.0,
+  "\u00a714 Parity gates & gauntlet machinery": 0.0,
+  "\u00a715 Alien-artifact families": 0.0,
+  "\u00a72 Modeling features": 0.0,
+  "\u00a73 Modeling features": 0.0,
+  "\u00a74 Modeling features": 0.0,
+  "\u00a75 Modeling features": 0.0,
+  "\u00a76 Modeling features": 0.0,
+  "\u00a77 Modeling features": 0.0,
+  "\u00a78 Modeling features": 0.0,
+  "\u00a79 Op map": 0.0
+ },
+ "per_category_mean": {
+  "\u00a71 Modeling features": 0.660377,
+  "\u00a710 Op map": 0.607142,
+  "\u00a711 `.focrq` weight transformation & quant recipe": 0.666666,
+  "\u00a712 CLI surface": 0.631944,
+  "\u00a713 Robot / NDJSON event contract": 0.666666,
+  "\u00a714 Parity gates & gauntlet machinery": 0.633333,
+  "\u00a715 Alien-artifact families": 0.433333,
+  "\u00a72 Modeling features": 0.666666,
+  "\u00a73 Modeling features": 0.666666,
+  "\u00a74 Modeling features": 0.648148,
+  "\u00a75 Modeling features": 0.619047,
+  "\u00a76 Modeling features": 0.654761,
+  "\u00a77 Modeling features": 0.666666,
+  "\u00a78 Modeling features": 0.641025,
+  "\u00a79 Op map": 0.666666
+ },
+ "pillar": "surface",
+ "point_estimate": 0.635274,
+ "residual_history_n": 0,
+ "source": "docs/FEATURE_PARITY.md"
+}

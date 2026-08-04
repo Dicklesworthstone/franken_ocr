@@ -14,9 +14,9 @@
 //! On Apple Silicon, `SMMLA`/i8mm issues at HALF the rate of `SDOT`, so its 2x
 //! MACs/instruction cancel (measured on M4: 0.994x SDOT MACs/s at the raw-
 //! intrinsic level) AND it pays a 2x2 operand repack the dot path skips.
-//! [`simd::arm::detect_tier`] therefore prefers SDOT on macOS. This bench proves
-//! the consequence at the REAL committed-kernel level (repack overhead included,
-//! not just raw issue rate) by forcing each tier in turn and comparing ns/iter:
+//! [`simd::arm::detect_tier`] reports SDOT capability on macOS, while ordinary
+//! dense GEMM defaults to the measured-faster LLVM-autovec route. This bench can
+//! force each intrinsic tier and compare ns/iter at the committed-kernel level:
 //!
 //! ```text
 //! FOCR_FORCE_ARCH=sdot  cargo bench --bench igemm_tier -- --nocapture
@@ -25,9 +25,9 @@
 //!
 //! Each process reads `FOCR_FORCE_ARCH` ONCE (the tier is cached in a OnceLock),
 //! so every `#[bench]` in a given run dispatches to the same forced tier. The
-//! `[igemm_tier] DISPATCHED int8 tier = ...` line (under `--nocapture`) confirms
-//! which kernel was actually timed. The two runs' ns/iter give the SDOT-vs-SMMLA
-//! ratio on the committed code; SDOT should win (lower ns/iter) on this M4.
+//! `[igemm_tier] EFFECTIVE dense int8 route = ...` line (under `--nocapture`)
+//! confirms which implementation was timed and records hardware selection
+//! separately. The two forced runs give the committed SDOT-vs-SMMLA ratio.
 //!
 //! Every tier is BIT-IDENTICAL to the scalar oracle (i32 accumulation is exact),
 //! so this measures pure throughput — correctness is held by the `src/simd`
@@ -57,15 +57,18 @@ use test::{Bencher, black_box};
 const HIDDEN: usize = 1280; // hidden_size
 const DENSE_INTER: usize = 6848; // dense layer-0 intermediate_size (worst-case K)
 
-// One-time report of the tier actually dispatched (visible under `--nocapture`),
-// so the A/B log is self-documenting about which kernel each run timed.
+// One-time report of the effective route (visible under `--nocapture`), so the
+// A/B log is self-documenting about which implementation each run timed.
 static TIER_ONCE: Once = Once::new();
 fn report_tier() {
     TIER_ONCE.call_once(|| {
         eprintln!(
-            "[igemm_tier] DISPATCHED int8 tier = {} ({})  [override via FOCR_FORCE_ARCH]",
+            "[igemm_tier] EFFECTIVE dense int8 route = {} ({})  hardware = {} ({}) \
+             [override via FOCR_FORCE_ARCH]",
+            dispatch::effective_dense_route().tag(),
+            dispatch::effective_dense_route().feature_string(),
             dispatch::detected_tier().tag(),
-            dispatch::tier_string()
+            dispatch::tier_string(),
         );
     });
 }

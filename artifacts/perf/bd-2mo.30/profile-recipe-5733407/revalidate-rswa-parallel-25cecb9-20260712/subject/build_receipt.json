@@ -1,0 +1,80 @@
+{
+  "binary": {
+    "path": "/home/ubuntu/focr-perf-25cecb9-build-20260712T2203Z/build/focr",
+    "sha256": "0e50d513e60956d544af4e7cd707e76888a00de83598563dffd4b0cbc94961c6",
+    "size": 96506416
+  },
+  "build": {
+    "cargo_target_dir": "/home/ubuntu/focr-perf-scratch-25cecb9/focr-gauntlet-target.F37CQb",
+    "command": [
+      "rch",
+      "exec",
+      "--",
+      "cargo",
+      "build",
+      "--locked",
+      "--profile",
+      "release-perf",
+      "--bin",
+      "focr",
+      "--target",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "runner": "rch"
+  },
+  "build_environment": {
+    "CARGO_BUILD_RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_HOME": null,
+    "RUSTFLAGS": null,
+    "cargo_config_build_rustflags": {
+      "status": "unset",
+      "value": null
+    },
+    "cargo_config_target": {
+      "status": "unset",
+      "value": null
+    },
+    "release_perf_profile_overrides": {},
+    "rustc_overrides": {
+      "RUSTC": null,
+      "RUSTC_WORKSPACE_WRAPPER": null,
+      "RUSTC_WRAPPER": null
+    },
+    "target_rustflags_env_name": "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+    "target_rustflags_env_value": null
+  },
+  "created_utc": "2026-07-12T22:10:08Z",
+  "git_head": "25cecb9c4cbfa599fbf48a45d9bf9748daab4192",
+  "inputs": {
+    "Cargo.lock": {
+      "sha256": "69edd8a5927404fe1954d5dc0db988dd6369d7269d5e979f1400082ef1be49ef",
+      "size": 92832
+    },
+    "Cargo.toml": {
+      "sha256": "e589be652e2f5d1e2bd761578b0c060bf305cd12b95e64e19f026193ebe590d5",
+      "size": 7328
+    },
+    "rust-toolchain.toml": {
+      "sha256": "8406102cabeb1596bf8eb6eacf3d2fe24f7852a5bd584bc22b3f517f33555b67",
+      "size": 237
+    }
+  },
+  "profile": "release-perf",
+  "schema": "focr-build-receipt/v1",
+  "source_manifest": {
+    "entry_count": 22489,
+    "path": "/home/ubuntu/focr-perf-25cecb9-build-20260712T2203Z/build/source_input_manifest.json",
+    "root_hash_algorithm": "sha256(domain='focr-source-input-root/v1\\0'; sorted(repository,path); repository\\0path\\0size\\0sha256\\n)",
+    "root_sha256": "09a9893d1ae83d7bef652051e3772b2ee6d27eeec9c5768ad25f12a88dda9f0d",
+    "schema": "focr-source-input-manifest/v1",
+    "sha256": "1b5a125925ccc7665311951bd99cb76e98e059b09be144e30ec36a86ebd1ca3d",
+    "size": 5482350
+  },
+  "target_triple": "x86_64-unknown-linux-gnu",
+  "toolchain": {
+    "cargo_version": "cargo 1.99.0-nightly (59800466c 2026-07-07)",
+    "rch_version": "rch 1.0.48 (commit a86a045dd5b2)",
+    "rustc_verbose_version": "rustc 1.99.0-nightly (14cae6813 2026-07-08)\nbinary: rustc\ncommit-hash: 14cae681329a63c622a6e1fbe1d30f9374bc51d8\ncommit-date: 2026-07-08\nhost: x86_64-unknown-linux-gnu\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8\n"
+  }
+}

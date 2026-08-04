@@ -24,9 +24,11 @@
 //! Coverage: the warm-up append regime; the exact ring-fill boundary
 //! (`checkpoint.ring_len + discarded == RING_WINDOW`, still lossless); a realistic
 //! multi-round speculate→reject→accept loop; the per-stream `BatchedRingCache`
-//! delegation (a roll-back on one stream never touches a sibling); and — in debug
-//! builds — the contract guard that refuses a roll-back which would have to
-//! resurrect an evicted (steady-state-overwritten) slot.
+//! delegation (a roll-back on one stream never touches a sibling); and the
+//! all-build contract guards that return an error before mutating cursors when a
+//! roll-back would have to resurrect an evicted slot or when an abandoned-branch
+//! checkpoint encounters the same cursor values with different K/V lineage, plus
+//! cache-instance identity that rejects checkpoints from independent clones.
 
 // Hot synthetic builders index parallel K/V stride-arrays by `(h, d)`; the index
 // is genuinely needed across buffers, mirroring the kernel's own allow.
@@ -170,7 +172,7 @@ fn rollback_discards_speculative_and_is_byte_identical() {
     );
 
     // Roll back to the checkpoint.
-    test.rollback_to(&cp);
+    test.rollback_to(&cp).unwrap();
 
     // (a) cursors restored exactly.
     assert_eq!(test.prefill_len(), cp.prefill_len());
@@ -233,7 +235,7 @@ fn rollback_at_exact_ring_fill_boundary_is_lossless() {
     assert_eq!(test.ring_len(), RING_WINDOW, "draft fills the ring exactly");
     assert!(test.is_warm());
 
-    test.rollback_to(&cp);
+    test.rollback_to(&cp).unwrap();
     assert_eq!(test.ring_len(), accept);
     assert_eq!(test.ring_pos(), accept);
     assert!(!test.is_warm(), "roll-back undoes the warm transition");
@@ -269,7 +271,7 @@ fn multiple_speculation_rounds_match_non_speculating_control() {
         let cp = test.checkpoint();
         // Draft a speculative block, then reject ALL of it.
         drive_steps(&mut test, 0, 0, SPEC, r * draft, draft);
-        test.rollback_to(&cp);
+        test.rollback_to(&cp).unwrap();
         assert_eq!(test.ring_len(), cp.ring_len());
         assert_eq!(test.ring_pos(), cp.ring_pos());
 
@@ -337,7 +339,7 @@ fn batched_rollback_is_per_stream_and_lossless() {
     }
     assert_eq!(test.layer(ts, tl).ring_len(), accept + spec);
 
-    test.rollback_to(ts, tl, &cp);
+    test.rollback_to(ts, tl, &cp).unwrap();
 
     // (a) target cursors restored.
     assert_eq!(test.layer(ts, tl).ring_len(), cp.ring_len());
@@ -363,13 +365,11 @@ fn batched_rollback_is_per_stream_and_lossless() {
     }
 }
 
-// ── (5) contract guard (debug builds): refuse a roll-back that would resurrect ──
-//        an evicted (steady-state-overwritten) slot, which indices cannot do.
+// ── (5) all-build guard: refuse a roll-back that would resurrect an evicted ─────
+//        (steady-state-overwritten) slot, which indices cannot do.
 
-#[cfg(debug_assertions)]
 #[test]
-#[should_panic(expected = "not lossless")]
-fn rollback_panics_when_speculation_evicted_a_live_slot() {
+fn rollback_errors_when_speculation_evicted_a_live_slot_without_mutating() {
     let cap = 32;
     let prefill_rows = 4usize;
     let (pk, pv) = prefill_kv(prefill_rows, PREFILL_SEED);
@@ -387,5 +387,139 @@ fn rollback_panics_when_speculation_evicted_a_live_slot() {
     // prior K/V is physically gone, so the index-only roll-back is NOT lossless
     // and must be rejected rather than silently corrupt the cache.
     drive_steps(&mut c, 0, 0, SPEC, 0, 1);
-    c.rollback_to(&cp);
+    let current = c.checkpoint();
+    let probe = query(0x0BAD_5EED);
+    let output = out(&c, &probe);
+    let error = c
+        .rollback_to(&cp)
+        .expect_err("steady-state overwrite cannot be restored from cursors");
+    assert!(error.to_string().contains("not lossless"));
+    assert_eq!(
+        c.checkpoint(),
+        current,
+        "failed rollback must not change live cursors"
+    );
+    assert_eq!(
+        out(&c, &probe),
+        output,
+        "failed rollback must not change live K/V"
+    );
+}
+
+// ── (6) stale checkpoint ABA: same cursors, different branch K/V ───────────────
+
+#[test]
+fn rollback_rejects_abandoned_branch_checkpoint_without_mutating() {
+    let cap = 64;
+    let prefill_rows = 4usize;
+    let (pk, pv) = prefill_kv(prefill_rows, PREFILL_SEED);
+    let mut c = RingCache::new(cap);
+    c.record_prefill(&pk, &pv, prefill_rows).unwrap();
+    drive_steps(&mut c, 0, 0, ACCEPT, 0, 3);
+
+    let branch_point = c.checkpoint();
+    drive_steps(&mut c, 0, 0, SPEC, 0, 1);
+    let stale = c.checkpoint();
+    let probe = query(0x0ABA_5EED);
+    let abandoned_output = out(&c, &probe);
+
+    c.rollback_to(&branch_point).unwrap();
+    drive_steps(&mut c, 0, 0, ACCEPT, 3, 1);
+
+    // ABA teeth: the replacement write recreated the abandoned checkpoint's
+    // public cursors, but it put different K/V in the re-used physical slot.
+    assert_eq!(c.ring_len(), stale.ring_len());
+    assert_eq!(c.ring_pos(), stale.ring_pos());
+    let replacement_output = out(&c, &probe);
+    assert_ne!(
+        replacement_output, abandoned_output,
+        "fixture must put observably different K/V on the replacement branch"
+    );
+
+    let current = c.checkpoint();
+    let error = c
+        .rollback_to(&stale)
+        .expect_err("abandoned-branch checkpoint must be refused");
+    assert!(error.to_string().contains("stale checkpoint lineage"));
+    assert_eq!(
+        c.checkpoint(),
+        current,
+        "stale-lineage refusal must not mutate live cursors"
+    );
+    assert_eq!(
+        out(&c, &probe),
+        replacement_output,
+        "stale-lineage refusal must not mutate replacement-branch K/V"
+    );
+}
+
+// ── (7) cloned caches have distinct checkpoint identity ───────────────────────
+
+#[test]
+fn rollback_rejects_checkpoint_from_cloned_cache_without_mutating() {
+    let cap = 64;
+    let prefill_rows = 4usize;
+    let (pk, pv) = prefill_kv(prefill_rows, PREFILL_SEED);
+    let mut issuer = RingCache::new(cap);
+    issuer.record_prefill(&pk, &pv, prefill_rows).unwrap();
+    drive_steps(&mut issuer, 0, 0, ACCEPT, 0, 2);
+
+    // Clone starts byte-identical but is an independent mutation branch.
+    let mut target = issuer.clone();
+    drive_steps(&mut issuer, 0, 0, SPEC, 0, 2);
+    let foreign = issuer.checkpoint();
+    drive_steps(&mut target, 0, 0, ACCEPT, 2, 3);
+
+    // Without cache identity, the foreign checkpoint looks like a valid
+    // one-step warm-up rollback and would truncate target over unrelated K/V.
+    assert_eq!(foreign.prefill_len(), target.prefill_len());
+    assert!(foreign.ring_len() < target.ring_len());
+    let probe = query(0xC10E_5EED);
+    let current = target.checkpoint();
+    let output = out(&target, &probe);
+    let error = target
+        .rollback_to(&foreign)
+        .expect_err("checkpoint from cloned sibling must be refused");
+    assert!(error.to_string().contains("different cache instance"));
+    assert_eq!(
+        target.checkpoint(),
+        current,
+        "cross-clone refusal must not mutate live cursors"
+    );
+    assert_eq!(
+        out(&target, &probe),
+        output,
+        "cross-clone refusal must not mutate target K/V"
+    );
+}
+
+// ── (8) the KV-cap invariant verdict (bd-re8.15 e-process observation) ─────────
+
+/// INV-KV-CAP: the generated tail NEVER occupies more than the fixed
+/// `RING_WINDOW` slots, however long the decode runs — driving 5× the window
+/// must leave `ring_len == RING_WINDOW` and `effective_len == prefill + W`.
+/// The verdict is computed BEFORE the asserts and emitted as one structured
+/// line so the e-process monitor (`gauntlet_cert.py --eprocess-fold`) observes
+/// a genuine `fail` alarm on violation, not just a CI panic.
+#[test]
+fn kv_cap_ring_bound_holds_under_overfill() {
+    let prefill_rows = 16usize;
+    let mut c = RingCache::new(4096);
+    let (pk, pv) = prefill_kv(prefill_rows, PREFILL_SEED);
+    c.record_prefill(&pk, &pv, prefill_rows).unwrap();
+    drive_steps(&mut c, 0, 0, ACCEPT, 0, RING_WINDOW * 5);
+
+    let bound_ok = c.ring_len() == RING_WINDOW && c.effective_len() == prefill_rows + RING_WINDOW;
+    eprintln!(
+        r#"{{"schema_version":1,"test":"spec_ring_rollback","case":"kv_cap_ring_bound","event":"result","result":"{}"}}"#,
+        if bound_ok { "pass" } else { "fail" }
+    );
+    assert!(
+        bound_ok,
+        "KV cap violated after 5x window overfill: ring_len={} (want {RING_WINDOW}), \
+         effective_len={} (want {})",
+        c.ring_len(),
+        c.effective_len(),
+        prefill_rows + RING_WINDOW,
+    );
 }

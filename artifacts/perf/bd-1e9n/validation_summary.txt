@@ -1,0 +1,3 @@
+default page_0009 sha: 7125f593c503b54705ab6c95b79f40d317513f316dd70f1479055ae42eabe934 == banked f32 sha 7125f593... IDENTITY
+base-size 512: DIFFERS (flag alive, rc=0)
+gundam page_0107: rc=0, 7 views, CER 0.0179 WER 0.0138 vs GT

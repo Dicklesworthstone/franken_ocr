@@ -1,0 +1,33 @@
+{
+  "tag": "run_001",
+  "command": [
+    "/private/tmp/cc_tgt_dev/release/focr",
+    "ocr",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr-upstream/examples/1.png",
+    "--model",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr/tromr.focrq",
+    "--task",
+    "music"
+  ],
+  "exit_code": 0,
+  "wall_ms": 2629.139,
+  "stdout": "run_001.stdout",
+  "stderr": "run_001.stderr",
+  "binary": "/private/tmp/cc_tgt_dev/release/focr",
+  "binary_sha256": "00d3607a306545e8d787dabdefe5e84b86e0559dfc5702ae2480f0bd21239415",
+  "page": "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr-upstream/examples/1.png",
+  "page_sha256": "f6bdab10d87ba14259c403903ff1a3378b21307e4a4edd37fdef9c77cf7abd3b",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/zoo/tromr/tromr.focrq",
+  "threads": 8,
+  "warmup": 1,
+  "env_pins": {
+    "FOCR_TIMING": "1",
+    "FOCR_THREADS": "8",
+    "OMP_NUM_THREADS": "8",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "focr_env": {
+    "FOCR_THREADS": "8",
+    "FOCR_TIMING": "1"
+  }
+}

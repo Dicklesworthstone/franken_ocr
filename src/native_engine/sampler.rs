@@ -44,6 +44,49 @@ pub const NGRAM_WINDOW_MULTI: usize = 1024;
 /// `modeling_unlimitedocr.py:787/1011/1139/1249`).
 pub const DEFAULT_MAX_LENGTH: usize = 32_768;
 
+/// Opt-in diagnostic guard for deterministic low-novelty periodic decode
+/// trajectories (bd-2mo.30.12). Unset and `0` are OFF; only `1` arms it.
+///
+/// The guard remains default-off until its false-positive posterior and corpus
+/// tail impact have been calibrated. When armed, a trigger is a typed timeout,
+/// never a synthetic EOS or a successful truncated result.
+pub const RUNAWAY_GUARD_ENV: &str = "FOCR_RUNAWAY_GUARD";
+
+/// Do not inspect ordinary short outputs. This provisional threshold has not
+/// yet been calibrated against the pinned BF16 token stream and cannot become a
+/// default until that evidence exists.
+pub const RUNAWAY_GUARD_MIN_TOKENS: usize = 8_192;
+
+/// Inspect one fixed suffix every 256 emitted tokens. Sparse checkpoints bound
+/// detector work without making the decision depend on caller polling cadence.
+pub const RUNAWAY_GUARD_CHECK_INTERVAL: usize = 256;
+
+/// Token suffix used by the periodicity and novelty statistics.
+pub const RUNAWAY_GUARD_WINDOW_TOKENS: usize = 2_048;
+
+/// Longest candidate token period. Together with the 2,048-token window this
+/// guarantees at least eight observed cycles for every candidate.
+pub const RUNAWAY_GUARD_MAX_PERIOD: usize = 256;
+
+/// Minimum complete cycles represented by a candidate period.
+pub const RUNAWAY_GUARD_MIN_PERIOD_CYCLES: usize = 8;
+
+/// A candidate period must agree with its lagged copy on at least 15/16 token
+/// positions. Integer ratios keep the trigger bit-deterministic.
+pub const RUNAWAY_GUARD_MATCH_NUMERATOR: usize = 15;
+pub const RUNAWAY_GUARD_MATCH_DENOMINATOR: usize = 16;
+
+/// Exact token 4-gram novelty must be no more than 1/4. This catches a repeated
+/// table-row template whose small numeric fields change while avoiding string,
+/// markup, or language-specific heuristics.
+pub const RUNAWAY_GUARD_NGRAM_ORDER: usize = 4;
+pub const RUNAWAY_GUARD_NOVELTY_NUMERATOR: usize = 1;
+pub const RUNAWAY_GUARD_NOVELTY_DENOMINATOR: usize = 4;
+
+/// Hysteresis: three consecutive suspicious checkpoints are required before a
+/// request fails. One anomalous 2,048-token suffix cannot terminate a decode.
+pub const RUNAWAY_GUARD_REQUIRED_HITS: usize = 3;
+
 /// Decode-time sampling parameters (the frozen contract). Greedy when
 /// `temperature == 0.0`.
 #[derive(Debug, Clone)]
@@ -105,6 +148,305 @@ impl DecodeParams {
     pub fn sliding_ngram_active(&self) -> bool {
         self.no_repeat_ngram_size > 0 && self.ngram_window > 0
     }
+
+    /// Whether these params are exactly the FROZEN single-image ban the
+    /// speculative-decode verifier's chooser hardwires (bd-1azu.32/.35/.36):
+    /// `no_repeat_ngram_size == 35` over the `ngram_window == 128` lookback.
+    ///
+    /// This is the params half of the `FOCR_SPEC_DECODE` dispatch guard in
+    /// `OcrModel::generate_cached_i8` — `spec::accept_longest` recomputes each
+    /// per-position greedy token with [`DEFAULT_NO_REPEAT_NGRAM_SIZE`] /
+    /// [`NGRAM_WINDOW_SINGLE`] baked in, so ANY override of either knob (e.g.
+    /// `--no-repeat-ngram 20`, `--ngram-window 1024`, `FOCR_NO_REPEAT_NGRAM`)
+    /// MUST keep speculative decode disengaged: this predicate returning `false`
+    /// means the sequential greedy loop runs untouched, byte-for-byte today's
+    /// path. Extracted here so the gate is testable from the public surface
+    /// (`tests/spec_decode_gate.rs`) — a pure read, no numerics.
+    #[must_use]
+    pub fn matches_frozen_spec_ban(&self) -> bool {
+        self.no_repeat_ngram_size == DEFAULT_NO_REPEAT_NGRAM_SIZE
+            && self.ngram_window == NGRAM_WINDOW_SINGLE
+    }
+}
+
+/// Pure token-stream statistics from one runaway-guard checkpoint.
+///
+/// These fields are deliberately public so calibration/evidence harnesses can
+/// record the exact integer witness. No decoded strings or model precision
+/// choices participate in the decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunawayMetrics {
+    /// Number of emitted tokens at this checkpoint.
+    pub emitted_tokens: usize,
+    /// Fixed suffix length analyzed.
+    pub window_tokens: usize,
+    /// Candidate lag with the greatest exact token agreement.
+    pub best_period: usize,
+    /// Equal token positions at `i` and `i - best_period`.
+    pub period_matches: usize,
+    /// Total lagged token comparisons.
+    pub period_comparisons: usize,
+    /// Distinct exact token 4-grams in the suffix.
+    pub unique_ngrams: usize,
+    /// Total (overlapping) token 4-grams in the suffix.
+    pub total_ngrams: usize,
+}
+
+impl RunawayMetrics {
+    /// Exact period-match ratio in parts per million for evidence logs.
+    #[must_use]
+    pub fn period_match_ppm(self) -> u32 {
+        ratio_ppm(self.period_matches, self.period_comparisons)
+    }
+
+    /// Exact token 4-gram novelty ratio in parts per million for evidence logs.
+    #[must_use]
+    pub fn ngram_novelty_ppm(self) -> u32 {
+        ratio_ppm(self.unique_ngrams, self.total_ngrams)
+    }
+
+    /// Whether this checkpoint crosses both fixed integer thresholds.
+    #[must_use]
+    pub fn is_suspicious(self) -> bool {
+        (self.period_matches as u128) * (RUNAWAY_GUARD_MATCH_DENOMINATOR as u128)
+            >= (self.period_comparisons as u128) * (RUNAWAY_GUARD_MATCH_NUMERATOR as u128)
+            && (self.unique_ngrams as u128) * (RUNAWAY_GUARD_NOVELTY_DENOMINATOR as u128)
+                <= (self.total_ngrams as u128) * (RUNAWAY_GUARD_NOVELTY_NUMERATOR as u128)
+    }
+}
+
+/// Auditable witness carried by the typed timeout when hysteresis fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunawayEvidence {
+    /// Metrics at the checkpoint that completed the trigger.
+    pub metrics: RunawayMetrics,
+    /// Consecutive suspicious checkpoints observed.
+    pub consecutive_hits: usize,
+}
+
+impl RunawayEvidence {
+    /// Convert a trigger into the stable budget/timeout error class (exit 5).
+    ///
+    /// This intentionally does not return generated tokens or synthesize EOS:
+    /// the caller must reject the run rather than silently bless truncation.
+    #[must_use]
+    pub fn timeout_error(self) -> FocrError {
+        FocrError::Timeout(format!(
+            "runaway token guard triggered at {} emitted tokens after {} consecutive \
+             checkpoints: period={} match={}/{} ({} ppm), token-4gram novelty={}/{} \
+             ({} ppm); output rejected rather than silently truncated",
+            self.metrics.emitted_tokens,
+            self.consecutive_hits,
+            self.metrics.best_period,
+            self.metrics.period_matches,
+            self.metrics.period_comparisons,
+            self.metrics.period_match_ppm(),
+            self.metrics.unique_ngrams,
+            self.metrics.total_ngrams,
+            self.metrics.ngram_novelty_ppm(),
+        ))
+    }
+}
+
+/// Deterministic action selected by [`RunawayGuard::observe`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunawayDecision {
+    /// Preserve the ordinary decode path unchanged.
+    Continue,
+    /// Reject the run with [`RunawayEvidence::timeout_error`].
+    Abort(RunawayEvidence),
+}
+
+/// Opt-in finite-state detector for sustained periodic, low-novelty token tails.
+///
+/// State is only the next fixed checkpoint, consecutive suspicious-hit count,
+/// last metrics, and an optional terminal evidence witness. Abort is sticky:
+/// once selected, every later observation returns the identical evidence. The
+/// token stream is caller-owned and read-only, so an armed guard cannot change
+/// sampling, token order, or EOS behavior before selecting Abort.
+#[derive(Debug, Clone)]
+pub struct RunawayGuard {
+    enabled: bool,
+    next_checkpoint: Option<usize>,
+    consecutive_hits: usize,
+    last_metrics: Option<RunawayMetrics>,
+    terminal_evidence: Option<RunawayEvidence>,
+}
+
+impl RunawayGuard {
+    /// Construct an explicitly enabled or disabled guard.
+    #[must_use]
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            next_checkpoint: Some(RUNAWAY_GUARD_MIN_TOKENS),
+            consecutive_hits: 0,
+            last_metrics: None,
+            terminal_evidence: None,
+        }
+    }
+
+    /// Parse the strict public environment contract.
+    ///
+    /// `None` and `Some("0")` preserve today's exact token stream. Only
+    /// `Some("1")` arms the uncalibrated diagnostic controller; every other
+    /// value is a usage error rather than a silently guessed policy.
+    pub fn from_env_value(raw: Option<&str>) -> FocrResult<Self> {
+        let enabled = match raw {
+            None | Some("0") => false,
+            Some("1") => true,
+            Some(other) => {
+                return Err(FocrError::Usage(format!(
+                    "{RUNAWAY_GUARD_ENV} must be exactly 0 or 1, got {other:?}"
+                )));
+            }
+        };
+        Ok(Self::new(enabled))
+    }
+
+    /// Read [`RUNAWAY_GUARD_ENV`] once for one decode invocation.
+    pub fn from_env() -> FocrResult<Self> {
+        match std::env::var(RUNAWAY_GUARD_ENV) {
+            Ok(raw) => Self::from_env_value(Some(&raw)),
+            Err(std::env::VarError::NotPresent) => Self::from_env_value(None),
+            Err(std::env::VarError::NotUnicode(_)) => Err(FocrError::Usage(format!(
+                "{RUNAWAY_GUARD_ENV} must be valid UTF-8 containing exactly 0 or 1"
+            ))),
+        }
+    }
+
+    /// Whether this invocation is armed.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Metrics from the most recent analyzed checkpoint, if any.
+    #[must_use]
+    pub fn last_metrics(&self) -> Option<RunawayMetrics> {
+        self.last_metrics
+    }
+
+    /// Observe an append-only emitted-token history.
+    ///
+    /// Checkpoints are analyzed at their exact prefix even if a caller commits
+    /// several tokens between calls. The decision is therefore invariant to
+    /// polling cadence. Disabled guards do not inspect or allocate.
+    #[must_use]
+    pub fn observe(&mut self, emitted: &[u32]) -> RunawayDecision {
+        if !self.enabled {
+            return RunawayDecision::Continue;
+        }
+        if let Some(evidence) = self.terminal_evidence {
+            return RunawayDecision::Abort(evidence);
+        }
+
+        while let Some(checkpoint) = self.next_checkpoint {
+            if emitted.len() < checkpoint {
+                break;
+            }
+            self.next_checkpoint = checkpoint.checked_add(RUNAWAY_GUARD_CHECK_INTERVAL);
+
+            let Some(metrics) = analyze_runaway_suffix(&emitted[..checkpoint]) else {
+                continue;
+            };
+            self.last_metrics = Some(metrics);
+            if metrics.is_suspicious() {
+                self.consecutive_hits += 1;
+                if self.consecutive_hits >= RUNAWAY_GUARD_REQUIRED_HITS {
+                    let evidence = RunawayEvidence {
+                        metrics,
+                        consecutive_hits: self.consecutive_hits,
+                    };
+                    self.terminal_evidence = Some(evidence);
+                    return RunawayDecision::Abort(evidence);
+                }
+            } else {
+                self.consecutive_hits = 0;
+            }
+        }
+
+        RunawayDecision::Continue
+    }
+
+    /// Shared production commit hook: check one just-appended token and
+    /// propagate a terminal trigger as a typed timeout.
+    ///
+    /// A real EOS observed before a terminal trigger bypasses analysis; the
+    /// guard exists only for sustained **no-EOS** trajectories. Once selected,
+    /// Abort remains sticky. Every production AR loop calls this after appending
+    /// its token and before committing more decoder state.
+    pub fn check_after_emit(&mut self, emitted: &[u32], is_eos: bool) -> FocrResult<()> {
+        if let Some(evidence) = self.terminal_evidence {
+            return Err(evidence.timeout_error());
+        }
+        if is_eos {
+            return Ok(());
+        }
+        match self.observe(emitted) {
+            RunawayDecision::Continue => Ok(()),
+            RunawayDecision::Abort(evidence) => Err(evidence.timeout_error()),
+        }
+    }
+}
+
+impl Default for RunawayGuard {
+    fn default() -> Self {
+        Self::new(false)
+    }
+}
+
+/// Analyze the fixed token suffix used by the runaway guard.
+///
+/// This pure API exposes the exact integer witness for offline calibration and
+/// replay. It returns `None` until a full 2,048-token window exists.
+#[must_use]
+pub fn analyze_runaway_suffix(emitted: &[u32]) -> Option<RunawayMetrics> {
+    if emitted.len() < RUNAWAY_GUARD_WINDOW_TOKENS {
+        return None;
+    }
+    let window = &emitted[emitted.len() - RUNAWAY_GUARD_WINDOW_TOKENS..];
+    let max_period = RUNAWAY_GUARD_MAX_PERIOD.min(window.len() / RUNAWAY_GUARD_MIN_PERIOD_CYCLES);
+
+    let mut best_period = 1usize;
+    let mut best_matches = 0usize;
+    let mut best_comparisons = window.len() - 1;
+    for period in 1..=max_period {
+        let comparisons = window.len() - period;
+        let matches = (period..window.len())
+            .filter(|&i| window[i] == window[i - period])
+            .count();
+        let lhs = (matches as u128) * (best_comparisons as u128);
+        let rhs = (best_matches as u128) * (comparisons as u128);
+        if lhs > rhs || (lhs == rhs && period < best_period) {
+            best_period = period;
+            best_matches = matches;
+            best_comparisons = comparisons;
+        }
+    }
+
+    let total_ngrams = window.len() - RUNAWAY_GUARD_NGRAM_ORDER + 1;
+    let mut unique = std::collections::BTreeSet::new();
+    for ngram in window.windows(RUNAWAY_GUARD_NGRAM_ORDER) {
+        unique.insert(ngram);
+    }
+
+    Some(RunawayMetrics {
+        emitted_tokens: emitted.len(),
+        window_tokens: window.len(),
+        best_period,
+        period_matches: best_matches,
+        period_comparisons: best_comparisons,
+        unique_ngrams: unique.len(),
+        total_ngrams,
+    })
+}
+
+fn ratio_ppm(numerator: usize, denominator: usize) -> u32 {
+    if denominator == 0 {
+        return 0;
+    }
+    u32::try_from(((numerator as u128) * 1_000_000) / (denominator as u128)).unwrap_or(u32::MAX)
 }
 
 /// One step's decode result (the frozen output contract).
@@ -135,14 +477,18 @@ impl DecodeOutput {
 /// Greedy argmax over a single `[1, vocab]` logits row, returning the
 /// lowest-index maximal token id.
 ///
-/// This matches `torch.argmax` semantics used by HF greedy decode: on ties the
-/// **first** (lowest-index) maximum wins. `NaN` logits never compare greater, so
-/// a token banned to `-inf` (or any finite value) is preferred over `NaN`; an
-/// all-`NaN` row falls back to id 0.
+/// This matches the pinned `torch.argmax` semantics used by HF greedy decode:
+/// on ties the **first** (lowest-index) maximum wins, and the first `NaN` wins
+/// as soon as one is present. Banned tokens are set to `-inf` before this scan,
+/// so a banned `NaN` no longer participates.
 ///
 /// # Errors
 /// Returns [`FocrError::Other`] if the row is empty (`vocab == 0`).
-fn argmax_row(logits: &[f32]) -> FocrResult<u32> {
+///
+/// `pub(crate)` so the speculative-decode verifier ([`super::spec`], bd-1azu.32)
+/// reuses the EXACT argmax/tie-break the production decode loop runs — sharing
+/// this one function is what makes the verifier byte-for-byte greedy.
+pub(crate) fn argmax_row(logits: &[f32]) -> FocrResult<u32> {
     if logits.is_empty() {
         return Err(FocrError::Other(anyhow::anyhow!(
             "sampler::argmax_row: empty logits row"
@@ -151,7 +497,7 @@ fn argmax_row(logits: &[f32]) -> FocrResult<u32> {
     let mut best: Option<(usize, f32)> = None;
     for (i, &v) in logits.iter().enumerate() {
         if v.is_nan() {
-            continue;
+            return Ok(i as u32);
         }
         match best {
             Some((_, best_val)) if v <= best_val => {}
@@ -214,7 +560,12 @@ fn for_each_sliding_window_ngram_ban(
 /// Return a masked logits copy only when the blocker actually bans at least one
 /// in-vocab token. The common no-ban decode step returns `None`, avoiding a
 /// full-vocab copy.
-fn masked_sliding_window_logits_if_needed(
+///
+/// `pub(crate)` so the speculative-decode verifier ([`super::spec`], bd-1azu.32)
+/// applies the IDENTICAL sliding-window n-gram ban the production decode loop
+/// runs before argmax — the verifier reuses this exact masking, never a re-derived
+/// copy, so its per-position greedy token matches sequential decode bit-for-bit.
+pub(crate) fn masked_sliding_window_logits_if_needed(
     row: &[f32],
     sequence: &[u32],
     ngram_size: usize,
@@ -227,6 +578,29 @@ fn masked_sliding_window_logits_if_needed(
         row[bi] = f32::NEG_INFINITY;
     });
     masked
+}
+
+/// Collect every in-vocab token id the sliding-window no-repeat-ngram processor
+/// would ban for `sequence`, as a flat list — the ban SET the
+/// `FOCR_FUSE_NGRAM_LMHEAD` lm_head epilogue masks to -inf as the logits are
+/// produced ([`super::decoder::lm_head_cached_i8_ngram_masked`]). Reuses the EXACT
+/// [`for_each_sliding_window_ngram_ban`] scan that
+/// [`masked_sliding_window_logits_if_needed`] uses, so the ban set is identical;
+/// ids may repeat when the same completion is reachable from several window
+/// positions (the epilogue mask is idempotent). `window == 0` is the HF global
+/// no-repeat-ngram fallback.
+pub(crate) fn collect_sliding_window_ngram_bans(
+    sequence: &[u32],
+    ngram_size: usize,
+    window: usize,
+    whitelist: &[u32],
+    vocab: usize,
+) -> Vec<u32> {
+    let mut banned = Vec::new();
+    for_each_sliding_window_ngram_ban(sequence, ngram_size, window, whitelist, vocab, |bi| {
+        banned.push(bi as u32);
+    });
+    banned
 }
 
 /// Apply the custom sliding-window no-repeat-n-gram blocker in place over a
@@ -355,6 +729,54 @@ pub fn decode_step(
     params: &DecodeParams,
 ) -> FocrResult<DecodeOutput> {
     let token_id = sample(logits, generated, params)?;
+    Ok(DecodeOutput::new(token_id, params))
+}
+
+/// Argmax + EOS over a `[1, vocab]` logits row whose sliding-window
+/// no-repeat-ngram ban has ALREADY been folded into the lm_head epilogue
+/// (`FOCR_FUSE_NGRAM_LMHEAD`, [`super::decoder::lm_head_cached_i8_ngram_masked`]):
+/// the banned tokens are already `-inf`, so this argmaxes directly with NO masking
+/// pass. For a row produced from those bans (via
+/// [`collect_sliding_window_ngram_bans`]), the chosen token is byte-for-byte the
+/// one [`decode_step`] returns for the UNMASKED logits + the same sequence — the
+/// row the argmax sees is identical either way (banned channels `-inf`, the rest
+/// the same lm_head dot products), and [`argmax_row`] is the same tie/NaN scan.
+///
+/// # Errors
+/// * [`FocrError::Other`] if `logits` is not a single row, or the backing length
+///   disagrees with `rows * cols`.
+/// * [`FocrError::NotImplemented`] for `temperature > 0` (sampling path).
+pub fn decode_step_premasked(logits: &Mat, params: &DecodeParams) -> FocrResult<DecodeOutput> {
+    if logits.rows != 1 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "sampler::decode_step_premasked expects a single [1, vocab] logits row, got [{}, {}]",
+            logits.rows,
+            logits.cols
+        )));
+    }
+    if !params.is_greedy() {
+        return Err(FocrError::NotImplemented(
+            "native_engine::sampler::decode_step_premasked — temperature>0 sampling is outside the greedy fp32 spine"
+                .into(),
+        ));
+    }
+    let expected_len = logits.rows.checked_mul(logits.cols).ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "sampler::decode_step_premasked: logits shape product overflow for [{}, {}]",
+            logits.rows,
+            logits.cols
+        ))
+    })?;
+    if logits.data.len() != expected_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "sampler::decode_step_premasked: logits data len {} != rows*cols {} for shape [{}, {}]",
+            logits.data.len(),
+            expected_len,
+            logits.rows,
+            logits.cols
+        )));
+    }
+    let token_id = argmax_row(logits.row(0))?;
     Ok(DecodeOutput::new(token_id, params))
 }
 
@@ -489,6 +911,22 @@ mod tests {
         }
     }
 
+    fn periodic_tokens(len: usize, period: usize) -> Vec<u32> {
+        (0..len).map(|i| (i % period) as u32).collect()
+    }
+
+    fn near_periodic_tokens(len: usize, period: usize) -> Vec<u32> {
+        (0..len)
+            .map(|i| {
+                if i % period == 0 {
+                    10_000 + (i / period) as u32
+                } else {
+                    (i % period) as u32
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn defaults_match_frozen_contract() {
         let p = DecodeParams::default();
@@ -499,6 +937,207 @@ mod tests {
         assert_eq!(p.ngram_window, 128);
         assert!(p.is_greedy());
         assert!(p.sliding_ngram_active());
+    }
+
+    #[test]
+    fn runaway_guard_is_default_off_and_strictly_opt_in() {
+        let default_guard = RunawayGuard::default();
+        assert!(!default_guard.enabled());
+        assert!(!RunawayGuard::from_env_value(None).unwrap().enabled());
+        assert!(!RunawayGuard::from_env_value(Some("0")).unwrap().enabled());
+        assert!(RunawayGuard::from_env_value(Some("1")).unwrap().enabled());
+
+        for invalid in ["", "true", "on", "2", " 1 "] {
+            assert!(matches!(
+                RunawayGuard::from_env_value(Some(invalid)),
+                Err(FocrError::Usage(message))
+                    if message.contains("must be exactly 0 or 1")
+            ));
+        }
+    }
+
+    #[test]
+    fn runaway_metrics_are_exact_token_level_witnesses() {
+        let tokens = periodic_tokens(RUNAWAY_GUARD_WINDOW_TOKENS, 32);
+        let metrics = analyze_runaway_suffix(&tokens).expect("full analysis window");
+        assert_eq!(metrics.emitted_tokens, RUNAWAY_GUARD_WINDOW_TOKENS);
+        assert_eq!(metrics.window_tokens, RUNAWAY_GUARD_WINDOW_TOKENS);
+        assert_eq!(metrics.best_period, 32);
+        assert_eq!(metrics.period_matches, RUNAWAY_GUARD_WINDOW_TOKENS - 32);
+        assert_eq!(metrics.period_comparisons, RUNAWAY_GUARD_WINDOW_TOKENS - 32);
+        assert_eq!(metrics.period_match_ppm(), 1_000_000);
+        assert_eq!(metrics.unique_ngrams, 32);
+        assert_eq!(metrics.total_ngrams, RUNAWAY_GUARD_WINDOW_TOKENS - 3);
+        assert_eq!(metrics.ngram_novelty_ppm(), 15_647);
+        assert!(metrics.is_suspicious());
+    }
+
+    #[test]
+    fn runaway_guard_requires_three_consecutive_checkpoints() {
+        let tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            32,
+        );
+        let mut guard = RunawayGuard::new(true);
+
+        assert_eq!(
+            guard.observe(&tokens[..RUNAWAY_GUARD_MIN_TOKENS]),
+            RunawayDecision::Continue
+        );
+        assert_eq!(
+            guard.observe(&tokens[..RUNAWAY_GUARD_MIN_TOKENS + RUNAWAY_GUARD_CHECK_INTERVAL]),
+            RunawayDecision::Continue
+        );
+        let RunawayDecision::Abort(evidence) = guard.observe(&tokens) else {
+            unreachable!("third suspicious checkpoint must abort");
+        };
+        assert_eq!(evidence.consecutive_hits, RUNAWAY_GUARD_REQUIRED_HITS);
+        assert_eq!(evidence.metrics.emitted_tokens, tokens.len());
+        assert!(evidence.metrics.is_suspicious());
+    }
+
+    #[test]
+    fn runaway_guard_catches_repeated_template_with_changing_field() {
+        let tokens = near_periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            32,
+        );
+        let metrics = analyze_runaway_suffix(&tokens).expect("full analysis window");
+        assert_eq!(metrics.best_period, 32);
+        assert!(metrics.period_match_ppm() >= 968_000);
+        assert!(metrics.ngram_novelty_ppm() < 250_000);
+        assert!(metrics.is_suspicious());
+
+        let mut guard = RunawayGuard::new(true);
+        assert!(matches!(guard.observe(&tokens), RunawayDecision::Abort(_)));
+    }
+
+    #[test]
+    fn runaway_guard_rejects_with_typed_timeout_not_synthetic_eos() {
+        let tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            19,
+        );
+        let mut guard = RunawayGuard::new(true);
+        let RunawayDecision::Abort(evidence) = guard.observe(&tokens) else {
+            unreachable!("periodic stream must produce an evidence witness");
+        };
+        let error = evidence.timeout_error();
+        assert_eq!(error.kind(), "timeout");
+        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+        let message = error.to_string();
+        assert!(message.contains("output rejected rather than silently truncated"));
+        assert!(message.contains("period=19"));
+        assert!(message.contains("token-4gram novelty"));
+    }
+
+    #[test]
+    fn shared_commit_hook_propagates_timeout_but_never_overrides_real_eos() {
+        let tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            29,
+        );
+
+        let mut eos_guard = RunawayGuard::new(true);
+        assert!(
+            eos_guard
+                .check_after_emit(&tokens[..RUNAWAY_GUARD_MIN_TOKENS], false)
+                .is_ok()
+        );
+        assert!(
+            eos_guard
+                .check_after_emit(
+                    &tokens[..RUNAWAY_GUARD_MIN_TOKENS + RUNAWAY_GUARD_CHECK_INTERVAL],
+                    false,
+                )
+                .is_ok()
+        );
+        assert!(eos_guard.check_after_emit(&tokens, true).is_ok());
+
+        let mut runaway_guard = RunawayGuard::new(true);
+        let error = runaway_guard
+            .check_after_emit(&tokens, false)
+            .expect_err("third no-EOS checkpoint must fail");
+        assert_eq!(error.kind(), "timeout");
+        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+    }
+
+    #[test]
+    fn runaway_abort_is_terminal_and_preserves_its_first_witness() {
+        let mut tokens = periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            23,
+        );
+        let mut guard = RunawayGuard::new(true);
+        let first = guard.observe(&tokens);
+        let RunawayDecision::Abort(first_evidence) = first else {
+            unreachable!("periodic stream must abort");
+        };
+
+        assert_eq!(guard.observe(&tokens), first);
+        tokens.extend(periodic_tokens(RUNAWAY_GUARD_CHECK_INTERVAL, 23));
+        assert_eq!(
+            guard.observe(&tokens),
+            RunawayDecision::Abort(first_evidence)
+        );
+        let sticky_error = guard
+            .check_after_emit(&tokens, true)
+            .expect_err("a terminal Abort cannot transition back to Continue on later EOS");
+        let first_error = first_evidence.timeout_error();
+        assert_eq!(sticky_error.kind(), first_error.kind());
+        assert_eq!(sticky_error.to_string(), first_error.to_string());
+    }
+
+    #[test]
+    fn runaway_guard_does_not_fire_on_high_novelty_tokens() {
+        let tokens: Vec<u32> = (0..DEFAULT_MAX_LENGTH as u32).collect();
+        let mut guard = RunawayGuard::new(true);
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        let metrics = guard.last_metrics().expect("long stream was analyzed");
+        assert_eq!(metrics.ngram_novelty_ppm(), 1_000_000);
+        assert!(!metrics.is_suspicious());
+    }
+
+    #[test]
+    fn one_suspicious_checkpoint_cannot_survive_a_normal_checkpoint() {
+        let mut tokens = periodic_tokens(RUNAWAY_GUARD_MIN_TOKENS, 32);
+        let mut guard = RunawayGuard::new(true);
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        assert!(guard.last_metrics().unwrap().is_suspicious());
+
+        tokens.extend((0..RUNAWAY_GUARD_CHECK_INTERVAL).map(|i| 1_000_000 + i as u32));
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        assert!(!guard.last_metrics().unwrap().is_suspicious());
+    }
+
+    #[test]
+    fn runaway_decision_is_invariant_to_observer_polling_cadence() {
+        let tokens = near_periodic_tokens(
+            RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
+            47,
+        );
+        let mut one_shot = RunawayGuard::new(true);
+        let one_shot_decision = one_shot.observe(&tokens);
+
+        let mut incremental = RunawayGuard::new(true);
+        let mut incremental_decision = RunawayDecision::Continue;
+        for end in 1..=tokens.len() {
+            incremental_decision = incremental.observe(&tokens[..end]);
+            if matches!(incremental_decision, RunawayDecision::Abort(_)) {
+                break;
+            }
+        }
+        assert_eq!(incremental_decision, one_shot_decision);
+    }
+
+    #[test]
+    fn disabled_runaway_guard_never_inspects_or_changes_tokens() {
+        let tokens = periodic_tokens(DEFAULT_MAX_LENGTH, 7);
+        let original = tokens.clone();
+        let mut guard = RunawayGuard::default();
+        assert_eq!(guard.observe(&tokens), RunawayDecision::Continue);
+        assert!(guard.last_metrics().is_none());
+        assert_eq!(tokens, original);
     }
 
     #[test]
@@ -535,18 +1174,18 @@ mod tests {
     }
 
     #[test]
-    fn argmax_skips_nan_and_neg_inf() {
-        let r = row(vec![f32::NAN, f32::NEG_INFINITY, 2.0, 1.0]);
+    fn argmax_selects_first_nan_like_pinned_torch() {
+        let r = row(vec![7.0, f32::NAN, f32::NEG_INFINITY, f32::NAN, 9.0]);
         let p = DecodeParams {
             no_repeat_ngram_size: 0,
             ngram_window: 0,
             ..DecodeParams::default()
         };
-        assert_eq!(sample(&r, &[], &p).unwrap(), 2);
+        assert_eq!(sample(&r, &[], &p).unwrap(), 1);
     }
 
     #[test]
-    fn argmax_all_nan_falls_back_to_zero() {
+    fn argmax_all_nan_selects_first_index() {
         let r = row(vec![f32::NAN, f32::NAN, f32::NAN]);
         let p = DecodeParams {
             no_repeat_ngram_size: 0,
@@ -824,5 +1463,532 @@ mod tests {
         assert_eq!(logits[2], f32::NEG_INFINITY);
         assert_eq!(logits[0], 0.0);
         assert_eq!(logits[1], 0.0);
+    }
+}
+
+/// bd-1azu.36 (LINEAR half) — speculative-decode gate FAULT-INJECTION battery: an
+/// UNTRUSTED drafter can never change the emitted stream.
+///
+/// Lives here rather than in `tests/spec_decode_gate.rs` (its integration-side
+/// companion) because the seams under fault —
+/// `native_engine::spec::{accept_longest, resolve_round}` — are `pub(crate)`, so
+/// integration tests (public API only) cannot reach them, and `spec.rs`/`mod.rs`
+/// are owner-frozen this wave. The sampler is the natural in-crate home: the
+/// verifier's chooser under fault IS this module's [`sample`]/[`decode_step`],
+/// and every assertion replays it as the ground truth.
+///
+/// The model-free abstraction mirrors `spec.rs`'s own loop-parity tests: the
+/// decoder is a pure token-sequence -> `[1, V]` logits ORACLE (the property the
+/// real verify forward preserves bit-exactly, gated by
+/// `tests/spec_verify_forward_parity.rs`), and the loop skeleton mirrors
+/// `OcrModel::spec_decode_i8` — but the DRAFTER is an injected ADVERSARY instead
+/// of `spec::draft_ngram`: garbage ids, out-of-vocab/wild ids, forged EOS,
+/// oversized blocks far past `SPEC_DRAFT_MAX`, and always-empty proposals. The
+/// gate holds iff the emitted stream is byte-for-byte sequential greedy in every
+/// case (a draft is a PROPOSAL — the verifier accepts only tokens equal to the
+/// per-position greedy choice, and fails CLOSED on malformed verify rows).
+///
+/// TREE-verify clauses (tree-attention node parity, longest-path accept,
+/// `FOCR_SPEC_TREE_W=1` collapse) stay parked behind bd-1azu.34.
+#[cfg(test)]
+mod spec_gate_fault_injection {
+    use super::{DecodeParams, decode_step, sample};
+    use crate::native_engine::spec::{SPEC_DRAFT_MAX, accept_longest, resolve_round};
+    use crate::native_engine::tensor::Mat;
+
+    /// Vocabulary width for the synthetic logits rows (above every id used,
+    /// including the distinct-id oversized-draft targets).
+    const V: usize = 128;
+    /// EOS id under test == the frozen default ([SPEC-101]).
+    const EOS: u32 = 1;
+
+    /// A `[1, V]` logits row whose unique argmax is `token`.
+    fn peak_row(token: u32) -> Mat {
+        let mut r = vec![0.0f32; V];
+        r[token as usize] = 10.0;
+        Mat::from_vec(1, V, r)
+    }
+
+    /// A `[1, V]` row peaked at `peak` with a distinct runner-up at `runner_up`,
+    /// so a ban on `peak` flips the greedy token (the spec.rs ban-fixture idiom).
+    fn row_peaked(peak: u32, runner_up: u32) -> Mat {
+        let mut r = vec![0.0f32; V];
+        r[peak as usize] = 10.0;
+        r[runner_up as usize] = 9.0;
+        Mat::from_vec(1, V, r)
+    }
+
+    /// Single-image greedy params (the frozen 35/128 ban) with a `max_length` cap.
+    fn params(max_length: usize) -> DecodeParams {
+        let mut p = DecodeParams::single_image();
+        p.max_length = max_length;
+        p
+    }
+
+    /// Deterministic xorshift64 step (the house PRNG idiom — reproducible, no
+    /// dev-dependency).
+    fn xs(s: &mut u64) -> u64 {
+        let mut x = *s;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *s = x;
+        x
+    }
+
+    /// A deterministic 3rd-order content oracle: the next token is a hash of the
+    /// last three tokens, in `2..=6`, with EOS firing intermittently once there
+    /// is some history. Content-keyed, so verify rows are genuinely sensitive to
+    /// the draft tokens; the small alphabet lets plausible garbage both agree and
+    /// diverge. (Alphabet is `{EOS} ∪ 2..=6` — ids outside it are NEVER greedy.)
+    fn content_oracle(seq: &[u32]) -> Mat {
+        let start = seq.len().saturating_sub(3);
+        let mut h: u64 = 0x9E37_79B9_7F4A_7C15;
+        for &t in &seq[start..] {
+            h ^= u64::from(t).wrapping_add(0x517C_C1B7_2722_0A95);
+            h = h.rotate_left(23).wrapping_mul(0x2545_F491_4F6C_DD1D);
+        }
+        let pick = if seq.len() >= 5 && (h & 7) == 0 {
+            EOS
+        } else {
+            2 + (h % 5) as u32
+        };
+        peak_row(pick)
+    }
+
+    /// Reference SEQUENTIAL greedy decode — the literal `generate_cached_i8` loop
+    /// with the decoder abstracted as `oracle`: choose via [`decode_step`] (the
+    /// production chooser), append, halt at EOS or `max_length`. No draft, no
+    /// verify assembly — the independent ground truth.
+    fn seq_generate(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        params: &DecodeParams,
+    ) -> Vec<u32> {
+        let mut generated = prompt.to_vec();
+        let mut emitted = Vec::new();
+        while emitted.len() < params.max_length {
+            let logits = oracle(&generated);
+            let step = decode_step(&logits, &generated, params).expect("seq decode_step");
+            generated.push(step.token_id);
+            emitted.push(step.token_id);
+            if step.is_eos {
+                break;
+            }
+        }
+        emitted
+    }
+
+    /// What each adversarial drafter actually hit — TEETH for the battery (the
+    /// parity assertions must not pass vacuously).
+    #[derive(Default)]
+    struct RoundStats {
+        /// Speculative rounds run (a non-empty draft reached the verifier).
+        rounds: usize,
+        /// Empty-draft fallback steps (one sequential step, no verify).
+        fallbacks: usize,
+        /// Total accepted draft tokens across all rounds.
+        accepted_tokens: usize,
+        /// Rounds where the verifier rejected at least one proposed token.
+        rejected_rounds: usize,
+    }
+
+    /// The `OcrModel::spec_decode_i8` loop skeleton with the DRAFTER injected as
+    /// an arbitrary (adversarial) closure: `verify_logits[i]` plays the batched
+    /// verify forward (`oracle(generated ++ draft[0..i])` — the contract
+    /// `decoder::verify_forward_i8` upholds bit-exactly), the REAL
+    /// [`resolve_round`] accepts + corrects, and committing a token is appending
+    /// it (the oracle is a pure function of the token sequence). Honors
+    /// EOS/`max_length` exactly as the live loop; mirrors `spec.rs`'s own
+    /// `spec_generate` step for step.
+    fn spec_generate_with_drafter(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        params: &DecodeParams,
+        drafter: &mut dyn FnMut(&[u32]) -> Vec<u32>,
+        stats: &mut RoundStats,
+    ) -> Vec<u32> {
+        let mut generated = prompt.to_vec();
+        let mut emitted = Vec::new();
+        while emitted.len() < params.max_length {
+            let draft = drafter(&generated);
+            if draft.is_empty() {
+                stats.fallbacks += 1;
+                let logits = oracle(&generated);
+                let step = decode_step(&logits, &generated, params).expect("spec fallback step");
+                generated.push(step.token_id);
+                emitted.push(step.token_id);
+                if step.is_eos {
+                    break;
+                }
+                continue;
+            }
+            // verify_logits[i] conditions on generated ++ draft[0..i] (i in 0..=K).
+            let mut verify_logits: Vec<Mat> = Vec::with_capacity(draft.len() + 1);
+            for i in 0..=draft.len() {
+                let mut ctx = generated.clone();
+                ctx.extend_from_slice(&draft[..i]);
+                verify_logits.push(oracle(&ctx));
+            }
+            let emit =
+                resolve_round(&generated, &draft, &verify_logits, params).expect("resolve_round");
+            stats.rounds += 1;
+            stats.accepted_tokens += emit.accepted;
+            if emit.accepted < draft.len() {
+                stats.rejected_rounds += 1;
+            }
+            let mut stopped = false;
+            for &token in &draft[..emit.accepted] {
+                generated.push(token);
+                emitted.push(token);
+                if params.eos_token_id == token {
+                    stopped = true;
+                    break;
+                }
+                if emitted.len() >= params.max_length {
+                    stopped = true;
+                    break;
+                }
+            }
+            if stopped {
+                break;
+            }
+            match emit.correction {
+                None => break,
+                Some(c) => {
+                    generated.push(c.token_id);
+                    emitted.push(c.token_id);
+                    if c.is_eos {
+                        break;
+                    }
+                }
+            }
+        }
+        emitted
+    }
+
+    /// The next up-to-`k` tokens sequential greedy WOULD emit from `seq` — the
+    /// "perfect drafter" (teeth: full agreement must actually be accepted).
+    fn greedy_lookahead(
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        seq: &[u32],
+        k: usize,
+        params: &DecodeParams,
+    ) -> Vec<u32> {
+        let mut ctx = seq.to_vec();
+        let mut out = Vec::new();
+        for _ in 0..k {
+            let step = decode_step(&oracle(&ctx), &ctx, params).expect("lookahead step");
+            out.push(step.token_id);
+            if step.is_eos {
+                break;
+            }
+            ctx.push(step.token_id);
+        }
+        out
+    }
+
+    /// Assert one (oracle, prompt, drafter) case: the speculative stream equals
+    /// the sequential greedy stream byte-for-byte, whatever the drafter proposed.
+    fn assert_drafter_harmless(
+        label: &str,
+        oracle: &dyn Fn(&[u32]) -> Mat,
+        prompt: &[u32],
+        max_length: usize,
+        drafter: &mut dyn FnMut(&[u32]) -> Vec<u32>,
+        stats: &mut RoundStats,
+    ) {
+        let p = params(max_length);
+        let seq = seq_generate(oracle, prompt, &p);
+        let spec = spec_generate_with_drafter(oracle, prompt, &p, drafter, stats);
+        assert_eq!(
+            spec, seq,
+            "{label}: adversarial drafter changed the emitted stream \
+             (prompt={prompt:?} ml={max_length})"
+        );
+    }
+
+    /// GATE (bd-1azu.36 fault-injection): NO drafter behavior — plausible garbage,
+    /// out-of-vocab/wild ids, EOS spam, oversized blocks far past
+    /// [`SPEC_DRAFT_MAX`], always-empty proposals, or the true greedy continuation
+    /// — changes the emitted stream: it is byte-for-byte sequential greedy in
+    /// every case. Prompts + caps stay under the 35-gram window so this battery
+    /// runs ban-free (the ban path has its own dedicated fixture below); teeth
+    /// assertions prove accepts, rejects, AND fallbacks all actually ran.
+    #[test]
+    fn adversarial_drafters_never_change_the_emitted_stream() {
+        let oracle: fn(&[u32]) -> Mat = content_oracle;
+        let prompts: [&[u32]; 3] = [&[2, 3, 4], &[5, 5, 5, 5], &[2, 6, 2, 6, 3]];
+
+        let mut garbage = RoundStats::default();
+        let mut wild = RoundStats::default();
+        let mut spam = RoundStats::default();
+        let mut oversized = RoundStats::default();
+        let mut empty = RoundStats::default();
+        let mut echo = RoundStats::default();
+        let mut seed: u64 = 0x5EC6_A7E0_D00D_F00D;
+
+        for prompt in prompts {
+            for ml in [8usize, 20] {
+                // (a) plausible garbage: random-length drafts of random ids in
+                // 0..8 (the oracle's alphabet ∪ EOS ∪ two never-emitted ids) —
+                // agreement is possible but never trusted.
+                let mut s = xs(&mut seed);
+                assert_drafter_harmless(
+                    "garbage",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| {
+                        let len = 1 + (xs(&mut s) % 6) as usize;
+                        (0..len).map(|_| (xs(&mut s) % 8) as u32).collect()
+                    },
+                    &mut garbage,
+                );
+
+                // (b) wild out-of-vocab ids: can never equal a greedy token, and
+                // must be rejected without panicking (the verifier never indexes
+                // by a draft id).
+                assert_drafter_harmless(
+                    "wild-ids",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| vec![u32::MAX, V as u32, 0x7FFF_FFFF],
+                    &mut wild,
+                );
+
+                // (c) EOS spam: a forged-termination attempt every round.
+                assert_drafter_harmless(
+                    "eos-spam",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| vec![EOS; 4],
+                    &mut spam,
+                );
+
+                // (d) oversized: 64 tokens (>> SPEC_DRAFT_MAX) of id 30, which the
+                // content oracle never emits — the budget is a proposal knob, not
+                // a safety boundary the verifier relies on.
+                assert_drafter_harmless(
+                    "oversized",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| vec![30u32; 64],
+                    &mut oversized,
+                );
+
+                // (e) always-empty: the loop must ride the sequential fallback.
+                assert_drafter_harmless(
+                    "empty",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |_: &[u32]| Vec::new(),
+                    &mut empty,
+                );
+
+                // (f) echo of the true greedy continuation: full accepts.
+                let p_look = params(ml);
+                assert_drafter_harmless(
+                    "echo",
+                    &oracle,
+                    prompt,
+                    ml,
+                    &mut |g: &[u32]| greedy_lookahead(&oracle, g, 4, &p_look),
+                    &mut echo,
+                );
+            }
+        }
+
+        // TEETH — each guaranteed by construction (pure oracles, fixed seeds):
+        assert!(
+            garbage.rounds > 0,
+            "garbage drafter never reached the verifier"
+        );
+        assert!(
+            wild.rounds > 0,
+            "wild-id drafter never reached the verifier"
+        );
+        assert_eq!(
+            wild.rejected_rounds, wild.rounds,
+            "an out-of-vocab id can never equal a greedy token"
+        );
+        assert_eq!(wild.accepted_tokens, 0, "wild ids must never be accepted");
+        assert!(
+            spam.rounds > 0,
+            "EOS-spam drafter never reached the verifier"
+        );
+        assert!(
+            oversized.rounds > 0,
+            "oversized drafter never reached the verifier"
+        );
+        assert_eq!(
+            oversized.accepted_tokens, 0,
+            "an id the oracle never emits must never be accepted"
+        );
+        assert_eq!(
+            empty.rounds, 0,
+            "an empty draft must not reach the verifier"
+        );
+        assert!(empty.fallbacks > 0, "empty-draft fallback never exercised");
+        assert!(echo.rounds > 0, "echo drafter never reached the verifier");
+        assert!(
+            echo.accepted_tokens > 0,
+            "full agreement was never accepted — the harness has no teeth"
+        );
+        assert_eq!(
+            echo.rejected_rounds, 0,
+            "the true greedy continuation must never be rejected"
+        );
+    }
+
+    /// Direct verifier-level fault: a draft far beyond the [`SPEC_DRAFT_MAX`]
+    /// budget is verified position by position — truncated at the first
+    /// divergence with the true greedy correction, or fully accepted when it
+    /// genuinely agrees — never trusted, never panicking. Distinct-id targets
+    /// keep the 35-gram ban silent (no 34-gram ever recurs), so greedy is the raw
+    /// per-row argmax throughout.
+    #[test]
+    fn oversized_draft_is_verified_position_by_position_never_trusted() {
+        const K: usize = 64;
+        let p = params(1000);
+        let target: Vec<u32> = (0..=K).map(|i| i as u32 + 2).collect();
+        let rows: Vec<Mat> = target.iter().map(|&t| peak_row(t)).collect();
+
+        // (a) agrees for 5 positions then diverges: truncated exactly there, the
+        // correction is the true greedy token, the oversized tail is discarded.
+        let mut draft: Vec<u32> = target[..K].to_vec();
+        draft[5] = 99;
+        assert!(
+            draft.len() > SPEC_DRAFT_MAX,
+            "the fault draft must dwarf the live proposal budget"
+        );
+        let emit = resolve_round(&[], &draft, &rows, &p).unwrap();
+        assert_eq!(
+            emit.accepted, 5,
+            "first divergence truncates; budget ignored"
+        );
+        assert_eq!(
+            emit.correction.expect("correction at divergence").token_id,
+            target[5]
+        );
+
+        // (b) fully-agreeing oversized draft: all K accepted + the bonus token.
+        let emit = resolve_round(&[], &target[..K], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, K, "genuine agreement is accepted in full");
+        assert_eq!(
+            emit.correction.expect("bonus after full accept").token_id,
+            target[K]
+        );
+    }
+
+    /// The 69-token spec.rs ban fixture: the trailing 34 tokens repeat an earlier
+    /// 34-gram whose observed completion was token 7, so the frozen 35/128
+    /// blocker bans 7 at the next position.
+    fn history_banning_token_7() -> Vec<u32> {
+        let prefix: Vec<u32> = (20u32..54).collect();
+        assert_eq!(prefix.len(), 34);
+        let mut h = Vec::with_capacity(69);
+        h.extend_from_slice(&prefix); // leading 34-gram
+        h.push(7); // its observed completion
+        h.extend_from_slice(&prefix); // current prefix == leading 34-gram
+        h
+    }
+
+    /// A malicious drafter cannot SMUGGLE a banned token past the frozen 35-gram
+    /// ban: the verifier recomputes greedy WITH the ban, rejects the raw-argmax
+    /// token the ban forbids, and corrects to the ban-aware choice.
+    #[test]
+    fn drafter_cannot_smuggle_a_banned_token() {
+        let history = history_banning_token_7();
+        // Raw argmax is 7 (banned in this context); runner-up is 6.
+        let rows = vec![row_peaked(7, 6), peak_row(8)];
+        let p = params(1000);
+        // Ground truth via the production chooser: the ban flips greedy to 6.
+        let g = sample(&rows[0], &history, &p).expect("production chooser");
+        assert_eq!(g, 6, "the 35-gram ban must flip greedy from 7 to 6");
+
+        let emit = resolve_round(&history, &[7], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 0, "the banned token must not be accepted");
+        assert_eq!(
+            emit.correction.expect("ban-aware correction").token_id,
+            6,
+            "the correction must be the ban-aware greedy token"
+        );
+    }
+
+    /// A drafter cannot FORGE termination: a proposed EOS where greedy would not
+    /// pick EOS is rejected, and the stream continues with the true token.
+    #[test]
+    fn drafter_cannot_forge_eos_termination() {
+        let rows = vec![peak_row(5), peak_row(6)];
+        let p = params(1000);
+        let emit = resolve_round(&[], &[EOS], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 0, "a forged EOS must be rejected");
+        let c = emit.correction.expect("correction after forged EOS");
+        assert_eq!(c.token_id, 5);
+        assert!(!c.is_eos, "the stream must not terminate on a forged EOS");
+    }
+
+    /// An empty draft resolves to exactly one pure sequential step: nothing
+    /// accepted, and the correction equals the production chooser's decision.
+    #[test]
+    fn empty_draft_resolves_to_the_pure_sequential_step() {
+        let rows = vec![peak_row(9)];
+        let p = params(1000);
+        let emit = resolve_round(&[2, 3], &[], &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 0);
+        let c = emit
+            .correction
+            .expect("the round still yields the sequential token");
+        assert_eq!(c.token_id, 9);
+        assert_eq!(
+            c.token_id,
+            sample(&rows[0], &[2, 3], &p).expect("production chooser"),
+            "the empty-draft round must equal the sequential chooser"
+        );
+    }
+
+    /// Verify rows SHORTER than the `draft.len() + 1` contract: only verified
+    /// positions are ever emitted — acceptance caps at the available rows and a
+    /// missing correction row yields NO token, never a fabricated one.
+    #[test]
+    fn short_verify_rows_fail_closed() {
+        let p = params(1000);
+        let draft = [3u32, 4, 2];
+        // 2 rows for a 3-token draft: positions 0 and 1 verifiable, 2 is not.
+        let rows = vec![peak_row(3), peak_row(4)];
+        let emit = resolve_round(&[], &draft, &rows, &p).unwrap();
+        assert_eq!(emit.accepted, 2, "the unverifiable tail is not accepted");
+        assert!(
+            emit.correction.is_none(),
+            "no verify row to correct from -> no token"
+        );
+    }
+
+    /// A MALFORMED (empty) verify row fails CLOSED: acceptance stops before the
+    /// unverifiable position, and a malformed correction row is a hard error —
+    /// the round never emits an unverified token.
+    #[test]
+    fn malformed_verify_row_never_emits_unverified_tokens() {
+        let p = params(1000);
+        // Empty row at the live position: nothing is verifiable and the
+        // correction row itself is malformed -> error, no fabricated token.
+        let r = resolve_round(&[], &[3], &[Mat::from_vec(1, 0, vec![]), peak_row(4)], &p);
+        assert!(r.is_err(), "a malformed correction row must fail closed");
+
+        // Empty row mid-draft: acceptance stops BEFORE the unverifiable position
+        // (position 0 verifies against a well-formed row and is accepted).
+        let good = peak_row(3);
+        let bad = Mat::from_vec(1, 0, vec![]);
+        let rows: Vec<&[f32]> = vec![good.row(0), bad.row(0)];
+        assert_eq!(
+            accept_longest(&[], &[3, 4], &rows, EOS),
+            1,
+            "acceptance must stop at the first unverifiable position"
+        );
     }
 }

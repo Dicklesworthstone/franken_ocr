@@ -1,0 +1,4 @@
+[focr-timing]   onechart.vision+splice 5.40s
+[focr-timing]   decode 257 tok in 1.22s (210.7 tok/s) | seed(prefill 308 tok) 0.07s | layers 1.00s (attn 0.30s, gemv+misc 0.70s) | lm_head 0.21s
+[focr-timing]   onechart.generate 257 tokens 1.32s
+[focr-timing] onechart forward 6.80s (reliable_distance None reliable None)

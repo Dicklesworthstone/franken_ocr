@@ -1,0 +1,25 @@
+{
+  "pages": [
+    "page_0009.png",
+    "page_0014.png",
+    "page_0019.png",
+    "page_0023.png",
+    "page_0086.png",
+    "page_0091.png",
+    "page_0105.png",
+    "page_0107.png",
+    "page_0108.png",
+    "page_0126.png"
+  ],
+  "prompt": "<image>Multi page parsing.",
+  "image_size": 640,
+  "no_repeat_ngram_size": 35,
+  "ngram_window": 1024,
+  "max_length": 32768,
+  "chars": 23697,
+  "output_tokens": 7117,
+  "page_markers": 9,
+  "sha256": "66bd3447c49c904f6fd3bfaed304a929bfc07dc9f1766065d8583c5a07de99b8",
+  "seconds": 409.54,
+  "raw": "multi_raw.md"
+}

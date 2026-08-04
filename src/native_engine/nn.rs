@@ -28,6 +28,7 @@ use ft_core::{DType, Device, TensorMeta};
 
 use super::tensor::{Mat, QInt8};
 use crate::error::{FocrError, FocrResult};
+use crate::quant::recipe::switch_on;
 
 /// Build a contiguous 2-D f32 CPU `TensorMeta` for a `[rows, cols]` tensor.
 ///
@@ -203,6 +204,166 @@ pub fn conv2d(
     )
 }
 
+/// TF-'SAME' padding amounts for ONE dimension (timm `padding.py`, E3/A8 —
+/// tromr-spec §2a): `total = max((ceil(i/s)−1)·s + k − i, 0)`, split
+/// `begin = total/2`, `end = total − begin` (right/bottom gets the extra —
+/// the asymmetry that plain symmetric padding cannot express; stem 7×7 s2 at
+/// H=128 pads 2 top / 3 bottom).
+#[must_use]
+pub fn tf_same_pad_amounts(i: usize, k: usize, s: usize) -> (usize, usize) {
+    let total = (i.div_ceil(s) - 1) * s + k;
+    let total = total.saturating_sub(i);
+    (total / 2, total - total / 2)
+}
+
+/// Pad a flat NCHW tensor per TF-'SAME' for a `(kh, kw, sh, sw)` op, filling
+/// with `fill` (`0.0` before [`conv2d`]; `f32::NEG_INFINITY` before
+/// [`max_pool2d`] — timm `MaxPool2dSame` pads with −∞ so border maxima are
+/// never fabricated from zeros). Returns `(padded, ph, pw)`; the SAME output
+/// dims are `ceil(h/sh) × ceil(w/sw)`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn tf_same_pad(
+    input: &[f32],
+    batch: usize,
+    ch: usize,
+    h: usize,
+    w: usize,
+    kh: usize,
+    kw: usize,
+    sh: usize,
+    sw: usize,
+    fill: f32,
+) -> (Vec<f32>, usize, usize) {
+    let (top, bottom) = tf_same_pad_amounts(h, kh, sh);
+    let (left, right) = tf_same_pad_amounts(w, kw, sw);
+    let (ph, pw) = (h + top + bottom, w + left + right);
+    let mut out = vec![fill; batch * ch * ph * pw];
+    for bc in 0..batch * ch {
+        let src = &input[bc * h * w..(bc + 1) * h * w];
+        let dst = &mut out[bc * ph * pw..(bc + 1) * ph * pw];
+        for row in 0..h {
+            let d = (row + top) * pw + left;
+            dst[d..d + w].copy_from_slice(&src[row * w..(row + 1) * w]);
+        }
+    }
+    (out, ph, pw)
+}
+
+/// Max-pool `k×k` stride `s` over a PRE-PADDED flat NCHW tensor (pair with
+/// [`tf_same_pad`] using a `NEG_INFINITY` fill for the timm `MaxPool2dSame`
+/// semantics — tromr-spec §2a stem `MaxPool2dSame(k3, s2)`). `(oh, ow)` are
+/// the output spatial dims. Tight scalar loops (doctrine #3).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool2d(
+    input: &[f32],
+    batch: usize,
+    ch: usize,
+    ph: usize,
+    pw: usize,
+    k: usize,
+    s: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f32> {
+    let mut out = vec![f32::NEG_INFINITY; batch * ch * oh * ow];
+    for bc in 0..batch * ch {
+        let src = &input[bc * ph * pw..(bc + 1) * ph * pw];
+        let dst = &mut out[bc * oh * ow..(bc + 1) * oh * ow];
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut m = f32::NEG_INFINITY;
+                for ky in 0..k {
+                    let row = oy * s + ky;
+                    for kx in 0..k {
+                        m = m.max(src[row * pw + ox * s + kx]);
+                    }
+                }
+                dst[oy * ow + ox] = m;
+            }
+        }
+    }
+    out
+}
+
+/// In-place GroupNorm (+ optional fused ReLU) over a flat NCHW tensor — the
+/// TrOMR/pix2tex ResNetV2 backbone norm (E3/A8; tromr-spec §2a:
+/// `GroupNormAct(num_groups=32, eps=1e-5)`, groups of 2 even at 64 channels;
+/// the `norm3`/downsample instances skip the activation, hence `fuse_relu`).
+///
+/// Torch `nn.GroupNorm` semantics: per `(batch, group)`, mean and POPULATION
+/// variance over the group's `(channels/groups) × spatial` elements, then the
+/// per-CHANNEL affine `y = (x − μ)/√(σ² + eps) · γ_c + β_c`. First GroupNorm
+/// in the repo (Baidu/GOT/SmolVLM2/OneChart are LayerNorm/RMSNorm only).
+/// Tight scalar loops — LLVM autovectorizes (doctrine #3).
+///
+/// # Errors
+/// Shape violations: `channels % groups != 0`, a length mismatch on `x`
+/// (`batch·channels·spatial`) or on `weight`/`bias` (`channels`).
+#[allow(clippy::too_many_arguments)]
+pub fn group_norm(
+    x: &mut [f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    groups: usize,
+    eps: f32,
+    weight: &[f32],
+    bias: &[f32],
+    fuse_relu: bool,
+) -> FocrResult<()> {
+    if groups == 0 || !channels.is_multiple_of(groups) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "group_norm: channels {channels} not divisible by groups {groups}"
+        )));
+    }
+    if x.len() != batch * channels * spatial {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "group_norm: x len {} != batch {batch} * channels {channels} * spatial {spatial}",
+            x.len()
+        )));
+    }
+    if weight.len() != channels || bias.len() != channels {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "group_norm: weight/bias len {}/{} != channels {channels}",
+            weight.len(),
+            bias.len()
+        )));
+    }
+    let cpg = channels / groups;
+    let group_len = cpg * spatial;
+    for b in 0..batch {
+        for g in 0..groups {
+            let start = (b * channels + g * cpg) * spatial;
+            let slice = &mut x[start..start + group_len];
+            // Population mean/variance in f64 accumulation (spatial × cpg can
+            // reach 64·80·8 = 40960 elements — f32 running sums drift).
+            let mut sum = 0.0f64;
+            for &v in slice.iter() {
+                sum += f64::from(v);
+            }
+            let mean = sum / group_len as f64;
+            let mut var = 0.0f64;
+            for &v in slice.iter() {
+                let d = f64::from(v) - mean;
+                var += d * d;
+            }
+            let var = var / group_len as f64;
+            let inv = 1.0 / (var + f64::from(eps)).sqrt();
+            let (mean, inv) = (mean as f32, inv as f32);
+            for c in 0..cpg {
+                let (gamma, beta) = (weight[g * cpg + c], bias[g * cpg + c]);
+                for v in &mut slice[c * spatial..(c + 1) * spatial] {
+                    let y = (*v - mean) * inv * gamma + beta;
+                    *v = if fuse_relu { y.max(0.0) } else { y };
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Scaled dot-product attention forward (`sdpa_forward_f32`).
 ///
 /// `q/k/v` are flat, head-major: `q` is `[num_bh, seq_q, d_k]`, `k` is
@@ -290,12 +451,32 @@ pub fn layer_norm(
     Ok(Mat::from_vec(x.rows, x.cols, data))
 }
 
+/// Truthy diagnostic fallback that preserves the pre-optimization payload copy
+/// for same-binary A/B measurements. The ownership-transfer path remains the
+/// default.
+const SOFTMAX_COPY_ENV: &str = "FOCR_SOFTMAX_COPY";
+
+fn softmax_copy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| switch_on(SOFTMAX_COPY_ENV))
+}
+
+fn install_softmax_output(x: &mut Mat, out: Vec<f32>, copy: bool) {
+    if copy {
+        x.data.copy_from_slice(&out);
+    } else {
+        x.data = out;
+    }
+}
+
 /// In-place numerically-stable per-row softmax over the last dim
 /// (`softmax_dim_tensor_contiguous_f32`, dim = 1).
 ///
 /// Each row is softmaxed independently (max-subtract for overflow safety). The
-/// kernel returns a fresh buffer; we copy it back into `x` so call sites can
-/// keep operating in place over their `Mat`.
+/// kernel returns a fresh final buffer; transfer that allocation into `x` so
+/// call sites keep their in-place API without copying the full payload. Truthy
+/// [`SOFTMAX_COPY_ENV`] preserves the former payload copy for diagnostic A/Bs.
 ///
 /// # Errors
 /// Returns [`FocrError::Other`] if the kernel rejects the shape.
@@ -314,7 +495,7 @@ pub fn softmax_rows(x: &mut Mat) -> FocrResult<()> {
             x.data.len()
         )));
     }
-    x.data.copy_from_slice(&out);
+    install_softmax_output(x, out, softmax_copy_enabled());
     Ok(())
 }
 
@@ -366,6 +547,43 @@ pub fn quick_gelu(x: &mut Mat) {
 #[must_use]
 pub fn quick_gelu_scalar(x: f32) -> f32 {
     x / (1.0 + (-1.702 * x).exp())
+}
+
+/// In-place tanh-approximation GELU (`gelu_pytorch_tanh`) — the SigLIP MLP
+/// activation (SmolVLM2 C3, OQ-1; `docs/zoo/smolvlm2-spec.md` §2):
+///
+/// `0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))`
+///
+/// Distinct from the SAM erf-[`gelu`] and the CLIP [`quick_gelu`] — a third
+/// named variant so a wrong-GELU vision divergence stays loud. f32 math end to
+/// end, matching torch's f32 CPU `gelu(approximate="tanh")` kernel; the SigLIP
+/// seam parity gate (vision_siglip.rs) measures the residual ULP drift against
+/// the oracle floor.
+pub fn gelu_tanh(x: &mut Mat) {
+    for v in &mut x.data {
+        *v = gelu_tanh_scalar(*v);
+    }
+}
+
+/// In-place ReLU — the OPT MLP activation (OneChart D4; census §4
+/// `activation_function: relu`, the plain non-gated `fc1`/`fc2` pair).
+/// Distinct from SiLU/GELU so a wrong-activation divergence stays loud.
+pub fn relu(x: &mut Mat) {
+    for v in &mut x.data {
+        *v = v.max(0.0);
+    }
+}
+
+/// `gelu_tanh` on a single scalar — the hand-verifiable kernel of
+/// [`gelu_tanh`].
+#[inline]
+#[must_use]
+pub fn gelu_tanh_scalar(x: f32) -> f32 {
+    // sqrt(2/pi) as f32 — the constant torch's tanh-GELU uses (M_SQRT2/M_2_SQRTPI
+    // composition lands on the same f32 value).
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    let inner = SQRT_2_OVER_PI * (x + 0.044_715 * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
 }
 
 /// Error function on f64 — an Abramowitz & Stegun 7.1.26 rational-poly
@@ -533,6 +751,24 @@ mod tests {
     }
 
     #[test]
+    fn softmax_output_copy_fallback_preserves_values_and_old_allocation() {
+        let expected = vec![0.25, 0.75];
+
+        let mut copied = Mat::from_vec(1, 2, vec![1.0, 2.0]);
+        let copied_ptr = copied.data.as_ptr();
+        install_softmax_output(&mut copied, expected.clone(), true);
+        assert_eq!(copied.data, expected);
+        assert_eq!(copied.data.as_ptr(), copied_ptr);
+
+        let mut transferred = Mat::from_vec(1, 2, vec![1.0, 2.0]);
+        let out = expected.clone();
+        let out_ptr = out.as_ptr();
+        install_softmax_output(&mut transferred, out, false);
+        assert_eq!(transferred.data, expected);
+        assert_eq!(transferred.data.as_ptr(), out_ptr);
+    }
+
+    #[test]
     fn softmax_rows_rejects_malformed_backing_data_without_panicking() {
         let mut x = Mat {
             rows: 1,
@@ -567,6 +803,7 @@ mod tests {
             scales: vec![1.0],
             n: 1,
             k: 2,
+            layout: super::super::tensor::WeightLayout::RowMajor,
         };
         assert_err_contains(
             linear_int8_dynamic(&x, &w, None),
@@ -579,6 +816,7 @@ mod tests {
             scales: vec![1.0],
             n: 1,
             k: 2,
+            layout: super::super::tensor::WeightLayout::RowMajor,
         };
         assert_err_contains(
             linear_int8_dynamic(&x, &short_weight, None),
@@ -590,6 +828,7 @@ mod tests {
             scales: vec![],
             n: 1,
             k: 2,
+            layout: super::super::tensor::WeightLayout::RowMajor,
         };
         assert_err_contains(
             linear_int8_dynamic(&x, &missing_scale, None),
@@ -625,5 +864,137 @@ mod tests {
 
         let again = linear_int8_dynamic(&x, &w, None).unwrap();
         assert_eq!(y, again, "dynamic activation quant must be byte-identical");
+    }
+
+    /// group_norm vs a torch `nn.GroupNorm(3, 6, eps=1e-5)` oracle golden —
+    /// B2×C6×H2×W3, groups of 2 (the same family as TrOMR's GN32-over-64ch).
+    /// Generated 2026-07-05 in the pinned zoo venv (torch 2.12.1):
+    /// `x = sin(0.13·arange)`, `γ = linspace(0.5,1.5,6)`, `β = linspace(-0.2,0.2,6)`.
+    #[test]
+    fn group_norm_matches_torch_golden() {
+        const X: [f32; 72] = [
+            0.0, 0.1296341, 0.2570806, 0.3801884, 0.4968801, 0.6051864, 0.7032794, 0.7895037,
+            0.8624042, 0.9207506, 0.9635582, 0.9901046, 0.9999417, 0.9929036, 0.9691092, 0.9289597,
+            0.873133, 0.8025711, 0.7184649, 0.6222337, 0.5155014, 0.4000695, 0.277886, 0.1510129,
+            0.0215911, -0.1081951, -0.2361552, -0.3601299, -0.4780271, -0.5878571, -0.6877661,
+            -0.7760682, -0.8512733, -0.9121122, -0.957558, -0.9868438, -0.9994755, -0.9952398,
+            -0.9742084, -0.9367359, -0.8834547, -0.8152643, -0.7333152, -0.6389909, -0.5338824,
+            -0.4197641, -0.2985622, -0.1723212, -0.0431721, 0.0867056, 0.21512, 0.3399035,
+            0.4589513, 0.5702536, 0.6719319, 0.7622709, 0.8397455, 0.9030485, 0.9511114, 0.983123,
+            0.9985433, 0.997112, 0.9788533, 0.9440752, 0.8933646, 0.8275774, 0.7478238, 0.6554497,
+            0.5520141, 0.4392635, 0.3190989, 0.1935491,
+        ];
+        const Y: [f32; 72] = [
+            -1.1128683, -0.9128186, -0.716145, -0.5261666, -0.3460895, -0.1789526, 0.1213925,
+            0.3076768, 0.4651756, 0.5912306, 0.6837148, 0.7410672, 0.9592738, 0.9367534, 0.8606158,
+            0.7321458, 0.5535116, 0.3277276, 0.1605169, -0.2158298, -0.6332453, -1.084684,
+            -1.5625268, -2.0587103, 2.4798393, 1.9679233, 1.4632101, 0.9742165, 0.509194,
+            0.0759915, -0.305477, -0.7073503, -1.0496179, -1.3265028, -1.5333323, -1.6666154,
+            -0.7448562, -0.7371473, -0.6988704, -0.6306711, -0.5337003, -0.4095948, -0.2046283,
+            0.0357078, 0.3035217, 0.5942926, 0.9031123, 1.2247713, -1.6645347, -1.3156482,
+            -0.9706925, -0.6354902, -0.3156959, -0.0167077, 0.4023003, 0.6989031, 0.9532693,
+            1.1611068, 1.3189077, 1.424009, 1.5083864, 1.5014455, 1.4129068, 1.2442629, 0.9983606,
+            0.6793492, 0.3991693, -0.1176782, -0.6964164, -1.3272738, -1.9996133, -2.7020838,
+        ];
+        let weight: Vec<f32> = (0..6).map(|i| 0.5 + i as f32 * 0.2).collect();
+        let bias: Vec<f32> = (0..6).map(|i| -0.2 + i as f32 * 0.08).collect();
+
+        let mut x = X.to_vec();
+        group_norm(&mut x, 2, 6, 6, 3, 1e-5, &weight, &bias, false).unwrap();
+        let maxabs = x
+            .iter()
+            .zip(Y.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maxabs <= 2e-6, "vs torch golden: maxabs {maxabs}");
+
+        // Fused ReLU == unfused + clamp (and matches the oracle's relu(y)).
+        let mut fused = X.to_vec();
+        group_norm(&mut fused, 2, 6, 6, 3, 1e-5, &weight, &bias, true).unwrap();
+        let clamped: Vec<f32> = x.iter().map(|v| v.max(0.0)).collect();
+        assert_eq!(fused, clamped, "fused ReLU must equal unfused + clamp");
+    }
+
+    /// TF-'SAME' pad arithmetic vs the timm `padding.py` formula — every case
+    /// the TrOMR backbone hits (tromr-spec §2a).
+    #[test]
+    fn tf_same_pad_amounts_match_timm() {
+        // Stem 7×7 s2 at H=128: total 5 → 2 top / 3 bottom (the spec's example).
+        assert_eq!(tf_same_pad_amounts(128, 7, 2), (2, 3));
+        assert_eq!(tf_same_pad_amounts(1280, 7, 2), (2, 3));
+        // 3×3 s1 → symmetric 1/1 at any size; 1×1 anything → 0/0.
+        assert_eq!(tf_same_pad_amounts(37, 3, 1), (1, 1));
+        assert_eq!(tf_same_pad_amounts(64, 1, 1), (0, 0));
+        assert_eq!(tf_same_pad_amounts(64, 1, 2), (0, 0));
+        // k3 s2: even i → total 1 (asymmetric 0/1), odd i → total 2 (1/1).
+        assert_eq!(tf_same_pad_amounts(6, 3, 2), (0, 1));
+        assert_eq!(tf_same_pad_amounts(9, 3, 2), (1, 1));
+    }
+
+    /// tf_same_pad(−∞) + max_pool2d vs a timm-`pad_same` + `F.max_pool2d`
+    /// oracle golden (torch 2.12.1, 2026-07-05): x = cos(0.37·arange) over
+    /// (1,2,6,9), k3 s2 → padded (7,11), out (3,5). H pads 0/1 (asymmetric),
+    /// W pads 1/1 — the dynamic-SAME case a fixed pad cannot express.
+    #[test]
+    fn max_pool2d_same_matches_timm_golden() {
+        let x: Vec<f32> = (0..2 * 6 * 9).map(|i| (i as f32 * 0.37).cos()).collect();
+        const Y: [f32; 30] = [
+            1.0, 0.9323273, 0.4507553, 0.93477, 0.9999768, 0.9298415, 0.7338563, 0.7475899,
+            0.9999071, 0.9999071, 0.7292103, 0.4628793, 0.9395249, 0.999791, 0.9247403, 0.4262586,
+            0.7565722, 0.9996285, 0.9996285, 0.7198165, 0.4749172, 0.9441053, 0.9994195, 0.9194672,
+            0.4138885, 0.7654141, 0.9991641, 0.9991641, 0.7102889, 0.1313064,
+        ];
+        let (padded, ph, pw) = tf_same_pad(&x, 1, 2, 6, 9, 3, 3, 2, 2, f32::NEG_INFINITY);
+        assert_eq!((ph, pw), (7, 11), "padded dims match timm pad_same");
+        let y = max_pool2d(&padded, 1, 2, ph, pw, 3, 2, 3, 5);
+        assert_eq!(y.len(), Y.len());
+        let maxabs = y
+            .iter()
+            .zip(Y.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(maxabs <= 1e-6, "vs timm golden: maxabs {maxabs}");
+        // No output may be −∞ (the pad fill must never win a real window).
+        assert!(
+            y.iter().all(|v| v.is_finite()),
+            "pool output must be finite"
+        );
+    }
+
+    /// The zero-fill pad path composes with `conv2d` at the stem geometry:
+    /// 128×1280 k7 s2 pads to 133×1285 (timm golden shape) and convolves to
+    /// the SAME output 64×640.
+    #[test]
+    fn tf_same_pad_stem_geometry_composes_with_conv2d() {
+        let (h, w) = (128usize, 1280usize);
+        let x = vec![1.0f32; h * w];
+        let (padded, ph, pw) = tf_same_pad(&x, 1, 1, h, w, 7, 7, 2, 2, 0.0);
+        assert_eq!((ph, pw), (133, 1285), "timm pad_same golden shape");
+        // A 7×7 all-ones kernel over an all-ones interior: the CENTER output
+        // (away from every border) must sum to exactly 49.
+        let weight = vec![1.0f32; 7 * 7];
+        let (oh, ow) = (h.div_ceil(2), w.div_ceil(2));
+        let y = conv2d(&padded, &weight, None, 1, 1, ph, pw, 7, 7, oh, ow, 2, 2, 1);
+        assert_eq!(y.len(), oh * ow);
+        assert_eq!(y[(oh / 2) * ow + ow / 2], 49.0, "interior window sums 7×7");
+        // The top-left output sees the 2-top/2-left pad: 5×5 real ones = 25.
+        assert_eq!(y[0], 25.0, "corner window is 5×5 real after 2/3-2/3 pads");
+    }
+
+    #[test]
+    fn group_norm_rejects_bad_shapes() {
+        let w = vec![1.0f32; 6];
+        let b = vec![0.0f32; 6];
+        // channels not divisible by groups
+        let mut x = vec![0.0f32; 2 * 6 * 6];
+        assert!(group_norm(&mut x, 2, 6, 6, 4, 1e-5, &w, &b, false).is_err());
+        // zero groups
+        assert!(group_norm(&mut x, 2, 6, 6, 0, 1e-5, &w, &b, false).is_err());
+        // x length mismatch
+        let mut short = vec![0.0f32; 5];
+        assert!(group_norm(&mut short, 2, 6, 6, 3, 1e-5, &w, &b, false).is_err());
+        // weight/bias length mismatch
+        let mut x2 = vec![0.0f32; 2 * 6 * 6];
+        assert!(group_norm(&mut x2, 2, 6, 6, 3, 1e-5, &w[..4], &b, false).is_err());
     }
 }

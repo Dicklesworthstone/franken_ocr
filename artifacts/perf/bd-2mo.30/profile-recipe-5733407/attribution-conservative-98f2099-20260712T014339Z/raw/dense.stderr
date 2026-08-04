@@ -1,0 +1,59 @@
+[focr-timing] preprocess 0.02s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.11s
+[focr-timing]       sam.block attn(win) 0.078s
+[focr-timing]       sam.block mlp 0.126s
+[focr-timing]       sam.block attn(win) 0.077s
+[focr-timing]       sam.block mlp 0.125s
+[focr-timing]       sam.block attn(GLOBAL) 0.300s
+[focr-timing]       sam.block mlp 0.123s
+[focr-timing]       sam.block attn(win) 0.074s
+[focr-timing]       sam.block mlp 0.129s
+[focr-timing]       sam.block attn(win) 0.073s
+[focr-timing]       sam.block mlp 0.127s
+[focr-timing]       sam.block attn(GLOBAL) 0.291s
+[focr-timing]       sam.block mlp 0.124s
+[focr-timing]       sam.block attn(win) 0.080s
+[focr-timing]       sam.block mlp 0.127s
+[focr-timing]       sam.block attn(win) 0.080s
+[focr-timing]       sam.block mlp 0.125s
+[focr-timing]       sam.block attn(GLOBAL) 0.294s
+[focr-timing]       sam.block mlp 0.123s
+[focr-timing]       sam.block attn(win) 0.077s
+[focr-timing]       sam.block mlp 0.126s
+[focr-timing]       sam.block attn(win) 0.075s
+[focr-timing]       sam.block mlp 0.122s
+[focr-timing]       sam.block attn(GLOBAL) 0.290s
+[focr-timing]       sam.block mlp 0.122s
+[focr-timing]     sam.blocks 3.32s
+[focr-timing]   vision.sam 3.41s
+[focr-timing]     clip.hydrate(cached) 0.37s
+[focr-timing]     clip.blocks 0.57s
+[focr-timing]   vision.clip 0.94s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 4.46s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.49s
+[focr-timing] prefill 1.51s (277 tokens)
+[focr-timing] decode 13.25s (495 tokens, 0.027s/tok)
+[focr-timing] decode phases (ms): lm_head 5227  attn 4687  experts 2781  route 458
+[focr] wrote /private/tmp/focr-attribution-conservative-98f2099-20260712T014339Z/dense.md (markdown)
+real 20.47
+user 97.65
+sys 21.12
+         10282631168  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1426210  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  55  voluntary context switches
+             2720900  involuntary context switches
+       1296198081028  instructions retired
+        398625598861  cycles elapsed
+         11524809752  peak memory footprint

@@ -1,0 +1,4 @@
+target
+artifacts
+coverage
+# corpus/ is COMMITTED (deterministic seed corpus, bd-10sb.1)

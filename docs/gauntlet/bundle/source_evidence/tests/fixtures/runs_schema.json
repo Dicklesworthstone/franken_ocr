@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "description": "FROZEN contract for `focr runs` output and the `focr sync` JSONL audit stream (bd-wp8.11). Drift against this fixture is a CI failure (tests/cli_robot_golden.rs: runs_schema_contract_over_populated_store). Versioned by hand, like robot_schema_v1.json.",
+  "record": {
+    "required": [
+      "schema_version",
+      "run_id",
+      "started_at",
+      "finished_at",
+      "input_path",
+      "mode",
+      "quant",
+      "model_version_tag",
+      "exit_code",
+      "status"
+    ],
+    "notes": "One run record. The SAME shape is used by `runs --format ndjson` (one object per line), by the `runs` field of `runs --format json`, and by every `sync export-jsonl` line — one contract, three carriers."
+  },
+  "runs_json_wrapper": {
+    "required": ["schema_version", "command", "store", "count", "runs"],
+    "command": "runs",
+    "notes": "`runs --format json` emits ONE document: `runs` is an array of record objects, `count` equals its length. Empty history is exit 0 with count 0 and an empty array (agent-ergonomics Axiom 5: no-results is success)."
+  },
+  "sync_contract": {
+    "direction": "one-way",
+    "notes": "Export is the canonical direction (locked, atomic temp+fsync+rename, idempotent byte-identical for identical history). Import is additive/restorative replay keyed by run_id — NEVER a bidirectional merge; an import cannot silently overwrite live history beyond replacing records with the same run_id."
+  }
+}

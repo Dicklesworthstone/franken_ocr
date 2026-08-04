@@ -1,0 +1,21 @@
+measured_binary_source_revision=98f209969820f2b9ba22ce33025e39ae019f80fb
+workspace_head_at_capture=a5acde7dc438841a86bc1b3a368715b250155241
+workspace_runtime_diff_at_capture=.beads/issues.jsonl only
+parser_note=phase JSON generated after the capture with the current parser timing-vocabulary fix
+parser=2f2ba76a41b610735f9973a57ede62e7356c70fea0abb42cab0d1178d70c9088  scripts/gauntlet_timing.py
+binary=0e7742752ab87b4c50dc4512632f9e14e6483b0d4c2ee758846b81c3bf76f082  /private/tmp/focr-perf-98f2099
+model=573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592  /private/tmp/franken_ocr-models/unlimited-ocr.recipe-v1.20260709T2304.focrq
+tokenizer=a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4  /private/tmp/franken_ocr-models/tokenizer.json
+page=f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2  /private/tmp/focr-attribution-98f2099/page_0014.png
+build_receipt=324a8b8360089f7a457443a12d252bbd62fd9964eae3dc136af230e139cc39b5  /Volumes/ExtData/temp_agent_space/focr-perf-98f2099/franken_ocr/artifacts/perf/bd-2mo.30/current-tree-98f2099-20260711T2021Z/build/build_receipt.json
+source_input_manifest=df44fe17ad57239d5894ddfe0fdd015c5740e4234cf984aff058742845e2ed6f  /Volumes/ExtData/temp_agent_space/focr-perf-98f2099/franken_ocr/artifacts/perf/bd-2mo.30/current-tree-98f2099-20260711T2021Z/build/source_input_manifest.json
+binary_size=18907720
+model_size=4157448783
+tokenizer_size=9979544
+page_size=297844
+FOCR_TIMING=1
+FOCR_PROFILE_DECODE=1
+FOCR_THREADS=8
+RAYON_NUM_THREADS=8
+OMP_NUM_THREADS=8
+all other environment variables absent via env -i

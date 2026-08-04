@@ -1,0 +1,164 @@
+warning: feature `core_intrinsics` is declared but not used
+ --> /Users/jemanuel/projects/frankensqlite/crates/fsqlite-pager/src/lib.rs:2:12
+  |
+2 | #![feature(core_intrinsics)]
+  |            ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_features)]` (part of `#[warn(unused)]`) on by default
+
+warning: `fsqlite-pager` (lib) generated 1 warning
+warning: feature `core_intrinsics` is declared but not used
+ --> /Users/jemanuel/projects/frankensqlite/crates/fsqlite-btree/src/lib.rs:2:12
+  |
+2 | #![feature(core_intrinsics)]
+  |            ^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_features)]` (part of `#[warn(unused)]`) on by default
+
+warning: `fsqlite-btree` (lib) generated 1 warning
+warning: `fsqlite-pager` (lib) generated 1 warning (1 duplicate)
+warning: `fsqlite-btree` (lib) generated 1 warning (1 duplicate)
+    Finished `release` profile [optimized] target(s) in 1.14s
+     Running tests/parity_ladder.rs (/Volumes/USBNVME16TB/temp_agent_space/cargo-target/release/deps/parity_ladder-05675e2d9c8cc2b9)
+
+running 47 tests
+test comparator_normalizes_before_numeric_compare ... {"schema_version":1,"ts":1783476116032227,"test":"comparator_normalize","case":"synthetic","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476116032287,"test":"comparator_normalize","case":"synthetic","run_seq":1,"event":"assert","result":"pass","assertion":"shape mismatch rejected before numeric compare","pass":true}
+{"schema_version":1,"ts":1783476116032339,"test":"comparator_normalize","case":"synthetic","run_seq":2,"event":"result","result":"pass","elapsed_us":55}
+ok
+test differential_per_op_vs_bf16_oracle ... {"schema_version":1,"ts":1783476116032424,"test":"differential_per_op","case":"corpus","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476116032468,"test":"differential_per_op","case":"corpus","run_seq":1,"event":"assert","result":"pass","assertion":"EngineIdentity subject != oracle (never compare oracle against itself)","pass":true}
+{"schema_version":1,"ts":1783476116032520,"test":"differential_per_op","case":"corpus","run_seq":2,"event":"assert","result":"pass","assertion":"differential row carries {scope,oracle,module,max_diff,within_tol,xfail}","pass":true}
+{"schema_version":1,"ts":1783476116858241,"test":"differential_per_op","case":"corpus","run_seq":3,"event":"parity","result":"pass","gate":"differential","metric":"cosine","value":0.9999999999994894,"tolerance":0.9999,"oracle_fixture":"projector_output","oracle_sha256":"d3c58acfbce352767905a9bf1728d88c4d532435443cc36f99a79c8e3501a9ed","nondeterminism_envelope":{"differential_row":{"scope":"op","oracle":"bf16","module":"projector","max_diff":5.9604644775390625e-6,"within_tol":true,"xfail":false,"disc":null},"subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_ulp_ledgered":592848,"ulp_budget_f32":4,"doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476116878341,"test":"differential_per_op","case":"corpus","run_seq":4,"event":"parity","result":"pass","gate":"differential","metric":"cosine","value":0.999999999999554,"tolerance":0.9999,"oracle_fixture":"projector_output","oracle_sha256":"2cfbc22bc3dad20e29e3209c9a586fb15ed3a7755c34f3e995e93d1b131f6972","nondeterminism_envelope":{"differential_row":{"scope":"op","oracle":"bf16","module":"projector","max_diff":8.58306884765625e-6,"within_tol":true,"xfail":false,"disc":null},"subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_ulp_ledgered":1218688,"ulp_budget_f32":4,"doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476116878514,"test":"differential_per_op","case":"corpus","run_seq":5,"event":"result","result":"pass","elapsed_us":846058}
+ok
+test golden_decode_params_come_from_the_golden_contract ... ok
+test golden_token_stream_parses_and_rejects_malformed ... ok
+test l0_preprocess_exact ... {"schema_version":1,"ts":1783476116953182,"test":"L0_preprocess","case":"corpus","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476116953253,"test":"L0_preprocess","case":"corpus","run_seq":1,"event":"assert","result":"pass","assertion":"gray pad == int(0.5*255) == 127","pass":true}
+{"schema_version":1,"ts":1783476116953300,"test":"L0_preprocess","case":"corpus","run_seq":2,"event":"assert","result":"pass","assertion":"normalize maps to [-1,1]","pass":true}
+{"schema_version":1,"ts":1783476116953347,"test":"L0_preprocess","case":"corpus","run_seq":3,"event":"assert","result":"pass","assertion":"image-token slots per 1024-view == 273","pass":true}
+{"schema_version":1,"ts":1783476117031375,"test":"L0_preprocess","case":"corpus","run_seq":4,"event":"parity","result":"pass","gate":"L0","metric":"max_abs_diff","value":0.007843196392059326,"tolerance":0.06274509803921569,"oracle_fixture":"sam_input","oracle_sha256":"3143350d39655feb5863ddadf316a692883c3718d1b5c716174942490104057b","nondeterminism_envelope":{"seam":"preprocess (decode/resize/pad/normalize -> [3, H*W])","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","exact":false,"exact_elements":3104851,"total_elements":3145728,"cosine":0.9999987755754056,"resample_kind":"CatmullRom","tolerance_source":"bd-30me/DISC-001 resample envelope (CatmullRom vs PIL ImageOps.pad BICUBIC; 8 u8 steps in [-1,1])","doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476117101027,"test":"L0_preprocess","case":"corpus","run_seq":5,"event":"parity","result":"pass","gate":"L0","metric":"max_abs_diff","value":0.007843196392059326,"tolerance":0.06274509803921569,"oracle_fixture":"sam_input","oracle_sha256":"5eeb0a83915d76cc65f578cb86ba79b5fe6278e304bc70fe82dbc205f2f5f03f","nondeterminism_envelope":{"seam":"preprocess (decode/resize/pad/normalize -> [3, H*W])","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","exact":false,"exact_elements":3122305,"total_elements":3145728,"cosine":0.9999994043938955,"resample_kind":"CatmullRom","tolerance_source":"bd-30me/DISC-001 resample envelope (CatmullRom vs PIL ImageOps.pad BICUBIC; 8 u8 steps in [-1,1])","doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476117101254,"test":"L0_preprocess","case":"corpus","run_seq":6,"event":"result","result":"pass","elapsed_us":148001}
+ok
+test l0_resample_tolerance_is_the_documented_bd30me_envelope ... ok
+test l1_per_op_cosine ... {"schema_version":1,"ts":1783476117101529,"test":"L1_per_op","case":"corpus","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476123429637,"test":"L1_per_op","case":"corpus","run_seq":1,"event":"parity","result":"pass","gate":"L1","metric":"cosine","value":0.9999999999824407,"tolerance":0.9999,"oracle_fixture":"sam_output","oracle_sha256":"aaf0a47f5756893cc37409c7e37b722dd2473bdf24db71682a21f887a7e60d60","nondeterminism_envelope":{"seam":"vision_sam (ViT-B tower)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_abs_diff":8.51927325129509e-6,"max_ulp":9677982,"ulp_budget":4,"input":"oracle sam_input (exact)","doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476123430287,"test":"L1_per_op","case":"corpus","run_seq":2,"event":"parity","result":"pass","gate":"L1","metric":"cosine","value":0.999999999984337,"tolerance":0.9999,"oracle_fixture":"clip_output","oracle_sha256":"b077628f7ffc81574e84996a67835c71b2f0b00d659439b59e5276166fb553e0","nondeterminism_envelope":{"seam":"vision_clip (CLIP tower over SAM patch embeds)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_abs_diff":0.000040665268898010254,"max_ulp":1741094912,"ulp_budget":4,"input":"oracle sam_output (exact)","doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476123430990,"test":"L1_per_op","case":"corpus","run_seq":3,"event":"parity","result":"pass","gate":"L1","metric":"cosine","value":0.9999999999994894,"tolerance":0.9999,"oracle_fixture":"projector_output","oracle_sha256":"d3c58acfbce352767905a9bf1728d88c4d532435443cc36f99a79c8e3501a9ed","nondeterminism_envelope":{"seam":"vision_bridge (projector 2048->1280)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_abs_diff":5.9604644775390625e-6,"max_ulp":592848,"ulp_budget":4,"input":"oracle clip_output + sam_output (exact)","doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476128905927,"test":"L1_per_op","case":"corpus","run_seq":4,"event":"parity","result":"pass","gate":"L1","metric":"cosine","value":0.9999999999864706,"tolerance":0.9999,"oracle_fixture":"sam_output","oracle_sha256":"b02b4313eda805c18da63798fff79c3417aad42b5d63b20f8552e92bc420e8a9","nondeterminism_envelope":{"seam":"vision_sam (ViT-B tower)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_abs_diff":5.769543349742889e-6,"max_ulp":6219278,"ulp_budget":4,"input":"oracle sam_input (exact)","doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476128906694,"test":"L1_per_op","case":"corpus","run_seq":5,"event":"parity","result":"pass","gate":"L1","metric":"cosine","value":0.9999999999933069,"tolerance":0.9999,"oracle_fixture":"clip_output","oracle_sha256":"18b9e98c3ba25cae377f2d16584cf4f19bb18358ced506e03578ad67d84e7817","nondeterminism_envelope":{"seam":"vision_clip (CLIP tower over SAM patch embeds)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_abs_diff":0.0000209808349609375,"max_ulp":1758789632,"ulp_budget":4,"input":"oracle sam_output (exact)","doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476128907397,"test":"L1_per_op","case":"corpus","run_seq":6,"event":"parity","result":"pass","gate":"L1","metric":"cosine","value":0.999999999999554,"tolerance":0.9999,"oracle_fixture":"projector_output","oracle_sha256":"2cfbc22bc3dad20e29e3209c9a586fb15ed3a7755c34f3e995e93d1b131f6972","nondeterminism_envelope":{"seam":"vision_bridge (projector 2048->1280)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","max_abs_diff":8.58306884765625e-6,"max_ulp":1218688,"ulp_budget":4,"input":"oracle clip_output + sam_output (exact)","doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476128907525,"test":"L1_per_op","case":"corpus","run_seq":7,"event":"result","result":"pass","elapsed_us":11806120}
+ok
+test l2_per_layer_cosine_and_ledger ... {"schema_version":1,"ts":1783476128957625,"test":"L2_per_layer","case":"corpus","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476128957672,"test":"L2_per_layer","case":"corpus","run_seq":1,"event":"assert","result":"pass","assertion":"decoder layer count == 12 (SPEC-070..072)","pass":true}
+{"schema_version":1,"ts":1783476128957716,"test":"L2_per_layer","case":"corpus","run_seq":2,"event":"assert","result":"pass","assertion":"vision seams == [sam, clip, projector]","pass":true}
+{"schema_version":1,"ts":1783476134341754,"test":"L2_per_layer","case":"corpus","run_seq":3,"event":"parity","result":"pass","gate":"L2","metric":"max_abs_diff","value":5.9604644775390625e-6,"tolerance":0.0,"oracle_fixture":"projector_output","oracle_sha256":"d3c58acfbce352767905a9bf1728d88c4d532435443cc36f99a79c8e3501a9ed","nondeterminism_envelope":{"cosine":0.9999999999994894,"ledger":"per-stage max-abs (cross-stage drift)","seam":"vision_bridge (projector 2048->1280)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","cosine_threshold":0.9999,"doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476134342467,"test":"L2_per_layer","case":"corpus","run_seq":4,"event":"parity","result":"pass","gate":"L2","metric":"max_abs_diff","value":0.00008761882781982422,"tolerance":0.0,"oracle_fixture":"inputs_embeds","oracle_sha256":"a8ecec3da58362ad09ed0ace286f25a9c2362e691f2a166a0fbf21cdbb4bfc81","nondeterminism_envelope":{"cosine":0.9999999999278577,"ledger":"per-stage max-abs (cross-stage drift)","seam":"vision(sam→clip→bridge) + connector splice (layer-0 inputs_embeds)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","cosine_threshold":0.9999,"doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476139074785,"test":"L2_per_layer","case":"corpus","run_seq":5,"event":"parity","result":"pass","gate":"L2","metric":"max_abs_diff","value":8.58306884765625e-6,"tolerance":0.0,"oracle_fixture":"projector_output","oracle_sha256":"2cfbc22bc3dad20e29e3209c9a586fb15ed3a7755c34f3e995e93d1b131f6972","nondeterminism_envelope":{"cosine":0.999999999999554,"ledger":"per-stage max-abs (cross-stage drift)","seam":"vision_bridge (projector 2048->1280)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","cosine_threshold":0.9999,"doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476139075710,"test":"L2_per_layer","case":"corpus","run_seq":6,"event":"parity","result":"pass","gate":"L2","metric":"max_abs_diff","value":0.000044345855712890625,"tolerance":0.0,"oracle_fixture":"inputs_embeds","oracle_sha256":"c48c7cd326944a4533a996f106f51bbcbe69d8b2fa36b03b1d5f3c7112795033","nondeterminism_envelope":{"cosine":0.9999999999770784,"ledger":"per-stage max-abs (cross-stage drift)","seam":"vision(sam→clip→bridge) + connector splice (layer-0 inputs_embeds)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","cosine_threshold":0.9999,"doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476139075834,"test":"L2_per_layer","case":"corpus","run_seq":7,"event":"result","result":"pass","elapsed_us":10118314}
+ok
+test l3_logits_measured_budget_and_argmax ... {"schema_version":1,"ts":1783476139119711,"test":"L3_logits","case":"corpus","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476139119757,"test":"L3_logits","case":"corpus","run_seq":1,"event":"assert","result":"pass","assertion":"L3 tolerance DERIVED from oracle floor (== measured spread, not imported 0.055)","pass":true}
+{"schema_version":1,"ts":1783476139119807,"test":"L3_logits","case":"corpus","run_seq":2,"event":"assert","result":"pass","assertion":"argmax stable across the two oracle runs (deterministic positions exist)","pass":true}
+{"schema_version":1,"ts":1783476141377866,"test":"L3_logits","case":"corpus","run_seq":3,"event":"parity","result":"pass","gate":"L3","metric":"cosine","value":0.9999999999987671,"tolerance":0.9999,"oracle_fixture":"lm_head_logits","oracle_sha256":"c6606dd18f75ef493bbaf288eaf617d88c3f367326e4028e4aac6ba68b5c978b","nondeterminism_envelope":{"seam":"final model.norm + lm_head (1280->129280)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","argmax_exact":true,"positions":277,"max_abs_diff":0.0000476837158203125,"max_abs_floor":0.019999980926513672,"budget_source":"oracle_floor §2 (continuous logits ledgered, not the f32 gate)","input":"oracle decoder_layer_11_hidden (exact)","doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476142893037,"test":"L3_logits","case":"corpus","run_seq":4,"event":"parity","result":"pass","gate":"L3","metric":"cosine","value":0.9999999999982422,"tolerance":0.9999,"oracle_fixture":"lm_head_logits","oracle_sha256":"434530f1d26f4e0293d565ce4c63031acbc7af1882e9977e659a842263d281d0","nondeterminism_envelope":{"seam":"final model.norm + lm_head (1280->129280)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","argmax_exact":true,"positions":277,"max_abs_diff":0.000057220458984375,"max_abs_floor":0.019999980926513672,"budget_source":"oracle_floor §2 (continuous logits ledgered, not the f32 gate)","input":"oracle decoder_layer_11_hidden (exact)","doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476142893176,"test":"L3_logits","case":"corpus","run_seq":5,"event":"result","result":"pass","elapsed_us":3773477}
+ok
+test l4_token_exact_prefix ... {"schema_version":1,"ts":1783476142934796,"test":"L4_token","case":"corpus","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476142934848,"test":"L4_token","case":"corpus","run_seq":1,"event":"assert","result":"pass","assertion":"L4 EXACT only over the §2 reproducible prefix","pass":true}
+{"schema_version":1,"ts":1783476190763675,"test":"L4_token","case":"corpus","run_seq":2,"event":"parity","result":"pass","gate":"L4","metric":"token_exact_fraction","value":1.0,"tolerance":1.0,"oracle_fixture":"token_stream.generated_ids","oracle_sha256":"67ff907f107304e3cea2b713d52f551311d363432cf5321b004d02037ddf3eca","nondeterminism_envelope":{"seam":"decoder prefill + greedy AR decode (cached f32 loop)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","input":"oracle inputs_embeds + prompt_ids (exact)","exact":true,"n_subject":98,"n_golden":98,"prompt_len":277,"first_divergence":null,"subject_token_at_divergence":null,"oracle_token_at_divergence":null,"prefill_hidden_cosine":0.9999999999989552,"prefill_hidden_max_abs":0.0004425048828125,"reproducible_prefix":"full stream (oracle run is deterministic: CPU greedy, torch deterministic algorithms)","doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476190764917,"test":"L4_token","case":"corpus","run_seq":3,"event":"parity","result":"pass","gate":"L4","metric":"token_exact_fraction","value":1.0,"tolerance":1.0,"oracle_fixture":"token_stream.generated_ids","oracle_sha256":"20ec4543c0632377fa27453d97516419a4d39d97863df57798ecd13e9300d23d","nondeterminism_envelope":{"seam":"decoder prefill + greedy AR decode (cached f32 loop)","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","input":"oracle inputs_embeds + prompt_ids (exact)","exact":true,"n_subject":495,"n_golden":495,"prompt_len":277,"first_divergence":null,"subject_token_at_divergence":null,"oracle_token_at_divergence":null,"prefill_hidden_cosine":0.9999999999987511,"prefill_hidden_max_abs":0.0004730224609375,"reproducible_prefix":"full stream (oracle run is deterministic: CPU greedy, torch deterministic algorithms)","doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476190765072,"test":"L4_token","case":"corpus","run_seq":4,"event":"result","result":"pass","elapsed_us":47830949}
+ok
+test l5_end_to_end_cer_budget ... {"schema_version":1,"ts":1783476191014280,"test":"L5_e2e","case":"corpus","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476191014335,"test":"L5_e2e","case":"corpus","run_seq":1,"event":"assert","result":"pass","assertion":"CER(identical) == 0","pass":true}
+{"schema_version":1,"ts":1783476191014381,"test":"L5_e2e","case":"corpus","run_seq":2,"event":"assert","result":"pass","assertion":"CER(1 substitution / 5) == 0.2","pass":true}
+{"schema_version":1,"ts":1783476193797581,"test":"L5_e2e","case":"corpus","run_seq":3,"event":"parity","result":"pass","gate":"L5","metric":"cer","value":0.0,"tolerance":0.01,"oracle_fixture":"page_0009.png","oracle_sha256":"51d47803c5a944dba29ad626dcb11511e017215a55a49e7c915ca44976e813a4","nondeterminism_envelope":{"seam":"decode ids -> tokenizer.decode -> postprocess::finalize","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","input":"oracle inputs_embeds + prompt_ids (exact)","exact_text":true,"subject_chars":105,"golden_chars":105,"budget_source":"documented detok+postprocess envelope (tokens are gated EXACT by L4)","doc":"page_0009"},"pass":true}
+{"schema_version":1,"ts":1783476193798242,"test":"L5_e2e","case":"corpus","run_seq":4,"event":"parity","result":"pass","gate":"L5","metric":"cer","value":0.0,"tolerance":0.01,"oracle_fixture":"page_0014.png","oracle_sha256":"1ebeaaf8aeca61b7ab9c812bee94297afac004dbbfc7e94ed09bef4ba0dfad0f","nondeterminism_envelope":{"seam":"decode ids -> tokenizer.decode -> postprocess::finalize","subject":"franken_ocr","oracle":"unlimited-ocr-oracle","input":"oracle inputs_embeds + prompt_ids (exact)","exact_text":true,"subject_chars":529,"golden_chars":529,"budget_source":"documented detok+postprocess envelope (tokens are gated EXACT by L4)","doc":"page_0014"},"pass":true}
+{"schema_version":1,"ts":1783476193798378,"test":"L5_e2e","case":"corpus","run_seq":5,"event":"result","result":"pass","elapsed_us":2784092}
+ok
+test l5_multi_page_10p_long_horizon ... {"schema_version":1,"ts":1783476193838107,"test":"L5_multi_page","case":"p10","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476193838492,"test":"L5_multi_page","case":"p10","run_seq":1,"event":"assert","result":"pass","assertion":"oracle raw carries a <PAGE> marker","pass":true}
+{"schema_version":1,"ts":1783476193838550,"test":"L5_multi_page","case":"p10","run_seq":2,"event":"assert","result":"pass","assertion":"oracle meta pins ngram_window 1024 (OQ-18 multi)","pass":true}
+{"schema_version":1,"ts":1783476193838825,"test":"L5_multi_page","case":"p10","run_seq":3,"event":"assert","result":"pass","assertion":"plate anchor extracted (3 lines)","pass":true}
+{"schema_version":1,"ts":1783476658637638,"test":"L5_multi_page","case":"p10","run_seq":4,"event":"assert","result":"pass","assertion":"deterministic plate line reproduced: \"LONDON\"","pass":true}
+{"schema_version":1,"ts":1783476658637891,"test":"L5_multi_page","case":"p10","run_seq":5,"event":"assert","result":"pass","assertion":"deterministic plate line reproduced: \"LONDON\"","pass":true}
+{"schema_version":1,"ts":1783476658637939,"test":"L5_multi_page","case":"p10","run_seq":6,"event":"assert","result":"pass","assertion":"deterministic plate line reproduced: \"PRINTED BY WILLIAM CLOVER AND SONS, LIMITED,\"","pass":true}
+{"schema_version":1,"ts":1783476659076497,"test":"L5_multi_page","case":"p10","run_seq":7,"event":"parity","result":"pass","gate":"L5_multi_page","metric":"cer_vs_infer_multi_oracle_prefix","value":0.40454081906499917,"tolerance":0.5,"oracle_fixture":"tests/fixtures/multi_page/p10_raw.md","oracle_sha256":"66bd3447c49c904f6fd3bfaed304a929bfc07dc9f1766065d8583c5a07de99b8","nondeterminism_envelope":{"oracle":"bf16-cpu greedy (deterministic)","subject":"f32 greedy","subject_token_cap":7600,"page_markers":{"ours":8,"oracle":9},"note":"post-plate greedy fork budgeted (DISC-004); plate exact-matched above"},"pass":true}
+{"suite":"parity_ladder","rung":"L5_multi_page","case":"p10","cer":0.4045,"budget":0.5,"markers_ours":8,"markers_oracle":9,"result":"pass"}
+{"schema_version":1,"ts":1783476659076636,"test":"L5_multi_page","case":"p10","run_seq":8,"event":"result","result":"pass","elapsed_us":465245524}
+ok
+test l5_multi_page_matches_infer_multi_oracle ... {"schema_version":1,"ts":1783476659126176,"test":"L5_multi_page","case":"p9_p14","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476659127542,"test":"L5_multi_page","case":"p9_p14","run_seq":1,"event":"assert","result":"pass","assertion":"oracle raw carries a <PAGE> marker","pass":true}
+{"schema_version":1,"ts":1783476659127593,"test":"L5_multi_page","case":"p9_p14","run_seq":2,"event":"assert","result":"pass","assertion":"oracle meta pins ngram_window 1024 (OQ-18 multi)","pass":true}
+{"schema_version":1,"ts":1783476659127649,"test":"L5_multi_page","case":"p9_p14","run_seq":3,"event":"assert","result":"pass","assertion":"plate anchor extracted (3 lines)","pass":true}
+{"schema_version":1,"ts":1783476686965767,"test":"L5_multi_page","case":"p9_p14","run_seq":4,"event":"assert","result":"pass","assertion":"deterministic plate line reproduced: \"LONDON\"","pass":true}
+{"schema_version":1,"ts":1783476686966462,"test":"L5_multi_page","case":"p9_p14","run_seq":5,"event":"assert","result":"pass","assertion":"deterministic plate line reproduced: \"PRINTED BY WILLIAM CLOVER AND SONS, LIMITED,\"","pass":true}
+{"schema_version":1,"ts":1783476686966510,"test":"L5_multi_page","case":"p9_p14","run_seq":6,"event":"assert","result":"pass","assertion":"deterministic plate line reproduced: \"STAMFORD STREET AND CHARING CROSS.\"","pass":true}
+{"schema_version":1,"ts":1783476686966822,"test":"L5_multi_page","case":"p9_p14","run_seq":7,"event":"parity","result":"pass","gate":"L5_multi_page","metric":"cer_vs_infer_multi_oracle_prefix","value":0.1791044776119403,"tolerance":0.25,"oracle_fixture":"tests/fixtures/multi_page/p9_p14_raw.md","oracle_sha256":"6fad1a5e0dbb22257f95c805c8ee0e053f9bc8a014737d10bcec8615e72ee54d","nondeterminism_envelope":{"oracle":"bf16-cpu greedy (deterministic)","subject":"f32 greedy","subject_token_cap":null,"page_markers":{"ours":1,"oracle":1},"note":"post-plate greedy fork budgeted (DISC-004); plate exact-matched above"},"pass":true}
+{"suite":"parity_ladder","rung":"L5_multi_page","case":"p9_p14","cer":0.1791,"budget":0.25,"markers_ours":1,"markers_oracle":1,"result":"pass"}
+{"schema_version":1,"ts":1783476686966935,"test":"L5_multi_page","case":"p9_p14","run_seq":8,"event":"result","result":"pass","elapsed_us":27841127}
+ok
+test matched_prefix_len_locates_first_divergence ... ok
+test parity_harness::tests::activation_manifest_bytes_verify_file_sha_shape_and_dtype ... ok
+test parity_harness::tests::activation_manifest_rejects_path_traversal ... ok
+test parity_harness::tests::check_provenance_rejects_missing_transformers_pin ... ok
+test parity_harness::tests::check_provenance_rejects_wrong_commit ... ok
+test parity_harness::tests::cosine_above_threshold_for_tiny_perturbation ... ok
+test parity_harness::tests::cosine_identical_is_one ... ok
+test parity_harness::tests::cosine_orthogonal_is_zero ... ok
+test parity_harness::tests::cosine_zero_vs_zero_is_one ... ok
+test parity_harness::tests::determinism_gate_passes_stable_and_fails_injected ... {"schema_version":1,"test":"harness_self","case":"stable","event":"parity","metric":"token_exact","attempt":1,"value":"identical","result":"pass"}
+{"schema_version":1,"test":"harness_self","case":"stable","event":"parity","metric":"token_exact","attempt":2,"value":"identical","result":"pass"}
+{"schema_version":1,"test":"harness_self","case":"injected","event":"parity","metric":"token_exact","attempt":1,"value":"4","result":"fail"}
+
+thread 'parity_harness::tests::determinism_gate_passes_stable_and_fails_injected' (37757459) panicked at tests/support/parity_harness.rs:1331:9:
+DETERMINISM VIOLATION (harness_self/injected): attempt 1 diverges from the reference at byte 4 (lens 245 vs 245) — a real engine bug under greedy, never test noise
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+test parity_harness::tests::diagnostic_parity_events_are_non_proof_failures ... ok
+test parity_harness::tests::emitted_events_conform_to_frozen_schema ... ok
+test parity_harness::tests::establish_floor_finds_prefix_and_spread ... ok
+test parity_harness::tests::establish_floor_identical_runs_full_prefix ... ok
+test parity_harness::tests::fixture_loader_reports_absence_on_empty_root ... ok
+test parity_harness::tests::fixture_loader_skips_hidden_sidecar_goldens ... ok
+test parity_harness::tests::golden_carries_bd3s7v_seam_inputs_and_token_stream ... ok
+test parity_harness::tests::golden_from_value_parses_manifest ... ok
+test parity_harness::tests::golden_from_value_rejects_malformed_activation_shape ... ok
+test parity_harness::tests::log_schema_version_matches_robot ... ok
+test parity_harness::tests::read_npy_rejects_non_npy ... ok
+test parity_harness::tests::read_npy_roundtrip_synthetic_v1 ... ok
+test parity_harness::tests::scrub_removes_timing_keeps_shape ... ok
+test parity_harness::tests::tensorspec_rejects_shape_and_dtype_mismatch ... ok
+test parity_harness::tests::ulp_compare_passes_within_budget_fails_outside ... ok
+test parity_harness::tests::ulp_distance_across_zero_sign ... ok
+test parity_harness::tests::ulp_distance_adjacent_is_one ... ok
+test parity_harness::tests::ulp_distance_nan_is_max ... ok
+test parity_harness::tests::ulp_table_matches_methodology ... ok
+test resolve_corpus_image_searches_pages_dirs_and_provenance ... ok
+test sam_input_view_mat_reshapes_channel_major ... ok
+test sam_output_features_mat_folds_hw_into_cols ... ok
+test surface_error_exit_codes_are_stable ... {"schema_version":1,"ts":1783476687099630,"test":"surface_exit_codes","case":"stable","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476687099672,"test":"surface_exit_codes","case":"stable","run_seq":1,"event":"assert","result":"pass","assertion":"Usage(\"x\") ⇒ exit 2","pass":true}
+{"schema_version":1,"ts":1783476687099717,"test":"surface_exit_codes","case":"stable","run_seq":2,"event":"assert","result":"pass","assertion":"ModelNotFound(\"x\") ⇒ exit 3","pass":true}
+{"schema_version":1,"ts":1783476687099761,"test":"surface_exit_codes","case":"stable","run_seq":3,"event":"assert","result":"pass","assertion":"InputDecode(\"x\") ⇒ exit 4","pass":true}
+{"schema_version":1,"ts":1783476687099804,"test":"surface_exit_codes","case":"stable","run_seq":4,"event":"assert","result":"pass","assertion":"Timeout(\"x\") ⇒ exit 5","pass":true}
+{"schema_version":1,"ts":1783476687099848,"test":"surface_exit_codes","case":"stable","run_seq":5,"event":"assert","result":"pass","assertion":"Cancelled ⇒ exit 6","pass":true}
+{"schema_version":1,"ts":1783476687099889,"test":"surface_exit_codes","case":"stable","run_seq":6,"event":"assert","result":"pass","assertion":"FormatMismatch(\"x\") ⇒ exit 7","pass":true}
+{"schema_version":1,"ts":1783476687099933,"test":"surface_exit_codes","case":"stable","run_seq":7,"event":"assert","result":"pass","assertion":"NotImplemented(\"x\") ⇒ exit 1","pass":true}
+{"schema_version":1,"ts":1783476687099977,"test":"surface_exit_codes","case":"stable","run_seq":8,"event":"result","result":"pass","elapsed_us":306}
+ok
+test surface_robot_schema_self_describes ... {"schema_version":1,"ts":1783476687100032,"test":"surface_robot_schema","case":"stable","run_seq":0,"event":"setup","result":"pass","seed":0}
+{"schema_version":1,"ts":1783476687100074,"test":"surface_robot_schema","case":"stable","run_seq":1,"event":"assert","result":"pass","assertion":"robot schema advertises ROBOT_SCHEMA_VERSION","pass":true}
+{"schema_version":1,"ts":1783476687100115,"test":"surface_robot_schema","case":"stable","run_seq":2,"event":"assert","result":"pass","assertion":"robot schema enumerates all EVENT_KINDS","pass":true}
+{"schema_version":1,"ts":1783476687100157,"test":"surface_robot_schema","case":"stable","run_seq":3,"event":"assert","result":"pass","assertion":"scrubber masks elapsed_ms but keeps the field present","pass":true}
+{"schema_version":1,"ts":1783476687100197,"test":"surface_robot_schema","case":"stable","run_seq":4,"event":"result","result":"pass","elapsed_us":127}
+ok
+
+test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 571.08s
+

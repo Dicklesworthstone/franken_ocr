@@ -1,0 +1,33 @@
+{
+  "tag": "warmup_1",
+  "command": [
+    "/private/tmp/cc_tgt_dev/release/focr",
+    "ocr",
+    "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+    "--model",
+    "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model"
+  ],
+  "exit_code": 0,
+  "wall_ms": 21483.746,
+  "stdout": "warmup_1.stdout",
+  "stderr": "warmup_1.stderr",
+  "binary": "/private/tmp/cc_tgt_dev/release/focr",
+  "binary_sha256": "fefe50a83b9e9261f13cdc90cdff5a4870d695c95149878ac64a1442d54c90ad",
+  "page": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+  "page_sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model",
+  "threads": 8,
+  "warmup": 1,
+  "env_pins": {
+    "FOCR_TIMING": "1",
+    "FOCR_THREADS": "8",
+    "OMP_NUM_THREADS": "8",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "focr_env": {
+    "FOCR_DECODE_INT8": "1",
+    "FOCR_MODEL_PATH": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/model",
+    "FOCR_THREADS": "8",
+    "FOCR_TIMING": "1"
+  }
+}

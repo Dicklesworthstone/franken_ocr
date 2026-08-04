@@ -1,0 +1,57 @@
+[focr-timing] preprocess 0.02s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.12s
+[focr-timing]       sam.block attn(win) 0.078s
+[focr-timing]       sam.block mlp 0.123s
+[focr-timing]       sam.block attn(win) 0.074s
+[focr-timing]       sam.block mlp 0.124s
+[focr-timing]       sam.block attn(GLOBAL) 0.287s
+[focr-timing]       sam.block mlp 0.120s
+[focr-timing]       sam.block attn(win) 0.071s
+[focr-timing]       sam.block mlp 0.120s
+[focr-timing]       sam.block attn(win) 0.070s
+[focr-timing]       sam.block mlp 0.121s
+[focr-timing]       sam.block attn(GLOBAL) 0.275s
+[focr-timing]       sam.block mlp 0.121s
+[focr-timing]       sam.block attn(win) 0.072s
+[focr-timing]       sam.block mlp 0.125s
+[focr-timing]       sam.block attn(win) 0.070s
+[focr-timing]       sam.block mlp 0.124s
+[focr-timing]       sam.block attn(GLOBAL) 0.278s
+[focr-timing]       sam.block mlp 0.123s
+[focr-timing]       sam.block attn(win) 0.073s
+[focr-timing]       sam.block mlp 0.121s
+[focr-timing]       sam.block attn(win) 0.074s
+[focr-timing]       sam.block mlp 0.119s
+[focr-timing]       sam.block attn(GLOBAL) 0.282s
+[focr-timing]       sam.block mlp 0.121s
+[focr-timing]     sam.blocks 3.20s
+[focr-timing]   vision.sam 3.29s
+[focr-timing]     clip.hydrate(cached) 0.38s
+[focr-timing]     clip.blocks 0.59s
+[focr-timing]   vision.clip 0.97s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 4.39s
+[focr-timing] weight_cache_build 0.42s
+[focr-timing] prefill 0.92s (277 tokens)
+[focr-timing] decode 10.83s (495 tokens, 0.022s/tok)
+[focr-timing] decode phases (ms): lm_head 3932  attn 3749  experts 2685  route 375
+real 16.81
+user 85.66
+sys 13.72
+         11527700480  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              704768  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  14  voluntary context switches
+             1508353  involuntary context switches
+       1057940667394  instructions retired
+        332432830192  cycles elapsed
+          7369925656  peak memory footprint

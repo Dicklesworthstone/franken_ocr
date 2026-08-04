@@ -1,0 +1,95 @@
+{
+  "tag": "b_run_001",
+  "command": [
+    "/home/ubuntu/focr-perf-25cecb9-dense-20260712T2214Z/subject/release-perf/focr",
+    "ocr",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png",
+    "--model",
+    "/home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq"
+  ],
+  "exit_code": 0,
+  "wall_ms": 48520.428,
+  "stdout": "b_run_001.stdout",
+  "stderr": "b_run_001.stderr",
+  "binary": "/home/ubuntu/focr-perf-25cecb9-dense-20260712T2214Z/subject/release-perf/focr",
+  "binary_sha256": "0e50d513e60956d544af4e7cd707e76888a00de83598563dffd4b0cbc94961c6",
+  "binary_size": 96506416,
+  "binary_origin": "/home/ubuntu/focr-perf-25cecb9-build-20260712T2203Z/build/focr",
+  "build_receipt": "/home/ubuntu/focr-perf-25cecb9-dense-20260712T2214Z/subject/build_receipt.json",
+  "build_receipt_sha256": "31df05098b3671d1efaf4f6eb357fb1b5aecc7bedfdf3333aa6cd7f685beef08",
+  "page": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png",
+  "page_sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+  "pages": [
+    {
+      "path": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png",
+      "sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+      "size": 297844
+    }
+  ],
+  "workload": {
+    "label": "dense",
+    "command": "ocr",
+    "page_count": 1
+  },
+  "model": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq",
+  "model_kind": "file",
+  "model_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+  "model_size": 4157448783,
+  "model_identity": {
+    "dev": 66308,
+    "ino": 46278308,
+    "size": 4157448783,
+    "mtime_ns": 1783652647330000000,
+    "ctime_ns": 1783892393733883688
+  },
+  "quant_recipe": "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1",
+  "threads": 8,
+  "warmup": 1,
+  "env_pins": {
+    "FOCR_TIMING": "1",
+    "FOCR_PROFILE_DECODE": "1",
+    "FOCR_THREADS": "8",
+    "OMP_NUM_THREADS": "8",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "focr_env": {
+    "FOCR_DECODE_INT8": "0",
+    "FOCR_INT8_ATTN": "0",
+    "FOCR_INT8_LMHEAD": "0",
+    "FOCR_MODEL_PATH": "/home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq",
+    "FOCR_PROFILE_DECODE": "1",
+    "FOCR_RSWA_PARALLEL_ATTN": "0",
+    "FOCR_THREADS": "8",
+    "FOCR_TIMING": "1"
+  },
+  "precision_gate_states": {
+    "FOCR_DECODE_INT8": "0",
+    "FOCR_INT8_ATTN": "0",
+    "FOCR_INT8_LMHEAD": "0",
+    "FOCR_ATTN_GEMM": "<unset>",
+    "FOCR_INT8_KV": "<unset>",
+    "FOCR_SPEC_DECODE": "<unset>",
+    "FOCR_DECODE_STATELESS": "<unset>"
+  },
+  "performance_switch_states": {
+    "FOCR_RSWA_PARALLEL_ATTN": "0",
+    "FOCR_MMAP": "<unset>",
+    "FOCR_SOFTMAX_COPY": "<unset>",
+    "FOCR_UNLIMITED_VISION_CACHE": "<unset>",
+    "FOCR_INT8_AUTOVEC": "<unset>",
+    "FOCR_BATCHED_MOE": "<unset>",
+    "FOCR_BATCH_PACK": "<unset>",
+    "FOCR_BATCH_SIZE": "<unset>",
+    "FOCR_BATCH_SPINE": "<unset>",
+    "FOCR_BATCH_VISION": "<unset>",
+    "FOCR_MAX_NEW_TOKENS": "<unset>"
+  },
+  "ab": {
+    "env": "FOCR_RSWA_PARALLEL_ATTN",
+    "arm": "b",
+    "label": "serial-control",
+    "value": "0",
+    "schedule_index": 2,
+    "arm_run": 1
+  }
+}

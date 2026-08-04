@@ -1,0 +1,5 @@
+schema=focr-attribution-only/v1
+attribution_only=true
+publishable_timing=false
+quiet_host_gate=not_claimed
+reason=contended-host directional phase attribution only; no latency distribution or performance verdict

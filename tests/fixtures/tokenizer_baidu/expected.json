@@ -1,0 +1,2825 @@
+{
+  "_meta": {
+    "purpose": "Baidu Unlimited-OCR tokenizer token-id-EXACT conformance golden fixtures (OQ-16)",
+    "model_id": "unlimited-ocr",
+    "tokenizer_class": "LlamaTokenizerFast (byte-level BPE tokenizer.json, NOT SentencePiece)",
+    "tokenizer_json_sha256": "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4",
+    "backend": "tokenizers.Tokenizer.from_file (the exact Rust crate LlamaTokenizerFast wraps)",
+    "tokenizers_version": "0.23.1",
+    "transformers_version": null,
+    "torch_loaded": false,
+    "corpus": "tests/fixtures/tokenizer/corpus.txt",
+    "add_special_tokens": false,
+    "skip_special_tokens": false,
+    "bos_id": 0,
+    "eos_id": 1,
+    "pad_id": 2,
+    "image_token_id": 128815,
+    "anchor_ids": {
+      "<｜begin▁of▁sentence｜>": 0,
+      "<｜end▁of▁sentence｜>": 1,
+      "<｜▁pad▁｜>": 2,
+      "<image>": 128815,
+      "<|ref|>": 128816,
+      "<|/ref|>": 128817,
+      "<|det|>": 128818,
+      "<|/det|>": 128819,
+      "<|grounding|>": 128820,
+      "<td>": 128821,
+      "</td>": 128822,
+      "<tr>": 128823,
+      "</tr>": 128824,
+      "<|User|>": 128825,
+      "<|Assistant|>": 128826
+    },
+    "num_cases": 163,
+    "num_exact_roundtrip": 163,
+    "note": "ids use add_special_tokens=False (the inference path; the prompt builder owns BOS=0). decoded is the reference decode of exactly `ids` with skip_special_tokens=False; it may differ from `text` only where the reference itself is not surface-exact."
+  },
+  "fixtures": [
+    {
+      "text": "# franken_ocr tokenizer conformance corpus.",
+      "ids": [
+        5,
+        14870,
+        4490,
+        65,
+        7638,
+        17840,
+        9160,
+        399,
+        13315,
+        43418,
+        16
+      ],
+      "decoded": "# franken_ocr tokenizer conformance corpus."
+    },
+    {
+      "text": "# Format: ONE test case per line. Each line is a JSON-encoded string",
+      "ids": [
+        5,
+        29478,
+        28,
+        36338,
+        1950,
+        2352,
+        716,
+        2562,
+        16,
+        8829,
+        2562,
+        344,
+        260,
+        26639,
+        15,
+        78650,
+        3418
+      ],
+      "decoded": "# Format: ONE test case per line. Each line is a JSON-encoded string"
+    },
+    {
+      "text": "# (the exact output of json.dumps(text, ensure_ascii=False)). Lines whose",
+      "ids": [
+        5,
+        343,
+        1805,
+        6319,
+        5238,
+        294,
+        18786,
+        3845,
+        17120,
+        40157,
+        14,
+        5261,
+        65,
+        50457,
+        75,
+        34985,
+        20933,
+        44564,
+        6501
+      ],
+      "decoded": "# (the exact output of json.dumps(text, ensure_ascii=False)). Lines whose"
+    },
+    {
+      "text": "# decoded value begins with '#' AND contains no other content are treated as",
+      "ids": [
+        5,
+        91249,
+        1990,
+        12600,
+        418,
+        905,
+        32260,
+        7554,
+        7272,
+        1119,
+        915,
+        3445,
+        477,
+        10202,
+        412
+      ],
+      "decoded": "# decoded value begins with '#' AND contains no other content are treated as"
+    },
+    {
+      "text": "# comments and skipped. Blank lines are skipped. To test a string that begins",
+      "ids": [
+        5,
+        8785,
+        305,
+        80812,
+        16,
+        65007,
+        6243,
+        477,
+        80812,
+        16,
+        2600,
+        1950,
+        260,
+        3418,
+        396,
+        12600
+      ],
+      "decoded": "# comments and skipped. Blank lines are skipped. To test a string that begins"
+    },
+    {
+      "text": "# with '#', it is fine -- a JSON-encoded '#...' line is NOT a comment unless",
+      "ids": [
+        5,
+        418,
+        40331,
+        1780,
+        436,
+        344,
+        8209,
+        3820,
+        260,
+        26639,
+        15,
+        78650,
+        40331,
+        1613,
+        9,
+        2562,
+        344,
+        11388,
+        260,
+        7006,
+        11482
+      ],
+      "decoded": "# with '#', it is fine -- a JSON-encoded '#...' line is NOT a comment unless"
+    },
+    {
+      "text": "# the raw line itself (before JSON-decoding) starts with a literal '#'.",
+      "ids": [
+        5,
+        270,
+        14099,
+        2562,
+        5231,
+        343,
+        35975,
+        26639,
+        55034,
+        8686,
+        11,
+        12444,
+        418,
+        260,
+        39248,
+        40331,
+        11892
+      ],
+      "decoded": "# the raw line itself (before JSON-decoding) starts with a literal '#'."
+    },
+    {
+      "text": "# See README.md in this directory for the conformance contract.",
+      "ids": [
+        5,
+        6575,
+        40006,
+        10259,
+        26887,
+        295,
+        566,
+        20289,
+        362,
+        270,
+        399,
+        13315,
+        6085,
+        16
+      ],
+      "decoded": "# See README.md in this directory for the conformance contract."
+    },
+    {
+      "text": "# --- 1. ASCII / English prose ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        19,
+        16,
+        67512,
+        1492,
+        3947,
+        46030,
+        11569
+      ],
+      "decoded": "# --- 1. ASCII / English prose ---"
+    },
+    {
+      "text": "Hello, world!",
+      "ids": [
+        19923,
+        14,
+        2058,
+        3
+      ],
+      "decoded": "Hello, world!"
+    },
+    {
+      "text": "The quick brown fox jumps over the lazy dog.",
+      "ids": [
+        671,
+        4787,
+        13769,
+        46012,
+        54994,
+        1060,
+        270,
+        41638,
+        6397,
+        16
+      ],
+      "decoded": "The quick brown fox jumps over the lazy dog."
+    },
+    {
+      "text": "Pack my box with five dozen liquor jugs.",
+      "ids": [
+        45791,
+        1026,
+        6485,
+        418,
+        3818,
+        28371,
+        58073,
+        15237,
+        85,
+        16
+      ],
+      "decoded": "Pack my box with five dozen liquor jugs."
+    },
+    {
+      "text": "OCR stands for Optical Character Recognition.",
+      "ids": [
+        119316,
+        13809,
+        362,
+        54020,
+        17943,
+        44602,
+        16
+      ],
+      "decoded": "OCR stands for Optical Character Recognition."
+    },
+    {
+      "text": "franken_ocr is a pure-Rust port of Baidu Unlimited-OCR.",
+      "ids": [
+        101319,
+        4490,
+        65,
+        7638,
+        344,
+        260,
+        11367,
+        8555,
+        583,
+        3386,
+        294,
+        10579,
+        55849,
+        104757,
+        15,
+        119316,
+        16
+      ],
+      "decoded": "franken_ocr is a pure-Rust port of Baidu Unlimited-OCR."
+    },
+    {
+      "text": "# --- 2. Leading / trailing / repeated whitespace edge cases ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        20,
+        16,
+        65464,
+        1492,
+        52964,
+        1492,
+        12529,
+        37899,
+        5790,
+        9449,
+        4599,
+        11569
+      ],
+      "decoded": "# --- 2. Leading / trailing / repeated whitespace edge cases ---"
+    },
+    {
+      "text": " leading single space",
+      "ids": [
+        6646,
+        4031,
+        3987
+      ],
+      "decoded": " leading single space"
+    },
+    {
+      "text": "  leading double space",
+      "ids": [
+        223,
+        6646,
+        6042,
+        3987
+      ],
+      "decoded": "  leading double space"
+    },
+    {
+      "text": "\t leading tab then space",
+      "ids": [
+        200,
+        6646,
+        12826,
+        1539,
+        3987
+      ],
+      "decoded": "\t leading tab then space"
+    },
+    {
+      "text": "trailing single space ",
+      "ids": [
+        19660,
+        7400,
+        4031,
+        3987,
+        223
+      ],
+      "decoded": "trailing single space "
+    },
+    {
+      "text": "trailing double space  ",
+      "ids": [
+        19660,
+        7400,
+        6042,
+        3987,
+        262
+      ],
+      "decoded": "trailing double space  "
+    },
+    {
+      "text": "trailing tab\t",
+      "ids": [
+        19660,
+        7400,
+        12826,
+        200
+      ],
+      "decoded": "trailing tab\t"
+    },
+    {
+      "text": "a  b   c    d",
+      "ids": [
+        67,
+        223,
+        291,
+        262,
+        274,
+        361,
+        283
+      ],
+      "decoded": "a  b   c    d"
+    },
+    {
+      "text": "word\ttab\tseparated\tvalues",
+      "ids": [
+        3899,
+        200,
+        14278,
+        200,
+        72940,
+        638,
+        200,
+        15737
+      ],
+      "decoded": "word\ttab\tseparated\tvalues"
+    },
+    {
+      "text": "   ",
+      "ids": [
+        361
+      ],
+      "decoded": "   "
+    },
+    {
+      "text": "\t\t\t",
+      "ids": [
+        4564
+      ],
+      "decoded": "\t\t\t"
+    },
+    {
+      "text": "\n",
+      "ids": [
+        201
+      ],
+      "decoded": "\n"
+    },
+    {
+      "text": "\n\n",
+      "ids": [
+        271
+      ],
+      "decoded": "\n\n"
+    },
+    {
+      "text": "\r\n",
+      "ids": [
+        204,
+        201
+      ],
+      "decoded": "\r\n"
+    },
+    {
+      "text": "line one\nline two\nline three",
+      "ids": [
+        1836,
+        834,
+        201,
+        1836,
+        1234,
+        201,
+        1836,
+        2038
+      ],
+      "decoded": "line one\nline two\nline three"
+    },
+    {
+      "text": "trailing newline\n",
+      "ids": [
+        19660,
+        7400,
+        1017,
+        1836,
+        201
+      ],
+      "decoded": "trailing newline\n"
+    },
+    {
+      "text": "crlf line one\r\ncrlf line two\r\n",
+      "ids": [
+        18977,
+        39724,
+        2562,
+        834,
+        204,
+        201,
+        18977,
+        39724,
+        2562,
+        1234,
+        204,
+        201
+      ],
+      "decoded": "crlf line one\r\ncrlf line two\r\n"
+    },
+    {
+      "text": "mixed\r\n\n\r line breaks",
+      "ids": [
+        122545,
+        204,
+        271,
+        204,
+        2562,
+        21994
+      ],
+      "decoded": "mixed\r\n\n\r line breaks"
+    },
+    {
+      "text": "\n   leading newline then spaces",
+      "ids": [
+        201,
+        262,
+        6646,
+        1017,
+        1836,
+        1539,
+        13564
+      ],
+      "decoded": "\n   leading newline then spaces"
+    },
+    {
+      "text": "word \n space-before-newline",
+      "ids": [
+        3899,
+        539,
+        3987,
+        1761,
+        8286,
+        55921,
+        1836
+      ],
+      "decoded": "word \n space-before-newline"
+    },
+    {
+      "text": "   \n   spaces around newline   \n   ",
+      "ids": [
+        14320,
+        262,
+        13564,
+        2448,
+        1017,
+        1836,
+        14320,
+        361
+      ],
+      "decoded": "   \n   spaces around newline   \n   "
+    },
+    {
+      "text": "# --- 3. Digit grouping (pre-tokenizer Split \\p{N}{1,3} -> groups of 1-3) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        21,
+        16,
+        67779,
+        54835,
+        343,
+        3548,
+        2364,
+        6618,
+        9160,
+        59512,
+        874,
+        82,
+        37415,
+        3069,
+        19,
+        14,
+        21,
+        95,
+        6248,
+        4691,
+        294,
+        223,
+        19,
+        15,
+        21,
+        11,
+        11569
+      ],
+      "decoded": "# --- 3. Digit grouping (pre-tokenizer Split \\p{N}{1,3} -> groups of 1-3) ---"
+    },
+    {
+      "text": "0",
+      "ids": [
+        18
+      ],
+      "decoded": "0"
+    },
+    {
+      "text": "00",
+      "ids": [
+        504
+      ],
+      "decoded": "00"
+    },
+    {
+      "text": "000",
+      "ids": [
+        1320
+      ],
+      "decoded": "000"
+    },
+    {
+      "text": "0000",
+      "ids": [
+        1320,
+        18
+      ],
+      "decoded": "0000"
+    },
+    {
+      "text": "12",
+      "ids": [
+        736
+      ],
+      "decoded": "12"
+    },
+    {
+      "text": "123",
+      "ids": [
+        6895
+      ],
+      "decoded": "123"
+    },
+    {
+      "text": "1234",
+      "ids": [
+        6895,
+        22
+      ],
+      "decoded": "1234"
+    },
+    {
+      "text": "12345",
+      "ids": [
+        6895,
+        1883
+      ],
+      "decoded": "12345"
+    },
+    {
+      "text": "123456",
+      "ids": [
+        6895,
+        18009
+      ],
+      "decoded": "123456"
+    },
+    {
+      "text": "1234567",
+      "ids": [
+        6895,
+        18009,
+        25
+      ],
+      "decoded": "1234567"
+    },
+    {
+      "text": "12345678901234567890",
+      "ids": [
+        6895,
+        18009,
+        25744,
+        16993,
+        18014,
+        27183,
+        2225
+      ],
+      "decoded": "12345678901234567890"
+    },
+    {
+      "text": "3.14159265358979",
+      "ids": [
+        21,
+        16,
+        9926,
+        25403,
+        26681,
+        27471,
+        3981
+      ],
+      "decoded": "3.14159265358979"
+    },
+    {
+      "text": "Phone: +1 (800) 555-0199 ext. 4242",
+      "ids": [
+        15455,
+        28,
+        940,
+        19,
+        343,
+        6884,
+        11,
+        223,
+        20295,
+        15,
+        21400,
+        27,
+        1693,
+        16,
+        223,
+        21932,
+        20
+      ],
+      "decoded": "Phone: +1 (800) 555-0199 ext. 4242"
+    },
+    {
+      "text": "Total: $1,234,567.89 USD",
+      "ids": [
+        9538,
+        28,
+        957,
+        19,
+        14,
+        14456,
+        14,
+        25601,
+        16,
+        4362,
+        22191
+      ],
+      "decoded": "Total: $1,234,567.89 USD"
+    },
+    {
+      "text": "Page 1 of 100, section 42.7.3",
+      "ids": [
+        10085,
+        223,
+        19,
+        294,
+        223,
+        1457,
+        14,
+        4868,
+        223,
+        3180,
+        16,
+        25,
+        16,
+        21
+      ],
+      "decoded": "Page 1 of 100, section 42.7.3"
+    },
+    {
+      "text": "Year 2026, ISBN 978-3-16-148410-0",
+      "ids": [
+        18239,
+        223,
+        939,
+        24,
+        14,
+        9399,
+        223,
+        9203,
+        15,
+        21,
+        15,
+        926,
+        15,
+        11065,
+        17726,
+        15,
+        18
+      ],
+      "decoded": "Year 2026, ISBN 978-3-16-148410-0"
+    },
+    {
+      "text": "0x1F4A9 and 0b1010 and 0o755",
+      "ids": [
+        18,
+        90,
+        19,
+        40,
+        22,
+        35,
+        27,
+        305,
+        223,
+        18,
+        68,
+        4460,
+        18,
+        305,
+        223,
+        18,
+        81,
+        27481
+      ],
+      "decoded": "0x1F4A9 and 0b1010 and 0o755"
+    },
+    {
+      "text": "١٢٣٤٥ arabic-indic digits",
+      "ids": [
+        63468,
+        76647,
+        127056,
+        152,
+        100,
+        152,
+        101,
+        69572,
+        297,
+        25936,
+        297,
+        10923
+      ],
+      "decoded": "١٢٣٤٥ arabic-indic digits"
+    },
+    {
+      "text": "# --- 4. Punctuation, symbols, math, LaTeX ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        22,
+        16,
+        40242,
+        119569,
+        14,
+        19435,
+        14,
+        7704,
+        14,
+        4176,
+        67854,
+        11569
+      ],
+      "decoded": "# --- 4. Punctuation, symbols, math, LaTeX ---"
+    },
+    {
+      "text": "a+b=c, x-y*z/w",
+      "ids": [
+        67,
+        25846,
+        38676,
+        14,
+        1527,
+        5200,
+        24347,
+        13580
+      ],
+      "decoded": "a+b=c, x-y*z/w"
+    },
+    {
+      "text": "f(x) = x^2 + 2*x + 1",
+      "ids": [
+        72,
+        4042,
+        11,
+        438,
+        1527,
+        64,
+        20,
+        940,
+        223,
+        20,
+        13912,
+        940,
+        223,
+        19
+      ],
+      "decoded": "f(x) = x^2 + 2*x + 1"
+    },
+    {
+      "text": "E = mc^2",
+      "ids": [
+        39,
+        438,
+        83359,
+        64,
+        20
+      ],
+      "decoded": "E = mc^2"
+    },
+    {
+      "text": "\\frac{a}{b} + \\sqrt{x^2 + y^2}",
+      "ids": [
+        27406,
+        30162,
+        3069,
+        68,
+        95,
+        940,
+        874,
+        9884,
+        16834,
+        64,
+        20,
+        940,
+        383,
+        64,
+        20,
+        95
+      ],
+      "decoded": "\\frac{a}{b} + \\sqrt{x^2 + y^2}"
+    },
+    {
+      "text": "$\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}$",
+      "ids": [
+        22984,
+        650,
+        65,
+        18,
+        43976,
+        19573,
+        312,
+        15374,
+        90,
+        64,
+        20,
+        16334,
+        18437,
+        438,
+        874,
+        4015,
+        3757,
+        9884,
+        3757,
+        5976,
+        14963,
+        20,
+        12222
+      ],
+      "decoded": "$\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}$"
+    },
+    {
+      "text": "\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}",
+      "ids": [
+        89496,
+        1364,
+        75,
+        31,
+        19,
+        4080,
+        80,
+        95,
+        1008,
+        438,
+        874,
+        4015,
+        37540,
+        3913,
+        13,
+        19,
+        42573,
+        20,
+        95
+      ],
+      "decoded": "\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}"
+    },
+    {
+      "text": "\\begin{align} a &= b + c \\\\ d &= e - f \\end{align}",
+      "ids": [
+        18832,
+        44294,
+        95,
+        260,
+        51303,
+        291,
+        940,
+        274,
+        4991,
+        283,
+        51303,
+        312,
+        565,
+        285,
+        874,
+        523,
+        44294,
+        95
+      ],
+      "decoded": "\\begin{align} a &= b + c \\\\ d &= e - f \\end{align}"
+    },
+    {
+      "text": "\\alpha \\beta \\gamma \\delta \\epsilon \\theta \\lambda \\mu \\pi \\sigma \\omega",
+      "ids": [
+        49966,
+        874,
+        13400,
+        874,
+        18480,
+        874,
+        18650,
+        874,
+        26235,
+        874,
+        12778,
+        874,
+        13077,
+        874,
+        9159,
+        874,
+        5976,
+        874,
+        14787,
+        874,
+        16254
+      ],
+      "decoded": "\\alpha \\beta \\gamma \\delta \\epsilon \\theta \\lambda \\mu \\pi \\sigma \\omega"
+    },
+    {
+      "text": "\\nabla \\cdot \\mathbf{E} = \\frac{\\rho}{\\varepsilon_0}",
+      "ids": [
+        5809,
+        425,
+        4558,
+        874,
+        13336,
+        874,
+        8901,
+        36297,
+        95,
+        438,
+        874,
+        4015,
+        3757,
+        18714,
+        10808,
+        27197,
+        65,
+        18,
+        95
+      ],
+      "decoded": "\\nabla \\cdot \\mathbf{E} = \\frac{\\rho}{\\varepsilon_0}"
+    },
+    {
+      "text": "A \\subseteq B \\cup C, x \\in \\mathbb{R}, \\forall \\epsilon > 0",
+      "ids": [
+        35,
+        874,
+        62060,
+        406,
+        874,
+        30521,
+        345,
+        14,
+        1527,
+        874,
+        261,
+        874,
+        14229,
+        21451,
+        6989,
+        874,
+        50685,
+        874,
+        26235,
+        1955,
+        223,
+        18
+      ],
+      "decoded": "A \\subseteq B \\cup C, x \\in \\mathbb{R}, \\forall \\epsilon > 0"
+    },
+    {
+      "text": "P(A|B) = \\frac{P(B|A)P(A)}{P(B)}",
+      "ids": [
+        50,
+        11531,
+        94,
+        36,
+        11,
+        438,
+        874,
+        4015,
+        32619,
+        14332,
+        94,
+        35,
+        73259,
+        11531,
+        42573,
+        50,
+        14332,
+        15688
+      ],
+      "decoded": "P(A|B) = \\frac{P(B|A)P(A)}{P(B)}"
+    },
+    {
+      "text": "matrix: \\begin{bmatrix} 1 & 0 \\\\ 0 & 1 \\end{bmatrix}",
+      "ids": [
+        19684,
+        28,
+        874,
+        8277,
+        45056,
+        95,
+        223,
+        19,
+        1051,
+        223,
+        18,
+        4991,
+        223,
+        18,
+        1051,
+        223,
+        19,
+        874,
+        523,
+        45056,
+        95
+      ],
+      "decoded": "matrix: \\begin{bmatrix} 1 & 0 \\\\ 0 & 1 \\end{bmatrix}"
+    },
+    {
+      "text": "∀x∈ℝ, x²≥0 ∧ √x·√x=x",
+      "ids": [
+        78728,
+        90,
+        20954,
+        119659,
+        14,
+        1527,
+        1628,
+        27297,
+        18,
+        29313,
+        29412,
+        90,
+        1845,
+        13612,
+        90,
+        33577
+      ],
+      "decoded": "∀x∈ℝ, x²≥0 ∧ √x·√x=x"
+    },
+    {
+      "text": "α+β=γ, ∑∫∞∂∇±×÷≠≤≥≈∝",
+      "ids": [
+        1753,
+        13,
+        8133,
+        31,
+        5591,
+        14,
+        52621,
+        36705,
+        24219,
+        26083,
+        62414,
+        14594,
+        4792,
+        14109,
+        56470,
+        20069,
+        27297,
+        45181,
+        2190,
+        254
+      ],
+      "decoded": "α+β=γ, ∑∫∞∂∇±×÷≠≤≥≈∝"
+    },
+    {
+      "text": "# --- 5. Code samples ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        23,
+        16,
+        9909,
+        9571,
+        11569
+      ],
+      "decoded": "# --- 5. Code samples ---"
+    },
+    {
+      "text": "def f(x):\n    return x * 2",
+      "ids": [
+        3465,
+        285,
+        4042,
+        3395,
+        361,
+        1354,
+        1527,
+        982,
+        223,
+        20
+      ],
+      "decoded": "def f(x):\n    return x * 2"
+    },
+    {
+      "text": "fn main() { println!(\"Hello, {}!\", name); }",
+      "ids": [
+        28952,
+        1840,
+        1393,
+        680,
+        42432,
+        64325,
+        19923,
+        14,
+        26102,
+        112893,
+        2329,
+        3171,
+        837
+      ],
+      "decoded": "fn main() { println!(\"Hello, {}!\", name); }"
+    },
+    {
+      "text": "let v: Vec<u8> = (0..=255).collect();",
+      "ids": [
+        1775,
+        374,
+        28,
+        50526,
+        30,
+        87,
+        26,
+        32,
+        438,
+        343,
+        18,
+        426,
+        31,
+        9489,
+        797,
+        45684,
+        12184
+      ],
+      "decoded": "let v: Vec<u8> = (0..=255).collect();"
+    },
+    {
+      "text": "if (a && b) || !c { return Ok(()); }",
+      "ids": [
+        394,
+        343,
+        67,
+        6546,
+        291,
+        11,
+        8932,
+        4050,
+        69,
+        680,
+        1354,
+        17535,
+        24918,
+        3171,
+        837
+      ],
+      "decoded": "if (a && b) || !c { return Ok(()); }"
+    },
+    {
+      "text": "impl<T: Clone + Send> Iterator for Foo<T> where T: 'static {}",
+      "ids": [
+        31281,
+        14607,
+        28,
+        94915,
+        940,
+        38207,
+        32,
+        99568,
+        362,
+        94028,
+        14607,
+        32,
+        1479,
+        330,
+        28,
+        905,
+        15514,
+        26102
+      ],
+      "decoded": "impl<T: Clone + Send> Iterator for Foo<T> where T: 'static {}"
+    },
+    {
+      "text": "SELECT * FROM users WHERE id = ? AND name LIKE '%abc%';",
+      "ids": [
+        21039,
+        982,
+        17934,
+        6628,
+        29379,
+        4099,
+        438,
+        4054,
+        7554,
+        2329,
+        74596,
+        56867,
+        32372,
+        7,
+        34355
+      ],
+      "decoded": "SELECT * FROM users WHERE id = ? AND name LIKE '%abc%';"
+    },
+    {
+      "text": "#![forbid(unsafe_code)]\n#[derive(Debug, Clone)]\npub struct S;",
+      "ids": [
+        5,
+        29539,
+        2251,
+        18689,
+        10,
+        9921,
+        15702,
+        17636,
+        22143,
+        68061,
+        125415,
+        17587,
+        82029,
+        14,
+        94915,
+        22143,
+        38744,
+        2771,
+        327,
+        29
+      ],
+      "decoded": "#![forbid(unsafe_code)]\n#[derive(Debug, Clone)]\npub struct S;"
+    },
+    {
+      "text": "std::collections::HashMap<String, Vec<(i32, f64)>>",
+      "ids": [
+        8017,
+        2366,
+        3441,
+        8294,
+        2366,
+        79451,
+        20304,
+        14,
+        50526,
+        111478,
+        75,
+        2111,
+        14,
+        285,
+        2892,
+        11,
+        5957
+      ],
+      "decoded": "std::collections::HashMap<String, Vec<(i32, f64)>>"
+    },
+    {
+      "text": "x = [a for a in range(10) if a % 2 == 0]",
+      "ids": [
+        90,
+        438,
+        764,
+        67,
+        362,
+        260,
+        295,
+        3291,
+        10,
+        553,
+        11,
+        855,
+        260,
+        3104,
+        223,
+        20,
+        2606,
+        223,
+        18,
+        63
+      ],
+      "decoded": "x = [a for a in range(10) if a % 2 == 0]"
+    },
+    {
+      "text": "const RE = /[a-z0-9_]+@[a-z0-9.]+/gi;",
+      "ids": [
+        3949,
+        12370,
+        438,
+        1492,
+        61,
+        67,
+        26831,
+        18,
+        15,
+        27,
+        65,
+        22554,
+        34,
+        61,
+        67,
+        26831,
+        18,
+        15,
+        27,
+        16,
+        22554,
+        17,
+        9275,
+        29
+      ],
+      "decoded": "const RE = /[a-z0-9_]+@[a-z0-9.]+/gi;"
+    },
+    {
+      "text": "git commit -m \"fix: handle edge case\" --no-verify",
+      "ids": [
+        30139,
+        8929,
+        565,
+        79,
+        582,
+        16270,
+        28,
+        9495,
+        9449,
+        2352,
+        4,
+        3820,
+        3567,
+        15,
+        75558
+      ],
+      "decoded": "git commit -m \"fix: handle edge case\" --no-verify"
+    },
+    {
+      "text": "</div><span class=\"x\" data-id='42'>&amp;&lt;&gt;</span>",
+      "ids": [
+        1718,
+        2512,
+        5451,
+        6019,
+        1312,
+        1281,
+        90,
+        4,
+        1499,
+        47189,
+        6471,
+        3180,
+        9,
+        31513,
+        2030,
+        29428,
+        6306,
+        29428,
+        12006,
+        47827,
+        6019,
+        32
+      ],
+      "decoded": "</div><span class=\"x\" data-id='42'>&amp;&lt;&gt;</span>"
+    },
+    {
+      "text": "{\"key\": [1, 2, {\"nested\": true}], \"u\": null}",
+      "ids": [
+        24313,
+        4989,
+        3362,
+        764,
+        19,
+        14,
+        223,
+        20,
+        14,
+        28612,
+        80,
+        12904,
+        3362,
+        3292,
+        95,
+        3031,
+        582,
+        87,
+        3362,
+        5100,
+        95
+      ],
+      "decoded": "{\"key\": [1, 2, {\"nested\": true}], \"u\": null}"
+    },
+    {
+      "text": "camelCaseWord PascalCaseWord snake_case_word SCREAMING_SNAKE kebab-case-word",
+      "ids": [
+        69,
+        31105,
+        15434,
+        21412,
+        56780,
+        15434,
+        21412,
+        34951,
+        78392,
+        58340,
+        17283,
+        89879,
+        4951,
+        10993,
+        3794,
+        13969,
+        473,
+        39637,
+        54690,
+        68467
+      ],
+      "decoded": "camelCaseWord PascalCaseWord snake_case_word SCREAMING_SNAKE kebab-case-word"
+    },
+    {
+      "text": "# --- 6. CJK: Chinese (split by [一-龥]+ pre-tokenizer stage) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        24,
+        16,
+        54442,
+        45,
+        28,
+        7891,
+        343,
+        19134,
+        513,
+        764,
+        378,
+        15,
+        2715,
+        101,
+        22554,
+        852,
+        2364,
+        6618,
+        9160,
+        6632,
+        11,
+        11569
+      ],
+      "decoded": "# --- 6. CJK: Chinese (split by [一-龥]+ pre-tokenizer stage) ---"
+    },
+    {
+      "text": "你好，世界！",
+      "ids": [
+        30594,
+        303,
+        3427,
+        1175
+      ],
+      "decoded": "你好，世界！"
+    },
+    {
+      "text": "光学字符识别是一项重要的技术。",
+      "ids": [
+        49566,
+        15019,
+        19742,
+        57110,
+        9091,
+        2823,
+        320
+      ],
+      "decoded": "光学字符识别是一项重要的技术。"
+    },
+    {
+      "text": "中文混合English和数字123的文本。",
+      "ids": [
+        21134,
+        14769,
+        17530,
+        548,
+        8283,
+        6895,
+        301,
+        18804,
+        320
+      ],
+      "decoded": "中文混合English和数字123的文本。"
+    },
+    {
+      "text": "繁體中文：這是一個測試。",
+      "ids": [
+        127651,
+        21134,
+        768,
+        2424,
+        36697,
+        83711,
+        320
+      ],
+      "decoded": "繁體中文：這是一個測試。"
+    },
+    {
+      "text": "百度Unlimited-OCR模型。",
+      "ids": [
+        39063,
+        4437,
+        31915,
+        15,
+        119316,
+        8842,
+        320
+      ],
+      "decoded": "百度Unlimited-OCR模型。"
+    },
+    {
+      "text": "# --- 7. CJK: Japanese (Hiragana ぀-ゟ, Katakana ゠-ヿ isolated) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        25,
+        16,
+        54442,
+        45,
+        28,
+        10999,
+        343,
+        42,
+        5287,
+        1508,
+        67,
+        223,
+        415,
+        225,
+        15,
+        665,
+        256,
+        14,
+        24204,
+        480,
+        3393,
+        223,
+        665,
+        257,
+        15,
+        912,
+        126,
+        17000,
+        11,
+        11569
+      ],
+      "decoded": "# --- 7. CJK: Japanese (Hiragana ぀-ゟ, Katakana ゠-ヿ isolated) ---"
+    },
+    {
+      "text": "こんにちは、世界。",
+      "ids": [
+        4549,
+        7245,
+        2298,
+        12457,
+        2841,
+        410,
+        3427,
+        320
+      ],
+      "decoded": "こんにちは、世界。"
+    },
+    {
+      "text": "ひらがなとカタカナと漢字が混ざる。",
+      "ids": [
+        40259,
+        4970,
+        2936,
+        2942,
+        2495,
+        15961,
+        11767,
+        15961,
+        27071,
+        2495,
+        29069,
+        2024,
+        2936,
+        5764,
+        51060,
+        2479,
+        320
+      ],
+      "decoded": "ひらがなとカタカナと漢字が混ざる。"
+    },
+    {
+      "text": "コンピューターでOCRを実行する。",
+      "ids": [
+        73892,
+        245,
+        107596,
+        34412,
+        2539,
+        119316,
+        2747,
+        110509,
+        7220,
+        320
+      ],
+      "decoded": "コンピューターでOCRを実行する。"
+    },
+    {
+      "text": "日本語のテキストを認識します。",
+      "ids": [
+        88768,
+        1576,
+        17383,
+        20367,
+        24552,
+        2747,
+        43367,
+        22035,
+        320
+      ],
+      "decoded": "日本語のテキストを認識します。"
+    },
+    {
+      "text": "あいうえおアイウエオ一二三",
+      "ids": [
+        5947,
+        78107,
+        8968,
+        9940,
+        96610,
+        19774,
+        20720,
+        21721,
+        49548,
+        1131
+      ],
+      "decoded": "あいうえおアイウエオ一二三"
+    },
+    {
+      "text": "# --- 8. CJK: Korean (Hangul, outside the CJK pre-tokenizer ranges) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        26,
+        16,
+        54442,
+        45,
+        28,
+        21279,
+        343,
+        42,
+        555,
+        363,
+        14,
+        5854,
+        270,
+        54442,
+        45,
+        852,
+        2364,
+        6618,
+        9160,
+        23980,
+        11,
+        11569
+      ],
+      "decoded": "# --- 8. CJK: Korean (Hangul, outside the CJK pre-tokenizer ranges) ---"
+    },
+    {
+      "text": "안녕하세요, 세계!",
+      "ids": [
+        31404,
+        11939,
+        246,
+        4567,
+        73527,
+        14,
+        76878,
+        3
+      ],
+      "decoded": "안녕하세요, 세계!"
+    },
+    {
+      "text": "광학 문자 인식은 중요한 기술입니다.",
+      "ids": [
+        73663,
+        14823,
+        86915,
+        19381,
+        22215,
+        7180,
+        127339,
+        84764,
+        34941,
+        16
+      ],
+      "decoded": "광학 문자 인식은 중요한 기술입니다."
+    },
+    {
+      "text": "한국어 텍스트와 English가 섞인 문장.",
+      "ids": [
+        5634,
+        17564,
+        9227,
+        61291,
+        238,
+        45652,
+        15523,
+        3947,
+        6751,
+        9712,
+        255,
+        9752,
+        22426,
+        14301,
+        16
+      ],
+      "decoded": "한국어 텍스트와 English가 섞인 문장."
+    },
+    {
+      "text": "가나다라마바사아자차카타파하",
+      "ids": [
+        6751,
+        12671,
+        3874,
+        11011,
+        29936,
+        46904,
+        10898,
+        14815,
+        9907,
+        35179,
+        52649,
+        31650,
+        45919,
+        4567
+      ],
+      "decoded": "가나다라마바사아자차카타파하"
+    },
+    {
+      "text": "# --- 9. Other scripts & emoji (full byte-level coverage, no UNK) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        27,
+        16,
+        6241,
+        39372,
+        1051,
+        980,
+        82644,
+        343,
+        29015,
+        26490,
+        12675,
+        12656,
+        14,
+        1119,
+        9167,
+        45,
+        11,
+        11569
+      ],
+      "decoded": "# --- 9. Other scripts & emoji (full byte-level coverage, no UNK) ---"
+    },
+    {
+      "text": "Привет, мир! Русский текст.",
+      "ids": [
+        24797,
+        8919,
+        14,
+        74779,
+        3,
+        87103,
+        16980,
+        121212,
+        16
+      ],
+      "decoded": "Привет, мир! Русский текст."
+    },
+    {
+      "text": "مرحبا بالعالم (Arabic, RTL)",
+      "ids": [
+        10393,
+        2212,
+        53067,
+        9254,
+        1183,
+        14059,
+        343,
+        70261,
+        14,
+        433,
+        20925,
+        11
+      ],
+      "decoded": "مرحبا بالعالم (Arabic, RTL)"
+    },
+    {
+      "text": "שלום עולם (Hebrew, RTL)",
+      "ids": [
+        8793,
+        2328,
+        16467,
+        6166,
+        41141,
+        343,
+        64615,
+        14,
+        433,
+        20925,
+        11
+      ],
+      "decoded": "שלום עולם (Hebrew, RTL)"
+    },
+    {
+      "text": "हैलो दुनिया (Devanagari)",
+      "ids": [
+        18359,
+        20846,
+        14598,
+        10263,
+        26227,
+        101422,
+        85639,
+        343,
+        4301,
+        13530,
+        409,
+        1035,
+        11
+      ],
+      "decoded": "हैलो दुनिया (Devanagari)"
+    },
+    {
+      "text": "สวัสดีชาวโลก (Thai)",
+      "ids": [
+        2952,
+        34189,
+        2952,
+        25581,
+        88176,
+        50889,
+        343,
+        72736,
+        11
+      ],
+      "decoded": "สวัสดีชาวโลก (Thai)"
+    },
+    {
+      "text": "Ελληνικά (Greek)",
+      "ids": [
+        40435,
+        43595,
+        20975,
+        343,
+        78473,
+        11
+      ],
+      "decoded": "Ελληνικά (Greek)"
+    },
+    {
+      "text": "emoji: 😀 🚀 👍 🌍 🤖 ❤️",
+      "ids": [
+        18872,
+        7063,
+        28,
+        53769,
+        225,
+        7351,
+        251,
+        225,
+        102527,
+        73369,
+        238,
+        112838,
+        247,
+        53341,
+        100,
+        10759
+      ],
+      "decoded": "emoji: 😀 🚀 👍 🌍 🤖 ❤️"
+    },
+    {
+      "text": "flags: 🇺🇸 🇯🇵 zwj: 👩‍💻",
+      "ids": [
+        100711,
+        28,
+        77579,
+        121,
+        43754,
+        119,
+        77579,
+        110,
+        43754,
+        116,
+        18219,
+        76,
+        28,
+        52780,
+        105,
+        46088,
+        23903,
+        122
+      ],
+      "decoded": "flags: 🇺🇸 🇯🇵 zwj: 👩‍💻"
+    },
+    {
+      "text": "combining: áèîõü ñ",
+      "ids": [
+        23182,
+        2367,
+        28,
+        260,
+        17793,
+        71,
+        45345,
+        75,
+        75274,
+        81,
+        59436,
+        87,
+        66383,
+        313,
+        59436
+      ],
+      "decoded": "combining: áèîõü ñ"
+    },
+    {
+      "text": "# --- 10. DeepSeek glyph specials (fullwidth bar U+FF5C, bullet U+2581) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        553,
+        16,
+        22651,
+        4374,
+        1465,
+        87309,
+        3953,
+        85,
+        343,
+        29015,
+        12356,
+        4758,
+        628,
+        13,
+        6459,
+        23,
+        37,
+        14,
+        37561,
+        628,
+        13,
+        17015,
+        19,
+        11,
+        11569
+      ],
+      "decoded": "# --- 10. DeepSeek glyph specials (fullwidth bar U+FF5C, bullet U+2581) ---"
+    },
+    {
+      "text": "<｜begin▁of▁sentence｜>",
+      "ids": [
+        0
+      ],
+      "decoded": "<｜begin▁of▁sentence｜>"
+    },
+    {
+      "text": "<｜end▁of▁sentence｜>",
+      "ids": [
+        1
+      ],
+      "decoded": "<｜end▁of▁sentence｜>"
+    },
+    {
+      "text": "<｜▁pad▁｜>",
+      "ids": [
+        2
+      ],
+      "decoded": "<｜▁pad▁｜>"
+    },
+    {
+      "text": "<｜User｜>",
+      "ids": [
+        128803
+      ],
+      "decoded": "<｜User｜>"
+    },
+    {
+      "text": "<｜Assistant｜>",
+      "ids": [
+        128804
+      ],
+      "decoded": "<｜Assistant｜>"
+    },
+    {
+      "text": "<｜fim▁begin｜>middle<｜fim▁hole｜>suffix<｜fim▁end｜>",
+      "ids": [
+        128801,
+        52787,
+        128800,
+        85,
+        73957,
+        128802
+      ],
+      "decoded": "<｜fim▁begin｜>middle<｜fim▁hole｜>suffix<｜fim▁end｜>"
+    },
+    {
+      "text": "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜><｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+      "ids": [
+        128806,
+        128808,
+        128809,
+        128807
+      ],
+      "decoded": "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜><｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+    },
+    {
+      "text": "<｜place▁holder▁no₁0｜>",
+      "ids": [
+        30,
+        28217,
+        4205,
+        5487,
+        226,
+        14646,
+        5487,
+        226,
+        3567,
+        90534,
+        18,
+        28217,
+        32
+      ],
+      "decoded": "<｜place▁holder▁no₁0｜>"
+    },
+    {
+      "text": "prefix <｜begin▁of▁sentence｜> suffix",
+      "ids": [
+        44846,
+        223,
+        0,
+        45449
+      ],
+      "decoded": "prefix <｜begin▁of▁sentence｜> suffix"
+    },
+    {
+      "text": "# --- 11. ASCII-pipe specials and OCR / vision / grounding / table glyphs ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        779,
+        16,
+        67512,
+        3095,
+        17932,
+        3953,
+        85,
+        305,
+        126041,
+        1492,
+        10048,
+        1492,
+        78768,
+        1492,
+        4184,
+        87309,
+        85,
+        11569
+      ],
+      "decoded": "# --- 11. ASCII-pipe specials and OCR / vision / grounding / table glyphs ---"
+    },
+    {
+      "text": "<|User|>",
+      "ids": [
+        128825
+      ],
+      "decoded": "<|User|>"
+    },
+    {
+      "text": "<|Assistant|>",
+      "ids": [
+        128826
+      ],
+      "decoded": "<|Assistant|>"
+    },
+    {
+      "text": "<|User|>Read the document.<|Assistant|>",
+      "ids": [
+        128825,
+        8158,
+        270,
+        4940,
+        16,
+        128826
+      ],
+      "decoded": "<|User|>Read the document.<|Assistant|>"
+    },
+    {
+      "text": "<image>",
+      "ids": [
+        128815
+      ],
+      "decoded": "<image>"
+    },
+    {
+      "text": "<|ref|>title<|/ref|><|det|>[[10, 20, 300, 400]]<|/det|>",
+      "ids": [
+        128816,
+        10212,
+        128817,
+        128818,
+        22663,
+        553,
+        14,
+        223,
+        397,
+        14,
+        223,
+        4314,
+        14,
+        223,
+        5126,
+        11621,
+        128819
+      ],
+      "decoded": "<|ref|>title<|/ref|><|det|>[[10, 20, 300, 400]]<|/det|>"
+    },
+    {
+      "text": "<|grounding|>Convert the document to markdown.",
+      "ids": [
+        128820,
+        21842,
+        270,
+        4940,
+        304,
+        2121,
+        7919,
+        16
+      ],
+      "decoded": "<|grounding|>Convert the document to markdown."
+    },
+    {
+      "text": "<td>cell</td><tr></tr>",
+      "ids": [
+        128821,
+        11908,
+        128822,
+        128823,
+        128824
+      ],
+      "decoded": "<td>cell</td><tr></tr>"
+    },
+    {
+      "text": "<table><tr><td>A</td><td>B</td></tr></table>",
+      "ids": [
+        114761,
+        32,
+        128823,
+        128821,
+        35,
+        128822,
+        128821,
+        36,
+        128822,
+        128824,
+        1718,
+        8603,
+        32
+      ],
+      "decoded": "<table><tr><td>A</td><td>B</td></tr></table>"
+    },
+    {
+      "text": "<|EOT|>",
+      "ids": [
+        128805
+      ],
+      "decoded": "<|EOT|>"
+    },
+    {
+      "text": "text <image> text <|ref|>x<|/ref|> text",
+      "ids": [
+        2067,
+        223,
+        128815,
+        3051,
+        223,
+        128816,
+        90,
+        128817,
+        3051
+      ],
+      "decoded": "text <image> text <|ref|>x<|/ref|> text"
+    },
+    {
+      "text": "<|User|><image>\n<|grounding|>OCR this.<|Assistant|>",
+      "ids": [
+        128825,
+        128815,
+        201,
+        128820,
+        119316,
+        566,
+        16,
+        128826
+      ],
+      "decoded": "<|User|><image>\n<|grounding|>OCR this.<|Assistant|>"
+    },
+    {
+      "text": "# --- 12. Adjacency / boundary stress (specials touching text and digits) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        736,
+        16,
+        64320,
+        66019,
+        1492,
+        16429,
+        5505,
+        343,
+        25910,
+        22223,
+        35560,
+        3051,
+        305,
+        10923,
+        11,
+        11569
+      ],
+      "decoded": "# --- 12. Adjacency / boundary stress (specials touching text and digits) ---"
+    },
+    {
+      "text": "a<image>b",
+      "ids": [
+        67,
+        128815,
+        68
+      ],
+      "decoded": "a<image>b"
+    },
+    {
+      "text": "123<image>456",
+      "ids": [
+        6895,
+        128815,
+        18009
+      ],
+      "decoded": "123<image>456"
+    },
+    {
+      "text": "<image><image><image>",
+      "ids": [
+        128815,
+        128815,
+        128815
+      ],
+      "decoded": "<image><image><image>"
+    },
+    {
+      "text": "中文<image>日本語",
+      "ids": [
+        21134,
+        128815,
+        88768
+      ],
+      "decoded": "中文<image>日本語"
+    },
+    {
+      "text": "<|ref|><|det|><|/det|><|/ref|>",
+      "ids": [
+        128816,
+        128818,
+        128819,
+        128817
+      ],
+      "decoded": "<|ref|><|det|><|/det|><|/ref|>"
+    },
+    {
+      "text": "no space<|Assistant|>no space",
+      "ids": [
+        3567,
+        3987,
+        128826,
+        3567,
+        3987
+      ],
+      "decoded": "no space<|Assistant|>no space"
+    },
+    {
+      "text": "<｜User｜><|User|>",
+      "ids": [
+        128803,
+        128825
+      ],
+      "decoded": "<｜User｜><|User|>"
+    },
+    {
+      "text": "</td></tr><td><tr>",
+      "ids": [
+        128822,
+        128824,
+        128821,
+        128823
+      ],
+      "decoded": "</td></tr><td><tr>"
+    },
+    {
+      "text": "# --- 13. Single chars, empties, and BPE-merge stress ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        907,
+        16,
+        24266,
+        74752,
+        14,
+        55560,
+        517,
+        14,
+        305,
+        406,
+        10644,
+        15,
+        46467,
+        5505,
+        11569
+      ],
+      "decoded": "# --- 13. Single chars, empties, and BPE-merge stress ---"
+    },
+    {
+      "text": "",
+      "ids": [],
+      "decoded": ""
+    },
+    {
+      "text": " ",
+      "ids": [
+        223
+      ],
+      "decoded": " "
+    },
+    {
+      "text": "a",
+      "ids": [
+        67
+      ],
+      "decoded": "a"
+    },
+    {
+      "text": "Ġ",
+      "ids": [
+        131,
+        257
+      ],
+      "decoded": "Ġ"
+    },
+    {
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "ids": [
+        89086,
+        89086,
+        89086,
+        89086
+      ],
+      "decoded": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "text": "the the the the the the the the",
+      "ids": [
+        1805,
+        270,
+        270,
+        270,
+        270,
+        270,
+        270,
+        270
+      ],
+      "decoded": "the the the the the the the the"
+    },
+    {
+      "text": "............",
+      "ids": [
+        66979
+      ],
+      "decoded": "............"
+    },
+    {
+      "text": "!!!!!!!!",
+      "ids": [
+        67692
+      ],
+      "decoded": "!!!!!!!!"
+    },
+    {
+      "text": "________",
+      "ids": [
+        3621
+      ],
+      "decoded": "________"
+    },
+    {
+      "text": "            ",
+      "ids": [
+        9212
+      ],
+      "decoded": "            "
+    },
+    {
+      "text": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+      "ids": [
+        119232,
+        772,
+        2047,
+        7355,
+        32157,
+        476,
+        83,
+        43108,
+        8729,
+        89,
+        65987,
+        51453,
+        8345,
+        33202,
+        53332,
+        45,
+        39851,
+        48,
+        7819,
+        35890,
+        2453,
+        30102,
+        57,
+        75871
+      ],
+      "decoded": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    },
+    {
+      "text": "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+      "ids": [
+        16512,
+        125463,
+        7,
+        8,
+        9,
+        1393,
+        12,
+        13,
+        14162,
+        6984,
+        28,
+        29,
+        17394,
+        32,
+        33,
+        34,
+        61,
+        23862,
+        64,
+        65,
+        66,
+        82623,
+        95,
+        96
+      ],
+      "decoded": "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    },
+    {
+      "text": "      various unicode spaces",
+      "ids": [
+        2162,
+        98362,
+        300,
+        235,
+        300,
+        227,
+        77469,
+        3624,
+        612,
+        49224,
+        13564
+      ],
+      "decoded": "      various unicode spaces"
+    },
+    {
+      "text": "zero​width​space​joined",
+      "ids": [
+        20692,
+        35020,
+        12356,
+        35020,
+        20229,
+        35020,
+        115109
+      ],
+      "decoded": "zero​width​space​joined"
+    },
+    {
+      "text": "# --- 14. Realistic OCR document snippets (mixed everything) ---",
+      "ids": [
+        5,
+        11569,
+        223,
+        929,
+        16,
+        13521,
+        3617,
+        126041,
+        4940,
+        60452,
+        343,
+        122545,
+        5675,
+        11,
+        11569
+      ],
+      "decoded": "# --- 14. Realistic OCR document snippets (mixed everything) ---"
+    },
+    {
+      "text": "Invoice #2026-0042\nDate: 2026-06-24\nTotal: ¥1,234,567\n中文说明：请付款。",
+      "ids": [
+        92234,
+        1823,
+        939,
+        24,
+        15,
+        14453,
+        20,
+        201,
+        7778,
+        28,
+        223,
+        939,
+        24,
+        15,
+        3398,
+        15,
+        1173,
+        201,
+        9538,
+        28,
+        74117,
+        19,
+        14,
+        14456,
+        14,
+        25601,
+        201,
+        21134,
+        6977,
+        768,
+        2788,
+        30088,
+        320
+      ],
+      "decoded": "Invoice #2026-0042\nDate: 2026-06-24\nTotal: ¥1,234,567\n中文说明：请付款。"
+    },
+    {
+      "text": "Theorem 1. For all $n \\in \\mathbb{N}$, $\\sum_{k=1}^{n} k^3 = \\left(\\frac{n(n+1)}{2}\\right)^2$.",
+      "ids": [
+        54895,
+        223,
+        19,
+        16,
+        1884,
+        710,
+        957,
+        80,
+        874,
+        261,
+        874,
+        14229,
+        37415,
+        68868,
+        9692,
+        5674,
+        1364,
+        77,
+        31,
+        19,
+        4080,
+        80,
+        95,
+        473,
+        64,
+        21,
+        438,
+        874,
+        4589,
+        7420,
+        4015,
+        37540,
+        3913,
+        13,
+        19,
+        42573,
+        20,
+        1464,
+        2459,
+        21590,
+        20,
+        25605
+      ],
+      "decoded": "Theorem 1. For all $n \\in \\mathbb{N}$, $\\sum_{k=1}^{n} k^3 = \\left(\\frac{n(n+1)}{2}\\right)^2$."
+    },
+    {
+      "text": "| Name | 年齢 | Score |\n|------|------|-------|\n| Alice | 30 | 95.5 |\n| 张三 | 25 | 88.0 |",
+      "ids": [
+        94,
+        9838,
+        369,
+        223,
+        695,
+        94931,
+        369,
+        29700,
+        7640,
+        94,
+        20004,
+        94,
+        20004,
+        94,
+        83351,
+        22301,
+        94,
+        31065,
+        369,
+        223,
+        1059,
+        369,
+        223,
+        2875,
+        16,
+        23,
+        7640,
+        94,
+        223,
+        99068,
+        369,
+        223,
+        1069,
+        369,
+        223,
+        2851,
+        16,
+        18,
+        369
+      ],
+      "decoded": "| Name | 年齢 | Score |\n|------|------|-------|\n| Alice | 30 | 95.5 |\n| 张三 | 25 | 88.0 |"
+    },
+    {
+      "text": "第1章 Introduction（1.1）\nThis chapter 介绍了 the basics.\n```python\nx = 1  # comment 注释\n```",
+      "ids": [
+        1056,
+        19,
+        2487,
+        10793,
+        1237,
+        19,
+        16,
+        19,
+        7807,
+        2337,
+        8261,
+        223,
+        28888,
+        270,
+        33171,
+        603,
+        9854,
+        36490,
+        201,
+        90,
+        438,
+        223,
+        19,
+        223,
+        1823,
+        7006,
+        223,
+        37689,
+        201,
+        9854
+      ],
+      "decoded": "第1章 Introduction（1.1）\nThis chapter 介绍了 the basics.\n```python\nx = 1  # comment 注释\n```"
+    },
+    {
+      "text": "<|grounding|><|ref|>标题<|/ref|><|det|>[[0, 0, 999, 50]]<|/det|>\n# Heading标题\n\nBody text 正文 with $\\pi \\approx 3.14$.",
+      "ids": [
+        128820,
+        128816,
+        24153,
+        128817,
+        128818,
+        22663,
+        18,
+        14,
+        223,
+        18,
+        14,
+        223,
+        8834,
+        14,
+        223,
+        1328,
+        11621,
+        128819,
+        201,
+        5,
+        108531,
+        24153,
+        271,
+        23698,
+        3051,
+        223,
+        33292,
+        418,
+        9692,
+        5976,
+        874,
+        43747,
+        223,
+        21,
+        16,
+        929,
+        25605
+      ],
+      "decoded": "<|grounding|><|ref|>标题<|/ref|><|det|>[[0, 0, 999, 50]]<|/det|>\n# Heading标题\n\nBody text 正文 with $\\pi \\approx 3.14$."
+    }
+  ]
+}

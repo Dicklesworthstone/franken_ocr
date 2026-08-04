@@ -1,0 +1,33 @@
+{
+ "any_rejected": false,
+ "artifact": "franken_ocr.gauntlet.eprocess.v1",
+ "global_e_value": 0.027750000000249995,
+ "invariants": {
+  "INV-DETERMINISM": {
+   "e_value": 0.0010000000000000009,
+   "obs_count": 1,
+   "rejected_at": null,
+   "threshold": 1000000.0
+  },
+  "INV-I32-NOOVERFLOW": {
+   "e_value": 0.009999999999999995,
+   "obs_count": 2,
+   "rejected_at": null,
+   "threshold": 1000.0
+  },
+  "INV-KV-CAP": {
+   "e_value": 0.09999999999999998,
+   "obs_count": 1,
+   "rejected_at": null,
+   "threshold": 1000.0
+  },
+  "INV-SIMD-SCALAR": {
+   "e_value": 1.0000000000000036e-12,
+   "obs_count": 4,
+   "rejected_at": null,
+   "threshold": 1000000.0
+  }
+ },
+ "observations_folded": 4,
+ "source": "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/428b19d6-fc4f-48be-83b7-8c9b166195ff/scratchpad/eprocess_stream.ndjson"
+}

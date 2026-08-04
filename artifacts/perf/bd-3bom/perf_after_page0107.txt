@@ -1,0 +1,9 @@
+# AFTER — same model/page/host, focr WITH decoder::norm_and_lm_head_pretransposed (transpose once at build).
+# Output byte-identical to BEFORE (cmp -s vs the committed baseline).
+
+[focr-timing]   got.vision+splice 5.84s
+[focr-timing]   decode 688 tok in 28.74s (23.9 tok/s) | seed(prefill) 1.16s | layers 12.49s (attn 4.90s, gemv+misc 7.59s) | lm_head 16.18s
+[focr-timing]   got.generate 688 tokens 30.07s
+[focr-timing] got forward 35.93s
+PAGE107_TOTAL_SECONDS=41
+OUTPUT_IDENTICAL=yes

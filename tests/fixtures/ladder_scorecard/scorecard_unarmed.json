@@ -1,0 +1,50 @@
+{
+ "schema": "focr-ladder-scorecard/v1",
+ "gates": [
+  {
+   "gate": "L0",
+   "outcome": "skip_no_model",
+   "meaningful": true,
+   "parity_rows": 0,
+   "worst": null
+  },
+  {
+   "gate": "L1",
+   "outcome": "skip_no_model",
+   "meaningful": true,
+   "parity_rows": 0,
+   "worst": null
+  },
+  {
+   "gate": "L2",
+   "outcome": "skip_no_model",
+   "meaningful": true,
+   "parity_rows": 0,
+   "worst": null
+  },
+  {
+   "gate": "L3",
+   "outcome": "skip_no_model",
+   "meaningful": true,
+   "parity_rows": 0,
+   "worst": null
+  },
+  {
+   "gate": "L4",
+   "outcome": "skip_no_model",
+   "meaningful": true,
+   "parity_rows": 0,
+   "worst": null
+  },
+  {
+   "gate": "L5",
+   "outcome": "skip_no_model",
+   "meaningful": true,
+   "parity_rows": 0,
+   "worst": null
+  }
+ ],
+ "all_green": false,
+ "skipped_no_model": true,
+ "receipt": "L0 skip_no_model; L1 skip_no_model; L2 skip_no_model; L3 skip_no_model; L4 skip_no_model; L5 skip_no_model"
+}

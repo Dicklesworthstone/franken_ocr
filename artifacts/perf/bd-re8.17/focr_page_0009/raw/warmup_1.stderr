@@ -1,0 +1,8 @@
+[focr-timing] preprocess 0.03s
+[focr-timing]   vision.sam 5.78s
+[focr-timing]   vision.clip 1.39s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 7.18s
+[focr-timing] weight_cache_build_i8 1.14s
+[focr-timing] prefill_i8 0.49s (277 tokens)
+[focr-timing] decode_i8 1.79s (98 tokens, 0.018s/tok)

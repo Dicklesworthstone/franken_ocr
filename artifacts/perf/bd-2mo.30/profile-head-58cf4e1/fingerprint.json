@@ -1,0 +1,81 @@
+{
+  "schema": "focr-profile-fingerprint/v1",
+  "run_id": "bd-2mo.30-profile-head-58cf4e1",
+  "captured_at_utc": "2026-07-10T02:04:07Z",
+  "git_sha": "58cf4e196e787fff8a2e83b2d5478541c64a3ee4",
+  "git_dirty": true,
+  "dirty_paths": [
+    ".beads/issues.jsonl",
+    ".claude/worktrees/"
+  ],
+  "hardware": {
+    "cpu_model": "Apple M4",
+    "machine_model": "Mac16,10",
+    "architecture": "arm64",
+    "physical_cores": 10,
+    "logical_cores": 10,
+    "ram_bytes": 34359738368,
+    "simd_selected": "scalar-autovec (effective dense IGEMM route; nominal tier reports sdot)",
+    "simd_feature": "aarch64+neon+dotprod hardware capability",
+    "simd_available": ["sdot", "smmla", "scalar"]
+  },
+  "storage": {
+    "device": "/dev/disk3s5",
+    "filesystem": "apfs",
+    "mount": "/System/Volumes/Data",
+    "available_gib": 45,
+    "capacity_used_pct": 90
+  },
+  "os": {
+    "product": "macOS 26.5",
+    "build": "25F71",
+    "kernel": "Darwin 25.5.0"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.96.0-nightly (0c68443b0 2026-03-10)",
+    "llvm": "22.1.0",
+    "rch": "1.0.47 (local-only; 0 healthy workers)",
+    "samply": "/opt/homebrew/bin/samply",
+    "hyperfine": "/opt/homebrew/bin/hyperfine"
+  },
+  "build": {
+    "profile": "release-perf",
+    "opt_level": 3,
+    "lto": "thin",
+    "codegen_units": 1,
+    "debug": "line-tables-only",
+    "strip": false,
+    "rustflags": "-C force-frame-pointers=yes",
+    "binary": "/private/tmp/cc_tgt_dev/release-perf/focr",
+    "binary_sha256": "62287c0d2f0bc1a360e4e3adf9b58dfa1fa60a088bc6bf0728c60c01b4db435f"
+  },
+  "model": {
+    "path": "/Users/jemanuel/.cache/franken_ocr/models/unlimited-ocr.int8.focrq",
+    "sha256": "d8c5fcf223c8e062af63f6b86964d099e2c5a5b272ae096a09433aaf5510a440",
+    "precision": "experimental full-int8 artifact (includes attention and lm_head beyond the frozen default recipe)",
+    "mmap": false,
+    "loader_observation": "At profiled HEAD, OcrModel::load bypassed Weights::load and retained an owned Vec despite the mmap documentation; bd-2mo.30.4 tracks the repair."
+  },
+  "fixtures": [
+    {
+      "regime": "sparse-page",
+      "path": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0009.png",
+      "sha256": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da"
+    },
+    {
+      "regime": "dense-page",
+      "path": "/Volumes/USBNVME16TB/temp_agent_space/franken_ocr_work/pages/page_0014.png",
+      "sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2"
+    }
+  ],
+  "measurement_policy": {
+    "threads": 8,
+    "allocator": "system",
+    "cache": "warm after explicit warmups",
+    "kernel_tuning_applied": false,
+    "os_tuning_applied": false,
+    "host_quiet_required_for_baseline": true,
+    "initial_loadavg": [7.02, 7.67, 5.23],
+    "initial_contention_note": "Build-triggered Spotlight and other foreground work made the initial host ineligible for timing; attribution may proceed, publishable baselines wait for a quiet window."
+  }
+}

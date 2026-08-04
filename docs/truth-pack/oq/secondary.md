@@ -135,6 +135,35 @@ statements). They are **not blocking** the `PM1-census-generator` bead — the c
 `CENSUS.md`. They are marked **DEFERRED** here rather than answered, to avoid fabricating
 content against questions whose authoritative wording I cannot quote.
 
+### OQ-11 — int8 patch-embed conv: UNMEASURED, deferred (vision stays high-precision)
+
+> **Question (now pinned from plan §13, `COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md:888`,
+> and bead `bd-322.17`):** *"Is int8 viable for the patch-embed conv specifically
+> (cleaner stats than mid-network ViT)?"*
+
+**Disposition: UNMEASURED.** No in-repo experiment isolates the patch-embed conv. The
+only quant measurements on record (`docs/NEGATIVE_EVIDENCE.md`) are *decoder* levers —
+int8/int4 attention `q/k/v/o`, KV cache, and `lm_head` (`FOCR_ATTN_GEMM`, `FOCR_INT8_KV`,
+`FOCR_LMHEAD_INT4`, `FOCR_QKV_FUSED`, `FOCR_ATTN_SERIAL`); none quantize any vision
+tensor. The vision tower is validated **f32-only** (`docs/VISION_PARITY_RESULTS.md`:
+full-tower cosine 0.9996, *"quantized kernels are a separate, later comparison"*). There
+is therefore **no measurement** — neither for the whole vision tower nor for the
+patch-embed conv in isolation — that bears on this question.
+
+**Recorded hypothesis (untested):** the patch-embed conv is the *most promising*
+vision-int8 candidate because its activation stats are the cleanest in the tower — it is
+non-overlapping (`k=stride`, so im2col is exact, plan §6.4 `:494`) and sits *before* any
+LayerNorm/GELU, so it never sees the post-LayerNorm/post-GELU outliers that *"wreck
+low-bit activation quant"* mid-network (plan §6.4 `:494`, §10 risk table `:839`). This is
+a hypothesis, **not** a result.
+
+**What would resolve it:** an isolated A/B that quantizes **only** the patch-embed conv
+(per-channel int8 weights + per-token dynamic activation quant) vs the f32 baseline,
+gated on the 20-page **CER** budget, behind a kill-switch — run **after** decoder parity
+is locked (Phase 4+; depends on the PM1-oracle per-layer activation dumps). Until that
+A/B is run, vision stays BF16/F32 by **doctrine #2** (quantize the decoder FFN/experts
+ONLY); OQ-11 remains a **deferred, non-blocking** experiment marker.
+
 ### Why deferred (not blocking)
 
 - The census bead's four deliverables (a–d) are complete and line-backed without

@@ -400,6 +400,54 @@ meaningful with **all** of:
 > CPU reference** on the primary arches (the gating part). Vision-prefill **parity-or-slower in f32 v1
 > is acceptable and recorded honestly** (§1.1 G2). End-to-end-faster is a tracked *stretch*, not a gate.
 
+### 5.2 Evidence is reconstructed, not trusted
+
+A summary number is never the evidence. The producer records enough bounded, hash-bound material for
+`gauntlet_row.py` and `gauntlet_cert.py` to replay the claim independently:
+
+| Contract | Producer obligation | Row / certificate replay |
+|----------|---------------------|--------------------------|
+| **Raw timing** (`focr-gauntlet-raw-timing/v1`) | Emit one record per measured run. The focr side binds the exact meta, stdout, and stderr bytes; the reference side binds each stage sample and the deterministic text SHA-256. Warmups are identified and excluded. | Reconstruct the per-stage sample vectors and recompute `n`, best, median, mean, `cv_pct`, and token-normalized decode time. Any aggregate/raw disagreement, missing run, identity drift, or unhashed raw file refuses the row. |
+| **Physical OCR comparison** (`focr-ocr-comparison/v1`) | Bundle the exact reference text and every measured focr stdout. Record the named transforms, normalization, integer edit distances, denominators, and input bindings. | Re-read the physical bytes, require identical focr output across timed runs and the reference hash on every reference invocation, reapply `identity-v1` / `strip-unlimited-det-spans-v1`, and recompute normalized Levenshtein CER from the authoritative integers. A prose CER claim or JSON receipt without its source bytes is ineligible. |
+| **Trusted subject build** (`focr-source-input-manifest/v1`, `focr-build-receipt/v1`) | Before compilation, capture the clean source closure for the workspace and reachable local path dependencies, including effective Cargo configuration. Bind the exact RCH `--locked --profile release-perf` command, target, toolchain, Rust flags, manifest root, and binary hash/size. | Recompute the source root and require the current closure to match; reject dirty tracked or untracked build inputs, source drift during compilation, a reused output directory, a mismatched binary, or a non-`release-perf` receipt. `gauntlet_focr.sh` executes an evidence-local copy of the receipted binary and checks the source binary, copy, receipt, and model before and after capture. |
+| **Pinned reference inference** (`focr-reference-model-manifest/v1`, `focr-reference-inference-binding/v1`) | Hash the exact 12-file Unlimited-OCR runtime model against the truth pack before and after inference; validate the 2,710-entry index and its single registered shard. Bind the model-root hash, page, entry/setup Python sources, argv, thread pins, backend, precision, package versions, and a newly created evidence-local `HF_MODULES_CACHE`. | Require the canonical manifest and inference binding in the bundled reference timing document, rederive their domain-separated roots, and reject a missing/extra file, changed page/source/model, stale modules cache, unregistered entry, or stack drift. |
+| **Source-to-evidence lineage** (`focr-gauntlet-row/v3`) | Record `source_git_head`, the build manifest's `source_root`, a domain-separated `producer_root` over the exact gauntlet validators/producers/config, and one canonical `allowed_evidence_path` below `artifacts/perf/`. | Recompute both roots from the source commit. The final evidence HEAD must equal the source commit or descend from it; every path touched by every intervening commit must remain inside the one declared evidence subtree. Source, validator, runbook/config, ledger, rename, merge, and source-pack drift fail closed. There is no generic ledger exception. |
+
+The exact reference-model set is: `config.json`, `configuration_deepseek_v2.py`, `conversation.py`,
+`deepencoder.py`, `model-00001-of-000001.safetensors`, `model.safetensors.index.json`,
+`modeling_deepseekv2.py`, `modeling_unlimitedocr.py`, `processor_config.json`,
+`special_tokens_map.json`, `tokenizer.json`, and `tokenizer_config.json`. Their exact sizes and SHA-256s
+are the entries in [`../truth-pack/SOURCE_HASHES.md`](../truth-pack/SOURCE_HASHES.md); a directory that
+merely contains files with those names is not sufficient.
+
+The resulting performance evidence bundle contains the raw timing observations, physical correctness
+inputs, build/source receipts, captured subject identity, reference manifest, and inference binding.
+Certification replays those bundled bytes and does **not** need the external 6.67 GB model directory.
+The model and pinned Python environment remain mandatory to *produce or regenerate* reference evidence;
+the bundle is a verification artifact, not a substitute for rerunning inference.
+
+The v3 producer root is
+`sha256("focr-gauntlet-producer-root/v1\\0" || sorted(path, size, sha256))` over the
+committed timing, reference, roofline, row, certificate, correctness, ledger-check, and runbook inputs
+listed by `PRODUCER_PATHS` in both independent validators. A dirty live producer is refused at row
+generation. At certification, Git ancestry is checked commit by commit so a validator/config edit that
+was later reverted cannot hide in the endpoint tree. An operator who changes `docs/PERF_LEDGER.md` must
+make that change part of a new source commit and recapture; `APPLY=1` is therefore refused by the strict
+runbook rather than treated as an evidence-only change.
+
+`--smoke`, synthetic stub captures, and plumbing self-tests are deliberately stamped
+synthetic/non-citable. They can prove that the harness is wired, but `gauntlet_row.py` refuses them and
+they cannot satisfy a performance, parity, readiness, or release cell.
+
+### 5.3 Residual provenance limits
+
+The ordinary drift model is fail-closed, but two stronger adversarial claims remain out of scope. The
+pre/post snapshots cannot detect a hostile actor that mutates bytes, lets the compiler or interpreter
+consume them, and restores the exact original identity before the post-check. The RCH receipt binds the
+requested command, local source closure, toolchain/configuration, and returned binary, but it is not a
+cryptographic attestation from the remote worker that those exact bytes were the only compilation
+inputs. These limitations must not be described as solved supply-chain attestation.
+
 ---
 
 ## 6. The e-processes (Ville) — anytime-valid monitoring of the load-bearing invariants
@@ -521,11 +569,31 @@ monotone). The certificate's `parity_score` field is the **`truncate_score`'d co
 (a release either meets the bar or is shipped as a clearly-labeled `provisional-release.v1` with the
 specific deviations enumerated).
 
+The certificate is verified from the selected bundle rather than from live external weights or an
+operator's filesystem paths. All cited raw timings, OCR source texts, subject build receipts, and
+reference provenance records must be inside and hash-covered by that bundle. A dirty source/build
+closure cannot produce eligible evidence, and a dirty live worktree cannot certify an otherwise valid
+bundle. The signed certificate binds `evidence_git_head` to the final evidence commit. Generated
+certificate material is allowed only under the git-ignored `.gauntlet-output/` tree; it is never written
+into the tracked `docs/gauntlet/bundle/` snapshot.
+
 > **`franken_ocr`-specific ship gates layered on top** (plan §10 Phase 5, AGENTS.md): no red parity
 > cell and no unledgered divergence; decode-per-token faster than the proven CPU reference on the
 > primary arches; vision-prefill ratio recorded honestly; `--version` carries the Baidu MIT
-> attribution; the 5-target single-binary build green; the robot NDJSON contract test passing against
-> its frozen schema; the `pdf` row remains `excluded` with its re-open condition intact.
+> attribution; all six portable runtime-dispatch distribution jobs green (four
+> Unix/macOS plus native Windows x86-64 and ARM64); both Linux assets linked and
+> `readelf`-audited for a glibc 2.17 floor; both Windows assets installed offline
+> through `install.ps1` with exact-byte and failed-replacement preservation
+> proofs; the robot NDJSON contract test passing against its frozen schema; the
+> `pdf` row remains `excluded` with its re-open condition intact. A tag build is
+> ineligible unless its exact `vX.Y.Z` name matches `Cargo.toml` and its commit is
+> reachable from `origin/main`.
+
+> **Current status is distribution-pending, not certified.** These evidence-integrity contracts do not
+> turn the present tree green. The exact Torch routing candidate now emits EOS on `page0590` and passes
+> the complete local 20-page CER budget; its hard-page CER tail remains explicitly documented. The
+> compatible artifact is still unpublished, and the clean-tree bundle, platform distribution, signing,
+> and remaining readiness cells must pass before any strict release certificate may be issued.
 
 ---
 
@@ -578,6 +646,13 @@ oracle bridge, never linked into `focr`).
 | `partial` rounded up to `present` | Overstated surface parity | `partial` is 0.5 in the Beta evidence but never reported as `present` (§2.1.1) |
 | `excluded` silently omitted | Hidden coverage debt | Every exclusion enumerated with a reason + re-open condition (§2.1.2) |
 | Inheriting frankensearch's `0.055` int8 budget | Wrong tolerance for this model | The int8 budget is **measured for this model**, derived from the oracle's own bf16 floor (§1.3, §1.4) |
+| Trusting aggregate timing JSON | Edited medians/CV can masquerade as measurements | Reconstruct every aggregate from hash-bound `focr-gauntlet-raw-timing/v1` observations (§5.2) |
+| Trusting a CER string or receipt alone | Self-attested correctness without the compared text | Bundle both physical texts and replay the full `focr-ocr-comparison/v1` calculation (§5.2) |
+| Timing an arbitrary target-tree binary | A rebuild can silently change the measured subject | Clean producer receipt plus an evidence-local binary copy with pre/post identity checks (§5.2) |
+| Treating a model directory name as provenance | Different weights or remote code can impersonate the pin | Exact 12-file model manifest + inference-source binding + fresh `HF_MODULES_CACHE` (§5.2) |
+| Certifying a convenient descendant HEAD | Validator/config/source changes can inherit old measurements | Row v3 producer/source roots plus commit-by-commit, one-subtree evidence lineage (§5.2) |
+| Generating certificates into tracked docs | Generated control files dirty or overwrite their own inputs | Generation is confined to ignored `.gauntlet-output/`; the certificate binds the final evidence HEAD (§8) |
+| Citing smoke output | Plumbing success is mistaken for release evidence | Smoke/synthetic records are stamped non-citable and refused by the normal row path (§5.2) |
 
 ---
 

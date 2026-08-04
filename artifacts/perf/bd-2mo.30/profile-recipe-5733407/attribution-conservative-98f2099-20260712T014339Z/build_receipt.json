@@ -1,0 +1,80 @@
+{
+  "binary": {
+    "path": "/Volumes/ExtData/temp_agent_space/focr-perf-98f2099/franken_ocr/artifacts/perf/bd-2mo.30/current-tree-98f2099-20260711T2021Z/build/focr",
+    "sha256": "0e7742752ab87b4c50dc4512632f9e14e6483b0d4c2ee758846b81c3bf76f082",
+    "size": 18907720
+  },
+  "build": {
+    "cargo_target_dir": "/Volumes/ExtData/temp_agent_space/focr-gauntlet-target.ETBxpy",
+    "command": [
+      "rch",
+      "exec",
+      "--",
+      "cargo",
+      "build",
+      "--locked",
+      "--profile",
+      "release-perf",
+      "--bin",
+      "focr",
+      "--target",
+      "aarch64-apple-darwin"
+    ],
+    "runner": "rch"
+  },
+  "build_environment": {
+    "CARGO_BUILD_RUSTFLAGS": null,
+    "CARGO_ENCODED_RUSTFLAGS": null,
+    "CARGO_HOME": null,
+    "RUSTFLAGS": null,
+    "cargo_config_build_rustflags": {
+      "status": "unset",
+      "value": null
+    },
+    "cargo_config_target": {
+      "status": "unset",
+      "value": null
+    },
+    "release_perf_profile_overrides": {},
+    "rustc_overrides": {
+      "RUSTC": null,
+      "RUSTC_WORKSPACE_WRAPPER": null,
+      "RUSTC_WRAPPER": null
+    },
+    "target_rustflags_env_name": "CARGO_TARGET_AARCH64_APPLE_DARWIN_RUSTFLAGS",
+    "target_rustflags_env_value": null
+  },
+  "created_utc": "2026-07-11T20:26:05Z",
+  "git_head": "98f209969820f2b9ba22ce33025e39ae019f80fb",
+  "inputs": {
+    "Cargo.lock": {
+      "sha256": "69edd8a5927404fe1954d5dc0db988dd6369d7269d5e979f1400082ef1be49ef",
+      "size": 92832
+    },
+    "Cargo.toml": {
+      "sha256": "701ae5bc6694733b7262755a5326a5bd9667561edaafdf04c2a89ed068daa71e",
+      "size": 7800
+    },
+    "rust-toolchain.toml": {
+      "sha256": "8406102cabeb1596bf8eb6eacf3d2fe24f7852a5bd584bc22b3f517f33555b67",
+      "size": 237
+    }
+  },
+  "profile": "release-perf",
+  "schema": "focr-build-receipt/v1",
+  "source_manifest": {
+    "entry_count": 22489,
+    "path": "/Volumes/ExtData/temp_agent_space/focr-perf-98f2099/franken_ocr/artifacts/perf/bd-2mo.30/current-tree-98f2099-20260711T2021Z/build/source_input_manifest.json",
+    "root_hash_algorithm": "sha256(domain='focr-source-input-root/v1\\0'; sorted(repository,path); repository\\0path\\0size\\0sha256\\n)",
+    "root_sha256": "05fae0344dd4340784bfc67186e4655d070168165bc96ee6a393f8d6277270b5",
+    "schema": "focr-source-input-manifest/v1",
+    "sha256": "df44fe17ad57239d5894ddfe0fdd015c5740e4234cf984aff058742845e2ed6f",
+    "size": 5482338
+  },
+  "target_triple": "aarch64-apple-darwin",
+  "toolchain": {
+    "cargo_version": "cargo 1.99.0-nightly (59800466c 2026-07-07)",
+    "rch_version": "rch 1.0.47 (commit facb7b2d9df1)",
+    "rustc_verbose_version": "rustc 1.99.0-nightly (14cae6813 2026-07-08)\nbinary: rustc\ncommit-hash: 14cae681329a63c622a6e1fbe1d30f9374bc51d8\ncommit-date: 2026-07-08\nhost: aarch64-apple-darwin\nrelease: 1.99.0-nightly\nLLVM version: 22.1.8\n"
+  }
+}

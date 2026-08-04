@@ -1,0 +1,4 @@
+exhaustive_pairs=16129
+random_pairs=10000
+unicode_alphabet=true
+result=pass

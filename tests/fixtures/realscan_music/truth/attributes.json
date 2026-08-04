@@ -1,0 +1,68 @@
+{
+  "_comment": "TIER-1 TRUTH: human-verified attributes only (clefs, key, time, staff counts, bar-count lower bounds, spot-verified opening notes). Verified by eye from the source scans 2026-07-07 with model-cross-checking for the spot notes (bd-av64.6). Note-exact full-staff ground truth is TIER-2 and lives in goldens/ as clearly-labeled frozen model output (regression anchors), NOT truth.",
+  "staves/spohr_no17_top.png": {
+    "kind": "single_staff",
+    "clef": "G2",
+    "fifths": 0,
+    "time": "3/4",
+    "bars_min": 5,
+    "bars_note": "line-end truncated mid-exercise; 5 complete internal measures verified",
+    "bar1_notes": [
+      "E5:quarter",
+      "C5:quarter",
+      "A5:quarter"
+    ],
+    "bar1_note": "spot-verified by eye AND independently reproduced by the model"
+  },
+  "staves/spohr_no17_sys.png": {
+    "kind": "two_staff_system",
+    "staff_count": 2,
+    "clefs": [
+      "G2",
+      "G2"
+    ],
+    "fifths": 0,
+    "time": "3/4"
+  },
+  "staves/spohr_no21_sys.png": {
+    "kind": "two_staff_system",
+    "staff_count": 2,
+    "clefs": [
+      "G2",
+      "G2"
+    ],
+    "fifths": 0,
+    "time": "3/4",
+    "content_note": "contains DOUBLE-dotted figures - outside the TrOMR duration vocab; attribute-tier only by design",
+    "xfail": [
+      "time"
+    ],
+    "xfail_note": "model misreads 3/4 on this double-dotted system (verified 3/4 by eye); expected to flip with bd-av64.13 voting / model-quality work \u2014 the gate FAILS LOUD if it starts passing so we promote it"
+  },
+  "staves/spohr_p116_sys29.png": {
+    "kind": "two_staff_system",
+    "staff_count": 2,
+    "clefs": [
+      "G2",
+      "G2"
+    ],
+    "fifths": -2,
+    "time_note": "mid-exercise line (bars 29-31), no time signature printed",
+    "content_note": "the WIDE-SYSTEM class (bd-av64.14): virtuosic 16th content, attribute-tier only"
+  },
+  "pages/spohr_p055.png": {
+    "kind": "full_page",
+    "staff_count": 12,
+    "staff_count_note": "5 two-staff systems of No.16 + first system of No.17; verified by eye",
+    "clefs_all": "G2",
+    "min_recognized": 5,
+    "xfail_note": "floor 5 = bd-av64.14 fit-first geometry (was 0). The 2 remaining clamp-bound duet bands CAN be rescued to 7/7 by FOCR_TROMR_SPLIT=1 (bd-av64.4), but splitting is experimental/off-by-default: isolated segments are OOD for the model (continuation octave registration lost, rhythm agreement 0.2 measured 2026-07-07) \u2014 recognition-count rescue only"
+  },
+  "pages/spohr_p100.png": {
+    "kind": "full_page_mixed_prose",
+    "staff_count_detectable": 3,
+    "staff_count_note": "3 full-width example staves embedded in prose (the detector-precision class); several inline snippet staves are legitimately sub-detectable",
+    "min_recognized": 1,
+    "xfail_note": "PROMOTED 2026-07-07: bd-av64.14 fit-first geometry (ink-extent trim + extend-to-fit on over-budget bands) recognizes the prose-embedded staves; was 0 recognized before"
+  }
+}

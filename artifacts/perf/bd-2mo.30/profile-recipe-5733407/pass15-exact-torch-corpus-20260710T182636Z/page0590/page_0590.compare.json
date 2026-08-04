@@ -1,0 +1,85 @@
+{
+  "schema": "focr-ocr-comparison/v1",
+  "created_utc": "2026-07-10T18:26:36.302176Z",
+  "normalization": "collapse-unicode-whitespace-v1",
+  "metric_formulas": {
+    "cer_raw": "raw_edit_distance / max(1, raw_reference_chars)",
+    "cer_norm": "normalized_edit_distance / max(1, normalized_reference_chars)"
+  },
+  "aggregate": {
+    "pages_total": 1,
+    "pages_with_hyp": 1,
+    "exact_raw": 0,
+    "exact_norm": 0,
+    "raw_edit_distance": 11848,
+    "raw_reference_chars": 18813,
+    "normalized_edit_distance": 11598,
+    "normalized_reference_chars": 18813,
+    "reference_source_bytes": 19021,
+    "reference_source_chars": 19019,
+    "hypothesis_source_bytes": 11765,
+    "hypothesis_source_chars": 11763,
+    "cer_raw": 0.6297772816669325,
+    "cer_norm": 0.6164885983096795
+  },
+  "pages": [
+    {
+      "page": "page_0590.md",
+      "status": "OK",
+      "reference": {
+        "source": {
+          "basename": "page_0590.md",
+          "sha256": "6542b1d31b64103e9a56104738bf9038487877e8408b8ac34d8d10d1f5d2c8cd",
+          "bytes": 19021,
+          "chars": 19019,
+          "normalized_sha256": "0f5a0af973b82bd0b008cec706ec7189b30364c33be133e418a51fb809599206",
+          "normalized_bytes": 19021,
+          "normalized_chars": 19019
+        },
+        "transform": {
+          "name": "strip-unlimited-det-spans-v1",
+          "matches": 5
+        },
+        "scored": {
+          "sha256": "a7e0ec1ed0ca4e5ba40e7e9aa5869aacdd6ab19c98f414592d6de367a565dda6",
+          "bytes": 18815,
+          "chars": 18813,
+          "normalized_sha256": "884f2ca9cb767f3ddf27cea65006821d613af925bf69709628dfc5d533081164",
+          "normalized_bytes": 18815,
+          "normalized_chars": 18813
+        }
+      },
+      "hypothesis": {
+        "source": {
+          "basename": "page_0590.md",
+          "sha256": "57d9b5a6686e4c8f877b42390c74b85f77ef789036351cfbd0f373194d10997a",
+          "bytes": 11765,
+          "chars": 11763,
+          "normalized_sha256": "2daabc7c5c185297656d996adef8967bf3552f10a698393f05dbb10f08a7b2fc",
+          "normalized_bytes": 11764,
+          "normalized_chars": 11762
+        },
+        "transform": {
+          "name": "identity-v1",
+          "matches": 0
+        },
+        "scored": {
+          "sha256": "57d9b5a6686e4c8f877b42390c74b85f77ef789036351cfbd0f373194d10997a",
+          "bytes": 11765,
+          "chars": 11763,
+          "normalized_sha256": "2daabc7c5c185297656d996adef8967bf3552f10a698393f05dbb10f08a7b2fc",
+          "normalized_bytes": 11764,
+          "normalized_chars": 11762
+        }
+      },
+      "raw_edit_distance": 11848,
+      "normalized_edit_distance": 11598,
+      "ref_chars": 18813,
+      "hyp_chars": 11763,
+      "cer_raw": 0.6297772816669325,
+      "cer_norm": 0.6164885983096795,
+      "exact": false,
+      "exact_norm": false
+    }
+  ]
+}

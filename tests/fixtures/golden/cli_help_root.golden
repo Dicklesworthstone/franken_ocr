@@ -1,0 +1,19 @@
+Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model
+
+Usage: focr <COMMAND>
+
+Commands:
+  ocr        Parse a document image into structured markdown (or `--json`)
+  ocr-batch  OCR many images in ONE process — load the 6.2 GB weights + build the int8 decoder cache ONCE, then stream a result per image (the throughput path)
+  convert    Offline weight transformation: safetensors → `.focrq` (plan §5)
+  pull       Download the model weights (int8 `.focrq` + tokenizer) into the cache
+  models     List the models this build can run (the "model zoo"): id, tasks, status
+  robot      Agent-facing diagnostics and the machine contract
+  runs       Query durable run history (fsqlite-backed store lands with plan §7.2)
+  sync       Export/import the append-only run audit stream
+  doctor     Idempotent self-check / repair
+  help       Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

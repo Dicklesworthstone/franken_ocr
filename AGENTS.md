@@ -47,7 +47,7 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 It is built on:
 - `/dp/frankentorch` (`ft-kernel-cpu`, `ft-core`, `ft-serialize`) — custom CPU tensor kernels, consumed at the **kernel** level (not the autograd level).
-- `/dp/asupersync` — structured-concurrency runtime, for **orchestration / cancellation / IO only** (not for intra-op math parallelism).
+- `../asupersync` — structured-concurrency runtime, for **orchestration / cancellation / IO only** (not for intra-op math parallelism).
 - `/dp/frankensqlite` (`fsqlite`) — durable local run state + telemetry (NEVER `rusqlite`).
 
 **The single source of truth for what we are building and why is [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md).** Read it before writing any kernel.
@@ -66,7 +66,7 @@ The project must be both:
    - **robot mode** (agent-first, versioned NDJSON, self-describing `robot schema`)
    - human mode (`focr ocr <image>` → markdown, or `--json`)
 
-Input: **document images only in v1** (PNG/JPG/…; PDF is rasterized out-of-band — see plan §7.7). No Python, no FFI, **no network at inference time**, no GPU required.
+Input: **document images** (PNG/JPG/…) **and PDFs**. Scanned / image-XObject PDF pages are rasterized **natively, in-process**, in pure memory-safe Rust (`src/pdf.rs`, no FFI); born-digital *vector/text* pages and the two codecs with no pure-Rust decoder (`JPXDecode`/`JBIG2Decode`) still surface a clear error asking for out-of-band rasterization — see plan §7.7. No Python, no FFI, **no network at inference time**, no GPU required.
 
 ---
 
@@ -145,29 +145,28 @@ We are in early development with **no users**. Do things the **RIGHT** way with 
 
 ```bash
 cargo fmt --check
-cargo check --all-targets
-cargo clippy --all-targets -- -D warnings
-cargo test
-ubs $(git diff --name-only)
+cargo check --locked --all-targets
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+ubs --diff
 ```
 
 If any check fails, fix root causes before handing off.
 
-### The `cargo test` gate (green-bar requirement)
+### The `cargo test --locked` gate (green-bar requirement)
 
-`cargo test` is a **hard gate**: it MUST exit `0` before any change is handed off
-or a bead is closed. There is no Makefile/justfile/CI in the repo yet, so the gate
-is the bare command above plus the convenience wrapper `scripts/check.sh`
-(`scripts/check.sh` runs `cargo fmt --check`, `cargo check --all-targets`,
-`cargo clippy --all-targets -- -D warnings`, and `cargo test` in order and stops
-on the first failure). When CI is added, this same sequence is the required job —
-wire `scripts/check.sh` as the CI test step rather than duplicating the commands.
+`cargo test --locked` is a **hard gate**: it MUST exit `0` before any change is
+handed off or a bead is closed. `scripts/check.sh` is the one-command gate: it
+runs the repository validators and installer E2E before `cargo fmt --check`,
+locked check/clippy/test, and bounded `ubs --diff`, stopping on the first failure.
+CI exists and invokes this same script as its single test step, so the script is
+the source of truth rather than a duplicated workflow command list.
 
 Note on the build surface: both binaries (`focr`, `franken_ocr`) compile from thin
-shims over the shared `cli_main()` in the lib (doctrine #9). `cargo check
---all-targets` MUST be free of the "`src/main.rs` … present in multiple build
+shims over the shared `cli_main()` in the lib (doctrine #9). The
+`cargo check --locked --all-targets` gate MUST be free of the "`src/main.rs` … present in multiple build
 targets" warning — each `[[bin]]` points at its own shim file. (The only warnings
-permitted from `cargo check` are environmental, e.g. the incremental-cache
+permitted from `cargo check --locked` are environmental, e.g. the incremental-cache
 hard-link notice when the target dir lives on a filesystem without hard links.)
 
 ---
@@ -240,12 +239,13 @@ Conventions: use the bead ID (e.g. `br-123`) as the Agent-Mail `thread_id` and p
 
 ## UBS — Ultimate Bug Scanner
 
-`ubs <changed-files>` before every commit. Exit 0 = safe; exit >0 = fix & re-run.
+Run `ubs --diff` over working-tree changes and `ubs --staged` immediately before
+each commit. Exit 0 = safe; exit >0 = fix and re-run.
 
 ```bash
-ubs file.rs file2.rs                    # specific files (< 1s)
-ubs $(git diff --name-only --cached)    # staged files — before commit
-ubs --only=rust,toml src/               # language filter
+ubs --diff                  # modified files relative to HEAD
+ubs --staged                # staged files immediately before commit
+ubs --only=rust .           # restrict a project scan to Rust
 ```
 Parse `file:line:col` → location, 💡 → suggested fix. Fix root cause, not symptom. Critical (always fix): memory safety, UB, data races. Important: unwrap panics, resource leaks, overflow.
 
@@ -253,7 +253,7 @@ Parse `file:line:col` → location, 💡 → suggested fix. Fix root cause, not 
 
 ## RCH — Remote Compilation Helper
 
-RCH offloads `cargo build/test/clippy` to remote workers to avoid local compilation storms. Installed at `~/.local/bin/rch`, hooked into Claude Code's PreToolUse — usually transparent. Manual: `rch exec -- cargo build --release`. Health: `rch doctor`, `rch status`. Fails open (builds run locally if workers unavailable). **Codex/GPT users:** no auto-hook — manually `rch exec -- <cmd>` for heavy builds.
+RCH offloads `cargo build/test/clippy` to remote workers to avoid local compilation storms. Installed at `~/.local/bin/rch`, hooked into Claude Code's PreToolUse — usually transparent. Manual: `rch exec -- cargo build --locked --release`. Health: `rch doctor`, `rch status`. Fails open (builds run locally if workers unavailable). **Codex/GPT users:** no auto-hook — manually `rch exec -- <cmd>` for heavy builds.
 
 ---
 

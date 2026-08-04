@@ -1,0 +1,31 @@
+{
+  "tag": "run_003",
+  "command": [
+    "/private/tmp/cc_tgt_dev/release/focr",
+    "ocr",
+    "tests/fixtures/smolvlm2/sample_photo.png",
+    "--model",
+    "/Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2/smolvlm2.int8.focrq"
+  ],
+  "exit_code": 0,
+  "wall_ms": 19230.888,
+  "stdout": "run_003.stdout",
+  "stderr": "run_003.stderr",
+  "binary": "/private/tmp/cc_tgt_dev/release/focr",
+  "binary_sha256": "ce670b644f987abc1fc258e864a9c49850309cdf66ace98b9f837a84b428fed2",
+  "page": "tests/fixtures/smolvlm2/sample_photo.png",
+  "page_sha256": "c69c42d3ff66849c8e3d45170484f4e133dc00552d5049c7e2b13ee232bed9f6",
+  "model": "/Volumes/USBNVME16TB/temp_agent_space/zoo/smolvlm2/smolvlm2.int8.focrq",
+  "threads": 8,
+  "warmup": 1,
+  "env_pins": {
+    "FOCR_TIMING": "1",
+    "FOCR_THREADS": "8",
+    "OMP_NUM_THREADS": "8",
+    "RAYON_NUM_THREADS": "8"
+  },
+  "focr_env": {
+    "FOCR_THREADS": "8",
+    "FOCR_TIMING": "1"
+  }
+}

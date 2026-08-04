@@ -1,4 +1,6 @@
 //! SAM ViT-B encoder forward ([SPEC-040..046], PROPOSED_ARCHITECTURE.md §6.3).
+//! Vision config provenance: SAM ViT-B width 768 / depth 12 / 12 heads /
+//! global attention at [2,5,8,11], image size 1024 ([SPEC-017]).
 //!
 //! Real fp32 forward. Patch-embed Conv2d k16s16 -> 64x64 tokens (width 768);
 //! learned `pos_embed` (1,64,64,768) bicubic-interpolated to the runtime grid;
@@ -13,9 +15,10 @@
 //! Weights are owned by the parallel weights wave; this module operates over a
 //! [`SamWeights`] parameter bundle so the full math is unit-testable on tiny
 //! synthetic inputs with no model present. The public [`forward`] entrypoint
-//! adapts a loaded [`Weights`] into a [`SamWeights`] once the `.focrq` reader
-//! exposes named tensors (Phase 2, bd-1es.3); until then it surfaces a clear
-//! `NotImplemented` rather than fabricating output.
+//! adapts a loaded [`Weights`] into a [`SamWeights`] through the `.focrq`
+//! reader's named-tensor accessors (bd-1es.3) and runs the real SAM forward.
+
+use rayon::prelude::*;
 
 use super::nn;
 use super::tensor::Mat;
@@ -98,13 +101,20 @@ fn checked_conv_weight_len(
 
 // ── parameter bundles ──────────────────────────────────────────────────────
 
-/// A `nn.Linear` parameter pair (`[out, in]` row-major weight + length-`out`
-/// bias). PyTorch stores `Linear.weight` as `[out_features, in_features]`, so
-/// `y = x @ w^T + b`.
+/// A `nn.Linear` parameter pair, weight pre-transposed to the GEMM-ready
+/// `[in, out]` row-major layout plus a length-`out` bias.
+///
+/// PyTorch stores `Linear.weight` as `[out_features, in_features]`;
+/// [`Self::from_row_major`] transposes it ONCE at construction so `apply` is a
+/// straight matmul — bd-av64.10 measured the old transpose-at-apply-time as
+/// hundreds of MB of pure data movement per vision forward, and TrOMR's AR
+/// loop paid it PER DECODE STEP. Same floats in a different order ⇒ outputs
+/// byte-identical. The weight field is private so a mis-shaped Linear is
+/// unrepresentable outside the validating constructor.
 #[derive(Debug, Clone)]
 pub struct Linear {
-    /// `[out, in]` row-major weight.
-    pub w: Vec<f32>,
+    /// Weight pre-transposed to `[in_, out]` row-major.
+    wt: Mat,
     /// Length-`out` bias (may be empty for `bias=False`).
     pub b: Vec<f32>,
     /// Output features.
@@ -114,8 +124,41 @@ pub struct Linear {
 }
 
 impl Linear {
-    /// `y[m,out] = x[m,in] @ w^T + b`. `x.cols` must equal `self.in_`.
-    fn apply(&self, x: &Mat) -> FocrResult<Mat> {
+    /// Build from a PyTorch `[out, in]` row-major weight, transposing once and
+    /// validating every length at construction (fail-fast, so `apply` never
+    /// discovers a malformed bundle mid-forward).
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] when `w.len() != out*in` or a non-empty bias has
+    /// `b.len() != out`.
+    pub fn from_row_major(w: &[f32], b: Vec<f32>, out: usize, in_: usize) -> FocrResult<Self> {
+        let expected_weight_len = checked_shape_mul("vision_sam linear", out, in_, "out*in")?;
+        if w.len() != expected_weight_len {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam linear: weight len {} != out*in {}",
+                w.len(),
+                expected_weight_len
+            )));
+        }
+        if !b.is_empty() && b.len() != out {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam linear: bias len {} != out_features {}",
+                b.len(),
+                out
+            )));
+        }
+        // w is [out, in]; transpose to [in, out] so matmul([m,in],[in,out]).
+        let wt = Mat::from_vec(in_, out, transpose(w, out, in_));
+        Ok(Self { wt, b, out, in_ })
+    }
+
+    /// `y[m,out] = x[m,in] @ w^T + b`. `x.cols` must equal `self.in_`. Also the
+    /// GOT `mm_projector_vary` connector (a plain Linear(1024→1024)+bias).
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] if `x.cols != self.in_` or the public shape
+    /// metadata was corrupted after construction.
+    pub fn apply(&self, x: &Mat) -> FocrResult<Mat> {
         if x.cols != self.in_ {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "vision_sam linear: input cols {} != expected in_features {}",
@@ -123,13 +166,13 @@ impl Linear {
                 self.in_
             )));
         }
-        let expected_weight_len =
-            checked_shape_mul("vision_sam linear", self.out, self.in_, "out*in")?;
-        if self.w.len() != expected_weight_len {
+        if self.wt.rows != self.in_ || self.wt.cols != self.out {
             return Err(FocrError::Other(anyhow::anyhow!(
-                "vision_sam linear: weight len {} != out*in {}",
-                self.w.len(),
-                expected_weight_len
+                "vision_sam linear: pretransposed weight shape [{}, {}] != [in,out] [{}, {}]",
+                self.wt.rows,
+                self.wt.cols,
+                self.in_,
+                self.out
             )));
         }
         if !self.b.is_empty() && self.b.len() != self.out {
@@ -139,10 +182,7 @@ impl Linear {
                 self.out
             )));
         }
-        // w is [out, in]; transpose to [in, out] so matmul([m,in],[in,out]).
-        let wt = transpose(&self.w, self.out, self.in_);
-        let wt_mat = Mat::from_vec(self.in_, self.out, wt);
-        let mut y = nn::matmul(x, &wt_mat)?;
+        let mut y = nn::matmul(x, &self.wt)?;
         if !self.b.is_empty() {
             for r in 0..y.rows {
                 let row = y.row_mut(r);
@@ -253,10 +293,22 @@ pub struct SamWeights {
 /// (`flatten(2)` layout, OQ-6).
 ///
 /// # Errors
-/// [`FocrError::NotImplemented`] until the `.focrq` reader (Phase 2) exposes
-/// named SAM tensors to build a [`SamWeights`]. The real math lives in
-/// [`forward_with`], which is exercised by the unit tests below.
+/// Propagates accessor errors from building the [`SamWeights`] (e.g. a missing
+/// or mis-shaped `model.sam_model.*` tensor), the input-shape checks above, and
+/// whatever [`forward_with`] returns. The real math lives in [`forward_with`],
+/// which is exercised by the unit tests below.
 pub fn forward(weights: &Weights, image: &Mat) -> FocrResult<Mat> {
+    forward_prefix(weights, image, "model.sam_model")
+}
+
+/// [`forward`] with an explicit `.focrq` tensor-name prefix for the SAM-family
+/// vision tower — Baidu Unlimited-OCR uses `model.sam_model` (the default), GOT-OCR2
+/// uses `model.vision_tower_high`; the leaf tensor names + all geometry are identical.
+///
+/// # Errors
+/// As [`forward`] — the first vision-stage error (missing/mis-shaped tensor or a
+/// kernel failure).
+pub fn forward_prefix(weights: &Weights, image: &Mat, prefix: &str) -> FocrResult<Mat> {
     if image.rows != 3 {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_sam::forward: expected 3 input channels, got {}",
@@ -271,15 +323,27 @@ pub fn forward(weights: &Weights, image: &Mat) -> FocrResult<Mat> {
             image.cols
         )));
     }
-    let w = sam_weights_from(weights)?;
-    forward_with(&w, image, side, side)
+    let th = std::time::Instant::now();
+    let w = sam_weights_from(weights, prefix)?;
+    super::timing_log(&format!(
+        "    sam.hydrate {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    let tf = std::time::Instant::now();
+    let out = forward_with(&w, image, side, side);
+    super::timing_log(&format!(
+        "    sam.forward {:.2}s",
+        tf.elapsed().as_secs_f64()
+    ));
+    out
 }
 
-/// Build a [`SamWeights`] from the named `model.sam_model.*` tensors in
-/// `weights` (BF16→f32 widened at the accessor). Dims are read from each
-/// tensor's shape; rel-pos table sizes are derived from the stored rows.
-fn sam_weights_from(weights: &Weights) -> FocrResult<SamWeights> {
-    let p = "model.sam_model";
+/// Build a [`SamWeights`] from the named `{prefix}.*` tensors in `weights`
+/// (BF16→f32 widened at the accessor). Dims are read from each tensor's shape;
+/// rel-pos table sizes are derived from the stored rows. `pub(crate)` so the
+/// batch spine (bd-1azu.10) hydrates ONCE per batch instead of once per view.
+pub(crate) fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<SamWeights> {
+    let p = prefix;
     let flat = |n: &str| weights.vec(n);
     let conv = |n: &str, bias: bool| -> FocrResult<Conv> {
         let d = tensor_min_rank_shape(weights, n, 2)?;
@@ -341,36 +405,36 @@ fn sam_weights_from(weights: &Weights) -> FocrResult<SamWeights> {
         blocks.push(BlockP {
             norm1: ln(&format!("{b}.norm1"))?,
             attn: AttnP {
-                qkv: Linear {
-                    w: flat(&qkv_name)?,
-                    b: flat(&format!("{b}.attn.qkv.bias"))?,
-                    out: q_out,
-                    in_: q_in,
-                },
-                proj: Linear {
-                    w: flat(&proj_name)?,
-                    b: flat(&format!("{b}.attn.proj.bias"))?,
-                    out: proj_out,
-                    in_: proj_in,
-                },
+                qkv: Linear::from_row_major(
+                    &flat(&qkv_name)?,
+                    flat(&format!("{b}.attn.qkv.bias"))?,
+                    q_out,
+                    q_in,
+                )?,
+                proj: Linear::from_row_major(
+                    &flat(&proj_name)?,
+                    flat(&format!("{b}.attn.proj.bias"))?,
+                    proj_out,
+                    proj_in,
+                )?,
                 rel_pos_h: flat(&rph_name)?,
                 rel_pos_w: flat(&rpw_name)?,
                 size_h: rph_rows.div_ceil(2),
                 size_w: rpw_rows.div_ceil(2),
             },
             norm2: ln(&format!("{b}.norm2"))?,
-            lin1: Linear {
-                w: flat(&lin1_name)?,
-                b: flat(&format!("{b}.mlp.lin1.bias"))?,
-                out: lin1_out,
-                in_: lin1_in,
-            },
-            lin2: Linear {
-                w: flat(&lin2_name)?,
-                b: flat(&format!("{b}.mlp.lin2.bias"))?,
-                out: lin2_out,
-                in_: lin2_in,
-            },
+            lin1: Linear::from_row_major(
+                &flat(&lin1_name)?,
+                flat(&format!("{b}.mlp.lin1.bias"))?,
+                lin1_out,
+                lin1_in,
+            )?,
+            lin2: Linear::from_row_major(
+                &flat(&lin2_name)?,
+                flat(&format!("{b}.mlp.lin2.bias"))?,
+                lin2_out,
+                lin2_in,
+            )?,
             window,
         });
     }
@@ -491,9 +555,14 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
     }
 
     // ── 12 transformer blocks.
+    let tb = std::time::Instant::now();
     for blk in &w.blocks {
         x = block_forward(blk, &x, gh, gw)?;
     }
+    super::timing_log(&format!(
+        "    sam.blocks {:.2}s",
+        tb.elapsed().as_secs_f64()
+    ));
 
     // ── neck: x is [gh*gw, dim] NHWC rows; neck operates NCHW.
     // permute(0,3,1,2): NHWC-rows -> NCHW flat.
@@ -687,11 +756,17 @@ pub fn forward_with_batched(
 fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     let normed = layer_norm_rows(x, &blk.norm1)?;
 
+    let ta = std::time::Instant::now();
     let attn_out = if blk.window > 0 {
         attention_windowed(&blk.attn, &normed, gh, gw, blk.window)?
     } else {
-        attention(&blk.attn, &normed, gh, gw)?
+        attention(&blk.attn, &normed, gh, gw, None)?
     };
+    super::timing_log(&format!(
+        "      sam.block attn({}) {:.3}s",
+        if blk.window > 0 { "win" } else { "GLOBAL" },
+        ta.elapsed().as_secs_f64()
+    ));
     ensure_same_shape("vision_sam block attention residual", &attn_out, x)?;
 
     // residual 1: x = shortcut + attn
@@ -701,10 +776,15 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     }
 
     // residual 2: x = h1 + mlp(norm2(h1))
+    let tm = std::time::Instant::now();
     let normed2 = layer_norm_rows(&h1, &blk.norm2)?;
     let mut mlp = blk.lin1.apply(&normed2)?;
     nn::gelu(&mut mlp);
     let mlp = blk.lin2.apply(&mlp)?;
+    super::timing_log(&format!(
+        "      sam.block mlp {:.3}s",
+        tm.elapsed().as_secs_f64()
+    ));
     ensure_same_shape("vision_sam block mlp residual", &mlp, &h1)?;
     for (a, b) in h1.data.iter_mut().zip(mlp.data.iter()) {
         *a += *b;
@@ -748,7 +828,7 @@ fn block_forward_batched(blk: &BlockP, x: &Mat, gh: usize, gw: usize, v: usize) 
         let av = if blk.window > 0 {
             attention_windowed(&blk.attn, &normed_view, gh, gw, blk.window)?
         } else {
-            attention(&blk.attn, &normed_view, gh, gw)?
+            attention(&blk.attn, &normed_view, gh, gw, None)?
         };
         ensure_mat_shape(
             &av,
@@ -816,14 +896,30 @@ fn attention_windowed(p: &AttnP, normed: &Mat, gh: usize, gw: usize, ws: usize) 
         }
     }
 
-    // Attention per window (each window: ws x ws grid).
+    // Attention per window (each window: ws x ws grid). The rel-pos tables
+    // depend only on the window size — compute them ONCE for all 25 windows
+    // instead of per window (bd-av64.10).
+    let nh = NUM_HEADS;
+    let hd = dim / nh;
+    let rh = get_rel_pos(ws, ws, &p.rel_pos_h, p.size_h, hd);
+    let rw = get_rel_pos(ws, ws, &p.rel_pos_w, p.size_w, hd);
+    // Windows are independent — run them across the pool (bd-av64.10: the
+    // serial loop left ~90% of cores idle because each 196-token window sits
+    // below the inner kernels' own parallel thresholds). Per-window
+    // arithmetic is unchanged and outputs land in disjoint spans, so the
+    // result is bit-identical to the serial loop.
+    let win_span = ws * ws * dim;
     let mut out_windows = vec![0.0f32; windows.len()];
-    for widx in 0..nwin {
-        let base = widx * ws * ws * dim;
-        let win_in = Mat::from_vec(ws * ws, dim, windows[base..base + ws * ws * dim].to_vec());
-        let win_out = attention(p, &win_in, ws, ws)?;
-        out_windows[base..base + ws * ws * dim].copy_from_slice(&win_out.data);
-    }
+    out_windows
+        .par_chunks_mut(win_span)
+        .enumerate()
+        .try_for_each(|(widx, out_chunk)| -> FocrResult<()> {
+            let base = widx * win_span;
+            let win_in = Mat::from_vec(ws * ws, dim, windows[base..base + win_span].to_vec());
+            let win_out = attention(p, &win_in, ws, ws, Some((&rh, &rw)))?;
+            out_chunk.copy_from_slice(&win_out.data);
+            Ok(())
+        })?;
 
     // window_unpartition: scatter back, strip padding.
     let mut merged = vec![0.0f32; gh * gw * dim];
@@ -851,7 +947,13 @@ fn attention_windowed(p: &AttnP, normed: &Mat, gh: usize, gw: usize, ws: usize) 
 /// Multi-head attention over a `gh x gw` token grid `[gh*gw, dim]`, adding the
 /// decomposed rel-pos bias to the logits before softmax. Returns `proj(out)`
 /// shaped `[gh*gw, dim]`.
-fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
+fn attention(
+    p: &AttnP,
+    x: &Mat,
+    gh: usize,
+    gw: usize,
+    relpos: Option<(&[f32], &[f32])>,
+) -> FocrResult<Mat> {
     let n = gh * gw;
     if x.rows != n {
         return Err(FocrError::Other(anyhow::anyhow!(
@@ -903,14 +1005,12 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     for r in 0..n {
         let row = qkv.row(r);
         for head in 0..nh {
-            for d in 0..hd {
-                let qv = row[head * hd + d];
-                let kv = row[(nh + head) * hd + d];
-                let vv = row[(2 * nh + head) * hd + d];
-                q[(head * n + r) * hd + d] = qv;
-                k[(head * n + r) * hd + d] = kv;
-                v[(head * n + r) * hd + d] = vv;
-            }
+            // Each (row, head) segment is hd contiguous floats in both the
+            // source row and the per-head destination — copy, don't loop.
+            let dst = (head * n + r) * hd;
+            q[dst..dst + hd].copy_from_slice(&row[head * hd..(head + 1) * hd]);
+            k[dst..dst + hd].copy_from_slice(&row[(nh + head) * hd..(nh + head + 1) * hd]);
+            v[dst..dst + hd].copy_from_slice(&row[(2 * nh + head) * hd..(2 * nh + head + 1) * hd]);
         }
     }
 
@@ -919,36 +1019,60 @@ fn attention(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     // Rw = get_rel_pos(gw, gw, rel_pos_w) -> [gw, gw, hd]
     // rel_h[head, q, ky] = sum_c q[head,q,c] * Rh[qy, ky, c]
     // rel_w[head, q, kx] = sum_c q[head,q,c] * Rw[qx, kx, c]
-    let rh = get_rel_pos(gh, gh, &p.rel_pos_h, p.size_h, hd);
-    let rw = get_rel_pos(gw, gw, &p.rel_pos_w, p.size_w, hd);
+    //
+    // The tables depend only on (gh, gw) — the windowed path passes them in,
+    // computed once per block instead of once per window (bd-av64.10).
+    let (rh_owned, rw_owned);
+    let (rh, rw): (&[f32], &[f32]) = match relpos {
+        Some((rh, rw)) => (rh, rw),
+        None => {
+            rh_owned = get_rel_pos(gh, gh, &p.rel_pos_h, p.size_h, hd);
+            rw_owned = get_rel_pos(gw, gw, &p.rel_pos_w, p.size_w, hd);
+            (&rh_owned, &rw_owned)
+        }
+    };
 
     // Compute attention head-by-head with explicit logits so we can add bias.
+    // Heads are independent and write disjoint output spans — run them across
+    // the pool (bd-av64.10 pass 2); per-head arithmetic is unchanged, so the
+    // result is bit-identical to the sequential loop. The inner matmuls also
+    // parallelize; rayon's work stealing shares the pool between the levels.
     let mut out = vec![0.0f32; nh * n * hd]; // [nh][n, hd]
-    for head in 0..nh {
-        let qh = &q[head * n * hd..(head + 1) * n * hd];
-        let kh = &k[head * n * hd..(head + 1) * n * hd];
-        let vh = &v[head * n * hd..(head + 1) * n * hd];
-        let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, &rh, &rw, gh, gw, hd);
+    out.par_chunks_mut(n * hd)
+        .enumerate()
+        .try_for_each(|(head, out_chunk)| -> FocrResult<()> {
+            let qh = &q[head * n * hd..(head + 1) * n * hd];
+            let kh = &k[head * n * hd..(head + 1) * n * hd];
+            let vh = &v[head * n * hd..(head + 1) * n * hd];
+            let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, rh, rw, gh, gw, hd);
 
-        // logits = scale * (Q @ K^T) + decomposed rel-pos bias.
-        let qh_mat = Mat::from_vec(n, hd, qh.to_vec());
-        let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
-        let mut lm = nn::matmul(&qh_mat, &kt_mat)?;
-        for i in 0..n {
-            for j in 0..n {
-                let ky = j / gw;
-                let kx = j % gw;
-                let bh = rel_h_bias[i * gh + ky];
-                let bw = rel_w_bias[i * gw + kx];
-                lm.data[i * n + j] = scale * lm.data[i * n + j] + bh + bw;
+            // logits = scale * (Q @ K^T) + decomposed rel-pos bias.
+            let qh_mat = Mat::from_vec(n, hd, qh.to_vec());
+            let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
+            let mut lm = nn::matmul(&qh_mat, &kt_mat)?;
+            // Bias add, row-structured: j = ky*gw + kx, so walk (ky, kx) directly
+            // instead of dividing per element — bit-identical arithmetic in the
+            // same order, but branch/div-free and autovectorizable (bd-av64.10:
+            // the naive j/gw + j%gw form burned ~200M integer divisions per
+            // global block).
+            for i in 0..n {
+                let lrow = &mut lm.data[i * n..(i + 1) * n];
+                let brow_w = &rel_w_bias[i * gw..(i + 1) * gw];
+                for ky in 0..gh {
+                    let bh = rel_h_bias[i * gh + ky];
+                    let seg = &mut lrow[ky * gw..(ky + 1) * gw];
+                    for (l, &bw) in seg.iter_mut().zip(brow_w) {
+                        *l = scale * *l + bh + bw;
+                    }
+                }
             }
-        }
-        // softmax rows then weighted sum of v.
-        nn::softmax_rows(&mut lm)?;
-        let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
-        let head_out = nn::matmul(&lm, &vh_mat)?;
-        out[head * n * hd..(head + 1) * n * hd].copy_from_slice(&head_out.data);
-    }
+            // softmax rows then weighted sum of v.
+            nn::softmax_rows(&mut lm)?;
+            let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
+            let head_out = nn::matmul(&lm, &vh_mat)?;
+            out_chunk.copy_from_slice(&head_out.data);
+            Ok(())
+        })?;
 
     // Reassemble [n, dim] from [nh][n, hd] (head-major -> token rows).
     let mut ctx = vec![0.0f32; n * dim];
@@ -1190,10 +1314,15 @@ fn layer_norm_2d(
 }
 
 // ── conv + layout helpers ──────────────────────────────────────────────────
+// `pub(crate)` where noted: these are the A8 shared vision conv leaves
+// (bd-3jo6.1.8) — the SigLIP patch-embed (vision_siglip.rs) drives the SAME
+// im2col+GEMM conv path SAM/GOT certify, exactly like GOT reuses
+// `forward_prefix`/`Linear` (B3's precedent: share by import, never relocate
+// certified code).
 
 /// Apply a [`Conv`] over an NCHW-flat `[in_ch, gh*gw]` buffer with symmetric
 /// zero padding `pad` and stride `stride`, returning the NCHW-flat output.
-fn conv_apply(
+pub(crate) fn conv_apply(
     conv: &Conv,
     input: &[f32],
     gh: usize,
@@ -1327,7 +1456,7 @@ fn pad_nchw(input: &[f32], ch: usize, gh: usize, gw: usize, pad: usize) -> FocrR
 
 /// `[1, ch, gh, gw]` channel-major conv output -> NHWC token rows
 /// `[gh*gw, ch]`.
-fn nchw_to_nhwc_rows(nchw: &[f32], ch: usize, gh: usize, gw: usize) -> Mat {
+pub(crate) fn nchw_to_nhwc_rows(nchw: &[f32], ch: usize, gh: usize, gw: usize) -> Mat {
     let n = gh * gw;
     let mut data = vec![0.0f32; n * ch];
     for s in 0..n {
@@ -1580,7 +1709,7 @@ mod tests {
         )
         .unwrap();
         let weights = Weights::from_bytes(b.build()).unwrap();
-        assert_err_contains(sam_weights_from(&weights), "rank 1");
+        assert_err_contains(sam_weights_from(&weights, "model.sam_model"), "rank 1");
     }
 
     #[test]
@@ -1596,7 +1725,7 @@ mod tests {
         )
         .unwrap();
         let weights = Weights::from_bytes(b.build()).unwrap();
-        assert_err_contains(sam_weights_from(&weights), "rank 1");
+        assert_err_contains(sam_weights_from(&weights, "model.sam_model"), "rank 1");
     }
 
     #[test]
@@ -1619,7 +1748,7 @@ mod tests {
         )
         .unwrap();
         let weights = Weights::from_bytes(b.build()).unwrap();
-        assert_err_contains(sam_weights_from(&weights), "rank 1");
+        assert_err_contains(sam_weights_from(&weights, "model.sam_model"), "rank 1");
     }
 
     #[test]
@@ -1630,15 +1759,14 @@ mod tests {
         assert_eq!(transpose(&t, 3, 2), m);
     }
 
+    fn test_linear(w: Vec<f32>, b: Vec<f32>, out: usize, in_: usize) -> Linear {
+        Linear::from_row_major(&w, b, out, in_).expect("test linear shape is valid")
+    }
+
     #[test]
     fn linear_applies_weight_and_bias() -> FocrResult<()> {
         // w = [[1,2,3],[4,5,6]] (out=2,in=3), b=[10,20]
-        let lin = Linear {
-            w: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            b: vec![10.0, 20.0],
-            out: 2,
-            in_: 3,
-        };
+        let lin = test_linear(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![10.0, 20.0], 2, 3);
         // x = [[1,1,1]] -> y = [1+2+3+10, 4+5+6+20] = [16, 35]
         let x = Mat::from_vec(1, 3, vec![1.0, 1.0, 1.0]);
         let y = lin.apply(&x)?;
@@ -1650,38 +1778,17 @@ mod tests {
 
     #[test]
     fn linear_rejects_malformed_shapes_without_panic() {
-        let x = Mat::from_vec(1, 3, vec![1.0, 2.0, 3.0]);
         assert_err_contains(
-            Linear {
-                w: vec![1.0; 5],
-                b: vec![],
-                out: 2,
-                in_: 3,
-            }
-            .apply(&x),
+            Linear::from_row_major(&[1.0; 5], vec![], 2, 3),
             "weight len",
         );
         assert_err_contains(
-            Linear {
-                w: vec![1.0; 6],
-                b: vec![0.0],
-                out: 2,
-                in_: 3,
-            }
-            .apply(&x),
+            Linear::from_row_major(&[1.0; 6], vec![0.0], 2, 3),
             "bias len",
         );
         let bad_x = Mat::from_vec(1, 2, vec![1.0, 2.0]);
-        assert_err_contains(
-            Linear {
-                w: vec![1.0; 6],
-                b: vec![],
-                out: 2,
-                in_: 3,
-            }
-            .apply(&bad_x),
-            "input cols",
-        );
+        let lin = test_linear(vec![1.0; 6], vec![], 2, 3);
+        assert_err_contains(lin.apply(&bad_x), "input cols");
     }
 
     #[test]
@@ -1973,18 +2080,8 @@ mod tests {
                 b: vec![0.0; dim],
             },
             attn: AttnP {
-                qkv: Linear {
-                    w: identity_block_3(dim),
-                    b: vec![0.0; 3 * dim],
-                    out: 3 * dim,
-                    in_: dim,
-                },
-                proj: Linear {
-                    w: identity_mat(dim),
-                    b: vec![0.0; dim],
-                    out: dim,
-                    in_: dim,
-                },
+                qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+                proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
                 rel_pos_h: vec![0.0; rel_rows * hd],
                 rel_pos_w: vec![0.0; rel_rows * hd],
                 size_h: size,
@@ -1994,18 +2091,13 @@ mod tests {
                 w: vec![1.0; dim],
                 b: vec![0.0; dim],
             },
-            lin1: Linear {
-                w: vec![0.0; MLP_HIDDEN * dim],
-                b: vec![0.0; MLP_HIDDEN],
-                out: MLP_HIDDEN,
-                in_: dim,
-            },
-            lin2: Linear {
-                w: vec![0.0; dim * MLP_HIDDEN],
-                b: vec![0.0; dim],
-                out: dim,
-                in_: MLP_HIDDEN,
-            },
+            lin1: test_linear(
+                vec![0.0; MLP_HIDDEN * dim],
+                vec![0.0; MLP_HIDDEN],
+                MLP_HIDDEN,
+                dim,
+            ),
+            lin2: test_linear(vec![0.0; dim * MLP_HIDDEN], vec![0.0; dim], dim, MLP_HIDDEN),
             window,
         }
     }
@@ -2109,18 +2201,8 @@ mod tests {
         let n = grid * grid;
         let rel_rows = 2 * grid - 1;
         let attn = AttnP {
-            qkv: Linear {
-                w: identity_block_3(dim),
-                b: vec![0.0; 3 * dim],
-                out: 3 * dim,
-                in_: dim,
-            },
-            proj: Linear {
-                w: identity_mat(dim),
-                b: vec![0.0; dim],
-                out: dim,
-                in_: dim,
-            },
+            qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+            proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
             rel_pos_h: (0..rel_rows * hd)
                 .map(|i| ((i % 13) as f32 - 6.0) * 0.0011)
                 .collect(),
@@ -2137,7 +2219,7 @@ mod tests {
                 .map(|i| ((i % 29) as f32 - 14.0) * 0.003)
                 .collect(),
         );
-        let got = attention(&attn, &x, grid, grid)?;
+        let got = attention(&attn, &x, grid, grid, None)?;
         let expected = attention_scalar_reference(&attn, &x, grid, grid)?;
         let max_abs = got
             .data
@@ -2154,17 +2236,21 @@ mod tests {
         let dim = EMBED_DIM;
         let x = Mat::from_vec(4, dim, vec![0.0; 4 * dim]);
 
+        // Each Linear is VALID in isolation (the constructor enforces that);
+        // its out is simply incompatible with the attention dim, which is
+        // exactly what attention's own shape guards must reject.
         let mut bad_qkv = tiny_block(0).attn;
-        bad_qkv.qkv.out = 3 * dim - 1;
-        bad_qkv.qkv.w = vec![0.0; bad_qkv.qkv.out * bad_qkv.qkv.in_];
-        bad_qkv.qkv.b = vec![0.0; bad_qkv.qkv.out];
-        assert_err_contains(attention(&bad_qkv, &x, 2, 2), "qkv shape");
+        bad_qkv.qkv = test_linear(
+            vec![0.0; (3 * dim - 1) * dim],
+            vec![0.0; 3 * dim - 1],
+            3 * dim - 1,
+            dim,
+        );
+        assert_err_contains(attention(&bad_qkv, &x, 2, 2, None), "qkv shape");
 
         let mut bad_proj = tiny_block(0).attn;
-        bad_proj.proj.out = dim - 1;
-        bad_proj.proj.w = vec![0.0; bad_proj.proj.out * bad_proj.proj.in_];
-        bad_proj.proj.b = vec![0.0; bad_proj.proj.out];
-        assert_err_contains(attention(&bad_proj, &x, 2, 2), "proj shape");
+        bad_proj.proj = test_linear(vec![0.0; (dim - 1) * dim], vec![0.0; dim - 1], dim - 1, dim);
+        assert_err_contains(attention(&bad_proj, &x, 2, 2, None), "proj shape");
     }
 
     #[test]
@@ -2202,9 +2288,17 @@ mod tests {
     #[test]
     fn block_forward_rejects_mlp_residual_shape_mismatch() {
         let mut blk = tiny_block(0);
-        blk.lin2.out = EMBED_DIM - 1;
-        blk.lin2.w = vec![0.0; blk.lin2.out * blk.lin2.in_];
-        blk.lin2.b = vec![0.0; blk.lin2.out];
+        // A VALID Linear (the constructor validates lengths) whose out is one
+        // short of EMBED_DIM, so the mlp output genuinely mismatches h1 and the
+        // residual shape guard fires. Mutating only the pub `out`/`b` fields
+        // would leave the private pre-transposed weight at the old width and
+        // panic in the bias add instead of erroring.
+        blk.lin2 = test_linear(
+            vec![0.0; (EMBED_DIM - 1) * MLP_HIDDEN],
+            vec![0.0; EMBED_DIM - 1],
+            EMBED_DIM - 1,
+            MLP_HIDDEN,
+        );
         let n = 4;
         let dim = EMBED_DIM;
         let data: Vec<f32> = (0..n * dim).map(|i| (i as f32 % 5.0) * 0.01).collect();
@@ -2225,18 +2319,8 @@ mod tests {
         let size = 2;
         let rel_rows = 2 * size - 1;
         let attn = AttnP {
-            qkv: Linear {
-                w: identity_block_3(dim),
-                b: vec![0.0; 3 * dim],
-                out: 3 * dim,
-                in_: dim,
-            },
-            proj: Linear {
-                w: identity_mat(dim),
-                b: vec![0.0; dim],
-                out: dim,
-                in_: dim,
-            },
+            qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+            proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
             rel_pos_h: vec![0.0; rel_rows * hd],
             rel_pos_w: vec![0.0; rel_rows * hd],
             size_h: size,
@@ -2244,7 +2328,7 @@ mod tests {
         };
         // all 4 tokens identical = ones
         let x = Mat::from_vec(4, dim, vec![1.0; 4 * dim]);
-        let out = attention(&attn, &x, 2, 2)?;
+        let out = attention(&attn, &x, 2, 2, None)?;
         assert_eq!(out.shape(), (4, dim));
         // uniform average of identical value vectors -> 1.0 everywhere
         for &v in &out.data {
@@ -2262,18 +2346,8 @@ mod tests {
         let n = grid * grid;
         let rel_rows = 2 * grid - 1;
         let attn = AttnP {
-            qkv: Linear {
-                w: identity_block_3(dim),
-                b: vec![0.0; 3 * dim],
-                out: 3 * dim,
-                in_: dim,
-            },
-            proj: Linear {
-                w: identity_mat(dim),
-                b: vec![0.0; dim],
-                out: dim,
-                in_: dim,
-            },
+            qkv: test_linear(identity_block_3(dim), vec![0.0; 3 * dim], 3 * dim, dim),
+            proj: test_linear(identity_mat(dim), vec![0.0; dim], dim, dim),
             rel_pos_h: (0..rel_rows * hd)
                 .map(|i| ((i % 17) as f32 - 8.0) * 0.0007)
                 .collect(),
@@ -2296,12 +2370,12 @@ mod tests {
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(3)
             .max(1);
-        let warm = attention(&attn, &x, grid, grid)?;
+        let warm = attention(&attn, &x, grid, grid, None)?;
         let warm_checksum: f32 = warm.data.iter().step_by(97).copied().sum();
         let start = Instant::now();
         let mut checksum = 0.0f32;
         for _ in 0..runs {
-            let out = attention(&attn, &x, grid, grid)?;
+            let out = attention(&attn, &x, grid, grid, None)?;
             checksum += out.data.iter().step_by(97).copied().sum::<f32>();
         }
         let elapsed = start.elapsed();
@@ -2363,18 +2437,13 @@ mod tests {
                         b: vec![0.0; dim],
                     },
                     attn: AttnP {
-                        qkv: Linear {
-                            w: vec![0.0; 3 * dim * dim],
-                            b: vec![0.0; 3 * dim],
-                            out: 3 * dim,
-                            in_: dim,
-                        },
-                        proj: Linear {
-                            w: vec![0.0; dim * dim],
-                            b: vec![0.0; dim],
-                            out: dim,
-                            in_: dim,
-                        },
+                        qkv: test_linear(
+                            vec![0.0; 3 * dim * dim],
+                            vec![0.0; 3 * dim],
+                            3 * dim,
+                            dim,
+                        ),
+                        proj: test_linear(vec![0.0; dim * dim], vec![0.0; dim], dim, dim),
                         rel_pos_h: vec![0.0; rel_rows * hd],
                         rel_pos_w: vec![0.0; rel_rows * hd],
                         size_h: size,
@@ -2384,18 +2453,13 @@ mod tests {
                         w: vec![1.0; dim],
                         b: vec![0.0; dim],
                     },
-                    lin1: Linear {
-                        w: vec![0.0; MLP_HIDDEN * dim],
-                        b: vec![0.0; MLP_HIDDEN],
-                        out: MLP_HIDDEN,
-                        in_: dim,
-                    },
-                    lin2: Linear {
-                        w: vec![0.0; dim * MLP_HIDDEN],
-                        b: vec![0.0; dim],
-                        out: dim,
-                        in_: MLP_HIDDEN,
-                    },
+                    lin1: test_linear(
+                        vec![0.0; MLP_HIDDEN * dim],
+                        vec![0.0; MLP_HIDDEN],
+                        MLP_HIDDEN,
+                        dim,
+                    ),
+                    lin2: test_linear(vec![0.0; dim * MLP_HIDDEN], vec![0.0; dim], dim, MLP_HIDDEN),
                     window,
                 }
             })
@@ -2514,18 +2578,13 @@ mod tests {
                         b: vec![0.0; dim],
                     },
                     attn: AttnP {
-                        qkv: Linear {
-                            w: vec![0.0; 3 * dim * dim],
-                            b: vec![0.0; 3 * dim],
-                            out: 3 * dim,
-                            in_: dim,
-                        },
-                        proj: Linear {
-                            w: vec![0.0; dim * dim],
-                            b: vec![0.0; dim],
-                            out: dim,
-                            in_: dim,
-                        },
+                        qkv: test_linear(
+                            vec![0.0; 3 * dim * dim],
+                            vec![0.0; 3 * dim],
+                            3 * dim,
+                            dim,
+                        ),
+                        proj: test_linear(vec![0.0; dim * dim], vec![0.0; dim], dim, dim),
                         rel_pos_h: vec![0.0; rel_rows * hd],
                         rel_pos_w: vec![0.0; rel_rows * hd],
                         size_h: size,
@@ -2535,18 +2594,13 @@ mod tests {
                         w: vec![1.0; dim],
                         b: vec![0.0; dim],
                     },
-                    lin1: Linear {
-                        w: vec![0.0; MLP_HIDDEN * dim],
-                        b: vec![0.0; MLP_HIDDEN],
-                        out: MLP_HIDDEN,
-                        in_: dim,
-                    },
-                    lin2: Linear {
-                        w: vec![0.0; dim * MLP_HIDDEN],
-                        b: vec![0.0; dim],
-                        out: dim,
-                        in_: MLP_HIDDEN,
-                    },
+                    lin1: test_linear(
+                        vec![0.0; MLP_HIDDEN * dim],
+                        vec![0.0; MLP_HIDDEN],
+                        MLP_HIDDEN,
+                        dim,
+                    ),
+                    lin2: test_linear(vec![0.0; dim * MLP_HIDDEN], vec![0.0; dim], dim, MLP_HIDDEN),
                     window,
                 }
             })
@@ -2620,12 +2674,12 @@ mod tests {
         (x as f32) / 1000.0 - 0.5
     }
     fn rand_lin(out: usize, inn: usize, salt: usize) -> Linear {
-        Linear {
-            w: (0..out * inn).map(|i| det(i, salt)).collect(),
-            b: (0..out).map(|i| det(i, salt + 1)).collect(),
+        test_linear(
+            (0..out * inn).map(|i| det(i, salt)).collect(),
+            (0..out).map(|i| det(i, salt + 1)).collect(),
             out,
-            in_: inn,
-        }
+            inn,
+        )
     }
     fn rand_ln(dim: usize, salt: usize) -> LayerNormP {
         LayerNormP {

@@ -5,7 +5,7 @@
 //! ISA dispatch that selects the fastest one for the host CPU, with a portable
 //! scalar oracle as the always-present floor. The public surface is exactly the
 //! two GEMM entrypoints re-exported below ([`igemm_s8s8`] / [`igemm_u8s8`]) plus
-//! the capability-reflection helpers for `focr robot backends`.
+//! the hardware-capability and effective-route helpers for `focr robot backends`.
 //!
 //! ## Layout
 //!
@@ -47,6 +47,7 @@
 
 pub mod dispatch;
 pub mod int4;
+pub mod pack;
 pub mod scalar;
 
 // Arch-specific intrinsic modules. Each is compiled only on its native arch so
@@ -68,7 +69,9 @@ pub mod x86;
 // never name a tier.
 
 pub use dispatch::{
-    Caps, IsaTier, available_tiers, caps, detected_tier, igemm_s8s8, igemm_u8s8, tier_string,
+    Caps, EffectiveI8Route, IsaTier, SelftestCase, SelftestReport, available_tiers, caps,
+    detected_tier, effective_dense_route, igemm_s8s8, igemm_s8s8_packed_b, igemm_u8s8, selftest,
+    tier_string,
 };
 
 #[cfg(test)]
@@ -126,6 +129,7 @@ mod tests {
         let c = super::caps();
         assert!(!c.available.is_empty());
         assert!(!super::tier_string().is_empty());
+        assert!(!super::effective_dense_route().tag().is_empty());
         assert!(c.available.contains(&super::detected_tier()));
     }
 }

@@ -1,0 +1,5 @@
+label=batch20-after
+utc=2026-07-12T23:31:41Z
+host=sensedemobox
+uname=Linux sensedemobox 6.17.0-35-generic #35-Ubuntu SMP PREEMPT_DYNAMIC Tue May 26 13:10:28 UTC 2026 x86_64 GNU/Linux
+proc_loadavg=5.87 5.94 5.81 2/1827 2974677

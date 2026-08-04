@@ -1,0 +1,766 @@
+[focr-timing] preprocess 0.09s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.64s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.239s
+[focr-timing]       sam.block attn(win) 0.096s
+[focr-timing]       sam.block mlp 0.252s
+[focr-timing]       sam.block attn(GLOBAL) 0.692s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(win) 0.094s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(win) 0.086s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(GLOBAL) 0.702s
+[focr-timing]       sam.block mlp 0.235s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(win) 0.090s
+[focr-timing]       sam.block mlp 0.235s
+[focr-timing]       sam.block attn(GLOBAL) 0.690s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.093s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(GLOBAL) 0.696s
+[focr-timing]       sam.block mlp 0.236s
+[focr-timing]     sam.blocks 6.55s
+[focr-timing]   vision.sam 6.81s
+[focr-timing]     clip.hydrate(cached) 1.39s
+[focr-timing]     clip.blocks 0.79s
+[focr-timing]   vision.clip 2.19s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 9.65s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 5.57s
+[focr-timing] prefill 4.19s (277 tokens)
+[focr-timing] decode 1.48s (32 tokens, 0.046s/tok)
+[focr-timing] decode phases (ms): lm_head 434  attn 372  experts 600  route 60
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0009.png (25.13s)
+[focr-timing] preprocess 0.08s
+[focr-timing]       sam.block attn(win) 0.119s
+[focr-timing]       sam.block mlp 0.256s
+[focr-timing]       sam.block attn(win) 0.128s
+[focr-timing]       sam.block mlp 0.278s
+[focr-timing]       sam.block attn(GLOBAL) 0.672s
+[focr-timing]       sam.block mlp 0.237s
+[focr-timing]       sam.block attn(win) 0.109s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(GLOBAL) 0.677s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.094s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(win) 0.093s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(GLOBAL) 0.685s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.097s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.092s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(GLOBAL) 0.687s
+[focr-timing]       sam.block mlp 0.234s
+[focr-timing]     sam.blocks 6.62s
+[focr-timing]   vision.sam 6.82s
+[focr-timing]     clip.blocks 0.80s
+[focr-timing]   vision.clip 0.80s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 7.62s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 5.43s (277 tokens)
+[focr-timing] decode 1.85s (32 tokens, 0.058s/tok)
+[focr-timing] decode phases (ms): lm_head 475  attn 407  experts 900  route 58
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png (16.35s)
+[focr-timing] preprocess 0.07s
+[focr-timing]       sam.block attn(win) 0.126s
+[focr-timing]       sam.block mlp 0.259s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.264s
+[focr-timing]       sam.block attn(GLOBAL) 0.692s
+[focr-timing]       sam.block mlp 0.255s
+[focr-timing]       sam.block attn(win) 0.112s
+[focr-timing]       sam.block mlp 0.254s
+[focr-timing]       sam.block attn(win) 0.103s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(GLOBAL) 0.689s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.112s
+[focr-timing]       sam.block mlp 0.260s
+[focr-timing]       sam.block attn(win) 0.105s
+[focr-timing]       sam.block mlp 0.248s
+[focr-timing]       sam.block attn(GLOBAL) 0.701s
+[focr-timing]       sam.block mlp 0.251s
+[focr-timing]       sam.block attn(win) 0.110s
+[focr-timing]       sam.block mlp 0.263s
+[focr-timing]       sam.block attn(win) 0.102s
+[focr-timing]       sam.block mlp 0.248s
+[focr-timing]       sam.block attn(GLOBAL) 0.692s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]     sam.blocks 6.88s
+[focr-timing]   vision.sam 7.09s
+[focr-timing]     clip.blocks 1.70s
+[focr-timing]   vision.clip 1.70s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 8.81s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 5.32s (277 tokens)
+[focr-timing] decode 1.85s (32 tokens, 0.058s/tok)
+[focr-timing] decode phases (ms): lm_head 444  attn 443  experts 898  route 59
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0019.png (17.01s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.124s
+[focr-timing]       sam.block mlp 0.253s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(GLOBAL) 0.730s
+[focr-timing]       sam.block mlp 0.258s
+[focr-timing]       sam.block attn(win) 0.109s
+[focr-timing]       sam.block mlp 0.263s
+[focr-timing]       sam.block attn(win) 0.103s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(GLOBAL) 0.690s
+[focr-timing]       sam.block mlp 0.258s
+[focr-timing]       sam.block attn(win) 0.111s
+[focr-timing]       sam.block mlp 0.262s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.249s
+[focr-timing]       sam.block attn(GLOBAL) 0.702s
+[focr-timing]       sam.block mlp 0.253s
+[focr-timing]       sam.block attn(win) 0.110s
+[focr-timing]       sam.block mlp 0.260s
+[focr-timing]       sam.block attn(win) 0.107s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(GLOBAL) 0.704s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]     sam.blocks 6.94s
+[focr-timing]   vision.sam 7.15s
+[focr-timing]     clip.blocks 1.62s
+[focr-timing]   vision.clip 1.62s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 8.79s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 6.48s (277 tokens)
+[focr-timing] decode 1.70s (32 tokens, 0.053s/tok)
+[focr-timing] decode phases (ms): lm_head 446  attn 395  experts 795  route 58
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0023.png (18.00s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.126s
+[focr-timing]       sam.block mlp 0.254s
+[focr-timing]       sam.block attn(win) 0.105s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(GLOBAL) 0.708s
+[focr-timing]       sam.block mlp 0.248s
+[focr-timing]       sam.block attn(win) 0.121s
+[focr-timing]       sam.block mlp 0.277s
+[focr-timing]       sam.block attn(win) 0.103s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(GLOBAL) 0.692s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(win) 0.112s
+[focr-timing]       sam.block mlp 0.263s
+[focr-timing]       sam.block attn(win) 0.111s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(GLOBAL) 0.689s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.113s
+[focr-timing]       sam.block mlp 0.261s
+[focr-timing]       sam.block attn(win) 0.108s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(GLOBAL) 0.699s
+[focr-timing]       sam.block mlp 0.249s
+[focr-timing]     sam.blocks 6.94s
+[focr-timing]   vision.sam 7.20s
+[focr-timing]     clip.blocks 1.60s
+[focr-timing]   vision.clip 1.61s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 8.82s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.51s (277 tokens)
+[focr-timing] decode 1.48s (32 tokens, 0.046s/tok)
+[focr-timing] decode phases (ms): lm_head 431  attn 364  experts 614  route 59
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0086.png (15.92s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.113s
+[focr-timing]       sam.block mlp 0.251s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.702s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.110s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(win) 0.094s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(GLOBAL) 0.718s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(win) 0.098s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(GLOBAL) 0.699s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.090s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(GLOBAL) 0.682s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]     sam.blocks 6.65s
+[focr-timing]   vision.sam 6.88s
+[focr-timing]     clip.blocks 1.13s
+[focr-timing]   vision.clip 1.14s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 8.03s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 6.10s (277 tokens)
+[focr-timing] decode 1.49s (32 tokens, 0.047s/tok)
+[focr-timing] decode phases (ms): lm_head 428  attn 348  experts 645  route 59
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0091.png (16.65s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.122s
+[focr-timing]       sam.block mlp 0.251s
+[focr-timing]       sam.block attn(win) 0.100s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.704s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(win) 0.112s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(win) 0.100s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(GLOBAL) 0.686s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(win) 0.109s
+[focr-timing]       sam.block mlp 0.256s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.692s
+[focr-timing]       sam.block mlp 0.260s
+[focr-timing]       sam.block attn(win) 0.108s
+[focr-timing]       sam.block mlp 0.256s
+[focr-timing]       sam.block attn(win) 0.102s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(GLOBAL) 0.704s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]     sam.blocks 6.84s
+[focr-timing]   vision.sam 7.03s
+[focr-timing]     clip.blocks 0.92s
+[focr-timing]   vision.clip 0.92s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 7.98s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 5.74s (277 tokens)
+[focr-timing] decode 1.64s (32 tokens, 0.051s/tok)
+[focr-timing] decode phases (ms): lm_head 427  attn 367  experts 774  route 62
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0105.png (16.50s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.128s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.097s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.719s
+[focr-timing]       sam.block mlp 0.275s
+[focr-timing]       sam.block attn(win) 0.117s
+[focr-timing]       sam.block mlp 0.256s
+[focr-timing]       sam.block attn(win) 0.115s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.692s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(win) 0.111s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(GLOBAL) 0.687s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(win) 0.111s
+[focr-timing]       sam.block mlp 0.256s
+[focr-timing]       sam.block attn(win) 0.107s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(GLOBAL) 0.698s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]     sam.blocks 6.87s
+[focr-timing]   vision.sam 7.10s
+[focr-timing]     clip.blocks 1.25s
+[focr-timing]   vision.clip 1.25s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 8.36s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.23s (277 tokens)
+[focr-timing] decode 1.44s (32 tokens, 0.045s/tok)
+[focr-timing] decode phases (ms): lm_head 435  attn 342  experts 595  route 57
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0107.png (15.14s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.111s
+[focr-timing]       sam.block mlp 0.237s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(GLOBAL) 0.713s
+[focr-timing]       sam.block mlp 0.227s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.235s
+[focr-timing]       sam.block attn(win) 0.086s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(GLOBAL) 0.685s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.106s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.084s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(GLOBAL) 0.695s
+[focr-timing]       sam.block mlp 0.229s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.234s
+[focr-timing]       sam.block attn(win) 0.084s
+[focr-timing]       sam.block mlp 0.254s
+[focr-timing]       sam.block attn(GLOBAL) 0.682s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]     sam.blocks 6.59s
+[focr-timing]   vision.sam 6.86s
+[focr-timing]     clip.blocks 0.80s
+[focr-timing]   vision.clip 0.80s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 7.67s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 6.03s (277 tokens)
+[focr-timing] decode 1.79s (32 tokens, 0.056s/tok)
+[focr-timing] decode phases (ms): lm_head 507  attn 384  experts 831  route 59
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0108.png (16.48s)
+[focr-timing] preprocess 0.07s
+[focr-timing]       sam.block attn(win) 0.124s
+[focr-timing]       sam.block mlp 0.249s
+[focr-timing]       sam.block attn(win) 0.094s
+[focr-timing]       sam.block mlp 0.235s
+[focr-timing]       sam.block attn(GLOBAL) 0.726s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(win) 0.109s
+[focr-timing]       sam.block mlp 0.252s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(GLOBAL) 0.695s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(win) 0.118s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.258s
+[focr-timing]       sam.block attn(GLOBAL) 0.697s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(win) 0.122s
+[focr-timing]       sam.block mlp 0.249s
+[focr-timing]       sam.block attn(win) 0.100s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(GLOBAL) 0.678s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]     sam.blocks 6.86s
+[focr-timing]   vision.sam 7.08s
+[focr-timing]     clip.blocks 1.18s
+[focr-timing]   vision.clip 1.18s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 8.28s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.26s (277 tokens)
+[focr-timing] decode 1.50s (32 tokens, 0.047s/tok)
+[focr-timing] decode phases (ms): lm_head 435  attn 350  experts 649  route 57
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0126.png (15.18s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.112s
+[focr-timing]       sam.block mlp 0.238s
+[focr-timing]       sam.block attn(win) 0.093s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(GLOBAL) 0.714s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.113s
+[focr-timing]       sam.block mlp 0.236s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(GLOBAL) 0.690s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.236s
+[focr-timing]       sam.block attn(win) 0.087s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(GLOBAL) 0.696s
+[focr-timing]       sam.block mlp 0.240s
+[focr-timing]       sam.block attn(win) 0.110s
+[focr-timing]       sam.block mlp 0.234s
+[focr-timing]       sam.block attn(win) 0.095s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.689s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]     sam.blocks 6.64s
+[focr-timing]   vision.sam 6.86s
+[focr-timing]     clip.blocks 0.77s
+[focr-timing]   vision.clip 0.78s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 7.64s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.17s (277 tokens)
+[focr-timing] decode 1.49s (32 tokens, 0.046s/tok)
+[focr-timing] decode phases (ms): lm_head 431  attn 346  experts 643  route 57
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0136.png (14.30s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.109s
+[focr-timing]       sam.block mlp 0.237s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(GLOBAL) 0.713s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(win) 0.105s
+[focr-timing]       sam.block mlp 0.235s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.260s
+[focr-timing]       sam.block attn(GLOBAL) 0.703s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(win) 0.102s
+[focr-timing]       sam.block mlp 0.234s
+[focr-timing]       sam.block attn(win) 0.087s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.697s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.087s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(GLOBAL) 0.711s
+[focr-timing]       sam.block mlp 0.242s
+[focr-timing]     sam.blocks 6.68s
+[focr-timing]   vision.sam 6.88s
+[focr-timing]     clip.blocks 0.77s
+[focr-timing]   vision.clip 0.77s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 7.65s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 6.03s (277 tokens)
+[focr-timing] decode 1.66s (32 tokens, 0.052s/tok)
+[focr-timing] decode phases (ms): lm_head 443  attn 368  experts 782  route 57
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0179.png (16.38s)
+[focr-timing] preprocess 0.07s
+[focr-timing]       sam.block attn(win) 0.121s
+[focr-timing]       sam.block mlp 0.241s
+[focr-timing]       sam.block attn(win) 0.095s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(GLOBAL) 0.718s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(win) 0.102s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.100s
+[focr-timing]       sam.block mlp 0.259s
+[focr-timing]       sam.block attn(GLOBAL) 0.697s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.115s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.261s
+[focr-timing]       sam.block attn(GLOBAL) 0.691s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.116s
+[focr-timing]       sam.block mlp 0.250s
+[focr-timing]       sam.block attn(win) 0.098s
+[focr-timing]       sam.block mlp 0.261s
+[focr-timing]       sam.block attn(GLOBAL) 0.708s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]     sam.blocks 6.86s
+[focr-timing]   vision.sam 7.08s
+[focr-timing]     clip.blocks 0.90s
+[focr-timing]   vision.clip 0.91s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 8.01s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.30s (277 tokens)
+[focr-timing] decode 1.50s (32 tokens, 0.047s/tok)
+[focr-timing] decode phases (ms): lm_head 433  attn 349  experts 652  route 57
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0250.png (14.84s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.108s
+[focr-timing]       sam.block mlp 0.238s
+[focr-timing]       sam.block attn(win) 0.093s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(GLOBAL) 0.706s
+[focr-timing]       sam.block mlp 0.231s
+[focr-timing]       sam.block attn(win) 0.108s
+[focr-timing]       sam.block mlp 0.237s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(GLOBAL) 0.684s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(win) 0.103s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.085s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(GLOBAL) 0.689s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.234s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]       sam.block attn(GLOBAL) 0.698s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]     sam.blocks 6.59s
+[focr-timing]   vision.sam 6.83s
+[focr-timing]     clip.blocks 0.81s
+[focr-timing]   vision.clip 0.81s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 7.65s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.90s (277 tokens)
+[focr-timing] decode 1.79s (32 tokens, 0.056s/tok)
+[focr-timing] decode phases (ms): lm_head 486  attn 424  experts 807  route 64
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0358.png (15.40s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.121s
+[focr-timing]       sam.block mlp 0.260s
+[focr-timing]       sam.block attn(win) 0.093s
+[focr-timing]       sam.block mlp 0.227s
+[focr-timing]       sam.block attn(GLOBAL) 0.731s
+[focr-timing]       sam.block mlp 0.248s
+[focr-timing]       sam.block attn(win) 0.105s
+[focr-timing]       sam.block mlp 0.253s
+[focr-timing]       sam.block attn(win) 0.097s
+[focr-timing]       sam.block mlp 0.254s
+[focr-timing]       sam.block attn(GLOBAL) 0.698s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(win) 0.117s
+[focr-timing]       sam.block mlp 0.267s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.255s
+[focr-timing]       sam.block attn(GLOBAL) 0.677s
+[focr-timing]       sam.block mlp 0.251s
+[focr-timing]       sam.block attn(win) 0.117s
+[focr-timing]       sam.block mlp 0.263s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.255s
+[focr-timing]       sam.block attn(GLOBAL) 0.681s
+[focr-timing]       sam.block mlp 0.263s
+[focr-timing]     sam.blocks 6.90s
+[focr-timing]   vision.sam 7.16s
+[focr-timing]     clip.blocks 0.97s
+[focr-timing]   vision.clip 0.97s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 8.14s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 6.17s (277 tokens)
+[focr-timing] decode 1.65s (32 tokens, 0.052s/tok)
+[focr-timing] decode phases (ms): lm_head 511  attn 390  experts 678  route 61
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0400.png (17.04s)
+[focr-timing] preprocess 0.07s
+[focr-timing]       sam.block attn(win) 0.126s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(win) 0.098s
+[focr-timing]       sam.block mlp 0.234s
+[focr-timing]       sam.block attn(GLOBAL) 0.743s
+[focr-timing]       sam.block mlp 0.239s
+[focr-timing]       sam.block attn(win) 0.104s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.258s
+[focr-timing]       sam.block attn(GLOBAL) 0.705s
+[focr-timing]       sam.block mlp 0.242s
+[focr-timing]       sam.block attn(win) 0.122s
+[focr-timing]       sam.block mlp 0.259s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(GLOBAL) 0.709s
+[focr-timing]       sam.block mlp 0.253s
+[focr-timing]       sam.block attn(win) 0.118s
+[focr-timing]       sam.block mlp 0.245s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.266s
+[focr-timing]       sam.block attn(GLOBAL) 0.703s
+[focr-timing]       sam.block mlp 0.252s
+[focr-timing]     sam.blocks 6.93s
+[focr-timing]   vision.sam 7.14s
+[focr-timing]     clip.blocks 0.96s
+[focr-timing]   vision.clip 0.96s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 8.12s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.42s (277 tokens)
+[focr-timing] decode 1.68s (32 tokens, 0.053s/tok)
+[focr-timing] decode phases (ms): lm_head 578  attn 416  experts 608  route 72
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0437.png (15.27s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.114s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(GLOBAL) 0.742s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(win) 0.112s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.255s
+[focr-timing]       sam.block attn(GLOBAL) 0.693s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.105s
+[focr-timing]       sam.block mlp 0.229s
+[focr-timing]       sam.block attn(win) 0.088s
+[focr-timing]       sam.block mlp 0.240s
+[focr-timing]       sam.block attn(GLOBAL) 0.670s
+[focr-timing]       sam.block mlp 0.228s
+[focr-timing]       sam.block attn(win) 0.108s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.090s
+[focr-timing]       sam.block mlp 0.239s
+[focr-timing]       sam.block attn(GLOBAL) 0.662s
+[focr-timing]       sam.block mlp 0.226s
+[focr-timing]     sam.blocks 6.64s
+[focr-timing]   vision.sam 6.84s
+[focr-timing]     clip.blocks 0.82s
+[focr-timing]   vision.clip 0.82s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 7.67s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 5.98s (277 tokens)
+[focr-timing] decode 1.51s (32 tokens, 0.047s/tok)
+[focr-timing] decode phases (ms): lm_head 452  attn 357  experts 627  route 64
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0547.png (16.23s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.120s
+[focr-timing]       sam.block mlp 0.252s
+[focr-timing]       sam.block attn(win) 0.097s
+[focr-timing]       sam.block mlp 0.230s
+[focr-timing]       sam.block attn(GLOBAL) 0.717s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.248s
+[focr-timing]       sam.block attn(win) 0.097s
+[focr-timing]       sam.block mlp 0.256s
+[focr-timing]       sam.block attn(GLOBAL) 0.695s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(win) 0.114s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(win) 0.097s
+[focr-timing]       sam.block mlp 0.257s
+[focr-timing]       sam.block attn(GLOBAL) 0.695s
+[focr-timing]       sam.block mlp 0.242s
+[focr-timing]       sam.block attn(win) 0.114s
+[focr-timing]       sam.block mlp 0.248s
+[focr-timing]       sam.block attn(win) 0.097s
+[focr-timing]       sam.block mlp 0.254s
+[focr-timing]       sam.block attn(GLOBAL) 0.690s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]     sam.blocks 6.81s
+[focr-timing]   vision.sam 7.02s
+[focr-timing]     clip.blocks 0.78s
+[focr-timing]   vision.clip 0.78s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 7.81s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 4.15s (277 tokens)
+[focr-timing] decode 1.41s (32 tokens, 0.044s/tok)
+[focr-timing] decode phases (ms): lm_head 422  attn 355  experts 562  route 59
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0557.png (14.39s)
+[focr-timing] preprocess 0.07s
+[focr-timing]       sam.block attn(win) 0.106s
+[focr-timing]       sam.block mlp 0.255s
+[focr-timing]       sam.block attn(win) 0.092s
+[focr-timing]       sam.block mlp 0.234s
+[focr-timing]       sam.block attn(GLOBAL) 0.710s
+[focr-timing]       sam.block mlp 0.251s
+[focr-timing]       sam.block attn(win) 0.107s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.099s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(GLOBAL) 0.693s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(win) 0.105s
+[focr-timing]       sam.block mlp 0.233s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.263s
+[focr-timing]       sam.block attn(GLOBAL) 0.685s
+[focr-timing]       sam.block mlp 0.249s
+[focr-timing]       sam.block attn(win) 0.106s
+[focr-timing]       sam.block mlp 0.235s
+[focr-timing]       sam.block attn(win) 0.089s
+[focr-timing]       sam.block mlp 0.248s
+[focr-timing]       sam.block attn(GLOBAL) 0.706s
+[focr-timing]       sam.block mlp 0.232s
+[focr-timing]     sam.blocks 6.75s
+[focr-timing]   vision.sam 6.97s
+[focr-timing]     clip.blocks 0.81s
+[focr-timing]   vision.clip 0.81s
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] vision_tower 7.79s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 5.84s (277 tokens)
+[focr-timing] decode 1.53s (32 tokens, 0.048s/tok)
+[focr-timing] decode phases (ms): lm_head 450  attn 361  experts 646  route 59
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0590.png (16.20s)
+[focr-timing] preprocess 0.06s
+[focr-timing]       sam.block attn(win) 0.120s
+[focr-timing]       sam.block mlp 0.239s
+[focr-timing]       sam.block attn(win) 0.095s
+[focr-timing]       sam.block mlp 0.229s
+[focr-timing]       sam.block attn(GLOBAL) 0.716s
+[focr-timing]       sam.block mlp 0.242s
+[focr-timing]       sam.block attn(win) 0.101s
+[focr-timing]       sam.block mlp 0.246s
+[focr-timing]       sam.block attn(win) 0.108s
+[focr-timing]       sam.block mlp 0.256s
+[focr-timing]       sam.block attn(GLOBAL) 0.695s
+[focr-timing]       sam.block mlp 0.243s
+[focr-timing]       sam.block attn(win) 0.114s
+[focr-timing]       sam.block mlp 0.249s
+[focr-timing]       sam.block attn(win) 0.098s
+[focr-timing]       sam.block mlp 0.259s
+[focr-timing]       sam.block attn(GLOBAL) 0.684s
+[focr-timing]       sam.block mlp 0.258s
+[focr-timing]       sam.block attn(win) 0.116s
+[focr-timing]       sam.block mlp 0.247s
+[focr-timing]       sam.block attn(win) 0.105s
+[focr-timing]       sam.block mlp 0.255s
+[focr-timing]       sam.block attn(GLOBAL) 0.696s
+[focr-timing]       sam.block mlp 0.244s
+[focr-timing]     sam.blocks 6.82s
+[focr-timing]   vision.sam 7.04s
+[focr-timing]     clip.blocks 0.81s
+[focr-timing]   vision.clip 0.82s
+[focr-timing]   vision.bridge 0.02s
+[focr-timing] vision_tower 7.87s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 5.81s (277 tokens)
+[focr-timing] decode 1.71s (32 tokens, 0.053s/tok)
+[focr-timing] decode phases (ms): lm_head 447  attn 365  experts 830  route 60
+[focr] /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0645.png (16.44s)
+[focr] batch complete: 20 images in 328.86s (16.44s/image, decode_mode=conservative_recipe)
+	Command being timed: "/home/ubuntu/focr-perf-25cecb9-batch20-20260712T2227Z/subject/release-perf/focr ocr-batch /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0009.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0014.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0019.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0023.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0086.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0091.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0105.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0107.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0108.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0126.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0136.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0179.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0250.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0358.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0400.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0437.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0547.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0557.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0590.png /home/ubuntu/focr-perf-fixtures-5733407-20260712/pages/page_0645.png --model /home/ubuntu/focr-perf-fixtures-5733407-20260712/model.focrq"
+	User time (seconds): 1361.91
+	System time (seconds): 368.20
+	Percent of CPU this job got: 523%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 5:30.33
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 10441328
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 85052552
+	Voluntary context switches: 1450385
+	Involuntary context switches: 65806
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 216
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

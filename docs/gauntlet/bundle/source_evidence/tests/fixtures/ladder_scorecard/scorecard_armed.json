@@ -1,0 +1,74 @@
+{
+ "schema": "focr-ladder-scorecard/v1",
+ "gates": [
+  {
+   "gate": "L0",
+   "outcome": "pass",
+   "meaningful": true,
+   "parity_rows": 2,
+   "worst": {
+    "metric": "max_abs_diff",
+    "value": 0.007843196392059326,
+    "tolerance": 0.06274509803921569
+   }
+  },
+  {
+   "gate": "L1",
+   "outcome": "pass",
+   "meaningful": true,
+   "parity_rows": 6,
+   "worst": {
+    "metric": "cosine",
+    "value": 0.999999999999554,
+    "tolerance": 0.9999
+   }
+  },
+  {
+   "gate": "L2",
+   "outcome": "pass",
+   "meaningful": true,
+   "parity_rows": 4,
+   "worst": {
+    "metric": "max_abs_diff",
+    "value": 8.761882781982422e-05,
+    "tolerance": 0.0
+   }
+  },
+  {
+   "gate": "L3",
+   "outcome": "pass",
+   "meaningful": true,
+   "parity_rows": 2,
+   "worst": {
+    "metric": "cosine",
+    "value": 0.9999999999987671,
+    "tolerance": 0.9999
+   }
+  },
+  {
+   "gate": "L4",
+   "outcome": "pass",
+   "meaningful": true,
+   "parity_rows": 2,
+   "worst": {
+    "metric": "token_exact_fraction",
+    "value": 1.0,
+    "tolerance": 1.0
+   }
+  },
+  {
+   "gate": "L5",
+   "outcome": "pass",
+   "meaningful": true,
+   "parity_rows": 4,
+   "worst": {
+    "metric": "cer",
+    "value": 0.0,
+    "tolerance": 0.01
+   }
+  }
+ ],
+ "all_green": true,
+ "skipped_no_model": false,
+ "receipt": "L0 max_abs_diff=0.0078432; L1 cosine=1; L2 max_abs_diff=8.76188e-05; L3 cosine=1; L4 token_exact_fraction=1; L5 cer=0"
+}
