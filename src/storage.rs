@@ -151,7 +151,13 @@ impl RunStore {
         &self.path
     }
 
-    /// Drive one fsqlite future to completion on the store's own runtime.
+    /// Drive one fsqlite future to completion on the store's own runtime,
+    /// on the CALLING thread (fsqlite futures are not `Send`).
+    ///
+    /// Stack note: fsqlite 0.2's VDBE recursion needs more than the 2 MiB
+    /// default of secondary threads. The CLI calls the store from the main
+    /// thread (8 MiB default); any other caller must provide a generously
+    /// sized stack (see `tests::on_big_stack`).
     fn drive<F: std::future::Future>(&self, fut: F) -> F::Output {
         self.runtime.block_on(fut)
     }
@@ -241,23 +247,25 @@ impl RunStore {
     /// # Errors
     /// An fsqlite failure.
     pub fn insert_run(&self, r: &RunRecord) -> FocrResult<()> {
-        self.drive(self.conn.execute_with_params(
-            "INSERT OR REPLACE INTO runs (run_id, started_at, finished_at, input_path, \
+        self.drive(
+            self.conn.execute_with_params(
+                "INSERT OR REPLACE INTO runs (run_id, started_at, finished_at, input_path, \
              mode, quant, model_version_tag, exit_code, status) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            &[
-                SqliteValue::Text(r.run_id.as_str().into()),
-                SqliteValue::Integer(r.started_at),
-                r.finished_at
-                    .map_or(SqliteValue::Null, SqliteValue::Integer),
-                SqliteValue::Text(r.input_path.as_str().into()),
-                SqliteValue::Text(r.mode.as_str().into()),
-                SqliteValue::Text(r.quant.as_str().into()),
-                SqliteValue::Text(r.model_version_tag.as_str().into()),
-                SqliteValue::Integer(r.exit_code),
-                SqliteValue::Text(r.status.as_str().into()),
-            ],
-        ))
+                &[
+                    SqliteValue::Text(r.run_id.as_str().into()),
+                    SqliteValue::Integer(r.started_at),
+                    r.finished_at
+                        .map_or(SqliteValue::Null, SqliteValue::Integer),
+                    SqliteValue::Text(r.input_path.as_str().into()),
+                    SqliteValue::Text(r.mode.as_str().into()),
+                    SqliteValue::Text(r.quant.as_str().into()),
+                    SqliteValue::Text(r.model_version_tag.as_str().into()),
+                    SqliteValue::Integer(r.exit_code),
+                    SqliteValue::Text(r.status.as_str().into()),
+                ],
+            ),
+        )
         .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite insert run: {e}")))?;
         Ok(())
     }
@@ -478,6 +486,19 @@ pub fn import_jsonl(store: &RunStore, input: &Path) -> FocrResult<usize> {
 mod tests {
     use super::*;
 
+    /// Run a test body on a thread with a generous stack: fsqlite 0.2's VDBE
+    /// recursion overflows the 2 MiB default of Rust test threads (the CLI
+    /// itself always drives the store from the 8 MiB main thread).
+    fn on_big_stack(body: impl FnOnce() + Send + 'static) {
+        std::thread::Builder::new()
+            .name("focr-store-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(body)
+            .expect("spawn big-stack test thread")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
+    }
+
     fn scratch_store(name: &str) -> (RunStore, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "focr-runstore-{name}-{}",
@@ -504,52 +525,62 @@ mod tests {
 
     #[test]
     fn meta_schema_created_and_versioned() {
-        let (store, _dir) = scratch_store("meta");
-        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
-        // Reopen: no re-init, version stable.
-        let path = store.path().to_path_buf();
-        drop(store);
-        let again = RunStore::open(&path).expect("reopen migrates/no-ops");
-        assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
+        on_big_stack(|| {
+            let (store, _dir) = scratch_store("meta");
+            assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+            // Reopen: no re-init, version stable.
+            let path = store.path().to_path_buf();
+            drop(store);
+            let again = RunStore::open(&path).expect("reopen migrates/no-ops");
+            assert_eq!(again.schema_version().unwrap(), SCHEMA_VERSION);
+        });
     }
 
     #[test]
     fn too_new_store_refused_with_format_mismatch() {
-        let (store, _dir) = scratch_store("toonew");
-        let path = store.path().to_path_buf();
-        store
-            .sql(&format!(
-                "UPDATE _meta SET schema_version = {}",
-                SCHEMA_VERSION + 1
-            ))
-            .unwrap();
-        drop(store);
-        let err = RunStore::open(&path).expect_err("newer store must refuse");
-        assert!(matches!(err, FocrError::FormatMismatch(_)), "{err:?}");
-        assert_eq!(err.exit_code(), 7, "FormatMismatch is exit 7");
+        on_big_stack(|| {
+            let (store, _dir) = scratch_store("toonew");
+            let path = store.path().to_path_buf();
+            store
+                .sql(&format!(
+                    "UPDATE _meta SET schema_version = {}",
+                    SCHEMA_VERSION + 1
+                ))
+                .unwrap();
+            drop(store);
+            let err = RunStore::open(&path).expect_err("newer store must refuse");
+            assert!(matches!(err, FocrError::FormatMismatch(_)), "{err:?}");
+            assert_eq!(err.exit_code(), 7, "FormatMismatch is exit 7");
+        });
     }
 
     #[test]
     fn run_insert_and_query_by_id_and_limit() {
-        let (store, _dir) = scratch_store("query");
-        for n in 0..5u8 {
-            store.insert_run(&sample(n)).unwrap();
-        }
-        // By id.
-        let one = store.query(Some(&sample(3).run_id), 20).unwrap();
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0], sample(3));
-        // Recent-first with limit.
-        let recent = store.query(None, 2).unwrap();
-        assert_eq!(recent.len(), 2);
-        assert_eq!(recent[0], sample(4), "most recent first");
-        assert_eq!(recent[1], sample(3));
-        // Unknown id = empty, not an error.
-        assert!(store.query(Some("nope"), 20).unwrap().is_empty());
+        on_big_stack(|| {
+            let (store, _dir) = scratch_store("query");
+            for n in 0..5u8 {
+                store.insert_run(&sample(n)).unwrap();
+            }
+            // By id.
+            let one = store.query(Some(&sample(3).run_id), 20).unwrap();
+            assert_eq!(one.len(), 1);
+            assert_eq!(one[0], sample(3));
+            // Recent-first with limit.
+            let recent = store.query(None, 2).unwrap();
+            assert_eq!(recent.len(), 2);
+            assert_eq!(recent[0], sample(4), "most recent first");
+            assert_eq!(recent[1], sample(3));
+            // Unknown id = empty, not an error.
+            assert!(store.query(Some("nope"), 20).unwrap().is_empty());
+        });
     }
 
     #[test]
     fn sync_jsonl_roundtrip_and_atomicity() {
+        on_big_stack(sync_jsonl_roundtrip_and_atomicity_body);
+    }
+
+    fn sync_jsonl_roundtrip_and_atomicity_body() {
         let (store, dir) = scratch_store("sync");
         for n in [3u8, 0, 4, 1, 2] {
             store.insert_run(&sample(n)).unwrap();
@@ -589,14 +620,16 @@ mod tests {
 
     #[test]
     fn malformed_import_fails_loud_with_line_number() {
-        let (store, dir) = scratch_store("badline");
-        let bad = dir.join("bad.jsonl");
-        std::fs::write(&bad, "{\"run_id\": 42}\n").unwrap();
-        let err = import_jsonl(&store, &bad).expect_err("malformed line");
-        assert!(matches!(err, FocrError::FormatMismatch(_)), "{err:?}");
-        assert!(
-            format!("{err}").contains(":1:"),
-            "carries the line number: {err}"
-        );
+        on_big_stack(|| {
+            let (store, dir) = scratch_store("badline");
+            let bad = dir.join("bad.jsonl");
+            std::fs::write(&bad, "{\"run_id\": 42}\n").unwrap();
+            let err = import_jsonl(&store, &bad).expect_err("malformed line");
+            assert!(matches!(err, FocrError::FormatMismatch(_)), "{err:?}");
+            assert!(
+                format!("{err}").contains(":1:"),
+                "carries the line number: {err}"
+            );
+        });
     }
 }
