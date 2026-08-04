@@ -22,6 +22,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use asupersync::runtime::{Runtime, RuntimeBuilder};
 use fsqlite::{Connection, SqliteValue};
 
 use crate::error::{FocrError, FocrResult};
@@ -58,7 +59,14 @@ pub struct RunRecord {
 }
 
 /// The open store.
+///
+/// fsqlite 0.2 exposes an async surface; the store keeps its public SYNC
+/// facade (plain sequential CLI I/O per the doctrine note above) by owning a
+/// tiny dedicated asupersync runtime and driving every fsqlite future to
+/// completion via `block_on`. The runtime is NEVER exposed: no store method
+/// may be called from async context (the engine's runtime is separate).
 pub struct RunStore {
+    runtime: Runtime,
     conn: Connection,
     path: PathBuf,
 }
@@ -118,9 +126,19 @@ impl RunStore {
                 FocrError::Other(anyhow::anyhow!("create {}: {e}", parent.display()))
             })?;
         }
-        let conn = Connection::open(path.display().to_string())
+        let runtime = RuntimeBuilder::new()
+            .worker_threads(1)
+            .blocking_threads(1, 2)
+            .thread_name_prefix("focr-store")
+            .build()
+            .map_err(|e| {
+                FocrError::Other(anyhow::anyhow!("asupersync runtime build (run store): {e}"))
+            })?;
+        let conn = runtime
+            .block_on(Connection::open(path.display().to_string()))
             .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite open: {e}")))?;
         let store = Self {
+            runtime,
             conn,
             path: path.to_path_buf(),
         };
@@ -134,16 +152,22 @@ impl RunStore {
         &self.path
     }
 
+    /// Drive one fsqlite future to completion on the store's own runtime.
+    fn drive<F: std::future::Future>(&self, fut: F) -> F::Output {
+        self.runtime.block_on(fut)
+    }
+
     fn sql(&self, sql: &str) -> FocrResult<usize> {
-        self.conn
-            .execute(sql)
+        self.drive(self.conn.execute(sql))
             .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite execute: {e}: {sql}")))
     }
 
     fn init_or_migrate(&self) -> FocrResult<()> {
         let has_meta = !self
-            .conn
-            .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_meta'")
+            .drive(
+                self.conn
+                    .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_meta'"),
+            )
             .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query: {e}")))?
             .is_empty();
         if !has_meta {
@@ -166,18 +190,17 @@ impl RunStore {
                      exit_code INTEGER NOT NULL,\n\
                      status TEXT NOT NULL)",
             )?;
-            self.conn
-                .execute_with_params(
-                    "INSERT INTO _meta (schema_version, created_at, franken_ocr_version, \
-                     model_version_tag) VALUES (?, ?, ?, ?)",
-                    &[
-                        SqliteValue::Integer(SCHEMA_VERSION),
-                        SqliteValue::Integer(now_millis()),
-                        SqliteValue::Text(env!("CARGO_PKG_VERSION").into()),
-                        SqliteValue::Text("unknown".into()),
-                    ],
-                )
-                .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite insert _meta: {e}")))?;
+            self.drive(self.conn.execute_with_params(
+                "INSERT INTO _meta (schema_version, created_at, franken_ocr_version, \
+                 model_version_tag) VALUES (?, ?, ?, ?)",
+                &[
+                    SqliteValue::Integer(SCHEMA_VERSION),
+                    SqliteValue::Integer(now_millis()),
+                    SqliteValue::Text(env!("CARGO_PKG_VERSION").into()),
+                    SqliteValue::Text("unknown".into()),
+                ],
+            ))
+            .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite insert _meta: {e}")))?;
             return Ok(());
         }
         let version = self.schema_version()?;
@@ -207,8 +230,7 @@ impl RunStore {
     /// An fsqlite failure or a malformed `_meta`.
     pub fn schema_version(&self) -> FocrResult<i64> {
         let rows = self
-            .conn
-            .query("SELECT schema_version FROM _meta")
+            .drive(self.conn.query("SELECT schema_version FROM _meta"))
             .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query _meta: {e}")))?;
         rows.first()
             .and_then(|r| r.get(0).map(int))
@@ -220,25 +242,24 @@ impl RunStore {
     /// # Errors
     /// An fsqlite failure.
     pub fn insert_run(&self, r: &RunRecord) -> FocrResult<()> {
-        self.conn
-            .execute_with_params(
-                "INSERT OR REPLACE INTO runs (run_id, started_at, finished_at, input_path, \
-                 mode, quant, model_version_tag, exit_code, status) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                &[
-                    SqliteValue::Text(r.run_id.as_str().into()),
-                    SqliteValue::Integer(r.started_at),
-                    r.finished_at
-                        .map_or(SqliteValue::Null, SqliteValue::Integer),
-                    SqliteValue::Text(r.input_path.as_str().into()),
-                    SqliteValue::Text(r.mode.as_str().into()),
-                    SqliteValue::Text(r.quant.as_str().into()),
-                    SqliteValue::Text(r.model_version_tag.as_str().into()),
-                    SqliteValue::Integer(r.exit_code),
-                    SqliteValue::Text(r.status.as_str().into()),
-                ],
-            )
-            .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite insert run: {e}")))?;
+        self.drive(self.conn.execute_with_params(
+            "INSERT OR REPLACE INTO runs (run_id, started_at, finished_at, input_path, \
+             mode, quant, model_version_tag, exit_code, status) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            &[
+                SqliteValue::Text(r.run_id.as_str().into()),
+                SqliteValue::Integer(r.started_at),
+                r.finished_at
+                    .map_or(SqliteValue::Null, SqliteValue::Integer),
+                SqliteValue::Text(r.input_path.as_str().into()),
+                SqliteValue::Text(r.mode.as_str().into()),
+                SqliteValue::Text(r.quant.as_str().into()),
+                SqliteValue::Text(r.model_version_tag.as_str().into()),
+                SqliteValue::Integer(r.exit_code),
+                SqliteValue::Text(r.status.as_str().into()),
+            ],
+        ))
+        .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite insert run: {e}")))?;
         Ok(())
     }
 
@@ -277,20 +298,18 @@ impl RunStore {
                             model_version_tag, exit_code, status";
         let rows = match id {
             Some(id) => self
-                .conn
-                .query_with_params(
+                .drive(self.conn.query_with_params(
                     &format!("SELECT {COLS} FROM runs WHERE run_id = ?"),
                     &[SqliteValue::Text(id.into())],
-                )
+                ))
                 .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query runs: {e}")))?,
             None => self
-                .conn
-                .query_with_params(
+                .drive(self.conn.query_with_params(
                     &format!(
                         "SELECT {COLS} FROM runs ORDER BY started_at DESC, run_id DESC LIMIT ?"
                     ),
                     &[SqliteValue::Integer(limit.max(0))],
-                )
+                ))
                 .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query runs: {e}")))?,
         };
         Ok(Self::rows_to_records(&rows))
@@ -303,11 +322,10 @@ impl RunStore {
     /// An fsqlite failure.
     pub fn all_runs_canonical(&self) -> FocrResult<Vec<RunRecord>> {
         let rows = self
-            .conn
-            .query(
+            .drive(self.conn.query(
                 "SELECT run_id, started_at, finished_at, input_path, mode, quant, \
                  model_version_tag, exit_code, status FROM runs ORDER BY run_id ASC",
-            )
+            ))
             .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query runs: {e}")))?;
         Ok(Self::rows_to_records(&rows))
     }
