@@ -126,14 +126,13 @@ impl RunStore {
                 FocrError::Other(anyhow::anyhow!("create {}: {e}", parent.display()))
             })?;
         }
-        let runtime = RuntimeBuilder::new()
-            .worker_threads(1)
-            .blocking_threads(1, 2)
-            .thread_name_prefix("focr-store")
-            .build()
-            .map_err(|e| {
-                FocrError::Other(anyhow::anyhow!("asupersync runtime build (run store): {e}"))
-            })?;
+        // current_thread: block_on drives fsqlite futures on the CALLER's
+        // stack (plain sequential CLI I/O). A worker-pool runtime here both
+        // wastes threads and overflows the small worker stacks on fsqlite's
+        // deep VDBE recursion.
+        let runtime = RuntimeBuilder::current_thread().build().map_err(|e| {
+            FocrError::Other(anyhow::anyhow!("asupersync runtime build (run store): {e}"))
+        })?;
         let conn = runtime
             .block_on(Connection::open(path.display().to_string()))
             .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite open: {e}")))?;
