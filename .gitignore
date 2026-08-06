@@ -151,3 +151,7 @@ crates/*/target/
 # Baidu model source snapshots (re-fetch via scripts/fetch_sources.sh; only hashes are committed)
 /docs/truth-pack/snapshots/
 .beads/.br_history/
+
+# === multi-repo ephemeral hygiene 2026-08-06 ===
+# br/doctor per-run artifacts
+.doctor/
