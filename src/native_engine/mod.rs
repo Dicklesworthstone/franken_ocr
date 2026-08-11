@@ -1762,6 +1762,11 @@ impl EmbedTable<'_> {
 
     /// Materialize row `idx` as f32 — the per-token embed. Caller guarantees
     /// `idx < rows` (both decode loops guard with their out-of-vocab check).
+    ///
+    /// # Panics
+    /// Panics if `idx >= self.rows()` — every caller checks the decoded id
+    /// against the vocab first ([`Self::embed_ids`] returns an error instead).
+    #[must_use]
     pub fn row_f32(&self, idx: usize) -> Vec<f32> {
         match self {
             EmbedTable::F32(m) => m.data[idx * m.cols..(idx + 1) * m.cols].to_vec(),

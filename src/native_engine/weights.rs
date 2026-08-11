@@ -146,6 +146,10 @@ pub const FOCRQ_MAGIC: &[u8; 6] = b"FOCRQ\0";
 /// "loader refuses version > binary's".
 pub const FOCRQ_FORMAT_VERSION: u32 = 1;
 
+/// Fixed `.focrq` preamble size: `magic(6) + format_version(4) + arch(1) +
+/// source_sha256(32) + header_len(8)`. Everything after it is the header JSON.
+pub const FOCRQ_PREAMBLE: usize = 6 + 4 + 1 + 32 + 8;
+
 /// Highest defined `.focrq` architecture-target byte in format v1.
 const MAX_ARCH_TARGET: u8 = 3;
 
@@ -414,25 +418,110 @@ pub struct Weights {
     quant_recipe: Option<String>,
 }
 
-/// The weight blob's storage: an owned buffer (the safe default) or a read-only
-/// memory map explicitly requested with `FOCR_MMAP=1`. Both deref to `&[u8]`;
-/// every reader below is backing-agnostic.
+/// One piece of a [`Backing::Segmented`] blob: the absolute offset the piece
+/// starts at, and its bytes.
+#[derive(Debug)]
+pub struct BlobSegment {
+    /// Absolute offset of `bytes[0]` within the logical blob.
+    start: u64,
+    /// This piece's bytes.
+    bytes: Vec<u8>,
+}
+
+/// The weight blob's storage: an owned buffer (the safe default), a read-only
+/// memory map explicitly requested with `FOCR_MMAP=1`, or a SEGMENTED blob —
+/// several buffers that together cover `[0, len)`.
+///
+/// The segmented arm exists for wasm32 (bd-syf2): Rust caps ANY single
+/// allocation (and any slice) at `isize::MAX` = 2 GiB there, so the 3.0 GB
+/// artifact simply cannot live in one `Vec<u8>` even though the 4 GiB heap has
+/// room. Segment boundaries are planned to fall on TENSOR boundaries, so every
+/// tensor's payload (and its inline scales) stays contiguous inside exactly one
+/// segment and every accessor keeps returning a plain `&[u8]`.
+///
+/// There is deliberately NO `Deref<Target = [u8]>`: a segmented blob has no
+/// single slice. [`Backing::range`] is the one chokepoint every reader goes
+/// through, and it REFUSES a range that straddles two segments rather than
+/// silently stitching a copy.
 enum Backing {
     /// Fully-owned bytes (`std::fs::read` / in-memory blobs).
     Owned(Vec<u8>),
     /// Read-only file mapping.
     #[cfg(feature = "native")]
     Mapped(memmap2::Mmap),
+    /// Contiguous, ordered, non-overlapping pieces covering `[0, len)`.
+    Segmented {
+        /// Pieces in ascending `start` order, each starting where the previous
+        /// ended (validated by [`Weights::from_segments`]).
+        segments: Vec<BlobSegment>,
+        /// Total logical length (the sum of the segment lengths).
+        len: u64,
+    },
 }
 
-impl std::ops::Deref for Backing {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
+impl Backing {
+    /// Total logical blob length.
+    fn len(&self) -> u64 {
         match self {
-            Backing::Owned(v) => v,
+            Backing::Owned(v) => v.len() as u64,
             #[cfg(feature = "native")]
-            Backing::Mapped(m) => m,
+            Backing::Mapped(m) => m.len() as u64,
+            Backing::Segmented { len, .. } => *len,
         }
+    }
+
+    /// Resolve `[start, start + len)` to `(segment index, offset within that
+    /// segment)`, or `None` if the range runs past the blob **or straddles a
+    /// segment boundary**. Owned/Mapped blobs are one segment (index 0), so the
+    /// native path is a pure bounds check.
+    fn locate(&self, start: u64, len: usize) -> Option<(usize, usize)> {
+        let end = start.checked_add(len as u64)?;
+        if end > self.len() {
+            return None;
+        }
+        match self {
+            Backing::Owned(_) => Some((0, usize::try_from(start).ok()?)),
+            #[cfg(feature = "native")]
+            Backing::Mapped(_) => Some((0, usize::try_from(start).ok()?)),
+            Backing::Segmented { segments, .. } => {
+                // Rightmost segment whose start is <= `start`.
+                let idx = match segments.binary_search_by_key(&start, |s| s.start) {
+                    Ok(i) => i,
+                    Err(0) => return None,
+                    Err(i) => i - 1,
+                };
+                let seg = &segments[idx];
+                if end > seg.start + seg.bytes.len() as u64 {
+                    // Straddles into the next segment — a planning bug, never
+                    // papered over with a copy.
+                    return None;
+                }
+                Some((idx, usize::try_from(start - seg.start).ok()?))
+            }
+        }
+    }
+
+    /// The bytes of segment `idx` (index 0 is the whole blob for Owned/Mapped).
+    fn segment_bytes(&self, idx: usize) -> &[u8] {
+        match self {
+            Backing::Owned(v) => {
+                debug_assert_eq!(idx, 0);
+                v
+            }
+            #[cfg(feature = "native")]
+            Backing::Mapped(m) => {
+                debug_assert_eq!(idx, 0);
+                m
+            }
+            Backing::Segmented { segments, .. } => &segments[idx].bytes,
+        }
+    }
+
+    /// THE chokepoint: borrow `[start, start + len)` as one contiguous slice,
+    /// or `None` when the range is out of bounds or crosses a segment edge.
+    fn range(&self, start: u64, len: usize) -> Option<&[u8]> {
+        let (idx, off) = self.locate(start, len)?;
+        self.segment_bytes(idx).get(off..off + len)
     }
 }
 
@@ -442,8 +531,229 @@ impl std::fmt::Debug for Backing {
             Backing::Owned(v) => write!(f, "Backing::Owned({} bytes)", v.len()),
             #[cfg(feature = "native")]
             Backing::Mapped(m) => write!(f, "Backing::Mapped({} bytes)", m.len()),
+            Backing::Segmented { segments, len } => write!(
+                f,
+                "Backing::Segmented({len} bytes in {} segments)",
+                segments.len()
+            ),
         }
     }
+}
+
+/// The fixed-size `.focrq` preamble, decoded.
+struct FocrqPreamble {
+    /// Architecture-target byte from the preamble (the header may override it).
+    arch_target: u8,
+    /// Hex source sha256 from the preamble (the header may override it).
+    source_sha256: String,
+    /// Length of the header JSON that follows the preamble.
+    header_len: usize,
+}
+
+/// Decode the fixed `.focrq` preamble from its first [`FOCRQ_PREAMBLE`] bytes
+/// (magic included). Shared by the whole-blob loader and the wasm prefix
+/// planner so the two can never disagree about where the header ends.
+fn parse_focrq_preamble(bytes: &[u8]) -> FocrResult<FocrqPreamble> {
+    if bytes.len() < FOCRQ_PREAMBLE {
+        return Err(FocrError::FormatMismatch(format!(
+            ".focrq truncated: {} bytes < {FOCRQ_PREAMBLE}-byte preamble",
+            bytes.len()
+        )));
+    }
+    if &bytes[..FOCRQ_MAGIC.len()] != FOCRQ_MAGIC {
+        return Err(FocrError::FormatMismatch(
+            ".focrq magic mismatch".to_owned(),
+        ));
+    }
+    let mut cur = FOCRQ_MAGIC.len();
+    let version = read_u32_le(&bytes[cur..cur + 4], ".focrq format_version")?;
+    cur += 4;
+    if version > FOCRQ_FORMAT_VERSION {
+        return Err(FocrError::FormatMismatch(format!(
+            ".focrq format_version {version} is newer than this binary supports \
+             (max {FOCRQ_FORMAT_VERSION})"
+        )));
+    }
+    let arch_target = bytes[cur];
+    cur += 1;
+    let source_sha256 = hex_encode(&bytes[cur..cur + 32]);
+    cur += 32;
+    let header_len = read_u64_len_le(&bytes[cur..cur + 8], ".focrq header_len")?;
+    Ok(FocrqPreamble {
+        arch_target,
+        source_sha256,
+        header_len,
+    })
+}
+
+/// Default maximum planned segment size: 1 GiB. Rust caps a single allocation
+/// (and any slice) at `isize::MAX` = 2 GiB on wasm32; 1 GiB leaves the
+/// allocator room to place several segments inside the 4 GiB heap without a
+/// near-limit request ever being attempted.
+pub const MAX_BLOB_SEGMENT: u64 = 1 << 30;
+
+/// A single tensor larger than this cannot be planned into a segment — it
+/// would need one allocation above the wasm32 `isize::MAX` slice ceiling.
+const MAX_SINGLE_SEGMENT: u64 = 3 << 29; // 1.5 GiB
+
+/// What [`focrq_segment_plan`] concluded from a `.focrq` prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SegmentPlan {
+    /// The prefix contained the whole header; these are the planned segment
+    /// byte LENGTHS in order (they sum to the artifact size, and every segment
+    /// edge falls on a tensor boundary).
+    Planned {
+        /// Per-segment byte lengths, in order from offset 0.
+        segment_lens: Vec<u64>,
+        /// Absolute offset where the payload begins (end of the header JSON);
+        /// segment 0 always contains the whole preamble + header.
+        payload_base: u64,
+    },
+    /// The prefix was too short to contain preamble + header: refetch at least
+    /// `need_bytes` and call again.
+    NeedPrefix {
+        /// Minimum prefix length that will contain the complete header.
+        need_bytes: u64,
+    },
+}
+
+/// Plan how to cut a `.focrq` artifact of `total_bytes` into segments of at
+/// most `max_segment` bytes, cutting ONLY at tensor boundaries (bd-syf2).
+///
+/// `prefix` must be the artifact's leading bytes; only the preamble + header
+/// JSON are read from it. Segment 0 starts at absolute 0 and always contains
+/// the preamble + header (plus as many whole tensors as fit); every later
+/// segment starts exactly where the previous ended, so the segments cover
+/// `[0, total_bytes)` with no gap and no overlap — the contract
+/// [`Weights::from_segments`] validates independently.
+///
+/// A NON-`.focrq` blob (a raw safetensors shard) has no such directory here; it
+/// is planned as ONE segment when it fits under `max_segment` and refused
+/// otherwise, because there is no way to cut it safely without parsing its own
+/// directory.
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if the header is malformed, if a single tensor
+/// is too large to be one segment, or if the tensor layout has no clean cut
+/// (overlapping/interleaved extents) that keeps every tensor contiguous.
+pub fn focrq_segment_plan(
+    prefix: &[u8],
+    total_bytes: u64,
+    max_segment: u64,
+) -> FocrResult<SegmentPlan> {
+    if max_segment == 0 {
+        return Err(FocrError::FormatMismatch(
+            "segment plan: max_segment must be non-zero".to_owned(),
+        ));
+    }
+    if total_bytes == 0 {
+        return Err(FocrError::FormatMismatch(
+            "segment plan: total_bytes must be non-zero".to_owned(),
+        ));
+    }
+    // Not a `.focrq`: no tensor directory to cut on. One segment or refuse.
+    if prefix.len() < FOCRQ_MAGIC.len() || &prefix[..FOCRQ_MAGIC.len()] != FOCRQ_MAGIC {
+        if total_bytes <= max_segment.max(MAX_SINGLE_SEGMENT) {
+            return Ok(SegmentPlan::Planned {
+                segment_lens: vec![total_bytes],
+                payload_base: 0,
+            });
+        }
+        return Err(FocrError::FormatMismatch(format!(
+            "segment plan: a non-.focrq blob of {total_bytes} bytes cannot be segmented \
+             (no tensor directory to cut on)"
+        )));
+    }
+    if prefix.len() < FOCRQ_PREAMBLE {
+        return Ok(SegmentPlan::NeedPrefix {
+            need_bytes: FOCRQ_PREAMBLE as u64,
+        });
+    }
+    let preamble = parse_focrq_preamble(prefix)?;
+    let header_end = FOCRQ_PREAMBLE
+        .checked_add(preamble.header_len)
+        .ok_or_else(|| FocrError::FormatMismatch(".focrq header_len overflows".into()))?;
+    if prefix.len() < header_end {
+        return Ok(SegmentPlan::NeedPrefix {
+            need_bytes: header_end as u64,
+        });
+    }
+    let header: FocrqHeader = serde_json::from_slice(&prefix[FOCRQ_PREAMBLE..header_end])
+        .map_err(|e| FocrError::FormatMismatch(format!(".focrq header JSON invalid: {e}")))?;
+    let payload_base = header_end as u64;
+    if payload_base > total_bytes {
+        return Err(FocrError::FormatMismatch(format!(
+            "segment plan: header ends at {payload_base} past the artifact end ({total_bytes})"
+        )));
+    }
+
+    // Absolute [start, end) extent of every tensor (payload AND inline scales),
+    // sorted by start. A cut is legal only at a position no extent spans.
+    let mut extents: Vec<(u64, u64)> = Vec::with_capacity(header.tensors.len());
+    for (name, rec) in &header.tensors {
+        let mut lo = u64::MAX;
+        let mut hi = 0u64;
+        for (off, len) in [
+            (rec.byte_offset, rec.byte_len),
+            (rec.scales_offset, rec.scales_len),
+        ] {
+            if len == 0 {
+                continue;
+            }
+            let start = payload_base + off as u64;
+            let end = start.checked_add(len as u64).ok_or_else(|| {
+                FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows"))
+            })?;
+            lo = lo.min(start);
+            hi = hi.max(end);
+        }
+        if hi == 0 {
+            continue; // zero-length record: nothing to place
+        }
+        if hi - lo > MAX_SINGLE_SEGMENT {
+            return Err(FocrError::FormatMismatch(format!(
+                "segment plan: tensor {name:?} spans {} bytes, above the {MAX_SINGLE_SEGMENT}-byte \
+                 single-segment ceiling",
+                hi - lo
+            )));
+        }
+        if hi > total_bytes {
+            return Err(FocrError::FormatMismatch(format!(
+                "segment plan: tensor {name:?} ends at {hi} past the artifact end ({total_bytes})"
+            )));
+        }
+        extents.push((lo, hi));
+    }
+    extents.sort_unstable();
+
+    let mut segment_lens: Vec<u64> = Vec::new();
+    let mut seg_start = 0u64; // segment 0 owns preamble + header
+    let mut cut_at = payload_base; // rightmost legal cut seen so far
+    for (lo, hi) in extents {
+        // `cut_at` is the running max end of everything placed so far. It is a
+        // LEGAL cut only when this tensor starts at or after it (otherwise the
+        // extents interleave and cutting there would split this tensor).
+        // Close the segment when adding this tensor would overflow the budget
+        // and a legal cut exists — never mid-tensor, never a copy.
+        if hi - seg_start > max_segment && cut_at > seg_start && lo >= cut_at {
+            segment_lens.push(cut_at - seg_start);
+            seg_start = cut_at;
+        }
+        cut_at = cut_at.max(hi);
+    }
+    // Trailing bytes (padding after the last tensor) join the final segment.
+    if total_bytes - seg_start > MAX_SINGLE_SEGMENT {
+        return Err(FocrError::FormatMismatch(format!(
+            "segment plan: final segment would be {} bytes, above the {MAX_SINGLE_SEGMENT}-byte \
+             ceiling (tensor layout offers no earlier clean cut)",
+            total_bytes - seg_start
+        )));
+    }
+    segment_lens.push(total_bytes - seg_start);
+    Ok(SegmentPlan::Planned {
+        segment_lens,
+        payload_base,
+    })
 }
 
 /// A zero-copy, owning view of a byte range inside a model blob: an
@@ -451,32 +761,37 @@ impl std::fmt::Debug for Backing {
 /// This is how quantized weight structs reference their payload bytes WITHOUT
 /// duplicating them next to the resident artifact (bd-4l71 residency work):
 /// cloning is an `Arc` bump, and the view keeps the blob alive on its own.
+/// The range is RESOLVED at construction (segment index + offset inside that
+/// segment), so the `Deref` below is an infallible index — a segmented blob
+/// cannot make a live view dangle or straddle.
 #[derive(Clone)]
 pub struct SharedBytes {
     backing: std::sync::Arc<Backing>,
-    start: usize,
+    segment: usize,
+    off: usize,
     len: usize,
 }
 
 impl SharedBytes {
-    fn new(backing: std::sync::Arc<Backing>, start: usize, len: usize) -> Self {
-        debug_assert!(
-            start
-                .checked_add(len)
-                .is_some_and(|end| end <= backing.len())
-        );
-        Self {
+    /// Resolve `[start, start + len)` inside `backing`, or `None` if it is out
+    /// of bounds or crosses a segment boundary.
+    fn new(backing: std::sync::Arc<Backing>, start: u64, len: usize) -> Option<Self> {
+        let (segment, off) = backing.locate(start, len)?;
+        Some(Self {
             backing,
-            start,
+            segment,
+            off,
             len,
-        }
+        })
     }
 }
 
 impl std::ops::Deref for SharedBytes {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        &self.backing[self.start..self.start + self.len]
+        // Resolved and bounds-checked by `new`; the backing is immutable and
+        // held alive by this handle's `Arc`.
+        &self.backing.segment_bytes(self.segment)[self.off..self.off + self.len]
     }
 }
 
@@ -484,9 +799,10 @@ impl std::fmt::Debug for SharedBytes {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "SharedBytes([{}, {}) of {} blob bytes)",
-            self.start,
-            self.start + self.len,
+            "SharedBytes({} bytes at segment {} offset {} of {} blob bytes)",
+            self.len,
+            self.segment,
+            self.off,
             self.backing.len()
         )
     }
@@ -662,6 +978,56 @@ impl Weights {
         Self::from_backing(Backing::Owned(bytes))
     }
 
+    /// Parse + index a blob that arrived as SEGMENTS — the wasm32 path
+    /// (bd-syf2), where no single `Vec<u8>` may exceed `isize::MAX` = 2 GiB so
+    /// a 3 GB artifact must live in several buffers.
+    ///
+    /// `segments` is `(absolute start, bytes)` and must be ordered,
+    /// non-overlapping, and exactly cover `[0, total)` starting at 0. Segment
+    /// edges must additionally fall on TENSOR boundaries: after the directory
+    /// parses, every tensor's payload and inline scales must resolve inside ONE
+    /// segment or the load is refused (a mid-tensor split is a planning bug —
+    /// see [`focrq_segment_plan`]). Everything downstream is identical to
+    /// [`Weights::from_bytes`]: same header validation, same accessors, same
+    /// bytes.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] on a gap/overlap/ordering violation, on any
+    /// structural problem the owned path would reject, or if a tensor straddles
+    /// a segment boundary.
+    pub fn from_segments(segments: Vec<(u64, Vec<u8>)>) -> FocrResult<Self> {
+        let mut expected_start = 0u64;
+        let mut built: Vec<BlobSegment> = Vec::with_capacity(segments.len());
+        for (index, (start, bytes)) in segments.into_iter().enumerate() {
+            if start != expected_start {
+                return Err(FocrError::FormatMismatch(format!(
+                    "segmented weights: segment {index} starts at {start}, expected \
+                     {expected_start} (segments must be ordered and contiguous from 0)"
+                )));
+            }
+            if bytes.is_empty() {
+                return Err(FocrError::FormatMismatch(format!(
+                    "segmented weights: segment {index} is empty"
+                )));
+            }
+            expected_start = start.checked_add(bytes.len() as u64).ok_or_else(|| {
+                FocrError::FormatMismatch(
+                    "segmented weights: total length overflows u64".to_owned(),
+                )
+            })?;
+            built.push(BlobSegment { start, bytes });
+        }
+        if built.is_empty() {
+            return Err(FocrError::FormatMismatch(
+                "segmented weights: no segments".to_owned(),
+            ));
+        }
+        Self::from_backing(Backing::Segmented {
+            segments: built,
+            len: expected_start,
+        })
+    }
+
     /// Test-only probe: did this load take the mmap backing?
     #[cfg(test)]
     pub(super) fn is_mapped(&self) -> bool {
@@ -672,7 +1038,8 @@ impl Weights {
     /// [`Weights::load`] / [`Weights::from_bytes`]).
     fn from_backing(bytes: Backing) -> FocrResult<Self> {
         let bytes = std::sync::Arc::new(bytes);
-        if bytes.len() >= FOCRQ_MAGIC.len() && &bytes[..FOCRQ_MAGIC.len()] == FOCRQ_MAGIC {
+        let magic = bytes.range(0, FOCRQ_MAGIC.len());
+        if magic == Some(FOCRQ_MAGIC) {
             Self::from_focrq_bytes(bytes)
         } else {
             Self::from_safetensors_bytes(bytes)
@@ -687,46 +1054,28 @@ impl Weights {
     /// header JSON (the byte fields before it are the fixed-size preamble that a
     /// reader can validate before parsing JSON).
     fn from_focrq_bytes(bytes: std::sync::Arc<Backing>) -> FocrResult<Self> {
-        // Fixed preamble: magic(6) + version(4) + arch(1) + sha256(32) +
-        // header_len(8) = 51 bytes minimum.
-        const PREAMBLE: usize = 6 + 4 + 1 + 32 + 8;
-        if bytes.len() < PREAMBLE {
-            return Err(FocrError::FormatMismatch(format!(
-                ".focrq truncated: {} bytes < {PREAMBLE}-byte preamble",
+        let preamble_bytes = bytes.range(0, FOCRQ_PREAMBLE).ok_or_else(|| {
+            FocrError::FormatMismatch(format!(
+                ".focrq truncated: {} bytes < {FOCRQ_PREAMBLE}-byte preamble",
                 bytes.len()
-            )));
-        }
-        let mut cur = FOCRQ_MAGIC.len();
-
-        let version = read_u32_le(&bytes[cur..cur + 4], ".focrq format_version")?;
-        cur += 4;
-        if version > FOCRQ_FORMAT_VERSION {
-            return Err(FocrError::FormatMismatch(format!(
-                ".focrq format_version {version} is newer than this binary supports \
-                 (max {FOCRQ_FORMAT_VERSION})"
-            )));
-        }
-
-        let preamble_arch = bytes[cur];
-        cur += 1;
-
-        let preamble_sha = hex_encode(&bytes[cur..cur + 32]);
-        cur += 32;
-
-        let header_len = read_u64_len_le(&bytes[cur..cur + 8], ".focrq header_len")?;
-        cur += 8;
-
-        let header_end = cur
-            .checked_add(header_len)
+            ))
+        })?;
+        let preamble = parse_focrq_preamble(preamble_bytes)?;
+        let header_end = FOCRQ_PREAMBLE
+            .checked_add(preamble.header_len)
             .ok_or_else(|| FocrError::FormatMismatch(".focrq header_len overflows".into()))?;
-        if header_end > bytes.len() {
-            return Err(FocrError::FormatMismatch(format!(
-                ".focrq header ({header_len} bytes) overruns file ({} bytes)",
-                bytes.len()
-            )));
-        }
-        let header: FocrqHeader = serde_json::from_slice(&bytes[cur..header_end])
+        let header_json = bytes
+            .range(FOCRQ_PREAMBLE as u64, preamble.header_len)
+            .ok_or_else(|| {
+                FocrError::FormatMismatch(format!(
+                    ".focrq header ({} bytes) overruns file ({} bytes) or crosses a segment edge",
+                    preamble.header_len,
+                    bytes.len()
+                ))
+            })?;
+        let header: FocrqHeader = serde_json::from_slice(header_json)
             .map_err(|e| FocrError::FormatMismatch(format!(".focrq header JSON invalid: {e}")))?;
+        let (preamble_arch, preamble_sha) = (preamble.arch_target, preamble.source_sha256);
         // Resolve the declared architecture FIRST (absent ⇒ v1 default unlimited-ocr;
         // unknown non-empty id ⇒ loud refusal) so the license check below can demand
         // the right notice for that arch (Baidu/MIT vs e.g. GOT-OCR2 Apache-2.0).
@@ -737,7 +1086,7 @@ impl Weights {
         }
 
         let payload_base = header_end;
-        let payload_len = bytes.len() - payload_base;
+        let payload_len = payload_len_of(&bytes, payload_base)?;
 
         // Prefer the header's own fields; the preamble bytes are a cheap
         // pre-JSON sanity surface (and the source of truth if the header omits
@@ -749,6 +1098,7 @@ impl Weights {
         };
         validate_arch_target(arch_target)?;
         validate_directory(&header.tensors, payload_len, arch_target)?;
+        validate_segment_containment(&bytes, payload_base, &header.tensors)?;
         let source_sha256 = if header.source_sha256.is_empty() {
             preamble_sha
         } else {
@@ -775,22 +1125,23 @@ impl Weights {
     /// (offsets are payload-relative); a `__metadata__` key, if present, is
     /// skipped.
     fn from_safetensors_bytes(bytes: std::sync::Arc<Backing>) -> FocrResult<Self> {
-        if bytes.len() < 8 {
-            return Err(FocrError::FormatMismatch(format!(
+        let len_prefix = bytes.range(0, 8).ok_or_else(|| {
+            FocrError::FormatMismatch(format!(
                 "safetensors truncated: {} bytes < 8-byte header length prefix",
                 bytes.len()
-            )));
-        }
-        let header_len = read_u64_len_le(&bytes[..8], "safetensors header_len")?;
+            ))
+        })?;
+        let header_len = read_u64_len_le(len_prefix, "safetensors header_len")?;
         let header_end = 8usize
             .checked_add(header_len)
             .ok_or_else(|| FocrError::FormatMismatch("safetensors header_len overflows".into()))?;
-        if header_end > bytes.len() {
-            return Err(FocrError::FormatMismatch(format!(
-                "safetensors header ({header_len} bytes) overruns file ({} bytes)",
+        let header_json = bytes.range(8, header_len).ok_or_else(|| {
+            FocrError::FormatMismatch(format!(
+                "safetensors header ({header_len} bytes) overruns file ({} bytes) or crosses a \
+                 segment edge",
                 bytes.len()
-            )));
-        }
+            ))
+        })?;
 
         #[derive(Deserialize)]
         struct StEntry {
@@ -802,10 +1153,10 @@ impl Weights {
         // The header is a flat object of name -> entry, with one reserved
         // `__metadata__` string-map key. Parse to `serde_json::Value` so we can
         // skip the reserved key without a custom visitor.
-        let raw: serde_json::Map<String, serde_json::Value> =
-            serde_json::from_slice(&bytes[8..header_end]).map_err(|e| {
-                FocrError::FormatMismatch(format!("safetensors header JSON invalid: {e}"))
-            })?;
+        let raw: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(header_json)
+            .map_err(|e| {
+            FocrError::FormatMismatch(format!("safetensors header JSON invalid: {e}"))
+        })?;
 
         let mut directory = BTreeMap::new();
         for (name, value) in raw {
@@ -837,8 +1188,9 @@ impl Weights {
         }
 
         let payload_base = header_end;
-        let payload_len = bytes.len() - payload_base;
+        let payload_len = payload_len_of(&bytes, payload_base)?;
         validate_directory(&directory, payload_len, 0)?;
+        validate_segment_containment(&bytes, payload_base, &directory)?;
 
         Ok(Self {
             bytes,
@@ -1252,37 +1604,87 @@ impl Weights {
     /// primitive quantized weight structs use to reference their payload
     /// without duplicating it (bd-4l71).
     fn payload_shared(&self, name: &str, off: usize, len: usize) -> FocrResult<SharedBytes> {
-        // Validate exactly like `payload_slice` (same errors), then keep the
-        // range instead of the borrow.
-        self.payload_slice(name, off, len)?;
-        let start = self
-            .payload_base
-            .checked_add(off)
-            .expect("payload_slice validated the range");
-        Ok(SharedBytes::new(
-            std::sync::Arc::clone(&self.bytes),
-            start,
-            len,
-        ))
+        let start = absolute_payload_start(name, self.payload_base, off)?;
+        SharedBytes::new(std::sync::Arc::clone(&self.bytes), start, len)
+            .ok_or_else(|| payload_range_error(name, off, len))
     }
 
-    /// Resolve a payload byte range, bounds-checked against the backing buffer.
+    /// Resolve a payload byte range, bounds-checked against the backing blob
+    /// (and, for a segmented blob, required to live inside ONE segment — the
+    /// planner guarantees that, so a failure here is a corrupt plan, never a
+    /// reason to stitch a copy).
     fn payload_slice(&self, name: &str, off: usize, len: usize) -> FocrResult<&[u8]> {
-        let start = self.payload_base.checked_add(off).ok_or_else(|| {
-            FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows"))
-        })?;
-        let end = start.checked_add(len).ok_or_else(|| {
-            FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows"))
-        })?;
-        self.bytes.get(start..end).ok_or_else(|| {
-            let range_end = off
-                .checked_add(len)
-                .map_or_else(|| "<overflow>".to_owned(), |end| end.to_string());
-            FocrError::FormatMismatch(format!(
-                "tensor {name:?} range [{off}, {range_end}) overruns payload"
-            ))
-        })
+        let start = absolute_payload_start(name, self.payload_base, off)?;
+        self.bytes
+            .range(start, len)
+            .ok_or_else(|| payload_range_error(name, off, len))
     }
+}
+
+/// Absolute blob offset of a payload-relative tensor offset.
+fn absolute_payload_start(name: &str, payload_base: usize, off: usize) -> FocrResult<u64> {
+    (payload_base as u64)
+        .checked_add(off as u64)
+        .ok_or_else(|| FocrError::FormatMismatch(format!("tensor {name:?} byte range overflows")))
+}
+
+/// The one error shape for a payload range that is out of bounds OR crosses a
+/// segment edge (both mean "this blob cannot serve this tensor contiguously").
+fn payload_range_error(name: &str, off: usize, len: usize) -> FocrError {
+    let range_end = off
+        .checked_add(len)
+        .map_or_else(|| "<overflow>".to_owned(), |end| end.to_string());
+    FocrError::FormatMismatch(format!(
+        "tensor {name:?} range [{off}, {range_end}) overruns the payload or crosses a segment \
+         boundary"
+    ))
+}
+
+/// Payload length (blob length minus the header) as a `usize`.
+fn payload_len_of(bytes: &Backing, payload_base: usize) -> FocrResult<usize> {
+    let len = bytes
+        .len()
+        .checked_sub(payload_base as u64)
+        .ok_or_else(|| FocrError::FormatMismatch("payload base past end of blob".to_owned()))?;
+    usize::try_from(len).map_err(|_| {
+        FocrError::FormatMismatch(format!(
+            "payload of {len} bytes does not fit this target's usize"
+        ))
+    })
+}
+
+/// For a SEGMENTED blob (bd-syf2), prove up front that every tensor's payload
+/// and inline scales resolve inside ONE segment. A segment plan that cut
+/// mid-tensor is refused at load — naming the tensor — instead of failing much
+/// later inside a forward. Owned/Mapped blobs are one segment, so this is a
+/// no-op there (and the loop is skipped entirely).
+fn validate_segment_containment(
+    bytes: &Backing,
+    payload_base: usize,
+    directory: &BTreeMap<String, TensorRecord>,
+) -> FocrResult<()> {
+    if !matches!(bytes, Backing::Segmented { .. }) {
+        return Ok(());
+    }
+    for (name, rec) in directory {
+        for (off, len, what) in [
+            (rec.byte_offset, rec.byte_len, "payload"),
+            (rec.scales_offset, rec.scales_len, "scales"),
+        ] {
+            if len == 0 {
+                continue;
+            }
+            let start = absolute_payload_start(name, payload_base, off)?;
+            if bytes.range(start, len).is_none() {
+                return Err(FocrError::FormatMismatch(format!(
+                    "segmented weights: tensor {name:?} {what} [{off}, {}) crosses a segment \
+                     boundary — segment edges must fall on tensor boundaries",
+                    off.saturating_add(len)
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validate every directory record against the payload length + its own shape.
@@ -1859,6 +2261,236 @@ mod tests {
         assert_eq!(q.k, 3);
         assert_eq!(&q.w[..], &[1i8, -2, 3, 4, -5, 6]);
         assert_eq!(q.scales, vec![0.1, 0.2]);
+    }
+
+    // ── segmented backing (bd-syf2 wasm32 >2 GiB blobs) ─────────────────────
+
+    /// A small multi-tensor `.focrq` exercising every accessor family: BF16
+    /// (mat/vec), `QInt8PerChan` (qint8), `QInt4PerGroup` (qint4).
+    fn segmented_fixture_blob() -> Vec<u8> {
+        let mut builder = crate::quant::focrq::FocrqBuilder::new()
+            .with_license_notice(FOCR_MODEL_LICENSE_NOTICE)
+            .with_alignment(false);
+        builder
+            .add_tensor(
+                "a.bf16",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![2, 3],
+                bf16_le_bytes(&[1.0, -2.0, 4.0, 8.0, -0.5, 0.25]),
+            )
+            .expect("bf16 tensor");
+        builder
+            .add_quantized(
+                "b.int8",
+                crate::quant::focrq::WriteDType::QInt8PerChan,
+                vec![2, 3],
+                [1i8, -2, 3, 4, -5, 6].iter().map(|&v| v as u8).collect(),
+                f32_le_bytes(&[0.1, 0.2]),
+                0,
+                0,
+            )
+            .expect("int8 tensor");
+        builder
+            .add_quantized(
+                "c.int4",
+                crate::quant::focrq::WriteDType::QInt4PerGroup,
+                vec![2, 16],
+                (0u8..16).collect(),
+                f32_le_bytes(&[0.3, 0.4]),
+                16,
+                3,
+            )
+            .expect("int4 tensor");
+        builder
+            .add_tensor(
+                "d.bf16",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![4],
+                bf16_le_bytes(&[3.0, 5.0, -7.0, 9.0]),
+            )
+            .expect("trailing bf16 tensor");
+        builder.build()
+    }
+
+    /// Split `blob` into `(start, bytes)` segments at the given absolute cut
+    /// offsets (each cut becomes a segment boundary).
+    fn split_at(blob: &[u8], cuts: &[u64]) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut prev = 0u64;
+        for &cut in cuts {
+            out.push((prev, blob[prev as usize..cut as usize].to_vec()));
+            prev = cut;
+        }
+        out.push((prev, blob[prev as usize..].to_vec()));
+        out
+    }
+
+    /// bd-syf2: a blob loaded from SEGMENTS is indistinguishable from the same
+    /// blob loaded whole — every accessor returns identical bytes/values. This
+    /// is what lets wasm32 (2 GiB max single allocation) hold a 3 GB artifact.
+    #[test]
+    fn from_segments_matches_from_bytes_across_every_accessor() {
+        let blob = segmented_fixture_blob();
+        let whole = Weights::from_bytes(blob.clone()).expect("whole blob loads");
+
+        // Cut on tensor boundaries taken from the whole load's own directory.
+        let payload_base = whole.payload_base as u64;
+        let mut cuts: Vec<u64> = whole
+            .directory
+            .values()
+            .map(|rec| {
+                payload_base
+                    + (rec.byte_offset + rec.byte_len).max(rec.scales_offset + rec.scales_len)
+                        as u64
+            })
+            .collect();
+        cuts.sort_unstable();
+        cuts.retain(|&c| c < blob.len() as u64);
+        assert!(cuts.len() >= 3, "fixture must offer several tensor edges");
+        let segmented =
+            Weights::from_segments(split_at(&blob, &cuts)).expect("segmented blob loads");
+
+        let names: Vec<String> = whole.names().map(str::to_owned).collect();
+        assert_eq!(
+            segmented.names().collect::<Vec<_>>(),
+            whole.names().collect::<Vec<_>>()
+        );
+        assert_eq!(segmented.arch_target(), whole.arch_target());
+        assert_eq!(segmented.license_notice(), whole.license_notice());
+        for name in &names {
+            let (ws, ss) = (
+                whole.tensor(name).expect("whole view"),
+                segmented.tensor(name).expect("segmented view"),
+            );
+            assert_eq!(ss.dtype, ws.dtype, "{name} dtype");
+            assert_eq!(ss.shape, ws.shape, "{name} shape");
+            assert_eq!(ss.data, ws.data, "{name} payload bytes");
+            assert_eq!(ss.scales, ws.scales, "{name} scale bytes");
+        }
+        assert_eq!(
+            segmented.mat("a.bf16").unwrap().data,
+            whole.mat("a.bf16").unwrap().data
+        );
+        assert_eq!(
+            segmented.vec("d.bf16").unwrap(),
+            whole.vec("d.bf16").unwrap()
+        );
+        let (qs, qw) = (
+            segmented.qint8("b.int8").unwrap(),
+            whole.qint8("b.int8").unwrap(),
+        );
+        assert_eq!(&qs.w[..], &qw.w[..]);
+        assert_eq!(qs.scales, qw.scales);
+        let (q4s, q4w) = (
+            segmented.qint4("c.int4").unwrap(),
+            whole.qint4("c.int4").unwrap(),
+        );
+        assert_eq!(&q4s.packed[..], &q4w.packed[..]);
+        assert_eq!(q4s.scales.to_vec(), q4w.scales.to_vec());
+        // The zero-copy views survive the loader handle, segmented or not.
+        drop(segmented);
+        assert_eq!(&q4s.packed[..], &q4w.packed[..]);
+    }
+
+    /// bd-syf2 planted negative: a plan that cuts INSIDE a tensor is refused at
+    /// load, naming the tensor — never silently stitched into a copy.
+    #[test]
+    fn from_segments_rejects_a_split_inside_a_tensor() {
+        let blob = segmented_fixture_blob();
+        let whole = Weights::from_bytes(blob.clone()).expect("whole blob loads");
+        let rec = whole.record("c.int4").expect("fixture tensor");
+        // One byte into the int4 payload: a boundary no tensor may straddle.
+        let bad_cut = whole.payload_base as u64 + rec.byte_offset as u64 + 1;
+        let err = Weights::from_segments(split_at(&blob, &[bad_cut]))
+            .expect_err("a mid-tensor split must be refused");
+        let message = err.to_string();
+        assert!(
+            message.contains("c.int4") && message.contains("segment boundary"),
+            "error must name the straddling tensor: {message}"
+        );
+
+        // Ordering/coverage violations are refused too.
+        assert!(
+            Weights::from_segments(vec![(1, blob.clone())]).is_err(),
+            "a blob that does not start at 0 must be refused"
+        );
+        assert!(
+            Weights::from_segments(vec![(0, blob[..64].to_vec()), (65, blob[65..].to_vec()),])
+                .is_err(),
+            "a gap between segments must be refused"
+        );
+        assert!(
+            Weights::from_segments(Vec::new()).is_err(),
+            "an empty segment list must be refused"
+        );
+    }
+
+    /// bd-syf2: [`focrq_segment_plan`] cuts only at tensor edges, covers the
+    /// artifact exactly, and the resulting segments load — the exact contract
+    /// the wasm two-phase staging depends on. A short prefix asks for more
+    /// bytes instead of guessing.
+    #[test]
+    fn focrq_segment_plan_cuts_only_on_tensor_boundaries() {
+        let blob = segmented_fixture_blob();
+        let total = blob.len() as u64;
+
+        // A prefix shorter than the header reports how much is needed.
+        // Probing converges in at most two steps: an 8-byte prefix can only ask
+        // for the fixed preamble; the preamble then reveals the header length.
+        let mut have = 8usize;
+        let mut probes = 0;
+        while let SegmentPlan::NeedPrefix { need_bytes } =
+            focrq_segment_plan(&blob[..have], total, 64).expect("prefix probes cleanly")
+        {
+            probes += 1;
+            assert!(
+                need_bytes as usize > have,
+                "a probe must ask for MORE bytes"
+            );
+            assert!(
+                (need_bytes as usize) <= blob.len(),
+                "the header is far smaller than the artifact"
+            );
+            have = need_bytes as usize;
+            assert!(probes <= 2, "probing must converge in two steps");
+        }
+        assert_eq!(probes, 2, "8 bytes -> preamble -> header");
+
+        // A tiny budget forces several cuts; each must land on a tensor edge.
+        let SegmentPlan::Planned {
+            segment_lens,
+            payload_base,
+        } = focrq_segment_plan(&blob, total, 24).expect("plan over the full prefix")
+        else {
+            panic!("the full prefix contains the header");
+        };
+        assert!(
+            segment_lens.len() > 1,
+            "a 24-byte budget must produce multiple segments, got {segment_lens:?}"
+        );
+        assert_eq!(segment_lens.iter().sum::<u64>(), total, "exact coverage");
+        assert!(
+            segment_lens[0] >= payload_base,
+            "segment 0 must contain the whole preamble + header"
+        );
+
+        // The planned segmentation loads and agrees with the whole blob.
+        let mut segments = Vec::new();
+        let mut off = 0u64;
+        for len in &segment_lens {
+            segments.push((off, blob[off as usize..(off + len) as usize].to_vec()));
+            off += len;
+        }
+        let planned = Weights::from_segments(segments).expect("planned segments load");
+        let whole = Weights::from_bytes(blob).expect("whole blob loads");
+        let names: Vec<String> = whole.names().map(str::to_owned).collect();
+        for name in &names {
+            assert_eq!(
+                planned.tensor(name).unwrap().data,
+                whole.tensor(name).unwrap().data,
+                "{name} payload after planned segmentation"
+            );
+        }
     }
 
     /// bd-4l71 residency: a canonical row-major `QInt8PerChan` record is
