@@ -463,7 +463,12 @@ fn add_assign(x: &mut Mat, y: &Mat) -> FocrResult<()> {
 /// # Errors
 /// Shape violations, a missing tensor, or a kernel failure.
 pub fn encode(w: &TromrEncoderW, pixels: &[f32], width: usize) -> FocrResult<Mat> {
+    // `encode` is the outermost owner of this staff's vision pass, so it owns
+    // the progress budget: the ResNet backbone counts as one unit ahead of the
+    // ViT blocks, which each report as they retire.
+    super::progress::vision_begin(w.blocks.len() as u64 + 1);
     let feat = backbone(w, pixels, width)?;
+    super::progress::vision_step();
     let x = tokens_from_feature(&feat); // [8·wp, 1024] row-major (r, c)
     let x = w.patch_proj.apply(&x)?; // [8·wp, 256]
 
@@ -495,6 +500,9 @@ pub fn encode(w: &TromrEncoderW, pixels: &[f32], width: usize) -> FocrResult<Mat
         nn::gelu(&mut m);
         let m = blk.fc2.apply(&m)?;
         add_assign(&mut tok, &m)?;
+        // Sequential, on the thread that entered the forward — the only place
+        // a progress event may be raised (see `super::progress`).
+        super::progress::vision_step();
     }
     nn::layer_norm(&tok, Some(&w.final_ln_w), Some(&w.final_ln_b), LN_EPS)
 }
@@ -934,6 +942,8 @@ pub fn generate_with(w: &TromrDecoderW, ctx: &Mat, pick: DecodePick) -> FocrResu
         rhythm.push(r);
         pitch.push(pick_id(&w.head_pitch, &mut rng)?);
         lift.push(pick_id(&w.head_lift, &mut rng)?);
+        // `rhythm[0]` is the seed token, so the emitted count is len-1.
+        super::progress::emit("decode", rhythm.len() as u64 - 1, MAX_SEQ as u64);
         if r == crate::tokenizer::music::EOS_ID {
             break;
         }
@@ -1764,7 +1774,9 @@ pub fn recognize(
     img: &image::DynamicImage,
 ) -> FocrResult<MusicResult> {
     let t0 = Instant::now();
+    super::progress::emit("preprocess", 0, 0);
     let (pixels, width) = crate::preprocess::tromr_staff_tensor(img)?;
+    super::progress::emit("preprocess", 1, 1);
     let enc = TromrEncoderW::build(weights)?;
     let ctx = encode(&enc, &pixels, width)?;
     super::timing_log(&format!(
@@ -1929,6 +1941,7 @@ pub fn recognize_page(
     let crops = crate::preprocess::staff_detect::detect_staves(img)?;
     if crops.len() < 2 {
         let (w, h) = (img.width() as usize, img.height() as usize);
+        super::progress::emit("staff", 0, 1);
         let res = recognize(weights, tk, img)?;
         return Ok(PageRecognition {
             staves: vec![(0, res, (0, 0, w, h))],
@@ -1938,7 +1951,11 @@ pub fn recognize_page(
     super::timing_log(&format!("  tromr.staff_detect {} staves", crops.len()));
     let mut staves = Vec::with_capacity(crops.len());
     let mut skips = Vec::new();
+    let staff_total = crops.len() as u64;
     for (index, crop) in crops.into_iter().enumerate() {
+        // The per-staff loop is sequential (doctrine #5), so this is the outer
+        // scope a progress consumer maps the vision/decode counts into.
+        super::progress::emit("staff", index as u64, staff_total);
         let (cw, ch, bbox) = (crop.w, crop.h, crop.bbox);
         // Over-budget bands (which the geometry pass could not fit,
         // bd-av64.14) can try barline splitting (bd-av64.4) — EXPERIMENTAL

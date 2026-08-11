@@ -534,6 +534,9 @@ fn forward_with_supplied<'w>(
     for l in 0..cfg.num_layers {
         let block = block_at(l)?;
         x = transformer_block(cfg, &block, &x)?;
+        // Sequential, on the thread that entered the forward — the only place
+        // a progress event may be raised (see `super::progress`).
+        super::progress::vision_step();
     }
     Ok(x)
 }

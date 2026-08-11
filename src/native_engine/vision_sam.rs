@@ -694,6 +694,9 @@ fn forward_core<'w>(
     for i in 0..depth {
         let blk = block_at(i)?;
         x = block_forward_impl(&blk, &x, gh, gw, low_mem)?;
+        // Sequential, on the thread that entered the forward — the only place
+        // a progress event may be raised (see `super::progress`).
+        super::progress::vision_step();
     }
     super::timing_log(&format!(
         "    sam.blocks {:.2}s",

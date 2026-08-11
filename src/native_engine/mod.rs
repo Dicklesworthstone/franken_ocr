@@ -31,6 +31,7 @@ pub mod moe;
 pub mod nn;
 pub mod onechart;
 pub mod postprocess;
+pub mod progress;
 pub mod rswa;
 pub mod sampler;
 pub mod smolvlm2;
@@ -2079,7 +2080,9 @@ impl OcrModel {
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
         // Mode = the certified Base-1024 default unless the CLI overrode it
         // (--base-size/--image-size/--crop-mode, bd-1e9n).
+        progress::emit("preprocess", 0, 0);
         let pre = preprocess::preprocess_image(image_path, preprocess_mode())?;
+        progress::emit("preprocess", 1, 1);
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
     }
@@ -2106,7 +2109,9 @@ impl OcrModel {
             return self.forward_tromr(&img);
         }
         let t = Instant::now();
+        progress::emit("preprocess", 0, 0);
         let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
+        progress::emit("preprocess", 1, 1);
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
     }
@@ -2368,6 +2373,7 @@ impl OcrModel {
 
         // Detokenize the generated ids into the raw model text (the postprocess
         // pass strips EOS / parses ref-det / rewrites image spans).
+        progress::emit("postprocess", 0, 0);
         let decoded = self.tokenizer()?.decode(&generated)?;
         Ok((decoded, image_w, image_h))
     }
@@ -3258,7 +3264,15 @@ impl OcrModel {
             None
         };
         let mut features = Vec::new();
-        for view in Self::views(pre) {
+        let views = Self::views(pre);
+        // Progress budget for the whole tower: every view pays the same fixed
+        // SAM + CLIP block count, so the per-block hooks inside the two towers
+        // report one continuous, determinate count across views.
+        progress::vision_begin(
+            views.len() as u64
+                * (vision_sam::DEPTH as u64 + vision_clip::ClipConfig::default().num_layers as u64),
+        );
+        for view in views {
             // SAM tower -> [1024, 16*16] x3 feature (flatten(2) layout, OQ-6).
             let ts = Instant::now();
             let sam = if let Some(statics) = statics {
@@ -3672,7 +3686,9 @@ impl OcrModel {
         // Prefill once, capturing each layer's reference K/V; `last_hidden` is the
         // final prefill position, which predicts the FIRST generated token.
         let tp = Instant::now();
+        progress::emit("prefill", 0, prefill_len as u64);
         let (hidden, mut caches) = decoder::prefill_with_cache(wc, &inputs_embeds)?;
+        progress::emit("prefill", prefill_len as u64, prefill_len as u64);
         let mut last_hidden = Self::last_hidden_row(&hidden)?;
         timing_log(&format!(
             "prefill {:.2}s ({} tokens)",
@@ -3694,6 +3710,9 @@ impl OcrModel {
             generated.push(step.token_id);
             emitted.push(step.token_id);
             runaway_guard.check_after_emit(&emitted, step.is_eos)?;
+            // Per-token progress. Sequential loop on the calling thread; the
+            // hook is a relaxed atomic load when no sink is installed.
+            progress::emit("decode", emitted.len() as u64, params.max_length as u64);
             if let Some(f) = observer.as_deref_mut() {
                 f(step.token_id);
             }
@@ -3781,7 +3800,9 @@ impl OcrModel {
         ));
 
         let tp = Instant::now();
+        progress::emit("prefill", 0, prefill_len as u64);
         let (hidden, mut caches) = decoder::prefill_with_cache_i8(wc, &inputs_embeds)?;
+        progress::emit("prefill", prefill_len as u64, prefill_len as u64);
         let mut last_hidden = Self::last_hidden_row(&hidden)?;
         timing_log(&format!(
             "prefill_i8 {:.2}s ({} tokens)",
@@ -3850,6 +3871,9 @@ impl OcrModel {
             generated.push(step.token_id);
             emitted.push(step.token_id);
             runaway_guard.check_after_emit(&emitted, step.is_eos)?;
+            // Per-token progress. Sequential loop on the calling thread; the
+            // hook is a relaxed atomic load when no sink is installed.
+            progress::emit("decode", emitted.len() as u64, params.max_length as u64);
             if let Some(f) = observer.as_deref_mut() {
                 f(step.token_id);
             }
@@ -3940,6 +3964,7 @@ impl OcrModel {
         let mut last_hidden = last_hidden.clone();
         while emitted.len() < params.max_length {
             crate::cancel_checkpoint()?;
+            progress::emit("decode", emitted.len() as u64, params.max_length as u64);
             let draft = spec::draft_ngram(generated, spec::SPEC_DRAFT_MAX, spec::SPEC_DRAFT_NGRAM);
             if draft.is_empty() {
                 // EMPTY-DRAFT FALLBACK: nothing to verify, so take exactly ONE
@@ -4139,6 +4164,9 @@ impl OcrModel {
             generated.push(step.token_id);
             emitted.push(step.token_id);
             runaway_guard.check_after_emit(&emitted, step.is_eos)?;
+            // Per-token progress. Sequential loop on the calling thread; the
+            // hook is a relaxed atomic load when no sink is installed.
+            progress::emit("decode", emitted.len() as u64, params.max_length as u64);
             if let Some(f) = observer.as_deref_mut() {
                 f(step.token_id);
             }
