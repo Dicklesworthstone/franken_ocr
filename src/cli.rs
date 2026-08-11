@@ -1,10 +1,11 @@
 //! The `focr` clap-derive CLI surface (plan §7.2).
 //!
-//! Subcommands are Phase-0 skeleton stubs: the diagnostics (`robot
-//! schema/health/backends`) work today; `ocr` routes through the native model
-//! resolver/engine skeleton and then fails cleanly at the first unimplemented
-//! stage, while `convert` and `doctor` return clear `NotImplemented` errors
-//! pointing at the plan phase that lands them. PDF input is handled natively:
+//! The diagnostics (`robot schema/health/backends`) work today; `ocr` routes
+//! through the native model resolver/engine; `convert` writes real `.focrq`
+//! artifacts (`--quant int8` conservative recipe, `--quant int4` the wasm
+//! experts-int4 recipe); `doctor` is the live detect-only doctor. Anything
+//! still unimplemented returns a clear `NotImplemented` error pointing at the
+//! plan phase that lands it. PDF input is handled natively:
 //! `focr ocr file.pdf` rasterizes each page (the pure-Rust [`crate::pdf`] scanned-
 //! image fast path) and feeds it through the same pipeline an image takes.
 //!
@@ -2151,37 +2152,29 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     Ok(())
 }
 
-/// Offline weight transform: raw bf16 safetensors → a self-contained int8
-/// `.focrq` (plan §5). Unlimited-OCR quantizes only the validated decoder
-/// FFN/expert GEMMs; attention q/k/v/o, `lm_head`, vision, projector,
-/// `embed_tokens`, router, and norms remain high precision. `--quant int4` is
-/// not yet validated (doctrine #1) and returns `NotImplemented`.
+/// Offline weight transform: raw bf16 safetensors → a self-contained `.focrq`
+/// (plan §5). `--quant int8` is the validated conservative recipe (decoder
+/// FFN/expert GEMMs int8; attention q/k/v/o, `lm_head`, vision, projector,
+/// `embed_tokens`, router, and norms high precision). `--quant int4` emits the
+/// explicitly NON-DEFAULT wasm/browser Unlimited-OCR recipe (bd-50wo stage 1):
+/// expert/dense FFN int4 per-group, attention + `lm_head` + `embed_tokens`
+/// int8, everything else high precision — an artifact the model resolver never
+/// auto-selects (explicit `--model` path only).
 fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
-    // int4: surface the machine scaffold (so robot callers still see the planned
-    // shape) then refuse — BEFORE any file I/O, so the outcome is deterministic
-    // regardless of whether the input exists.
-    if args.quant == QuantTarget::Int4 {
-        if args.json {
-            emit(&serde_json::json!({
-                "schema_version": robot::ROBOT_SCHEMA_VERSION,
-                "command": "convert",
-                "status": "scaffold",
-                "implemented": false,
-                "input": args.input,
-                "output": args.output,
-                "quant": args.quant.as_str(),
-                "arch": args.arch.as_str(),
-            }));
-        }
-        return Err(FocrError::NotImplemented(
-            "focr convert --quant int4 is not yet supported; the int4 group-quantized \
-             path is unvalidated (use --quant int8)"
-                .into(),
-        ));
+    // int4 targets the wasm runtime: offline SMMLA/VNNI/AMX prepacking is a
+    // native-host concern the wasm runtime never consumes. Refuse BEFORE any
+    // file I/O so the outcome is deterministic regardless of input existence
+    // (the same pre-I/O determinism the old int4 scaffold guaranteed).
+    if args.quant == QuantTarget::Int4 && args.arch != ArchTarget::Generic {
+        return Err(FocrError::Usage(format!(
+            "focr convert --quant int4 emits the wasm recipe and supports only \
+             --arch generic, got --arch {}",
+            args.arch.as_str()
+        )));
     }
 
-    // int8 — the validated path. Resolve the input the way `ocr` resolves a model
-    // (a `.safetensors` file as-is, or the canonical shard inside a directory).
+    // Resolve the input the way `ocr` resolves a model (a `.safetensors` file
+    // as-is, or the canonical shard inside a directory).
     let resolved = native_engine::OcrModel::resolve_model(&args.input)?;
     let bytes = std::fs::read(&resolved).map_err(|e| {
         FocrError::ModelNotFound(format!(
@@ -2205,15 +2198,40 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
         native_engine::unlimited_ocr_census::validate_conversion_source_sha256(&source_sha256)?;
     }
     let omit_lm_head = arch.tie_word_embeddings();
-    let quantized = weights
-        .names()
-        .filter(|name| quant::convert::is_decoder_int8_tensor_for(name, arch))
-        .filter(|name| !(omit_lm_head && *name == "lm_head.weight"))
-        .count();
+    let convert_quant = match args.quant {
+        QuantTarget::Int8 => quant::convert::ConvertQuant::Int8,
+        QuantTarget::Int4 => quant::convert::ConvertQuant::Int4,
+    };
+    // `tensors_quantized` counts every LOSSY record the artifact will carry:
+    // the conservative int8 set for --quant int8, or the wasm recipe's
+    // int4 + int8 union for --quant int4.
+    let (quantized_int8, quantized_int4) = match convert_quant {
+        quant::convert::ConvertQuant::Int8 => (
+            weights
+                .names()
+                .filter(|name| quant::convert::is_decoder_int8_tensor_for(name, arch))
+                .filter(|name| !(omit_lm_head && *name == "lm_head.weight"))
+                .count(),
+            0usize,
+        ),
+        quant::convert::ConvertQuant::Int4 => {
+            let mut int8 = 0usize;
+            let mut int4 = 0usize;
+            for name in weights.names() {
+                match quant::recipe::classify_wasm_experts_int4(name) {
+                    quant::recipe::WasmInt4Policy::ExpertInt4 => int4 += 1,
+                    quant::recipe::WasmInt4Policy::Int8 => int8 += 1,
+                    quant::recipe::WasmInt4Policy::KeepHighPrecision => {}
+                }
+            }
+            (int8, int4)
+        }
+    };
+    let quantized = quantized_int8 + quantized_int4;
 
     let blob = quant::convert::safetensors_to_focrq(
         &weights,
-        quant::convert::ConvertQuant::Int8,
+        convert_quant,
         args.arch.packing_byte(),
         source_sha256,
         arch,
@@ -2227,8 +2245,12 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     })?;
 
     let sha_hex = hex_encode32(&source_sha256);
-    let quant_recipe = (arch.id() == native_engine::model_arch::default_arch().id())
-        .then_some(quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID);
+    let quant_recipe = (arch.id() == native_engine::model_arch::default_arch().id()).then_some(
+        match convert_quant {
+            quant::convert::ConvertQuant::Int8 => quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID,
+            quant::convert::ConvertQuant::Int4 => quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID,
+        },
+    );
     if args.json {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
@@ -2244,12 +2266,15 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             "source_sha256": sha_hex,
             "tensors": tensor_count,
             "tensors_quantized": quantized,
+            "tensors_int8": quantized_int8,
+            "tensors_int4": quantized_int4,
             "input_bytes": input_bytes,
             "output_bytes": output_bytes,
         }));
     } else {
         eprintln!(
-            "[focr] convert: wrote {} ({} quant {}: {tensor_count} tensors, {quantized} int8, \
+            "[focr] convert: wrote {} ({} quant {}: {tensor_count} tensors, \
+             {quantized_int8} int8 + {quantized_int4} int4, \
              {input_bytes} -> {output_bytes} bytes) source_sha256={sha_hex}{}",
             args.output.display(),
             args.arch.as_str(),

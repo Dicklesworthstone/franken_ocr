@@ -32,7 +32,7 @@
 //!   [C1] `--help` renders the frozen root golden; `ocr --help` documents PDF.   -> cli_root_help_golden / ocr_help_documents_pdf_input
 //!   [C2] `--version` renders `focr <version>` (version scrubbed).             -> cli_version_golden
 //!   [C3] `ocr`    -> env/default model resolver; missing default exits 3.      -> exit_code_conformance / ocr_default_model_not_found_golden
-//!   [C4] `convert`-> NotImplemented, exit 1.                                   -> exit_code_conformance / convert_not_implemented_golden
+//!   [C4] `convert` int8 + int4 (wasm recipe) implemented; missing input -> 3.  -> exit_code_conformance / convert_int4_missing_input_model_not_found_golden
 //!   [C5] `doctor` -> NotImplemented, exit 1.                                   -> exit_code_conformance / doctor_not_implemented_golden
 //! Stable exit codes (`src/error.rs`, plan §7.4):
 //!   [E2] usage error  -> 2   (bad flag / missing subcommand / unknown subcmd). -> exit_code_conformance
@@ -1835,6 +1835,11 @@ fn assert_model_not_found_golden(test: &str, name: &str, argv: &[&str]) {
 
 /// Freeze the scrubbed STDERR of a command that is expected to fail with
 /// `NotImplemented` (exit 1), and assert the exit code + the message shape.
+// Kept for the next NotImplemented CLI surface (its last caller, the int4
+// convert refusal, went live in bd-50wo stage 1 — coverage transformed into
+// `convert_int4_missing_input_model_not_found_golden` and
+// `convert_int4_non_generic_arch_is_pre_io_usage_error`, not deleted).
+#[allow(dead_code)]
 fn assert_not_implemented_golden(test: &str, name: &str, argv: &[&str]) {
     let out = run_focr(argv);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -2145,15 +2150,16 @@ fn models_lists_the_registered_archs_human_and_json() {
     assert_eq!(v["models"][0]["implemented"], serde_json::json!(true));
 }
 
-/// [C4] `focr convert --quant int4` -> NotImplemented golden. The int8 path is
-/// now implemented (it writes a real `.focrq`); int4 remains the unvalidated
-/// lossy path that refuses BEFORE any file I/O (doctrine #1), so this stays a
-/// deterministic NotImplemented surface regardless of the input's existence.
+/// [C4→bd-50wo] `focr convert --quant int4` is now IMPLEMENTED (the wasm
+/// experts-int4 recipe), so the old NotImplemented golden is transformed, not
+/// deleted: with a nonexistent input the surface is the same deterministic
+/// resolver ModelNotFound (exit 3) as `--quant int8` — proving int4 routes
+/// through the real converter path instead of stopping at a refusal.
 #[test]
-fn convert_int4_not_implemented_golden() {
-    assert_not_implemented_golden(
-        "convert_int4_not_implemented_golden",
-        "convert_not_implemented",
+fn convert_int4_missing_input_model_not_found_golden() {
+    assert_model_not_found_golden(
+        "convert_int4_missing_input_model_not_found_golden",
+        "convert_int4_missing_input",
         &[
             "convert",
             "in.safetensors",
@@ -2165,11 +2171,16 @@ fn convert_int4_not_implemented_golden() {
     );
 }
 
-/// `focr convert` accepts the planned quantization + arch-packing enum surface.
+/// `focr convert --quant int4` emits the wasm recipe: only `--arch generic`
+/// is defined, and the refusal happens BEFORE any file I/O (the same pre-I/O
+/// determinism the old int4 scaffold guaranteed) — exit 2 (Usage) regardless
+/// of the input's existence. (Transformed from the old scaffold-JSON test:
+/// int4+x86-vnni was previously accepted by the scaffold and refused as
+/// NotImplemented; it is now a hard usage error.)
 #[test]
-fn convert_arch_json_surface_accepts_targets() {
-    let test = "convert_arch_json_surface_accepts_targets";
-    let out = run_focr(&[
+fn convert_int4_non_generic_arch_is_pre_io_usage_error() {
+    let test = "convert_int4_non_generic_arch_is_pre_io_usage_error";
+    let argv = &[
         "convert",
         "in.safetensors",
         "-o",
@@ -2179,28 +2190,27 @@ fn convert_arch_json_surface_accepts_targets() {
         "--arch",
         "x86-vnni",
         "--json",
-    ]);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .expect("convert --json scaffold line");
-    let v = parse_json_line(line, "convert --json");
-    let pass = out.status.code() == Some(1)
-        && v["status"].as_str() == Some("scaffold")
-        && v["quant"].as_str() == Some("int4")
-        && v["arch"].as_str() == Some("x86-vnni");
+    ];
+    let out = run_focr(argv);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let scrubbed = scrub(&stderr);
+    let code = out.status.code();
+    let pass = code == Some(2) && scrubbed.contains("only --arch generic");
     tlog!(test,
-        "case": "convert_arch",
+        "case": "convert_int4_arch",
         "event": "assert",
-        "assertion": "convert --json accepts int4 + x86-vnni and still exits NotImplemented",
-        "inputs": {"argv": ["convert", "in.safetensors", "-o", "out.focrq", "--quant", "int4", "--arch", "x86-vnni", "--json"]},
-        "exit_code": out.status.code(),
-        "payload": v,
+        "assertion": "convert --quant int4 + non-generic --arch exits 2 (Usage) pre-I/O",
+        "inputs": {"argv": argv},
+        "exit_code": code,
+        "stderr": scrubbed.trim(),
         "pass": pass,
         "result": if pass { "pass" } else { "fail" },
     );
-    assert!(pass, "unexpected convert --json result; stdout:\n{stdout}");
+    assert!(
+        pass,
+        "unexpected convert int4 arch-refusal result (code {code:?}); stderr:\n{scrubbed}"
+    );
+    assert_golden(test, "convert_int4_arch_usage", &scrubbed);
 }
 
 /// [C5] `focr doctor` -> NotImplemented golden (message points at Phase 5).
@@ -2530,10 +2540,12 @@ fn exit_code_conformance() {
             clause: "E3",
             xfail: None,
         },
-        // [E1] not-implemented -> 1. int8 convert is implemented; the int4 lossy
-        // path is the remaining NotImplemented surface (refuses before I/O).
+        // [E3] int4 convert is now implemented (bd-50wo stage 1: the wasm
+        // experts-int4 recipe): this static-argv row points at a NON-EXISTENT
+        // input, so like int8 it resolves to ModelNotFound (3) — the row proves
+        // int4 routes through the real converter path, not the old scaffold.
         ExitRow {
-            label: "convert --quant int4 -> 1 (NotImplemented)",
+            label: "convert --quant int4, missing input -> 3 (model-not-found)",
             argv: &[
                 "convert",
                 "in.safetensors",
@@ -2542,8 +2554,26 @@ fn exit_code_conformance() {
                 "--quant",
                 "int4",
             ],
-            expect: 1,
-            clause: "E1",
+            expect: 3,
+            clause: "E3",
+            xfail: None,
+        },
+        // [E2] the int4 wasm recipe defines only --arch generic; the refusal is
+        // pre-I/O, so it is deterministic even with the missing input.
+        ExitRow {
+            label: "convert --quant int4 --arch x86-vnni -> 2 (usage)",
+            argv: &[
+                "convert",
+                "in.safetensors",
+                "-o",
+                "out.focrq",
+                "--quant",
+                "int4",
+                "--arch",
+                "x86-vnni",
+            ],
+            expect: 2,
+            clause: "E2",
             xfail: None,
         },
         ExitRow {

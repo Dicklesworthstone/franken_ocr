@@ -35,7 +35,7 @@
 use sha2::{Digest, Sha256};
 
 use super::focrq::{FocrqBuilder, WriteDType};
-use super::recipe::Recipe;
+use super::recipe::{Recipe, WasmInt4Policy, classify_wasm_experts_int4};
 use crate::error::{FocrError, FocrResult};
 use crate::native_engine::model_arch::ModelArch;
 use crate::native_engine::nn;
@@ -65,9 +65,15 @@ pub enum ConvertQuant {
     /// Per-output-channel symmetric int8 on the decoder GEMM tensors — the
     /// validated, must-have path.
     Int8,
-    /// Group-quantized int4. NOT yet shipped (AGENTS.md doctrine #1: never ship
-    /// an unverified lossy path); [`safetensors_to_focrq`] returns
-    /// [`FocrError::NotImplemented`].
+    /// The explicitly NON-DEFAULT wasm/browser Unlimited-OCR recipe (bd-50wo
+    /// stage 1): every tensor stored per [`classify_wasm_experts_int4`] —
+    /// expert/dense FFN GEMMs as `QInt4PerGroup` ([`wasm_int4_group_size`] per
+    /// tensor), attention + `lm_head` + `embed_tokens` as `QInt8PerChan`,
+    /// everything else BF16/F32 verbatim. Quantization math v1 is the plain
+    /// symmetric RTN of [`super::int4::pack_int4_bf16`]; the calibration-aware
+    /// upgrades (weighted scale search, AWQ fold, GPTQ) are LATER bd-50wo
+    /// stages. Only defined for the default (Unlimited-OCR) arch and the
+    /// generic `arch_target`.
     Int4,
 }
 
@@ -190,8 +196,8 @@ pub fn is_decoder_int8_tensor(name: &str) -> bool {
 /// is stored), so existing artifacts are unchanged.
 ///
 /// # Errors
-/// * [`FocrError::NotImplemented`] for [`ConvertQuant::Int4`] — the int4 group
-///   path is not yet validated (doctrine #1).
+/// * [`FocrError::NotImplemented`] for [`ConvertQuant::Int4`] on a non-default
+///   arch — the wasm experts-int4 recipe is defined ONLY for Unlimited-OCR.
 /// * [`FocrError::FormatMismatch`] if a decoder int8 tensor is not rank-2
 ///   `[n, k]`, if a tensor's bytes disagree with its shape, or if an input tensor
 ///   is unexpectedly already quantized (the converter input must be raw bf16/f32).
@@ -203,11 +209,7 @@ pub fn safetensors_to_focrq(
     arch: &dyn ModelArch,
 ) -> FocrResult<Vec<u8>> {
     if quant == ConvertQuant::Int4 {
-        return Err(FocrError::NotImplemented(
-            "focr convert --quant int4 is not yet supported; the int4 group-quantized \
-             path is unvalidated (use --quant int8)"
-                .into(),
-        ));
+        return wasm_int4_to_focrq(weights, arch_target, source_sha256, arch);
     }
 
     let mut builder = FocrqBuilder::new()
@@ -268,6 +270,136 @@ pub fn safetensors_to_focrq(
         }
     }
     Ok(builder.build())
+}
+
+/// The pinned per-tensor int4 group size of the wasm recipe
+/// ([`UNLIMITED_OCR_WASM_INT4_RECIPE_ID`]): **g16 for `gate_proj` and
+/// `down_proj`** (and the dense layer-0 equivalents), **g32 for `up_proj`** —
+/// the measured sensitivity order from the quantization research
+/// (gate > down > up), spending the finer groups where the error hurts most.
+///
+/// Only meaningful for names classified [`WasmInt4Policy::ExpertInt4`]; the
+/// group size is recorded per tensor record, so the reader never guesses.
+#[must_use]
+pub fn wasm_int4_group_size(name: &str) -> usize {
+    if name.ends_with(".up_proj.weight") {
+        32
+    } else {
+        16
+    }
+}
+
+/// The [`ConvertQuant::Int4`] arm: emit the wasm/browser Unlimited-OCR artifact
+/// ([`UNLIMITED_OCR_WASM_INT4_RECIPE_ID`]) — the same census-complete tensor
+/// directory as the conservative converter, with per-tensor storage decided by
+/// [`classify_wasm_experts_int4`]:
+///
+/// * [`WasmInt4Policy::ExpertInt4`] → [`super::int4::pack_int4_bf16`]
+///   (per-group symmetric RTN, group size per [`wasm_int4_group_size`]);
+/// * [`WasmInt4Policy::Int8`] → the SAME per-output-channel int8 quantization
+///   as the conservative arm ([`quantize_decoder_tensor`]);
+/// * [`WasmInt4Policy::KeepHighPrecision`] → bf16/f32 passthrough, byte-verbatim.
+///
+/// The recipe is Unlimited-OCR-only (the classifier is written against that
+/// census) and the artifact targets the browser, so only the generic
+/// `arch_target` (0) is accepted — offline SMMLA/VNNI/AMX prepacking is a
+/// native-host concern the wasm runtime never consumes.
+fn wasm_int4_to_focrq(
+    weights: &Weights,
+    arch_target: u8,
+    source_sha256: [u8; 32],
+    arch: &dyn ModelArch,
+) -> FocrResult<Vec<u8>> {
+    if arch.id() != crate::native_engine::model_arch::default_arch().id() {
+        return Err(FocrError::NotImplemented(format!(
+            "focr convert --quant int4 implements only the Unlimited-OCR wasm recipe \
+             {UNLIMITED_OCR_WASM_INT4_RECIPE_ID:?}; --model-id {:?} has no certified int4 \
+             recipe (use --quant int8)",
+            arch.id()
+        )));
+    }
+    if arch_target != 0 {
+        return Err(FocrError::Usage(format!(
+            "focr convert --quant int4 targets the wasm runtime: only --arch generic \
+             (arch_target 0) is defined for recipe {UNLIMITED_OCR_WASM_INT4_RECIPE_ID:?}, \
+             got arch_target {arch_target}"
+        )));
+    }
+
+    let mut builder = FocrqBuilder::new()
+        .with_arch_target(arch_target)
+        .with_source_sha256(source_sha256)
+        .with_model_id(arch.id())
+        .with_license_notice(arch.license_notice())
+        .with_packing_manifest_json(format!(
+            r#"{{"quant_recipe":"{UNLIMITED_OCR_WASM_INT4_RECIPE_ID}"}}"#
+        ));
+
+    let names: Vec<String> = weights.names().map(str::to_owned).collect();
+    for name in &names {
+        match classify_wasm_experts_int4(name) {
+            WasmInt4Policy::ExpertInt4 => quantize_expert_int4_tensor(&mut builder, weights, name)?,
+            WasmInt4Policy::Int8 => quantize_decoder_tensor(&mut builder, weights, name, 0)?,
+            WasmInt4Policy::KeepHighPrecision => {
+                // Same source-dtype guard as the conservative arm: the pinned
+                // Unlimited-OCR checkpoint stores only BF16/F32.
+                if matches!(
+                    weights.record(name).map(|record| record.dtype),
+                    Some(DType::F16)
+                ) {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "convert: Unlimited-OCR high-precision tensor {name:?} is F16; recipe \
+                         {UNLIMITED_OCR_WASM_INT4_RECIPE_ID} permits only source BF16 or F32"
+                    )));
+                }
+                copy_high_precision_tensor(&mut builder, weights, name)?;
+            }
+        }
+    }
+    Ok(builder.build())
+}
+
+/// Quantize one expert/dense-FFN `[n, k]` weight to per-group symmetric int4
+/// with the pinned [`super::int4::pack_int4_bf16`] packing (low-nibble-first,
+/// widen-then-quantize), staging a `QInt4PerGroup` record that carries its own
+/// `group_size` ([`wasm_int4_group_size`]).
+fn quantize_expert_int4_tensor(
+    builder: &mut FocrqBuilder,
+    weights: &Weights,
+    name: &str,
+) -> FocrResult<()> {
+    let record = weights.record(name).ok_or_else(|| {
+        FocrError::FormatMismatch(format!("convert: tensor {name:?} missing from directory"))
+    })?;
+    if record.shape.len() != 2 {
+        return Err(FocrError::FormatMismatch(format!(
+            "convert: expert int4 tensor {name:?} must be rank-2 [n, k], got shape {:?}",
+            record.shape
+        )));
+    }
+    let (n, k) = (record.shape[0], record.shape[1]);
+    let group_size = wasm_int4_group_size(name);
+    // Fail with a converter error (not the packer's contract panic) on a shape
+    // the pinned packing cannot represent.
+    if k == 0 || !k.is_multiple_of(2) || !k.is_multiple_of(group_size) {
+        return Err(FocrError::FormatMismatch(format!(
+            "convert: expert int4 tensor {name:?} has k {k}, which group_size {group_size} \
+             cannot tile (k must be even and a multiple of the group size)"
+        )));
+    }
+    // Widen bf16→f32 (exact — identical to `pack_int4_bf16`'s own widening),
+    // then the pinned per-group symmetric RTN.
+    let mat = weights.mat(name)?;
+    let q = super::int4::pack_int4_f32(&mat.data, n, k, group_size);
+    builder.add_quantized(
+        name,
+        WriteDType::QInt4PerGroup,
+        vec![n, k],
+        q.packed_bytes(),
+        q.scale_bytes(),
+        group_size,
+        0,
+    )
 }
 
 /// Convert-time proof that an arch-declared UNTIED `lm_head` really is untied:
@@ -729,20 +861,217 @@ mod tests {
         assert_eq!(empty[3], 0x42);
     }
 
+    // ── bd-50wo stage 1: the wasm experts-int4 converter arm ─────────────────
+    // (transforms the old `int4_is_not_implemented` refusal test into coverage
+    // of the now-implemented behavior — the refusal is retained only for the
+    // still-undefined non-default-arch / non-generic-arch_target combinations.)
+
+    /// A wasm-recipe-shaped synthetic checkpoint. Int4 groups need `k` to be a
+    /// multiple of 32 (up_proj is g32), so this uses k=32/64 shapes; every
+    /// [`WasmInt4Policy`] bucket is represented: expert + dense-layer-0 FFN
+    /// GEMMs (int4), attention + lm_head + embed_tokens (int8), and the
+    /// high-precision refusal set (router gate, norms, vision).
+    fn synthetic_wasm_safetensors() -> Vec<u8> {
+        let ramp = |n: usize, k: usize, bias: f32| -> Vec<f32> {
+            (0..n * k).map(|i| (i as f32) * 0.37 - bias).collect()
+        };
+        build_safetensors(&[
+            // int8 set (gated-in-conservative + embed_tokens under wasm).
+            ("lm_head.weight", vec![6, 32], ramp(6, 32, 11.0)),
+            ("model.embed_tokens.weight", vec![6, 32], ramp(6, 32, 3.5)),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![4, 32],
+                ramp(4, 32, 7.0),
+            ),
+            (
+                "model.layers.1.self_attn.o_proj.weight",
+                vec![4, 32],
+                ramp(4, 32, 6.0),
+            ),
+            // int4 set: dense layer-0 SwiGLU + routed/shared experts.
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![5, 32],
+                ramp(5, 32, 9.0),
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![5, 64],
+                ramp(5, 64, 2.0),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![4, 32],
+                ramp(4, 32, 4.0),
+            ),
+            (
+                "model.layers.1.mlp.experts.0.up_proj.weight",
+                vec![3, 32],
+                ramp(3, 32, 5.0),
+            ),
+            (
+                "model.layers.1.mlp.experts.0.gate_proj.weight",
+                vec![3, 32],
+                ramp(3, 32, 8.0),
+            ),
+            (
+                "model.layers.1.mlp.shared_experts.down_proj.weight",
+                vec![8, 32],
+                ramp(8, 32, 4.0),
+            ),
+            // high-precision set.
+            (
+                "model.layers.1.mlp.gate.weight",
+                vec![2, 32],
+                ramp(2, 32, 3.0),
+            ),
+            (
+                "model.layers.0.input_layernorm.weight",
+                vec![32],
+                ramp(1, 32, 1.0),
+            ),
+            ("model.norm.weight", vec![32], ramp(1, 32, 2.0)),
+            (
+                "vision_model.patch_embed.weight",
+                vec![2, 3],
+                ramp(2, 3, 1.0),
+            ),
+        ])
+    }
+
+    /// The int4 expert set of [`synthetic_wasm_safetensors`], with the pinned
+    /// per-tensor group size (g16 gate/down, g32 up — the measured sensitivity
+    /// order gate > down > up).
+    const WASM_INT4_NAMES: &[(&str, usize)] = &[
+        ("model.layers.0.mlp.gate_proj.weight", 16),
+        ("model.layers.0.mlp.up_proj.weight", 32),
+        ("model.layers.0.mlp.down_proj.weight", 16),
+        ("model.layers.1.mlp.experts.0.up_proj.weight", 32),
+        ("model.layers.1.mlp.experts.0.gate_proj.weight", 16),
+        ("model.layers.1.mlp.shared_experts.down_proj.weight", 16),
+    ];
+
+    const WASM_INT8_NAMES: &[&str] = &[
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.1.self_attn.o_proj.weight",
+    ];
+
+    const WASM_KEPT_NAMES: &[&str] = &[
+        "model.layers.1.mlp.gate.weight",
+        "model.layers.0.input_layernorm.weight",
+        "model.norm.weight",
+        "vision_model.patch_embed.weight",
+    ];
+
     #[test]
-    fn int4_is_not_implemented() {
-        let src = synthetic_safetensors();
-        let w = Weights::from_bytes(src).expect("synthetic safetensors parse");
-        let err = safetensors_to_focrq(
-            &w,
-            ConvertQuant::Int4,
-            0,
-            [0u8; 32],
-            crate::native_engine::model_arch::default_arch(),
-        )
-        .expect_err("int4 must be NotImplemented");
+    fn wasm_int4_group_sizes_follow_measured_sensitivity_order() {
+        for (name, group_size) in WASM_INT4_NAMES {
+            assert_eq!(
+                wasm_int4_group_size(name),
+                *group_size,
+                "{name} group size"
+            );
+        }
+        // The dense layer-0 equivalents follow the same leaf rule.
+        assert_eq!(wasm_int4_group_size("model.layers.5.mlp.gate_proj.weight"), 16);
+        assert_eq!(wasm_int4_group_size("model.layers.5.mlp.up_proj.weight"), 32);
+        assert_eq!(wasm_int4_group_size("model.layers.5.mlp.down_proj.weight"), 16);
+    }
+
+    /// The stage-1 acceptance oracle: every converted tensor record matches the
+    /// [`classify_wasm_experts_int4`] classifier — int4 experts bit-identical
+    /// to [`crate::quant::int4::pack_int4_bf16`] with the pinned group sizes,
+    /// int8 gated set bit-identical to the load-time [`nn::quantize_int8`],
+    /// high-precision set byte-verbatim — and the artifact stamps the wasm
+    /// recipe id + source sha.
+    #[test]
+    fn int4_wasm_convert_matches_classifier_and_pinned_packing() {
+        let src = synthetic_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("synthetic wasm safetensors parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        let blob = safetensors_to_focrq(&w, ConvertQuant::Int4, 0, [9u8; 32], arch)
+            .expect("wasm int4 convert");
+        // The bytes physically declare the wasm recipe.
+        assert!(
+            String::from_utf8_lossy(&blob).contains(UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+            "packing manifest must stamp the wasm recipe id"
+        );
+        let out = Weights::from_bytes(blob.clone()).expect("wasm .focrq parse");
+        assert_eq!(
+            out.quant_recipe(),
+            Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+            "reader-parsed packing_manifest.quant_recipe"
+        );
+        assert_eq!(out.source_sha256(), "09".repeat(32));
+        assert_eq!(out.len(), w.len(), "every source tensor survives");
+
+        // int4 experts: byte-identical to the pinned pack_int4_bf16 packing.
+        for (name, group_size) in WASM_INT4_NAMES {
+            let rec = w.record(name).expect("record");
+            let (n, k) = (rec.shape[0], rec.shape[1]);
+            let bf: Vec<half::bf16> = w
+                .tensor(name)
+                .unwrap()
+                .data
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            let expected = crate::quant::int4::pack_int4_bf16(&bf, n, k, *group_size);
+            let got = out.qint4(name).expect("qint4 readback");
+            assert_eq!((got.n, got.k), (n, k), "{name} [n,k]");
+            assert_eq!(got.group_size, *group_size, "{name} recorded group_size");
+            assert_eq!(got.packed, expected.packed, "{name} packed nibbles");
+            assert_eq!(got.scales, expected.scales, "{name} per-group f32 scales");
+            assert!(out.qint8(name).is_err(), "{name} must NOT be int8");
+        }
+        // int8 gated set: the SAME per-OC quantization as the conservative arm.
+        for name in WASM_INT8_NAMES {
+            let rec = w.record(name).expect("record");
+            let (n, k) = (rec.shape[0], rec.shape[1]);
+            let expected = nn::quantize_int8(&w.mat(name).unwrap().data, n, k);
+            let got = out.qint8(name).expect("qint8 readback");
+            assert_eq!((got.n, got.k), (n, k), "{name} [n,k]");
+            assert_eq!(got.w, expected.w, "{name} int8 payload bit-identical");
+            assert_eq!(got.scales, expected.scales, "{name} scales bit-identical");
+        }
+        // high-precision set: raw bf16 bytes verbatim.
+        for name in WASM_KEPT_NAMES {
+            let before = w.tensor(name).expect("src view");
+            let after = out.tensor(name).expect("out view");
+            assert_eq!(after.dtype, DType::BF16, "{name} dtype preserved");
+            assert_eq!(after.shape, before.shape, "{name} shape preserved");
+            assert_eq!(after.data, before.data, "{name} raw bytes verbatim");
+        }
+
+        // Determinism: same source → same bytes.
+        let again = safetensors_to_focrq(&w, ConvertQuant::Int4, 0, [9u8; 32], arch)
+            .expect("wasm int4 convert again");
+        assert_eq!(
+            sha256_of_bytes(&blob),
+            sha256_of_bytes(&again),
+            "wasm int4 conversion must be byte-deterministic"
+        );
+    }
+
+    /// The refusal surface that REMAINS after stage 1: int4 is defined only
+    /// for the Unlimited-OCR wasm recipe on the generic arch_target.
+    #[test]
+    fn int4_refuses_non_default_arch_and_non_generic_arch_target() {
+        let w = Weights::from_bytes(synthetic_got_safetensors()).expect("synthetic GOT parse");
+        let got = crate::native_engine::model_arch::arch_by_id("got-ocr2").unwrap();
+        let err = safetensors_to_focrq(&w, ConvertQuant::Int4, 0, [0u8; 32], got)
+            .expect_err("non-default arch int4 must be NotImplemented");
         assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
         assert_eq!(err.exit_code(), 1);
+
+        let w = Weights::from_bytes(synthetic_wasm_safetensors()).expect("wasm parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        let err = safetensors_to_focrq(&w, ConvertQuant::Int4, 1, [0u8; 32], arch)
+            .expect_err("non-generic arch_target int4 must be refused");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
     }
 
     // ── B2: arch-aware GOT-OCR2 convert ──────────────────────────────────────
