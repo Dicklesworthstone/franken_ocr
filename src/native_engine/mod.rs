@@ -21,6 +21,7 @@
 //! [`Mat`]: tensor::Mat
 
 pub mod batch_scheduler;
+pub mod calib;
 pub mod connector;
 pub mod decoder;
 pub mod decoder_qwen2;
@@ -3726,6 +3727,14 @@ impl OcrModel {
                 "decode phases (ms): lm_head {lmhead:.0}  attn {attn:.0}  experts {experts:.0}  route {route:.0}"
             ));
         }
+        // `FOCR_CALIB_OUT` (bd-50wo stage A): checkpoint the activation
+        // statistics accumulated so far. Rewriting after every generation (not
+        // only at process exit) means a calibration sweep that is interrupted
+        // still leaves usable statistics for the pages it finished. A no-op —
+        // not even a file open — when the recorder is disarmed.
+        if calib::enabled() {
+            calib::flush()?;
+        }
         Ok(emitted)
     }
 
@@ -3870,6 +3879,10 @@ impl OcrModel {
             timing_log(&format!(
                 "decode_i8 phases (ms): lm_head {lmhead:.0}  attn {attn:.0}  experts {experts:.0}  route {route:.0}"
             ));
+        }
+        // `FOCR_CALIB_OUT` checkpoint — see the twin in `generate_cached`.
+        if calib::enabled() {
+            calib::flush()?;
         }
         Ok(emitted)
     }

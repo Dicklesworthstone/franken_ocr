@@ -37,12 +37,14 @@
 // is a false positive — the index is genuinely needed across several arrays.
 #![allow(clippy::needless_range_loop)]
 
+use super::calib;
 use super::moe;
 use super::nn;
 use super::rswa::{self, BatchedRingCache, RingCache};
 use super::tensor::{Mat, QInt4, QInt8, WeightLayout};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
+use crate::quant::calib as quant_calib;
 use crate::simd;
 use rayon::prelude::*;
 
@@ -950,8 +952,13 @@ fn cached_layer_weights(cl: &CachedLayer) -> LayerWeights<'_> {
 }
 
 /// Run the recipe-approved int8 MLP/MoE for one prefill activation block.
-fn cached_mlp(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Mat> {
-    prefill_mlp_i8(mlp, normed)
+///
+/// `calib_layer` is the decoder layer index when the activation-statistics
+/// recorder is armed (`FOCR_CALIB_OUT`, bd-50wo stage A) and `None` otherwise;
+/// it only ever selects the stat key the recorder files this block's inputs
+/// under, and is inert when the recorder is off.
+fn cached_mlp(mlp: &CachedMlpI8, normed: &Mat, calib_layer: Option<usize>) -> FocrResult<Mat> {
+    prefill_mlp_i8(mlp, normed, calib_layer)
 }
 
 // ── Decode phase profiler (FOCR_PROFILE_DECODE) ──────────────────────────────
@@ -1054,8 +1061,9 @@ fn silu(x: f32) -> f32 {
 }
 
 /// Decode the recipe-approved int8 MLP/MoE for one normalized token row.
-fn decode_mlp(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
-    decode_mlp_i8(mlp, normed)
+/// `calib_layer` as in [`cached_mlp`].
+fn decode_mlp(mlp: &CachedMlpI8, normed: &Mat, calib_layer: Option<usize>) -> FocrResult<Vec<f32>> {
+    decode_mlp_i8(mlp, normed, calib_layer)
 }
 
 /// Final RMSNorm + `lm_head` over the decode hidden (`[1, hidden]`), off the
@@ -1074,6 +1082,9 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
     let t = prof::enabled().then(Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
     let row = normed.row(0);
+    if calib::enabled() {
+        calib::record_row(quant_calib::LM_HEAD_IN_KEY, row);
+    }
     // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv`).
     // Byte-for-byte identical either way — each logit is an independent dot.
     let logits = if lmhead_shard_enabled() {
@@ -1324,6 +1335,9 @@ pub fn prefill_with_cache_chunked(
                 let cl = &wc.layers[layer];
                 let lw = cached_layer_weights(cl);
                 let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
+                if calib::enabled() {
+                    calib::record_rows(&quant_calib::attn_in_key(layer), &normed.data, normed.cols);
+                }
                 let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
                 // Append this chunk's K/V into the running reference block.
                 k_full[layer].data[c0 * qkv_dim..c1 * qkv_dim].copy_from_slice(&k.data);
@@ -1331,10 +1345,13 @@ pub fn prefill_with_cache_chunked(
                 let kpre = Mat::from_vec(c1, qkv_dim, k_full[layer].data[..c1 * qkv_dim].to_vec());
                 let vpre = Mat::from_vec(c1, qkv_dim, v_full[layer].data[..c1 * qkv_dim].to_vec());
                 let context = chunk_prefill_attention(&q, &kpre, &vpre, num_heads, head_dim, c0)?;
+                if calib::enabled() {
+                    calib::record_rows(&quant_calib::o_in_key(layer), &context.data, context.cols);
+                }
                 let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
                 let h = add_residual(&x, &attn_out)?;
                 let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
-                let mlp_out = cached_mlp(&cl.mlp, &normed2)?;
+                let mlp_out = cached_mlp(&cl.mlp, &normed2, calib::enabled().then_some(layer))?;
                 x = add_residual(&h, &mlp_out)?;
             }
             out.data[c0 * hidden..c1 * hidden].copy_from_slice(&x.data);
@@ -1367,16 +1384,22 @@ pub fn prefill_with_cache_chunked(
         // Attention sub-block — mirrors `layer_forward`, but intercepts (k, v) to
         // seed the ring cache's reference block before the prefill SDPA.
         let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
+        if calib::enabled() {
+            calib::record_rows(&quant_calib::attn_in_key(layer), &normed.data, normed.cols);
+        }
         let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
         let (kh, vh) = token_major_to_head_major(&k, &v, seq, num_heads, head_dim)?;
         caches[layer].record_prefill(&kh, &vh, seq)?;
         let context = prefill_attention(&q, &k, &v, num_heads, head_dim)?;
+        if calib::enabled() {
+            calib::record_rows(&quant_calib::o_in_key(layer), &context.data, context.cols);
+        }
         let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
         let h = add_residual(&x, &attn_out)?;
 
         // MLP / MoE sub-block (dense layer 0, MoE 1..11) off the cached weights.
         let normed2 = nn::rms_norm(&h, Some(lw.post_attn_ln), eps)?;
-        let mlp_out = cached_mlp(&cl.mlp, &normed2)?;
+        let mlp_out = cached_mlp(&cl.mlp, &normed2, calib::enabled().then_some(layer))?;
         x = add_residual(&h, &mlp_out)?;
     }
     Ok((x, caches))
@@ -1447,6 +1470,9 @@ pub fn decode_step_with_cache(
         // the head-major `[num_heads, head_dim]` flats the ring kernels expect.
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         let nrow = normed.row(0);
+        if calib::enabled() {
+            calib::record_row(&quant_calib::attn_in_key(layer), nrow);
+        }
         let mut q = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.q_proj, qkv_dim, hidden));
         let mut k = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.k_proj, qkv_dim, hidden));
         let v = gemv(nrow, &cl.v_proj, qkv_dim, hidden);
@@ -1454,6 +1480,9 @@ pub fn decode_step_with_cache(
         apply_rope(&mut k, &rope)?;
         caches[layer].write_decode_step(&k.data, &v)?;
         let context = rswa::decode_attention(&caches[layer], &q.data)?;
+        if calib::enabled() {
+            calib::record_row(&quant_calib::o_in_key(layer), &context.data);
+        }
         let attn_out = Mat::from_vec(1, hidden, gemv(&context.data, &cl.o_proj, hidden, qkv_dim));
         let h = add_residual(&x, &attn_out)?;
         if let Some(t) = t_attn {
@@ -1462,7 +1491,11 @@ pub fn decode_step_with_cache(
 
         // MLP / MoE via the bespoke GEMV (routed top-k experts + shared).
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-        let mlp_out = Mat::from_vec(1, hidden, decode_mlp(&cl.mlp, &normed2)?);
+        let mlp_out = Mat::from_vec(
+            1,
+            hidden,
+            decode_mlp(&cl.mlp, &normed2, calib::enabled().then_some(layer))?,
+        );
         x = add_residual(&h, &mlp_out)?;
     }
     Ok(x)
@@ -1700,13 +1733,25 @@ fn rms_norm_quant_i8(x: &Mat, weight: Option<&[f32]>, eps: f32) -> FocrResult<(V
 /// to the historical int8-only path; int4 arm consumes packed nibbles).
 /// Internally parallel (used for the big dense layer-0 MLP + the shared
 /// expert).
-fn expert_gemv_i8(x: &[f32], gate: &QLinear, up: &QLinear, down: &QLinear) -> Vec<f32> {
+fn expert_gemv_i8(
+    x: &[f32],
+    gate: &QLinear,
+    up: &QLinear,
+    down: &QLinear,
+    calib: Option<(usize, quant_calib::MlpUnit)>,
+) -> Vec<f32> {
+    if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
+        calib::record_row(&quant_calib::ffn_in_key(layer, unit), x);
+    }
     let g = gemv_q(x, gate);
     let u = gemv_q(x, up);
     let inter = gate.n();
     let mut act = vec![0.0f32; inter];
     for i in 0..inter {
         act[i] = silu(g[i]) * u[i];
+    }
+    if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
+        calib::record_row(&quant_calib::down_in_key(layer, unit), &act);
     }
     gemv_q(&act, down)
 }
@@ -1734,7 +1779,16 @@ fn gemv_i8_serial(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
 /// One SwiGLU expert, fully SERIAL (the input is quantized ONCE and reused for
 /// gate+up). The serial twin of [`expert_gemv_i8`] for cross-expert
 /// parallelism; dispatches per-tensor between the int8 and packed-int4 arms.
-fn expert_gemv_i8_serial(x: &[f32], gate: &QLinear, up: &QLinear, down: &QLinear) -> Vec<f32> {
+fn expert_gemv_i8_serial(
+    x: &[f32],
+    gate: &QLinear,
+    up: &QLinear,
+    down: &QLinear,
+    calib: Option<(usize, quant_calib::MlpUnit)>,
+) -> Vec<f32> {
+    if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
+        calib::record_row(&quant_calib::ffn_in_key(layer, unit), x);
+    }
     let (xq, a_scale) = quantize_row_i8(x);
     let g = gemv_q_serial(&xq, a_scale, gate);
     let u = gemv_q_serial(&xq, a_scale, up);
@@ -1742,6 +1796,9 @@ fn expert_gemv_i8_serial(x: &[f32], gate: &QLinear, up: &QLinear, down: &QLinear
     let mut act = vec![0.0f32; inter];
     for i in 0..inter {
         act[i] = silu(g[i]) * u[i];
+    }
+    if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
+        calib::record_row(&quant_calib::down_in_key(layer, unit), &act);
     }
     let (aq, a_scale2) = quantize_row_i8(&act);
     gemv_q_serial(&aq, a_scale2, down)
@@ -2412,7 +2469,11 @@ pub(crate) fn expert_mlp_q(
     gate: &QLinear,
     up: &QLinear,
     down: &QLinear,
+    calib: Option<(usize, quant_calib::MlpUnit)>,
 ) -> FocrResult<Mat> {
+    if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
+        calib::record_rows(&quant_calib::ffn_in_key(layer, unit), &x.data, x.cols);
+    }
     let mut g = linear_q_dynamic(x, gate)?;
     nn::silu(&mut g);
     let u = linear_q_dynamic(x, up)?;
@@ -2425,6 +2486,9 @@ pub(crate) fn expert_mlp_q(
     }
     for (a, &b) in g.data.iter_mut().zip(u.data.iter()) {
         *a *= b;
+    }
+    if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
+        calib::record_rows(&quant_calib::down_in_key(layer, unit), &g.data, g.cols);
     }
     linear_q_dynamic(&g, down)
 }
@@ -2439,6 +2503,7 @@ fn moe_block_i8(
     gate: &[f32],
     experts: &[[QLinear; 3]],
     shared: &[QLinear; 3],
+    calib_layer: Option<usize>,
 ) -> FocrResult<Mat> {
     let n_tok = hidden.rows;
     let h = hidden.cols;
@@ -2469,7 +2534,13 @@ fn moe_block_i8(
         for (r, &(t, _slot, _w)) in members.iter().enumerate() {
             sub.row_mut(r).copy_from_slice(hidden.row(t));
         }
-        let y = expert_mlp_q(&sub, &experts[e][0], &experts[e][1], &experts[e][2])?;
+        let y = expert_mlp_q(
+            &sub,
+            &experts[e][0],
+            &experts[e][1],
+            &experts[e][2],
+            calib_layer.map(|l| (l, quant_calib::MlpUnit::Expert(e))),
+        )?;
         for (r, &(t, slot, w)) in members.iter().enumerate() {
             let yr = y.row(r);
             let base = (t * moe::config::NUM_EXPERTS_PER_TOK + slot) * h;
@@ -2487,7 +2558,13 @@ fn moe_block_i8(
         });
         moe::combine_routed_rows(rows, &routing.indices[t], out.row_mut(t))?;
     }
-    let shared_out = expert_mlp_q(hidden, &shared[0], &shared[1], &shared[2])?;
+    let shared_out = expert_mlp_q(
+        hidden,
+        &shared[0],
+        &shared[1],
+        &shared[2],
+        calib_layer.map(|l| (l, quant_calib::MlpUnit::Shared)),
+    )?;
     for (o, &s) in out.data.iter_mut().zip(shared_out.data.iter()) {
         *o += s;
     }
@@ -2496,28 +2573,44 @@ fn moe_block_i8(
 
 /// Run one int8 layer's MLP/MoE over the `post_attention_layernorm`'d hidden
 /// (prefill, m>1). Int8 twin of [`cached_mlp`].
-fn prefill_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Mat> {
+fn prefill_mlp_i8(mlp: &CachedMlpI8, normed: &Mat, calib_layer: Option<usize>) -> FocrResult<Mat> {
     match mlp {
-        CachedMlpI8::Dense { gate, up, down } => expert_mlp_q(normed, gate, up, down),
+        CachedMlpI8::Dense { gate, up, down } => expert_mlp_q(
+            normed,
+            gate,
+            up,
+            down,
+            calib_layer.map(|l| (l, quant_calib::MlpUnit::Dense)),
+        ),
         CachedMlpI8::Moe {
             gate,
             experts,
             shared,
-        } => moe_block_i8(normed, gate, experts, shared),
+        } => moe_block_i8(normed, gate, experts, shared, calib_layer),
     }
 }
 
 /// Int8 decode MLP/MoE over a single `post_attention_layernorm`'d row. Int8 twin
 /// of [`decode_mlp`] (route top-k via the f32 gate, weighted [`expert_gemv_i8`]
 /// sum, + shared expert).
-fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
+fn decode_mlp_i8(
+    mlp: &CachedMlpI8,
+    normed: &Mat,
+    calib_layer: Option<usize>,
+) -> FocrResult<Vec<f32>> {
     let hidden = config::HIDDEN_SIZE;
     let row = normed.row(0);
     let profiling = prof::enabled();
     match mlp {
         CachedMlpI8::Dense { gate, up, down } => {
             let t = profiling.then(Instant::now);
-            let y = expert_gemv_i8(row, gate, up, down);
+            let y = expert_gemv_i8(
+                row,
+                gate,
+                up,
+                down,
+                calib_layer.map(|l| (l, quant_calib::MlpUnit::Dense)),
+            );
             if let Some(t) = t {
                 prof::add(&prof::EXPERTS_NS, t.elapsed().as_nanos() as u64);
             }
@@ -2554,6 +2647,7 @@ fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
                                 &experts[e][0],
                                 &experts[e][1],
                                 &experts[e][2],
+                                calib_layer.map(|l| (l, quant_calib::MlpUnit::Expert(e))),
                             );
                             for v in y.iter_mut() {
                                 *v *= w;
@@ -2562,7 +2656,15 @@ fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
                         })
                         .collect::<Vec<Vec<f32>>>()
                 },
-                || expert_gemv_i8(row, &shared[0], &shared[1], &shared[2]),
+                || {
+                    expert_gemv_i8(
+                        row,
+                        &shared[0],
+                        &shared[1],
+                        &shared[2],
+                        calib_layer.map(|l| (l, quant_calib::MlpUnit::Shared)),
+                    )
+                },
             );
             let mut out = vec![0.0f32; hidden];
             let rows: [&[f32]; moe::config::NUM_EXPERTS_PER_TOK] =
@@ -2802,7 +2904,7 @@ pub fn prefill_with_cache_i8_chunked(
                 let attn_out = nn::linear_int8_dynamic(&context, &cl.o_proj, None)?;
                 let h = add_residual(&x, &attn_out)?;
                 let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-                let mlp_out = prefill_mlp_i8(&cl.mlp, &normed2)?;
+                let mlp_out = prefill_mlp_i8(&cl.mlp, &normed2, calib::enabled().then_some(layer))?;
                 x = add_residual(&h, &mlp_out)?;
             }
             out.data[c0 * hidden..c1 * hidden].copy_from_slice(&x.data);
@@ -2839,7 +2941,7 @@ pub fn prefill_with_cache_i8_chunked(
         let attn_out = nn::linear_int8_dynamic(&context, &cl.o_proj, None)?;
         let h = add_residual(&x, &attn_out)?;
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-        let mlp_out = prefill_mlp_i8(&cl.mlp, &normed2)?;
+        let mlp_out = prefill_mlp_i8(&cl.mlp, &normed2, calib::enabled().then_some(layer))?;
         x = add_residual(&h, &mlp_out)?;
     }
     Ok((x, caches))
@@ -2932,7 +3034,11 @@ pub fn decode_step_with_cache_i8(
             prof::add(&prof::ATTN_NS, t.elapsed().as_nanos() as u64);
         }
         let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-        let mlp_out = Mat::from_vec(1, hidden, decode_mlp_i8(&cl.mlp, &normed2)?);
+        let mlp_out = Mat::from_vec(
+            1,
+            hidden,
+            decode_mlp_i8(&cl.mlp, &normed2, calib::enabled().then_some(layer))?,
+        );
         x = add_residual(&h, &mlp_out)?;
     }
     Ok(x)
@@ -3250,7 +3356,11 @@ pub fn batched_decode_step_i8_streams(
             let attn_out = Mat::from_vec(1, hidden, attn);
             let h = add_residual(&x[s], &attn_out)?;
             let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-            let mlp_out = Mat::from_vec(1, hidden, decode_mlp_i8(&cl.mlp, &normed2)?);
+            let mlp_out = Mat::from_vec(
+                1,
+                hidden,
+                decode_mlp_i8(&cl.mlp, &normed2, calib::enabled().then_some(layer))?,
+            );
             x[s] = add_residual(&h, &mlp_out)?;
         }
     }
@@ -3435,7 +3545,11 @@ pub(crate) fn verify_forward(
             let attn_out = Mat::from_vec(1, hidden, o);
             let h = add_residual(&x[i], &attn_out)?;
             let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-            let mlp_out = Mat::from_vec(1, hidden, decode_mlp(&cl.mlp, &normed2)?);
+            let mlp_out = Mat::from_vec(
+                1,
+                hidden,
+                decode_mlp(&cl.mlp, &normed2, calib::enabled().then_some(layer))?,
+            );
             x[i] = add_residual(&h, &mlp_out)?;
         }
     }
@@ -3536,7 +3650,11 @@ pub(crate) fn verify_forward_i8(
             let attn_out = Mat::from_vec(1, hidden, attn);
             let h = add_residual(&x[i], &attn_out)?;
             let normed2 = nn::rms_norm(&h, Some(&cl.post_attn_ln), eps)?;
-            let mlp_out = Mat::from_vec(1, hidden, decode_mlp_i8(&cl.mlp, &normed2)?);
+            let mlp_out = Mat::from_vec(
+                1,
+                hidden,
+                decode_mlp_i8(&cl.mlp, &normed2, calib::enabled().then_some(layer))?,
+            );
             x[i] = add_residual(&h, &mlp_out)?;
         }
     }
@@ -3680,12 +3798,14 @@ mod tests {
                 &experts[expert][0],
                 &experts[expert][1],
                 &experts[expert][2],
+                None,
             )?;
             let decode = expert_gemv_i8_serial(
                 hidden.row(0),
                 &experts[expert][0],
                 &experts[expert][1],
                 &experts[expert][2],
+                None,
             );
             for channel in 0..moe::config::HIDDEN_SIZE {
                 prefill_contributions[slot][channel] = weights[slot] * prefill.data[channel];
@@ -3709,7 +3829,7 @@ mod tests {
         let mut batched_data = hidden.data.clone();
         batched_data.extend_from_slice(&hidden.data);
         let batched_hidden = Mat::from_vec(2, moe::config::HIDDEN_SIZE, batched_data);
-        let prefill = moe_block_i8(&batched_hidden, &gate, &experts, &shared)?;
+        let prefill = moe_block_i8(&batched_hidden, &gate, &experts, &shared, None)?;
         assert_eq!(prefill.row(0), expected_prefill.as_slice());
         assert_eq!(prefill.row(1), expected_prefill.as_slice());
 
@@ -3718,7 +3838,7 @@ mod tests {
             experts,
             shared,
         };
-        let decode = decode_mlp_i8(&mlp, &hidden)?;
+        let decode = decode_mlp_i8(&mlp, &hidden, None)?;
         assert_eq!(decode, expected_decode);
         eprintln!("FOCR_MOE_POLICY_PROBE_INT8={case}");
         Ok(())
@@ -3965,8 +4085,8 @@ mod tests {
 
         // Decode (serial, cross-expert-parallel shape) and internally-parallel
         // paths agree bit-exactly — the same integer contraction contract.
-        let decode = expert_gemv_i8_serial(&x, &gate, &up, &down);
-        let parallel = expert_gemv_i8(&x, &gate, &up, &down);
+        let decode = expert_gemv_i8_serial(&x, &gate, &up, &down, None);
+        let parallel = expert_gemv_i8(&x, &gate, &up, &down, None);
         assert_eq!(
             decode.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
             parallel.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
@@ -3974,7 +4094,7 @@ mod tests {
         );
         // The prefill (m=1) driver row equals the decode row bit-exactly too.
         let xm = Mat::from_vec(1, hidden, x.clone());
-        let prefill = expert_mlp_q(&xm, &gate, &up, &down).expect("prefill expert runs");
+        let prefill = expert_mlp_q(&xm, &gate, &up, &down, None).expect("prefill expert runs");
         assert_eq!(
             prefill
                 .row(0)
@@ -4120,12 +4240,13 @@ mod tests {
             hidden,
             (0..hidden).map(|i| (i as f32 * 0.31).sin() * 1.1).collect(),
         );
-        let decoded = decode_mlp_i8(&mlp, &x).expect("decode over artifact int4 runs");
+        let decoded = decode_mlp_i8(&mlp, &x, None).expect("decode over artifact int4 runs");
         let want = expert_gemv_i8(
             x.row(0),
             &QLinear::I4(gate),
             &QLinear::I4(up),
             &QLinear::I4(down),
+            None,
         );
         assert_eq!(
             decoded.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
@@ -4133,7 +4254,7 @@ mod tests {
             "artifact-loaded int4 dense MLP must match direct packed compute"
         );
         // Prefill driver over the same cache agrees with the decode row.
-        let prefill = prefill_mlp_i8(&mlp, &x).expect("prefill over artifact int4 runs");
+        let prefill = prefill_mlp_i8(&mlp, &x, None).expect("prefill over artifact int4 runs");
         assert_eq!(
             prefill
                 .row(0)
