@@ -293,6 +293,61 @@ since exact-token OCR fails in the tail.
     envelope + SER over its crop corpus, and extend the alpha-variance rule
     if real rendered-PNG (transparent-background) staves appear there.
 
+## DISC-005: the wasm-only int4 browser artifact — quantization tail on degraded newsprint + platform f32 decode drift
+- claim_id / evidence_id: CLAIM-WASM-INT4-V2 → scratchpad corpus receipts
+    (`corpus/MANIFEST.json`, `cer_v1_vs_v2.tsv`, `corpus/browser/REPORT*.json`,
+    session 2026-08-10..11); to be re-homed under `artifacts/parity/bd-b8ta/` at
+    the next evidence sweep.
+- Provenance (model commit + fixture hash): HF 3a7f4db… source shard sha256
+    2bc48a7a… → `unlimited-ocr.wasm-int4.focrq` v2 sha256 2653831c… (recipe
+    `unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1`, calibration-aware:
+    importance-weighted clip search + AWQ down_proj fold over a 13-page
+    activation-stats run, `scratchpad/calib/expert_stats.json`). Corpus: 3 repo
+    fixtures + 4 public-domain archive.org scan pages (1873/1886), provenance in
+    `corpus/provenance.md`.
+- CPU feature string: native side aarch64+neon+dotprod (autovec default); browser
+    side wasm32+simd128, serial AND threaded (8 rayon workers) — threaded output
+    byte-identical to serial wasm.
+- Exact command + env: native `focr ocr --model <artifact> <page>` (defaults;
+    `FOCR_STAGE_BUDGET_FORWARD_MS=7200000` for the hard pages); browser via
+    `site/harness/differential.mjs` (real Chromium, real `_headers`, persistent
+    profile).
+- Reference behavior: the certified native bf16-source decode (conservative
+    cached int8 route) on the same pages. NOTE: this is a PROXY reference — the
+    torch oracle was not re-run on these corpus pages (the pinned oracle stack is
+    not installed on this host), and the bf16 decode is itself imperfect OCR. No
+    ground truth exists for the archive scans.
+- Our impl: (a) offline int4/int8 quantization per the wasm recipe
+    (`src/quant/convert.rs::wasm_int4_to_focrq`); (b) browser decode over the
+    identical artifact through `focr-wasm` (scalar int8 tier — bit-identical to
+    every accelerated tier by the selftest contract; the drift source is
+    autovectorized f32 glue codegen, proven by `FOCR_FORCE_ARCH=scalar` native
+    runs reproducing the native answer exactly).
+- Fallback / kill-switch state: the artifact is wasm-lane-only — the native
+    resolver refuses it as a default and `focr pull` never fetches it; native
+    users keep the certified conservative artifact. In-browser, the labeled
+    repetition-guard `no_repeat_ngram=20` (the README-documented
+    `FOCR_NO_REPEAT_NGRAM` mitigation) is applied via the model manifest's
+    `decodeGuard`; the native CLI can reproduce it with the same knob.
+- Measured impact (v2 artifact, true Levenshtein):
+    * Quantization fidelity, native int4 vs native bf16 decode: CER 0 on 3/7
+      pages, ≤0.0006 on 2, 0.0155 on one fixture, **0.1562 on the degraded 1886
+      newsprint page** (v1 RTN was 0.1753; calibration closed 10.9% relative;
+      corpus micro-CER 0.0962 → 0.0856, nothing regressed on any page).
+    * Platform drift, browser vs native on the SAME artifact (v1 measurement):
+      byte-identical modulo the CLI trailing newline on 4/7 pages, ≤3 chars on
+      2, and on the hardest page the un-guarded wasm decode fell into a
+      degenerate repetition loop (CER 0.3489 vs native int4) — the motivation
+      for the labeled `decodeGuard`.
+- Resolution: ACCEPTED for the wasm-only browser lane (never a native default),
+    with per-expert GPTQ error compensation filed as the next quality lever
+    (bd-50wo remainder). INVESTIGATING remains open only for the f32-glue drift
+    class (bd-ajna).
+- Tests affected: `site/harness/differential.mjs` (browser-vs-native
+    differential), `site/harness/persistence.mjs`; native corpus receipts in the
+    scratchpad paths above.
+- Review date: 2026-09-15, or immediately upon a GPTQ-compensated artifact.
+
 ## DISC-004: multi-page (640-squash) f32 subject forks from the bf16 oracle after the deterministic plate
 
 - claim_id / evidence_id: CLAIM-l5multi-fork → `tests/parity_ladder.rs`
