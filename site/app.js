@@ -18,7 +18,8 @@ let nextId = 1;
 const pending = new Map(); // id -> {resolve, reject, timer}
 
 // Watchdogs catch "never", not "slow" — generous ceilings per call type.
-const CEILINGS_MS = { init: 60_000, load: 10 * 60_000, recognize: 10 * 60_000, cancel: 5_000 };
+// recognize: hard archive pages measured at up to ~15 min in-tab (int4 wasm), so the ceiling is 30 min.
+const CEILINGS_MS = { init: 60_000, load: 10 * 60_000, recognize: 30 * 60_000, cancel: 5_000 };
 
 function call(type, payload = {}, transfer = []) {
   return new Promise((resolve, reject) => {
