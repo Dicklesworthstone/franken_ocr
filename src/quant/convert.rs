@@ -34,6 +34,7 @@
 
 use sha2::{Digest, Sha256};
 
+use super::calib::CalibStats;
 use super::focrq::{FocrqBuilder, WriteDType};
 use super::recipe::{Recipe, WasmInt4Policy, classify_wasm_experts_int4};
 use crate::error::{FocrError, FocrResult};
@@ -208,8 +209,41 @@ pub fn safetensors_to_focrq(
     source_sha256: [u8; 32],
     arch: &dyn ModelArch,
 ) -> FocrResult<Vec<u8>> {
+    safetensors_to_focrq_calibrated(weights, quant, arch_target, source_sha256, arch, None)
+}
+
+/// [`safetensors_to_focrq`] with an optional activation calibration
+/// ([`crate::quant::calib`], bd-50wo stages B/C).
+///
+/// `calib: None` reproduces [`safetensors_to_focrq`] **byte-for-byte** — the
+/// uncalibrated artifact is frozen and unchanged. `calib: Some(..)` switches the
+/// `--quant int4` (wasm) arm to the calibration-aware quantizers:
+///
+/// * **stage B** — every int4 group and every int8 output channel picks its
+///   scale by an importance-weighted clip search instead of plain min-max RTN
+///   ([`super::int4::pack_int4_f32_searched`], [`super::int8::quantize_int8_f32_searched`]);
+/// * **stage C** — an AWQ channel-scale fold on each expert's `up_proj`/`down_proj`
+///   pair ([`awq_fold_plan`]).
+///
+/// Both are *value* changes inside the FROZEN storage format: same dtypes, same
+/// group sizes, same nibble packing, same per-group/per-channel scale tables, so
+/// the artifact declares the same `quant_recipe` and the runtime kernels are
+/// untouched. Calibration is only honored for [`ConvertQuant::Int4`]; the
+/// conservative int8 recipe is a separately certified byte contract and ignores it.
+///
+/// # Errors
+/// As [`safetensors_to_focrq`], plus [`FocrError::FormatMismatch`] if a
+/// calibration vector's length disagrees with the tensor it keys.
+pub fn safetensors_to_focrq_calibrated(
+    weights: &Weights,
+    quant: ConvertQuant,
+    arch_target: u8,
+    source_sha256: [u8; 32],
+    arch: &dyn ModelArch,
+    calib: Option<&CalibStats>,
+) -> FocrResult<Vec<u8>> {
     if quant == ConvertQuant::Int4 {
-        return wasm_int4_to_focrq(weights, arch_target, source_sha256, arch);
+        return wasm_int4_to_focrq(weights, arch_target, source_sha256, arch, calib);
     }
 
     let mut builder = FocrqBuilder::new()
@@ -309,6 +343,7 @@ fn wasm_int4_to_focrq(
     arch_target: u8,
     source_sha256: [u8; 32],
     arch: &dyn ModelArch,
+    calib: Option<&CalibStats>,
 ) -> FocrResult<Vec<u8>> {
     if arch.id() != crate::native_engine::model_arch::default_arch().id() {
         return Err(FocrError::NotImplemented(format!(
@@ -335,11 +370,23 @@ fn wasm_int4_to_focrq(
             r#"{{"quant_recipe":"{UNLIMITED_OCR_WASM_INT4_RECIPE_ID}"}}"#
         ));
 
+    // Stage C: the per-layer AWQ channel-scale fold, planned ONCE up front (it
+    // needs a whole layer's `down_proj` weights to choose that layer's alpha).
+    // Empty when uncalibrated ⇒ no fold anywhere.
+    let fold = match calib {
+        Some(stats) => awq_fold_plan(weights, stats)?,
+        None => AwqFoldPlan::default(),
+    };
+
     let names: Vec<String> = weights.names().map(str::to_owned).collect();
     for name in &names {
         match classify_wasm_experts_int4(name) {
-            WasmInt4Policy::ExpertInt4 => quantize_expert_int4_tensor(&mut builder, weights, name)?,
-            WasmInt4Policy::Int8 => quantize_decoder_tensor(&mut builder, weights, name, 0)?,
+            WasmInt4Policy::ExpertInt4 => {
+                quantize_expert_int4_tensor(&mut builder, weights, name, calib, &fold)?;
+            }
+            WasmInt4Policy::Int8 => {
+                quantize_wasm_int8_tensor(&mut builder, weights, name, calib)?;
+            }
             WasmInt4Policy::KeepHighPrecision => {
                 // Same source-dtype guard as the conservative arm: the pinned
                 // Unlimited-OCR checkpoint stores only BF16/F32.
@@ -359,14 +406,356 @@ fn wasm_int4_to_focrq(
     Ok(builder.build())
 }
 
+// ── Stage C: the AWQ channel-scale fold (bd-50wo) ───────────────────────────
+//
+// int4 quantizes each `down_proj` row in groups along its INPUT (intermediate)
+// channels, so a single intermediate channel whose weights are much larger than
+// its neighbours' widens every group it lands in. AWQ removes that imbalance
+// OFFLINE, without changing a single runtime operation, by moving a per-channel
+// scale `s_j` across the elementwise product that feeds `down_proj`.
+//
+// The SwiGLU expert computes
+//
+//     down_in_j = silu(gate·x)_j · (up·x)_j
+//
+// Because the product is ELEMENTWISE in `j` and `silu(gate·x)` is untouched,
+// dividing `up_proj`'s OUTPUT ROW `j` by `s_j` divides `down_in_j` by exactly
+// `s_j`; multiplying `down_proj`'s INPUT COLUMN `j` by `s_j` puts it back:
+//
+//     (W_down[:, j]·s_j) · (down_in_j / s_j) = W_down[:, j] · down_in_j
+//
+// — an exact identity in real arithmetic and bit-close in f32
+// (`awq_fold_is_exact_in_f32`). Only then are the FOLDED weights quantized.
+//
+// The fold is free on the `up_proj` side: scaling a whole output ROW by a
+// constant scales that row's every per-group `max|w|` by the same constant, so
+// the int4 CODES are unchanged and only the stored f32 scales move
+// (`up_proj_row_scaling_is_absorbed_by_the_group_scales`). All the benefit lands
+// on `down_proj`, whose groups become balanced.
+//
+// `s_j = (E[x_j²])^(α/2)` over `down_proj`'s input channels (stage-A statistics),
+// normalized by `1/sqrt(max s · min s)` so the fold neither inflates nor shrinks
+// the pair overall. `α` is chosen PER LAYER from {0.25, 0.5, 0.75} by minimizing
+// that layer's total importance-weighted `down_proj` quantization error — the
+// same objective stage B minimizes, so the two stages cannot pull apart.
+
+/// The α grid searched per decoder layer.
+pub const AWQ_ALPHA_GRID: [f32; 3] = [0.25, 0.5, 0.75];
+
+/// The planned stage-C fold: per expert/dense unit, the per-intermediate-channel
+/// scale vector `s`, plus the α each layer selected (kept for reporting).
+#[derive(Debug, Clone, Default)]
+pub struct AwqFoldPlan {
+    /// Unit prefix (e.g. `model.layers.3.mlp.experts.17`) → `s`, length = the
+    /// unit's intermediate size.
+    scales: std::collections::BTreeMap<String, Vec<f32>>,
+    /// Decoder layer index → the α its `down_proj` error selected.
+    alpha_by_layer: std::collections::BTreeMap<usize, f32>,
+}
+
+impl AwqFoldPlan {
+    /// The fold vector for a unit prefix, if that unit was folded.
+    #[must_use]
+    pub fn scales_for(&self, unit_prefix: &str) -> Option<&[f32]> {
+        self.scales.get(unit_prefix).map(Vec::as_slice)
+    }
+
+    /// `(layer, alpha)` pairs in layer order — the per-layer α the search chose.
+    pub fn alphas(&self) -> impl Iterator<Item = (usize, f32)> + '_ {
+        self.alpha_by_layer.iter().map(|(&l, &a)| (l, a))
+    }
+
+    /// How many units carry a fold.
+    #[must_use]
+    pub fn folded_units(&self) -> usize {
+        self.scales.len()
+    }
+}
+
+/// Split a FFN projection tensor name into `(unit_prefix, leaf)`, e.g.
+/// `("model.layers.3.mlp.experts.17", "down_proj.weight")`. `None` for a name
+/// that is not one of the three SwiGLU projections.
+#[must_use]
+fn split_ffn_unit(name: &str) -> Option<(&str, &str)> {
+    for leaf in ["gate_proj.weight", "up_proj.weight", "down_proj.weight"] {
+        if let Some(prefix) = name.strip_suffix(leaf)
+            && let Some(prefix) = prefix.strip_suffix('.')
+        {
+            return Some((prefix, leaf));
+        }
+    }
+    None
+}
+
+/// The decoder layer index a `model.layers.{L}.…` tensor belongs to.
+#[must_use]
+fn layer_of(name: &str) -> Option<usize> {
+    name.strip_prefix("model.layers.")?
+        .split_once('.')
+        .and_then(|(l, _)| l.parse().ok())
+}
+
+/// The unnormalized AWQ scale vector `s_j = (E[x_j²])^(α/2)`, normalized by
+/// `1/sqrt(max s · min s)` and guarded so every entry is finite and strictly
+/// positive (a channel the calibration never saw is floored to a tiny fraction
+/// of the largest observed channel rather than producing `0^α = 0`).
+#[must_use]
+fn awq_scale_vector(mean_sq: &[f64], alpha: f32) -> Vec<f32> {
+    let max_e = mean_sq.iter().fold(0.0f64, |m, &v| m.max(v));
+    if max_e <= 0.0 || !max_e.is_finite() {
+        return vec![1.0; mean_sq.len()];
+    }
+    let floor = max_e * 1e-12;
+    let mut s: Vec<f64> = mean_sq
+        .iter()
+        .map(|&e| e.max(floor).powf(f64::from(alpha) / 2.0))
+        .collect();
+    let (mut lo, mut hi) = (f64::INFINITY, 0.0f64);
+    for &v in &s {
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    let norm = (lo * hi).sqrt();
+    if norm.is_finite() && norm > 0.0 {
+        for v in s.iter_mut() {
+            *v /= norm;
+        }
+    }
+    s.iter()
+        .map(|&v| {
+            let v = v as f32;
+            if v.is_finite() && v > 0.0 { v } else { 1.0 }
+        })
+        .collect()
+}
+
+/// Apply a planned fold to a `down_proj` `[n, k]` weight: column `j` scaled by
+/// `s[j]`. Also returns the correspondingly rescaled importance
+/// (`E[x_j²] / s_j²`, since the folded GEMM sees `x_j / s_j`).
+#[must_use]
+fn fold_down_proj(
+    w: &[f32],
+    n: usize,
+    k: usize,
+    s: &[f32],
+    importance: &[f64],
+) -> (Vec<f32>, Vec<f64>) {
+    debug_assert_eq!(s.len(), k);
+    let mut out = w.to_vec();
+    for row in out.chunks_exact_mut(k) {
+        for (slot, &sj) in row.iter_mut().zip(s.iter()) {
+            *slot *= sj;
+        }
+    }
+    let _ = n;
+    let imp = importance
+        .iter()
+        .zip(s.iter())
+        .map(|(&e, &sj)| e / f64::from(sj) / f64::from(sj))
+        .collect();
+    (out, imp)
+}
+
+/// Whether the unit owning this `down_proj` also owns a QUANTIZED `up_proj`
+/// whose output rows line up with `down_proj`'s `k` input columns.
+///
+/// The fold is only an identity when BOTH halves move: scaling `down_proj`'s
+/// columns without dividing the producing `up_proj`'s rows would change the
+/// function the expert computes. A unit missing its partner (or with a shape
+/// that does not line up) is therefore left unfolded — refuse, never guess.
+#[must_use]
+fn has_foldable_up_partner(weights: &Weights, down_name: &str, down_k: usize) -> bool {
+    let Some((unit, _)) = split_ffn_unit(down_name) else {
+        return false;
+    };
+    let up_name = format!("{unit}.up_proj.weight");
+    if classify_wasm_experts_int4(&up_name) != WasmInt4Policy::ExpertInt4 {
+        return false;
+    }
+    weights
+        .record(&up_name)
+        .is_some_and(|record| record.shape.len() == 2 && record.shape[0] == down_k)
+}
+
+/// Plan the stage-C fold for every expert/dense unit that has `down_proj`
+/// statistics: choose each LAYER's α by the total importance-weighted int4
+/// quantization error its `down_proj` tensors achieve under that α, then record
+/// the winning `s` per unit. Units without statistics (a starved MoE expert) are
+/// left unfolded and fall back to stage B alone.
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] on a mis-shaped tensor or a calibration vector
+/// whose length disagrees with the tensor it keys.
+pub fn awq_fold_plan(weights: &Weights, calib: &CalibStats) -> FocrResult<AwqFoldPlan> {
+    // Group the calibrated `down_proj` tensors by decoder layer.
+    let mut by_layer: std::collections::BTreeMap<usize, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for name in weights.names() {
+        if classify_wasm_experts_int4(name) != WasmInt4Policy::ExpertInt4 {
+            continue;
+        }
+        let Some((_, leaf)) = split_ffn_unit(name) else {
+            continue;
+        };
+        if leaf != "down_proj.weight" {
+            continue;
+        }
+        let Some(layer) = layer_of(name) else {
+            continue;
+        };
+        by_layer.entry(layer).or_default().push(name.to_string());
+        // (the up_proj partner is validated in the per-layer pass below)
+    }
+
+    let mut plan = AwqFoldPlan::default();
+    for (layer, names) in by_layer {
+        // Per-α total error over this layer's calibrated down_proj tensors.
+        let mut totals = [0.0f64; AWQ_ALPHA_GRID.len()];
+        let mut any = false;
+        for name in &names {
+            let record = weights.record(name).ok_or_else(|| {
+                FocrError::FormatMismatch(format!("convert: tensor {name:?} missing"))
+            })?;
+            if record.shape.len() != 2 {
+                continue;
+            }
+            let (n, k) = (record.shape[0], record.shape[1]);
+            if !has_foldable_up_partner(weights, name, k) {
+                continue;
+            }
+            let Some(importance) = calib.importance_for_checked(name, k)? else {
+                continue;
+            };
+            let group_size = wasm_int4_group_size(name);
+            if k == 0 || !k.is_multiple_of(2) || !k.is_multiple_of(group_size) {
+                continue;
+            }
+            any = true;
+            let mat = weights.mat(name)?;
+            for (i, &alpha) in AWQ_ALPHA_GRID.iter().enumerate() {
+                let s = awq_scale_vector(importance, alpha);
+                let (folded, imp) = fold_down_proj(&mat.data, n, k, &s, importance);
+                totals[i] +=
+                    super::int4::pack_int4_f32_searched(&folded, n, k, group_size, Some(&imp))
+                        .objective;
+            }
+        }
+        if !any {
+            continue;
+        }
+        // Fixed scan order + strict improvement ⇒ deterministic, and ties keep
+        // the smaller (gentler) α.
+        let mut best = 0usize;
+        for i in 1..AWQ_ALPHA_GRID.len() {
+            if totals[i] < totals[best] {
+                best = i;
+            }
+        }
+        let alpha = AWQ_ALPHA_GRID[best];
+        plan.alpha_by_layer.insert(layer, alpha);
+        for name in &names {
+            let Some(record) = weights.record(name) else {
+                continue;
+            };
+            if record.shape.len() != 2 {
+                continue;
+            }
+            let k = record.shape[1];
+            if !has_foldable_up_partner(weights, name, k) {
+                continue;
+            }
+            let Some(importance) = calib.importance_for_checked(name, k)? else {
+                continue;
+            };
+            let Some((unit, _)) = split_ffn_unit(name) else {
+                continue;
+            };
+            plan.scales
+                .insert(unit.to_string(), awq_scale_vector(importance, alpha));
+        }
+    }
+    Ok(plan)
+}
+
+/// How many of the artifact's quantized tensors the calibration actually covers:
+/// `(covered, total)` over every [`WasmInt4Policy::ExpertInt4`] tensor, plus the
+/// same pair for the [`WasmInt4Policy::Int8`] set. A starved MoE expert (no
+/// calibration token ever routed to it) shows up here as an uncovered tensor and
+/// falls back to uniform-importance stage B.
+#[must_use]
+pub fn calib_coverage(weights: &Weights, calib: &CalibStats) -> ((usize, usize), (usize, usize)) {
+    let (mut i4c, mut i4t, mut i8c, mut i8t) = (0usize, 0usize, 0usize, 0usize);
+    for name in weights.names() {
+        let Some(record) = weights.record(name) else {
+            continue;
+        };
+        let k = record.shape.get(1).copied().unwrap_or(0);
+        let covered = calib.importance_for(name, k).is_some();
+        match classify_wasm_experts_int4(name) {
+            WasmInt4Policy::ExpertInt4 => {
+                i4t += 1;
+                i4c += usize::from(covered);
+            }
+            WasmInt4Policy::Int8 => {
+                i8t += 1;
+                i8c += usize::from(covered);
+            }
+            WasmInt4Policy::KeepHighPrecision => {}
+        }
+    }
+    ((i4c, i4t), (i8c, i8t))
+}
+
+/// The wasm recipe's int8 arm: [`quantize_decoder_tensor`] verbatim when
+/// uncalibrated (byte-for-byte the frozen v1 artifact), or the
+/// importance-weighted per-output-channel search when a calibration is supplied.
+fn quantize_wasm_int8_tensor(
+    builder: &mut FocrqBuilder,
+    weights: &Weights,
+    name: &str,
+    calib: Option<&CalibStats>,
+) -> FocrResult<()> {
+    let Some(calib) = calib else {
+        return quantize_decoder_tensor(builder, weights, name, 0);
+    };
+    let record = weights.record(name).ok_or_else(|| {
+        FocrError::FormatMismatch(format!("convert: tensor {name:?} missing from directory"))
+    })?;
+    if record.shape.len() != 2 {
+        return Err(FocrError::FormatMismatch(format!(
+            "convert: decoder int8 tensor {name:?} must be rank-2 [n, k], got shape {:?}",
+            record.shape
+        )));
+    }
+    let (n, k) = (record.shape[0], record.shape[1]);
+    let importance = calib.importance_for_checked(name, k)?;
+    let mat = weights.mat(name)?;
+    let q = super::int8::quantize_int8_f32_searched(&mat.data, n, k, importance);
+    builder.add_quantized(
+        name,
+        WriteDType::QInt8PerChan,
+        vec![n, k],
+        q.weight_bytes(),
+        q.scale_bytes(),
+        0,
+        0,
+    )
+}
+
 /// Quantize one expert/dense-FFN `[n, k]` weight to per-group symmetric int4
 /// with the pinned [`super::int4::pack_int4_bf16`] packing (low-nibble-first,
 /// widen-then-quantize), staging a `QInt4PerGroup` record that carries its own
 /// `group_size` ([`wasm_int4_group_size`]).
+///
+/// With a calibration supplied, the VALUES come from the stage-B weighted search
+/// over the stage-C folded weights instead of plain RTN; the record layout,
+/// dtype and group size are identical either way.
 fn quantize_expert_int4_tensor(
     builder: &mut FocrqBuilder,
     weights: &Weights,
     name: &str,
+    calib: Option<&CalibStats>,
+    fold: &AwqFoldPlan,
 ) -> FocrResult<()> {
     let record = weights.record(name).ok_or_else(|| {
         FocrError::FormatMismatch(format!("convert: tensor {name:?} missing from directory"))
@@ -390,7 +779,58 @@ fn quantize_expert_int4_tensor(
     // Widen bf16→f32 (exact — identical to `pack_int4_bf16`'s own widening),
     // then the pinned per-group symmetric RTN.
     let mat = weights.mat(name)?;
-    let q = super::int4::pack_int4_f32(&mat.data, n, k, group_size);
+    let Some(calib) = calib else {
+        let q = super::int4::pack_int4_f32(&mat.data, n, k, group_size);
+        return builder.add_quantized(
+            name,
+            WriteDType::QInt4PerGroup,
+            vec![n, k],
+            q.packed_bytes(),
+            q.scale_bytes(),
+            group_size,
+            0,
+        );
+    };
+
+    // Calibrated path: apply this unit's stage-C fold (if any) to the weights,
+    // then run the stage-B importance-weighted scale search on the FOLDED values.
+    let importance = calib.importance_for_checked(name, k)?;
+    let unit = split_ffn_unit(name);
+    let folded: Option<(Vec<f32>, Option<Vec<f64>>)> = match unit {
+        Some((prefix, "down_proj.weight")) => fold.scales_for(prefix).map(|s| {
+            // `s` indexes down_proj's INPUT (intermediate) channels.
+            let imp = importance.map_or_else(|| vec![1.0f64; k], <[f64]>::to_vec);
+            let (w, imp) = fold_down_proj(&mat.data, n, k, s, &imp);
+            (w, Some(imp))
+        }),
+        Some((prefix, "up_proj.weight")) => fold.scales_for(prefix).map(|s| {
+            // `s` indexes up_proj's OUTPUT rows; dividing row j by s[j] is what
+            // the down_proj column scaling undoes. Exactly absorbed by the
+            // per-group scales, so the codes are unchanged.
+            let mut w = mat.data.clone();
+            for (row, &sj) in w.chunks_exact_mut(k).zip(s.iter()) {
+                for slot in row.iter_mut() {
+                    *slot /= sj;
+                }
+            }
+            (w, None)
+        }),
+        _ => None,
+    };
+    let (data, importance): (&[f32], Option<&[f64]>) = match &folded {
+        Some((w, Some(imp))) => (w, Some(imp.as_slice())),
+        Some((w, None)) => (w, importance),
+        None => (&mat.data, importance),
+    };
+    if let Some(imp) = importance
+        && imp.len() != k
+    {
+        return Err(FocrError::FormatMismatch(format!(
+            "convert: calibration for {name:?} has {} channels, tensor contracts over {k}",
+            imp.len()
+        )));
+    }
+    let q = super::int4::pack_int4_f32_searched(data, n, k, group_size, importance).q;
     builder.add_quantized(
         name,
         WriteDType::QInt4PerGroup,
@@ -1842,5 +2282,494 @@ mod tests {
             DType::BF16
         );
         assert_eq!(out.license_notice(), FOCR_MODEL_LICENSE_NOTICE);
+    }
+
+    // ── bd-50wo stages B/C: calibration-aware quantization ───────────────────
+
+    use super::super::calib::{CalibStats, ChannelStats, stat_key_for_tensor};
+
+    /// A SwiGLU expert in plain f32: `down(silu(gate·x) * (up·x))`.
+    /// Row-major `[n, k]` weights, `x` a single `[k_in]` activation row.
+    fn swiglu_f32(
+        x: &[f32],
+        gate: (&[f32], usize, usize),
+        up: (&[f32], usize, usize),
+        down: (&[f32], usize, usize),
+    ) -> Vec<f32> {
+        let gemv = |(w, n, k): (&[f32], usize, usize), v: &[f32]| -> Vec<f32> {
+            assert_eq!(v.len(), k);
+            (0..n)
+                .map(|o| {
+                    w[o * k..(o + 1) * k]
+                        .iter()
+                        .zip(v.iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                })
+                .collect()
+        };
+        let g = gemv(gate, x);
+        let u = gemv(up, x);
+        let act: Vec<f32> = g
+            .iter()
+            .zip(u.iter())
+            .map(|(&gv, &uv)| (gv / (1.0 + (-gv).exp())) * uv)
+            .collect();
+        gemv(down, &act)
+    }
+
+    fn ramp_weights(n: usize, k: usize, seed: f32) -> Vec<f32> {
+        (0..n * k)
+            .map(|i| ((i as f32) * 0.017 + seed).sin() * 0.4)
+            .collect()
+    }
+
+    /// Stage C's load-bearing claim: folding `s` out of `up_proj`'s rows and into
+    /// `down_proj`'s columns leaves the expert's FLOATING-POINT output unchanged.
+    /// If this identity failed, every downstream accuracy claim would be measuring
+    /// a different model rather than a better quantization.
+    #[test]
+    fn awq_fold_is_exact_in_f32() {
+        let (hidden, inter) = (16usize, 24usize);
+        let gate = ramp_weights(inter, hidden, 0.3);
+        let up = ramp_weights(inter, hidden, 1.7);
+        let down = ramp_weights(hidden, inter, 2.9);
+        let x: Vec<f32> = (0..hidden).map(|i| ((i as f32) * 0.21).cos()).collect();
+
+        // A realistic, wide-dynamic-range `s` from synthetic activation stats.
+        let mean_sq: Vec<f64> = (0..inter)
+            .map(|j| 10f64.powf(((j % 7) as f64) - 3.0))
+            .collect();
+        for alpha in AWQ_ALPHA_GRID {
+            let s = awq_scale_vector(&mean_sq, alpha);
+            assert_eq!(s.len(), inter);
+            assert!(
+                s.iter().all(|v| v.is_finite() && *v > 0.0),
+                "fold scales must be finite and positive"
+            );
+            // Fold: up rows /= s, down columns *= s.
+            let mut up_folded = up.clone();
+            for (row, &sj) in up_folded.chunks_exact_mut(hidden).zip(s.iter()) {
+                for slot in row.iter_mut() {
+                    *slot /= sj;
+                }
+            }
+            let (down_folded, _) = fold_down_proj(&down, hidden, inter, &s, &vec![1.0f64; inter]);
+
+            let want = swiglu_f32(
+                &x,
+                (&gate, inter, hidden),
+                (&up, inter, hidden),
+                (&down, hidden, inter),
+            );
+            let got = swiglu_f32(
+                &x,
+                (&gate, inter, hidden),
+                (&up_folded, inter, hidden),
+                (&down_folded, hidden, inter),
+            );
+            let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+            for (a, b) in want.iter().zip(got.iter()) {
+                assert!(
+                    (a - b).abs() <= 1e-5 * scale,
+                    "alpha {alpha}: folded output {b} != {a} (tolerance 1e-5 relative)"
+                );
+            }
+        }
+    }
+
+    /// The fold is FREE on the `up_proj` side: scaling a whole output row by a
+    /// constant scales every one of that row's per-group `max|w|` identically, so
+    /// the int4 CODES are untouched and only the stored f32 scales move. Proven
+    /// with power-of-two scales, where the f32 division is itself exact.
+    #[test]
+    fn up_proj_row_scaling_is_absorbed_by_the_group_scales() {
+        let (n, k) = (8usize, 64usize);
+        let w = ramp_weights(n, k, 0.11);
+        let s: Vec<f32> = (0..n).map(|j| (2.0f32).powi((j as i32 % 5) - 2)).collect();
+        let mut folded = w.clone();
+        for (row, &sj) in folded.chunks_exact_mut(k).zip(s.iter()) {
+            for slot in row.iter_mut() {
+                *slot /= sj;
+            }
+        }
+        let base = super::super::int4::pack_int4_f32_searched(&w, n, k, 32, None);
+        let after = super::super::int4::pack_int4_f32_searched(&folded, n, k, 32, None);
+        assert_eq!(
+            base.q.packed, after.q.packed,
+            "row scaling must not change a single int4 code"
+        );
+        let groups = k / 32;
+        for (o, &so) in s.iter().enumerate() {
+            for g in 0..groups {
+                let i = o * groups + g;
+                assert!(
+                    (after.q.scales[i] * so - base.q.scales[i]).abs()
+                        <= base.q.scales[i].abs() * 1e-6,
+                    "scale {i} must move by exactly 1/s"
+                );
+            }
+        }
+    }
+
+    /// A SHAPE-COHERENT wasm-recipe checkpoint (hidden 32, intermediate 64), so
+    /// the SwiGLU units really line up (`down_proj.k == up_proj.n`) the way the
+    /// real Unlimited-OCR census does. The frozen stage-1 fixture
+    /// ([`synthetic_wasm_safetensors`]) deliberately mixes incoherent shapes to
+    /// exercise both group sizes, which is fine for byte-contract tests but
+    /// cannot host the stage-C fold.
+    fn coherent_wasm_safetensors() -> Vec<u8> {
+        let (hidden, inter) = (32usize, 64usize);
+        let w = |n: usize, k: usize, seed: f32| -> Vec<f32> {
+            (0..n * k)
+                .map(|i| ((i as f32) * 0.017 + seed).sin() * 0.4)
+                .collect()
+        };
+        build_safetensors(&[
+            ("lm_head.weight", vec![6, hidden], w(6, hidden, 0.1)),
+            (
+                "model.embed_tokens.weight",
+                vec![6, hidden],
+                w(6, hidden, 0.2),
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![hidden, hidden],
+                w(hidden, hidden, 0.3),
+            ),
+            (
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![hidden, hidden],
+                w(hidden, hidden, 0.4),
+            ),
+            (
+                "model.layers.0.mlp.gate_proj.weight",
+                vec![inter, hidden],
+                w(inter, hidden, 0.5),
+            ),
+            (
+                "model.layers.0.mlp.up_proj.weight",
+                vec![inter, hidden],
+                w(inter, hidden, 0.6),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![hidden, inter],
+                w(hidden, inter, 0.7),
+            ),
+            (
+                "model.layers.1.mlp.experts.0.gate_proj.weight",
+                vec![inter, hidden],
+                w(inter, hidden, 0.8),
+            ),
+            (
+                "model.layers.1.mlp.experts.0.up_proj.weight",
+                vec![inter, hidden],
+                w(inter, hidden, 0.9),
+            ),
+            (
+                "model.layers.1.mlp.experts.0.down_proj.weight",
+                vec![hidden, inter],
+                w(hidden, inter, 1.0),
+            ),
+            (
+                "model.layers.1.mlp.experts.1.gate_proj.weight",
+                vec![inter, hidden],
+                w(inter, hidden, 1.1),
+            ),
+            (
+                "model.layers.1.mlp.experts.1.up_proj.weight",
+                vec![inter, hidden],
+                w(inter, hidden, 1.2),
+            ),
+            (
+                "model.layers.1.mlp.experts.1.down_proj.weight",
+                vec![hidden, inter],
+                w(hidden, inter, 1.3),
+            ),
+            (
+                "model.layers.1.mlp.gate.weight",
+                vec![2, hidden],
+                w(2, hidden, 1.4),
+            ),
+            ("model.norm.weight", vec![hidden], w(1, hidden, 1.5)),
+        ])
+    }
+
+    const COHERENT_INT4_NAMES: &[&str] = &[
+        "model.layers.0.mlp.gate_proj.weight",
+        "model.layers.0.mlp.up_proj.weight",
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.1.mlp.experts.0.gate_proj.weight",
+        "model.layers.1.mlp.experts.0.up_proj.weight",
+        "model.layers.1.mlp.experts.0.down_proj.weight",
+        "model.layers.1.mlp.experts.1.gate_proj.weight",
+        "model.layers.1.mlp.experts.1.up_proj.weight",
+        "model.layers.1.mlp.experts.1.down_proj.weight",
+    ];
+
+    const COHERENT_INT8_NAMES: &[&str] = &[
+        "lm_head.weight",
+        "model.embed_tokens.weight",
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.self_attn.o_proj.weight",
+    ];
+
+    const COHERENT_KEPT_NAMES: &[&str] = &["model.layers.1.mlp.gate.weight", "model.norm.weight"];
+
+    /// Synthetic calibration for a checkpoint: every keyed tensor gets a
+    /// per-channel importance with a strong outlier structure, so the weighted
+    /// search has something to bite on. Keys whose tensors disagree on channel
+    /// count are SKIPPED (that is a mismatched calibration, tested separately).
+    fn synthetic_wasm_calib(w: &Weights) -> CalibStats {
+        // Collect key -> the set of contraction lengths that key must serve.
+        let mut widths: std::collections::BTreeMap<String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for name in w.names() {
+            let (Some(key), Some(record)) = (stat_key_for_tensor(name), w.record(name)) else {
+                continue;
+            };
+            if record.shape.len() != 2 {
+                continue;
+            }
+            widths.entry(key).or_default().push(record.shape[1]);
+        }
+        let mut stats = CalibStats::new();
+        for (key, ks) in widths {
+            let k = ks[0];
+            if ks.iter().any(|&other| other != k) {
+                continue; // incoherent fixture shape: leave this key uncovered
+            }
+            let mean_sq: Vec<f64> = (0..k)
+                .map(|i| {
+                    if i % 8 == 0 {
+                        1e-6
+                    } else {
+                        1.0 + (i % 5) as f64
+                    }
+                })
+                .collect();
+            stats.insert(key, ChannelStats { rows: 128, mean_sq });
+        }
+        stats
+    }
+
+    #[test]
+    fn uncalibrated_entry_point_is_byte_identical_to_the_frozen_converter() {
+        let src = synthetic_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("synthetic wasm safetensors parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        for quant in [ConvertQuant::Int8, ConvertQuant::Int4] {
+            let frozen =
+                safetensors_to_focrq(&w, quant, 0, [9u8; 32], arch).expect("frozen convert");
+            let via_calib = safetensors_to_focrq_calibrated(&w, quant, 0, [9u8; 32], arch, None)
+                .expect("uncalibrated convert");
+            assert_eq!(
+                frozen, via_calib,
+                "{quant:?}: calib=None must reproduce the frozen artifact byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn calibration_is_ignored_by_the_conservative_int8_recipe() {
+        let src = synthetic_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        let calib = synthetic_wasm_calib(&w);
+        let frozen =
+            safetensors_to_focrq(&w, ConvertQuant::Int8, 0, [9u8; 32], arch).expect("frozen");
+        let calibrated = safetensors_to_focrq_calibrated(
+            &w,
+            ConvertQuant::Int8,
+            0,
+            [9u8; 32],
+            arch,
+            Some(&calib),
+        )
+        .expect("calibrated");
+        assert_eq!(
+            frozen, calibrated,
+            "the conservative int8 recipe is a separately certified byte contract"
+        );
+    }
+
+    #[test]
+    fn calibrated_wasm_convert_changes_values_but_never_the_format() {
+        let src = coherent_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        let calib = synthetic_wasm_calib(&w);
+        let rtn_blob =
+            safetensors_to_focrq(&w, ConvertQuant::Int4, 0, [9u8; 32], arch).expect("rtn");
+        let cal_blob = safetensors_to_focrq_calibrated(
+            &w,
+            ConvertQuant::Int4,
+            0,
+            [9u8; 32],
+            arch,
+            Some(&calib),
+        )
+        .expect("calibrated");
+        assert_ne!(
+            rtn_blob, cal_blob,
+            "calibration must actually change values"
+        );
+        // Determinism: same inputs, same bytes.
+        let again = safetensors_to_focrq_calibrated(
+            &w,
+            ConvertQuant::Int4,
+            0,
+            [9u8; 32],
+            arch,
+            Some(&calib),
+        )
+        .expect("calibrated again");
+        assert_eq!(
+            cal_blob, again,
+            "calibrated conversion must be deterministic"
+        );
+
+        let rtn = Weights::from_bytes(rtn_blob).expect("rtn parse");
+        let cal = Weights::from_bytes(cal_blob).expect("calibrated parse");
+        // Same recipe id, same tensor set, same dtypes/shapes/group sizes.
+        assert_eq!(cal.quant_recipe(), rtn.quant_recipe());
+        assert_eq!(cal.quant_recipe(), Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID));
+        assert_eq!(cal.len(), rtn.len());
+        let mut any_value_change = false;
+        for name in COHERENT_INT4_NAMES {
+            let a = rtn.qint4(name).expect("rtn qint4");
+            let b = cal.qint4(name).expect("calibrated qint4");
+            assert_eq!((a.n, a.k), (b.n, b.k), "{name} shape");
+            assert_eq!(
+                b.group_size,
+                wasm_int4_group_size(name),
+                "{name} group size pinned"
+            );
+            assert_eq!(a.packed.len(), b.packed.len(), "{name} payload length");
+            assert_eq!(a.scales.len(), b.scales.len(), "{name} scale table length");
+            any_value_change |= a.packed != b.packed || a.scales != b.scales;
+        }
+        assert!(any_value_change, "some int4 values must actually move");
+        for name in COHERENT_INT8_NAMES {
+            let a = rtn.qint8(name).expect("rtn qint8");
+            let b = cal.qint8(name).expect("calibrated qint8");
+            assert_eq!((a.n, a.k), (b.n, b.k), "{name} shape");
+            assert_eq!(a.w.len(), b.w.len());
+            assert_eq!(a.scales.len(), b.scales.len());
+        }
+        for name in COHERENT_KEPT_NAMES {
+            assert_eq!(
+                cal.tensor(name).expect("kept").data,
+                rtn.tensor(name).expect("kept").data,
+                "{name} high-precision bytes stay verbatim under calibration"
+            );
+        }
+    }
+
+    #[test]
+    fn awq_fold_plan_requires_an_up_proj_partner_and_picks_one_alpha_per_layer() {
+        let src = coherent_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("parse");
+        let calib = synthetic_wasm_calib(&w);
+        let plan = awq_fold_plan(&w, &calib).expect("plan");
+        // Every coherent unit has gate+up+down and calibration ⇒ folded.
+        for unit in [
+            "model.layers.0.mlp",
+            "model.layers.1.mlp.experts.0",
+            "model.layers.1.mlp.experts.1",
+        ] {
+            let s = plan
+                .scales_for(unit)
+                .unwrap_or_else(|| panic!("{unit} must be folded"));
+            assert_eq!(s.len(), 64, "{unit} fold vector spans the intermediate dim");
+            assert!(s.iter().all(|v| v.is_finite() && *v > 0.0));
+        }
+        // Exactly one alpha per layer, drawn from the documented grid, and the
+        // two experts of layer 1 share it.
+        let alphas: Vec<(usize, f32)> = plan.alphas().collect();
+        assert_eq!(alphas.len(), 2, "layers 0 and 1 each choose one alpha");
+        for (_, a) in &alphas {
+            assert!(AWQ_ALPHA_GRID.contains(a), "alpha {a} outside the grid");
+        }
+        assert_eq!(plan.folded_units(), 3);
+        // Determinism.
+        let again = awq_fold_plan(&w, &calib).expect("plan again");
+        assert_eq!(
+            plan.scales_for("model.layers.1.mlp.experts.0"),
+            again.scales_for("model.layers.1.mlp.experts.0")
+        );
+        assert_eq!(alphas, again.alphas().collect::<Vec<_>>());
+        // No calibration at all ⇒ nothing folded.
+        let empty = awq_fold_plan(&w, &CalibStats::new()).expect("empty plan");
+        assert_eq!(empty.folded_units(), 0);
+    }
+
+    /// A `down_proj` whose unit has no `up_proj` partner (or a partner whose
+    /// output rows do not line up) must be left UNFOLDED — folding one half
+    /// alone would change the function the expert computes.
+    #[test]
+    fn awq_fold_skips_a_unit_without_a_matching_up_proj() {
+        let src = synthetic_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("parse");
+        let calib = synthetic_wasm_calib(&w);
+        let plan = awq_fold_plan(&w, &calib).expect("plan");
+        // layer-1 shared_experts has a down_proj but no up_proj in this fixture;
+        // layer-0's up_proj is [5, 64] while down_proj contracts over 32, so its
+        // rows do not line up either. Neither may be folded.
+        assert!(
+            plan.scales_for("model.layers.1.mlp.shared_experts")
+                .is_none()
+        );
+        assert!(plan.scales_for("model.layers.0.mlp").is_none());
+        assert_eq!(plan.folded_units(), 0);
+    }
+
+    #[test]
+    fn calib_coverage_reports_uncovered_tensors() {
+        let src = coherent_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("parse");
+        let full = synthetic_wasm_calib(&w);
+        let ((i4c, i4t), (i8c, i8t)) = calib_coverage(&w, &full);
+        assert_eq!(i4t, COHERENT_INT4_NAMES.len());
+        assert_eq!(i4c, i4t, "every int4 tensor is keyed and covered");
+        assert_eq!(i8t, COHERENT_INT8_NAMES.len());
+        // `embed_tokens` has no activation input, so it is never covered.
+        assert_eq!(i8c, i8t - 1);
+        // An empty calibration covers nothing.
+        let ((z4, t4), (z8, t8)) = calib_coverage(&w, &CalibStats::new());
+        assert_eq!((z4, z8), (0, 0));
+        assert_eq!((t4, t8), (i4t, i8t));
+    }
+
+    /// A tensor whose calibration vector has the wrong length is a
+    /// calibration/checkpoint mismatch and must FAIL the conversion rather than
+    /// silently mis-weighting every group.
+    #[test]
+    fn calibrated_convert_refuses_a_mismatched_calibration_vector() {
+        let src = synthetic_wasm_safetensors();
+        let w = Weights::from_bytes(src).expect("parse");
+        let arch = crate::native_engine::model_arch::default_arch();
+        let mut calib = CalibStats::new();
+        calib.insert(
+            stat_key_for_tensor("model.layers.0.mlp.gate_proj.weight").unwrap(),
+            ChannelStats {
+                rows: 10,
+                mean_sq: vec![1.0; 7], // the tensor contracts over 32
+            },
+        );
+        let err = safetensors_to_focrq_calibrated(
+            &w,
+            ConvertQuant::Int4,
+            0,
+            [9u8; 32],
+            arch,
+            Some(&calib),
+        )
+        .expect_err("a mismatched calibration must be refused");
+        assert!(
+            format!("{err}").contains("channels"),
+            "error must name the channel-count mismatch, got: {err}"
+        );
     }
 }

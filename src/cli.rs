@@ -641,6 +641,14 @@ pub struct ConvertArgs {
     /// tied `lm_head`, writes the Apache-2.0 notice). See `focr models`.
     #[arg(long, default_value = "unlimited-ocr")]
     pub model_id: String,
+    /// Activation-calibration JSON from a `FOCR_CALIB_OUT` run (bd-50wo stages
+    /// B/C). Only honored by `--quant int4`: the expert/attention scales are then
+    /// chosen by an importance-weighted clip search plus an AWQ channel-scale
+    /// fold instead of plain round-to-nearest. The STORAGE FORMAT and the
+    /// declared recipe id are unchanged — only the quantized values differ.
+    /// Omitted ⇒ the byte-for-byte frozen uncalibrated artifact.
+    #[arg(long, value_name = "FILE")]
+    pub calib: Option<PathBuf>,
     /// Emit machine-readable scaffold JSON before the Phase-2 NotImplemented.
     #[arg(long)]
     pub json: bool,
@@ -2229,12 +2237,31 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     };
     let quantized = quantized_int8 + quantized_int4;
 
-    let blob = quant::convert::safetensors_to_focrq(
+    // `--calib`: load the activation statistics BEFORE the (long) conversion so a
+    // bad path fails fast, and report the coverage the artifact was built with.
+    let calib = match &args.calib {
+        None => None,
+        Some(path) => {
+            let text = std::fs::read_to_string(path).map_err(|e| {
+                FocrError::ModelNotFound(format!(
+                    "cannot read --calib JSON at {}: {e}",
+                    path.display()
+                ))
+            })?;
+            Some(quant::calib::CalibStats::from_json(&text)?)
+        }
+    };
+    let calib_coverage = calib
+        .as_ref()
+        .map(|stats| quant::convert::calib_coverage(&weights, stats));
+
+    let blob = quant::convert::safetensors_to_focrq_calibrated(
         &weights,
         convert_quant,
         args.arch.packing_byte(),
         source_sha256,
         arch,
+        calib.as_ref(),
     )?;
     let output_bytes = blob.len();
     std::fs::write(&args.output, &blob).map_err(|e| {
@@ -2270,6 +2297,11 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             "tensors_int4": quantized_int4,
             "input_bytes": input_bytes,
             "output_bytes": output_bytes,
+            "calib": args.calib,
+            "calib_covered_int4": calib_coverage.map(|((c, _), _)| c),
+            "calib_total_int4": calib_coverage.map(|((_, t), _)| t),
+            "calib_covered_int8": calib_coverage.map(|(_, (c, _))| c),
+            "calib_total_int8": calib_coverage.map(|(_, (_, t))| t),
         }));
     } else {
         eprintln!(
@@ -2281,6 +2313,13 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             args.quant.as_str(),
             quant_recipe.map_or_else(String::new, |id| format!(" quant_recipe={id}")),
         );
+        if let Some(((i4c, i4t), (i8c, i8t))) = calib_coverage {
+            eprintln!(
+                "[focr] convert: calibration-aware quantization (bd-50wo B+C): \
+                 int4 coverage {i4c}/{i4t} tensors, int8 coverage {i8c}/{i8t} tensors \
+                 (uncovered tensors fall back to uniform importance)"
+            );
+        }
     }
     Ok(())
 }

@@ -42,6 +42,7 @@
 //! tensor gets which tier) is `recipe`/`bit_allocator`.
 
 pub mod bit_allocator;
+pub mod calib;
 pub mod convert;
 pub mod focrq;
 pub mod int4;
