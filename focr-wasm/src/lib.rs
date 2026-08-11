@@ -12,10 +12,18 @@
 //!   that natively lives in `focr robot backends` is exported as functions
 //!   (`int8_route`, `engine_info`) so JS can ASSERT the armed route instead of
 //!   trusting build flags.
-//! * **Never hold a big payload twice.** [`ModelStaging::reserve`] uses
-//!   `try_reserve_exact` and chunked `push`, so the weight blob exists exactly
-//!   once inside wasm memory (the JS side streams fetch chunks straight in and
-//!   drops them).
+//! * **Never hold a big payload twice.** [`ModelStaging::plan`] reserves the
+//!   blob's segments up front with `try_reserve_exact` and chunked `push`, so
+//!   the weight bytes exist exactly once inside wasm memory (the JS side
+//!   streams fetch chunks straight in and drops them).
+//! * **No 2 GiB wall.** wasm32 caps ANY single Rust allocation (and any slice)
+//!   at `isize::MAX` = 2 GiB, so the 3.0 GB Unlimited artifact cannot live in
+//!   one `Vec<u8>` even inside the 4 GiB heap (bd-syf2). Staging is therefore
+//!   two-phase: [`ModelStaging::plan`] reads the artifact's own tensor
+//!   directory out of a downloaded prefix and cuts the blob into ≤1 GiB
+//!   segments **at tensor boundaries only**; `push` then spills across those
+//!   boundaries transparently. Every tensor still resolves to one contiguous
+//!   `&[u8]`, so no kernel or accessor changes.
 //! * **One code path.** This crate adds no numerics: it decodes the uploaded
 //!   image with the same `image` crate the CLI uses and calls the same
 //!   `OcrModel` entrypoints. On wasm32 the SIMD dispatcher lands on the scalar
@@ -23,7 +31,7 @@
 
 use std::sync::Arc;
 
-use franken_ocr::native_engine::weights::Weights;
+use franken_ocr::native_engine::weights::{self, Weights};
 use franken_ocr::native_engine::{OcrModel, SidecarBundle};
 use wasm_bindgen::prelude::*;
 
@@ -40,6 +48,41 @@ pub fn focr_wasm_start() {
     std::panic::set_hook(Box::new(|info| {
         console_error(&format!("focr-wasm panic: {info}"));
     }));
+}
+
+/// `initThreadPool(n)` — the rayon worker-pool constructor, present ONLY in the
+/// threaded module (`site/pkg-threaded`, built with `--features threads`).
+///
+/// Re-exporting the crate's `#[wasm_bindgen]` function here is what puts it in
+/// the generated JS surface. JS must call it exactly once, and — the rule that
+/// cost the sibling project days — only AFTER the model is staged and hydrated:
+/// a worker parked in `Atomics.wait` blocks a shared-memory `grow`, and staging
+/// a multi-GB artifact is nothing but grows.
+#[cfg(all(target_arch = "wasm32", feature = "threads"))]
+pub use wasm_bindgen_rayon::init_thread_pool;
+
+/// Rayon's *actual* worker count in this module right now.
+///
+/// This is the honest test of the threaded lane: the build flags, the presence
+/// of `initThreadPool`, and even a `SharedArrayBuffer`-backed memory can all be
+/// right while the pool silently fell back to one thread. Serial builds report
+/// `1` here by construction.
+///
+/// Calling this initializes rayon's global pool if it is not built yet, so JS
+/// must call `initThreadPool` FIRST in the threaded module.
+#[wasm_bindgen]
+#[must_use]
+pub fn thread_count() -> usize {
+    rayon::current_num_threads()
+}
+
+/// The module's `WebAssembly.Memory`, so JS can assert
+/// `wasm_memory().buffer instanceof SharedArrayBuffer` after instantiation.
+/// Link flags are a claim; this is the receipt.
+#[wasm_bindgen]
+#[must_use]
+pub fn wasm_memory() -> JsValue {
+    wasm_bindgen::memory()
 }
 
 fn js_err(stage: &str, detail: impl std::fmt::Display) -> JsValue {
@@ -89,8 +132,16 @@ pub fn reset_cancel() {
 /// tokenizer sidecars keyed by their canonical zoo filenames.
 #[wasm_bindgen]
 pub struct ModelStaging {
-    weights: Vec<u8>,
-    expected: usize,
+    /// Planned segments in order: `(absolute start, bytes)`. Each `Vec` is
+    /// reserved to its planned length by [`ModelStaging::plan`]; `push` fills
+    /// them in sequence.
+    segments: Vec<(u64, Vec<u8>)>,
+    /// Planned length of each segment (parallel to `segments`).
+    segment_lens: Vec<usize>,
+    /// Total planned bytes across all segments.
+    expected: u64,
+    /// Bytes appended so far.
+    filled: u64,
     sidecars: SidecarBundle,
     /// TrOMR WordLevel tables staged individually until all four are present.
     music: [Option<String>; 4],
@@ -110,63 +161,140 @@ impl ModelStaging {
     #[must_use]
     pub fn new() -> ModelStaging {
         ModelStaging {
-            weights: Vec::new(),
+            segments: Vec::new(),
+            segment_lens: Vec::new(),
             expected: 0,
+            filled: 0,
             sidecars: SidecarBundle::default(),
             music: [None, None, None, None],
         }
     }
 
-    /// Reserve the full weight-blob size up front (`try_reserve_exact`, so a
-    /// failed reservation names the byte count instead of trapping on an
-    /// overcommitted grow).
-    pub fn reserve(&mut self, total_bytes: f64) -> Result<(), JsValue> {
-        if !(total_bytes.is_finite() && total_bytes >= 0.0 && total_bytes <= usize::MAX as f64) {
-            return Err(js_err("staging.reserve", "total_bytes out of range"));
+    /// PHASE 1 of staging (bd-syf2): plan the blob's segmentation from a
+    /// downloaded PREFIX of the artifact, and reserve every planned segment.
+    ///
+    /// `header_prefix` is the artifact's leading bytes (4 MiB is ample: the
+    /// 3.0 GB Unlimited artifact's header is ~0.5 MB). `total_bytes` is the
+    /// artifact's full pinned size. Returns a JSON object:
+    ///
+    /// * `{"status":"planned","segments":[len,…],"payload_base":N}` — staging is
+    ///   armed; start pushing bytes from offset 0.
+    /// * `{"status":"need_prefix","need_bytes":N}` — the prefix did not contain
+    ///   the whole header; refetch at least `N` leading bytes and call again
+    ///   (this converges in at most two probes).
+    ///
+    /// A small model (TrOMR) plans to exactly one segment and behaves like the
+    /// old single-buffer `reserve` did.
+    ///
+    /// # Errors
+    /// A malformed header, an artifact whose layout offers no clean cut, or a
+    /// failed reservation (named with its byte count, never an opaque trap).
+    pub fn plan(&mut self, header_prefix: &[u8], total_bytes: f64) -> Result<String, JsValue> {
+        if !(total_bytes.is_finite() && total_bytes >= 0.0 && total_bytes <= u64::MAX as f64) {
+            return Err(js_err("staging.plan", "total_bytes out of range"));
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let total = total_bytes as usize;
-        if !self.weights.is_empty() || self.expected != 0 {
+        let total = total_bytes as u64;
+        if self.expected != 0 {
             return Err(js_err(
-                "staging.reserve",
-                "already reserved; staging is single-use",
+                "staging.plan",
+                "already planned; staging is single-use",
             ));
         }
-        self.weights.try_reserve_exact(total).map_err(|e| {
-            js_err(
-                "staging.reserve",
-                format!("cannot reserve {total} bytes: {e}"),
-            )
-        })?;
-        self.expected = total;
-        Ok(())
+        let plan = weights::focrq_segment_plan(header_prefix, total, weights::MAX_BLOB_SEGMENT)
+            .map_err(|e| js_err("staging.plan", e))?;
+        let (segment_lens, payload_base) = match plan {
+            weights::SegmentPlan::NeedPrefix { need_bytes } => {
+                return Ok(serde_json::json!({
+                    "status": "need_prefix",
+                    "need_bytes": need_bytes,
+                })
+                .to_string());
+            }
+            weights::SegmentPlan::Planned {
+                segment_lens,
+                payload_base,
+            } => (segment_lens, payload_base),
+        };
+        let mut start = 0u64;
+        for (index, &len) in segment_lens.iter().enumerate() {
+            let len = usize::try_from(len).map_err(|_| {
+                js_err(
+                    "staging.plan",
+                    format!("segment {index} of {len} bytes exceeds this target's usize"),
+                )
+            })?;
+            let mut buf: Vec<u8> = Vec::new();
+            buf.try_reserve_exact(len).map_err(|e| {
+                js_err(
+                    "staging.plan",
+                    format!("cannot reserve segment {index} of {len} bytes: {e}"),
+                )
+            })?;
+            self.segments.push((start, buf));
+            self.segment_lens.push(len);
+            start += len as u64;
+        }
+        self.expected = start;
+        Ok(serde_json::json!({
+            "status": "planned",
+            "segments": segment_lens,
+            "payload_base": payload_base,
+        })
+        .to_string())
     }
 
-    /// Append one downloaded chunk. Refuses bytes past the reserved size —
-    /// a mismatched manifest must fail loudly, not grow silently.
+    /// PHASE 2: append one downloaded chunk. The caller streams the artifact
+    /// start-to-end and never needs to know where the segment edges are — a
+    /// chunk that spans a boundary is split across the two segments here.
+    /// Refuses bytes past the planned total: a mismatched manifest must fail
+    /// loudly, not grow silently.
     pub fn push(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
         if self.expected == 0 {
-            return Err(js_err("staging.push", "reserve() must run first"));
+            return Err(js_err("staging.push", "plan() must run first"));
         }
-        if self.weights.len() + chunk.len() > self.expected {
+        if self.filled + chunk.len() as u64 > self.expected {
             return Err(js_err(
                 "staging.push",
                 format!(
-                    "overflow: {} + {} exceeds reserved {}",
-                    self.weights.len(),
+                    "overflow: {} + {} exceeds planned {}",
+                    self.filled,
                     chunk.len(),
                     self.expected
                 ),
             ));
         }
-        self.weights.extend_from_slice(chunk);
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            // The first segment that still has room (segments fill in order).
+            let Some(index) = self
+                .segments
+                .iter()
+                .enumerate()
+                .find(|(i, (_, bytes))| bytes.len() < self.segment_lens[*i])
+                .map(|(i, _)| i)
+            else {
+                return Err(js_err("staging.push", "no segment has room left"));
+            };
+            let room = self.segment_lens[index] - self.segments[index].1.len();
+            let take = room.min(rest.len());
+            self.segments[index].1.extend_from_slice(&rest[..take]);
+            self.filled += take as u64;
+            rest = &rest[take..];
+        }
         Ok(())
     }
 
     /// Bytes staged so far (for progress display).
     #[must_use]
     pub fn filled(&self) -> f64 {
-        self.weights.len() as f64
+        self.filled as f64
+    }
+
+    /// The planned segment count (1 for every model that fits one buffer).
+    #[must_use]
+    pub fn segment_count(&self) -> usize {
+        self.segments.len()
     }
 
     /// Attach one tokenizer sidecar by its canonical zoo filename:
@@ -217,16 +345,32 @@ impl WasmEngine {
     /// rejects the tensor dtypes.
     pub fn from_staging(staging: ModelStaging) -> Result<WasmEngine, JsValue> {
         let ModelStaging {
-            weights,
+            segments,
+            segment_lens,
             expected,
+            filled,
             mut sidecars,
             music,
         } = staging;
-        if weights.len() != expected {
+        if expected == 0 {
+            return Err(js_err("engine.from_staging", "staging was never planned"));
+        }
+        if filled != expected {
             return Err(js_err(
                 "engine.from_staging",
-                format!("staging incomplete: {} of {expected} bytes", weights.len()),
+                format!("staging incomplete: {filled} of {expected} bytes"),
             ));
+        }
+        for (index, ((_, bytes), planned)) in segments.iter().zip(&segment_lens).enumerate() {
+            if bytes.len() != *planned {
+                return Err(js_err(
+                    "engine.from_staging",
+                    format!(
+                        "segment {index} holds {} of {planned} planned bytes",
+                        bytes.len()
+                    ),
+                ));
+            }
         }
         if music.iter().all(Option::is_some) {
             let [a, b, c, d] = music;
@@ -242,8 +386,10 @@ impl WasmEngine {
                 "partial TrOMR tokenizer set: all four tables are required",
             ));
         }
+        // One segment or several, the loader validates coverage/ordering and
+        // that no tensor straddles a boundary before anything reads a weight.
         let weights =
-            Weights::from_bytes(weights).map_err(|e| js_err("engine.parse_weights", e))?;
+            Weights::from_segments(segments).map_err(|e| js_err("engine.parse_weights", e))?;
         let model = OcrModel::from_weights(weights, sidecars)
             .map_err(|e| js_err("engine.validate_weights", e))?;
         Ok(WasmEngine { model })
