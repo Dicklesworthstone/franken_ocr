@@ -39,7 +39,9 @@
   --fg: #e8eef2;
   --fg-mid: #cbd5e1;
   --fg-dim: #94a3b8;
-  --fg-faint: #64748b;
+  /* #64748b measured 4.16:1 on this background — below AA for body text.
+     #748496 is 5.18:1 and still reads as the quietest voice on the page. */
+  --fg-faint: #748496;
 
   /* Semantics — fixed meanings, used identically in CSS and in every viz. */
   --accent: #34d399;   /* active / ours / success */
@@ -47,7 +49,7 @@
   --accent-ink: #04140d;
   --amber: #fbbf24;    /* warning / threshold / "here is the tail" */
   --red: #f87171;      /* failure / skipped / refused */
-  --ref: #64748b;      /* the reference we are measured against */
+  --ref: #7e8e9f;      /* the reference we are measured against */
   --violet: #a78bfa;   /* structure / shapes / metadata */
 
   --line: rgba(255, 255, 255, 0.07);
@@ -71,6 +73,13 @@
 }
 
 * { box-sizing: border-box; }
+
+/* app.js drives the whole playground with the `hidden` attribute, and several
+   elements below are given an explicit `display` (grid/inline-flex). A later
+   display rule beats the UA's `[hidden] { display: none }`, so without this the
+   consent box, the progress bar, the cancel button and the empty result panel
+   would all be permanently on screen. This line is load-bearing. */
+[hidden] { display: none !important; }
 
 html {
   scroll-behavior: smooth;
@@ -126,12 +135,10 @@ p code, li code, td code {
 
 h1, h2, h3, h4 { font-weight: 800; letter-spacing: -0.02em; margin: 0; }
 
-hr.rule {
-  border: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--line), transparent);
-  margin: 0;
-}
+/* Spacing utilities — the only two the page needs. */
+.mt { margin-top: 1.5rem; }
+.viz-intro { margin: 0.9rem 0 1.5rem; }
+.viz-foot { margin-top: 1.3rem; }
 
 .skip-link {
   position: absolute;
@@ -219,7 +226,7 @@ hr.rule {
   margin-top: 4px;
   font: 800 8px/1 var(--sans);
   letter-spacing: 0.22em;
-  color: var(--accent-deep);
+  color: #10b981;
   text-transform: uppercase;
 }
 
@@ -241,8 +248,20 @@ hr.rule {
 .wrap { width: min(100% - 2rem, var(--wrap)); margin-inline: auto; }
 .wrap-narrow { width: min(100% - 2rem, 780px); margin-inline: auto; }
 
-section { padding: 4.5rem 0; scroll-margin-top: 92px; }
+section { padding: 5rem 0; scroll-margin-top: 96px; position: relative; }
 section:first-of-type { padding-top: 0; }
+/* A hairline rule between sections: the page is one long dark column, and
+   without a beat every panel edge reads as the same weight. */
+main section + section::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(100% - 2rem, var(--wrap));
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--line) 22%, var(--line) 78%, transparent);
+}
 footer { scroll-margin-top: 92px; }
 
 .eyebrow {
@@ -252,7 +271,7 @@ footer { scroll-margin-top: 92px; }
   font: 800 10px/1 var(--sans);
   letter-spacing: 0.3em;
   text-transform: uppercase;
-  color: var(--accent-deep);
+  color: #10b981;
   margin-bottom: 1rem;
 }
 .eyebrow::before, .eyebrow::after {
@@ -356,6 +375,11 @@ select.btn {
   background-repeat: no-repeat;
 }
 select.btn option { background: #0b1512; color: var(--fg); }
+@media (max-width: 560px) {
+  /* The model names are long; on a phone the select owns its own line. */
+  select.btn { flex: 1 1 100%; width: 100%; }
+  .row > .btn { flex: 1 1 auto; }
+}
 
 /* Panels — the recurring surface for every visualization and the playground. */
 .panel {
@@ -404,30 +428,33 @@ select.btn option { background: #0b1512; color: var(--fg); }
   pointer-events: none;
 }
 .card h3 { font-size: 1.02rem; margin-bottom: 0.6rem; color: var(--fg); }
+.card.stat-card { text-align: center; display: grid; align-content: start; }
+.card.stat-card .label { margin-bottom: 0.7rem; }
 
 .label {
   font: 800 0.68rem/1 var(--sans);
   letter-spacing: 0.24em;
   text-transform: uppercase;
-  color: var(--accent-deep);
+  color: #10b981;
 }
 .label + * { margin-top: 0.8rem; }
 
 .grid { display: grid; gap: 1.2rem; }
-.grid-2 { grid-template-columns: 1fr; }
-.grid-3 { grid-template-columns: 1fr; }
-.grid-4 { grid-template-columns: 1fr; }
+.grid > * { min-width: 0; }
+.grid-2, .grid-3, .grid-4 { grid-template-columns: minmax(0, 1fr); }
 @media (min-width: 680px) {
-  .grid-2 { grid-template-columns: repeat(2, 1fr); }
-  .grid-4 { grid-template-columns: repeat(2, 1fr); }
+  .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (min-width: 940px) {
-  .grid-3 { grid-template-columns: repeat(3, 1fr); }
-  .grid-4 { grid-template-columns: repeat(4, 1fr); }
+  .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
 }
 
 .stack { display: grid; gap: 1.2rem; }
-.row { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
+.stack > * { min-width: 0; }
+.row { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; min-width: 0; }
+.row > * { min-width: 0; }
 .row.spread { justify-content: space-between; }
 
 /* Scroll reveals — the no-JS/no-motion fallback is "fully visible". */
@@ -476,11 +503,11 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 .pg {
   display: grid;
   gap: 1.5rem;
-  grid-template-columns: 1fr;
+  grid-template-columns: minmax(0, 1fr);
 }
-@media (min-width: 1000px) { .pg { grid-template-columns: 1fr 1fr; } }
-.pg-col { display: grid; gap: 1.1rem; align-content: start; }
-.pg-step { display: grid; gap: 0.75rem; }
+@media (min-width: 1000px) { .pg { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.pg-col { display: grid; gap: 1.1rem; align-content: start; min-width: 0; }
+.pg-step { display: grid; gap: 0.75rem; min-width: 0; }
 
 .kv { color: var(--fg-dim); font-size: 0.83rem; font-family: var(--mono); }
 .kv code { color: var(--accent); background: none; border: 0; padding: 0; }
@@ -562,6 +589,9 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 .warnings:empty { display: none; }
 #license { font-size: 0.76rem; color: var(--fg-faint); font-family: var(--mono); }
 #result-wrap { display: grid; gap: 0.9rem; }
+/* The placeholder explains what will appear in the empty right-hand column, and
+   retires itself the moment app.js unhides the real result. */
+.pg-col:has(#result-wrap:not([hidden])) #result-placeholder { display: none; }
 #progress-wrap { display: grid; gap: 0.5rem; }
 
 .legend { display: flex; flex-wrap: wrap; gap: 1rem; font-size: 0.8rem; color: var(--fg-dim); }
@@ -575,7 +605,19 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 .legend .sw-warn { color: var(--amber); }
 
 /* ------------------------------------------------------------ visualizations */
+/* Wide diagrams scroll inside their own box rather than widening the page. The
+   right-edge fade is the affordance that says so on a phone, where there is no
+   scrollbar to see. */
 .viz-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+.viz-wide {
+  position: relative;
+  -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 34px), transparent 100%);
+  mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 34px), transparent 100%);
+}
+@media (min-width: 1100px) {
+  /* At full width nothing is clipped, so the fade would be a lie. */
+  .viz-wide { -webkit-mask-image: none; mask-image: none; }
+}
 .viz-scroll > svg { display: block; width: 100%; height: auto; }
 .viz-wide > svg { min-width: 720px; }
 .viz-caption { color: var(--fg-dim); font-size: 0.86rem; text-align: center; margin: 1rem auto 0; max-width: 46rem; }
@@ -599,6 +641,7 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 .step-title { font: 800 1.25rem/1.2 var(--sans); color: var(--fg); }
 .step-stat { font: 700 0.9rem/1 var(--mono); color: var(--accent); margin-left: auto; }
 .step-body { min-height: 11.5em; }
+.stepper .step-body { min-height: 7.5em; }
 .step-row { display: flex; gap: 0.9rem; margin-bottom: 0.85rem; align-items: baseline; }
 .step-row:last-child { margin-bottom: 0; }
 .step-kind {
@@ -630,6 +673,9 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 
 /* Bar charts (byte budget, CER, parity) */
 .bars { display: grid; gap: 0.55rem; }
+/* A reference bar and its measured partner read as one unit. */
+.bar-pair { display: grid; gap: 0.3rem; margin-bottom: 0.85rem; }
+.bar-pair:last-child { margin-bottom: 0; }
 .bar-row { display: flex; align-items: center; gap: 0.85rem; }
 .bar-name {
   flex: 0 0 8.5rem;
@@ -664,17 +710,35 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 }
 .bar-val small { color: var(--fg-faint); font-weight: 500; }
 .bar-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--amber); opacity: 0.9; }
+/* An exact zero: an empty track with a start tick, so "we measured it and it
+   was nothing" looks different from "we measured it and it was very small". */
+.bar-track.is-zero::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 3px;
+  background: rgba(52, 211, 153, 0.55);
+}
 
 .stat { font: 800 clamp(2.1rem, 5vw, 2.9rem)/1.08 var(--mono); color: var(--accent); margin-bottom: 0.45rem; }
 .stat-dim { color: var(--fg-faint); font-size: 0.55em; font-weight: 700; }
 
 /* ------------------------------------------------------------------- tables */
 .table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--r); }
-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; min-width: 640px; }
-caption { text-align: left; color: var(--fg-faint); font-size: 0.8rem; padding-bottom: 0.7rem; }
+@media (max-width: 760px) {
+  /* Same affordance as the wide diagrams: a fading right edge is the only
+     "there is more over here" signal a phone gets. */
+  .table-scroll {
+    -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 30px), transparent 100%);
+    mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 30px), transparent 100%);
+  }
+}
+table { width: 100%; border-collapse: collapse; font-size: 0.88rem; min-width: 460px; }
+#models table { min-width: 680px; }
+caption { text-align: left; color: var(--fg-faint); font-size: 0.8rem; padding-bottom: 0.8rem; line-height: 1.5; }
 th, td { text-align: left; padding: 0.72rem 0.8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 thead th {
-  color: var(--accent-deep);
+  color: #10b981;
   font: 800 0.66rem/1.4 var(--sans);
   letter-spacing: 0.14em;
   text-transform: uppercase;
@@ -687,6 +751,7 @@ td strong { color: var(--fg); }
 td.num { font-family: var(--mono); font-size: 0.82rem; white-space: nowrap; }
 .yes { color: var(--accent); font-weight: 700; }
 .no { color: var(--fg-faint); }
+.bad { color: var(--red); font-weight: 600; }
 
 /* --------------------------------------------------------------------- code */
 pre.code {
@@ -713,11 +778,11 @@ footer {
 }
 .footer-grid { display: grid; gap: 2rem; grid-template-columns: 1fr; }
 @media (min-width: 780px) { .footer-grid { grid-template-columns: 1.4fr 1fr 1fr; } }
-.footer-grid h4 {
+.footer-head {
   font: 800 0.68rem/1 var(--sans);
   letter-spacing: 0.22em;
   text-transform: uppercase;
-  color: var(--accent-deep);
+  color: #10b981;
   margin-bottom: 0.9rem;
 }
 .footer-grid ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 0.5rem; }
@@ -732,6 +797,13 @@ footer {
 }
 
 /* ------------------------------------------------------- motion preferences */
+@media (pointer: coarse) {
+  /* 44px minimum touch target on anything tappable. */
+  .btn { min-height: 44px; }
+  .step-dot { width: 44px; height: 44px; }
+  .top nav a { min-height: 44px; display: inline-flex; align-items: center; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   *, *::before, *::after {
@@ -745,14 +817,28 @@ footer {
 }
 
 /* --------------------------------------------------------------- small screens */
+@media (max-width: 560px) {
+  /* The decorative rules either side of an eyebrow push a long one onto three
+     ragged lines on a phone. The words are the content; the rules are not. */
+  .eyebrow::before, .eyebrow::after { display: none; }
+  .eyebrow { gap: 0; }
+}
+
 @media (max-width: 640px) {
   :root { --header-h: 60px; }
   section { padding: 3.2rem 0; }
   .panel::before, .panel::after { display: none; }
   .step-row { display: block; }
   .step-kind { display: block; text-align: left; margin-bottom: 0.15rem; }
-  .step-body { min-height: 0; }
+  .step-body, .stepper .step-body { min-height: 0; }
   .step-stat { margin-left: 0; flex-basis: 100%; }
+  /* Prev / dots / Next will not fit one 390px line; the dots take their own row
+     so neither button is clipped off the edge. */
+  .step-nav { flex-wrap: wrap; justify-content: space-between; }
+  /* The five-wall rail is unreadable at 390px and the step dots already carry
+     the same "which one am I on" signal, so it goes rather than shrinks. */
+  .walls-rail { display: none; }
+  .step-dots { order: -1; flex-basis: 100%; margin: 0 0 0.6rem; justify-content: center; }
   .bar-row { flex-wrap: wrap; }
   .bar-name { flex-basis: 100%; text-align: left; }
   .bar-val { flex: 0 0 5.6rem; }

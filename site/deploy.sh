@@ -32,7 +32,8 @@ trap 'rm -rf "$STAGE"' EXIT
 
 rsync -a --exclude build.sh --exclude deploy.sh --exclude 'harness' . "$STAGE/"
 
-for f in "$STAGE"/index.html "$STAGE"/app.js "$STAGE"/engine-worker.js "$STAGE"/reset.html; do
+for f in "$STAGE"/index.html "$STAGE"/app.js "$STAGE"/chrome.js "$STAGE"/viz.js \
+         "$STAGE"/engine-worker.js "$STAGE"/reset.html; do
     perl -pi -e "s/\\@SITEV\\@/$VERSION/g" "$f"
 done
 

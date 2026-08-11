@@ -82,6 +82,22 @@ if (reduced) {
   window.addEventListener("load", sweep, { once: true });
 }
 
+/* ------------------------------------------------ drop zone, from a keyboard */
+// The drop zone is a div that app.js turns into a file picker on click. Giving
+// it role="button" and tabindex makes it reachable, but a div does not
+// synthesize a click from Enter/Space the way a real <button> does — so a
+// keyboard user would focus it and nothing would happen. This forwards the two
+// keys the role promises; it adds no behaviour app.js does not already have.
+const dropZone = document.getElementById("drop");
+if (dropZone) {
+  dropZone.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " " || e.key === "Spacebar") {
+      e.preventDefault();
+      dropZone.click();
+    }
+  });
+}
+
 /* ------------------------------------------------------- nav highlighting */
 // aria-current on the link whose section owns the top third of the viewport.
 const navLinks = [...document.querySelectorAll("#site-header nav a[href^='#']")];

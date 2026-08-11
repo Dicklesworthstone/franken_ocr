@@ -26,6 +26,10 @@
   Cache-Control: no-cache
 /app.js
   Cache-Control: no-cache
+/chrome.js
+  Cache-Control: no-cache
+/viz.js
+  Cache-Control: no-cache
 /engine-worker.js
   Cache-Control: no-cache
 /loader.js
