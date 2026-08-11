@@ -302,6 +302,47 @@ pub fn classify(name: &str) -> Classification {
     }
 }
 
+// ── The wasm/browser experts-int4 recipe (bd-4l71, explicitly NON-DEFAULT) ───
+
+/// Per-tensor storage policy under the wasm/browser recipe
+/// ([`crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID`]).
+///
+/// This recipe is only ever honored for an artifact that explicitly declares it
+/// in `packing_manifest.quant_recipe`; the artifact's storage dtypes are the
+/// opt-in (no env kill-switches). The conservative default recipe is untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WasmInt4Policy {
+    /// Stored [`QInt4PerGroup`](crate::native_engine::weights::DType) — the
+    /// decoder FFN/expert bulk: dense layer-0 SwiGLU, 64 routed experts × 3
+    /// projections per MoE layer, and the fused shared experts.
+    ExpertInt4,
+    /// Stored [`QInt8PerChan`](crate::native_engine::weights::DType) —
+    /// attention `q/k/v/o_proj`, `lm_head.weight`, and `embed_tokens`.
+    Int8,
+    /// Stored BF16/F32 — vision tower, projector, router gate, norms,
+    /// connector params, and anything unclassified (conservative default).
+    KeepHighPrecision,
+}
+
+/// Classify one tensor name under the wasm experts-int4 recipe. **Pure** (no
+/// env read): the recipe has no runtime switches — artifact storage is the
+/// opt-in. Built on the same predicates as [`classify`], so the high-precision
+/// refusal set (vision/projector/router/norms) is byte-for-byte the same.
+#[must_use]
+pub fn classify_wasm_experts_int4(name: &str) -> WasmInt4Policy {
+    // `embed_tokens` is KeepBf16 in the conservative recipe but int8 in the
+    // wasm recipe (halving the 660 MB bf16 table in the artifact). Checked
+    // FIRST because `classify` folds it into KeepBf16.
+    if is_embed_tokens(name) {
+        return WasmInt4Policy::Int8;
+    }
+    match classify(name).policy {
+        QuantPolicy::Int8 => WasmInt4Policy::ExpertInt4,
+        QuantPolicy::Gated(_) => WasmInt4Policy::Int8,
+        QuantPolicy::KeepBf16 => WasmInt4Policy::KeepHighPrecision,
+    }
+}
+
 /// Resolve a static [`QuantPolicy`] against the runtime kill-switches, returning
 /// the effective [`ResolvedPolicy`]. `attn_on` / `lmhead_on` are the (already
 /// read) switch states; see [`switch_on`] for the env-truthiness rule.
@@ -636,6 +677,57 @@ mod tests {
         assert_eq!(GatedKind::Attention.env_var(), FOCR_INT8_ATTN_ENV);
         assert_eq!(GatedKind::LmHead.env_var(), FOCR_INT8_LMHEAD_ENV);
         assert_ne!(FOCR_INT8_ATTN_ENV, FOCR_INT8_LMHEAD_ENV);
+    }
+
+    // ── wasm experts-int4 recipe classification (bd-4l71) ────────────────────
+
+    #[test]
+    fn wasm_recipe_puts_expert_ffn_in_int4() {
+        for n in [
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+            "model.layers.7.mlp.experts.63.up_proj.weight",
+            "model.layers.11.mlp.shared_experts.down_proj.weight",
+        ] {
+            assert_eq!(
+                classify_wasm_experts_int4(n),
+                WasmInt4Policy::ExpertInt4,
+                "{n}"
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_recipe_puts_attn_lmhead_embed_in_int8() {
+        for n in [
+            "model.layers.11.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
+            "lm_head.weight",
+            "model.embed_tokens.weight",
+        ] {
+            assert_eq!(classify_wasm_experts_int4(n), WasmInt4Policy::Int8, "{n}");
+        }
+    }
+
+    #[test]
+    fn wasm_recipe_keeps_vision_router_norms_high_precision() {
+        for n in [
+            "model.vision_model.transformer.layers.15.self_attn.out_proj.weight",
+            "model.sam_model.blocks.5.attn.qkv.weight",
+            "model.projector.layers.weight",
+            "model.layers.5.mlp.gate.weight", // router — gate-drift cliff
+            "model.norm.weight",
+            "model.layers.0.input_layernorm.weight",
+            "model.image_newline",
+            "some.unknown.tensor",
+        ] {
+            assert_eq!(
+                classify_wasm_experts_int4(n),
+                WasmInt4Policy::KeepHighPrecision,
+                "{n}"
+            );
+        }
     }
 
     // ── truthiness rule ──────────────────────────────────────────────────────

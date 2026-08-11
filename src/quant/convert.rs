@@ -44,6 +44,21 @@ use crate::native_engine::weights::{DType, Weights};
 /// Frozen identifier stamped into Unlimited-OCR conservative int8 artifacts.
 pub const UNLIMITED_OCR_INT8_RECIPE_ID: &str = "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1";
 
+/// Frozen identifier for the explicitly NON-DEFAULT wasm/browser Unlimited-OCR
+/// recipe (bd-4l71): routed + shared expert FFN and the dense layer-0 MLP stored
+/// [`DType::QInt4PerGroup`] (g16 or g32 per tensor), attention `q/k/v/o_proj` +
+/// `lm_head` + `embed_tokens` stored [`DType::QInt8PerChan`], everything else
+/// (vision tower, projector, router gate, norms, connector params) BF16/F32.
+///
+/// An artifact declaring this recipe id in `packing_manifest.quant_recipe` is
+/// accepted by the loader ONLY as an explicitly tagged non-default artifact:
+/// the native model resolver never selects it from the search directories — it
+/// must be loaded via an explicit path or [`crate::native_engine::OcrModel::from_weights`].
+/// The artifact's dtype storage IS the opt-in for int8 attention/lm_head
+/// consumption (no `FOCR_INT8_ATTN`/`FOCR_INT8_LMHEAD` env vars involved).
+pub const UNLIMITED_OCR_WASM_INT4_RECIPE_ID: &str =
+    "unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1";
+
 /// The quantization target requested on the `focr convert` command line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConvertQuant {

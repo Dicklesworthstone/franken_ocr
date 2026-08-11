@@ -18,8 +18,8 @@ use serde::Deserialize;
 use super::model_arch;
 use super::weights::{DType, TensorRecord, Weights};
 use crate::error::{FocrError, FocrResult};
-use crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID;
-use crate::quant::recipe::Recipe;
+use crate::quant::convert::{UNLIMITED_OCR_INT8_RECIPE_ID, UNLIMITED_OCR_WASM_INT4_RECIPE_ID};
+use crate::quant::recipe::{Recipe, WasmInt4Policy, classify_wasm_experts_int4};
 
 const MANIFEST_JSON: &str = include_str!("unlimited_ocr_manifest.json");
 const MANIFEST_SHA256: &str = "24ff1cfffe71eec6f07bfae8e8eb12b342877bccc43ad6ae4a4a4ceffb76edd3";
@@ -196,6 +196,10 @@ fn parse_and_verify_manifest() -> Result<UnlimitedOcrManifest, String> {
 enum CensusSurface {
     SourceSafetensors,
     ConservativeFocrq,
+    /// The explicitly-tagged NON-DEFAULT wasm experts-int4 recipe (bd-4l71):
+    /// same 2,710-tensor name/shape census, but expert FFN tensors stored
+    /// QInt4PerGroup and attention/lm_head/embed stored QInt8PerChan.
+    WasmInt4Focrq,
 }
 
 impl CensusSurface {
@@ -203,13 +207,22 @@ impl CensusSurface {
         match self {
             Self::SourceSafetensors => "source safetensors",
             Self::ConservativeFocrq => "conservative .focrq",
+            Self::WasmInt4Focrq => "wasm experts-int4 .focrq",
         }
     }
 
-    fn expected_dtype(self, tensor: &ManifestTensor) -> DType {
+    fn expected_dtype(self, name: &str, tensor: &ManifestTensor) -> DType {
         match self {
             Self::SourceSafetensors => tensor.source_dtype,
             Self::ConservativeFocrq => tensor.storage_dtype,
+            // The wasm quantized set is a superset of the conservative one, so
+            // every KeepHighPrecision name stores exactly what the conservative
+            // manifest stores (BF16) — the storage dtype cross-checks that.
+            Self::WasmInt4Focrq => match classify_wasm_experts_int4(name) {
+                WasmInt4Policy::ExpertInt4 => DType::QInt4PerGroup,
+                WasmInt4Policy::Int8 => DType::QInt8PerChan,
+                WasmInt4Policy::KeepHighPrecision => tensor.storage_dtype,
+            },
         }
     }
 }
@@ -268,7 +281,7 @@ fn validate_records<'a>(
                 expected.shape, record.shape
             ));
         }
-        let expected_dtype = surface.expected_dtype(expected);
+        let expected_dtype = surface.expected_dtype(name, expected);
         if record.dtype != expected_dtype {
             wrong_dtype.push(format!(
                 "{name} expected {expected_dtype:?} got {:?}",
@@ -324,15 +337,23 @@ pub(super) fn validate_focrq_header(
             manifest.source_sha256
         )));
     }
-    if quant_recipe != Some(manifest.quant_recipe.as_str()) {
+    let surface = if quant_recipe == Some(manifest.quant_recipe.as_str()) {
+        CensusSurface::ConservativeFocrq
+    } else if quant_recipe == Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID) {
+        // The explicitly-tagged non-default wasm recipe (bd-4l71): same pinned
+        // source + name/shape census, wasm storage dtypes. Never selected by
+        // the default resolver — explicit path / from_weights only.
+        CensusSurface::WasmInt4Focrq
+    } else {
         return Err(FocrError::FormatMismatch(format!(
-            "Unlimited-OCR .focrq packing_manifest.quant_recipe must be exactly {:?}, got {quant_recipe:?}",
+            "Unlimited-OCR .focrq packing_manifest.quant_recipe must be exactly {:?} (or the \
+             explicitly non-default {UNLIMITED_OCR_WASM_INT4_RECIPE_ID:?}), got {quant_recipe:?}",
             manifest.quant_recipe
         )));
-    }
+    };
     validate_records(
         records.iter().map(|(name, record)| (name.as_str(), record)),
-        CensusSurface::ConservativeFocrq,
+        surface,
     )
 }
 
@@ -352,7 +373,11 @@ pub(super) fn validate_loaded_weights(weights: &Weights) -> FocrResult<()> {
                 weights.source_sha256()
             )));
         }
-        CensusSurface::ConservativeFocrq
+        if weights.quant_recipe() == Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID) {
+            CensusSurface::WasmInt4Focrq
+        } else {
+            CensusSurface::ConservativeFocrq
+        }
     } else {
         CensusSurface::SourceSafetensors
     };
@@ -400,7 +425,7 @@ mod tests {
                 (
                     name.clone(),
                     TensorRecord {
-                        dtype: surface.expected_dtype(tensor),
+                        dtype: surface.expected_dtype(name, tensor),
                         shape: tensor.shape.clone(),
                         byte_offset: 0,
                         byte_len: 0,
@@ -537,6 +562,54 @@ mod tests {
             validate_focrq_header(&directory, SOURCE_SHA256, Some("legacy-full-int8"))
                 .expect_err("wrong recipe must fail");
         assert!(recipe_error.to_string().contains("quant_recipe"));
+    }
+
+    /// bd-4l71: the explicitly-tagged wasm experts-int4 recipe is accepted with
+    /// its OWN storage dtypes (experts QInt4PerGroup, attn/lm_head/embed
+    /// QInt8PerChan, rest BF16) — and each surface rejects the other's dtypes.
+    #[test]
+    fn wasm_int4_focrq_surface_accepts_wasm_dtypes_and_rejects_cross_recipe() {
+        let wasm = synthetic_directory(CensusSurface::WasmInt4Focrq);
+        // Sanity: the wasm directory really stores the three storage classes.
+        assert_eq!(
+            wasm["model.layers.11.mlp.experts.63.down_proj.weight"].dtype,
+            DType::QInt4PerGroup
+        );
+        assert_eq!(wasm["lm_head.weight"].dtype, DType::QInt8PerChan);
+        assert_eq!(wasm["model.embed_tokens.weight"].dtype, DType::QInt8PerChan);
+        assert_eq!(
+            wasm["model.layers.0.self_attn.q_proj.weight"].dtype,
+            DType::QInt8PerChan
+        );
+        assert_eq!(wasm["model.norm.weight"].dtype, DType::BF16);
+        assert_eq!(
+            wasm["model.layers.5.mlp.gate.weight"].dtype,
+            DType::BF16,
+            "router gate must stay high precision even under the wasm recipe"
+        );
+
+        validate_focrq_header(
+            &wasm,
+            SOURCE_SHA256,
+            Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+        )
+        .expect("wasm directory + wasm recipe id must pass");
+
+        // Wasm dtypes under the CONSERVATIVE recipe id must fail (the default
+        // recipe is untouched)...
+        let error = validate_focrq_header(&wasm, SOURCE_SHA256, Some(UNLIMITED_OCR_INT8_RECIPE_ID))
+            .expect_err("wasm dtypes must fail the conservative surface");
+        assert!(error.to_string().contains("wrong dtype"));
+
+        // ...and conservative dtypes under the wasm recipe id must fail too.
+        let conservative = synthetic_directory(CensusSurface::ConservativeFocrq);
+        let error = validate_focrq_header(
+            &conservative,
+            SOURCE_SHA256,
+            Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+        )
+        .expect_err("conservative dtypes must fail the wasm surface");
+        assert!(error.to_string().contains("wrong dtype"));
     }
 
     #[test]

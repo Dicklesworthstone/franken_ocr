@@ -319,6 +319,21 @@ struct FocrqHeader {
     /// v1 ever produced), so every existing `.focrq` keeps loading unchanged.
     #[serde(default)]
     model_id: String,
+    /// Optional packing manifest carrying the declared quant-recipe id (e.g.
+    /// the conservative `unlimited-ocr-ffn-int8-…` or the explicitly non-default
+    /// wasm `unlimited-ocr-wasm-experts-int4-…`). Retained so the post-load
+    /// recipe validation and the decoder cache builders can branch on the
+    /// artifact's own declaration (bd-4l71). Absent ⇒ `None`.
+    #[serde(default)]
+    packing_manifest: Option<FocrqPackingManifest>,
+}
+
+/// The subset of the `.focrq` `packing_manifest` header object the loader
+/// retains (the rest is forward-compat and ignored).
+#[derive(Debug, Clone, Deserialize)]
+struct FocrqPackingManifest {
+    #[serde(default)]
+    quant_recipe: Option<String>,
 }
 
 /// A zero-copy view of one stored tensor: its dtype, shape, and the raw payload
@@ -391,6 +406,9 @@ pub struct Weights {
     model_id: &'static str,
     /// Whether this came from a `.focrq` container (vs. a raw safetensors shard).
     is_focrq: bool,
+    /// The quant-recipe id the artifact's `packing_manifest` declares (`None`
+    /// for safetensors, recipe-less `.focrq`, or a manifest without the field).
+    quant_recipe: Option<String>,
 }
 
 /// The weight blob's storage: an owned buffer (the safe default) or a read-only
@@ -473,6 +491,7 @@ impl Default for Weights {
             license_notice: String::new(),
             model_id: model_arch::default_arch().id(),
             is_focrq: false,
+            quant_recipe: None,
         }
     }
 }
@@ -670,6 +689,9 @@ impl Weights {
             license_notice: header.license_notice,
             model_id,
             is_focrq: true,
+            quant_recipe: header
+                .packing_manifest
+                .and_then(|manifest| manifest.quant_recipe),
         })
     }
 
@@ -753,6 +775,7 @@ impl Weights {
             // A raw safetensors shard is the upstream Unlimited-OCR checkpoint.
             model_id: model_arch::default_arch().id(),
             is_focrq: false,
+            quant_recipe: None,
         })
     }
 
@@ -832,6 +855,15 @@ impl Weights {
     #[must_use]
     pub fn source_sha256(&self) -> &str {
         &self.source_sha256
+    }
+
+    /// The quant-recipe id this artifact's `packing_manifest` declares, if any
+    /// (`None` for safetensors and recipe-less `.focrq`). The loader and the
+    /// decoder cache builders branch on this to honor the explicitly-tagged
+    /// non-default wasm experts-int4 recipe (bd-4l71).
+    #[must_use]
+    pub fn quant_recipe(&self) -> Option<&str> {
+        self.quant_recipe.as_deref()
     }
 
     /// The `.focrq` license notice (MIT/Baidu; `""` for safetensors). The
@@ -1495,6 +1527,7 @@ mod tests {
             license_notice: String::new(),
             model_id: model_arch::default_arch().id(),
             is_focrq: true,
+            quant_recipe: None,
         }
     }
 

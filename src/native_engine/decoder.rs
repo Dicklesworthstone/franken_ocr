@@ -40,7 +40,7 @@
 use super::moe;
 use super::nn;
 use super::rswa::{self, BatchedRingCache, RingCache};
-use super::tensor::{Mat, QInt8, WeightLayout};
+use super::tensor::{Mat, QInt4, QInt8, WeightLayout};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
 use crate::simd;
@@ -850,13 +850,16 @@ impl DecoderWeightCache {
             let o_proj = weights
                 .mat(&format!("{prefix}.self_attn.o_proj.weight"))?
                 .data;
+            // FFN/expert projections go through `quant_ffn_loaded`: qint8 (or
+            // bf16 quantized at load) exactly as before, or PACKED int4 kept
+            // packed when the wasm experts-int4 artifact provides it (bd-4l71).
             let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
                 let p = format!("{prefix}.mlp");
                 let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
                 CachedMlpI8::Dense {
-                    gate: quant_oc_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
-                    up: quant_oc_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
-                    down: quant_oc_loaded(
+                    gate: quant_ffn_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
+                    up: quant_ffn_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
+                    down: quant_ffn_loaded(
                         weights,
                         &format!("{p}.down_proj.weight"),
                         config::HIDDEN_SIZE,
@@ -869,17 +872,17 @@ impl DecoderWeightCache {
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        quant_oc_loaded(
+                        quant_ffn_loaded(
                             weights,
                             &format!("{p}.experts.{e}.gate_proj.weight"),
                             inter,
                         )?,
-                        quant_oc_loaded(
+                        quant_ffn_loaded(
                             weights,
                             &format!("{p}.experts.{e}.up_proj.weight"),
                             inter,
                         )?,
-                        quant_oc_loaded(
+                        quant_ffn_loaded(
                             weights,
                             &format!("{p}.experts.{e}.down_proj.weight"),
                             config::HIDDEN_SIZE,
@@ -888,17 +891,17 @@ impl DecoderWeightCache {
                 }
                 let shared_inter = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    quant_oc_loaded(
+                    quant_ffn_loaded(
                         weights,
                         &format!("{p}.shared_experts.gate_proj.weight"),
                         shared_inter,
                     )?,
-                    quant_oc_loaded(
+                    quant_ffn_loaded(
                         weights,
                         &format!("{p}.shared_experts.up_proj.weight"),
                         shared_inter,
                     )?,
-                    quant_oc_loaded(
+                    quant_ffn_loaded(
                         weights,
                         &format!("{p}.shared_experts.down_proj.weight"),
                         config::HIDDEN_SIZE,
@@ -1692,18 +1695,20 @@ fn rms_norm_quant_i8(x: &Mat, weight: Option<&[f32]>, eps: f32) -> FocrResult<(V
     Ok(quantize_row_i8(normed.row(0)))
 }
 
-/// One SwiGLU expert over a single decode row `x[hidden]`, int8: `down(silu(gate·x) *
-/// (up·x))`. The int8 twin of [`expert_gemv`]. Internally parallel (used for the
-/// big dense layer-0 MLP + the shared expert).
-fn expert_gemv_i8(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32> {
-    let g = gemv_i8(x, gate);
-    let u = gemv_i8(x, up);
-    let inter = gate.n;
+/// One SwiGLU expert over a single decode row `x[hidden]`, quantized:
+/// `down(silu(gate·x) * (up·x))` over [`QLinear`] weights (int8 arm identical
+/// to the historical int8-only path; int4 arm consumes packed nibbles).
+/// Internally parallel (used for the big dense layer-0 MLP + the shared
+/// expert).
+fn expert_gemv_i8(x: &[f32], gate: &QLinear, up: &QLinear, down: &QLinear) -> Vec<f32> {
+    let g = gemv_q(x, gate);
+    let u = gemv_q(x, up);
+    let inter = gate.n();
     let mut act = vec![0.0f32; inter];
     for i in 0..inter {
         act[i] = silu(g[i]) * u[i];
     }
-    gemv_i8(&act, down)
+    gemv_q(&act, down)
 }
 
 /// SERIAL int8 GEMV from a pre-quantized activation — a single `simd::igemm_s8s8`
@@ -1727,18 +1732,19 @@ fn gemv_i8_serial(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
 }
 
 /// One SwiGLU expert, fully SERIAL (the input is quantized ONCE and reused for
-/// gate+up). The serial twin of [`expert_gemv_i8`] for cross-expert parallelism.
-fn expert_gemv_i8_serial(x: &[f32], gate: &QInt8, up: &QInt8, down: &QInt8) -> Vec<f32> {
+/// gate+up). The serial twin of [`expert_gemv_i8`] for cross-expert
+/// parallelism; dispatches per-tensor between the int8 and packed-int4 arms.
+fn expert_gemv_i8_serial(x: &[f32], gate: &QLinear, up: &QLinear, down: &QLinear) -> Vec<f32> {
     let (xq, a_scale) = quantize_row_i8(x);
-    let g = gemv_i8_serial(&xq, a_scale, gate);
-    let u = gemv_i8_serial(&xq, a_scale, up);
-    let inter = gate.n;
+    let g = gemv_q_serial(&xq, a_scale, gate);
+    let u = gemv_q_serial(&xq, a_scale, up);
+    let inter = gate.n();
     let mut act = vec![0.0f32; inter];
     for i in 0..inter {
         act[i] = silu(g[i]) * u[i];
     }
     let (aq, a_scale2) = quantize_row_i8(&act);
-    gemv_i8_serial(&aq, a_scale2, down)
+    gemv_q_serial(&aq, a_scale2, down)
 }
 
 /// Quantize an exact `[out, in_]` row-major f32 weight to per-output-channel
@@ -1803,6 +1809,201 @@ pub(crate) fn quant_oc_loaded(weights: &Weights, name: &str, out: usize) -> Focr
     }
     let mat = weights.mat(name)?;
     quant_oc(&mat.data, out, *in_, name)
+}
+
+// ── Packed int4 expert consumption (bd-4l71) ─────────────────────────────────
+//
+// The wasm experts-int4 recipe (`unlimited-ocr-wasm-experts-int4-attn-int8-
+// lmhead-int8-v1`) stores the decoder FFN/expert bulk as `QInt4PerGroup`. The
+// paths below consume the PACKED nibbles directly through
+// [`simd::int4::igemm_s4s8_packed`] — B is **never** materialized as a dense i8
+// buffer (halving resident expert bytes is the entire point of the recipe).
+// The activation side reuses the int8 path's [`quantize_row_i8`] (true
+// division + ties-to-even), so the int8 and int4 arms share one activation
+// contract. Conservative artifacts (qint8 or bf16 FFN tensors) take the
+// existing [`QInt8`] arm byte-for-byte unchanged.
+
+/// A quantized decoder FFN/expert GEMM weight: per-output-channel int8 (the
+/// conservative recipe / quantize-at-load path) or per-group PACKED int4 (the
+/// wasm experts-int4 artifact). The MLP caches hold this so the same
+/// prefill/decode drivers consume both storages; which arm a tensor takes is
+/// decided once at cache build by [`quant_ffn_loaded`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum QLinear {
+    /// Per-output-channel symmetric int8 (`[n, k]` + `n` scales).
+    I8(QInt8),
+    /// Group-quantized packed int4 (`[n, k/2]` nibbles + `n*(k/group)` scales),
+    /// consumed packed by [`simd::int4::igemm_s4s8_packed`].
+    I4(QInt4),
+}
+
+impl QLinear {
+    /// Output dimension (rows).
+    pub(crate) fn n(&self) -> usize {
+        match self {
+            QLinear::I8(q) => q.n,
+            QLinear::I4(q) => q.n,
+        }
+    }
+
+    /// Contraction dimension (columns). Exercised by the loader-plumbing tests
+    /// (the forward paths read `k` through the concrete arms).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn k(&self) -> usize {
+        match self {
+            QLinear::I8(q) => q.k,
+            QLinear::I4(q) => q.k,
+        }
+    }
+}
+
+/// Resolve a decoder FFN/expert tensor `name` to a [`QLinear`]:
+///
+/// * a `QInt4PerGroup` record (the wasm experts-int4 artifact) → the packed
+///   [`QLinear::I4`] arm, verbatim (nibbles stay packed in residency), or
+/// * anything else (pre-quantized `QInt8PerChan`, or raw bf16/f32 quantized at
+///   load) → the existing [`quant_oc_loaded`] int8 arm, byte-for-byte the
+///   conservative behavior.
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if `name` is absent, mis-shaped, or its
+/// output-row count disagrees with `out`.
+pub(crate) fn quant_ffn_loaded(weights: &Weights, name: &str, out: usize) -> FocrResult<QLinear> {
+    if matches!(
+        weights.record(name).map(|rec| rec.dtype),
+        Some(DType::QInt4PerGroup)
+    ) {
+        let q = weights.qint4(name)?;
+        if q.n != out {
+            return Err(FocrError::FormatMismatch(format!(
+                "QInt4 tensor {name:?} has {} output rows; expected {out}",
+                q.n
+            )));
+        }
+        return Ok(QLinear::I4(q));
+    }
+    Ok(QLinear::I8(quant_oc_loaded(weights, name, out)?))
+}
+
+/// Block-parallel m=1 packed-int4 GEMV — the int4 twin of [`gemv_i8`]. The
+/// activation row is dynamically int8-quantized ONCE (the same
+/// [`quantize_row_i8`] the int8 path uses); the `n` output rows fan across the
+/// rayon pool in [`I8_GEMV_BLOCK`] chunks, each one
+/// [`simd::int4::igemm_s4s8_packed`] call over that block's CONTIGUOUS packed
+/// rows/scales, then the activation scale is applied
+/// (`y[o] = a_scale * Σ_g scale[o,g]·(Σ_{k∈g} xq[k]·q4[o,k])`). Each output
+/// channel is an independent per-group contraction, so the block partition
+/// never changes a value — [`gemv_i4_serial`] is bit-identical (gated in-module).
+fn gemv_i4(x: &[f32], q: &QInt4) -> Vec<f32> {
+    debug_assert_eq!(x.len(), q.k);
+    let (xq, a_scale) = quantize_row_i8(x);
+    let kbytes = q.k / 2;
+    let groups = q.k / q.group_size;
+    let mut y = vec![0.0f32; q.n];
+    y.par_chunks_mut(I8_GEMV_BLOCK)
+        .enumerate()
+        .for_each(|(blk, ys)| {
+            let base = blk * I8_GEMV_BLOCK;
+            let cnt = ys.len();
+            simd::int4::igemm_s4s8_packed(
+                &xq,
+                &q.packed[base * kbytes..(base + cnt) * kbytes],
+                &q.scales[base * groups..(base + cnt) * groups],
+                q.group_size,
+                1,
+                q.k,
+                cnt,
+                ys,
+            );
+            for slot in ys.iter_mut() {
+                *slot *= a_scale;
+            }
+        });
+    y
+}
+
+/// SERIAL packed-int4 GEMV from a pre-quantized activation — the int4 twin of
+/// [`gemv_i8_serial`]: one [`simd::int4::igemm_s4s8_packed`] call over all `n`
+/// rows, NO rayon (used inside per-expert rayon tasks where parallelism is
+/// ACROSS experts). Bit-identical to [`gemv_i4`] for the same `(xq, a_scale)`.
+fn gemv_i4_serial(xq: &[i8], a_scale: f32, q: &QInt4) -> Vec<f32> {
+    debug_assert_eq!(xq.len(), q.k);
+    let mut y = vec![0.0f32; q.n];
+    simd::int4::igemm_s4s8_packed(xq, &q.packed, &q.scales, q.group_size, 1, q.k, q.n, &mut y);
+    for slot in y.iter_mut() {
+        *slot *= a_scale;
+    }
+    y
+}
+
+/// Storage-dispatching m=1 GEMV over a [`QLinear`] (fresh activation quantize):
+/// the int8 arm is exactly [`gemv_i8`], the int4 arm consumes packed nibbles
+/// via [`gemv_i4`].
+fn gemv_q(x: &[f32], w: &QLinear) -> Vec<f32> {
+    match w {
+        QLinear::I8(q) => gemv_i8(x, q),
+        QLinear::I4(q) => gemv_i4(x, q),
+    }
+}
+
+/// Storage-dispatching SERIAL m=1 GEMV from a pre-quantized activation row —
+/// the [`QLinear`] twin of [`gemv_i8_serial`] / [`gemv_i4_serial`].
+fn gemv_q_serial(xq: &[i8], a_scale: f32, w: &QLinear) -> Vec<f32> {
+    match w {
+        QLinear::I8(q) => gemv_i8_serial(xq, a_scale, q),
+        QLinear::I4(q) => gemv_i4_serial(xq, a_scale, q),
+    }
+}
+
+/// Prefill (m≥1) dynamic-activation packed-int4 linear — the int4 twin of
+/// [`nn::linear_int8_dynamic`]. Every activation row is int8-quantized with the
+/// SAME [`quantize_row_i8`] rule the int8 prefill kernel applies (true division,
+/// ties-to-even), the whole `[m, k] · [n, k]ᵀ` contraction runs as ONE
+/// [`simd::int4::igemm_s4s8_packed`] call over the packed nibbles (B never
+/// materialized), and each output row is dequantized by its own activation
+/// scale. Row `r` of the result is therefore bit-identical to the m=1
+/// [`gemv_i4_serial`] over that row alone.
+///
+/// # Errors
+/// [`FocrError::Other`] on a shape mismatch.
+fn linear_int4_dynamic(x: &Mat, q: &QInt4) -> FocrResult<Mat> {
+    checked_mat_len("linear_int4_dynamic x", x)?;
+    if x.cols != q.k {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "linear_int4_dynamic: x.cols {} != w.k {}",
+            x.cols,
+            q.k
+        )));
+    }
+    let (m, k, n) = (x.rows, x.cols, q.n);
+    let mut xq = vec![0i8; m * k];
+    let mut a_scales = vec![0.0f32; m];
+    for r in 0..m {
+        let (row_q, scale) = quantize_row_i8(x.row(r));
+        xq[r * k..(r + 1) * k].copy_from_slice(&row_q);
+        a_scales[r] = scale;
+    }
+    let mut out = vec![0.0f32; m * n];
+    simd::int4::igemm_s4s8_packed(&xq, &q.packed, &q.scales, q.group_size, m, k, n, &mut out);
+    for (r, &scale) in a_scales.iter().enumerate() {
+        for value in &mut out[r * n..(r + 1) * n] {
+            *value *= scale;
+        }
+    }
+    Ok(Mat::from_vec(m, n, out))
+}
+
+/// Storage-dispatching prefill linear over a [`QLinear`]: the int8 arm is
+/// exactly [`nn::linear_int8_dynamic`] (no bias — the decoder FFN projections
+/// carry none), the int4 arm is [`linear_int4_dynamic`].
+///
+/// # Errors
+/// Shape mismatches from either arm.
+fn linear_q_dynamic(x: &Mat, w: &QLinear) -> FocrResult<Mat> {
+    match w {
+        QLinear::I8(q) => nn::linear_int8_dynamic(x, q, None),
+        QLinear::I4(q) => linear_int4_dynamic(x, q),
+    }
 }
 
 // ── CCD-sharded / L3-tiled lm_head (FOCR_LMHEAD_SHARD, bd-1azu.25) ────────────
@@ -2016,19 +2217,21 @@ fn fuse_qkv(q: &QInt8, k: &QInt8, v: &QInt8) -> QInt8 {
     QInt8::new(w, scales, 3 * n, kk)
 }
 
-/// A layer's int8 MLP weights — dense (layer 0) or MoE (layers 1..11). Mirrors
-/// [`CachedMlp`] but every projection is a [`QInt8`]; the MoE router `gate` stays
+/// A layer's quantized MLP weights — dense (layer 0) or MoE (layers 1..11).
+/// Every projection is a [`QLinear`]: per-output-channel int8 for conservative
+/// artifacts (byte-for-byte the historical behavior) or per-group PACKED int4
+/// for the wasm experts-int4 artifact (bd-4l71). The MoE router `gate` stays
 /// f32 (top-k routing is precision-sensitive and the gate is tiny: `[64,1280]`).
 enum CachedMlpI8 {
     Dense {
-        gate: QInt8,
-        up: QInt8,
-        down: QInt8,
+        gate: QLinear,
+        up: QLinear,
+        down: QLinear,
     },
     Moe {
         gate: Vec<f32>,
-        experts: Vec<[QInt8; 3]>,
-        shared: [QInt8; 3],
+        experts: Vec<[QLinear; 3]>,
+        shared: [QLinear; 3],
     },
 }
 
@@ -2097,13 +2300,15 @@ impl DecoderWeightCacheI8 {
             // Fused q/k/v stack (FOCR_QKV_FUSED): built ONCE here so decode runs a
             // single block-parallel GEMV. Byte-identical to the 3 separate calls.
             let qkv = qkv_fused_enabled().then(|| fuse_qkv(&q_proj, &k_proj, &v_proj));
+            // FFN/expert projections dispatch per-tensor: qint8/bf16 exactly as
+            // before, PACKED int4 kept packed for the wasm artifact (bd-4l71).
             let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
                 let p = format!("{prefix}.mlp");
                 let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
                 CachedMlpI8::Dense {
-                    gate: quant_oc_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
-                    up: quant_oc_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
-                    down: quant_oc_loaded(weights, &format!("{p}.down_proj.weight"), hidden)?,
+                    gate: quant_ffn_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
+                    up: quant_ffn_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
+                    down: quant_ffn_loaded(weights, &format!("{p}.down_proj.weight"), hidden)?,
                 }
             } else {
                 let p = format!("{prefix}.mlp");
@@ -2112,17 +2317,17 @@ impl DecoderWeightCacheI8 {
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        quant_oc_loaded(
+                        quant_ffn_loaded(
                             weights,
                             &format!("{p}.experts.{e}.gate_proj.weight"),
                             inter,
                         )?,
-                        quant_oc_loaded(
+                        quant_ffn_loaded(
                             weights,
                             &format!("{p}.experts.{e}.up_proj.weight"),
                             inter,
                         )?,
-                        quant_oc_loaded(
+                        quant_ffn_loaded(
                             weights,
                             &format!("{p}.experts.{e}.down_proj.weight"),
                             hidden,
@@ -2131,9 +2336,9 @@ impl DecoderWeightCacheI8 {
                 }
                 let si = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    quant_oc_loaded(weights, &format!("{p}.shared_experts.gate_proj.weight"), si)?,
-                    quant_oc_loaded(weights, &format!("{p}.shared_experts.up_proj.weight"), si)?,
-                    quant_oc_loaded(
+                    quant_ffn_loaded(weights, &format!("{p}.shared_experts.gate_proj.weight"), si)?,
+                    quant_ffn_loaded(weights, &format!("{p}.shared_experts.up_proj.weight"), si)?,
+                    quant_ffn_loaded(
                         weights,
                         &format!("{p}.shared_experts.down_proj.weight"),
                         hidden,
@@ -2168,6 +2373,8 @@ impl DecoderWeightCacheI8 {
 
 /// One SwiGLU expert over a `[n_tok, hidden]` activation, int8 — `down(silu(gate·x)
 /// * (up·x))` via [`nn::linear_int8_dynamic`]. The int8 twin of [`moe::expert_mlp`].
+/// Kept int8-typed for the zoo decoders (`decoder_qwen2`); the Unlimited MLP
+/// caches route through the storage-dispatching [`expert_mlp_q`].
 pub(crate) fn expert_mlp_i8(x: &Mat, gate: &QInt8, up: &QInt8, down: &QInt8) -> FocrResult<Mat> {
     let mut g = nn::linear_int8_dynamic(x, gate, None)?;
     nn::silu(&mut g);
@@ -2185,6 +2392,32 @@ pub(crate) fn expert_mlp_i8(x: &Mat, gate: &QInt8, up: &QInt8, down: &QInt8) -> 
     nn::linear_int8_dynamic(&g, down, None)
 }
 
+/// One SwiGLU expert over a `[n_tok, hidden]` activation, storage-dispatching —
+/// `down(silu(gate·x) * (up·x))` via [`linear_q_dynamic`] (int8 arm =
+/// [`nn::linear_int8_dynamic`] exactly, so it cannot drift from
+/// [`expert_mlp_i8`]; int4 arm = packed [`linear_int4_dynamic`]).
+pub(crate) fn expert_mlp_q(
+    x: &Mat,
+    gate: &QLinear,
+    up: &QLinear,
+    down: &QLinear,
+) -> FocrResult<Mat> {
+    let mut g = linear_q_dynamic(x, gate)?;
+    nn::silu(&mut g);
+    let u = linear_q_dynamic(x, up)?;
+    if g.data.len() != u.data.len() {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::expert_mlp_q: gate/up shape mismatch ({} vs {})",
+            g.data.len(),
+            u.data.len()
+        )));
+    }
+    for (a, &b) in g.data.iter_mut().zip(u.data.iter()) {
+        *a *= b;
+    }
+    linear_q_dynamic(&g, down)
+}
+
 /// Int8 MoE block over `[n_tok, hidden]` — the int8 twin of [`moe::moe_block`]:
 /// route top-6 (f32 router gate), gather each selected token into a compact
 /// activation, run [`expert_mlp_i8`], scatter back weighted, then add the shared
@@ -2193,8 +2426,8 @@ pub(crate) fn expert_mlp_i8(x: &Mat, gate: &QInt8, up: &QInt8, down: &QInt8) -> 
 fn moe_block_i8(
     hidden: &Mat,
     gate: &[f32],
-    experts: &[[QInt8; 3]],
-    shared: &[QInt8; 3],
+    experts: &[[QLinear; 3]],
+    shared: &[QLinear; 3],
 ) -> FocrResult<Mat> {
     let n_tok = hidden.rows;
     let h = hidden.cols;
@@ -2225,7 +2458,7 @@ fn moe_block_i8(
         for (r, &(t, _slot, _w)) in members.iter().enumerate() {
             sub.row_mut(r).copy_from_slice(hidden.row(t));
         }
-        let y = expert_mlp_i8(&sub, &experts[e][0], &experts[e][1], &experts[e][2])?;
+        let y = expert_mlp_q(&sub, &experts[e][0], &experts[e][1], &experts[e][2])?;
         for (r, &(t, slot, w)) in members.iter().enumerate() {
             let yr = y.row(r);
             let base = (t * moe::config::NUM_EXPERTS_PER_TOK + slot) * h;
@@ -2243,7 +2476,7 @@ fn moe_block_i8(
         });
         moe::combine_routed_rows(rows, &routing.indices[t], out.row_mut(t))?;
     }
-    let shared_out = expert_mlp_i8(hidden, &shared[0], &shared[1], &shared[2])?;
+    let shared_out = expert_mlp_q(hidden, &shared[0], &shared[1], &shared[2])?;
     for (o, &s) in out.data.iter_mut().zip(shared_out.data.iter()) {
         *o += s;
     }
@@ -2254,7 +2487,7 @@ fn moe_block_i8(
 /// (prefill, m>1). Int8 twin of [`cached_mlp`].
 fn prefill_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Mat> {
     match mlp {
-        CachedMlpI8::Dense { gate, up, down } => expert_mlp_i8(normed, gate, up, down),
+        CachedMlpI8::Dense { gate, up, down } => expert_mlp_q(normed, gate, up, down),
         CachedMlpI8::Moe {
             gate,
             experts,
@@ -3320,7 +3553,7 @@ mod tests {
 
     fn int8_moe_policy_fixture(
         rollback: bool,
-    ) -> (Mat, Vec<f32>, Vec<[QInt8; 3]>, [QInt8; 3], moe::Routing) {
+    ) -> (Mat, Vec<f32>, Vec<[QLinear; 3]>, [QLinear; 3], moe::Routing) {
         const TARGETS: [f32; moe::config::NUM_EXPERTS_PER_TOK] =
             [16_777_216.0, 1.0, -16_777_216.0, 1.0, 1.0, 1.0];
         let fixture: serde_json::Value =
@@ -3378,13 +3611,22 @@ mod tests {
                         1,
                     )
                 };
-                [unit.clone(), unit.clone(), down]
+                [
+                    QLinear::I8(unit.clone()),
+                    QLinear::I8(unit.clone()),
+                    QLinear::I8(down),
+                ]
             })
             .collect::<Vec<_>>();
         let shared = [
-            zero.clone(),
-            zero,
-            QInt8::new(vec![0; hidden_size], vec![1.0; hidden_size], hidden_size, 1),
+            QLinear::I8(zero.clone()),
+            QLinear::I8(zero),
+            QLinear::I8(QInt8::new(
+                vec![0; hidden_size],
+                vec![1.0; hidden_size],
+                hidden_size,
+                1,
+            )),
         ];
         (hidden, gate, experts, shared, routing)
     }
@@ -3422,7 +3664,7 @@ mod tests {
             std::array::from_fn(|_| vec![0.0; moe::config::HIDDEN_SIZE]);
         for slot in 0..moe::config::NUM_EXPERTS_PER_TOK {
             let expert = indices[slot];
-            let prefill = expert_mlp_i8(
+            let prefill = expert_mlp_q(
                 &hidden,
                 &experts[expert][0],
                 &experts[expert][1],
@@ -3535,6 +3777,351 @@ mod tests {
             .expect_err("a rank-1 vector is not an [out, in] weight");
         assert!(matches!(err, FocrError::FormatMismatch(_)));
         assert!(format!("{err}").contains("rank 1; expected 2"));
+    }
+
+    // ── Packed int4 expert consumption (bd-4l71) ─────────────────────────────
+
+    /// Deterministic synthetic [`QInt4`]: packed nibbles covering the full
+    /// `[-8, 7]` domain and mixed-sign non-power-of-two group scales.
+    fn synthetic_qint4(n: usize, k: usize, group_size: usize, salt: u64) -> QInt4 {
+        let packed: Vec<u8> = (0..n * k / 2)
+            .map(|i| ((i as u64).wrapping_mul(2654435761).wrapping_add(salt * 977) & 0xFF) as u8)
+            .collect();
+        let groups = k / group_size;
+        let scales: Vec<f32> = (0..n * groups)
+            .map(|i| {
+                let raw = ((i as u64).wrapping_mul(40503).wrapping_add(salt) % 4096) as f32;
+                (raw / 4096.0 - 0.5) * 1.7e-2 + 1.0e-3
+            })
+            .collect();
+        QInt4 {
+            packed,
+            scales,
+            n,
+            k,
+            group_size,
+            tier: 1,
+        }
+    }
+
+    /// Independent decoder-level oracle for the packed-int4 GEMV: unpack the
+    /// nibbles with the module-external [`simd::int4::unpack_to_i8`] oracle,
+    /// contract each group in i32, dequant with the group scale in ascending
+    /// group order, then apply the activation scale — the exact op order
+    /// [`gemv_i4`]/[`gemv_i4_serial`] pin.
+    fn reference_gemv_i4(xq: &[i8], a_scale: f32, q: &QInt4) -> Vec<f32> {
+        let b = simd::int4::unpack_to_i8(&q.packed, q.n, q.k);
+        let groups = q.k / q.group_size;
+        let mut y = vec![0.0f32; q.n];
+        for o in 0..q.n {
+            let mut acc_f = 0.0f32;
+            for g in 0..groups {
+                let mut acc_i: i32 = 0;
+                for kk in g * q.group_size..(g + 1) * q.group_size {
+                    acc_i += i32::from(xq[kk]) * i32::from(b[o * q.k + kk]);
+                }
+                acc_f += q.scales[o * groups + g] * acc_i as f32;
+            }
+            y[o] = acc_f * a_scale;
+        }
+        y
+    }
+
+    /// bd-4l71 acceptance: the decoder's packed-int4 GEMV plumbing (parallel
+    /// block-partitioned [`gemv_i4`] AND single-call [`gemv_i4_serial`]) is
+    /// BIT-EXACT against the unpack-then-contract oracle across the REAL
+    /// Unlimited expert dims (routed gate/up `[896,1280]` g32, routed down
+    /// `[1280,896]` g16, dense layer-0 gate/up `[6848,1280]` g32 and down
+    /// `[1280,6848]` g16) plus an odd-block shape straddling `I8_GEMV_BLOCK`.
+    #[test]
+    fn gemv_i4_bitexact_vs_unpack_oracle_over_real_expert_dims() {
+        let cases: [(usize, usize, usize); 5] = [
+            (896, 1280, 32),
+            (1280, 896, 16),
+            (6848, 1280, 32),
+            (1280, 6848, 16),
+            (130, 96, 16), // n crosses a 64-row block boundary with an odd tail
+        ];
+        for (case, &(n, k, group)) in cases.iter().enumerate() {
+            let q = synthetic_qint4(n, k, group, case as u64 + 1);
+            let x: Vec<f32> = (0..k)
+                .map(|i| (i as f32 * 0.37).sin() * 2.5 - 0.4)
+                .collect();
+            let (xq, a_scale) = quantize_row_i8(&x);
+
+            let want = reference_gemv_i4(&xq, a_scale, &q);
+            let parallel = gemv_i4(&x, &q);
+            let serial = gemv_i4_serial(&xq, a_scale, &q);
+
+            let bits = |s: &[f32]| s.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+            assert_eq!(
+                bits(&parallel),
+                bits(&want),
+                "gemv_i4 != oracle for (n={n},k={k},g={group})"
+            );
+            assert_eq!(
+                bits(&serial),
+                bits(&want),
+                "gemv_i4_serial != oracle for (n={n},k={k},g={group})"
+            );
+        }
+    }
+
+    /// The prefill m>1 packed-int4 linear must reproduce, row for row and
+    /// BIT-EXACTLY, the m=1 serial GEMV over that row alone (each row carries
+    /// its own ties-to-even activation scale) — the same losslessness contract
+    /// the int8 batched paths pin. Also holds through the [`QLinear`] dispatch.
+    #[test]
+    fn linear_int4_dynamic_rows_bitexact_vs_serial_gemv() {
+        let (n, k, group) = (96usize, 64usize, 16usize);
+        let q = synthetic_qint4(n, k, group, 7);
+        let m = 3usize;
+        let x = Mat::from_vec(
+            m,
+            k,
+            (0..m * k)
+                .map(|i| (i as f32 * 0.11).cos() * 1.9 + 0.2)
+                .collect(),
+        );
+        let out = linear_int4_dynamic(&x, &q).expect("shapes agree");
+        assert_eq!(out.shape(), (m, n));
+        for r in 0..m {
+            let (xq, a_scale) = quantize_row_i8(x.row(r));
+            let want = gemv_i4_serial(&xq, a_scale, &q);
+            assert_eq!(
+                out.row(r).iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                want.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                "prefill row {r} != m=1 serial GEMV"
+            );
+        }
+        // QLinear dispatch reaches the same kernel.
+        let via_dispatch =
+            linear_q_dynamic(&x, &QLinear::I4(q.clone())).expect("dispatch shapes agree");
+        assert_eq!(via_dispatch, out);
+
+        // Shape mismatch is rejected, not silently mis-contracted.
+        let bad = Mat::zeros(1, k + group);
+        assert!(linear_int4_dynamic(&bad, &q).is_err());
+    }
+
+    /// End-to-end tensor-level parity (bd-4l71 acceptance): a full SwiGLU
+    /// expert over PACKED int4 weights (real routed-expert dims, g16 and g32
+    /// mixed per tensor) matches the `dequantize_int4` → f32 reference path
+    /// within the tolerance the int8 path's analogous test uses
+    /// (`nn::linear_int8_dynamic_approximates_f32`-style closeness, scaled to
+    /// the output magnitude) — and the decode (serial) and prefill (parallel /
+    /// m=1 batched) drivers agree BIT-EXACTLY with each other, because the
+    /// integer contraction contract is shared.
+    #[test]
+    fn expert_forward_int4_matches_dequantized_f32_reference() {
+        use crate::quant::int4::{dequantize_int4, pack_int4_f32};
+
+        let (hidden, inter) = (1280usize, 896usize);
+        let wgen = |len: usize, salt: u64| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let raw = ((i as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(salt)
+                        >> 33) as u32;
+                    (raw as f32 / u32::MAX as f32 - 0.5) * 0.08
+                })
+                .collect()
+        };
+        let gate_f = wgen(inter * hidden, 1);
+        let up_f = wgen(inter * hidden, 2);
+        let down_f = wgen(hidden * inter, 3);
+        // Mixed group sizes per tensor: the recipe allows g16 OR g32 per tensor.
+        let gate_q = pack_int4_f32(&gate_f, inter, hidden, 16);
+        let up_q = pack_int4_f32(&up_f, inter, hidden, 32);
+        let down_q = pack_int4_f32(&down_f, hidden, inter, 16);
+        let to_qint4 = |q: &crate::quant::int4::QuantizedInt4| QInt4 {
+            packed: q.packed.clone(),
+            scales: q.scales.clone(),
+            n: q.n,
+            k: q.k,
+            group_size: q.group_size,
+            tier: 1,
+        };
+        let gate = QLinear::I4(to_qint4(&gate_q));
+        let up = QLinear::I4(to_qint4(&up_q));
+        let down = QLinear::I4(to_qint4(&down_q));
+
+        let x: Vec<f32> = (0..hidden)
+            .map(|i| (i as f32 * 0.019).sin() * 1.3 - 0.1)
+            .collect();
+
+        // Decode (serial, cross-expert-parallel shape) and internally-parallel
+        // paths agree bit-exactly — the same integer contraction contract.
+        let decode = expert_gemv_i8_serial(&x, &gate, &up, &down);
+        let parallel = expert_gemv_i8(&x, &gate, &up, &down);
+        assert_eq!(
+            decode.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+            parallel.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+            "serial vs parallel int4 expert paths must be bit-identical"
+        );
+        // The prefill (m=1) driver row equals the decode row bit-exactly too.
+        let xm = Mat::from_vec(1, hidden, x.clone());
+        let prefill = expert_mlp_q(&xm, &gate, &up, &down).expect("prefill expert runs");
+        assert_eq!(
+            prefill
+                .row(0)
+                .iter()
+                .map(|f| f.to_bits())
+                .collect::<Vec<u32>>(),
+            decode.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+            "prefill m=1 vs decode int4 expert paths must be bit-identical"
+        );
+
+        // f32 reference over the EXACT dequantized int4 grid values: the only
+        // divergence left is the dynamic int8 activation quantization the int8
+        // path also performs — the near-lossless closeness the int8 test pins.
+        let gate_d = dequantize_int4(&gate_q);
+        let up_d = dequantize_int4(&up_q);
+        let down_d = dequantize_int4(&down_q);
+        let dot = |w: &[f32], row: usize, x: &[f32]| -> f32 {
+            let k = x.len();
+            w[row * k..(row + 1) * k]
+                .iter()
+                .zip(x)
+                .map(|(&a, &b)| a * b)
+                .sum()
+        };
+        let mut act = vec![0.0f32; inter];
+        for o in 0..inter {
+            let g = dot(&gate_d, o, &x);
+            let u = dot(&up_d, o, &x);
+            act[o] = silu(g) * u;
+        }
+        let reference: Vec<f32> = (0..hidden).map(|o| dot(&down_d, o, &act)).collect();
+
+        let amax = reference.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
+        assert!(amax > 0.0, "reference expert output must be non-degenerate");
+        for (o, (&got, &want)) in decode.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (got - want).abs() <= 0.02 * amax,
+                "int4 expert channel {o}: {got} vs f32 reference {want} (amax {amax})"
+            );
+        }
+    }
+
+    /// [`quant_ffn_loaded`] reads a `QInt4PerGroup` artifact tensor VERBATIM
+    /// into the packed [`QLinear::I4`] arm (nibbles + group scales untouched —
+    /// no unpack at residency), rejects an output-row mismatch, and still
+    /// resolves qint8/bf16 tensors through the historical int8 arm.
+    #[test]
+    fn quant_ffn_loaded_keeps_int4_packed_and_dispatches_int8_unchanged() {
+        let (n, k, group) = (4usize, 32usize, 16usize);
+        let q = synthetic_qint4(n, k, group, 11);
+        let mut builder = quant_oc_fixture_builder();
+        builder
+            .add_quantized(
+                "w4",
+                crate::quant::focrq::WriteDType::QInt4PerGroup,
+                vec![n, k],
+                q.packed.clone(),
+                q.scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                group,
+                1,
+            )
+            .expect("valid synthetic QInt4 record");
+        builder
+            .add_quantized(
+                "w8",
+                crate::quant::focrq::WriteDType::QInt8PerChan,
+                vec![3, 2],
+                vec![0; 6],
+                vec![0; 3 * std::mem::size_of::<f32>()],
+                0,
+                0,
+            )
+            .expect("valid synthetic QInt8 record");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact loads");
+
+        let loaded = quant_ffn_loaded(&weights, "w4", n).expect("int4 tensor loads");
+        assert_eq!((loaded.n(), loaded.k()), (n, k));
+        let QLinear::I4(loaded_q) = &loaded else {
+            panic!("QInt4PerGroup record must take the packed int4 arm");
+        };
+        assert_eq!(
+            loaded_q.packed, q.packed,
+            "nibbles must stay packed verbatim"
+        );
+        assert_eq!(loaded_q.scales, q.scales);
+        assert_eq!(loaded_q.group_size, group);
+
+        // The loaded tensor computes bit-identically to the directly built one.
+        let x: Vec<f32> = (0..k).map(|i| (i as f32) * 0.21 - 2.0).collect();
+        assert_eq!(gemv_q(&x, &loaded), gemv_i4(&x, &q));
+
+        let err = quant_ffn_loaded(&weights, "w4", n + 1).expect_err("row mismatch must fail");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(format!("{err}").contains("output rows; expected"));
+
+        let loaded8 = quant_ffn_loaded(&weights, "w8", 3).expect("int8 tensor loads");
+        assert!(
+            matches!(loaded8, QLinear::I8(_)),
+            "QInt8PerChan must keep the historical int8 arm"
+        );
+    }
+
+    /// Decoder-level plumbing over a synthetic [`Weights`]: a dense
+    /// [`CachedMlpI8`] built from artifact int4 tensors decodes BIT-EXACTLY to
+    /// the same expert computed over directly constructed packed weights.
+    #[test]
+    fn decode_mlp_over_artifact_int4_weights_is_bitexact() {
+        let (hidden, inter, group) = (64usize, 48usize, 16usize);
+        let gate = synthetic_qint4(inter, hidden, group, 21);
+        let up = synthetic_qint4(inter, hidden, 32, 22);
+        let down = synthetic_qint4(hidden, inter, group, 23);
+        let mut builder = quant_oc_fixture_builder();
+        for (name, q) in [("gate", &gate), ("up", &up), ("down", &down)] {
+            builder
+                .add_quantized(
+                    name,
+                    crate::quant::focrq::WriteDType::QInt4PerGroup,
+                    vec![q.n, q.k],
+                    q.packed.clone(),
+                    q.scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                    q.group_size,
+                    1,
+                )
+                .expect("valid synthetic QInt4 record");
+        }
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact loads");
+        let mlp = CachedMlpI8::Dense {
+            gate: quant_ffn_loaded(&weights, "gate", inter).expect("gate loads"),
+            up: quant_ffn_loaded(&weights, "up", inter).expect("up loads"),
+            down: quant_ffn_loaded(&weights, "down", hidden).expect("down loads"),
+        };
+
+        let x = Mat::from_vec(
+            1,
+            hidden,
+            (0..hidden).map(|i| (i as f32 * 0.31).sin() * 1.1).collect(),
+        );
+        let decoded = decode_mlp_i8(&mlp, &x).expect("decode over artifact int4 runs");
+        let want = expert_gemv_i8(
+            x.row(0),
+            &QLinear::I4(gate),
+            &QLinear::I4(up),
+            &QLinear::I4(down),
+        );
+        assert_eq!(
+            decoded.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+            want.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+            "artifact-loaded int4 dense MLP must match direct packed compute"
+        );
+        // Prefill driver over the same cache agrees with the decode row.
+        let prefill = prefill_mlp_i8(&mlp, &x).expect("prefill over artifact int4 runs");
+        assert_eq!(
+            prefill
+                .row(0)
+                .iter()
+                .map(|f| f.to_bits())
+                .collect::<Vec<u32>>(),
+            decoded.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+        );
     }
 
     #[test]

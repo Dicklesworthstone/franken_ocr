@@ -1058,6 +1058,58 @@ fn model_search_specs(spec: &Path) -> Vec<PathBuf> {
     specs
 }
 
+/// Bounded probe: does the `.focrq` at `path` declare the explicitly
+/// NON-DEFAULT wasm experts-int4 recipe
+/// ([`crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID`])?
+///
+/// The search-dir resolver consults this so a wasm-recipe artifact sitting in
+/// a model directory is NEVER selected as a default model (bd-4l71): it may
+/// only be loaded via an explicit path or [`OcrModel::from_weights`]. Reads at
+/// most the preamble + bounded header; any read/parse failure (including a
+/// non-`.focrq` file) answers `false` so resolution behavior is otherwise
+/// unchanged.
+fn focrq_declares_wasm_recipe(path: &Path) -> bool {
+    const FOCRQ_PREAMBLE_LEN: usize = 6 + 4 + 1 + 32 + 8;
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut preamble = [0u8; FOCRQ_PREAMBLE_LEN];
+    if file.read_exact(&mut preamble).is_err()
+        || &preamble[..weights::FOCRQ_MAGIC.len()] != weights::FOCRQ_MAGIC
+    {
+        return false;
+    }
+    let header_len = u64::from_le_bytes(
+        preamble[43..51]
+            .try_into()
+            .expect("fixed .focrq header length slice"),
+    );
+    let Ok(header_len) = usize::try_from(header_len) else {
+        return false;
+    };
+    if header_len == 0 || header_len > MODEL_HEADER_VALIDATION_MAX_BYTES {
+        return false;
+    }
+    let mut header_bytes = vec![0u8; header_len];
+    if file.read_exact(&mut header_bytes).is_err() {
+        return false;
+    }
+    #[derive(serde::Deserialize)]
+    struct RecipeProbe {
+        #[serde(default)]
+        packing_manifest: Option<FocrqPackingManifestProbe>,
+    }
+    let Ok(probe) = serde_json::from_slice::<RecipeProbe>(&header_bytes) else {
+        return false;
+    };
+    probe
+        .packing_manifest
+        .and_then(|manifest| manifest.quant_recipe)
+        .as_deref()
+        == Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID)
+}
+
 fn resolve_model_from_search_dirs_with_quant(
     spec: &Path,
     search_dirs: &[PathBuf],
@@ -1065,12 +1117,16 @@ fn resolve_model_from_search_dirs_with_quant(
 ) -> FocrResult<PathBuf> {
     let specs = model_search_specs(spec);
     for dir in search_dirs {
-        if let Some(resolved) = resolve_existing_model_artifact(dir) {
+        if let Some(resolved) = resolve_existing_model_artifact(dir)
+            && !focrq_declares_wasm_recipe(&resolved)
+        {
             return Ok(resolved);
         }
         for search_spec in &specs {
             for candidate in short_model_candidates(dir, search_spec, quant) {
-                if let Some(resolved) = resolve_existing_model_artifact(&candidate) {
+                if let Some(resolved) = resolve_existing_model_artifact(&candidate)
+                    && !focrq_declares_wasm_recipe(&resolved)
+                {
                     return Ok(resolved);
                 }
             }
@@ -1482,6 +1538,7 @@ fn validate_model_header_from_reader(mut reader: impl Read, file_len: u64) -> Fo
         validate_unlimited_ocr_quant_records(
             true,
             model_id,
+            declared_recipe,
             header
                 .tensors
                 .iter()
@@ -1579,6 +1636,7 @@ fn validate_unlimited_ocr_quant_recipe(weights: &Weights) -> FocrResult<()> {
     validate_unlimited_ocr_quant_records(
         weights.is_focrq(),
         weights.model_id(),
+        weights.quant_recipe(),
         weights.names().map(|name| {
             let dtype = weights
                 .record(name)
@@ -1593,26 +1651,43 @@ fn validate_unlimited_ocr_quant_recipe(weights: &Weights) -> FocrResult<()> {
 fn validate_unlimited_ocr_quant_records<'a>(
     is_focrq: bool,
     model_id: &str,
+    declared_recipe: Option<&str>,
     records: impl IntoIterator<Item = (&'a str, DType)>,
 ) -> FocrResult<()> {
     if !is_focrq || model_id != model_arch::default_arch().id() {
         return Ok(());
     }
 
+    // The explicitly-tagged NON-DEFAULT wasm experts-int4 recipe (bd-4l71) is
+    // honored ONLY when the artifact's packing manifest declares it; every
+    // other Unlimited-OCR `.focrq` is held to the conservative default exactly
+    // as before. Under the wasm recipe: expert FFN tensors MUST be
+    // QInt4PerGroup, attention/lm_head/embed MUST be QInt8PerChan, everything
+    // else BF16/F32 — so e.g. int4 attention is rejected loudly.
+    let wasm_recipe =
+        declared_recipe == Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID);
     let recipe = Recipe::validated_default();
     let mut violations = Vec::new();
     for (name, dtype) in records {
-        let valid = if recipe.is_quantized(name) {
-            dtype == DType::QInt8PerChan
+        let expected: (&str, bool) = if wasm_recipe {
+            match crate::quant::recipe::classify_wasm_experts_int4(name) {
+                crate::quant::recipe::WasmInt4Policy::ExpertInt4 => {
+                    ("QInt4PerGroup", dtype == DType::QInt4PerGroup)
+                }
+                crate::quant::recipe::WasmInt4Policy::Int8 => {
+                    ("QInt8PerChan", dtype == DType::QInt8PerChan)
+                }
+                crate::quant::recipe::WasmInt4Policy::KeepHighPrecision => {
+                    ("BF16 or F32", matches!(dtype, DType::BF16 | DType::F32))
+                }
+            }
+        } else if recipe.is_quantized(name) {
+            ("QInt8PerChan", dtype == DType::QInt8PerChan)
         } else {
-            matches!(dtype, DType::BF16 | DType::F32)
+            ("BF16 or F32", matches!(dtype, DType::BF16 | DType::F32))
         };
+        let (expected, valid) = expected;
         if !valid {
-            let expected = if recipe.is_quantized(name) {
-                "QInt8PerChan"
-            } else {
-                "BF16 or F32"
-            };
             violations.push(format!("{name} is {dtype:?}, expected {expected}"));
         }
     }
@@ -1632,10 +1707,14 @@ fn validate_unlimited_ocr_quant_records<'a>(
     } else {
         format!("; and {omitted} more")
     };
+    let recipe_id = if wasm_recipe {
+        crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID
+    } else {
+        crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID
+    };
     Err(FocrError::FormatMismatch(format!(
-        "Unlimited-OCR .focrq violates quant recipe {}: {shown}{suffix}. Re-convert the \
+        "Unlimited-OCR .focrq violates quant recipe {recipe_id}: {shown}{suffix}. Re-convert the \
          original safetensors with this build; legacy full-int8 artifacts are not accepted",
-        crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID,
     )))
 }
 
@@ -2561,7 +2640,7 @@ impl OcrModel {
         // BASE_PROMPT tokenizer); a got-ocr2/zoo artifact must take the
         // sequential loop, whose per-page forward() carries the arch dispatch.
         let spine = batch_scheduler::spine_enabled()
-            && int8_decode_requested()
+            && (int8_decode_requested() || self.artifact_stores_gated_int8())
             && std::env::var_os(DECODE_STATELESS_ENV).is_none()
             && self.arch().id() == model_arch::default_arch().id();
         // A7.5 (bd-3jo6.1.7.5): the DENSE continuous-batch spine. GOT decode is
@@ -2828,9 +2907,31 @@ impl OcrModel {
     /// driver reads the ~1.2 s quant ONCE without re-running it per page. Does NOT
     /// change the sequential path (which keeps its own inline get-or-build).
     fn decoder_cache_i8(&self) -> FocrResult<&decoder::DecoderWeightCacheI8> {
-        require_experimental_full_int8_recipe()?;
+        self.require_full_int8_authorization()?;
         self.decoder_cache_i8
             .get_or_try_init(|| decoder::DecoderWeightCacheI8::build(&self.weights))
+    }
+
+    /// Whether this model's artifact ITSELF stores the gated tensor sets
+    /// (attention `q/k/v/o` + `lm_head`) in int8 — true exactly for the
+    /// explicitly-tagged wasm experts-int4 recipe (bd-4l71). For such an
+    /// artifact the int8 attention/lm_head values were baked in by the
+    /// converter, so **artifact storage IS the opt-in**: the
+    /// `FOCR_INT8_ATTN`/`FOCR_INT8_LMHEAD` env kill-switches (which gate the
+    /// quantize-at-load experiment) are not required and not consulted.
+    fn artifact_stores_gated_int8(&self) -> bool {
+        self.weights.quant_recipe()
+            == Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID)
+    }
+
+    /// Authorize the all-int8 decoder cache: either the artifact itself stores
+    /// the gated sets int8 (see [`Self::artifact_stores_gated_int8`]) or the
+    /// experimental three-switch env contract is satisfied.
+    fn require_full_int8_authorization(&self) -> FocrResult<()> {
+        if self.artifact_stores_gated_int8() {
+            return Ok(());
+        }
+        require_experimental_full_int8_recipe()
     }
 
     /// Build or fetch the conservative mixed-precision decoder cache. Unlike
@@ -3305,7 +3406,11 @@ impl OcrModel {
                 observer,
                 &mut runaway_guard,
             )
-        } else if int8_decode_requested() {
+        } else if int8_decode_requested() || self.artifact_stores_gated_int8() {
+            // The wasm experts-int4 artifact routes through the int8 cache by
+            // default: its attention/lm_head are int8 IN the artifact (so they
+            // stay int8-resident) and its expert tensors are consumed as
+            // packed int4 by the cache's QLinear arm (bd-4l71).
             self.generate_cached_i8(
                 inputs_embeds,
                 prompt_ids,
@@ -3447,7 +3552,7 @@ impl OcrModel {
         mut observer: Option<&mut dyn FnMut(u32)>,
         runaway_guard: &mut sampler::RunawayGuard,
     ) -> FocrResult<Vec<u32>> {
-        require_experimental_full_int8_recipe()?;
+        self.require_full_int8_authorization()?;
         timing_log("precision focr-full-int8");
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
@@ -4483,6 +4588,260 @@ mod tests {
         let err = validate_unlimited_ocr_quant_recipe(&weights)
             .expect_err("validated FFN tensor must use int8 storage");
         assert!(err.to_string().contains("expected QInt8PerChan"));
+    }
+
+    // ── wasm experts-int4 recipe (bd-4l71) ───────────────────────────────────
+
+    fn add_unit_qint4(builder: &mut crate::quant::focrq::FocrqBuilder, name: &str) {
+        // [1, 16] g16: 8 packed bytes, one f32 group scale.
+        builder
+            .add_quantized(
+                name,
+                crate::quant::focrq::WriteDType::QInt4PerGroup,
+                vec![1, 16],
+                vec![0x21; 8],
+                1.0f32.to_le_bytes().to_vec(),
+                16,
+                0,
+            )
+            .expect("add synthetic qint4 tensor");
+    }
+
+    fn wasm_recipe_manifest_json() -> String {
+        format!(
+            r#"{{"quant_recipe":"{}"}}"#,
+            crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID,
+        )
+    }
+
+    #[test]
+    fn wasm_recipe_records_accept_int4_experts_and_int8_gated_sets() {
+        let wasm = Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID);
+        validate_unlimited_ocr_quant_records(
+            true,
+            model_arch::default_arch().id(),
+            wasm,
+            [
+                (
+                    "model.layers.3.mlp.experts.7.up_proj.weight",
+                    DType::QInt4PerGroup,
+                ),
+                ("model.layers.0.mlp.down_proj.weight", DType::QInt4PerGroup),
+                (
+                    "model.layers.11.mlp.shared_experts.gate_proj.weight",
+                    DType::QInt4PerGroup,
+                ),
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    DType::QInt8PerChan,
+                ),
+                ("lm_head.weight", DType::QInt8PerChan),
+                ("model.embed_tokens.weight", DType::QInt8PerChan),
+                ("model.norm.weight", DType::BF16),
+                ("model.layers.5.mlp.gate.weight", DType::BF16), // router
+            ],
+        )
+        .expect("the declared wasm recipe must accept its own storage dtypes");
+    }
+
+    #[test]
+    fn wasm_recipe_records_reject_int4_attention_and_wrong_expert_storage() {
+        let wasm = Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID);
+        // Planted negative: int4 ATTENTION under the wasm recipe is refused.
+        let err = validate_unlimited_ocr_quant_records(
+            true,
+            model_arch::default_arch().id(),
+            wasm,
+            [(
+                "model.layers.0.self_attn.q_proj.weight",
+                DType::QInt4PerGroup,
+            )],
+        )
+        .expect_err("int4 attention must be rejected under the wasm recipe");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(err.to_string().contains("expected QInt8PerChan"));
+        assert!(
+            err.to_string()
+                .contains(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID)
+        );
+
+        // Experts must actually BE int4 under the wasm recipe (not int8/bf16).
+        for dtype in [DType::QInt8PerChan, DType::BF16] {
+            let err = validate_unlimited_ocr_quant_records(
+                true,
+                model_arch::default_arch().id(),
+                wasm,
+                [("model.layers.3.mlp.experts.7.up_proj.weight", dtype)],
+            )
+            .expect_err("non-int4 expert storage must be rejected under the wasm recipe");
+            assert!(err.to_string().contains("expected QInt4PerGroup"));
+        }
+
+        // The router gate stays high precision even under the wasm recipe.
+        let err = validate_unlimited_ocr_quant_records(
+            true,
+            model_arch::default_arch().id(),
+            wasm,
+            [("model.layers.5.mlp.gate.weight", DType::QInt8PerChan)],
+        )
+        .expect_err("quantized router gate must be rejected");
+        assert!(err.to_string().contains("expected BF16 or F32"));
+    }
+
+    #[test]
+    fn conservative_recipe_still_rejects_int4_expert_storage() {
+        // No declared wasm recipe (None, or the conservative id): QInt4 expert
+        // storage stays a violation — the default recipe is untouched.
+        for declared in [
+            None,
+            Some(crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID),
+        ] {
+            let err = validate_unlimited_ocr_quant_records(
+                true,
+                model_arch::default_arch().id(),
+                declared,
+                [(
+                    "model.layers.3.mlp.experts.7.up_proj.weight",
+                    DType::QInt4PerGroup,
+                )],
+            )
+            .expect_err("int4 experts must stay rejected outside the wasm recipe");
+            assert!(err.to_string().contains("expected QInt8PerChan"));
+            assert!(
+                err.to_string()
+                    .contains(crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID)
+            );
+        }
+    }
+
+    #[test]
+    fn wasm_recipe_artifact_passes_dtype_validation_and_fails_only_the_census() {
+        // A loaded artifact that DECLARES the wasm recipe and stores an int4
+        // expert + int8 attention/lm_head passes the per-tensor dtype recipe
+        // check; the only remaining failure is the completeness census (this
+        // synthetic artifact has 3 of the 2,710 tensors) — proving acceptance
+        // of the wasm dtypes end-to-end through `Weights`.
+        let mut builder = crate::quant::focrq::FocrqBuilder::new()
+            .with_packing_manifest_json(wasm_recipe_manifest_json())
+            .with_source_sha256([
+                0x2b, 0xc4, 0x8a, 0x7a, 0x11, 0x00, 0x61, 0xea, 0x58, 0xff, 0xf6, 0x5d, 0x31, 0x69,
+                0x36, 0x7e, 0xeb, 0xe3, 0xae, 0xe3, 0x71, 0xca, 0x69, 0x68, 0xdc, 0x22, 0x19, 0xc1,
+                0xb2, 0x85, 0x5f, 0xc6,
+            ]);
+        add_unit_qint4(&mut builder, "model.layers.3.mlp.experts.7.up_proj.weight");
+        add_unit_qint8(&mut builder, "model.layers.0.self_attn.q_proj.weight");
+        add_unit_qint8(&mut builder, "lm_head.weight");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic wasm artifact parses");
+        assert_eq!(
+            weights.quant_recipe(),
+            Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+            "the loader must retain the declared recipe id"
+        );
+        let error = validate_unlimited_ocr_quant_recipe(&weights)
+            .expect_err("a 3-tensor subset must still fail the completeness census");
+        let text = error.to_string();
+        assert!(
+            text.contains("expected 2710 tensors, found 3"),
+            "failure must be the census, not a dtype-recipe violation: {text}"
+        );
+        assert!(
+            !text.contains("violates quant recipe"),
+            "wasm dtypes must not be flagged as recipe violations: {text}"
+        );
+    }
+
+    #[test]
+    fn weights_without_manifest_report_no_quant_recipe() {
+        let mut builder = crate::quant::focrq::FocrqBuilder::new();
+        add_unit_qint8(&mut builder, "model.layers.0.mlp.down_proj.weight");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact parses");
+        assert_eq!(weights.quant_recipe(), None);
+    }
+
+    /// Planted negative (bd-4l71 acceptance): an artifact whose int4 record
+    /// carries an invalid `group_size` is rejected by the bounded header probe
+    /// with `FormatMismatch` — proven by byte-patching a valid artifact's
+    /// header (`"group_size":16` → `"group_size":96`; same byte length, so the
+    /// container framing stays intact and ONLY the metadata is corrupt).
+    #[test]
+    fn focrq_int4_invalid_group_size_is_rejected_with_format_mismatch() {
+        let mut builder = crate::quant::focrq::FocrqBuilder::new()
+            .with_packing_manifest_json(wasm_recipe_manifest_json());
+        add_unit_qint4(&mut builder, "model.layers.3.mlp.experts.7.up_proj.weight");
+        let blob = builder.build();
+
+        // The intact artifact clears the bounded header probe's structural
+        // checks up to (at least) the census; the patched one must die earlier,
+        // at the quant-metadata check.
+        let needle = b"\"group_size\":16";
+        let position = blob
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("header must contain the int4 group_size field");
+        let mut corrupt = blob.clone();
+        corrupt[position + needle.len() - 2] = b'9'; // 16 -> 96
+
+        let err = validate_model_header_from_reader(corrupt.as_slice(), corrupt.len() as u64)
+            .expect_err("group_size 96 must be rejected");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+        assert!(
+            err.to_string().contains("group_size"),
+            "error must name the corrupt field: {err}"
+        );
+
+        // The same corruption is also refused by the full parser's accessor
+        // path: the tensor can never be consumed as int4.
+        let weights = Weights::from_bytes(corrupt).expect("directory framing is still intact");
+        let err = weights
+            .qint4("model.layers.3.mlp.experts.7.up_proj.weight")
+            .expect_err("qint4 accessor must reject group_size 96");
+        assert!(matches!(err, FocrError::FormatMismatch(_)));
+    }
+
+    /// bd-4l71: the search-dir resolver must NEVER hand out a wasm-recipe
+    /// artifact as a default model — even when it sits at a canonical
+    /// candidate name — while explicit-path resolution still reaches it.
+    #[test]
+    fn resolver_skips_wasm_recipe_artifacts_but_explicit_path_loads_them() {
+        let dir = temp_model_dir("resolver_skips_wasm_recipe");
+        let wasm_path = dir.join("unlimited-ocr.int8.focrq");
+        let mut wasm_builder = crate::quant::focrq::FocrqBuilder::new()
+            .with_packing_manifest_json(wasm_recipe_manifest_json());
+        add_unit_qint4(
+            &mut wasm_builder,
+            "model.layers.3.mlp.experts.7.up_proj.weight",
+        );
+        std::fs::write(&wasm_path, wasm_builder.build()).expect("write wasm-recipe artifact");
+        assert!(focrq_declares_wasm_recipe(&wasm_path));
+
+        let err =
+            resolve_model_from_search_dirs(Path::new("unlimited-ocr"), std::slice::from_ref(&dir))
+                .expect_err("the resolver must skip the wasm-recipe artifact");
+        assert!(matches!(err, FocrError::ModelNotFound(_)));
+
+        // Explicit path: resolution returns the file (loading then applies the
+        // recipe/census validation as usual).
+        let resolved =
+            OcrModel::resolve_model(&wasm_path).expect("explicit path must resolve verbatim");
+        assert_eq!(resolved, wasm_path);
+
+        // A conservative-recipe artifact at the same candidate name resolves.
+        let conservative_path = dir.join("unlimited-ocr.int4.focrq");
+        let mut conservative_builder = crate::quant::focrq::FocrqBuilder::new()
+            .with_packing_manifest_json(format!(
+                r#"{{"quant_recipe":"{}"}}"#,
+                crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID,
+            ));
+        add_unit_qint8(
+            &mut conservative_builder,
+            "model.layers.0.mlp.down_proj.weight",
+        );
+        std::fs::write(&conservative_path, conservative_builder.build())
+            .expect("write conservative artifact");
+        assert!(!focrq_declares_wasm_recipe(&conservative_path));
+        let resolved = resolve_model_from_search_dirs(Path::new("unlimited-ocr"), &[dir])
+            .expect("a non-wasm artifact must still resolve");
+        assert_eq!(resolved, conservative_path);
     }
 
     #[test]
