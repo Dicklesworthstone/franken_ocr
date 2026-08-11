@@ -134,6 +134,47 @@ impl Mat {
     }
 }
 
+/// Storage for a [`QInt8`]'s int8 weight buffer: an owned `Vec<i8>` (weights
+/// quantized at load, fused/repacked weights, tests) or a zero-copy
+/// [`SharedBytes`](super::weights::SharedBytes) view into the loaded model blob
+/// (bd-4l71 residency: a `.focrq` `QInt8PerChan` payload is ALREADY the exact
+/// row-major `[n, k]` int8 byte image, so copying it next to the resident
+/// artifact wastes ~244 MB on the wasm recipe's attention + `lm_head` set).
+///
+/// The `u8 -> i8` reinterpretation is a same-size, alignment-1 plain-old-data
+/// cast performed by `bytemuck::cast_slice` — no `unsafe` in this crate, and
+/// the VALUES are exactly what the historical `view.data.iter().map(|&b| b as
+/// i8)` copy produced, so every consumer is bit-exactly storage-agnostic.
+#[derive(Debug, Clone)]
+pub enum Int8Weights {
+    /// Fully-owned int8 weights.
+    Owned(Vec<i8>),
+    /// Zero-copy view into the loaded blob (holds the blob alive via `Arc`).
+    Shared(super::weights::SharedBytes),
+}
+
+impl std::ops::Deref for Int8Weights {
+    type Target = [i8];
+    fn deref(&self) -> &[i8] {
+        match self {
+            Int8Weights::Owned(v) => v,
+            Int8Weights::Shared(s) => bytemuck::cast_slice(s),
+        }
+    }
+}
+
+impl From<Vec<i8>> for Int8Weights {
+    fn from(v: Vec<i8>) -> Self {
+        Int8Weights::Owned(v)
+    }
+}
+
+impl PartialEq for Int8Weights {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+
 /// A symmetric per-output-channel int8-quantized linear weight.
 ///
 /// Stored in PyTorch `[out, in]` row-major layout (`n = out`, `k = in`): `w` is
@@ -148,8 +189,10 @@ impl Mat {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QInt8 {
     /// Int8 weights in the byte order [`Self::layout`] declares (row-major
-    /// `[n, k]` unless an offline-packed artifact kept its panels).
-    pub w: Vec<i8>,
+    /// `[n, k]` unless an offline-packed artifact kept its panels). May be an
+    /// owned buffer or a zero-copy view into the loaded blob
+    /// ([`Int8Weights::Shared`], bd-4l71 residency).
+    pub w: Int8Weights,
     /// Per-output-channel scales, length `n`.
     pub scales: Vec<f32>,
     /// Output dimension (number of rows / output channels).
@@ -196,7 +239,39 @@ impl QInt8 {
             n
         );
         Self {
-            w,
+            w: w.into(),
+            scales,
+            n,
+            k,
+            layout: WeightLayout::RowMajor,
+        }
+    }
+
+    /// Construct from a ZERO-COPY row-major int8 payload view into the loaded
+    /// blob (bd-4l71 residency) — the borrowing twin of [`Self::new`], with the
+    /// same shape contract and the same observable weights.
+    ///
+    /// # Panics
+    /// Panics on a length/shape mismatch (`w.len() != n*k` or
+    /// `scales.len() != n`).
+    #[must_use]
+    pub fn new_shared(
+        w: super::weights::SharedBytes,
+        scales: Vec<f32>,
+        n: usize,
+        k: usize,
+    ) -> Self {
+        let len = shape_len("QInt8::new_shared", n, k);
+        assert_eq!(w.len(), len, "QInt8: w len {} != n*k {}", w.len(), len);
+        assert_eq!(
+            scales.len(),
+            n,
+            "QInt8: scales len {} != n {}",
+            scales.len(),
+            n
+        );
+        Self {
+            w: Int8Weights::Shared(w),
             scales,
             n,
             k,
@@ -229,7 +304,7 @@ impl QInt8 {
             n
         );
         Self {
-            w,
+            w: w.into(),
             scales,
             n,
             k,
@@ -248,20 +323,146 @@ impl QInt8 {
     }
 }
 
+/// Storage for a [`QInt4`]'s packed nibble payload: an owned buffer (synthetic
+/// weights / tests) or a zero-copy [`SharedBytes`] view into the loaded model
+/// blob (the bd-4l71 residency mode — the wasm artifact's ~1.26 GB expert
+/// payload must never exist twice). Both deref to the identical `[n, k/2]`
+/// byte layout, so every consumer is storage-agnostic.
+#[derive(Debug, Clone)]
+pub enum PackedBytes {
+    /// Fully-owned packed nibbles.
+    Owned(Vec<u8>),
+    /// Zero-copy view into the loaded blob (holds the blob alive via `Arc`).
+    Shared(super::weights::SharedBytes),
+}
+
+impl std::ops::Deref for PackedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            PackedBytes::Owned(v) => v,
+            PackedBytes::Shared(s) => s,
+        }
+    }
+}
+
+impl From<Vec<u8>> for PackedBytes {
+    fn from(v: Vec<u8>) -> Self {
+        PackedBytes::Owned(v)
+    }
+}
+
+impl PartialEq for PackedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+
+/// Storage for a [`QInt4`]'s per-group scales: owned f32 (synthetic weights /
+/// tests) or the artifact's little-endian f32 bytes referenced zero-copy
+/// ([`SharedBytes`], bd-4l71 residency: ~0.53 GB of expert scales stay in the
+/// blob). The raw form is decoded per-use into a caller scratch — real `.focrq`
+/// payload offsets carry no alignment guarantee, so the bytes cannot be
+/// reinterpreted as `&[f32]` in place; the decoded VALUES are identical
+/// (`f32::from_le_bytes`, the same decode the eager loader performed).
+#[derive(Debug, Clone)]
+pub enum GroupScales {
+    /// Fully-owned decoded scales.
+    Owned(Vec<f32>),
+    /// Little-endian f32 bytes referenced zero-copy from the loaded blob
+    /// (`4 * len` bytes).
+    RawLe(super::weights::SharedBytes),
+}
+
+impl GroupScales {
+    /// Number of f32 scales.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            GroupScales::Owned(v) => v.len(),
+            GroupScales::RawLe(bytes) => bytes.len() / 4,
+        }
+    }
+
+    /// Whether there are no scales.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Borrow scales `[start, end)` as `&[f32]`, decoding through `scratch`
+    /// when the storage is raw little-endian bytes. The returned values are
+    /// identical for both storages (same `f32::from_le_bytes` decode the eager
+    /// loader used), so callers are bit-exactly storage-agnostic.
+    ///
+    /// # Panics
+    /// Panics if `start > end` or `end > self.len()` (caller shape bug).
+    #[must_use]
+    pub fn slice_f32<'a>(
+        &'a self,
+        start: usize,
+        end: usize,
+        scratch: &'a mut Vec<f32>,
+    ) -> &'a [f32] {
+        assert!(
+            start <= end && end <= self.len(),
+            "GroupScales::slice_f32: [{start}, {end}) out of bounds (len {})",
+            self.len()
+        );
+        match self {
+            GroupScales::Owned(v) => &v[start..end],
+            GroupScales::RawLe(bytes) => {
+                scratch.clear();
+                scratch.extend(
+                    bytes[start * 4..end * 4]
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| f32::from_le_bytes(*c)),
+                );
+                scratch
+            }
+        }
+    }
+
+    /// Decode every scale to an owned `Vec<f32>`.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<f32> {
+        let mut scratch = Vec::new();
+        self.slice_f32(0, self.len(), &mut scratch).to_vec()
+    }
+}
+
+impl From<Vec<f32>> for GroupScales {
+    fn from(v: Vec<f32>) -> Self {
+        GroupScales::Owned(v)
+    }
+}
+
+impl PartialEq for GroupScales {
+    fn eq(&self, other: &Self) -> bool {
+        // Semantic equality: the decoded f32 values (the only thing consumers
+        // ever observe).
+        self.len() == other.len() && self.to_vec() == other.to_vec()
+    }
+}
+
 /// Group-quantized int4 weight (the Phase-4 decode-bandwidth wedge, plan §9).
 ///
-/// Placeholder layout: int4 nibbles are packed two-per-byte in `packed`
-/// (`n * k / 2` bytes, `k` even), with one f32 `scale` per `group_size`-element
-/// group along the contraction dim. `tier` records the per-tensor precision
-/// choice from the rate-distortion allocator. No CPU has an int4 MAC, so the
-/// loader unpacks int4 -> int8 in-register and feeds the same int8 kernel; this
-/// struct only *carries* the packing. Construction/dequant land with bd-3gaa.1.
+/// int4 nibbles are packed two-per-byte in `packed` (`n * k / 2` bytes, `k`
+/// even), with one f32 `scale` per `group_size`-element group along the
+/// contraction dim. `tier` records the per-tensor precision choice from the
+/// rate-distortion allocator. No CPU has an int4 MAC, so the GEMM paths unpack
+/// int4 -> int8 in-register and feed the same int8 MAC; this struct only
+/// *carries* the packing. The payload/scale storages may be zero-copy views
+/// into the loaded blob ([`PackedBytes::Shared`] / [`GroupScales::RawLe`]) so
+/// the wasm artifact's expert bulk is never duplicated in residency (bd-4l71).
 #[derive(Debug, Clone, PartialEq)]
 pub struct QInt4 {
     /// Two int4 nibbles per byte, row-major `[n, k/2]`.
-    pub packed: Vec<u8>,
+    pub packed: PackedBytes,
     /// Per-group scales, length `n * (k / group_size)`.
-    pub scales: Vec<f32>,
+    pub scales: GroupScales,
     /// Output dimension.
     pub n: usize,
     /// Input dimension (contraction length; must be even and a multiple of
@@ -357,8 +558,8 @@ mod tests {
     fn qint4_placeholder_constructs() {
         // group_size 16 over k=16 => 1 group/row * n=2 = 2 scales; k/2=8 bytes/row.
         let q = QInt4 {
-            packed: (0u8..16).collect(),
-            scales: vec![0.1, 0.2],
+            packed: (0u8..16).collect::<Vec<u8>>().into(),
+            scales: vec![0.1, 0.2].into(),
             n: 2,
             k: 16,
             group_size: 16,
@@ -366,5 +567,27 @@ mod tests {
         };
         assert_eq!(q.packed.len(), q.n * (q.k / 2));
         assert_eq!(q.scales.len(), q.n * (q.k / q.group_size));
+    }
+
+    #[test]
+    fn group_scales_raw_le_decodes_identically_to_owned() {
+        let values = vec![0.125f32, -3.5, 1.0e-3, 0.0, 7.25];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // An Owned storage and a decoded RawLe must agree on every observation.
+        let owned = GroupScales::Owned(values.clone());
+        assert_eq!(owned.len(), 5);
+        assert_eq!(owned.to_vec(), values);
+        let mut scratch = Vec::new();
+        assert_eq!(owned.slice_f32(1, 4, &mut scratch), &values[1..4]);
+        // RawLe is exercised through the loader in weights.rs tests (SharedBytes
+        // needs a blob); here pin the byte layout the decode assumes.
+        assert_eq!(bytes.len(), values.len() * 4);
+        let decoded: Vec<f32> = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        assert_eq!(decoded, values);
     }
 }

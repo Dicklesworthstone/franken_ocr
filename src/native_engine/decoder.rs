@@ -1905,10 +1905,17 @@ fn gemv_i4(x: &[f32], q: &QInt4) -> Vec<f32> {
         .for_each(|(blk, ys)| {
             let base = blk * I8_GEMV_BLOCK;
             let cnt = ys.len();
+            // Scales may live as raw LE bytes in the blob (zero-copy residency,
+            // bd-4l71): decode just this block's groups into a task-local
+            // scratch — identical values to the owned-f32 storage.
+            let mut scale_scratch = Vec::new();
+            let scales =
+                q.scales
+                    .slice_f32(base * groups, (base + cnt) * groups, &mut scale_scratch);
             simd::int4::igemm_s4s8_packed(
                 &xq,
                 &q.packed[base * kbytes..(base + cnt) * kbytes],
-                &q.scales[base * groups..(base + cnt) * groups],
+                scales,
                 q.group_size,
                 1,
                 q.k,
@@ -1929,7 +1936,9 @@ fn gemv_i4(x: &[f32], q: &QInt4) -> Vec<f32> {
 fn gemv_i4_serial(xq: &[i8], a_scale: f32, q: &QInt4) -> Vec<f32> {
     debug_assert_eq!(xq.len(), q.k);
     let mut y = vec![0.0f32; q.n];
-    simd::int4::igemm_s4s8_packed(xq, &q.packed, &q.scales, q.group_size, 1, q.k, q.n, &mut y);
+    let mut scale_scratch = Vec::new();
+    let scales = q.scales.slice_f32(0, q.scales.len(), &mut scale_scratch);
+    simd::int4::igemm_s4s8_packed(xq, &q.packed, scales, q.group_size, 1, q.k, q.n, &mut y);
     for slot in y.iter_mut() {
         *slot *= a_scale;
     }
@@ -1984,7 +1993,9 @@ fn linear_int4_dynamic(x: &Mat, q: &QInt4) -> FocrResult<Mat> {
         a_scales[r] = scale;
     }
     let mut out = vec![0.0f32; m * n];
-    simd::int4::igemm_s4s8_packed(&xq, &q.packed, &q.scales, q.group_size, m, k, n, &mut out);
+    let mut scale_scratch = Vec::new();
+    let scales = q.scales.slice_f32(0, q.scales.len(), &mut scale_scratch);
+    simd::int4::igemm_s4s8_packed(&xq, &q.packed, scales, q.group_size, m, k, n, &mut out);
     for (r, &scale) in a_scales.iter().enumerate() {
         for value in &mut out[r * n..(r + 1) * n] {
             *value *= scale;
@@ -3795,8 +3806,8 @@ mod tests {
             })
             .collect();
         QInt4 {
-            packed,
-            scales,
+            packed: packed.into(),
+            scales: scales.into(),
             n,
             k,
             group_size,
@@ -3811,6 +3822,7 @@ mod tests {
     /// [`gemv_i4`]/[`gemv_i4_serial`] pin.
     fn reference_gemv_i4(xq: &[i8], a_scale: f32, q: &QInt4) -> Vec<f32> {
         let b = simd::int4::unpack_to_i8(&q.packed, q.n, q.k);
+        let scales = q.scales.to_vec();
         let groups = q.k / q.group_size;
         let mut y = vec![0.0f32; q.n];
         for o in 0..q.n {
@@ -3820,7 +3832,7 @@ mod tests {
                 for kk in g * q.group_size..(g + 1) * q.group_size {
                     acc_i += i32::from(xq[kk]) * i32::from(b[o * q.k + kk]);
                 }
-                acc_f += q.scales[o * groups + g] * acc_i as f32;
+                acc_f += scales[o * groups + g] * acc_i as f32;
             }
             y[o] = acc_f * a_scale;
         }
@@ -3936,8 +3948,8 @@ mod tests {
         let up_q = pack_int4_f32(&up_f, inter, hidden, 32);
         let down_q = pack_int4_f32(&down_f, hidden, inter, 16);
         let to_qint4 = |q: &crate::quant::int4::QuantizedInt4| QInt4 {
-            packed: q.packed.clone(),
-            scales: q.scales.clone(),
+            packed: q.packed.clone().into(),
+            scales: q.scales.clone().into(),
             n: q.n,
             k: q.k,
             group_size: q.group_size,
@@ -4019,8 +4031,12 @@ mod tests {
                 "w4",
                 crate::quant::focrq::WriteDType::QInt4PerGroup,
                 vec![n, k],
-                q.packed.clone(),
-                q.scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                q.packed.to_vec(),
+                q.scales
+                    .to_vec()
+                    .iter()
+                    .flat_map(|s| s.to_le_bytes())
+                    .collect(),
                 group,
                 1,
             )
@@ -4081,8 +4097,12 @@ mod tests {
                     name,
                     crate::quant::focrq::WriteDType::QInt4PerGroup,
                     vec![q.n, q.k],
-                    q.packed.clone(),
-                    q.scales.iter().flat_map(|s| s.to_le_bytes()).collect(),
+                    q.packed.to_vec(),
+                    q.scales
+                        .to_vec()
+                        .iter()
+                        .flat_map(|s| s.to_le_bytes())
+                        .collect(),
                     q.group_size,
                     1,
                 )
@@ -4228,7 +4248,8 @@ mod tests {
         )
         .0;
         assert_eq!(
-            fused_pk.w, repacked,
+            &fused_pk.w[..],
+            &repacked[..],
             "panel concat must equal pack of the fused matrix"
         );
         // and the GEMV agrees bitwise

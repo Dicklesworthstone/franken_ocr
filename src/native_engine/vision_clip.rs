@@ -266,10 +266,101 @@ pub(crate) fn forward_from_sam(
     out
 }
 
+/// [`forward`] semantics WITHOUT retaining (or even transiently building) the
+/// whole ~1.2 GB f32 tower (bd-4l71 wasm-lane residency): the embeddings/pre-LN
+/// head is hydrated once (small), then each of the `cfg.num_layers` blocks is
+/// hydrated from the blob, run, and DROPPED before the next — peak weight
+/// scratch is one block (~50 MB). Numerically bit-identical to
+/// [`forward_from_sam`] over [`clip_weights_from`]: per block the SAME tensor
+/// reads and the SAME [`LinearParams::from_row_major`] transpose feed the SAME
+/// [`transformer_block`] (gated by
+/// `streamed_clip_forward_is_bit_identical_to_cached`).
+///
+/// # Errors
+/// As [`forward`].
+pub(crate) fn forward_from_sam_streamed(
+    cfg: &ClipConfig,
+    weights: &Weights,
+    sam_features: &Mat,
+) -> FocrResult<Mat> {
+    ensure_mat_data_len(sam_features, "vision_clip forward sam_features")?;
+    // Same SAM channel-major -> token-major transpose as `forward_from_sam`.
+    let sam_t = transpose(&sam_features.data, sam_features.rows, sam_features.cols)?;
+    let sam_mat = Mat::from_vec(sam_features.cols, sam_features.rows, sam_t);
+
+    let p = "model.vision_model";
+    let pos_name = format!("{p}.embeddings.position_embedding.weight");
+    let (num_positions, _pos_dim) = tensor_rank2_shape(weights, &pos_name)?;
+    let class_embedding = weights.vec(&format!("{p}.embeddings.class_embedding"))?;
+    let position_embedding = weights.vec(&pos_name)?;
+    let pre_layernorm = LayerNormParams {
+        weight: weights.vec(&format!("{p}.pre_layrnorm.weight"))?,
+        bias: weights.vec(&format!("{p}.pre_layrnorm.bias"))?,
+    };
+    let tb = Instant::now();
+    let out = forward_with_supplied(
+        cfg,
+        &class_embedding,
+        &position_embedding,
+        num_positions,
+        &pre_layernorm,
+        &sam_mat,
+        &mut |l| Ok(std::borrow::Cow::Owned(clip_block_from(weights, l)?)),
+    );
+    super::timing_log(&format!(
+        "    clip.blocks(streamed) {:.2}s",
+        tb.elapsed().as_secs_f64()
+    ));
+    out
+}
+
+/// Hydrate ONE CLIP transformer block from the `model.vision_model.*` tensors —
+/// the same reads and the same [`LinearParams::from_row_major`] finish the
+/// whole-tower [`clip_weights_from`] performs for that layer, factored so the
+/// streamed forward can build/drop blocks one at a time (bd-4l71). The values
+/// are identical by construction (the transpose is a deterministic pure
+/// permutation; hydration order does not enter the math).
+pub(crate) fn clip_block_from(weights: &Weights, l: usize) -> FocrResult<ClipBlockWeights> {
+    let b = format!("model.vision_model.transformer.layers.{l}");
+    let ln = |n: &str| -> FocrResult<LayerNormParams> {
+        Ok(LayerNormParams {
+            weight: weights.vec(&format!("{n}.weight"))?,
+            bias: weights.vec(&format!("{n}.bias"))?,
+        })
+    };
+    let lin = |n: &str| -> FocrResult<LinearParams> {
+        let weight_name = format!("{n}.weight");
+        let (out_features, in_features) = tensor_rank2_shape(weights, &weight_name)?;
+        LinearParams::from_row_major(
+            &weights.vec(&weight_name)?,
+            Some(weights.vec(&format!("{n}.bias"))?),
+            out_features,
+            in_features,
+        )
+    };
+    Ok(ClipBlockWeights {
+        layer_norm1: ln(&format!("{b}.layer_norm1"))?,
+        qkv_proj: lin(&format!("{b}.self_attn.qkv_proj"))?,
+        out_proj: lin(&format!("{b}.self_attn.out_proj"))?,
+        layer_norm2: ln(&format!("{b}.layer_norm2"))?,
+        fc1: lin(&format!("{b}.mlp.fc1"))?,
+        fc2: lin(&format!("{b}.mlp.fc2"))?,
+    })
+}
+
 /// Build a [`ClipWeights`] from the `model.vision_model.*` tensors (note the
 /// preserved upstream `pre_layrnorm` typo). Dims read from each tensor shape.
 /// `pub(crate)` so the batch spine (bd-1azu.10) hydrates ONCE per batch.
 pub(crate) fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
+    clip_weights_from_with(&ClipConfig::default(), weights)
+}
+
+/// [`clip_weights_from`] parameterized on the config (layer count) so the
+/// streamed-vs-cached parity gate can hydrate a SMALL synthetic tower.
+pub(crate) fn clip_weights_from_with(
+    cfg: &ClipConfig,
+    weights: &Weights,
+) -> FocrResult<ClipWeights> {
     let p = "model.vision_model";
     let ln = |n: &str| -> FocrResult<LayerNormParams> {
         Ok(LayerNormParams {
@@ -305,7 +396,6 @@ pub(crate) fn clip_weights_from(weights: &Weights) -> FocrResult<ClipWeights> {
             in_features,
         })
     };
-    let cfg = ClipConfig::default();
     let pos_name = format!("{p}.embeddings.position_embedding.weight");
     let (num_positions, _pos_dim) = tensor_rank2_shape(weights, &pos_name)?;
     let mut raw_blocks = Vec::with_capacity(cfg.num_layers);
@@ -398,25 +488,52 @@ pub fn forward_with(
             cfg.num_layers
         )));
     }
+    forward_with_supplied(
+        cfg,
+        &weights.class_embedding,
+        &weights.position_embedding,
+        weights.num_positions,
+        &weights.pre_layernorm,
+        sam_features,
+        &mut |l| Ok(std::borrow::Cow::Borrowed(&weights.blocks[l])),
+    )
+}
 
+/// The shared tower core: embeddings + pre-LN + the `cfg.num_layers` blocks,
+/// with each block obtained from `block_at` — borrowed from a cached
+/// [`ClipWeights`] ([`forward_with`], zero-cost) or hydrated on demand and
+/// dropped ([`forward_from_sam_streamed`], the bd-4l71 residency mode). ONE
+/// body serves both, so cached and streamed forwards cannot drift numerically.
+#[allow(clippy::too_many_arguments)]
+fn forward_with_supplied<'w>(
+    cfg: &ClipConfig,
+    class_embedding: &[f32],
+    position_embedding: &[f32],
+    num_positions: usize,
+    pre_layernorm: &LayerNormParams,
+    sam_features: &Mat,
+    block_at: &mut dyn FnMut(usize) -> FocrResult<std::borrow::Cow<'w, ClipBlockWeights>>,
+) -> FocrResult<Mat> {
+    let dim = cfg.hidden_size;
     // ── Embeddings ([SPEC-048]) ────────────────────────────────────────────
     // Prepend the class token, then add the (interpolated) abs-pos embedding.
-    let mut x = prepend_class_token(&weights.class_embedding, sam_features)?;
+    let mut x = prepend_class_token(class_embedding, sam_features)?;
     let seq = x.rows; // num_patches + 1
-    let pos = abs_pos_for_len(&weights.position_embedding, weights.num_positions, dim, seq)?;
+    let pos = abs_pos_for_len(position_embedding, num_positions, dim, seq)?;
     add_in_place(&mut x, &pos)?;
 
     // ── pre_layrnorm ([SPEC-049], deepencoder.py:470-473) ──────────────────
     x = nn::layer_norm(
         &x,
-        Some(&weights.pre_layernorm.weight),
-        Some(&weights.pre_layernorm.bias),
+        Some(&pre_layernorm.weight),
+        Some(&pre_layernorm.bias),
         cfg.pre_layernorm_eps,
     )?;
 
-    // ── 24 transformer blocks ──────────────────────────────────────────────
-    for block in &weights.blocks {
-        x = transformer_block(cfg, block, &x)?;
+    // ── the transformer blocks (24 in the deployed config) ────────────────
+    for l in 0..cfg.num_layers {
+        let block = block_at(l)?;
+        x = transformer_block(cfg, &block, &x)?;
     }
     Ok(x)
 }
@@ -1233,6 +1350,130 @@ mod tests {
         (0..n)
             .flat_map(|_| bf16::from_f32(0.0).to_le_bytes())
             .collect()
+    }
+
+    // ── streamed (per-block dequant) vs cached tower parity (bd-4l71) ──────
+
+    /// Deterministic small-magnitude f32 values (mixed sign, non-degenerate).
+    fn synth_values(len: usize, salt: u64) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let raw = ((i as u64)
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(salt)
+                    >> 33) as u32;
+                (raw as f32 / u32::MAX as f32 - 0.5) * 0.6
+            })
+            .collect()
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// bd-4l71 acceptance: the per-block streamed CLIP forward
+    /// ([`forward_from_sam_streamed`]) is BIT-IDENTICAL to the cached-tower
+    /// forward ([`clip_weights_from_with`] + [`forward_from_sam`]) on a small
+    /// synthetic tower — proving the wasm-lane residency mode changes WHERE
+    /// weights live, never a single output bit.
+    #[test]
+    fn streamed_clip_forward_is_bit_identical_to_cached() {
+        let cfg = tiny_cfg();
+        let dim = cfg.hidden_size;
+        let num_patches = 4usize;
+        let num_positions = num_patches + 1; // no abs-pos interpolation needed
+        let p = "model.vision_model";
+
+        let mut b = FocrqBuilder::new();
+        let mut add = |name: String, shape: Vec<usize>, salt: u64| {
+            let len = shape.iter().product();
+            b.add_tensor(
+                name,
+                WriteDType::F32,
+                shape,
+                f32_bytes(&synth_values(len, salt)),
+            )
+            .expect("valid synthetic f32 tensor");
+        };
+        add(format!("{p}.embeddings.class_embedding"), vec![dim], 1);
+        add(
+            format!("{p}.embeddings.position_embedding.weight"),
+            vec![num_positions, dim],
+            2,
+        );
+        add(format!("{p}.pre_layrnorm.weight"), vec![dim], 3);
+        add(format!("{p}.pre_layrnorm.bias"), vec![dim], 4);
+        for l in 0..cfg.num_layers {
+            let base = format!("{p}.transformer.layers.{l}");
+            let salt = 100 * (l as u64 + 1);
+            add(format!("{base}.layer_norm1.weight"), vec![dim], salt + 1);
+            add(format!("{base}.layer_norm1.bias"), vec![dim], salt + 2);
+            add(
+                format!("{base}.self_attn.qkv_proj.weight"),
+                vec![3 * dim, dim],
+                salt + 3,
+            );
+            add(
+                format!("{base}.self_attn.qkv_proj.bias"),
+                vec![3 * dim],
+                salt + 4,
+            );
+            add(
+                format!("{base}.self_attn.out_proj.weight"),
+                vec![dim, dim],
+                salt + 5,
+            );
+            add(
+                format!("{base}.self_attn.out_proj.bias"),
+                vec![dim],
+                salt + 6,
+            );
+            add(format!("{base}.layer_norm2.weight"), vec![dim], salt + 7);
+            add(format!("{base}.layer_norm2.bias"), vec![dim], salt + 8);
+            add(
+                format!("{base}.mlp.fc1.weight"),
+                vec![cfg.ffn_hidden_size, dim],
+                salt + 9,
+            );
+            add(
+                format!("{base}.mlp.fc1.bias"),
+                vec![cfg.ffn_hidden_size],
+                salt + 10,
+            );
+            add(
+                format!("{base}.mlp.fc2.weight"),
+                vec![dim, cfg.ffn_hidden_size],
+                salt + 11,
+            );
+            add(format!("{base}.mlp.fc2.bias"), vec![dim], salt + 12);
+        }
+        let weights = Weights::from_bytes(b.build()).expect("synthetic tower parses");
+
+        // Channel-major SAM x3 features [dim, num_patches] — both entrypoints
+        // transpose identically.
+        let sam = Mat::from_vec(dim, num_patches, synth_values(dim * num_patches, 999));
+
+        let cached_tower = clip_weights_from_with(&cfg, &weights).expect("cached tower hydrates");
+        let cached = forward_from_sam(&cfg, &cached_tower, &sam).expect("cached forward runs");
+        let streamed =
+            forward_from_sam_streamed(&cfg, &weights, &sam).expect("streamed forward runs");
+
+        assert_eq!(cached.shape(), streamed.shape());
+        assert_eq!(
+            cached
+                .data
+                .iter()
+                .map(|f| f.to_bits())
+                .collect::<Vec<u32>>(),
+            streamed
+                .data
+                .iter()
+                .map(|f| f.to_bits())
+                .collect::<Vec<u32>>(),
+            "streamed per-block CLIP must be bit-identical to the cached tower"
+        );
+        // Non-degeneracy: the output actually carries signal.
+        assert!(cached.data.iter().any(|&v| v != 0.0));
     }
 
     // ── weight hydration error paths ───────────────────────────────────────

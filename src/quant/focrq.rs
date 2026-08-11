@@ -816,7 +816,7 @@ mod tests {
         let q = w.qint8("q").unwrap();
         assert_eq!(q.n, 2);
         assert_eq!(q.k, 3);
-        assert_eq!(q.w, vec![1i8, -2, 3, 4, -5, 6]);
+        assert_eq!(&q.w[..], &[1i8, -2, 3, 4, -5, 6]);
         assert_eq!(q.scales, vec![0.1, 0.2]);
     }
 
@@ -842,8 +842,8 @@ mod tests {
         assert_eq!(q.k, 16);
         assert_eq!(q.group_size, 16);
         assert_eq!(q.tier, 3);
-        assert_eq!(q.packed, packed);
-        assert_eq!(q.scales, vec![0.1, 0.2]);
+        assert_eq!(&q.packed[..], &packed[..]);
+        assert_eq!(q.scales.to_vec(), vec![0.1, 0.2]);
     }
 
     #[test]
@@ -1068,7 +1068,7 @@ mod tests {
         let rq = weights.qint8("expert.down_proj").unwrap();
         assert_eq!(rq.n, 2);
         assert_eq!(rq.k, 3);
-        assert_eq!(rq.w, q.q);
+        assert_eq!(&rq.w[..], &q.q[..]);
         assert_eq!(rq.scales, q.scales);
     }
 
@@ -1094,8 +1094,8 @@ mod tests {
         assert_eq!(rq.n, 1);
         assert_eq!(rq.k, 32);
         assert_eq!(rq.group_size, 16);
-        assert_eq!(rq.packed, q.packed);
-        assert_eq!(rq.scales, q.scales);
+        assert_eq!(&rq.packed[..], &q.packed[..]);
+        assert_eq!(rq.scales.to_vec(), q.scales);
     }
 
     // ── error paths ─────────────────────────────────────────────────────────

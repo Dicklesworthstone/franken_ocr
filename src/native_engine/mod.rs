@@ -1718,6 +1718,160 @@ fn validate_unlimited_ocr_quant_records<'a>(
     )))
 }
 
+/// Embedding-table access without whole-table f32 widening (bd-4l71 residency).
+///
+/// The conservative BF16/F32 table keeps the historical whole-table widen
+/// (`F32`, byte-for-byte unchanged). A `QInt8PerChan`-stored table (the wasm
+/// experts-int4 artifact) is kept as a ZERO-COPY int8 view over the blob and
+/// dequantized ONE ROW at a time at token-embed time — the same
+/// `f32::from(w) * scale[row]` per element that `Weights::mat`'s
+/// `dequant_qint8` would have applied to the whole table, so the embedded rows
+/// are bit-identical while the ~662 MB f32 copy never exists.
+pub enum EmbedTable<'w> {
+    /// Whole-table f32 widen (the historical accessor result).
+    F32(Mat),
+    /// Zero-copy int8 view + per-channel scales, dequantized per row.
+    QInt8 {
+        /// Row-major `[rows, cols]` int8 payload bytes (borrowed from the blob).
+        data: &'w [u8],
+        /// Per-row (output-channel) scales, length `rows`.
+        scales: Vec<f32>,
+        /// Vocab size.
+        rows: usize,
+        /// Hidden size.
+        cols: usize,
+    },
+}
+
+impl EmbedTable<'_> {
+    /// Vocab size.
+    pub fn rows(&self) -> usize {
+        match self {
+            EmbedTable::F32(m) => m.rows,
+            EmbedTable::QInt8 { rows, .. } => *rows,
+        }
+    }
+
+    /// Hidden size.
+    pub fn cols(&self) -> usize {
+        match self {
+            EmbedTable::F32(m) => m.cols,
+            EmbedTable::QInt8 { cols, .. } => *cols,
+        }
+    }
+
+    /// Materialize row `idx` as f32 — the per-token embed. Caller guarantees
+    /// `idx < rows` (both decode loops guard with their out-of-vocab check).
+    pub fn row_f32(&self, idx: usize) -> Vec<f32> {
+        match self {
+            EmbedTable::F32(m) => m.data[idx * m.cols..(idx + 1) * m.cols].to_vec(),
+            EmbedTable::QInt8 {
+                data, scales, cols, ..
+            } => {
+                let scale = scales[idx];
+                data[idx * cols..(idx + 1) * cols]
+                    .iter()
+                    .map(|&b| f32::from(b as i8) * scale)
+                    .collect()
+            }
+        }
+    }
+
+    /// Gather + (for the int8 arm) dequantize `ids` into a `[seq, hidden]`
+    /// matrix — the [`decoder::embed_tokens`] contract, including its
+    /// out-of-range error shape.
+    pub fn embed_ids(&self, ids: &[u32]) -> FocrResult<Mat> {
+        match self {
+            EmbedTable::F32(m) => decoder::embed_tokens(&m.data, m.rows, m.cols, ids),
+            EmbedTable::QInt8 { rows, cols, .. } => {
+                let mut out = Vec::with_capacity(ids.len() * cols);
+                for &id in ids {
+                    let row = id as usize;
+                    if row >= *rows {
+                        return Err(FocrError::Other(anyhow::anyhow!(
+                            "embed_tokens: id {row} out of range (vocab {rows})"
+                        )));
+                    }
+                    out.extend_from_slice(&self.row_f32(row));
+                }
+                Ok(Mat::from_vec(ids.len(), *cols, out))
+            }
+        }
+    }
+}
+
+/// The tensor name of the decoder embedding table in every Unlimited-OCR
+/// artifact.
+const EMBED_TOKENS: &str = "model.embed_tokens.weight";
+
+/// Resolve `model.embed_tokens.weight` out of `weights` as an [`EmbedTable`]
+/// (the body of [`OcrModel::embed_table`], free-standing so the bit-exactness
+/// gate can drive it over a synthetic artifact):
+///
+/// * BF16/F32 storage (conservative artifacts, raw safetensors) → the
+///   historical whole-table f32 widen via [`Weights::mat`], byte-for-byte
+///   unchanged.
+/// * `QInt8PerChan` storage (the wasm experts-int4 artifact) → a ZERO-COPY
+///   int8 view + per-channel scales, dequantized one row at a time at
+///   token-embed time (bd-4l71 residency: the ~662 MB f32 table copy never
+///   exists). Values are identical: `f32::from(w) * scale[row]` is exactly the
+///   `dequant_qint8` expression `Weights::mat` applies — gated by
+///   `int8_embed_row_lookup_matches_full_dequant`.
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if the table is absent or malformed.
+fn embed_table_from(weights: &Weights) -> FocrResult<EmbedTable<'_>> {
+    const NAME: &str = EMBED_TOKENS;
+    // The int8-view arm only understands canonical row-major int8 payloads
+    // (arch_target 0 — the only form the wasm recipe emits). Anything else
+    // takes the historical `mat()` path, whose accessors handle all forms.
+    if weights.arch_target() == 0
+        && matches!(
+            weights.record(NAME).map(|rec| rec.dtype),
+            Some(DType::QInt8PerChan)
+        )
+    {
+        let view = weights.tensor(NAME)?;
+        let [rows, cols] = view.shape else {
+            return Err(FocrError::FormatMismatch(format!(
+                "tensor {NAME:?} has rank {}; expected 2 ([vocab, hidden])",
+                view.shape.len()
+            )));
+        };
+        let (rows, cols) = (*rows, *cols);
+        let expected = rows
+            .checked_mul(cols)
+            .ok_or_else(|| FocrError::FormatMismatch(format!("tensor {NAME:?} shape overflows")))?;
+        if view.data.len() != expected {
+            return Err(FocrError::FormatMismatch(format!(
+                "QInt8 tensor {NAME:?}: {} payload bytes != vocab*hidden {expected}",
+                view.data.len()
+            )));
+        }
+        if view.scales.len() != rows * 4 {
+            return Err(FocrError::FormatMismatch(format!(
+                "QInt8 tensor {NAME:?}: {} scale bytes != vocab*f32 {}",
+                view.scales.len(),
+                rows * 4
+            )));
+        }
+        let scales: Vec<f32> = view
+            .scales
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        return Ok(EmbedTable::QInt8 {
+            data: view.data,
+            scales,
+            rows,
+            cols,
+        });
+    }
+    Ok(EmbedTable::F32(weights.mat(NAME)?))
+}
+
 /// One page's prefill state, handed from the batch spine front end
 /// ([`OcrModel::prefill_from_features`]) to the [`batch_scheduler`]: everything a
 /// [`batch_scheduler::PageStream`] needs to seed decode, plus the per-layer R-SWA
@@ -2779,7 +2933,7 @@ impl OcrModel {
         let n = image_paths.len();
         // ── batch-level artifacts, read ONCE (Doctrine #5) ───────────────────────
         let wc = self.decoder_cache_i8()?;
-        let embed_table = self.weights.mat("model.embed_tokens.weight")?;
+        let embed_table = self.embed_table()?;
         let tokenizer = self.tokenizer()?;
 
         // ── per-page prefill, staged so vision can batch ACROSS pages ────────────
@@ -3084,7 +3238,15 @@ impl OcrModel {
     /// by the `Weights`-backed SAM/CLIP/bridge entrypoints, or a kernel failure).
     fn vision_tower(&self, pre: &Preprocessed) -> FocrResult<Vec<Mat>> {
         let _fwd = enter_forward();
-        let statics = if unlimited_vision_cache_enabled() {
+        // bd-4l71 wasm-lane residency: with the 3 GB wasm artifact resident,
+        // whole-tower f32 caches (~1.2 GB CLIP + ~0.4 GB SAM) do not fit the
+        // wasm32 4 GiB ceiling. For a wasm-recipe artifact ONLY, SAM/projector
+        // hydrate per view and drop (the existing uncached arm) and CLIP runs
+        // the per-block streamed forward — numerics bit-identical (gated by
+        // `streamed_clip_forward_is_bit_identical_to_cached`). Conservative
+        // artifacts keep their caches exactly as before.
+        let wasm_residency = self.artifact_stores_gated_int8();
+        let statics = if !wasm_residency && unlimited_vision_cache_enabled() {
             Some(self.unlimited_vision_statics()?)
         } else {
             None
@@ -3102,17 +3264,29 @@ impl OcrModel {
                     )));
                 }
                 vision_sam::forward_with(&statics.sam, &view, side, side)?
+            } else if wasm_residency {
+                // Per-block hydrate/drop + bounded-scratch global attention —
+                // bit-identical, tens of MB of scratch instead of ~1.2 GB.
+                vision_sam::forward_streamed(&self.weights, &view, "model.sam_model")?
             } else {
                 vision_sam::forward(&self.weights, &view)?
             };
             timing_log(&format!("  vision.sam {:.2}s", ts.elapsed().as_secs_f64()));
             // CLIP tower fed SAM's x3 as patch_embeds -> [N+1, 1024] (CLS at 0).
             let tc = Instant::now();
-            let clip = vision_clip::forward_from_sam(
-                &vision_clip::ClipConfig::default(),
-                self.clip_weights()?,
-                &sam,
-            )?;
+            let clip = if wasm_residency {
+                vision_clip::forward_from_sam_streamed(
+                    &vision_clip::ClipConfig::default(),
+                    &self.weights,
+                    &sam,
+                )?
+            } else {
+                vision_clip::forward_from_sam(
+                    &vision_clip::ClipConfig::default(),
+                    self.clip_weights()?,
+                    &sam,
+                )?
+            };
             timing_log(&format!("  vision.clip {:.2}s", tc.elapsed().as_secs_f64()));
             // Bridge: concat CLIP[:,1:] ++ SAM (2048) -> projector -> [N, 1280].
             let tb = Instant::now();
@@ -3334,20 +3508,35 @@ impl OcrModel {
         Ok((inputs_embeds, prompt_ids))
     }
 
+    /// Resolve `model.embed_tokens.weight` as an [`EmbedTable`]:
+    ///
+    /// * BF16/F32 storage (conservative artifacts, raw safetensors) → the
+    ///   historical whole-table f32 widen via [`Weights::mat`], byte-for-byte
+    ///   unchanged.
+    /// * `QInt8PerChan` storage (the wasm experts-int4 artifact) → a ZERO-COPY
+    ///   int8 view + per-channel scales, dequantized one row at a time at
+    ///   token-embed time (bd-4l71 residency: the ~662 MB f32 table copy never
+    ///   exists). Values are identical: `f32::from(w) * scale[row]` is exactly
+    ///   the `dequant_qint8` expression `Weights::mat` applies.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if the table is absent or malformed.
+    fn embed_table(&self) -> FocrResult<EmbedTable<'_>> {
+        embed_table_from(&self.weights)
+    }
+
     /// Embed the prompt id-stream into the decoder hidden rail ([SPEC-070]).
     ///
     /// `embed_tokens(prompt_ids)` against `model.embed_tokens.weight` (`[vocab,
     /// hidden]` = `[129280, 1280]`). The gather math lives in
-    /// [`decoder::embed_tokens`] (unit-tested); the table is read through the
-    /// `.focrq`/safetensors accessor [`Weights::mat`].
+    /// [`decoder::embed_tokens`] (unit-tested) for the f32 arm; the int8 arm
+    /// gathers + dequantizes per row through [`EmbedTable::embed_ids`].
     ///
     /// # Errors
     /// [`FocrError::FormatMismatch`] if the embedding table is absent/malformed,
-    /// or whatever [`decoder::embed_tokens`] returns on a bad id.
+    /// or an out-of-range id.
     fn embed_prompt(&self, prompt_ids: &[u32]) -> FocrResult<Mat> {
-        let table = self.weights.mat("model.embed_tokens.weight")?;
-        let (vocab, hidden) = (table.rows, table.cols);
-        decoder::embed_tokens(&table.data, vocab, hidden, prompt_ids)
+        self.embed_table()?.embed_ids(prompt_ids)
     }
 
     /// Prefill the decoder over `inputs_embeds`, then run the **sequential**
@@ -3455,12 +3644,12 @@ impl OcrModel {
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
 
-        let table = self.weights.mat("model.embed_tokens.weight")?;
-        let vocab = table.rows;
-        if table.cols != hidden_dim {
+        let table = self.embed_table()?;
+        let vocab = table.rows();
+        if table.cols() != hidden_dim {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "native_engine::OcrModel::generate_cached: embed table hidden {} != inputs_embeds hidden {}",
-                table.cols,
+                table.cols(),
                 hidden_dim
             )));
         }
@@ -3514,7 +3703,7 @@ impl OcrModel {
             // Embed the just-emitted token and advance the ring one step at its
             // TRUE absolute position (`prefill_len` + tokens already ringed). After
             // the push above, `emitted.len() - 1` tokens are already in the ring.
-            let row = table.data[next * hidden_dim..(next + 1) * hidden_dim].to_vec();
+            let row = table.row_f32(next);
             let token_embed = Mat::from_vec(1, hidden_dim, row);
             let position = prefill_len + (emitted.len() - 1);
             let h = decoder::decode_step_with_cache(wc, &mut caches, &token_embed, position)?;
@@ -3557,12 +3746,12 @@ impl OcrModel {
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
 
-        let table = self.weights.mat("model.embed_tokens.weight")?;
-        let vocab = table.rows;
-        if table.cols != hidden_dim {
+        let table = self.embed_table()?;
+        let vocab = table.rows();
+        if table.cols() != hidden_dim {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "native_engine::OcrModel::generate_cached_i8: embed table hidden {} != inputs_embeds hidden {}",
-                table.cols,
+                table.cols(),
                 hidden_dim
             )));
         }
@@ -3659,7 +3848,7 @@ impl OcrModel {
                     "native_engine::OcrModel::generate_cached_i8: decoded token id {next} outside embed vocab {vocab}"
                 )));
             }
-            let row = table.data[next * hidden_dim..(next + 1) * hidden_dim].to_vec();
+            let row = table.row_f32(next);
             let token_embed = Mat::from_vec(1, hidden_dim, row);
             let position = prefill_len + (emitted.len() - 1);
             let h = decoder::decode_step_with_cache_i8(wc, &mut caches, &token_embed, position)?;
@@ -3719,7 +3908,7 @@ impl OcrModel {
         last_hidden: &Mat,
         generated: &mut Vec<u32>,
         emitted: &mut Vec<u32>,
-        table: &Mat,
+        table: &EmbedTable<'_>,
         vocab: usize,
         hidden_dim: usize,
         prefill_len: usize,
@@ -3848,7 +4037,7 @@ impl OcrModel {
     /// exact slice [`Self::generate_cached_i8`] takes per step, with the same
     /// out-of-vocab guard. Shared by the draft-embed build and the commit replay.
     fn embed_decode_token_i8(
-        table: &Mat,
+        table: &EmbedTable<'_>,
         vocab: usize,
         hidden_dim: usize,
         token: u32,
@@ -3859,7 +4048,7 @@ impl OcrModel {
                 "native_engine::OcrModel::generate_cached_i8: decoded token id {idx} outside embed vocab {vocab}"
             )));
         }
-        let row = table.data[idx * hidden_dim..(idx + 1) * hidden_dim].to_vec();
+        let row = table.row_f32(idx);
         Ok(Mat::from_vec(1, hidden_dim, row))
     }
 
@@ -3873,7 +4062,7 @@ impl OcrModel {
     fn commit_decode_token_i8(
         wc: &decoder::DecoderWeightCacheI8,
         caches: &mut [rswa::RingCache],
-        table: &Mat,
+        table: &EmbedTable<'_>,
         vocab: usize,
         hidden_dim: usize,
         prefill_len: usize,
@@ -3903,12 +4092,12 @@ impl OcrModel {
     ) -> FocrResult<Vec<u32>> {
         let hidden_dim = inputs_embeds.cols;
 
-        let table = self.weights.mat("model.embed_tokens.weight")?;
-        let vocab = table.rows;
-        if table.cols != hidden_dim {
+        let table = self.embed_table()?;
+        let vocab = table.rows();
+        if table.cols() != hidden_dim {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "native_engine::OcrModel::generate_stateless: embed table hidden {} != inputs_embeds hidden {}",
-                table.cols,
+                table.cols(),
                 hidden_dim
             )));
         }
@@ -3948,7 +4137,7 @@ impl OcrModel {
             }
             let new_rows = inputs_embeds.rows + 1;
             let mut data = std::mem::take(&mut inputs_embeds.data);
-            data.extend_from_slice(&table.data[next * hidden_dim..(next + 1) * hidden_dim]);
+            data.extend_from_slice(&table.row_f32(next));
             inputs_embeds = Mat::from_vec(new_rows, hidden_dim, data);
         }
         Ok(emitted)
@@ -4097,6 +4286,74 @@ impl OcrModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a synthetic one-tensor artifact holding `model.embed_tokens.weight`
+    /// as `QInt8PerChan` — the storage the wasm experts-int4 recipe emits.
+    fn synthetic_int8_embed_artifact(rows: usize, cols: usize) -> Weights {
+        let arch = model_arch::arch_by_id("got-ocr2").expect("test architecture is registered");
+        let payload: Vec<u8> = (0..rows * cols)
+            .map(|i| (((i * 37 + 11) % 255) as i64 - 127) as i8 as u8)
+            .collect();
+        let scales: Vec<u8> = (0..rows)
+            .flat_map(|r| (((r % 13) as f32) * 0.0007 + 0.0031).to_le_bytes())
+            .collect();
+        let mut builder = crate::quant::focrq::FocrqBuilder::new()
+            .with_model_id(arch.id())
+            .with_license_notice(arch.license_notice());
+        builder
+            .add_quantized(
+                EMBED_TOKENS,
+                crate::quant::focrq::WriteDType::QInt8PerChan,
+                vec![rows, cols],
+                payload,
+                scales,
+                0,
+                0,
+            )
+            .expect("valid synthetic QInt8 embedding record");
+        Weights::from_bytes(builder.build()).expect("synthetic artifact loads")
+    }
+
+    /// bd-4l71 acceptance: the int8-resident embedding lookup is BIT-IDENTICAL
+    /// to the historical whole-table f32 widen. Every row produced by
+    /// [`EmbedTable::row_f32`] / [`EmbedTable::embed_ids`] on the zero-copy
+    /// int8 arm must equal the corresponding row of the fully dequantized
+    /// matrix `Weights::mat` would have built (~662 MB on the real vocab).
+    #[test]
+    fn int8_embed_row_lookup_matches_full_dequant() {
+        let (rows, cols) = (67usize, 16usize);
+        let weights = synthetic_int8_embed_artifact(rows, cols);
+        // The reference: the whole-table dequant-on-access `Weights::mat` does.
+        let full = weights.mat(EMBED_TOKENS).expect("whole-table widen");
+        assert_eq!(full.shape(), (rows, cols));
+
+        let table = embed_table_from(&weights).expect("int8 embed table resolves");
+        assert!(
+            matches!(table, EmbedTable::QInt8 { .. }),
+            "a QInt8PerChan table must take the zero-copy int8 arm"
+        );
+        assert_eq!((table.rows(), table.cols()), (rows, cols));
+        for r in 0..rows {
+            assert_eq!(
+                table.row_f32(r),
+                full.data[r * cols..(r + 1) * cols].to_vec(),
+                "per-row dequant of row {r} must be bit-identical to the full dequant"
+            );
+        }
+
+        // The gather path agrees too (and keeps the out-of-vocab guard).
+        let ids: Vec<u32> = vec![0, 5, 66, 5, 42];
+        let gathered = table.embed_ids(&ids).expect("gather over valid ids");
+        assert_eq!(gathered.shape(), (ids.len(), cols));
+        for (i, &id) in ids.iter().enumerate() {
+            let want = &full.data[id as usize * cols..(id as usize + 1) * cols];
+            assert_eq!(&gathered.data[i * cols..(i + 1) * cols], want, "id {id}");
+        }
+        assert!(
+            table.embed_ids(&[rows as u32]).is_err(),
+            "an out-of-vocab id must still error"
+        );
+    }
 
     #[test]
     fn forward_admission_serializes_concurrent_callers() {

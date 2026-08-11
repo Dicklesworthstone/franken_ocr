@@ -1139,6 +1139,7 @@ version = "0.7.2"
 dependencies = [
  "anyhow",
  "asupersync",
+ "bytemuck",
  "clap",
  "ctrlc",
  "fax",

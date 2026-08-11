@@ -388,8 +388,11 @@ impl TensorView<'_> {
 /// resolves `bytes[payload_base + off .. payload_base + off + len]`.
 #[derive(Debug)]
 pub struct Weights {
-    /// The entire on-disk blob — owned bytes or a read-only mmap ([`Backing`]).
-    bytes: Backing,
+    /// The entire on-disk blob — owned bytes or a read-only mmap ([`Backing`]),
+    /// behind an [`Arc`] so zero-copy weight views ([`SharedBytes`]) can hold
+    /// the blob alive without duplicating payload bytes (bd-4l71 residency:
+    /// the wasm artifact's 1.8 GB expert payload must not exist twice).
+    bytes: std::sync::Arc<Backing>,
     /// Offset of the payload region within `bytes`.
     payload_base: usize,
     /// `name -> record` directory.
@@ -443,6 +446,58 @@ impl std::fmt::Debug for Backing {
     }
 }
 
+/// A zero-copy, owning view of a byte range inside a model blob: an
+/// [`Arc`](std::sync::Arc) on the whole [`Backing`] plus a validated range.
+/// This is how quantized weight structs reference their payload bytes WITHOUT
+/// duplicating them next to the resident artifact (bd-4l71 residency work):
+/// cloning is an `Arc` bump, and the view keeps the blob alive on its own.
+#[derive(Clone)]
+pub struct SharedBytes {
+    backing: std::sync::Arc<Backing>,
+    start: usize,
+    len: usize,
+}
+
+impl SharedBytes {
+    fn new(backing: std::sync::Arc<Backing>, start: usize, len: usize) -> Self {
+        debug_assert!(
+            start
+                .checked_add(len)
+                .is_some_and(|end| end <= backing.len())
+        );
+        Self {
+            backing,
+            start,
+            len,
+        }
+    }
+}
+
+impl std::ops::Deref for SharedBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.backing[self.start..self.start + self.len]
+    }
+}
+
+impl std::fmt::Debug for SharedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SharedBytes([{}, {}) of {} blob bytes)",
+            self.start,
+            self.start + self.len,
+            self.backing.len()
+        )
+    }
+}
+
+impl PartialEq for SharedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self[..] == other[..]
+    }
+}
+
 /// The ONE unsafe call in the loader — the read-only mmap island, mirroring
 /// the `simd::arm`/`simd::x86` island pattern (crate policy is
 /// `deny(unsafe_code)` with documented, minimal islands).
@@ -483,7 +538,7 @@ impl Default for Weights {
     /// cleanly errors rather than panicking.
     fn default() -> Self {
         Self {
-            bytes: Backing::Owned(Vec::new()),
+            bytes: std::sync::Arc::new(Backing::Owned(Vec::new())),
             payload_base: 0,
             directory: BTreeMap::new(),
             arch_target: 0,
@@ -553,10 +608,29 @@ impl Weights {
             .ok()
             .and_then(|metadata| usize::try_from(metadata.len()).ok())
             .unwrap_or(0);
-        let mut bytes = Vec::with_capacity(capacity);
-        file.read_to_end(&mut bytes).map_err(|e| {
-            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
-        })?;
+        // EXACT-SIZE read (bd-4l71 residency). `read_to_end` into a
+        // `with_capacity(len)` buffer still probes for EOF once the buffer is
+        // full, and that probe `reserve()`s past capacity — amortized growth
+        // then asks the allocator for a SECOND, twice-as-large buffer for a
+        // multi-GB artifact (fatal on wasm32, where the linear memory would
+        // have to grow to ~2x the model). Sizing the buffer to the file and
+        // `read_exact`-ing into it asks for the blob's bytes exactly once. A
+        // zero/unknown size (an unseekable or racing file) keeps the historical
+        // `read_to_end` path, and a short/long file surfaces the same IO error
+        // shape it always did.
+        let bytes = if capacity > 0 {
+            let mut bytes = vec![0u8; capacity];
+            file.read_exact(&mut bytes).map_err(|e| {
+                FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+            })?;
+            bytes
+        } else {
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|e| {
+                FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+            })?;
+            bytes
+        };
         Self::from_backing(Backing::Owned(bytes))
     }
 
@@ -591,12 +665,13 @@ impl Weights {
     /// Test-only probe: did this load take the mmap backing?
     #[cfg(test)]
     pub(super) fn is_mapped(&self) -> bool {
-        matches!(self.bytes, Backing::Mapped(_))
+        matches!(*self.bytes, Backing::Mapped(_))
     }
 
     /// Parse + index a blob in either backing (the shared core of
     /// [`Weights::load`] / [`Weights::from_bytes`]).
     fn from_backing(bytes: Backing) -> FocrResult<Self> {
+        let bytes = std::sync::Arc::new(bytes);
         if bytes.len() >= FOCRQ_MAGIC.len() && &bytes[..FOCRQ_MAGIC.len()] == FOCRQ_MAGIC {
             Self::from_focrq_bytes(bytes)
         } else {
@@ -611,7 +686,7 @@ impl Weights {
     /// payload`. The provenance/config and the tensor directory all live in the
     /// header JSON (the byte fields before it are the fixed-size preamble that a
     /// reader can validate before parsing JSON).
-    fn from_focrq_bytes(bytes: Backing) -> FocrResult<Self> {
+    fn from_focrq_bytes(bytes: std::sync::Arc<Backing>) -> FocrResult<Self> {
         // Fixed preamble: magic(6) + version(4) + arch(1) + sha256(32) +
         // header_len(8) = 51 bytes minimum.
         const PREAMBLE: usize = 6 + 4 + 1 + 32 + 8;
@@ -699,7 +774,7 @@ impl Weights {
     /// payload`. The JSON maps `name -> {dtype, shape, data_offsets:[beg,end]}`
     /// (offsets are payload-relative); a `__metadata__` key, if present, is
     /// skipped.
-    fn from_safetensors_bytes(bytes: Backing) -> FocrResult<Self> {
+    fn from_safetensors_bytes(bytes: std::sync::Arc<Backing>) -> FocrResult<Self> {
         if bytes.len() < 8 {
             return Err(FocrError::FormatMismatch(format!(
                 "safetensors truncated: {} bytes < 8-byte header length prefix",
@@ -1051,7 +1126,7 @@ impl Weights {
             }
             return Ok(QInt8::new_smmla_panels(packed, scales, n, k));
         }
-        let w: Vec<i8> = if self.arch_target == 1 {
+        if self.arch_target == 1 {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 crate::progress::stderr_message(format_args!(
@@ -1062,11 +1137,23 @@ impl Weights {
                 ));
             });
             let packed: Vec<i8> = view.data.iter().map(|&b| b as i8).collect();
-            crate::simd::pack::smmla_unpack_panels(&packed, n, k)
-                .map_err(|e| FocrError::FormatMismatch(format!("QInt8 tensor {name:?}: {e}")))?
-        } else {
-            view.data.iter().map(|&b| b as i8).collect()
-        };
+            let w = crate::simd::pack::smmla_unpack_panels(&packed, n, k)
+                .map_err(|e| FocrError::FormatMismatch(format!("QInt8 tensor {name:?}: {e}")))?;
+            let scales = decode_f32_le(view.scales)?;
+            if scales.len() != n {
+                return Err(FocrError::FormatMismatch(format!(
+                    "QInt8 tensor {name:?}: {} scales != n {}",
+                    scales.len(),
+                    n
+                )));
+            }
+            return Ok(QInt8::new(w, scales, n, k));
+        }
+        // Canonical row-major int8: the payload bytes ARE the weight image, so
+        // reference them ZERO-COPY out of the blob (bd-4l71 residency — the
+        // wasm recipe's attention + `lm_head` int8 set is ~244 MB that must not
+        // exist twice). Values are identical to the historical
+        // `view.data.iter().map(|&b| b as i8)` copy.
         let scales = decode_f32_le(view.scales)?;
         if scales.len() != n {
             return Err(FocrError::FormatMismatch(format!(
@@ -1075,7 +1162,12 @@ impl Weights {
                 n
             )));
         }
-        Ok(QInt8::new(w, scales, n, k))
+        let record = self
+            .directory
+            .get(name)
+            .expect("tensor() resolved this record above");
+        let shared = self.payload_shared(name, record.byte_offset, record.byte_len)?;
+        Ok(QInt8::new_shared(shared, scales, n, k))
     }
 
     /// Reconstruct a group-quantized [`QInt4`] for `name`.
@@ -1126,23 +1218,52 @@ impl Weights {
                 expected_packed
             )));
         }
-        let scales = decode_f32_le(view.scales)?;
         let expected_scales = checked_shape_len(name, n, k / view.group_size, "n*(k/group_size)")?;
-        if scales.len() != expected_scales {
+        if view.scales.len() != expected_scales * 4 {
             return Err(FocrError::FormatMismatch(format!(
-                "QInt4 tensor {name:?}: {} scales != n*(k/group_size) {}",
-                scales.len(),
-                expected_scales
+                "QInt4 tensor {name:?}: {} scale bytes != n*(k/group_size)*f32 {}",
+                view.scales.len(),
+                expected_scales * 4
             )));
         }
+        // ZERO-COPY residency (bd-4l71): the packed nibbles and the raw LE
+        // scale bytes are referenced straight out of the loaded blob (Arc'd
+        // range views) instead of being duplicated next to it — the wasm
+        // artifact's ~1.8 GB expert payload must exist ONCE. Consumers decode
+        // scale subranges per use (`GroupScales::slice_f32`, identical values).
+        let record = self
+            .directory
+            .get(name)
+            .expect("tensor() resolved this record above");
+        let packed = self.payload_shared(name, record.byte_offset, record.byte_len)?;
+        let scales = self.payload_shared(name, record.scales_offset, record.scales_len)?;
         Ok(QInt4 {
-            packed: view.data.to_vec(),
-            scales,
+            packed: crate::native_engine::tensor::PackedBytes::Shared(packed),
+            scales: crate::native_engine::tensor::GroupScales::RawLe(scales),
             n,
             k,
             group_size: view.group_size,
             tier: view.tier,
         })
+    }
+
+    /// Resolve a payload byte range as an OWNING zero-copy [`SharedBytes`]
+    /// view (an `Arc` on the whole blob + the validated range) — the residency
+    /// primitive quantized weight structs use to reference their payload
+    /// without duplicating it (bd-4l71).
+    fn payload_shared(&self, name: &str, off: usize, len: usize) -> FocrResult<SharedBytes> {
+        // Validate exactly like `payload_slice` (same errors), then keep the
+        // range instead of the borrow.
+        self.payload_slice(name, off, len)?;
+        let start = self
+            .payload_base
+            .checked_add(off)
+            .expect("payload_slice validated the range");
+        Ok(SharedBytes::new(
+            std::sync::Arc::clone(&self.bytes),
+            start,
+            len,
+        ))
     }
 
     /// Resolve a payload byte range, bounds-checked against the backing buffer.
@@ -1519,7 +1640,7 @@ mod tests {
 
     fn synthetic_weights(record: TensorRecord, bytes: Vec<u8>) -> Weights {
         Weights {
-            bytes: Backing::Owned(bytes),
+            bytes: std::sync::Arc::new(Backing::Owned(bytes)),
             payload_base: 0,
             directory: BTreeMap::from([("x".to_owned(), record)]),
             arch_target: 0,
@@ -1736,8 +1857,39 @@ mod tests {
         let q = w.qint8("q").unwrap();
         assert_eq!(q.n, 2);
         assert_eq!(q.k, 3);
-        assert_eq!(q.w, vec![1i8, -2, 3, 4, -5, 6]);
+        assert_eq!(&q.w[..], &[1i8, -2, 3, 4, -5, 6]);
         assert_eq!(q.scales, vec![0.1, 0.2]);
+    }
+
+    /// bd-4l71 residency: a canonical row-major `QInt8PerChan` record is
+    /// BORROWED from the loaded blob instead of being copied next to it (the
+    /// wasm recipe's attention + `lm_head` set is ~244 MB). The borrowed view
+    /// must be byte-for-byte the historical `view.data.iter().map(|&b| b as i8)`
+    /// copy, and it must stay valid after the `Weights` is dropped (the view
+    /// owns an `Arc` on the blob).
+    #[test]
+    fn qint8_row_major_payload_is_borrowed_zero_copy_and_byte_identical() {
+        let raw: Vec<i8> = vec![1, -2, 3, 4, -5, 6];
+        let w_bytes: Vec<u8> = raw.iter().map(|&v| v as u8).collect();
+        let scale_bytes = f32_le_bytes(&[0.1, 0.2]);
+        let mut payload = w_bytes.clone();
+        payload.extend_from_slice(&scale_bytes);
+        let dir = "{\"q\":{\"dtype\":\"QInt8PerChan\",\"shape\":[2,3],\
+             \"byte_offset\":0,\"byte_len\":6,\"scales_offset\":6,\"scales_len\":8}}";
+        let blob = build_focrq(1, 0, [0u8; 32], dir, &payload);
+        let weights = Weights::from_bytes(blob).unwrap();
+        let q = weights.qint8("q").unwrap();
+        assert!(
+            matches!(q.w, crate::native_engine::tensor::Int8Weights::Shared(_)),
+            "a row-major int8 record must be borrowed, not copied"
+        );
+        assert_eq!(&q.w[..], &raw[..], "borrowed bytes == the historical copy");
+        assert_eq!(q.scales, vec![0.1, 0.2]);
+        assert_eq!((q.n, q.k), (2, 3));
+
+        // The view keeps the blob alive on its own.
+        drop(weights);
+        assert_eq!(&q.w[..], &raw[..], "the view outlives the Weights handle");
     }
 
     #[test]
@@ -1785,8 +1937,8 @@ mod tests {
         assert_eq!(q.k, 16);
         assert_eq!(q.group_size, 16);
         assert_eq!(q.tier, 3);
-        assert_eq!(q.packed, packed);
-        assert_eq!(q.scales, vec![0.1, 0.2]);
+        assert_eq!(&q.packed[..], &packed[..]);
+        assert_eq!(q.scales.to_vec(), vec![0.1, 0.2]);
     }
 
     #[test]
@@ -2237,14 +2389,14 @@ mod tests {
                 crate::native_engine::tensor::WeightLayout::SmmlaPanels,
                 "SMMLA host must keep the offline panels (zero-shuffle)"
             );
-            assert_eq!(q.w, panels, "panel bytes verbatim");
+            assert_eq!(&q.w[..], &panels[..], "panel bytes verbatim");
         } else {
             assert_eq!(
                 q.layout,
                 crate::native_engine::tensor::WeightLayout::RowMajor,
                 "non-SMMLA host must un-permute to canonical row-major"
             );
-            assert_eq!(q.w, w_rm, "un-permute is lossless");
+            assert_eq!(&q.w[..], &w_rm[..], "un-permute is lossless");
         }
         println!(
             r#"{{"check":"packed_focrq_load","tier":"{}","layout":"{:?}","result":"pass"}}"#,

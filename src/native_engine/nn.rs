@@ -635,6 +635,45 @@ mod tests {
         assert_eq!(c.data, vec![58.0, 64.0, 139.0, 154.0]);
     }
 
+    /// bd-4l71 residency precondition: [`matmul`] is INVARIANT to how its `m`
+    /// rows are partitioned — row block `[r0, r1)` of `matmul(a, b)` equals
+    /// `matmul(a_rows[r0..r1], b)` BIT-FOR-BIT. Each output element is an
+    /// independent length-`k` dot product whose accumulation order depends on
+    /// `k` alone, so the kernel's `m`-blocking cannot move a bit. The streamed
+    /// vision MLP relies on exactly this to run in row chunks (bounded scratch)
+    /// without changing a single output value.
+    #[test]
+    fn matmul_is_row_block_invariant() {
+        let (m, k, n) = (301usize, 96usize, 160usize);
+        let a = Mat::from_vec(
+            m,
+            k,
+            (0..m * k)
+                .map(|i| ((i % 37) as f32) * 0.031 - 0.5)
+                .collect(),
+        );
+        let b = Mat::from_vec(
+            k,
+            n,
+            (0..k * n)
+                .map(|i| ((i % 53) as f32) * 0.017 - 0.4)
+                .collect(),
+        );
+        let whole = matmul(&a, &b).expect("whole matmul");
+        for chunk in [1usize, 7, 64, 128, 300, 301] {
+            let mut stitched = Vec::with_capacity(m * n);
+            for start in (0..m).step_by(chunk) {
+                let rows = chunk.min(m - start);
+                let part = Mat::from_vec(rows, k, a.data[start * k..(start + rows) * k].to_vec());
+                stitched.extend_from_slice(&matmul(&part, &b).expect("chunk matmul").data);
+            }
+            assert_eq!(
+                stitched, whole.data,
+                "row-chunked matmul (chunk {chunk}) must be bit-identical to the whole GEMM"
+            );
+        }
+    }
+
     #[test]
     fn matmul_rejects_inner_mismatch() {
         let a = Mat::zeros(2, 3);
@@ -799,7 +838,7 @@ mod tests {
             data: vec![1.0],
         };
         let w = QInt8 {
-            w: vec![1, 2],
+            w: vec![1i8, 2].into(),
             scales: vec![1.0],
             n: 1,
             k: 2,
@@ -812,7 +851,7 @@ mod tests {
 
         let x = Mat::from_vec(1, 2, vec![1.0, 2.0]);
         let short_weight = QInt8 {
-            w: vec![1],
+            w: vec![1i8].into(),
             scales: vec![1.0],
             n: 1,
             k: 2,
@@ -824,7 +863,7 @@ mod tests {
         );
 
         let missing_scale = QInt8 {
-            w: vec![1, 2],
+            w: vec![1i8, 2].into(),
             scales: vec![],
             n: 1,
             k: 2,

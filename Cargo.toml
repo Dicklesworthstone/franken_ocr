@@ -98,6 +98,15 @@ rayon = "1"
 sha2 = "0.10"
 # RunStore run ids (bd-223.4).
 uuid = { version = "1", features = ["v4"], optional = true }
+# Safe (no `unsafe` in THIS crate) plain-old-data slice reinterpretation for the
+# zero-copy weight residency work (bd-4l71): an int8 `.focrq` payload is a byte
+# range inside the loaded blob, and the GEMV kernels take `&[i8]`. `u8 -> i8` is
+# a same-size, alignment-1 `Pod` cast, so `bytemuck::cast_slice` is infallible
+# here and lets the decoder cache BORROW the artifact's int8 payload instead of
+# duplicating ~244 MB of attention/lm_head weights next to it. Already in the
+# lock graph (via `half`/`image`); `default-features = false` keeps it core-only
+# so the wasm32 build is unaffected.
+bytemuck = { version = "1", default-features = false }
 
 # Currently-unwired opt-in: declaring the feature makes `#[cfg(feature =
 # "mimalloc")]` in benches/support/perf_harness.rs a KNOWN cfg (no unexpected-cfg

@@ -350,6 +350,126 @@ pub fn forward_prefix(weights: &Weights, image: &Mat, prefix: &str) -> FocrResul
 /// rel-pos table sizes are derived from the stored rows. `pub(crate)` so the
 /// batch spine (bd-1azu.10) hydrates ONCE per batch instead of once per view.
 pub(crate) fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<SamWeights> {
+    // The embed/neck/per-block builders are the SAME functions the streamed
+    // forward uses (bd-4l71), so the two hydration modes cannot drift; only
+    // WHERE the hydrated blocks live differs. Hydration ORDER (patch/pos ->
+    // blocks -> neck) is the historical one, so error precedence on malformed
+    // artifacts is unchanged.
+    let (patch_embed, pos_embed, pos_grid_h, pos_grid_w) = sam_embed_from(weights, prefix)?;
+    let mut blocks = Vec::with_capacity(DEPTH);
+    for i in 0..DEPTH {
+        blocks.push(sam_block_from(weights, prefix, i)?);
+    }
+    let mut w = sam_neck_shell(
+        weights,
+        prefix,
+        patch_embed,
+        pos_embed,
+        pos_grid_h,
+        pos_grid_w,
+    )?;
+    w.blocks = blocks;
+    Ok(w)
+}
+
+/// Hydrate ONE SAM transformer block from the `{prefix}.blocks.{i}.*` tensors —
+/// the exact per-block build [`sam_weights_from`] performs (it calls this), so
+/// the streamed per-block forward (bd-4l71 wasm-lane residency) and the cached
+/// whole-tower hydration CANNOT drift.
+pub(crate) fn sam_block_from(weights: &Weights, prefix: &str, i: usize) -> FocrResult<BlockP> {
+    let flat = |n: &str| weights.vec(n);
+    let ln = |n: &str| -> FocrResult<LayerNormP> {
+        Ok(LayerNormP {
+            w: flat(&format!("{n}.weight"))?,
+            b: flat(&format!("{n}.bias"))?,
+        })
+    };
+    let b = format!("{prefix}.blocks.{i}");
+    let window = if GLOBAL_BLOCKS.contains(&i) {
+        0
+    } else {
+        WINDOW
+    };
+    let qkv_name = format!("{b}.attn.qkv.weight");
+    let proj_name = format!("{b}.attn.proj.weight");
+    let rph_name = format!("{b}.attn.rel_pos_h");
+    let rpw_name = format!("{b}.attn.rel_pos_w");
+    let lin1_name = format!("{b}.mlp.lin1.weight");
+    let lin2_name = format!("{b}.mlp.lin2.weight");
+    let (q_out, q_in) = tensor_rank2_shape(weights, &qkv_name)?;
+    let (proj_out, proj_in) = tensor_rank2_shape(weights, &proj_name)?;
+    let (rph_rows, _rph_cols) = tensor_rank2_shape(weights, &rph_name)?;
+    let (rpw_rows, _rpw_cols) = tensor_rank2_shape(weights, &rpw_name)?;
+    let (lin1_out, lin1_in) = tensor_rank2_shape(weights, &lin1_name)?;
+    let (lin2_out, lin2_in) = tensor_rank2_shape(weights, &lin2_name)?;
+    Ok(BlockP {
+        norm1: ln(&format!("{b}.norm1"))?,
+        attn: AttnP {
+            qkv: Linear::from_row_major(
+                &flat(&qkv_name)?,
+                flat(&format!("{b}.attn.qkv.bias"))?,
+                q_out,
+                q_in,
+            )?,
+            proj: Linear::from_row_major(
+                &flat(&proj_name)?,
+                flat(&format!("{b}.attn.proj.bias"))?,
+                proj_out,
+                proj_in,
+            )?,
+            rel_pos_h: flat(&rph_name)?,
+            rel_pos_w: flat(&rpw_name)?,
+            size_h: rph_rows.div_ceil(2),
+            size_w: rpw_rows.div_ceil(2),
+        },
+        norm2: ln(&format!("{b}.norm2"))?,
+        lin1: Linear::from_row_major(
+            &flat(&lin1_name)?,
+            flat(&format!("{b}.mlp.lin1.bias"))?,
+            lin1_out,
+            lin1_in,
+        )?,
+        lin2: Linear::from_row_major(
+            &flat(&lin2_name)?,
+            flat(&format!("{b}.mlp.lin2.bias"))?,
+            lin2_out,
+            lin2_in,
+        )?,
+        window,
+    })
+}
+
+/// Hydrate the patch-embed conv + abs pos-embed (the pre-block head parts, in
+/// the historical order). Shared by [`sam_weights_from`] and [`sam_head_from`].
+fn sam_embed_from(weights: &Weights, prefix: &str) -> FocrResult<(Conv, Vec<f32>, usize, usize)> {
+    let p = prefix;
+    let flat = |n: &str| weights.vec(n);
+    let pe = format!("{p}.patch_embed.proj.weight");
+    let (pe_out, pe_in, pe_kh, pe_kw) = tensor_rank4_shape(weights, &pe)?;
+    let patch_embed = Conv {
+        w: flat(&pe)?,
+        b: Some(flat(&format!("{p}.patch_embed.proj.bias"))?),
+        out_ch: pe_out,
+        in_ch: pe_in,
+        kh: pe_kh,
+        kw: pe_kw,
+    };
+    let pos_name = format!("{p}.pos_embed");
+    let (pgh, pgw) = tensor_pos_grid_shape(weights, &pos_name)?;
+    let pos_embed = flat(&pos_name)?;
+    Ok((patch_embed, pos_embed, pgh, pgw))
+}
+
+/// Hydrate the neck/net convs and assemble a [`SamWeights`] with an EMPTY
+/// `blocks` vec (the caller supplies blocks, or streams them per use).
+fn sam_neck_shell(
+    weights: &Weights,
+    prefix: &str,
+    patch_embed: Conv,
+    pos_embed: Vec<f32>,
+    pos_grid_h: usize,
+    pos_grid_w: usize,
+) -> FocrResult<SamWeights> {
     let p = prefix;
     let flat = |n: &str| weights.vec(n);
     let conv = |n: &str, bias: bool| -> FocrResult<Conv> {
@@ -373,85 +493,12 @@ pub(crate) fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<Sa
             b: flat(&format!("{n}.bias"))?,
         })
     };
-
-    let pe = format!("{p}.patch_embed.proj.weight");
-    let (pe_out, pe_in, pe_kh, pe_kw) = tensor_rank4_shape(weights, &pe)?;
-    let patch_embed = Conv {
-        w: flat(&pe)?,
-        b: Some(flat(&format!("{p}.patch_embed.proj.bias"))?),
-        out_ch: pe_out,
-        in_ch: pe_in,
-        kh: pe_kh,
-        kw: pe_kw,
-    };
-
-    let pos_name = format!("{p}.pos_embed");
-    let (pgh, pgw) = tensor_pos_grid_shape(weights, &pos_name)?;
-    let pos_embed = flat(&format!("{p}.pos_embed"))?;
-
-    let mut blocks = Vec::with_capacity(DEPTH);
-    for i in 0..DEPTH {
-        let b = format!("{p}.blocks.{i}");
-        let window = if GLOBAL_BLOCKS.contains(&i) {
-            0
-        } else {
-            WINDOW
-        };
-        let qkv_name = format!("{b}.attn.qkv.weight");
-        let proj_name = format!("{b}.attn.proj.weight");
-        let rph_name = format!("{b}.attn.rel_pos_h");
-        let rpw_name = format!("{b}.attn.rel_pos_w");
-        let lin1_name = format!("{b}.mlp.lin1.weight");
-        let lin2_name = format!("{b}.mlp.lin2.weight");
-        let (q_out, q_in) = tensor_rank2_shape(weights, &qkv_name)?;
-        let (proj_out, proj_in) = tensor_rank2_shape(weights, &proj_name)?;
-        let (rph_rows, _rph_cols) = tensor_rank2_shape(weights, &rph_name)?;
-        let (rpw_rows, _rpw_cols) = tensor_rank2_shape(weights, &rpw_name)?;
-        let (lin1_out, lin1_in) = tensor_rank2_shape(weights, &lin1_name)?;
-        let (lin2_out, lin2_in) = tensor_rank2_shape(weights, &lin2_name)?;
-        blocks.push(BlockP {
-            norm1: ln(&format!("{b}.norm1"))?,
-            attn: AttnP {
-                qkv: Linear::from_row_major(
-                    &flat(&qkv_name)?,
-                    flat(&format!("{b}.attn.qkv.bias"))?,
-                    q_out,
-                    q_in,
-                )?,
-                proj: Linear::from_row_major(
-                    &flat(&proj_name)?,
-                    flat(&format!("{b}.attn.proj.bias"))?,
-                    proj_out,
-                    proj_in,
-                )?,
-                rel_pos_h: flat(&rph_name)?,
-                rel_pos_w: flat(&rpw_name)?,
-                size_h: rph_rows.div_ceil(2),
-                size_w: rpw_rows.div_ceil(2),
-            },
-            norm2: ln(&format!("{b}.norm2"))?,
-            lin1: Linear::from_row_major(
-                &flat(&lin1_name)?,
-                flat(&format!("{b}.mlp.lin1.bias"))?,
-                lin1_out,
-                lin1_in,
-            )?,
-            lin2: Linear::from_row_major(
-                &flat(&lin2_name)?,
-                flat(&format!("{b}.mlp.lin2.bias"))?,
-                lin2_out,
-                lin2_in,
-            )?,
-            window,
-        });
-    }
-
     Ok(SamWeights {
         patch_embed,
         pos_embed,
-        pos_grid_h: pgh,
-        pos_grid_w: pgw,
-        blocks,
+        pos_grid_h,
+        pos_grid_w,
+        blocks: Vec::new(),
         neck_conv1: conv(&format!("{p}.neck.0.weight"), false)?,
         neck_ln1: ln(&format!("{p}.neck.1"))?,
         neck_conv2: conv(&format!("{p}.neck.2.weight"), false)?,
@@ -459,6 +506,14 @@ pub(crate) fn sam_weights_from(weights: &Weights, prefix: &str) -> FocrResult<Sa
         net2: conv(&format!("{p}.net_2.weight"), false)?,
         net3: conv(&format!("{p}.net_3.weight"), false)?,
     })
+}
+
+/// Hydrate ONLY the small non-block SAM parameters (patch embed, pos embed,
+/// neck/net convs — ~10 MB f32) with an EMPTY `blocks` vec: the head of the
+/// streamed per-block forward (bd-4l71 wasm-lane residency).
+pub(crate) fn sam_head_from(weights: &Weights, prefix: &str) -> FocrResult<SamWeights> {
+    let (patch_embed, pos_embed, pgh, pgw) = sam_embed_from(weights, prefix)?;
+    sam_neck_shell(weights, prefix, patch_embed, pos_embed, pgh, pgw)
 }
 
 fn tensor_min_rank_shape(weights: &Weights, name: &str, min_rank: usize) -> FocrResult<Vec<usize>> {
@@ -517,6 +572,79 @@ fn tensor_pos_grid_shape(weights: &Weights, name: &str) -> FocrResult<(usize, us
 /// [`FocrError::Other`] on a shape contract violation (non-3-channel input,
 /// non-square or non-`PATCH`-divisible spatial dims, or a kernel rejection).
 pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrResult<Mat> {
+    forward_core(
+        w,
+        image,
+        h,
+        win,
+        w.blocks.len(),
+        &mut |i| Ok(std::borrow::Cow::Borrowed(&w.blocks[i])),
+        false,
+    )
+}
+
+/// [`forward`] semantics WITHOUT retaining the whole ~0.4 GB f32 SAM tower
+/// (bd-4l71 wasm-lane residency): the small head hydrates once
+/// ([`sam_head_from`]), then each block is hydrated ([`sam_block_from`] — the
+/// SAME builder the cached path uses), run, and DROPPED. Global-attention
+/// blocks run the bounded-scratch query-slab kernel
+/// ([`attention_global_bounded`], bit-identical — see its gate) so the
+/// transient working set stays tens of MB instead of ~0.8 GB.
+///
+/// # Errors
+/// As [`forward_prefix`].
+pub(crate) fn forward_streamed(weights: &Weights, image: &Mat, prefix: &str) -> FocrResult<Mat> {
+    if image.rows != 3 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam::forward: expected 3 input channels, got {}",
+            image.rows
+        )));
+    }
+    let side = (image.cols as f64).sqrt() as usize;
+    if side * side != image.cols {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam::forward: image.cols {} is not a perfect square",
+            image.cols
+        )));
+    }
+    let th = Instant::now();
+    let head = sam_head_from(weights, prefix)?;
+    super::timing_log(&format!(
+        "    sam.hydrate(head) {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    let tf = Instant::now();
+    let out = forward_core(
+        &head,
+        image,
+        side,
+        side,
+        DEPTH,
+        &mut |i| Ok(std::borrow::Cow::Owned(sam_block_from(weights, prefix, i)?)),
+        true,
+    );
+    super::timing_log(&format!(
+        "    sam.forward(streamed) {:.2}s",
+        tf.elapsed().as_secs_f64()
+    ));
+    out
+}
+
+/// The shared SAM tower core: patch embed + pos embed, `depth` transformer
+/// blocks obtained from `block_at` (borrowed from a cached [`SamWeights`] or
+/// hydrated per use and dropped), then the neck/net convs. ONE body serves the
+/// cached and streamed forwards, so they cannot drift; `low_mem` selects the
+/// bounded-scratch global-attention kernel (bit-identical, gated).
+#[allow(clippy::too_many_arguments)]
+fn forward_core<'w>(
+    w: &SamWeights,
+    image: &Mat,
+    h: usize,
+    win: usize,
+    depth: usize,
+    block_at: &mut dyn FnMut(usize) -> FocrResult<std::borrow::Cow<'w, BlockP>>,
+    low_mem: bool,
+) -> FocrResult<Mat> {
     if image.rows != 3 {
         return Err(FocrError::Other(anyhow::anyhow!(
             "vision_sam: expected 3 input channels, got {}",
@@ -563,8 +691,9 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
 
     // ── 12 transformer blocks.
     let tb = Instant::now();
-    for blk in &w.blocks {
-        x = block_forward(blk, &x, gh, gw)?;
+    for i in 0..depth {
+        let blk = block_at(i)?;
+        x = block_forward_impl(&blk, &x, gh, gw, low_mem)?;
     }
     super::timing_log(&format!(
         "    sam.blocks {:.2}s",
@@ -760,12 +889,34 @@ pub fn forward_with_batched(
 ///
 /// `shortcut = x; x = norm1(x);` (window_partition if windowed) `x = attn(x);`
 /// (window_unpartition); `x = shortcut + x; x = x + mlp(norm2(x))`.
+///
+/// The forwards now call [`block_forward_impl`] directly (they thread the
+/// bd-4l71 `low_mem` selector); this alias pins the HISTORICAL `low_mem=false`
+/// contract for the block-level unit tests.
+#[cfg_attr(not(test), allow(dead_code))]
 fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
+    block_forward_impl(blk, x, gh, gw, false)
+}
+
+/// [`block_forward`] with the `low_mem` global-attention selector (bd-4l71):
+/// `false` is byte-for-byte the historical path; `true` routes GLOBAL blocks
+/// through the bounded-scratch [`attention_global_bounded`] (bit-identical —
+/// gated by `bounded_global_attention_is_bit_identical`). Windowed blocks are
+/// identical either way (their per-window logits are already tiny).
+fn block_forward_impl(
+    blk: &BlockP,
+    x: &Mat,
+    gh: usize,
+    gw: usize,
+    low_mem: bool,
+) -> FocrResult<Mat> {
     let normed = layer_norm_rows(x, &blk.norm1)?;
 
     let ta = Instant::now();
     let attn_out = if blk.window > 0 {
         attention_windowed(&blk.attn, &normed, gh, gw, blk.window)?
+    } else if low_mem {
+        attention_global_bounded(&blk.attn, &normed, gh, gw)?
     } else {
         attention(&blk.attn, &normed, gh, gw, None)?
     };
@@ -785,9 +936,13 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     // residual 2: x = h1 + mlp(norm2(h1))
     let tm = Instant::now();
     let normed2 = layer_norm_rows(&h1, &blk.norm2)?;
-    let mut mlp = blk.lin1.apply(&normed2)?;
-    nn::gelu(&mut mlp);
-    let mlp = blk.lin2.apply(&mlp)?;
+    let mlp = if low_mem {
+        mlp_row_chunked(blk, &normed2)?
+    } else {
+        let mut hidden = blk.lin1.apply(&normed2)?;
+        nn::gelu(&mut hidden);
+        blk.lin2.apply(&hidden)?
+    };
     super::timing_log(&format!(
         "      sam.block mlp {:.3}s",
         tm.elapsed().as_secs_f64()
@@ -797,6 +952,59 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
         *a += *b;
     }
     Ok(h1)
+}
+
+/// Token rows the low-memory block MLP processes per pass. At the SAM tower's
+/// 4096-token, 3072-wide hidden this trades ONE 48 MB `lin1` output for a
+/// 6 MB scratch (the `[n, dim]` result is allocated either way); the chunk is
+/// still far above the GEMM kernels' internal parallel thresholds, so the cost
+/// is unmeasurable next to the residency win.
+const MLP_ROW_CHUNK: usize = 512;
+
+/// `lin2(gelu(lin1(x)))` computed in [`MLP_ROW_CHUNK`]-row passes — the
+/// bd-4l71 low-memory twin of the whole-tensor MLP, so the streamed vision
+/// lane never materializes the full `[n, mlp_dim]` hidden.
+///
+/// BIT-IDENTICAL to the whole-tensor form: every op here is row-independent —
+/// [`nn::matmul`] row blocks are exact (gated by
+/// `matmul_is_row_block_invariant`), the `Linear` bias add is per-row, and
+/// [`nn::gelu`] is element-wise. Chunk `[r0, r1)` therefore sees exactly the
+/// inputs and produces exactly the values the whole-tensor pass wrote there.
+///
+/// # Errors
+/// Whatever [`Linear::apply`] rejects (a shape/metadata mismatch).
+fn mlp_row_chunked(blk: &BlockP, normed2: &Mat) -> FocrResult<Mat> {
+    mlp_row_chunked_with(blk, normed2, MLP_ROW_CHUNK)
+}
+
+/// [`mlp_row_chunked`] with an explicit chunk height, so the bit-identity gate
+/// (`row_chunked_block_mlp_is_bit_identical`) can sweep partitions.
+///
+/// # Errors
+/// Whatever [`Linear::apply`] rejects (a shape/metadata mismatch).
+fn mlp_row_chunked_with(blk: &BlockP, normed2: &Mat, chunk: usize) -> FocrResult<Mat> {
+    if chunk == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam mlp_row_chunked: row chunk must be non-zero"
+        )));
+    }
+    let (rows, cols) = (normed2.rows, normed2.cols);
+    let mut out: Vec<f32> = Vec::with_capacity(rows * blk.lin2.out);
+    let mut start = 0usize;
+    while start < rows {
+        let take = chunk.min(rows - start);
+        let chunk = Mat::from_vec(
+            take,
+            cols,
+            normed2.data[start * cols..(start + take) * cols].to_vec(),
+        );
+        let mut hidden = blk.lin1.apply(&chunk)?;
+        nn::gelu(&mut hidden);
+        let done = blk.lin2.apply(&hidden)?;
+        out.extend_from_slice(&done.data);
+        start += take;
+    }
+    Ok(Mat::from_vec(rows, blk.lin2.out, out))
 }
 
 /// Batched analogue of [`block_forward`] over a stacked `[V*n, dim]` buffer
@@ -1082,6 +1290,152 @@ fn attention(
         })?;
 
     // Reassemble [n, dim] from [nh][n, hd] (head-major -> token rows).
+    let mut ctx = vec![0.0f32; n * dim];
+    for head in 0..nh {
+        for r in 0..n {
+            let src = (head * n + r) * hd;
+            let dst = r * dim + head * hd;
+            ctx[dst..dst + hd].copy_from_slice(&out[src..src + hd]);
+        }
+    }
+    let ctx_mat = Mat::from_vec(n, dim, ctx);
+    let y = p.proj.apply(&ctx_mat)?;
+    ensure_mat_shape(&y, n, dim, "vision_sam attention projection output")?;
+    Ok(y)
+}
+
+/// Query rows per slab in [`attention_global_bounded`]: bounds the per-head
+/// logits scratch to `slab × n × 4` bytes (2 MB at the 64×64 global grid)
+/// instead of the full `n × n` (~64 MB × 12 concurrent heads ≈ 0.8 GB). The
+/// heads run concurrently, so this slab is paid ONCE PER HEAD — 128 rows keeps
+/// the whole global-attention logits footprint at ~24 MB while still handing
+/// the GEMM/softmax kernels rows in the thousands of elements.
+const GLOBAL_ATTN_QUERY_SLAB: usize = 128;
+
+/// Bounded-scratch global attention (bd-4l71 wasm-lane residency): identical
+/// math to [`attention`] with the per-head logits computed in CONTIGUOUS
+/// query-row slabs. Each query row's logits, bias adds, softmax, and `·V`
+/// reduction are computed with the SAME kernels over the SAME operands in the
+/// SAME order — a query row never reduces across other query rows, so slabbing
+/// only changes how rows are grouped into kernel calls. Bit-identity is gated
+/// by `bounded_global_attention_is_bit_identical`.
+fn attention_global_bounded(p: &AttnP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
+    attention_global_bounded_with(p, x, gh, gw, GLOBAL_ATTN_QUERY_SLAB)
+}
+
+fn attention_global_bounded_with(
+    p: &AttnP,
+    x: &Mat,
+    gh: usize,
+    gw: usize,
+    slab: usize,
+) -> FocrResult<Mat> {
+    let n = gh * gw;
+    if x.rows != n {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: input rows {} != gh*gw {}*{}",
+            x.rows,
+            gh,
+            gw
+        )));
+    }
+    let dim = x.cols;
+    let nh = NUM_HEADS;
+    if dim == 0 || !dim.is_multiple_of(nh) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: dim {} must be non-zero and divisible by heads {}",
+            dim,
+            nh
+        )));
+    }
+    if p.qkv.in_ != dim || p.qkv.out != 3 * dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: qkv shape out/in {}x{} incompatible with dim {}",
+            p.qkv.out,
+            p.qkv.in_,
+            dim
+        )));
+    }
+    if p.proj.in_ != dim || p.proj.out != dim {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: proj shape out/in {}x{} incompatible with dim {}",
+            p.proj.out,
+            p.proj.in_,
+            dim
+        )));
+    }
+    if slab == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam attention: query slab must be non-zero"
+        )));
+    }
+    let hd = dim / nh;
+    ensure_rel_pos_len("rel_pos_h", p.size_h, hd, p.rel_pos_h.len())?;
+    ensure_rel_pos_len("rel_pos_w", p.size_w, hd, p.rel_pos_w.len())?;
+    let scale = (hd as f32).powf(-0.5);
+
+    // qkv + per-head split — identical to `attention`.
+    let qkv = p.qkv.apply(x)?;
+    ensure_mat_shape(&qkv, n, 3 * dim, "vision_sam attention qkv output")?;
+    let mut q = vec![0.0f32; nh * n * hd];
+    let mut k = vec![0.0f32; nh * n * hd];
+    let mut v = vec![0.0f32; nh * n * hd];
+    for r in 0..n {
+        let row = qkv.row(r);
+        for head in 0..nh {
+            let dst = (head * n + r) * hd;
+            q[dst..dst + hd].copy_from_slice(&row[head * hd..(head + 1) * hd]);
+            k[dst..dst + hd].copy_from_slice(&row[(nh + head) * hd..(nh + head + 1) * hd]);
+            v[dst..dst + hd].copy_from_slice(&row[(2 * nh + head) * hd..(2 * nh + head + 1) * hd]);
+        }
+    }
+    // The fused `[n, 3*dim]` projection is dead once it has been split into the
+    // per-head q/k/v planes; releasing it HERE (bd-4l71) keeps its ~37 MB (SAM
+    // at 4096 tokens) out of the peak that the per-head parallel section below
+    // sets. Pure lifetime — no value changes.
+    drop(qkv);
+    let rh = get_rel_pos(gh, gh, &p.rel_pos_h, p.size_h, hd);
+    let rw = get_rel_pos(gw, gw, &p.rel_pos_w, p.size_w, hd);
+
+    let mut out = vec![0.0f32; nh * n * hd]; // [nh][n, hd]
+    out.par_chunks_mut(n * hd)
+        .enumerate()
+        .try_for_each(|(head, out_chunk)| -> FocrResult<()> {
+            let qh = &q[head * n * hd..(head + 1) * n * hd];
+            let kh = &k[head * n * hd..(head + 1) * n * hd];
+            let vh = &v[head * n * hd..(head + 1) * n * hd];
+            let (rel_h_bias, rel_w_bias) = decomposed_rel_pos_bias(qh, &rh, &rw, gh, gw, hd);
+            let kt_mat = Mat::from_vec(hd, n, transpose_contiguous_stores(kh, n, hd));
+            let vh_mat = Mat::from_vec(n, hd, vh.to_vec());
+
+            // Query slabs: rows [q0, q0+qc) of the logits, biased/softmaxed/
+            // reduced exactly as in `attention` (global row index i = q0 + li).
+            let mut q0 = 0usize;
+            while q0 < n {
+                let qc = slab.min(n - q0);
+                let qb_mat = Mat::from_vec(qc, hd, qh[q0 * hd..(q0 + qc) * hd].to_vec());
+                let mut lm = nn::matmul(&qb_mat, &kt_mat)?;
+                for li in 0..qc {
+                    let i = q0 + li;
+                    let lrow = &mut lm.data[li * n..(li + 1) * n];
+                    let brow_w = &rel_w_bias[i * gw..(i + 1) * gw];
+                    for ky in 0..gh {
+                        let bh = rel_h_bias[i * gh + ky];
+                        let seg = &mut lrow[ky * gw..(ky + 1) * gw];
+                        for (l, &bw) in seg.iter_mut().zip(brow_w) {
+                            *l = scale * *l + bh + bw;
+                        }
+                    }
+                }
+                nn::softmax_rows(&mut lm)?;
+                let slab_out = nn::matmul(&lm, &vh_mat)?;
+                out_chunk[q0 * hd..(q0 + qc) * hd].copy_from_slice(&slab_out.data);
+                q0 += qc;
+            }
+            Ok(())
+        })?;
+
+    // Reassemble + project — identical to `attention`.
     let mut ctx = vec![0.0f32; n * dim];
     for head in 0..nh {
         for r in 0..n {
@@ -2116,6 +2470,247 @@ mod tests {
             w[i * dim + i] = 1.0;
         }
         w
+    }
+
+    /// bd-4l71 acceptance: the row-chunked block MLP (the streamed lane's
+    /// bounded-scratch `lin2(gelu(lin1(x)))`) is BIT-IDENTICAL to the
+    /// whole-tensor form for every row partition. Every op in the MLP is
+    /// row-independent, so the chunk height can only change how many rows a
+    /// kernel call sees — never a value.
+    #[test]
+    fn row_chunked_block_mlp_is_bit_identical() -> FocrResult<()> {
+        let dim = EMBED_DIM;
+        let mut blk = tiny_block(0);
+        // A NON-zero MLP (tiny_block zeroes it) so the comparison has teeth.
+        blk.lin1 = test_linear(
+            (0..MLP_HIDDEN * dim)
+                .map(|i| (((i * 31 + 7) % 101) as f32 - 50.0) * 3.0e-4)
+                .collect(),
+            (0..MLP_HIDDEN)
+                .map(|i| ((i % 9) as f32 - 4.0) * 0.01)
+                .collect(),
+            MLP_HIDDEN,
+            dim,
+        );
+        blk.lin2 = test_linear(
+            (0..dim * MLP_HIDDEN)
+                .map(|i| (((i * 17 + 3) % 83) as f32 - 41.0) * 4.0e-4)
+                .collect(),
+            (0..dim).map(|i| ((i % 6) as f32 - 3.0) * 0.02).collect(),
+            dim,
+            MLP_HIDDEN,
+        );
+        let rows = 13usize;
+        let x = Mat::from_vec(
+            rows,
+            dim,
+            (0..rows * dim)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.004)
+                .collect(),
+        );
+        let mut whole = blk.lin1.apply(&x)?;
+        nn::gelu(&mut whole);
+        let whole = blk.lin2.apply(&whole)?;
+        for chunk in [1usize, 2, 5, 13, 512] {
+            let chunked = mlp_row_chunked_with(&blk, &x, chunk)?;
+            assert_eq!(chunked.shape(), whole.shape());
+            assert_eq!(
+                chunked
+                    .data
+                    .iter()
+                    .map(|f| f.to_bits())
+                    .collect::<Vec<u32>>(),
+                whole.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                "chunk {chunk}: row-chunked MLP must be bit-identical"
+            );
+        }
+        assert!(
+            mlp_row_chunked_with(&blk, &x, 0).is_err(),
+            "a zero chunk height must be rejected, not loop forever"
+        );
+        Ok(())
+    }
+
+    /// bd-4l71 acceptance: the bounded-scratch global attention
+    /// ([`attention_global_bounded_with`]) is BIT-IDENTICAL to the historical
+    /// full-logits [`attention`] across slab sizes that partition the query
+    /// rows evenly, unevenly, and not at all — with a NON-identity qkv, biases,
+    /// and non-zero rel-pos tables so every term is exercised.
+    #[test]
+    fn bounded_global_attention_is_bit_identical() -> FocrResult<()> {
+        let dim = EMBED_DIM;
+        let hd = HEAD_DIM;
+        for &(grid, slabs) in &[(6usize, [5usize, 16, 36, 512]), (8, [3, 16, 64, 512])] {
+            let n = grid * grid;
+            let rel_rows = 2 * grid - 1;
+            let qkv_w: Vec<f32> = (0..3 * dim * dim)
+                .map(|i| (((i * 37 + 11) % 97) as f32 - 48.0) * 4.0e-4)
+                .collect();
+            let qkv_b: Vec<f32> = (0..3 * dim)
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.01)
+                .collect();
+            let proj_w: Vec<f32> = (0..dim * dim)
+                .map(|i| (((i * 53 + 5) % 89) as f32 - 44.0) * 5.0e-4)
+                .collect();
+            let proj_b: Vec<f32> = (0..dim).map(|i| ((i % 5) as f32 - 2.0) * 0.02).collect();
+            let attn = AttnP {
+                qkv: test_linear(qkv_w, qkv_b, 3 * dim, dim),
+                proj: test_linear(proj_w, proj_b, dim, dim),
+                rel_pos_h: (0..rel_rows * hd)
+                    .map(|i| ((i % 13) as f32 - 6.0) * 0.0011)
+                    .collect(),
+                rel_pos_w: (0..rel_rows * hd)
+                    .map(|i| ((i % 11) as f32 - 5.0) * 0.0009)
+                    .collect(),
+                size_h: grid,
+                size_w: grid,
+            };
+            let x = Mat::from_vec(
+                n,
+                dim,
+                (0..n * dim)
+                    .map(|i| ((i % 29) as f32 - 14.0) * 0.003)
+                    .collect(),
+            );
+            let full = attention(&attn, &x, grid, grid, None)?;
+            for &slab in &slabs {
+                let bounded = attention_global_bounded_with(&attn, &x, grid, grid, slab)?;
+                assert_eq!(bounded.shape(), full.shape());
+                assert_eq!(
+                    bounded
+                        .data
+                        .iter()
+                        .map(|f| f.to_bits())
+                        .collect::<Vec<u32>>(),
+                    full.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                    "grid {grid} slab {slab}: bounded global attention must be bit-identical"
+                );
+            }
+            assert!(full.data.iter().any(|&v| v != 0.0));
+        }
+        Ok(())
+    }
+
+    /// bd-4l71: the streamed block hydration ([`sam_block_from`]) IS the cached
+    /// hydration ([`sam_weights_from`] calls it), and the streamed forward core
+    /// is the cached forward core — pinned structurally here by comparing a
+    /// hydrated block against the whole-tower build on synthetic weights.
+    #[test]
+    fn sam_block_from_matches_whole_tower_hydration() -> FocrResult<()> {
+        use crate::quant::focrq::{FocrqBuilder, WriteDType};
+
+        let prefix = "model.sam_model";
+        let dim = 24usize; // divisible by NUM_HEADS = 12
+        let mut b = FocrqBuilder::new();
+        let f32_bytes =
+            |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let synth = |len: usize, salt: u64| -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let raw = ((i as u64)
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(salt)
+                        >> 33) as u32;
+                    (raw as f32 / u32::MAX as f32 - 0.5) * 0.3
+                })
+                .collect()
+        };
+        let mut add = |name: String, shape: Vec<usize>, salt: u64| {
+            let len = shape.iter().product();
+            b.add_tensor(name, WriteDType::F32, shape, f32_bytes(&synth(len, salt)))
+                .expect("valid synthetic f32 tensor");
+        };
+        // Head tensors (small) + DEPTH blocks.
+        add(
+            format!("{prefix}.patch_embed.proj.weight"),
+            vec![dim, 3, PATCH, PATCH],
+            1,
+        );
+        add(format!("{prefix}.patch_embed.proj.bias"), vec![dim], 2);
+        add(format!("{prefix}.pos_embed"), vec![1, 4, 4, dim], 3);
+        for (idx, name) in ["neck.0", "neck.2"].iter().enumerate() {
+            let ch = 8usize;
+            let in_ch = if idx == 0 { dim } else { ch };
+            add(
+                format!("{prefix}.{name}.weight"),
+                vec![ch, in_ch, 1, 1],
+                10 + idx as u64,
+            );
+        }
+        for (idx, name) in ["neck.1", "neck.3"].iter().enumerate() {
+            add(format!("{prefix}.{name}.weight"), vec![8], 20 + idx as u64);
+            add(format!("{prefix}.{name}.bias"), vec![8], 30 + idx as u64);
+        }
+        add(format!("{prefix}.net_2.weight"), vec![8, 8, 3, 3], 40);
+        add(format!("{prefix}.net_3.weight"), vec![8, 8, 3, 3], 41);
+        let hd = dim / NUM_HEADS;
+        for i in 0..DEPTH {
+            let bb = format!("{prefix}.blocks.{i}");
+            let salt = 1000 * (i as u64 + 1);
+            let rel_rows = if GLOBAL_BLOCKS.contains(&i) {
+                2 * 4 - 1 // global grid 4
+            } else {
+                2 * WINDOW - 1
+            };
+            add(format!("{bb}.norm1.weight"), vec![dim], salt + 1);
+            add(format!("{bb}.norm1.bias"), vec![dim], salt + 2);
+            add(
+                format!("{bb}.attn.qkv.weight"),
+                vec![3 * dim, dim],
+                salt + 3,
+            );
+            add(format!("{bb}.attn.qkv.bias"), vec![3 * dim], salt + 4);
+            add(format!("{bb}.attn.proj.weight"), vec![dim, dim], salt + 5);
+            add(format!("{bb}.attn.proj.bias"), vec![dim], salt + 6);
+            add(format!("{bb}.attn.rel_pos_h"), vec![rel_rows, hd], salt + 7);
+            add(format!("{bb}.attn.rel_pos_w"), vec![rel_rows, hd], salt + 8);
+            add(format!("{bb}.norm2.weight"), vec![dim], salt + 9);
+            add(format!("{bb}.norm2.bias"), vec![dim], salt + 10);
+            add(
+                format!("{bb}.mlp.lin1.weight"),
+                vec![4 * dim, dim],
+                salt + 11,
+            );
+            add(format!("{bb}.mlp.lin1.bias"), vec![4 * dim], salt + 12);
+            add(
+                format!("{bb}.mlp.lin2.weight"),
+                vec![dim, 4 * dim],
+                salt + 13,
+            );
+            add(format!("{bb}.mlp.lin2.bias"), vec![dim], salt + 14);
+        }
+        let weights = Weights::from_bytes(b.build()).expect("synthetic SAM parses");
+
+        let whole = sam_weights_from(&weights, prefix)?;
+        assert_eq!(whole.blocks.len(), DEPTH);
+        for i in 0..DEPTH {
+            let solo = sam_block_from(&weights, prefix, i)?;
+            let cached = &whole.blocks[i];
+            assert_eq!(solo.window, cached.window, "block {i} window");
+            assert_eq!(solo.norm1.w, cached.norm1.w, "block {i} norm1.w");
+            assert_eq!(
+                solo.attn.qkv.wt.data, cached.attn.qkv.wt.data,
+                "block {i} qkv"
+            );
+            assert_eq!(solo.attn.qkv.b, cached.attn.qkv.b, "block {i} qkv bias");
+            assert_eq!(
+                solo.attn.proj.wt.data, cached.attn.proj.wt.data,
+                "block {i} proj"
+            );
+            assert_eq!(
+                solo.attn.rel_pos_h, cached.attn.rel_pos_h,
+                "block {i} rel_pos_h"
+            );
+            assert_eq!(solo.lin1.wt.data, cached.lin1.wt.data, "block {i} lin1");
+            assert_eq!(solo.lin2.wt.data, cached.lin2.wt.data, "block {i} lin2");
+        }
+        // Head-only hydration matches the whole tower's head fields.
+        let head = sam_head_from(&weights, prefix)?;
+        assert!(head.blocks.is_empty());
+        assert_eq!(head.patch_embed.w, whole.patch_embed.w);
+        assert_eq!(head.pos_embed, whole.pos_embed);
+        assert_eq!(head.net3.w, whole.net3.w);
+        Ok(())
     }
 
     /// qkv weight `[3*dim, dim]` that copies x into each of q,k,v (identity per

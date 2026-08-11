@@ -438,16 +438,19 @@ pub struct DecoderBatchStep<'a> {
     pub wc: &'a DecoderWeightCacheI8,
     /// Per-stream R-SWA KV rings, indexed by active slot.
     pub caches: &'a mut BatchedRingCache,
-    /// `model.embed_tokens.weight` `[vocab, hidden]` for token embedding.
-    pub embed_table: &'a Mat,
+    /// `model.embed_tokens.weight` `[vocab, hidden]` for token embedding —
+    /// the storage-dispatching accessor (bd-4l71), so a `QInt8PerChan` table
+    /// is dequantized ONE ROW at a time out of the blob instead of widening
+    /// the whole ~662 MB matrix to f32. Values are identical either way.
+    pub embed_table: &'a super::EmbedTable<'a>,
     /// Decode sampling parameters (greedy / EOS / n-gram ban).
     pub params: &'a DecodeParams,
 }
 
 impl BatchStep for DecoderBatchStep<'_> {
     fn step(&mut self, slots: &[StreamSlot<'_>]) -> FocrResult<Vec<StreamOut>> {
-        let hidden_dim = self.embed_table.cols;
-        let vocab = self.embed_table.rows;
+        let hidden_dim = self.embed_table.cols();
+        let vocab = self.embed_table.rows();
 
         // 1. Per-stream logits from the current hiddens (M=B lm_head).
         let hiddens: Vec<Mat> = slots.iter().map(|s| s.hidden.clone()).collect();
@@ -476,7 +479,7 @@ impl BatchStep for DecoderBatchStep<'_> {
                     "batch_scheduler::DecoderBatchStep: token id {t} outside embed vocab {vocab}"
                 )));
             }
-            let row = self.embed_table.data[t * hidden_dim..(t + 1) * hidden_dim].to_vec();
+            let row = self.embed_table.row_f32(t);
             token_embeds.push(Mat::from_vec(1, hidden_dim, row));
             positions.push(slot.position);
             stream_ids.push(slot.slot_index);

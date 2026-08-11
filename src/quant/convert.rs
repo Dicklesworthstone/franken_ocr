@@ -716,13 +716,17 @@ mod tests {
             // loader CORRECTLY keeps the offline panels, so the logical
             // equality must un-permute before comparing raw bytes.
             let b_rm = match b.layout {
-                crate::native_engine::tensor::WeightLayout::RowMajor => b.w.clone(),
+                crate::native_engine::tensor::WeightLayout::RowMajor => b.w.to_vec(),
                 crate::native_engine::tensor::WeightLayout::SmmlaPanels => {
                     crate::simd::pack::smmla_unpack_panels(&b.w, b.n, b.k)
                         .expect("panel stream length is loader-validated")
                 }
             };
-            assert_eq!(a.w, b_rm, "{name}: int8 weights identical across packings");
+            assert_eq!(
+                &a.w[..],
+                &b_rm[..],
+                "{name}: int8 weights identical across packings"
+            );
             assert_eq!(
                 a.scales, b.scales,
                 "{name}: scales identical across packings"
@@ -1030,8 +1034,16 @@ mod tests {
             let got = out.qint4(name).expect("qint4 readback");
             assert_eq!((got.n, got.k), (n, k), "{name} [n,k]");
             assert_eq!(got.group_size, *group_size, "{name} recorded group_size");
-            assert_eq!(got.packed, expected.packed, "{name} packed nibbles");
-            assert_eq!(got.scales, expected.scales, "{name} per-group f32 scales");
+            assert_eq!(
+                &got.packed[..],
+                &expected.packed[..],
+                "{name} packed nibbles"
+            );
+            assert_eq!(
+                got.scales.to_vec(),
+                expected.scales,
+                "{name} per-group f32 scales"
+            );
             assert!(out.qint8(name).is_err(), "{name} must NOT be int8");
         }
         // int8 gated set: the SAME per-OC quantization as the conservative arm.
