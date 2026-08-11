@@ -1021,8 +1021,10 @@ mod tests {
                 .tensor(name)
                 .unwrap()
                 .data
-                .chunks_exact(2)
-                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::bf16::from_le_bytes(*c))
                 .collect();
             let expected = crate::quant::int4::pack_int4_bf16(&bf, n, k, *group_size);
             let got = out.qint4(name).expect("qint4 readback");
