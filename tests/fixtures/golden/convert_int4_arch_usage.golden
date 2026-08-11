@@ -1,0 +1,1 @@
+focr: usage error: focr convert --quant int4 emits the wasm recipe and supports only --arch generic, got --arch x86-vnni

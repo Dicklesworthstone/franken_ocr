@@ -969,16 +969,21 @@ mod tests {
     #[test]
     fn wasm_int4_group_sizes_follow_measured_sensitivity_order() {
         for (name, group_size) in WASM_INT4_NAMES {
-            assert_eq!(
-                wasm_int4_group_size(name),
-                *group_size,
-                "{name} group size"
-            );
+            assert_eq!(wasm_int4_group_size(name), *group_size, "{name} group size");
         }
         // The dense layer-0 equivalents follow the same leaf rule.
-        assert_eq!(wasm_int4_group_size("model.layers.5.mlp.gate_proj.weight"), 16);
-        assert_eq!(wasm_int4_group_size("model.layers.5.mlp.up_proj.weight"), 32);
-        assert_eq!(wasm_int4_group_size("model.layers.5.mlp.down_proj.weight"), 16);
+        assert_eq!(
+            wasm_int4_group_size("model.layers.5.mlp.gate_proj.weight"),
+            16
+        );
+        assert_eq!(
+            wasm_int4_group_size("model.layers.5.mlp.up_proj.weight"),
+            32
+        );
+        assert_eq!(
+            wasm_int4_group_size("model.layers.5.mlp.down_proj.weight"),
+            16
+        );
     }
 
     /// The stage-1 acceptance oracle: every converted tensor record matches the

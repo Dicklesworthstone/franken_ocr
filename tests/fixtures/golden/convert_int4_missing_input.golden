@@ -1,0 +1,1 @@
+focr: model not found / not resolvable: no model artifact named in.safetensors (searched directories: [model-search-dirs]; set FOCR_MODEL_DIR or pass an explicit path)
