@@ -339,6 +339,14 @@ since exact-token OCR fails in the tail.
       2, and on the hardest page the un-guarded wasm decode fell into a
       degenerate repetition loop (CER 0.3489 vs native int4) — the motivation
       for the labeled `decodeGuard`.
+    * v2 + `decodeGuard=20` in-browser differential (real Chromium, threaded
+      lane, parts-streamed 2.8 GB, `corpus/browser/REPORT-v2.json`): the
+      repetition loop is GONE — 5/7 pages at edit distance 1 (the CLI trailing
+      newline), 1 at distance 3, and the hard newsprint page lands at
+      CER 0.1494 vs native-v2 (distance 2012/13.5 KB, the platform f32-drift
+      band, no degenerate loop). Browser wall time 80–406 s/page (8 threads);
+      total 1325 s browser vs 1611 s native for the 7 pages on a contended
+      host.
 - Resolution: ACCEPTED for the wasm-only browser lane (never a native default),
     with per-expert GPTQ error compensation filed as the next quality lever
     (bd-50wo remainder). INVESTIGATING remains open only for the f32-glue drift

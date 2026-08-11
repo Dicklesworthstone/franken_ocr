@@ -132,16 +132,12 @@ function rafWhileVisible(el, tick) {
 
 const C = {
   accent: "#34d399",
-  accentDeep: "#059669",
   amber: "#fbbf24",
-  red: "#f87171",
-  violet: "#a78bfa",
   dim: "#94a3b8",
   mid: "#cbd5e1",
   faint: "#748496",
   line: "rgba(255,255,255,0.09)",
   fillIdle: "rgba(255,255,255,0.03)",
-  fillWarm: "rgba(16,185,129,0.10)",
 };
 
 /* ==========================================================================
@@ -157,7 +153,6 @@ function buildPipeline() {
   // The stages ARE the markup: read them so the diagram and the prose can
   // never drift apart.
   const stages = [...list.querySelectorAll("li")].map((li) => ({
-    key: li.dataset.key,
     name: li.dataset.name,
     shape: li.dataset.shape,
     cost: li.dataset.cost ?? "",
@@ -480,7 +475,6 @@ function buildMoe() {
   // reads 6 of its 64 routed experts plus both shared ones.
   const ROUTED_GB = 1.716;
   const SHARED_GB = 0.054;
-  const MOE_LAYERS = 11;
   const perTokenGB = (ROUTED_GB * 6) / 64 + SHARED_GB;
   readout2.textContent =
     "each expert a 1280↔896 SiLU-gated MLP · top-6 of 64 = 9.4% of the bank, per token, per layer";
@@ -506,23 +500,28 @@ function buildMoe() {
       `token ${tokenNo} · experts ${chosen.slice().sort((a, b) => a - b).map((i) => `#${i}`).join(" ")}`;
   };
 
-  if (reduced) {
-    tokenNo = 1;
-    render(pickSix());
-  } else {
-    let last = 0;
-    let chosen = pickSix();
-    tokenNo = 1;
-    render(chosen);
-    rafWhileVisible(moeRoot, (now) => {
-      if (!last) last = now;
-      if (now - last > 1250) {
-        last = now;
-        tokenNo += 1;
-        chosen = pickSix();
-        render(chosen);
-      }
-    });
+  tokenNo = 1;
+  render(pickSix());
+  if (!reduced) {
+    // One token every 1.25 s is a timer, not an animation: the cells cross-fade
+    // in CSS. A RAF loop here would wake 60 times a second to do nothing.
+    let timer = null;
+    new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting && timer === null) {
+            timer = setInterval(() => {
+              tokenNo += 1;
+              render(pickSix());
+            }, 1250);
+          } else if (!e.isIntersecting && timer !== null) {
+            clearInterval(timer);
+            timer = null;
+          }
+        }
+      },
+      { rootMargin: "120px" },
+    ).observe(moeRoot);
   }
 
   const foot = h("p", {
@@ -596,7 +595,6 @@ function buildBits() {
   const totalLabel = text(root, (left + scaleX + scaleW) / 2, 172, "", { size: 11.5, fill: C.mid, mono: true, weight: 700 });
   const perLabel = text(root, (left + scaleX + scaleW) / 2, 190, "", { size: 11, fill: C.dim });
 
-  bitsRoot.appendChild(root);
 
   /* --- controls: group size drives everything, including a measured check --- */
   const GROUPS = [16, 32, 64, 128];
@@ -673,7 +671,6 @@ function tableToBars(table) {
   const valueCol = Number(table.dataset.barsValue ?? 1);
   const refCol = table.dataset.barsRef ? Number(table.dataset.barsRef) : null;
   const unit = table.dataset.barsUnit ?? "";
-  const mark = table.dataset.barsMark ? Number(table.dataset.barsMark) : null;
   const rows = [...table.querySelectorAll("tbody tr")];
   const wrap = h("div", { class: "bars" });
 
@@ -687,11 +684,6 @@ function tableToBars(table) {
     fill.dataset.width = `${pct}%`;
     if (value <= 0) track.classList.add("is-zero");
     track.append(fill);
-    if (mark !== null) {
-      const m = h("div", { class: "bar-mark" });
-      m.style.left = `${(mark / max) * 100}%`;
-      track.append(m);
-    }
     return h(
       "div",
       { class: "bar-row" },

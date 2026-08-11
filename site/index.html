@@ -74,7 +74,7 @@
     <figure class="hero-art reveal">
       <img src="./assets/franken_ocr_illustration.webp" width="1024" height="1024"
         alt="The franken_ocr monster at a reading desk, stitching scanned pages into text"
-        fetchpriority="high" decoding="async">
+        loading="lazy" decoding="async">
     </figure>
   </div>
 </section>
@@ -220,42 +220,42 @@
            and re-renders them as the stepper detail. With JS off, this list is
            the section's content. -->
       <ol id="pipeline-stages" class="stack">
-        <li data-key="page" data-name="Page image" data-shape="1024×1024×3" data-kind="input">
+        <li data-name="Page image" data-shape="1024×1024×3" data-kind="input">
           <h3>The page image</h3>
           <p>Decoded in-tab, resized and normalized by the same preprocessing code the native
           CLI runs — certified exact against the Python reference before any kernel work was
           allowed to start. Nothing is uploaded; the bytes go from your file picker into a
           worker.</p>
         </li>
-        <li data-key="sam" data-name="SAM-ViT-B" data-shape="4096 × 768" data-cost="12 blocks" data-kind="vision">
+        <li data-name="SAM-ViT-B" data-shape="4096 × 768" data-cost="12 blocks" data-kind="vision">
           <h3>SAM-ViT-B — the layout reader</h3>
           <p>A 16×16 patch embedding turns the page into a 64×64 grid of 4,096 tokens at width
           768, then twelve transformer blocks run windowed attention (window 14) with global
           attention at blocks 2, 5, 8 and 11, plus decomposed relative-position bias. This is the
           stage that understands where things are on the page: columns, tables, margins.</p>
         </li>
-        <li data-key="neck" data-name="Conv compressor" data-shape="256 × 1024" data-cost="16× fewer tokens" data-kind="vision">
+        <li data-name="Conv compressor" data-shape="256 × 1024" data-cost="16× fewer tokens" data-kind="vision">
           <h3>The 16× token compressor</h3>
           <p>A convolutional neck — 1×1, layernorm, 3×3, layernorm, then two stride-2
           convolutions — collapses 4,096 tokens into 256 at width 1024. Sixteen times fewer
           tokens reach the decoder, and the decoder's attention cost is what dominates a long
           page. This single block is the reason a whole scanned page fits in one pass.</p>
         </li>
-        <li data-key="clip" data-name="CLIP-L/14" data-shape="256 × 1024" data-cost="24 layers" data-kind="vision">
+        <li data-name="CLIP-L/14" data-shape="256 × 1024" data-cost="24 layers" data-kind="vision">
           <h3>CLIP-L/14 — the semantic reader</h3>
           <p>Twenty-four layers at width 1024 with sixteen heads, fused directly onto the SAM
           output: CLIP's embedding layer takes SAM's feature map as its patch embeddings instead
           of re-reading the image. SAM contributes <em>where</em>, CLIP contributes
           <em>what</em>.</p>
         </li>
-        <li data-key="proj" data-name="Linear projector" data-shape="2048 → 1280" data-kind="vision">
+        <li data-name="Linear projector" data-shape="2048 → 1280" data-kind="vision">
           <h3>Concatenate, then project</h3>
           <p>The two towers are concatenated channel-wise into 2,048 dimensions and a single
           linear layer maps them to the decoder's 1,280-wide residual stream. One matrix — and
           the exact concatenation order was resolved from the reference implementation rather
           than guessed, because getting it backwards produces plausible-looking garbage.</p>
         </li>
-        <li data-key="moe" data-name="MoE decoder" data-shape="12 layers × 1280" data-cost="64 experts, top-6" data-kind="decoder">
+        <li data-name="MoE decoder" data-shape="12 layers × 1280" data-cost="64 experts, top-6" data-kind="decoder">
           <h3>The DeepSeek-V2 mixture-of-experts decoder</h3>
           <p>Twelve layers, hidden size 1,280, ten attention heads of dimension 128. Layer 0 is a
           dense SwiGLU MLP; layers 1 through 11 are mixture-of-experts: 64 routed experts plus 2
@@ -264,7 +264,7 @@
           the whole visual prefill, plus a 128-slot ring that slides. Memory stays flat while the
           page grows.</p>
         </li>
-        <li data-key="text" data-name="Markdown" data-shape="vocab 129,280" data-kind="output">
+        <li data-name="Markdown" data-shape="vocab 129,280" data-kind="output">
           <h3>Out comes Markdown</h3>
           <p>The final RMSNorm feeds an lm_head GEMV from 1,280 to 129,280 logits, and greedy
           decoding writes the page: headings, paragraphs, tables, LaTeX, layout boxes. The
@@ -632,7 +632,8 @@
     <div class="panel reveal">
       <div class="table-scroll">
         <table>
-          <caption>Sizes are the default pulled artifact. “This page” means it runs in the playground above.</caption>
+          <caption>Sizes are the default pulled artifact. The browser column says where a model
+          runs in the playground above.</caption>
           <thead>
             <tr><th scope="col">Model</th><th scope="col">Task</th><th scope="col">Size</th><th scope="col">CLI</th><th scope="col">Browser</th></tr>
           </thead>

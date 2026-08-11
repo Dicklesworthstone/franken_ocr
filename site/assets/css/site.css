@@ -124,16 +124,18 @@ a:hover { text-decoration: underline; text-underline-offset: 3px; }
 
 ::selection { background: rgba(52, 211, 153, 0.28); color: #fff; }
 
-code, kbd, samp { font-family: var(--mono); font-size: 0.88em; }
-p code, li code, td code {
+code {
+  font-family: var(--mono);
+  font-size: 0.88em;
   background: var(--inset);
   border: 1px solid var(--line);
   border-radius: 5px;
   padding: 0.08em 0.34em;
   color: var(--fg-mid);
 }
+pre code { background: none; border: 0; padding: 0; }
 
-h1, h2, h3, h4 { font-weight: 800; letter-spacing: -0.02em; margin: 0; }
+h1, h2, h3 { font-weight: 800; letter-spacing: -0.02em; margin: 0; }
 
 /* Spacing utilities — the only two the page needs. */
 .mt { margin-top: 1.5rem; }
@@ -302,7 +304,6 @@ footer { scroll-margin-top: 92px; }
 .micro { color: var(--fg-faint); font-size: 0.82rem; line-height: 1.6; margin: 0; }
 .mono { font-family: var(--mono); }
 .hl { color: var(--accent); }
-.hl-amber { color: var(--amber); }
 
 .chips { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: center; }
 .chip {
@@ -441,15 +442,9 @@ select.btn option { background: #0b1512; color: var(--fg); }
 
 .grid { display: grid; gap: 1.2rem; }
 .grid > * { min-width: 0; }
-.grid-2, .grid-3, .grid-4 { grid-template-columns: minmax(0, 1fr); }
-@media (min-width: 680px) {
-  .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .grid-4 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (min-width: 940px) {
-  .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-}
+.grid-2, .grid-3 { grid-template-columns: minmax(0, 1fr); }
+@media (min-width: 680px) { .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 940px) { .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 
 .stack { display: grid; gap: 1.2rem; }
 .stack > * { min-width: 0; }
@@ -565,7 +560,6 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 .drop.armed { border-color: rgba(52, 211, 153, 0.42); }
 .drop.over { border-color: var(--accent); background: rgba(52, 211, 153, 0.07); }
 #drop-hint { display: block; max-width: 30rem; }
-#drop-hint .btn { margin-top: 0.7rem; }
 .preview-stack { position: relative; max-width: 100%; line-height: 0; }
 .preview-stack img { max-width: 100%; height: auto; display: block; border-radius: var(--r-sm); }
 .preview-stack canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
@@ -629,7 +623,6 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
   flex-wrap: wrap;
   margin-top: 1.1rem;
 }
-.viz-controls .spacer { flex: 1 1 auto; }
 .slider { flex: 1 1 200px; min-width: 170px; accent-color: var(--accent); height: 1.6rem; cursor: pointer; }
 .readout { display: flex; align-items: baseline; gap: 0.5rem; white-space: nowrap; }
 .readout-big { font: 800 1.7rem/1 var(--mono); color: var(--accent); }
@@ -702,14 +695,12 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 }
 .bar-fill.ref { background: linear-gradient(90deg, #334155, var(--ref)); }
 .bar-fill.amber { background: linear-gradient(90deg, #b45309, var(--amber)); }
-.bar-fill.red { background: linear-gradient(90deg, #b91c1c, var(--red)); }
 .bar-val {
   flex: 0 0 6.4rem;
   color: var(--fg-mid);
   font: 700 0.78rem/1.35 var(--mono);
 }
 .bar-val small { color: var(--fg-faint); font-weight: 500; }
-.bar-mark { position: absolute; top: -2px; bottom: -2px; width: 2px; background: var(--amber); opacity: 0.9; }
 /* An exact zero: an empty track with a start tick, so "we measured it and it
    was nothing" looks different from "we measured it and it was very small". */
 .bar-track.is-zero::before {
@@ -768,7 +759,6 @@ pre.code {
   text-align: left;
 }
 pre.code .c { color: var(--fg-faint); }
-pre.code .p { color: var(--accent); }
 
 /* ------------------------------------------------------------------- footer */
 footer {
