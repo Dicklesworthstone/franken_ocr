@@ -25,10 +25,10 @@ const S =
 // a run on a different port saw an empty cache and re-downloaded.)
 const PORT = Number(process.env.PORT ?? 8941);
 const MODEL_DIR = process.env.FOCR_MODEL_DIR ?? join(S, "models-www");
-const PROFILE_DIR = join(S, "chrome-profile-diff"); // SAME profile as visit 1
+const PROFILE_DIR = join(S, process.env.FOCR_DIFF_PROFILE ?? "chrome-profile-diff"); // SAME profile as visit 1
 const OUT_DIR = join(S, "corpus", "browser");
 
-const reportPath = join(OUT_DIR, "REPORT.json");
+const reportPath = join(OUT_DIR, process.env.FOCR_DIFF_REPORT ?? "REPORT.json");
 const coldSeconds = existsSync(reportPath)
   ? JSON.parse(readFileSync(reportPath, "utf8")).cold_load_seconds ?? null
   : null;

@@ -101,6 +101,36 @@ function stage(name) {
   post({ type: "stage", stage: name });
 }
 
+// ── live recognize progress ─────────────────────────────────────────────────
+//
+// `recognize_json` is ONE synchronous wasm call: this worker's event loop is
+// blocked for its whole duration, so nothing asynchronous can report anything.
+// The engine therefore calls back INTO JS from inside the forward's call stack
+// (per vision block, per decoded token) and we relay from there — `postMessage`
+// is legal on a blocked thread; the message is queued for the page.
+//
+// The callback can fire per token, so throttle: at most one message every
+// ~200 ms (≈5/s), except that a stage CHANGE always posts immediately (the
+// text is the point) and so does the terminal count of a determinate stage.
+const PROGRESS_MIN_INTERVAL_MS = 200;
+let relayProgress = false;
+let lastProgressPost = 0;
+let lastProgressStage = null;
+
+function installProgressRelay() {
+  if (typeof pkg?.set_progress_callback !== "function") return;
+  pkg.set_progress_callback((stageName, current, total) => {
+    if (!relayProgress) return;
+    const now = performance.now();
+    const isNewStage = stageName !== lastProgressStage;
+    const isStageEnd = total > 0 && current >= total;
+    if (!isNewStage && !isStageEnd && now - lastProgressPost < PROGRESS_MIN_INTERVAL_MS) return;
+    lastProgressPost = now;
+    lastProgressStage = stageName;
+    post({ type: "recognize-progress", stage: stageName, current, total });
+  });
+}
+
 async function handleMessage({ data }) {
   const { id, type } = data;
   try {
@@ -131,6 +161,7 @@ async function dispatch(data) {
         throw new Error("pkg-threaded instantiated with a non-shared memory");
       }
       threads = 1; // the pool is armed after hydration, never before
+      installProgressRelay();
       return { info: JSON.parse(pkg.engine_info()), pkg: pkgDir, threaded };
     }
     case "load": {
@@ -223,10 +254,17 @@ async function dispatch(data) {
       stage("recognize");
       pkg.reset_cancel();
       const t0 = performance.now();
-      const json = engine.recognize_json(new Uint8Array(data.bytes));
-      const ms = Math.round(performance.now() - t0);
-      stage("ready");
-      return { result: JSON.parse(json), ms };
+      relayProgress = true;
+      lastProgressPost = 0;
+      lastProgressStage = null;
+      try {
+        const json = engine.recognize_json(new Uint8Array(data.bytes));
+        const ms = Math.round(performance.now() - t0);
+        stage("ready");
+        return { result: JSON.parse(json), ms };
+      } finally {
+        relayProgress = false;
+      }
     }
     case "cancel": {
       // Cooperative: the decode loop observes the flag at its next token.

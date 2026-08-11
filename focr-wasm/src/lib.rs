@@ -127,6 +127,69 @@ pub fn reset_cancel() {
     franken_ocr::reset_shutdown();
 }
 
+/// Install (or, with `None`/`undefined`, remove) the live progress callback for
+/// the SYNCHRONOUS `recognize` call — the seam that lets the playground show
+/// "vision block 12/36" instead of a frozen tab for minutes.
+///
+/// The callback is invoked as `f(stage: string, current: number, total: number)`
+/// (`total === 0` means indeterminate) from INSIDE the forward's call stack, on
+/// the thread that entered `recognize_json`. That is the only way progress can
+/// escape at all: the worker is blocked in one synchronous wasm call, so nothing
+/// asynchronous can run until it returns.
+///
+/// Three rules make this safe and cheap:
+///
+/// * **The engine hooks sit on outer, sequential loops only** (per vision block,
+///   per decoded token, never inside a rayon body), so the `js_sys::Function` —
+///   which is emphatically NOT `Send`, whatever the sink signature says — is only
+///   ever called from the JS-owning worker thread. The `Send`/`Sync` promise
+///   below is the wasm single-threaded-JS invariant written down, not a claim
+///   that a `Function` can cross a thread.
+/// * **A throwing callback cannot poison a run.** The `Result` is discarded: a
+///   broken progress handler must never be able to fail a recognition.
+/// * **Zero cost when unset.** `set_progress_sink(None)` disarms the engine's
+///   relaxed-atomic fast path, and the native build never installs anything.
+#[wasm_bindgen]
+pub fn set_progress_callback(f: Option<js_sys::Function>) {
+    let armed = f.is_some();
+    // The `Function` lives in THREAD-LOCAL storage, never in the global sink —
+    // so no `unsafe impl Send` is needed anywhere (this crate denies
+    // `unsafe_code`), and the invariant is enforced by the type system instead
+    // of by a comment: the installed closure captures nothing, and an event
+    // raised on any other thread finds an empty slot and does nothing.
+    PROGRESS_CALLBACK.with(|slot| {
+        if let Ok(mut slot) = slot.try_borrow_mut() {
+            *slot = f;
+        }
+    });
+    if !armed {
+        franken_ocr::native_engine::progress::set_progress_sink(None);
+        return;
+    }
+    franken_ocr::native_engine::progress::set_progress_sink(Some(Box::new(|event| {
+        PROGRESS_CALLBACK.with(|slot| {
+            // `try_borrow`: a callback that re-enters this seam is dropped, not
+            // a panic (and a wasm panic is an opaque `unreachable`).
+            let Ok(slot) = slot.try_borrow() else { return };
+            let Some(f) = slot.as_ref() else { return };
+            // A failed JS call (a throwing handler) is swallowed on purpose:
+            // a broken progress handler must never fail a recognition.
+            let _ = f.call3(
+                &JsValue::NULL,
+                &JsValue::from_str(event.stage),
+                &JsValue::from_f64(event.current as f64),
+                &JsValue::from_f64(event.total as f64),
+            );
+        });
+    })));
+}
+
+thread_local! {
+    /// The page's progress handler, owned by the thread that installed it.
+    static PROGRESS_CALLBACK: std::cell::RefCell<Option<js_sys::Function>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Set (or clear, with `0`) the sliding no-repeat n-gram decode guard for the
 /// NEXT engine built by [`WasmEngine::from_staging`] — the browser analog of
 /// `--no-repeat-ngram` / `FOCR_NO_REPEAT_NGRAM`. The README documents a

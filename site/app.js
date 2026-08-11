@@ -42,6 +42,10 @@ worker.onmessage = ({ data }) => {
     onProgress(data);
     return;
   }
+  if (data.type === "recognize-progress") {
+    onRecognizeProgress(data);
+    return;
+  }
   const entry = pending.get(data.id);
   if (!entry) return;
   pending.delete(data.id);
@@ -90,6 +94,108 @@ function onProgress({ loaded, total, fromCache }) {
   $("progress-text").textContent =
     `${fmtMB(loaded)} / ${fmtMB(total)} MB` +
     (rate > 0 ? ` — ${fmtMB(rate)} MB/s${eta !== null ? `, ~${eta}s left` : ""}` : "");
+}
+
+// ── live recognize progress ────────────────────────────────────────────────
+//
+// The same #progress-wrap/#progress-bar/#progress-text the download uses — the
+// two never overlap in time (you cannot recognize before the model has loaded),
+// and each one resets the elements when it starts.
+//
+// The bar is an ESTIMATE and says so: only the vision block count is a real
+// denominator. Decode is the honest problem — the model stops at EOS, which is
+// unknowable in advance — so token progress is mapped against a typical output
+// length for the model and CAPPED at 99% until the result actually lands.
+// Better a bar that finishes early than one that lies about being done.
+const STAGE_WEIGHTS = { preprocess: 0.03, vision: 0.42, prefill: 0.05, decode: 0.5 };
+// Typical emitted-token counts, measured on the sample pages. Undershooting is
+// visible as a bar that sits at 99%; overshooting stalls it. Neither is a lie
+// while the label says "estimated".
+const EST_TOKENS = { "unlimited-ocr": 1600, tromr: 300 };
+const STAGE_LABELS = {
+  preprocess: "Preparing the image",
+  vision: "Vision encoder",
+  prefill: "Reading the prompt",
+  decode: "Reading the page",
+  postprocess: "Assembling the result",
+};
+
+let recognizeProgress = null;
+
+function resetRecognizeProgress() {
+  recognizeProgress = { staff: 0, staves: 1, done: 0, stage: null };
+}
+
+// Fraction (0..1) of ONE staff's work completed, from the stage weights.
+function stageFraction(stage, current, total) {
+  let done = 0;
+  for (const [name, weight] of Object.entries(STAGE_WEIGHTS)) {
+    if (name === stage) break;
+    done += weight;
+  }
+  const weight = STAGE_WEIGHTS[stage] ?? 0;
+  let within = 0;
+  if (stage === "decode") {
+    const est = EST_TOKENS[modelId] ?? 1600;
+    // A determinate cap tighter than the estimate (TrOMR's 256-step ceiling)
+    // is the better denominator — it cannot be exceeded.
+    const denom = total > 0 ? Math.min(total, est) : est;
+    within = Math.min(current / denom, 1);
+  } else if (total > 0) {
+    within = Math.min(current / total, 1);
+  }
+  if (stage === "postprocess") return 1;
+  return done + weight * within;
+}
+
+function onRecognizeProgress({ stage, current, total }) {
+  if (!recognizeProgress) resetRecognizeProgress();
+  if (stage === "staff") {
+    // TrOMR pages recognize staff by staff; each staff replays the whole
+    // preprocess→vision→decode arc, so scope the estimate into its slot
+    // instead of letting the bar march back to zero N times.
+    recognizeProgress.staff = current;
+    recognizeProgress.staves = Math.max(total, 1);
+    recognizeProgress.stage = "staff";
+    recognizeProgress.done = current / recognizeProgress.staves;
+    paintRecognizeProgress(`Staff ${current + 1} of ${recognizeProgress.staves}`);
+    return;
+  }
+  const { staff, staves } = recognizeProgress;
+  const within = stageFraction(stage, current, total);
+  // Monotonic: a stage arriving out of order must never rewind the bar.
+  recognizeProgress.done = Math.max(recognizeProgress.done, (staff + within) / staves);
+  recognizeProgress.stage = stage;
+
+  const label = STAGE_LABELS[stage] ?? stage;
+  let detail = label;
+  if (stage === "vision" && total > 0) {
+    detail = `${label} — block ${current}/${total}`;
+  } else if (stage === "decode") {
+    const pct = Math.round(within * 100);
+    detail = `${label} — ${current} token${current === 1 ? "" : "s"} (~${pct}%)`;
+  } else if (stage === "prefill" && total > 0) {
+    detail = `${label} — ${total} tokens`;
+  } else if (stage === "preprocess") {
+    detail = `${label}…`;
+  }
+  if (staves > 1) detail += ` · staff ${staff + 1}/${staves}`;
+  paintRecognizeProgress(detail);
+}
+
+function paintRecognizeProgress(detail) {
+  // Capped at 99: only the returned result may show a full bar.
+  const pct = Math.min(Math.round(recognizeProgress.done * 100), 99);
+  $("progress-wrap").hidden = false;
+  $("progress-bar").style.width = `${pct}%`;
+  $("progress-text").textContent = `${pct}% (estimated) — ${detail}`;
+}
+
+function hideRecognizeProgress() {
+  recognizeProgress = null;
+  $("progress-wrap").hidden = true;
+  $("progress-bar").style.width = "0%";
+  $("progress-text").textContent = "";
 }
 
 // ── model selection ─────────────────────────────────────────────────────────
@@ -226,6 +332,8 @@ $("run").addEventListener("click", async () => {
   refreshRunButton();
   $("cancel").hidden = false;
   setStatus("Recognizing… (all compute stays in this tab)");
+  resetRecognizeProgress();
+  paintRecognizeProgress("Starting…");
   try {
     const bytes = currentImage.bytes.slice(0);
     const { result, ms } = await call("recognize", { bytes }, [bytes]);
@@ -236,6 +344,7 @@ $("run").addEventListener("click", async () => {
     setStatus(`Recognition failed: ${err.message}`, "err");
   } finally {
     busy = false;
+    hideRecognizeProgress();
     $("cancel").hidden = true;
     refreshRunButton();
   }
