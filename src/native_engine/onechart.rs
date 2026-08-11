@@ -21,6 +21,13 @@ use super::tensor::Mat;
 use super::vision_sam::{self, Linear};
 use super::weights::Weights;
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 /// The vision-token count (SAM 1024² → 16× compressor → 256 tokens, as GOT).
 pub const VISION_TOKENS: usize = 256;
 /// The decoder hidden width the projector emits (OPT hidden 768 — census §3:
@@ -66,7 +73,7 @@ pub struct OnechartStatics {
 /// # Errors
 /// A missing or mis-shaped tensor.
 pub fn hydrate_statics(weights: &Weights, prefix: &str) -> FocrResult<OnechartStatics> {
-    let th = std::time::Instant::now();
+    let th = Instant::now();
     let statics = OnechartStatics {
         sam: vision_sam::sam_weights_from(weights, prefix)?,
         proj: Linear::from_row_major(
@@ -322,7 +329,7 @@ pub fn recognize(
     img: &image::DynamicImage,
     max_new: usize,
 ) -> FocrResult<ChartResult> {
-    let tv = std::time::Instant::now();
+    let tv = Instant::now();
     let image = crate::preprocess::onechart_view_tensor(img);
     let vision = vision_features(statics, &image)?;
     let prompt_ids = chart_prompt_ids(tk)?;
@@ -332,7 +339,7 @@ pub fn recognize(
         tv.elapsed().as_secs_f64()
     ));
 
-    let tg = std::time::Instant::now();
+    let tg = Instant::now();
     let cfg = super::decoder_qwen2::DecoderConfig::onechart();
     // OQ-D7: the learned position table has 4096 usable rows — hard-stop.
     let max_new = max_new.min(4096usize.saturating_sub(embeds.rows));
@@ -433,7 +440,7 @@ pub fn recognize_batch(
     imgs: &[&image::DynamicImage],
     max_new: usize,
 ) -> FocrResult<Vec<ChartResult>> {
-    let tv = std::time::Instant::now();
+    let tv = Instant::now();
     let prompt_ids = chart_prompt_ids(tk)?;
     let mut visions: Vec<Mat> = Vec::with_capacity(imgs.len());
     let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
@@ -452,7 +459,7 @@ pub fn recognize_batch(
         imgs.len(),
         tv.elapsed().as_secs_f64()
     ));
-    let tg = std::time::Instant::now();
+    let tg = Instant::now();
     let cfg = super::decoder_qwen2::DecoderConfig::onechart();
     let id_streams = super::decoder_qwen2::generate_greedy_batched(
         weights,

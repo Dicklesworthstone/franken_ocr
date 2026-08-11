@@ -38,8 +38,11 @@ pub const UNLIMITED_OCR_REQUIRED_RECIPE: &str = crate::quant::convert::UNLIMITED
 ///
 /// This is deliberately independent of the `focr` binary version: patch
 /// releases can keep consuming the same verified 4.16 GB model bytes without
-/// renaming or republishing them.
-pub(crate) const UNLIMITED_OCR_ARTIFACT_VERSION: &str = "0.7.0";
+/// renaming or republishing them. The value lives at the crate root (so model
+/// *resolution* in native_engine can use it in builds without this module);
+/// within this module only the manifest tests reference it by name.
+#[cfg(test)]
+pub(crate) use crate::UNLIMITED_OCR_ARTIFACT_VERSION;
 
 /// Recipe carried by the historical full-int8 artifact. It is retained for
 /// provenance and fail-closed compatibility tests, but is not compatible with

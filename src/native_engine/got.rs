@@ -31,6 +31,13 @@ use crate::error::FocrResult;
 use crate::preprocess;
 use crate::tokenizer::tiktoken::Tiktoken;
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 /// GOT generation stop id (`<|im_end|>`).
 pub const EOS_ID: u32 = 151_645;
 
@@ -104,7 +111,7 @@ pub struct GotStatics {
 /// # Errors
 /// A missing or mis-shaped tensor.
 pub fn hydrate_statics(weights: &Weights, prefix: &str) -> FocrResult<GotStatics> {
-    let th = std::time::Instant::now();
+    let th = Instant::now();
     let statics = GotStatics {
         sam: vision_sam::sam_weights_from(weights, prefix)?,
         proj: vision_sam::Linear::from_row_major(
@@ -179,7 +186,7 @@ pub fn recognize(
     max_new: usize,
     format: bool,
 ) -> FocrResult<String> {
-    let tv = std::time::Instant::now();
+    let tv = Instant::now();
     let image = preprocess::got_view_tensor(img);
     let prompt_ids = ocr_prompt_ids(tk, format)?;
     let inputs_embeds = build_inputs_embeds(statics, &image, &prompt_ids)?;
@@ -187,7 +194,7 @@ pub fn recognize(
         "  got.vision+splice {:.2}s",
         tv.elapsed().as_secs_f64()
     ));
-    let tg = std::time::Instant::now();
+    let tg = Instant::now();
     let mut cfg = DecoderConfig::got_ocr2();
     cfg.no_repeat_ngram_size = no_repeat_ngram_override(cfg.no_repeat_ngram_size);
     // The O(n)-per-token KV-cache decode (B9): one seeding prefill then a full-causal
@@ -220,7 +227,7 @@ pub fn recognize_batch(
     format: bool,
 ) -> FocrResult<Vec<String>> {
     let prompt_ids = ocr_prompt_ids(tk, format)?;
-    let tv = std::time::Instant::now();
+    let tv = Instant::now();
     // The model-constant tensors arrive pre-hydrated from the OcrModel cache
     // (bd-av64.10): batches AND sequential pages share one hydration.
     let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
@@ -233,7 +240,7 @@ pub fn recognize_batch(
         imgs.len(),
         tv.elapsed().as_secs_f64()
     ));
-    let tg = std::time::Instant::now();
+    let tg = Instant::now();
     let mut cfg = DecoderConfig::got_ocr2();
     cfg.no_repeat_ngram_size = no_repeat_ngram_override(cfg.no_repeat_ngram_size);
     let caps = vec![max_new; embeds_list.len()];

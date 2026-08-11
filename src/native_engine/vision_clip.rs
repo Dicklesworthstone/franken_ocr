@@ -30,6 +30,13 @@ use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
 use rayon::prelude::*;
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
     lhs.checked_mul(rhs).ok_or_else(|| {
         FocrError::Other(anyhow::anyhow!(
@@ -223,7 +230,7 @@ pub fn forward(weights: &Weights, _image: &Mat, sam_features: &Mat) -> FocrResul
     // Fail fast on a malformed input BEFORE the (heavy) weight hydration —
     // pinned by `forward_rejects_malformed_sam_features_before_weight_hydration`.
     ensure_mat_data_len(sam_features, "vision_clip forward sam_features")?;
-    let th = std::time::Instant::now();
+    let th = Instant::now();
     let cw = clip_weights_from(weights)?;
     super::timing_log(&format!(
         "    clip.hydrate {:.2}s",
@@ -250,7 +257,7 @@ pub(crate) fn forward_from_sam(
     // [num_patches, hidden] (flatten(2).transpose(1,2)), so transpose it.
     let sam_t = transpose(&sam_features.data, sam_features.rows, sam_features.cols)?;
     let sam_mat = Mat::from_vec(sam_features.cols, sam_features.rows, sam_t);
-    let tb = std::time::Instant::now();
+    let tb = Instant::now();
     let out = forward_with(cfg, cw, &sam_mat);
     super::timing_log(&format!(
         "    clip.blocks {:.2}s",

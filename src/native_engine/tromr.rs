@@ -34,6 +34,13 @@ use super::tensor::Mat;
 use super::vision_sam::Linear;
 use super::weights::Weights;
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 /// Staff-crop input height (config `max_height`; spec §6 resizes to this).
 pub const IMG_H: usize = 128;
 /// ViT patch stride — the backbone's total 16× downsample (spec §2b).
@@ -1756,7 +1763,7 @@ pub fn recognize(
     tk: &crate::tokenizer::music::MusicTokenizer,
     img: &image::DynamicImage,
 ) -> FocrResult<MusicResult> {
-    let t0 = std::time::Instant::now();
+    let t0 = Instant::now();
     let (pixels, width) = crate::preprocess::tromr_staff_tensor(img)?;
     let enc = TromrEncoderW::build(weights)?;
     let ctx = encode(&enc, &pixels, width)?;
@@ -1765,7 +1772,7 @@ pub fn recognize(
         t0.elapsed().as_secs_f64(),
         ctx.rows
     ));
-    let tg = std::time::Instant::now();
+    let tg = Instant::now();
     let dec = TromrDecoderW::build(weights)?;
     let streams = generate(&dec, &ctx)?;
     super::timing_log(&format!(
@@ -1845,7 +1852,7 @@ fn recognize_split(
             image::GrayImage::from_raw((b - a) as u32, crop.h as u32, seg).ok_or_else(|| {
                 FocrError::Other(anyhow::anyhow!("tromr split: segment buffer mismatch"))
             })?;
-        let t0 = std::time::Instant::now();
+        let t0 = Instant::now();
         let res = recognize(weights, tk, &image::DynamicImage::ImageLuma8(buf))?;
         super::timing_log(&format!(
             "    tromr.split seg {seg_idx} [{a}..{b}] {:.2}s ({} chars)",

@@ -400,6 +400,7 @@ enum Backing {
     /// Fully-owned bytes (`std::fs::read` / in-memory blobs).
     Owned(Vec<u8>),
     /// Read-only file mapping.
+    #[cfg(feature = "native")]
     Mapped(memmap2::Mmap),
 }
 
@@ -408,6 +409,7 @@ impl std::ops::Deref for Backing {
     fn deref(&self) -> &[u8] {
         match self {
             Backing::Owned(v) => v,
+            #[cfg(feature = "native")]
             Backing::Mapped(m) => m,
         }
     }
@@ -417,6 +419,7 @@ impl std::fmt::Debug for Backing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Backing::Owned(v) => write!(f, "Backing::Owned({} bytes)", v.len()),
+            #[cfg(feature = "native")]
             Backing::Mapped(m) => write!(f, "Backing::Mapped({} bytes)", m.len()),
         }
     }
@@ -425,6 +428,7 @@ impl std::fmt::Debug for Backing {
 /// The ONE unsafe call in the loader — the read-only mmap island, mirroring
 /// the `simd::arm`/`simd::x86` island pattern (crate policy is
 /// `deny(unsafe_code)` with documented, minimal islands).
+#[cfg(feature = "native")]
 #[allow(unsafe_code)]
 mod mmap_island {
     /// Map `file` read-only.
@@ -512,9 +516,12 @@ impl Weights {
         path: &Path,
         mmap_requested: bool,
     ) -> FocrResult<Self> {
+        #[cfg(feature = "native")]
         if mmap_requested && let Ok(map) = mmap_island::map_readonly(&file) {
             return Self::from_backing(Backing::Mapped(map));
         }
+        #[cfg(not(feature = "native"))]
+        let _ = mmap_requested; // no mmap island in the core build
 
         // Header validation advances the descriptor offset. Rewind this SAME
         // open file before the owned fallback; reopening `path` here would

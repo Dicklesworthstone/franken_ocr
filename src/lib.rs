@@ -20,21 +20,29 @@
 #![deny(unsafe_code)]
 
 pub mod adaptive;
+#[cfg(feature = "native")]
 pub mod cli;
+#[cfg(feature = "native")]
 pub mod conformance;
+#[cfg(feature = "native")]
 pub mod dist;
+#[cfg(feature = "native")]
 pub mod doctor;
 pub mod error;
 pub mod native_engine;
+#[cfg(feature = "pdf")]
 pub mod pdf;
 pub mod preprocess;
 pub mod progress;
 pub mod quant;
+#[cfg(feature = "native")]
 pub mod robot;
 pub mod simd;
+#[cfg(feature = "native")]
 pub mod storage;
 pub mod tokenizer;
 
+#[cfg(feature = "native")]
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
 /// Multi-model architecture descriptors + registry (the "model zoo" foundation,
@@ -42,13 +50,25 @@ pub use error::{FocrError, FocrResult};
 pub use native_engine::model_arch;
 pub use native_engine::{ExtractedFigure, LayoutSpan, RecognizedDocument};
 
+#[cfg(feature = "native")]
 use std::path::Path;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(feature = "native")]
+use std::sync::{Arc, Mutex, MutexGuard};
+#[cfg(feature = "native")]
 use std::time::Duration;
 
+#[cfg(feature = "native")]
 use asupersync::runtime::{Runtime, RuntimeBuilder};
+#[cfg(feature = "native")]
 use native_engine::OcrModel;
+
+/// The pinned Unlimited-OCR release-artifact version every released binary
+/// resolves (`unlimited-ocr.v{VERSION}.<quant>.focrq`). Lives at the crate
+/// root (not in the network-gated `dist` module) because model *resolution*
+/// needs it even in builds without the pull machinery (the wasm core).
+pub(crate) const UNLIMITED_OCR_ARTIFACT_VERSION: &str = "0.7.0";
 
 /// Environment override for the model artifact path (`.focrq` blob or a
 /// safetensors directory). When unset, [`OcrEngine`] falls back to
@@ -72,6 +92,7 @@ pub const FOCR_MODEL_LICENSE_NOTICE: &str =
 /// native path's clean [`FocrError::ModelNotFound`].
 pub const DEFAULT_MODEL_PATH: &str = "models/unlimited-ocr.focrq";
 
+#[cfg(feature = "native")]
 const DEFAULT_FORWARD_STAGE_BUDGET_MS: u64 = 10 * 60 * 1000;
 
 /// The OCR engine handle.
@@ -177,6 +198,7 @@ pub fn kernel_pool_width() -> usize {
 /// # Errors
 /// The producer's first error aborts the stream and is returned after the
 /// worker joins (consumers see only the items produced before it).
+#[cfg(feature = "native")]
 pub fn stream_pages<T, P, C>(capacity: usize, mut produce: P, mut consume: C) -> FocrResult<usize>
 where
     T: Send + 'static,
@@ -234,6 +256,7 @@ where
 /// the engine's blocking pool.
 pub type PageSink = Box<dyn FnMut(usize, &str) + Send>;
 
+#[cfg(feature = "native")]
 pub struct OcrEngine {
     /// The single owned async runtime. All public methods block on it.
     runtime: Runtime,
@@ -241,6 +264,7 @@ pub struct OcrEngine {
     model: Mutex<Option<Arc<OcrModel>>>,
 }
 
+#[cfg(feature = "native")]
 impl OcrEngine {
     /// Take (consume) the staff-level metadata from the most recent TrOMR
     /// music forward on this engine's cached model, if any (bd-av64.2): the
@@ -721,7 +745,7 @@ impl OcrEngine {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "native"))]
 mod tests {
     use super::*;
 

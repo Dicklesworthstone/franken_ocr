@@ -44,6 +44,13 @@ use rayon::prelude::*;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 // ── GOT decode perf levers (bd-3bom follow-on) — each gated so ONE build measures
 //    every config, and the gate on a numerics-changing lever IS its doctrine-#2
 //    kill-switch. Tri-state env: "1"/"int8"/"on" force ON, "0"/"f32"/"off" force OFF,
@@ -1304,7 +1311,7 @@ fn qwen2_decode_step(
     let rope = decoder::RopeTable::build(&[position], head_dim, cfg.rope_theta);
     let mut x = x.clone();
     add_learned_positions(&mut x, w, position)?;
-    let tlayers = std::time::Instant::now();
+    let tlayers = Instant::now();
     for (l, cl) in w.layers.iter().enumerate() {
         // ── attention: quantize the normed row ONCE, fused q|k|v GEMV (n-parallel) ──
         let ln1_b = cl.ln_bias.as_ref().map(|(a, _)| a.as_slice());
@@ -1319,7 +1326,7 @@ fn qwen2_decode_step(
             decoder::apply_rope(&mut k, &rope)?;
         }
         caches[l].append(&k.data, v);
-        let ta = std::time::Instant::now();
+        let ta = Instant::now();
         let ctx = qwen2_decode_attention(&caches[l], &q.data, num_heads, head_dim, kv_group);
         DECODE_ATTN_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let (xqc, ac) = decoder::quantize_row_i8_te(&ctx);
@@ -1363,7 +1370,7 @@ fn qwen2_decode_step(
         x = decoder::add_residual(&h, &Mat::from_vec(1, hidden, mlp_out))?;
     }
     DECODE_GEMV_NS.fetch_add(tlayers.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    let thead = std::time::Instant::now();
+    let thead = Instant::now();
     let logits = got_lm_head(w, &x, eps)?;
     DECODE_LMHEAD_NS.fetch_add(thead.elapsed().as_nanos() as u64, Ordering::Relaxed);
     Ok(logits)
@@ -1760,10 +1767,10 @@ fn generate_greedy_kvcache_with(
         DECODE_GEMV_NS.store(0, Ordering::Relaxed);
         DECODE_LMHEAD_NS.store(0, Ordering::Relaxed);
     }
-    let tseed = std::time::Instant::now();
+    let tseed = Instant::now();
     let last_logits = forward_prefill_seed(w, inputs_embeds, &mut caches)?;
     let seed_s = tseed.elapsed().as_secs_f64();
-    let tdec = std::time::Instant::now();
+    let tdec = Instant::now();
     let mut ids = Vec::new();
     let mut next = argmax_no_repeat(&last_logits, &ids, cfg.no_repeat_ngram_size) as u32;
     for _ in 0..max_new {

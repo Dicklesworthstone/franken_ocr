@@ -25,6 +25,13 @@ use super::tensor::Mat;
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 // ── fixed SAM-ViT-B geometry ([SPEC-040..046]) ─────────────────────────────
 
 /// Patch embedding / transformer width.
@@ -323,13 +330,13 @@ pub fn forward_prefix(weights: &Weights, image: &Mat, prefix: &str) -> FocrResul
             image.cols
         )));
     }
-    let th = std::time::Instant::now();
+    let th = Instant::now();
     let w = sam_weights_from(weights, prefix)?;
     super::timing_log(&format!(
         "    sam.hydrate {:.2}s",
         th.elapsed().as_secs_f64()
     ));
-    let tf = std::time::Instant::now();
+    let tf = Instant::now();
     let out = forward_with(&w, image, side, side);
     super::timing_log(&format!(
         "    sam.forward {:.2}s",
@@ -555,7 +562,7 @@ pub fn forward_with(w: &SamWeights, image: &Mat, h: usize, win: usize) -> FocrRe
     }
 
     // ── 12 transformer blocks.
-    let tb = std::time::Instant::now();
+    let tb = Instant::now();
     for blk in &w.blocks {
         x = block_forward(blk, &x, gh, gw)?;
     }
@@ -756,7 +763,7 @@ pub fn forward_with_batched(
 fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat> {
     let normed = layer_norm_rows(x, &blk.norm1)?;
 
-    let ta = std::time::Instant::now();
+    let ta = Instant::now();
     let attn_out = if blk.window > 0 {
         attention_windowed(&blk.attn, &normed, gh, gw, blk.window)?
     } else {
@@ -776,7 +783,7 @@ fn block_forward(blk: &BlockP, x: &Mat, gh: usize, gw: usize) -> FocrResult<Mat>
     }
 
     // residual 2: x = h1 + mlp(norm2(h1))
-    let tm = std::time::Instant::now();
+    let tm = Instant::now();
     let normed2 = layer_norm_rows(&h1, &blk.norm2)?;
     let mut mlp = blk.lin1.apply(&normed2)?;
     nn::gelu(&mut mlp);

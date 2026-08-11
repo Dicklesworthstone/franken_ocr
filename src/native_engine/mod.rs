@@ -49,6 +49,13 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak};
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 use crate::error::{FocrError, FocrResult};
 use crate::preprocess::{self, Preprocessed};
 use crate::quant::recipe::{Recipe, is_truthy};
@@ -216,9 +223,32 @@ where
 /// orchestration, the per-stage error mapping, and the **sequential** decode loop
 /// (doctrine #5: no nested runtime, no rayon under a lock — one forward at a
 /// time, fanning out across cores inside the kernels).
+/// In-memory tokenizer sidecar payloads for byte-loaded models
+/// ([`OcrModel::from_weights`]). On the filesystem route these files resolve
+/// beside the model artifact; a byte-loaded model (the browser/wasm path, or an
+/// embedder that ships weights inside its own binary) has no "beside", so the
+/// caller hands the payloads over up front. Only the entries the loaded arch
+/// actually needs must be present — a missing entry surfaces the same clean
+/// [`FocrError::ModelNotFound`] the filesystem route reports for a missing
+/// sidecar, at first tokenizer use.
+#[derive(Default)]
+pub struct SidecarBundle {
+    /// `tokenizer.json` bytes (the Unlimited-OCR / GOT-fallback BPE).
+    pub tokenizer_json: Option<Vec<u8>>,
+    /// `qwen.tiktoken` bytes (the GOT-OCR2 tokenizer).
+    pub qwen_tiktoken: Option<Vec<u8>>,
+    /// TrOMR WordLevel tables in stream order `[rhythm, pitch, lift, note]`.
+    pub music_tables: Option<[String; 4]>,
+}
+
 pub struct OcrModel {
     /// Filesystem path the model was resolved + loaded from (provenance).
+    /// Byte-loaded models ([`OcrModel::from_weights`]) carry the sentinel
+    /// `<in-memory>` and never touch the filesystem for sidecars.
     path: PathBuf,
+    /// In-memory sidecar payloads for byte-loaded models; empty (all `None`)
+    /// on the filesystem route, where sidecars resolve beside `path`.
+    sidecars: SidecarBundle,
     /// The loaded weight set. The `.focrq` reader (bd-1es.3) is wired, so every
     /// `Weights`-backed stage entrypoint hydrates its named tensors and runs the
     /// real math.
@@ -830,6 +860,18 @@ fn model_quant_preference() -> Option<ModelQuantPreference> {
     model_quant_preference_from_os(raw.as_deref())
 }
 
+/// The pull cache root, when the network/dist machinery is compiled in. The
+/// wasm/core build has no `focr pull` cache to search — models arrive as bytes.
+#[cfg(feature = "native")]
+fn dist_cache_root() -> Option<PathBuf> {
+    crate::dist::cache_root()
+}
+
+#[cfg(not(feature = "native"))]
+fn dist_cache_root() -> Option<PathBuf> {
+    None
+}
+
 fn model_search_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(raw) = std::env::var_os(MODEL_DIR_ENV)
@@ -837,7 +879,7 @@ fn model_search_dirs() -> Vec<PathBuf> {
     {
         dirs.extend(std::env::split_paths(&raw));
     }
-    if let Some(root) = crate::dist::cache_root() {
+    if let Some(root) = dist_cache_root() {
         let models = root.join("models");
         // Flat root FIRST (the layout every released binary knows), then one
         // level of per-model subdirectories, name-sorted for determinism:
@@ -938,7 +980,7 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
 fn versioned_quant_path(direct: &Path, quant: ModelQuantPreference) -> PathBuf {
     direct.with_extension(format!(
         "v{}.{}.focrq",
-        crate::dist::UNLIMITED_OCR_ARTIFACT_VERSION,
+        crate::UNLIMITED_OCR_ARTIFACT_VERSION,
         quant.as_str()
     ))
 }
@@ -1683,6 +1725,7 @@ impl OcrModel {
         let weights = load_weights_from_resolved_model(&resolved)?;
         let model = Arc::new(Self {
             path: resolved.clone(),
+            sidecars: SidecarBundle::default(),
             weights,
             decode_params: decode_params_from_env(),
             decoder_cache_i8: FallibleOnce::new(),
@@ -1701,6 +1744,38 @@ impl OcrModel {
         let mut guard = model_cache_guard()?;
         *guard = Some((resolved, Arc::downgrade(&model)));
         Ok(model)
+    }
+
+    /// Construct a model from an already-parsed [`Weights`] blob plus in-memory
+    /// tokenizer sidecars — the no-filesystem constructor (the browser/wasm
+    /// path; also embedders that ship weights as bytes). Mirrors [`Self::load`]
+    /// exactly — including the Unlimited-OCR conservative-recipe validation —
+    /// but skips path resolution, the load-admission gate, and the process-wide
+    /// weak cache (byte-loaded models are owned by their caller).
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if the weights violate the fixed
+    /// Unlimited-OCR quant recipe (other archs have separate storage contracts,
+    /// validated by their own tensor accessors at forward time).
+    pub fn from_weights(weights: Weights, sidecars: SidecarBundle) -> FocrResult<Arc<Self>> {
+        validate_unlimited_ocr_quant_recipe(&weights)?;
+        Ok(Arc::new(Self {
+            path: PathBuf::from("<in-memory>"),
+            sidecars,
+            weights,
+            decode_params: decode_params_from_env(),
+            decoder_cache_i8: FallibleOnce::new(),
+            decoder_cache: FallibleOnce::new(),
+            clip_cache: FallibleOnce::new(),
+            unlimited_vision: FallibleOnce::new(),
+            got_statics: FallibleOnce::new(),
+            onechart_statics: FallibleOnce::new(),
+            smol_statics: FallibleOnce::new(),
+            tokenizer: FallibleOnce::new(),
+            got_tokenizer: FallibleOnce::new(),
+            tromr_tokenizer: FallibleOnce::new(),
+            music_meta: std::sync::Mutex::new(None),
+        }))
     }
 
     /// The frozen greedy decode contract this model drives with (plan §6.10).
@@ -1761,7 +1836,7 @@ impl OcrModel {
         if self.arch().id() == "tromr" {
             return self.forward_tromr(&preprocess::decode_path(image_path)?);
         }
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
         // Mode = the certified Base-1024 default unless the CLI overrode it
         // (--base-size/--image-size/--crop-mode, bd-1e9n).
@@ -1791,7 +1866,7 @@ impl OcrModel {
         if self.arch().id() == "tromr" {
             return self.forward_tromr(&img);
         }
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
@@ -1803,7 +1878,7 @@ impl OcrModel {
     /// text plus source pixel dims (for the postprocess geometry the wrappers share).
     fn forward_got(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.got_tokenizer()?;
         // O(n) KV-cache greedy decode (B9); the model stops at <|im_end|>. The token
@@ -1831,7 +1906,7 @@ impl OcrModel {
     /// budget net of the prompt.
     fn forward_smolvlm2(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.tokenizer()?;
         let question = smolvlm2_question();
@@ -1861,7 +1936,7 @@ impl OcrModel {
     /// already the library return type).
     fn forward_onechart(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.tokenizer()?;
         let max_new = self.decode_params.max_length;
@@ -1890,7 +1965,7 @@ impl OcrModel {
 
     fn forward_tromr(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.tromr_tokenizer()?;
         let page = tromr::recognize_page(&self.weights, tk, img)?;
@@ -1962,6 +2037,17 @@ impl OcrModel {
     /// (the zoo files-beside convention) and cached.
     fn tromr_tokenizer(&self) -> FocrResult<&crate::tokenizer::music::MusicTokenizer> {
         self.tromr_tokenizer.get_or_try_init(|| {
+            if let Some([rhythm, pitch, lift, note]) = &self.sidecars.music_tables {
+                return crate::tokenizer::music::MusicTokenizer::from_json_tables(
+                    [rhythm, pitch, lift, note],
+                    [
+                        "tokenizer_rhythm.json (in-memory)",
+                        "tokenizer_pitch.json (in-memory)",
+                        "tokenizer_lift.json (in-memory)",
+                        "tokenizer_note.json (in-memory)",
+                    ],
+                );
+            }
             let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
             crate::tokenizer::music::MusicTokenizer::from_dir(dir)
         })
@@ -1971,6 +2057,9 @@ impl OcrModel {
     /// model and cached. (The Baidu path uses [`Self::tokenizer`].)
     fn got_tokenizer(&self) -> FocrResult<&crate::tokenizer::tiktoken::Tiktoken> {
         self.got_tokenizer.get_or_try_init(|| {
+            if let Some(bytes) = &self.sidecars.qwen_tiktoken {
+                return crate::tokenizer::tiktoken::Tiktoken::from_qwen_tiktoken(bytes);
+            }
             let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
             let path = dir.join("qwen.tiktoken");
             let bytes = std::fs::read(&path).map_err(|e| {
@@ -2028,7 +2117,7 @@ impl OcrModel {
         let (image_w, image_h) = Self::image_dims(&pre);
 
         // ── vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ───────────
-        let tv = std::time::Instant::now();
+        let tv = Instant::now();
         let vision_features = self.vision_tower(&pre)?;
         timing_log(&format!("vision_tower {:.2}s", tv.elapsed().as_secs_f64()));
 
@@ -2353,7 +2442,7 @@ impl OcrModel {
     ) -> FocrResult<String> {
         let _admission = forward_admission().acquire();
         // ── vision tower per page, sequential (§6.5: one live forward) ──────
-        let tv = std::time::Instant::now();
+        let tv = Instant::now();
         let mut globals: Vec<Mat> = Vec::with_capacity(pres.len());
         for pre in &pres {
             let mut feats = self.vision_tower(pre)?;
@@ -2409,7 +2498,7 @@ impl OcrModel {
                 .min(MAX_POSITION_EMBEDDINGS - prompt_ids.len()),
             ..self.decode_params.clone()
         };
-        let td = std::time::Instant::now();
+        let td = Instant::now();
         let generated = match on_page {
             None => self.generate_with(inputs_embeds, &prompt_ids, &params)?,
             Some(on_page) => {
@@ -2528,7 +2617,7 @@ impl OcrModel {
             "got-ocr2" => self.decode_params.max_length.min(got::MAX_NEW_TOKENS),
             _ => self.decode_params.max_length,
         };
-        let t = std::time::Instant::now();
+        let t = Instant::now();
         // Decode images per page; a bad page keeps its own error and is
         // excluded from the batch (the sequential loop's per-page semantics).
         let mut out: Vec<Option<FocrResult<String>>> =
@@ -2761,7 +2850,7 @@ impl OcrModel {
     /// A missing or mis-shaped `model.vision_model.*` tensor.
     fn clip_weights(&self) -> FocrResult<&vision_clip::ClipWeights> {
         self.clip_cache.get_or_try_init(|| {
-            let th = std::time::Instant::now();
+            let th = Instant::now();
             let built = vision_clip::clip_weights_from(&self.weights)?;
             timing_log(&format!(
                 "    clip.hydrate(cached) {:.2}s",
@@ -2773,7 +2862,7 @@ impl OcrModel {
 
     fn unlimited_vision_statics(&self) -> FocrResult<&UnlimitedVisionStatics> {
         self.unlimited_vision.get_or_try_init(|| {
-            let started = std::time::Instant::now();
+            let started = Instant::now();
             let built = UnlimitedVisionStatics {
                 sam: vision_sam::sam_weights_from(&self.weights, "model.sam_model")?,
                 projector: vision_bridge::projector_weights_from(&self.weights)?,
@@ -2863,6 +2952,10 @@ impl OcrModel {
     /// missing or malformed beside the model artifact.
     fn tokenizer(&self) -> FocrResult<&crate::tokenizer::Tokenizer> {
         self.tokenizer.get_or_try_init(|| {
+            // Byte-loaded models carry the payload directly (no "beside").
+            if let Some(bytes) = &self.sidecars.tokenizer_json {
+                return crate::tokenizer::Tokenizer::from_json_bytes(bytes);
+            }
             // The tokenizer ships beside the weights; OneChart uses the OPT
             // slow-tokenizer triple instead of tokenizer.json (D9).
             let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
@@ -2898,7 +2991,7 @@ impl OcrModel {
         let mut features = Vec::new();
         for view in Self::views(pre) {
             // SAM tower -> [1024, 16*16] x3 feature (flatten(2) layout, OQ-6).
-            let ts = std::time::Instant::now();
+            let ts = Instant::now();
             let sam = if let Some(statics) = statics {
                 let side = (view.cols as f64).sqrt() as usize;
                 if side * side != view.cols {
@@ -2913,7 +3006,7 @@ impl OcrModel {
             };
             timing_log(&format!("  vision.sam {:.2}s", ts.elapsed().as_secs_f64()));
             // CLIP tower fed SAM's x3 as patch_embeds -> [N+1, 1024] (CLS at 0).
-            let tc = std::time::Instant::now();
+            let tc = Instant::now();
             let clip = vision_clip::forward_from_sam(
                 &vision_clip::ClipConfig::default(),
                 self.clip_weights()?,
@@ -2921,7 +3014,7 @@ impl OcrModel {
             )?;
             timing_log(&format!("  vision.clip {:.2}s", tc.elapsed().as_secs_f64()));
             // Bridge: concat CLIP[:,1:] ++ SAM (2048) -> projector -> [N, 1280].
-            let tb = std::time::Instant::now();
+            let tb = Instant::now();
             let projected = if let Some(statics) = statics {
                 vision_bridge::forward_with(&statics.projector, &clip, &sam)?
             } else {
@@ -2952,13 +3045,13 @@ impl OcrModel {
         let _fwd = enter_forward();
         // (page, view-slot) inventory, preserving vision_tower's per-page order.
         let mut page_views: Vec<Vec<Mat>> = pres.iter().map(|pre| Self::views(pre)).collect();
-        let th = std::time::Instant::now();
+        let th = Instant::now();
         let retain_statics = unlimited_vision_cache_enabled();
         let statics_owner = retained_or_owned(
             retain_statics,
             &self.unlimited_vision,
             || -> FocrResult<UnlimitedVisionStatics> {
-                let started = std::time::Instant::now();
+                let started = Instant::now();
                 let built = UnlimitedVisionStatics {
                     sam: vision_sam::sam_weights_from(&self.weights, "model.sam_model")?,
                     projector: vision_bridge::projector_weights_from(&self.weights)?,
@@ -3010,14 +3103,14 @@ impl OcrModel {
             .collect();
         for (side, slots) in &groups {
             let view_refs: Vec<&Mat> = slots.iter().map(|&(p, v)| &page_views[p][v]).collect();
-            let ts = std::time::Instant::now();
+            let ts = Instant::now();
             let sams = vision_sam::forward_with_batched(&statics.sam, &view_refs, *side, *side)?;
             timing_log(&format!(
                 "  vision.sam(batch of {}, side {side}) {:.2}s",
                 slots.len(),
                 ts.elapsed().as_secs_f64()
             ));
-            let tc = std::time::Instant::now();
+            let tc = Instant::now();
             let sam_refs: Vec<&Mat> = sams.iter().collect();
             let clips = vision_clip::forward_batched_from_sam(&clip_cfg, clip_w, &sam_refs)?;
             timing_log(&format!(
@@ -3025,7 +3118,7 @@ impl OcrModel {
                 slots.len(),
                 tc.elapsed().as_secs_f64()
             ));
-            let tb = std::time::Instant::now();
+            let tb = Instant::now();
             for ((&(p, v), sam), clip) in slots.iter().zip(&sams).zip(&clips) {
                 let projected = vision_bridge::forward_with(&statics.projector, clip, sam)?;
                 features[p][v] = Some(projected);
@@ -3269,7 +3362,7 @@ impl OcrModel {
 
         // Build the conservative recipe cache once per model: int8 FFN/expert
         // matrices, high-precision attention and lm_head.
-        let tb = std::time::Instant::now();
+        let tb = Instant::now();
         let wc = self.decoder_cache()?;
         timing_log(&format!(
             "weight_cache_build {:.2}s",
@@ -3278,7 +3371,7 @@ impl OcrModel {
 
         // Prefill once, capturing each layer's reference K/V; `last_hidden` is the
         // final prefill position, which predicts the FIRST generated token.
-        let tp = std::time::Instant::now();
+        let tp = Instant::now();
         let (hidden, mut caches) = decoder::prefill_with_cache(wc, &inputs_embeds)?;
         let mut last_hidden = Self::last_hidden_row(&hidden)?;
         timing_log(&format!(
@@ -3286,7 +3379,7 @@ impl OcrModel {
             tp.elapsed().as_secs_f64(),
             prefill_len
         ));
-        let td = std::time::Instant::now();
+        let td = Instant::now();
         decoder::prof::reset();
 
         // `generated` seeds the no-repeat-ngram history with the prompt so the
@@ -3372,14 +3465,14 @@ impl OcrModel {
         // Quantize the decoder weights to int8 ONCE and cache on the model; a
         // load-once batch then reuses it across pages (the build is ~1.2 s). The
         // first page pays the quant; every later page in the same process skips it.
-        let tb = std::time::Instant::now();
+        let tb = Instant::now();
         let wc = self.decoder_cache_i8()?;
         timing_log(&format!(
             "weight_cache_build_i8 {:.2}s",
             tb.elapsed().as_secs_f64()
         ));
 
-        let tp = std::time::Instant::now();
+        let tp = Instant::now();
         let (hidden, mut caches) = decoder::prefill_with_cache_i8(wc, &inputs_embeds)?;
         let mut last_hidden = Self::last_hidden_row(&hidden)?;
         timing_log(&format!(
@@ -3387,7 +3480,7 @@ impl OcrModel {
             tp.elapsed().as_secs_f64(),
             prefill_len
         ));
-        let td = std::time::Instant::now();
+        let td = Instant::now();
         decoder::prof::reset();
 
         let mut generated: Vec<u32> = prompt_ids.to_vec();
@@ -4117,7 +4210,7 @@ mod tests {
         let dir = temp_model_dir("resolve_manifest_versioned_int8");
         let current = dir.join(format!(
             "unlimited-ocr.v{}.int8.focrq",
-            crate::dist::UNLIMITED_OCR_ARTIFACT_VERSION
+            crate::UNLIMITED_OCR_ARTIFACT_VERSION
         ));
         let legacy = dir.join("unlimited-ocr.int8.focrq");
         std::fs::write(&current, weights::FOCRQ_MAGIC).expect("write current model");

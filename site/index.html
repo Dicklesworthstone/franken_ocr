@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>franken_ocr — pure-Rust OCR engines, now in your browser</title>
+<meta name="description" content="A pure-Rust, CPU-only OCR engine for hand-ported vision-language models. The TrOMR sheet-music model runs fully in your browser — no server, no upload, no Python, no GPU.">
+<link rel="stylesheet" href="./assets/css/site.css?v=@SITEV@">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128441;</text></svg>">
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap row">
+    <div class="brand">franken_ocr</div>
+    <nav>
+      <a href="#playground">Playground</a>
+      <a href="#how">How it works</a>
+      <a href="#models">Models</a>
+      <a href="#browser">The browser port</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/Dicklesworthstone/franken_ocr">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<section class="hero wrap" id="top">
+  <h1>Neural OCR engines in pure Rust.<br>Now running <em>in this tab</em>.</h1>
+  <p class="lede">
+    <strong>franken_ocr</strong> hand-ports vision-language models into memory-safe Rust with
+    model-specific CPU kernels — no PyTorch, no Python, no CUDA, no GPU, no FFI.
+    The same code that ships as the <code>focr</code> CLI compiles to WebAssembly, so the
+    <strong>Polyphonic-TrOMR sheet-music model runs entirely in your browser</strong>:
+    your image never leaves this page.
+  </p>
+  <p class="cta-row">
+    <a class="btn primary" href="#playground">Try it — sheet music → MusicXML</a>
+    <a class="btn" href="#install">Install the CLI</a>
+  </p>
+</section>
+
+<section class="wrap" id="playground">
+  <h2>Playground — sheet music → MusicXML</h2>
+  <p>
+    A 58&nbsp;MB int8 neural OMR model (ResNet-V2 + ViT encoder, four-head autoregressive
+    decoder), quantized and executed by hand-written Rust kernels compiled to wasm.
+    Everything below happens on your CPU, in this tab. The download is verified by
+    SHA-256 against the same pinned manifest the CLI uses, and cached for next time.
+  </p>
+
+  <div class="panel">
+    <div class="row spread">
+      <div>
+        <button id="load-model" class="btn primary" disabled>Load model (<span id="model-size">…</span>)</button>
+        <button id="clear-cache" class="btn subtle">Clear cache</button>
+      </div>
+      <div class="kv">int8 route: <code id="route">…</code></div>
+    </div>
+
+    <div id="consent" class="consent" hidden>
+      <p>This downloads the <strong>58&nbsp;MB</strong> TrOMR model into your browser's cache.
+      After that it works offline. Continue?</p>
+      <button id="consent-yes" class="btn primary">Download</button>
+      <button id="consent-no" class="btn">Not now</button>
+    </div>
+
+    <div id="progress-wrap" hidden>
+      <div class="progress"><div id="progress-bar"></div></div>
+      <div id="progress-text" class="kv"></div>
+    </div>
+
+    <div id="status" class="status">Starting engine…</div>
+    <div id="reset-hint" hidden class="kv">Something crashed last time — <a href="./reset.html">reset page</a>.</div>
+
+    <div id="drop" class="drop">
+      <span id="drop-hint">Drop a sheet-music image here (PNG/JPEG), click to pick,
+        or paste from the clipboard. <button id="sample" class="btn subtle">Use a sample scan</button></span>
+      <div class="preview-stack">
+        <img id="preview" alt="input preview" hidden>
+        <canvas id="overlay" hidden></canvas>
+      </div>
+    </div>
+    <input type="file" id="file-input" accept="image/png,image/jpeg" hidden>
+
+    <div class="row">
+      <button id="run" class="btn primary" disabled>Recognize</button>
+      <button id="cancel" class="btn" hidden>Cancel</button>
+    </div>
+
+    <div id="result-wrap" hidden>
+      <div class="row spread">
+        <div id="result-meta" class="kv"></div>
+        <button id="download-xml" class="btn" hidden>Download .musicxml</button>
+      </div>
+      <ul id="warnings" class="warnings"></ul>
+      <pre id="output" class="output"></pre>
+      <p class="kv">Green boxes: recognized staves. Red: skipped (with the reason listed
+      above). “Sanity warnings” are annotate-only observations the engine makes about
+      the transcription (overfull bars, impossible durations) — honest signal, not
+      silent cleanup.</p>
+    </div>
+    <div id="license" class="kv"></div>
+  </div>
+</section>
+
+<section class="wrap" id="how">
+  <h2>How it works</h2>
+  <div class="cols">
+    <div>
+      <h3>A few models, every dimension fixed</h3>
+      <p>A general ML framework pays a generality tax on every op: dynamic dtype dispatch,
+      arbitrary shapes, autograd bookkeeping. franken_ocr runs a small set of hand-ported
+      models whose dimensions are known at compile time, so every kernel is written for
+      its exact shapes. There is no generic runtime underneath.</p>
+    </div>
+    <div>
+      <h3>Correctness before speed, always</h3>
+      <p>Every model is certified against its Python reference through a parity ladder —
+      preprocessing exact, per-op cosine ≈ 1.0, per-layer hidden states, logits, decoded
+      tokens, end-to-end error rates. A faster kernel that drifts the output is reverted
+      and recorded in a negative-evidence ledger. The browser build is the same code:
+      the wasm MusicXML output on this page's smoke fixture is byte-identical to the
+      native CLI's.</p>
+    </div>
+    <div>
+      <h3>Quantized, provably</h3>
+      <p>Checkpoints are transformed offline into <code>.focrq</code> artifacts: int8
+      weights where measurement says it's safe, high precision where it isn't. Every
+      accelerated int8 kernel ships with a bit-identical scalar oracle, and
+      <code>focr robot selftest</code> re-proves the dispatched kernel on <em>your</em>
+      CPU — including the browser's, where the wasm build reports its route the same way.</p>
+    </div>
+  </div>
+</section>
+
+<section class="wrap" id="models">
+  <h2>The model zoo</h2>
+  <table>
+    <thead><tr><th>Model</th><th>Task</th><th>Size (int8)</th><th>CLI</th><th>Browser</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Unlimited-OCR</strong> (Baidu)</td><td>General document OCR → Markdown, tables, LaTeX, layout boxes</td><td>4.16 GB</td><td>✅ default</td><td>🔬 int4 lane in progress<a href="#browser">*</a></td></tr>
+      <tr><td><strong>GOT-OCR2</strong></td><td>Formulas, tables, charts, geometry, molecular</td><td>776 MB</td><td>✅</td><td>possible next</td></tr>
+      <tr><td><strong>SmolVLM2</strong></td><td>Photo description / VQA</td><td>1.01 GB</td><td>✅</td><td>—</td></tr>
+      <tr><td><strong>OneChart</strong></td><td>Chart → structured data</td><td>346 MB</td><td>✅</td><td>—</td></tr>
+      <tr><td><strong>Polyphonic-TrOMR</strong></td><td>Sheet music → MusicXML</td><td>58 MB</td><td>✅</td><td>✅ this page</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="wrap" id="browser">
+  <h2>The browser port, honestly</h2>
+  <p>
+    The engine's inference core — model forwards, int8 kernels, preprocessing,
+    tokenizers — is pure sync compute over byte buffers, so it compiles to
+    <code>wasm32-unknown-unknown</code> with the async runtime, SQL run-store, and
+    CLI feature-gated away. One code path serves native and wasm; parity is proven on
+    the <em>built artifact</em> against the native CLI, not asserted from source.
+  </p>
+  <p>
+    <strong>What runs today:</strong> TrOMR (58 MB) — small enough to be interactive
+    everywhere, phones included, on the serial simd128 build.
+  </p>
+  <p>
+    <strong>What's in progress:</strong> the Baidu Unlimited-OCR lane. The shipped int8
+    artifact is 4.16 GB — over wasm's 4 GiB memory ceiling before the first activation
+    is allocated. Getting it into a tab requires a more aggressive, carefully-damage-
+    controlled quantization: int4 (group-16) on the MoE expert bulk with
+    error-compensated rounding and activation-aware scale folding, int8 everywhere else
+    that stays resident. That lands at roughly 2.3 GB — a desktop-Chrome-class download
+    in the same spirit as <a href="https://frankentts.com">frankentts</a>' 2 GB in-browser
+    TTS. It ships when — and only when — the quantized artifact passes the same corpus
+    error budgets the native release gates on. No preview toggles, no silently degraded
+    output.
+  </p>
+</section>
+
+<section class="wrap" id="install">
+  <h2>Install the CLI</h2>
+  <p>The full product — all five models, PDFs, batching, robot/agent mode — is a single
+  static binary:</p>
+  <pre class="code">curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
+focr pull tromr
+focr ocr --model tromr.int8.focrq --task music score.png -o score.musicxml</pre>
+  <p>macOS (Apple Silicon + Intel), Linux (x86-64 + ARM64), Windows (x86-64 + ARM64).
+  Runtime ISA dispatch picks NEON/SDOT/SMMLA or AVX2/AVX-VNNI/AVX-512-VNNI per host —
+  one binary per architecture.</p>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <p>franken_ocr — © 2026 Jeffrey Emanuel, MIT License (with OpenAI/Anthropic Rider).
+  Model weights carry their own notices: Baidu Unlimited-OCR (MIT, © 2026 Baidu),
+  Polyphonic-TrOMR (Apache-2.0, NetEase). Nothing on this page phones home; the
+  CSP's <code>connect-src 'self'</code> is the enforceable version of that promise.</p>
+</footer>
+
+<script type="module" src="./app.js?v=@SITEV@"></script>
+</body>
+</html>

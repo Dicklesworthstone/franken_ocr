@@ -1,0 +1,38 @@
+# Cloudflare Pages headers.
+#
+# COOP/COEP are set now even though the current serial wasm build doesn't need
+# them: they cost nothing, enable fine timers, and mean the future threaded
+# (SharedArrayBuffer) Unlimited-OCR build ships without a headers migration.
+#
+# CSP: connect-src 'self' is the enforceable form of "your image never leaves
+# this page". 'wasm-unsafe-eval' is required for WebAssembly.compileStreaming;
+# 'unsafe-eval' rides along because Safari only learned the wasm token in 16.4.
+#
+# Cache-control: every hand-written script is listed LITERALLY with no-cache
+# (Pages splats must end a pattern); the @SITEV@ stamp in every script URL is
+# the real freshness mechanism — a CDN zone TTL override can ignore origin
+# no-cache, and did, on the sibling project.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: require-corp
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+  X-Content-Type-Options: nosniff
+
+/index.html
+  Cache-Control: no-cache
+/app.js
+  Cache-Control: no-cache
+/engine-worker.js
+  Cache-Control: no-cache
+/loader.js
+  Cache-Control: no-cache
+/model-manifest.js
+  Cache-Control: no-cache
+/reset.html
+  Cache-Control: no-cache
+/pkg/*
+  Cache-Control: no-cache
+/model/*
+  Cache-Control: public, max-age=31536000, immutable
+/assets/*
+  Cache-Control: public, max-age=604800

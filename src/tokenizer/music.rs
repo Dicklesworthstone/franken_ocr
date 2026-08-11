@@ -119,7 +119,7 @@ impl MusicTokenizer {
     /// A missing/unreadable file, malformed JSON, a non-WordLevel model, a
     /// non-dense id space, or a vocab-size mismatch vs the census.
     pub fn from_dir(dir: &Path) -> FocrResult<Self> {
-        let load = |stem: &str, want: usize| -> FocrResult<WordLevelTable> {
+        let read = |stem: &str| -> FocrResult<(String, String)> {
             let path = dir.join(format!("tokenizer_{stem}.json"));
             let text = std::fs::read_to_string(&path).map_err(|e| {
                 FocrError::ModelNotFound(format!(
@@ -127,21 +127,45 @@ impl MusicTokenizer {
                     path.display()
                 ))
             })?;
-            let table = WordLevelTable::from_json(&text, &path.display().to_string())?;
+            Ok((text, path.display().to_string()))
+        };
+        let (rhythm, rhythm_src) = read("rhythm")?;
+        let (pitch, pitch_src) = read("pitch")?;
+        let (lift, lift_src) = read("lift")?;
+        let (note, note_src) = read("note")?;
+        Self::from_json_tables(
+            [&rhythm, &pitch, &lift, &note],
+            [&rhythm_src, &pitch_src, &lift_src, &note_src],
+        )
+    }
+
+    /// Build the tokenizer from already-read JSON table payloads in the fixed
+    /// stream order `[rhythm, pitch, lift, note]`, validating each against the
+    /// censused vocab size exactly as [`Self::from_dir`] does. `sources` are
+    /// human-readable provenance labels for error messages (paths on the CLI
+    /// route, asset names on the byte route — e.g. the wasm site's fetched
+    /// sidecars, which have no filesystem).
+    ///
+    /// # Errors
+    /// Malformed JSON, a non-WordLevel model, a non-dense id space, or a
+    /// vocab-size mismatch vs the census.
+    pub fn from_json_tables(tables: [&str; 4], sources: [&str; 4]) -> FocrResult<Self> {
+        let load = |idx: usize, want: usize| -> FocrResult<WordLevelTable> {
+            let table = WordLevelTable::from_json(tables[idx], sources[idx])?;
             if table.id_to_token.len() != want {
                 return Err(FocrError::FormatMismatch(format!(
                     "{}: {} ids, census expects {want} (spec §9)",
-                    path.display(),
+                    sources[idx],
                     table.id_to_token.len()
                 )));
             }
             Ok(table)
         };
         Ok(Self {
-            rhythm: load("rhythm", 260)?,
-            pitch: load("pitch", 71)?,
-            lift: load("lift", 7)?,
-            note: load("note", 2)?,
+            rhythm: load(0, 260)?,
+            pitch: load(1, 71)?,
+            lift: load(2, 7)?,
+            note: load(3, 2)?,
         })
     }
 

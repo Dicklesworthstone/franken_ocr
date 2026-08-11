@@ -1,0 +1,27 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_modelstaging_free: (a: number, b: number) => void;
+export const __wbg_wasmengine_free: (a: number, b: number) => void;
+export const engine_info: (a: number) => void;
+export const int8_route: (a: number) => void;
+export const modelstaging_filled: (a: number) => number;
+export const modelstaging_free: (a: number) => void;
+export const modelstaging_new: () => number;
+export const modelstaging_push: (a: number, b: number, c: number, d: number) => void;
+export const modelstaging_reserve: (a: number, b: number, c: number) => void;
+export const modelstaging_set_sidecar: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const wasmengine_free_engine: (a: number) => void;
+export const wasmengine_from_staging: (a: number, b: number) => void;
+export const wasmengine_license_notice: (a: number, b: number) => void;
+export const wasmengine_model_id: (a: number, b: number) => void;
+export const wasmengine_recognize: (a: number, b: number, c: number, d: number) => void;
+export const wasmengine_recognize_json: (a: number, b: number, c: number, d: number) => void;
+export const focr_wasm_start: () => void;
+export const request_cancel: () => void;
+export const reset_cancel: () => void;
+export const __wbindgen_add_to_stack_pointer: (a: number) => number;
+export const __wbindgen_export: (a: number, b: number, c: number) => void;
+export const __wbindgen_export2: (a: number, b: number) => number;
+export const __wbindgen_export3: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_start: () => void;

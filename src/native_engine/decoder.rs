@@ -46,6 +46,13 @@ use crate::error::{FocrError, FocrResult};
 use crate::simd;
 use rayon::prelude::*;
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 fn checked_shape_mul(context: &str, lhs: usize, rhs: usize, expression: &str) -> FocrResult<usize> {
     lhs.checked_mul(rhs).ok_or_else(|| {
         FocrError::Other(anyhow::anyhow!(
@@ -1061,7 +1068,7 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
             hidden.rows
         )));
     }
-    let t = prof::enabled().then(std::time::Instant::now);
+    let t = prof::enabled().then(Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
     let row = normed.row(0);
     // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv`).
@@ -1428,7 +1435,7 @@ pub fn decode_step_with_cache(
     let mut x = token_embed.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
-        let t_attn = profiling.then(std::time::Instant::now);
+        let t_attn = profiling.then(Instant::now);
 
         // Attention via the bespoke m=1 GEMV: project q/k/v, RoPE q/k at the true
         // `position`, push K/V into the ring (the query attends to itself as the
@@ -2265,7 +2272,7 @@ fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
     let profiling = prof::enabled();
     match mlp {
         CachedMlpI8::Dense { gate, up, down } => {
-            let t = profiling.then(std::time::Instant::now);
+            let t = profiling.then(Instant::now);
             let y = expert_gemv_i8(row, gate, up, down);
             if let Some(t) = t {
                 prof::add(&prof::EXPERTS_NS, t.elapsed().as_nanos() as u64);
@@ -2277,12 +2284,12 @@ fn decode_mlp_i8(mlp: &CachedMlpI8, normed: &Mat) -> FocrResult<Vec<f32>> {
             experts,
             shared,
         } => {
-            let tr = profiling.then(std::time::Instant::now);
+            let tr = profiling.then(Instant::now);
             let routing = moe::route_default(normed, gate)?;
             if let Some(t) = tr {
                 prof::add(&prof::ROUTE_NS, t.elapsed().as_nanos() as u64);
             }
-            let te = profiling.then(std::time::Instant::now);
+            let te = profiling.then(Instant::now);
             // Fan the 6 routed experts across the pool as FULLY SERIAL tasks (one
             // dispatch, no nested parallelism), CONCURRENTLY with the larger shared
             // expert (inter 1792), which keeps its own internal parallelism via
@@ -2340,7 +2347,7 @@ pub fn lm_head_cached_i8(wc: &DecoderWeightCacheI8, hidden: &Mat) -> FocrResult<
             hidden.rows
         )));
     }
-    let t = prof::enabled().then(std::time::Instant::now);
+    let t = prof::enabled().then(Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
     let row = normed.row(0);
     // FOCR_LMHEAD_SHARD: vocab-tiled head (default OFF ⇒ the monolithic `gemv_i8`).
@@ -2450,7 +2457,7 @@ pub fn lm_head_cached_i8_ngram_masked(
             hidden.rows
         )));
     }
-    let t = prof::enabled().then(std::time::Instant::now);
+    let t = prof::enabled().then(Instant::now);
     let normed = nn::rms_norm(hidden, Some(&wc.final_norm), config::RMS_NORM_EPS)?;
     let row = normed.row(0);
     let logits = gemv_i8_ngram_masked(row, &wc.lm_head, banned);
@@ -2633,7 +2640,7 @@ pub fn decode_step_with_cache_i8(
     let mut x = token_embed.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
-        let t_attn = profiling.then(std::time::Instant::now);
+        let t_attn = profiling.then(Instant::now);
         let (mut q, mut k, v) = if fuse_norm_quant_enabled() {
             // FOCR_FUSE_NORM_QUANT (Lever 1): quantize the `input_layernorm` output
             // ONCE in the norm epilogue and reuse that int8 row across q/k/v —
@@ -2935,7 +2942,7 @@ pub fn batched_decode_step_i8_streams(
     let mut x: Vec<Mat> = token_embeds.to_vec();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
-        let t_attn = profiling.then(std::time::Instant::now);
+        let t_attn = profiling.then(Instant::now);
         // 1. Per-stream pre-attention RMSNorm.
         let mut normed: Vec<Mat> = Vec::with_capacity(b);
         for s in 0..b {
@@ -3015,7 +3022,7 @@ pub fn batched_decode_step_i8_streams(
 /// # Errors
 /// [`FocrError::Other`] if any `hiddens[s]` is not a single `[1, hidden]` row.
 pub fn batched_lm_head_i8(wc: &DecoderWeightCacheI8, hiddens: &[Mat]) -> FocrResult<Vec<Mat>> {
-    let t = prof::enabled().then(std::time::Instant::now);
+    let t = prof::enabled().then(Instant::now);
     let mut normed: Vec<Mat> = Vec::with_capacity(hiddens.len());
     for (s, h) in hiddens.iter().enumerate() {
         if h.rows != 1 {

@@ -33,6 +33,13 @@ use super::vision_sam::Linear;
 use super::weights::Weights;
 use super::{connector, decoder, token_compress, vision_siglip};
 
+// Clock seam: `std::time::Instant` traps on wasm32-unknown-unknown; `web-time`
+// re-exports std's types on native targets, so native behavior is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
+
 /// The generation stop id — `<end_of_utterance>` (spec §8).
 pub const EOS_ID: u32 = special_smollm2::END_OF_UTTERANCE;
 /// `<image>` splice-slot id.
@@ -155,7 +162,7 @@ pub struct SmolStatics {
 /// # Errors
 /// A missing or mis-shaped tensor.
 pub fn hydrate_statics(weights: &Weights) -> FocrResult<SmolStatics> {
-    let th = std::time::Instant::now();
+    let th = Instant::now();
     let ps_cols = vision_siglip::EMBED_DIM * PS_SCALE * PS_SCALE; // 12288
     let proj = weights.mat("model.connector.modality_projection.proj.weight")?;
     if (proj.rows, proj.cols) != (960, ps_cols) {
@@ -214,7 +221,7 @@ pub fn recognize(
     question: &str,
     max_new: usize,
 ) -> FocrResult<String> {
-    let tv = std::time::Instant::now();
+    let tv = Instant::now();
     let pre = preprocess::preprocess_smolvlm2(img)?;
     let vision = vision_rows(statics, &pre.frames, pre.n_frames)?;
     let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, question)?;
@@ -225,7 +232,7 @@ pub fn recognize(
         pre.n_frames,
         prompt_ids.len()
     ));
-    let tg = std::time::Instant::now();
+    let tg = Instant::now();
     let cfg = DecoderConfig::smolvlm2();
     // Clamp to the architectural position budget net of the prompt (upstream
     // has no config max_new; the RoPE table stops at max_position 8192).
@@ -255,7 +262,7 @@ pub fn recognize_batch(
     question: &str,
     max_new: usize,
 ) -> FocrResult<Vec<String>> {
-    let tv = std::time::Instant::now();
+    let tv = Instant::now();
     let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
     let mut caps: Vec<usize> = Vec::with_capacity(imgs.len());
     for img in imgs {
@@ -271,7 +278,7 @@ pub fn recognize_batch(
         imgs.len(),
         tv.elapsed().as_secs_f64()
     ));
-    let tg = std::time::Instant::now();
+    let tg = Instant::now();
     let cfg = DecoderConfig::smolvlm2();
     let id_streams =
         decoder_qwen2::generate_greedy_batched(weights, &cfg, &embeds_list, &caps, EOS_ID)?;
