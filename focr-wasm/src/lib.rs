@@ -127,6 +127,22 @@ pub fn reset_cancel() {
     franken_ocr::reset_shutdown();
 }
 
+/// Set (or clear, with `0`) the sliding no-repeat n-gram decode guard for the
+/// NEXT engine built by [`WasmEngine::from_staging`] — the browser analog of
+/// `--no-repeat-ngram` / `FOCR_NO_REPEAT_NGRAM`. The README documents a
+/// tighter guard (20 vs the default 35) as the mitigation for degenerate
+/// repetition loops on hard dense pages; the measured in-browser failure on
+/// such a page (an f32-drift-tipped repeat attractor) is the same class. This
+/// is a mitigation the native CLI user can apply identically — not a silent
+/// numerics change: the site labels the lane's guard setting.
+#[wasm_bindgen]
+pub fn set_no_repeat_ngram(n: u32) {
+    franken_ocr::native_engine::set_decode_overrides(franken_ocr::native_engine::DecodeOverrides {
+        no_repeat_ngram: if n == 0 { None } else { Some(n as usize) },
+        ..Default::default()
+    });
+}
+
 /// Staging area for a model arriving over the network as chunks: exactly one
 /// copy of the weight blob lives here, reserved up front, plus the (small)
 /// tokenizer sidecars keyed by their canonical zoo filenames.

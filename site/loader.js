@@ -64,91 +64,128 @@ async function fetchVerifiedSmall(modelId, spec, onProgress) {
   return buf;
 }
 
-/** Drive one ReadableStream through hash + sink + progress. */
-async function pump(reader, spec, sink, onProgress) {
-  const hash = new Sha256();
-  let received = 0;
-  let prefixParts = [];
-  let prefixLen = 0;
-  let began = false;
+/**
+ * The whole-asset streaming state: one SHA-256, one sink, one progress counter,
+ * shared across every part so N parts behave as ONE logical byte stream.
+ */
+class WeightsPump {
+  constructor(spec, sink, onProgress) {
+    this.spec = spec;
+    this.sink = sink;
+    this.onProgress = onProgress;
+    this.hash = new Sha256();
+    this.received = 0;
+    this.prefixChunks = [];
+    this.prefixLen = 0;
+    this.began = false;
+  }
 
-  const beginIfReady = (eof) => {
-    if (began || (!eof && prefixLen < Math.min(PREFIX_BYTES, spec.bytes))) return;
-    const prefix = new Uint8Array(prefixLen);
+  beginIfReady(eof) {
+    if (this.began || (!eof && this.prefixLen < Math.min(PREFIX_BYTES, this.spec.bytes))) return;
+    const prefix = new Uint8Array(this.prefixLen);
     let off = 0;
-    for (const p of prefixParts) {
+    for (const p of this.prefixChunks) {
       prefix.set(p, off);
       off += p.length;
     }
-    prefixParts = [];
-    sink.begin(prefix, spec.bytes);
-    began = true;
-  };
+    this.prefixChunks = [];
+    this.sink.begin(prefix, this.spec.bytes);
+    this.began = true;
+  }
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (received + value.length > spec.bytes) {
-      throw new Error(`${spec.name}: server sent more than the pinned ${spec.bytes} bytes`);
+  /** Stream one part's reader. `partSpec` pins that part's bytes + sha256. */
+  async drain(reader, partSpec, fromCache) {
+    const partHash = new Sha256();
+    let partReceived = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (partReceived + value.length > partSpec.bytes) {
+        throw new Error(`${partSpec.name}: server sent more than the pinned ${partSpec.bytes} bytes`);
+      }
+      partHash.update(value);
+      partReceived += value.length;
+      this.hash.update(value);
+      this.received += value.length;
+      if (!this.began) {
+        this.prefixChunks.push(value);
+        this.prefixLen += value.length;
+        this.beginIfReady(false);
+      } else {
+        this.sink.push(value);
+      }
+      this.onProgress?.(this.received, fromCache);
     }
-    hash.update(value);
-    received += value.length;
-    if (!began) {
-      prefixParts.push(value);
-      prefixLen += value.length;
-      beginIfReady(false);
-    } else {
-      sink.push(value);
+    if (partReceived !== partSpec.bytes) {
+      throw new Error(`${partSpec.name}: got ${partReceived} of ${partSpec.bytes} bytes`);
     }
-    onProgress?.(received, false);
+    const hex = partHash.hex();
+    if (hex !== partSpec.sha256) {
+      throw new Error(`${partSpec.name}: SHA-256 mismatch (got ${hex.slice(0, 12)}…)`);
+    }
   }
-  beginIfReady(true); // short asset: whole thing is the prefix
-  if (received !== spec.bytes) {
-    throw new Error(`${spec.name}: got ${received} of ${spec.bytes} bytes`);
-  }
-  const hex = hash.hex();
-  if (hex !== spec.sha256) {
-    throw new Error(`${spec.name}: SHA-256 mismatch (got ${hex.slice(0, 12)}…)`);
+
+  finish() {
+    this.beginIfReady(true); // short asset: the whole thing was the prefix
+    if (this.received !== this.spec.bytes) {
+      throw new Error(`${this.spec.name}: got ${this.received} of ${this.spec.bytes} bytes`);
+    }
+    const hex = this.hash.hex();
+    if (hex !== this.spec.sha256) {
+      throw new Error(`${this.spec.name}: whole-asset SHA-256 mismatch (got ${hex.slice(0, 12)}…)`);
+    }
   }
 }
 
-/** Big-asset lane: stream into `sink`, tee into the cache, verify by stream. */
-async function streamWeights(modelId, spec, sink, onProgress) {
-  const url = assetUrl(modelId, spec.name);
-  const cache = await caches.open(CACHE_NAME);
-
+/** Get one part's reader: cache hit, else fetch teed into the cache. */
+async function partReader(cache, url) {
   const cached = await cache.match(url);
-  if (cached?.body) {
-    try {
-      await pump(cached.body.getReader(), spec, sink, (n) => onProgress?.(n, true));
-      return;
-    } catch (err) {
-      // Corrupt cache: delete and fall through to a fresh download. The sink
-      // may have consumed partial bytes — the caller must discard its staging.
-      await cache.delete(url);
-      throw new Error(`cached ${spec.name} failed verification (${err.message}); cache cleared — retry the load`);
-    }
-  }
-
+  if (cached?.body) return { reader: cached.body.getReader(), fromCache: true, cachePut: null };
   const resp = await fetch(url);
-  if (!resp.ok || !resp.body) throw new Error(`fetch ${spec.name}: HTTP ${resp.status}`);
+  if (!resp.ok || !resp.body) throw new Error(`fetch ${url}: HTTP ${resp.status}`);
   const [toSink, toCache] = resp.body.tee();
   const cachePut = cache
     .put(url, new Response(toCache, { headers: { "content-type": "application/octet-stream" } }))
     .catch((err) => ({ cacheError: err }));
-  try {
-    await pump(toSink.getReader(), spec, sink, (n) => onProgress?.(n, false));
-  } catch (err) {
-    await cachePut;
-    await cache.delete(url); // never keep bytes that failed verification
-    throw err;
+  return { reader: toSink.getReader(), fromCache: false, cachePut };
+}
+
+/**
+ * Big-asset lane: stream into `sink`, tee into the cache, verify by stream.
+ * A `spec.parts` array (the GitHub 2 GiB asset-cap split) streams as one
+ * logical byte stream: per-part pins verified as each part completes, the
+ * whole-asset pin at the end. A spec without `parts` is a single-part asset.
+ */
+async function streamWeights(modelId, spec, sink, onProgress) {
+  const cache = await caches.open(CACHE_NAME);
+  const parts = spec.parts ?? [{ name: spec.name, bytes: spec.bytes, sha256: spec.sha256 }];
+  const pump = new WeightsPump(spec, sink, onProgress);
+  const puts = [];
+  for (const part of parts) {
+    const url = assetUrl(modelId, part.name);
+    let src;
+    try {
+      src = await partReader(cache, url);
+      await pump.drain(src.reader, part, src.fromCache);
+    } catch (err) {
+      if (src?.cachePut) await src.cachePut;
+      await cache.delete(url).catch(() => {}); // never keep bytes that failed verification
+      const flavor = src?.fromCache
+        ? `cached ${part.name} failed verification (${err.message}); cache cleared — retry the load`
+        : String(err.message ?? err);
+      throw new Error(flavor);
+    }
+    if (src.cachePut) puts.push({ url, name: part.name, cachePut: src.cachePut });
   }
-  const putResult = await cachePut;
-  if (putResult?.cacheError) {
-    // Cache write failed (quota). The verified stream still reached the sink —
-    // the model runs; it just won't be cached for next time.
-    await cache.delete(url).catch(() => {});
-    console.warn(`cache.put(${spec.name}) failed: ${putResult.cacheError} — model will re-download next visit`);
+  pump.finish();
+  for (const { url, name, cachePut } of puts) {
+    const putResult = await cachePut;
+    if (putResult?.cacheError) {
+      // Cache write failed (quota). The verified stream still reached the sink —
+      // the model runs; it just won't be cached for next time.
+      await cache.delete(url).catch(() => {});
+      console.warn(`cache.put(${name}) failed: ${putResult.cacheError} — model will re-download next visit`);
+    }
   }
 }
 

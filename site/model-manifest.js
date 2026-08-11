@@ -27,16 +27,30 @@ export const MODELS = {
     label: "Baidu Unlimited-OCR (documents → Markdown)",
     license: "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
     // The wasm-only int4 artifact (recipe
-    // unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1): MoE experts
+    // unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1), v2:
+    // calibration-aware quantization (importance-weighted clip search + AWQ
+    // down_proj fold over a 13-page activation-statistics run) — measured
+    // strictly better than the plain-RTN v1 on every corpus page. MoE experts
     // int4 g16/g32, attention/lm_head/embed int8, vision tower bf16. The
     // native CLI keeps its own conservative 4.16 GB artifact — this one is
-    // NEVER a native default; corpus-level CER certification is still in
-    // progress (single-page smoke matches the bf16 reference to one line).
+    // NEVER a native default. Corpus receipts live in docs/DISCREPANCIES.md.
     desktopOnly: true,
+    // The README-documented repetition-guard mitigation (FOCR_NO_REPEAT_NGRAM
+    // analog): hard dense scans can tip the wasm decode into a repeat loop
+    // (measured); the tighter guard is applied at load and labeled honestly —
+    // native users can set the identical knob.
+    decodeGuard: 20,
     weights: {
       name: "unlimited-ocr.wasm-int4.focrq",
       bytes: 3003988117,
-      sha256: "28ac2ca296dda3b32a245652f4240f93410caad18ec23d5a2d8727f58dafe724",
+      sha256: "2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187",
+      // GitHub caps release assets at 2 GiB, so the artifact ships as ordered
+      // byte-split parts; the loader streams them as ONE logical byte stream
+      // and verifies each part AND the whole against these pins.
+      parts: [
+        { name: "unlimited-ocr.wasm-int4.focrq.part1", bytes: 1677721600, sha256: "95e8bc996ef08dc9ff179dba522ee45e953823913dbf73ac710d799627a9b2c5" },
+        { name: "unlimited-ocr.wasm-int4.focrq.part2", bytes: 1326266517, sha256: "1b6673345d1223f6ad4443df3f9c0760b4e401549c731c1c0d0c9e392dffda93" },
+      ],
     },
     sidecars: [
       { name: "tokenizer.json", bytes: 9979544, sha256: "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4" },

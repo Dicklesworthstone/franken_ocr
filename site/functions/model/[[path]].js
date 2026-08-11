@@ -15,7 +15,18 @@ const RELEASES = {
       "tokenizer_note.json",
     ]),
   },
-  // The Unlimited-OCR int4 browser artifact registers here when it ships.
+  "unlimited-ocr": {
+    // The wasm-only int4 artifact (v2, calibration-aware). GitHub caps release
+    // assets at 2 GiB, so the 3.0 GB artifact ships as byte-split parts; the
+    // loader streams them as one logical stream and verifies part + whole
+    // SHA-256 pins from model-manifest.js.
+    base: "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-unlimited-wasm-v1/",
+    files: new Set([
+      "unlimited-ocr.wasm-int4.focrq.part1",
+      "unlimited-ocr.wasm-int4.focrq.part2",
+      "tokenizer.json",
+    ]),
+  },
 };
 
 export async function onRequest({ request, params }) {

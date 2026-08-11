@@ -17,6 +17,7 @@ export const wasmengine_license_notice: (a: number, b: number) => void;
 export const wasmengine_model_id: (a: number, b: number) => void;
 export const wasmengine_recognize: (a: number, b: number, c: number, d: number) => void;
 export const wasmengine_recognize_json: (a: number, b: number, c: number, d: number) => void;
+export const set_no_repeat_ngram: (a: number) => void;
 export const focr_wasm_start: () => void;
 export const request_cancel: () => void;
 export const reset_cancel: () => void;

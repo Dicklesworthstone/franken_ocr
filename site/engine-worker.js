@@ -139,6 +139,11 @@ async function dispatch(data) {
       const model = MODELS[data.model];
       if (!model) throw new Error(`unknown model ${data.model}`);
 
+      // Decode-guard mitigation (labeled in the manifest, README-documented
+      // knob `FOCR_NO_REPEAT_NGRAM`): must be set BEFORE the engine is built;
+      // reset to the engine default when the model declares none.
+      pkg.set_no_repeat_ngram(model.decodeGuard ?? 0);
+
       stage("download");
       // The weight bytes STREAM straight from fetch (or the cache) into wasm
       // staging — Chrome refuses a single multi-GB ArrayBuffer, so they are

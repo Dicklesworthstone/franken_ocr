@@ -3,8 +3,13 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>franken_ocr — pure-Rust OCR engines, now in your browser</title>
-<meta name="description" content="A pure-Rust, CPU-only OCR engine for hand-ported vision-language models. The TrOMR sheet-music model runs fully in your browser — no server, no upload, no Python, no GPU.">
+<title>franken_ocr — Baidu Unlimited-OCR in your browser, pure Rust, no server</title>
+<meta name="description" content="A pure-Rust, CPU-only OCR engine for hand-ported vision-language models. Baidu's 3B-param Unlimited-OCR document model and the TrOMR sheet-music model run fully in your browser — no server, no upload, no Python, no GPU.">
+<meta property="og:title" content="franken_ocr — a 3B-parameter OCR model in your browser tab">
+<meta property="og:description" content="Baidu Unlimited-OCR, hand-ported to Rust, quantized to int4, compiled to WebAssembly. Your documents never leave the page.">
+<meta property="og:image" content="https://franken-ocr.com/assets/og.jpg">
+<meta property="og:url" content="https://franken-ocr.com/">
+<meta name="twitter:card" content="summary_large_image">
 <link rel="stylesheet" href="./assets/css/site.css?v=@SITEV@">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>&#128441;</text></svg>">
 </head>
@@ -27,27 +32,33 @@
 <main>
 
 <section class="hero wrap" id="top">
-  <h1>Neural OCR engines in pure Rust.<br>Now running <em>in this tab</em>.</h1>
+  <h1>A 3-billion-parameter OCR model.<br>Running <em>in this tab</em>.</h1>
   <p class="lede">
     <strong>franken_ocr</strong> hand-ports vision-language models into memory-safe Rust with
     model-specific CPU kernels — no PyTorch, no Python, no CUDA, no GPU, no FFI.
-    The same code that ships as the <code>focr</code> CLI compiles to WebAssembly, so the
-    <strong>Polyphonic-TrOMR sheet-music model runs entirely in your browser</strong>:
-    your image never leaves this page.
+    The same code that ships as the <code>focr</code> CLI compiles to WebAssembly, so
+    <strong>Baidu's Unlimited-OCR document model (int4, 2.8&nbsp;GB) and the TrOMR
+    sheet-music model (58&nbsp;MB) run fully in your browser</strong>: your documents
+    never leave this page — the CSP's <code>connect-src 'self'</code> makes that a
+    browser-enforced promise, not a privacy-policy one.
   </p>
   <p class="cta-row">
-    <a class="btn primary" href="#playground">Try it — sheet music → MusicXML</a>
+    <a class="btn primary" href="#playground">Try it in your browser</a>
     <a class="btn" href="#install">Install the CLI</a>
   </p>
+  <img src="./assets/franken_ocr_illustration.webp" alt="franken_ocr" style="max-width:100%;border-radius:12px;margin-top:2rem" loading="lazy">
 </section>
 
 <section class="wrap" id="playground">
-  <h2>Playground — sheet music → MusicXML</h2>
+  <h2>Playground</h2>
   <p>
-    A 58&nbsp;MB int8 neural OMR model (ResNet-V2 + ViT encoder, four-head autoregressive
-    decoder), quantized and executed by hand-written Rust kernels compiled to wasm.
-    Everything below happens on your CPU, in this tab. The download is verified by
-    SHA-256 against the same pinned manifest the CLI uses, and cached for next time.
+    Two models, both executed by hand-written Rust kernels compiled to wasm, entirely
+    on your CPU, in this tab. <strong>TrOMR</strong> (58&nbsp;MB) turns sheet-music scans
+    into MusicXML and runs anywhere, phones included. <strong>Baidu Unlimited-OCR</strong>
+    (2.8&nbsp;GB int4, desktop browsers) parses document pages into Markdown — expect
+    roughly 1–4 minutes per page depending on density and your core count; on
+    cross-origin-isolated Chrome it decodes across 8 worker threads. Every download is
+    SHA-256-verified against a pinned manifest and cached for next time.
   </p>
 
   <div class="panel">
@@ -144,7 +155,7 @@
   <table>
     <thead><tr><th>Model</th><th>Task</th><th>Size (int8)</th><th>CLI</th><th>Browser</th></tr></thead>
     <tbody>
-      <tr><td><strong>Unlimited-OCR</strong> (Baidu)</td><td>General document OCR → Markdown, tables, LaTeX, layout boxes</td><td>4.16 GB</td><td>✅ default</td><td>🔬 int4 lane in progress<a href="#browser">*</a></td></tr>
+      <tr><td><strong>Unlimited-OCR</strong> (Baidu)</td><td>General document OCR → Markdown, tables, LaTeX, layout boxes</td><td>4.16 GB (CLI) / 2.8 GB int4 (browser)</td><td>✅ default</td><td>✅ this page (desktop)<a href="#browser">*</a></td></tr>
       <tr><td><strong>GOT-OCR2</strong></td><td>Formulas, tables, charts, geometry, molecular</td><td>776 MB</td><td>✅</td><td>possible next</td></tr>
       <tr><td><strong>SmolVLM2</strong></td><td>Photo description / VQA</td><td>1.01 GB</td><td>✅</td><td>—</td></tr>
       <tr><td><strong>OneChart</strong></td><td>Chart → structured data</td><td>346 MB</td><td>✅</td><td>—</td></tr>
@@ -163,20 +174,32 @@
     the <em>built artifact</em> against the native CLI, not asserted from source.
   </p>
   <p>
-    <strong>What runs today:</strong> TrOMR (58 MB) — small enough to be interactive
-    everywhere, phones included, on the serial simd128 build.
+    <strong>TrOMR</strong> (58 MB) is small enough to be interactive everywhere, phones
+    included, on the serial simd128 build.
   </p>
   <p>
-    <strong>What's in progress:</strong> the Baidu Unlimited-OCR lane. The shipped int8
-    artifact is 4.16 GB — over wasm's 4 GiB memory ceiling before the first activation
-    is allocated. Getting it into a tab requires a more aggressive, carefully-damage-
-    controlled quantization: int4 (group-16) on the MoE expert bulk with
-    error-compensated rounding and activation-aware scale folding, int8 everywhere else
-    that stays resident. That lands at roughly 2.3 GB — a desktop-Chrome-class download
-    in the same spirit as <a href="https://frankentts.com">frankentts</a>' 2 GB in-browser
-    TTS. It ships when — and only when — the quantized artifact passes the same corpus
-    error budgets the native release gates on. No preview toggles, no silently degraded
-    output.
+    <strong>Unlimited-OCR took five walls to get here.</strong> The CLI's int8 artifact
+    is 4.16 GB — over wasm's 4 GiB ceiling — so the browser gets a wasm-only recipe:
+    int4 (group-16/32) on the MoE expert bulk with importance-weighted clip search and
+    activation-aware scale folding calibrated on real scanned pages, int8 on everything
+    else resident, vision tower kept bf16. That's 2.8 GB. Then: runtime residency work
+    (streamed per-block vision hydration, int8-resident embeddings — 5.7 → 3.6 GB peak);
+    wasm32's 2 GiB single-allocation cap (the blob loads as segments cut at tensor
+    boundaries); Chrome's refusal of multi-GB ArrayBuffers (weights stream from fetch
+    into wasm memory, hashed incrementally, never materialized in JS); and a
+    shared-memory threaded build (8 workers) beside a serial fallback for WebKit.
+  </p>
+  <p>
+    <strong>Honest numbers, not marketing:</strong> on a 7-page corpus of repo fixtures
+    and real 1870s–80s archive.org scans, the browser output is character-identical to
+    the native CLI running the same artifact on 6 of 7 pages; the hardest dense
+    newsprint page shows platform f32 drift (documented, with the same repetition-guard
+    mitigation the CLI manual describes applied and labeled). Quantization fidelity vs
+    the bf16 reference decode: exact-to-CER≤0.008 on clean pages, with a measured tail
+    on degraded newsprint — the full receipts live in the repo's
+    <a href="https://github.com/Dicklesworthstone/franken_ocr/blob/main/docs/DISCREPANCIES.md">discrepancies ledger</a>.
+    A page takes 1–4 minutes in-tab. The CLI is faster and certified deeper; the tab
+    needs zero installation and sends nothing anywhere.
   </p>
 </section>
 

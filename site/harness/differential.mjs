@@ -22,10 +22,10 @@ const S =
   "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/1a1fb67b-0a94-4cac-a2d8-53dc6a100500/scratchpad";
 const PORT = Number(process.env.PORT ?? 8941);
 const MODEL_DIR = process.env.FOCR_MODEL_DIR ?? join(S, "models-www");
-const PROFILE_DIR = join(S, "chrome-profile-diff");
+const PROFILE_DIR = join(S, process.env.FOCR_DIFF_PROFILE ?? "chrome-profile-diff");
 const OUT_DIR = join(S, "corpus", "browser");
 const IMG_DIR = join(S, "corpus", "images");
-const NATIVE_DIR = join(S, "corpus", "native_int4");
+const NATIVE_DIR = join(S, "corpus", process.env.FOCR_DIFF_NATIVE ?? "native_int4");
 mkdirSync(OUT_DIR, { recursive: true });
 
 const MANIFEST = JSON.parse(readFileSync(join(S, "corpus", "MANIFEST.json"), "utf8"));
@@ -226,7 +226,7 @@ try {
   failed = err;
   report.fatal = String(err?.stack ?? err);
 } finally {
-  writeFileSync(join(OUT_DIR, "REPORT.json"), JSON.stringify(report, null, 2));
+  writeFileSync(join(OUT_DIR, process.env.FOCR_DIFF_REPORT ?? "REPORT.json"), JSON.stringify(report, null, 2));
   await context.close();
   server.kill();
 }

@@ -386,6 +386,21 @@ export function reset_cancel() {
 }
 
 /**
+ * Set (or clear, with `0`) the sliding no-repeat n-gram decode guard for the
+ * NEXT engine built by [`WasmEngine::from_staging`] — the browser analog of
+ * `--no-repeat-ngram` / `FOCR_NO_REPEAT_NGRAM`. The README documents a
+ * tighter guard (20 vs the default 35) as the mitigation for degenerate
+ * repetition loops on hard dense pages; the measured in-browser failure on
+ * such a page (an f32-drift-tipped repeat attractor) is the same class. This
+ * is a mitigation the native CLI user can apply identically — not a silent
+ * numerics change: the site labels the lane's guard setting.
+ * @param {number} n
+ */
+export function set_no_repeat_ngram(n) {
+    wasm.set_no_repeat_ngram(n);
+}
+
+/**
  * Rayon's *actual* worker count in this module right now.
  *
  * This is the honest test of the threaded lane: the build flags, the presence
