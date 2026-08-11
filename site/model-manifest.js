@@ -23,9 +23,25 @@ export const MODELS = {
       { name: "tokenizer_note.json", bytes: 830, sha256: "504d886d11e3c1fe92893abd46edfc68dfbe7a8eb83e6b51646532dad8a485e1" },
     ],
   },
-  // The Unlimited-OCR desktop lane ships here when the int4 browser artifact
-  // passes its accuracy gates (see the roadmap section on the page). Entry
-  // deliberately absent until the artifact exists — no placeholder downloads.
+  "unlimited-ocr": {
+    label: "Baidu Unlimited-OCR (documents → Markdown)",
+    license: "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
+    // The wasm-only int4 artifact (recipe
+    // unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1): MoE experts
+    // int4 g16/g32, attention/lm_head/embed int8, vision tower bf16. The
+    // native CLI keeps its own conservative 4.16 GB artifact — this one is
+    // NEVER a native default; corpus-level CER certification is still in
+    // progress (single-page smoke matches the bf16 reference to one line).
+    desktopOnly: true,
+    weights: {
+      name: "unlimited-ocr.wasm-int4.focrq",
+      bytes: 3003988117,
+      sha256: "28ac2ca296dda3b32a245652f4240f93410caad18ec23d5a2d8727f58dafe724",
+    },
+    sidecars: [
+      { name: "tokenizer.json", bytes: 9979544, sha256: "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4" },
+    ],
+  },
 };
 
 export function totalBytes(model) {

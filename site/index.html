@@ -52,7 +52,11 @@
 
   <div class="panel">
     <div class="row spread">
-      <div>
+      <div class="row">
+        <select id="model-select" class="btn">
+          <option value="tromr">TrOMR — sheet music → MusicXML (58 MB)</option>
+          <option value="unlimited-ocr">Baidu Unlimited-OCR — documents → Markdown (2.8 GB, desktop)</option>
+        </select>
         <button id="load-model" class="btn primary" disabled>Load model (<span id="model-size">…</span>)</button>
         <button id="clear-cache" class="btn subtle">Clear cache</button>
       </div>
@@ -60,7 +64,7 @@
     </div>
 
     <div id="consent" class="consent" hidden>
-      <p>This downloads the <strong>58&nbsp;MB</strong> TrOMR model into your browser's cache.
+      <p id="consent-text">This downloads the model into your browser's cache.
       After that it works offline. Continue?</p>
       <button id="consent-yes" class="btn primary">Download</button>
       <button id="consent-no" class="btn">Not now</button>
@@ -75,7 +79,7 @@
     <div id="reset-hint" hidden class="kv">Something crashed last time — <a href="./reset.html">reset page</a>.</div>
 
     <div id="drop" class="drop">
-      <span id="drop-hint">Drop a sheet-music image here (PNG/JPEG), click to pick,
+      <span id="drop-hint">Drop an image here (PNG/JPEG), click to pick,
         or paste from the clipboard. <button id="sample" class="btn subtle">Use a sample scan</button></span>
       <div class="preview-stack">
         <img id="preview" alt="input preview" hidden>
@@ -92,7 +96,7 @@
     <div id="result-wrap" hidden>
       <div class="row spread">
         <div id="result-meta" class="kv"></div>
-        <button id="download-xml" class="btn" hidden>Download .musicxml</button>
+        <button id="download-xml" class="btn" hidden>Download result</button>
       </div>
       <ul id="warnings" class="warnings"></ul>
       <pre id="output" class="output"></pre>

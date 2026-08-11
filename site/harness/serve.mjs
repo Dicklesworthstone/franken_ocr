@@ -59,7 +59,7 @@ createServer((req, res) => {
       res.writeHead(503).end("FOCR_MODEL_DIR not set");
       return;
     }
-    const file = join(MODEL_DIR, m[2]);
+    const file = join(MODEL_DIR, m[1], m[2]);
     if (!existsSync(file)) {
       res.writeHead(404).end("no such model file");
       return;

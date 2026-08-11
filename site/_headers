@@ -1,12 +1,16 @@
 # Cloudflare Pages headers.
 #
-# COOP/COEP are set now even though the current serial wasm build doesn't need
-# them: they cost nothing, enable fine timers, and mean the future threaded
-# (SharedArrayBuffer) Unlimited-OCR build ships without a headers migration.
+# COOP/COEP are what make `crossOriginIsolated` (hence `SharedArrayBuffer`, hence
+# site/pkg-threaded) available at all; they also cost nothing and enable fine
+# timers for the serial lane.
 #
 # CSP: connect-src 'self' is the enforceable form of "your image never leaves
 # this page". 'wasm-unsafe-eval' is required for WebAssembly.compileStreaming;
 # 'unsafe-eval' rides along because Safari only learned the wasm token in 16.4.
+# worker-src needs blob: for the threaded lane: wasm-bindgen-rayon's no-bundler
+# helper self-spawns each rayon worker from a blob URL of its own script (so the
+# module still works when served from a CDN origin). Without blob: the pool
+# silently fails to arm.
 #
 # Cache-control: every hand-written script is listed LITERALLY with no-cache
 # (Pages splats must end a pattern); the @SITEV@ stamp in every script URL is
@@ -15,7 +19,7 @@
 /*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
 
 /index.html
@@ -31,6 +35,8 @@
 /reset.html
   Cache-Control: no-cache
 /pkg/*
+  Cache-Control: no-cache
+/pkg-threaded/*
   Cache-Control: no-cache
 /model/*
   Cache-Control: public, max-age=31536000, immutable

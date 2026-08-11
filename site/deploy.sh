@@ -10,16 +10,21 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-if [ ! -f pkg/focr_wasm_bg.wasm ]; then
-    echo "site/pkg is missing — run site/build.sh first" >&2
-    exit 1
-fi
-# Freshness gate: refuse to ship a wasm artifact older than the crate source.
-newest_src=$(find ../focr-wasm/src ../src -name '*.rs' -newer pkg/focr_wasm_bg.wasm | head -1)
-if [ -n "$newest_src" ]; then
-    echo "STALE ARTIFACT: $newest_src is newer than site/pkg/focr_wasm_bg.wasm — run site/build.sh" >&2
-    exit 1
-fi
+# BOTH lanes must ship together: engine-worker.js picks site/pkg-threaded at
+# runtime on cross-origin-isolated Blink, so a deploy carrying only site/pkg
+# would 404 the module for every desktop Chrome visitor.
+for lane in pkg pkg-threaded; do
+    if [ ! -f "$lane/focr_wasm_bg.wasm" ]; then
+        echo "site/$lane is missing — run site/build.sh first" >&2
+        exit 1
+    fi
+    # Freshness gate: refuse to ship a wasm artifact older than the crate source.
+    newest_src=$(find ../focr-wasm/src ../src -name '*.rs' -newer "$lane/focr_wasm_bg.wasm" | head -1)
+    if [ -n "$newest_src" ]; then
+        echo "STALE ARTIFACT: $newest_src is newer than site/$lane/focr_wasm_bg.wasm — run site/build.sh" >&2
+        exit 1
+    fi
+done
 
 VERSION="$(git rev-parse --short HEAD)-$(date +%s)"
 STAGE="$(mktemp -d)"

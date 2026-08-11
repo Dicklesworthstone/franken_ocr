@@ -20,8 +20,74 @@ const serialize = (e) => {
   queue = queue.then(() => handleMessage(e)).catch(() => {});
 };
 
-const PKG = "./pkg/focr_wasm.js";
+// ── threaded-lane selection ─────────────────────────────────────────────────
+//
+// Two modules ship (site/build.sh): `pkg` is serial with an unshared memory,
+// `pkg-threaded` is linked `--shared-memory --import-memory` with atomics and
+// carries wasm-bindgen-rayon's worker pool. Sharedness is a LINK-TIME property,
+// so this is a choice of module, not a flag.
+//
+// The choice is an ALLOW-LIST, not feature detection. `SharedArrayBuffer` also
+// exists on iOS/WebKit under COOP/COEP, but growing a shared memory toward 2 GB
+// kills the tab there — the Unlimited artifact is 2.8 GB. So: Blink only, and
+// only when actually cross-origin isolated.
+const THREADED_PKG_DIR = "./pkg-threaded";
+const SERIAL_PKG_DIR = "./pkg";
 
+function blinkAllowsThreads() {
+  if (typeof SharedArrayBuffer !== "function") return false;
+  if (self.crossOriginIsolated !== true) return false;
+  const ua = self.navigator?.userAgent ?? "";
+  // Every iOS browser is WebKit under the skin, whatever the brand in the UA.
+  if (/iPhone|iPad|iPod|CriOS|FxiOS|EdgiOS/.test(ua)) return false;
+  // Desktop Safari: AppleWebKit with no Chrome/ token.
+  return /Chrom(e|ium)\/\d/.test(ua);
+}
+
+// The rayon workers are spawned from a blob URL of wasm-bindgen-rayon's own
+// helper script. A `worker-src` CSP without `blob:` kills that — and it would
+// kill it AFTER the 2.8 GB model is staged, when falling back is ruinous. So
+// prove the blob-module-worker path with a byte-sized canary at init time,
+// before a single weight byte is downloaded.
+async function blobModuleWorkerWorks() {
+  let url;
+  try {
+    url = URL.createObjectURL(
+      new Blob(["self.postMessage('ok');"], { type: "text/javascript" }),
+    );
+    const w = new Worker(url, { type: "module" });
+    try {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("canary worker timeout")), 5000);
+        w.onmessage = () => {
+          clearTimeout(timer);
+          resolve();
+        };
+        w.onerror = (e) => {
+          clearTimeout(timer);
+          reject(new Error(e.message ?? "canary worker error"));
+        };
+      });
+      return true;
+    } finally {
+      w.terminate();
+    }
+  } catch {
+    return false;
+  } finally {
+    if (url) URL.revokeObjectURL(url);
+  }
+}
+
+// Leave one core for the page/worker that drives the pool, and stop at 8: past
+// that the m=1 GEMV blocks get too small to pay for the dispatch.
+function targetThreads() {
+  return Math.max(1, Math.min((self.navigator?.hardwareConcurrency ?? 4) - 1, 8));
+}
+
+let pkgDir = SERIAL_PKG_DIR;
+let threaded = false; // the loaded module is the shared-memory one
+let threads = 1; // rayon's ACTUAL worker count, straight from rayon
 let pkg = null;
 let engine = null; // WasmEngine
 let modelId = null;
@@ -49,12 +115,23 @@ async function dispatch(data) {
   switch (data.type) {
     case "init": {
       stage("init");
-      pkg = await import(`${PKG}?v=@SITEV@`);
+      const wantThreads = blinkAllowsThreads() && (await blobModuleWorkerWorks());
+      pkgDir = wantThreads ? THREADED_PKG_DIR : SERIAL_PKG_DIR;
+      pkg = await import(`${pkgDir}/focr_wasm.js?v=@SITEV@`);
       const module = await WebAssembly.compileStreaming(
-        fetch(`./pkg/focr_wasm_bg.wasm?v=@SITEV@`),
+        fetch(`${pkgDir}/focr_wasm_bg.wasm?v=@SITEV@`),
       );
       await pkg.default({ module_or_path: module });
-      return { info: JSON.parse(pkg.engine_info()) };
+      // The build flags are a claim; the instantiated memory is the receipt.
+      // A "threaded" module whose memory is a plain ArrayBuffer would run, and
+      // run single-threaded, and never say so.
+      threaded =
+        wantThreads && pkg.wasm_memory().buffer instanceof SharedArrayBuffer;
+      if (wantThreads && !threaded) {
+        throw new Error("pkg-threaded instantiated with a non-shared memory");
+      }
+      threads = 1; // the pool is armed after hydration, never before
+      return { info: JSON.parse(pkg.engine_info()), pkg: pkgDir, threaded };
     }
     case "load": {
       const { MODELS } = await import(`./model-manifest.js?v=@SITEV@`);
@@ -63,21 +140,47 @@ async function dispatch(data) {
       if (!model) throw new Error(`unknown model ${data.model}`);
 
       stage("download");
-      let lastPct = -1;
-      const { weights, sidecars } = await loadModel(data.model, model, (loaded, total, fromCache) => {
-        const pct = Math.floor((loaded / total) * 100);
-        if (pct !== lastPct) {
-          lastPct = pct;
-          post({ type: "progress", loaded, total, fromCache });
-        }
-      });
-
-      stage("stage-weights");
+      // The weight bytes STREAM straight from fetch (or the cache) into wasm
+      // staging — Chrome refuses a single multi-GB ArrayBuffer, so they are
+      // never materialized JS-side (loader.js owns hashing + caching).
+      //
+      // Two-phase staging (bd-syf2): wasm32 caps ONE allocation at 2 GiB, so a
+      // multi-GB artifact is cut into ≤1 GiB segments AT TENSOR BOUNDARIES.
+      // plan() reads the artifact's own header out of the streamed 4 MiB
+      // prefix to find those boundaries; push() then appends in order.
       const staging = new pkg.ModelStaging();
-      staging.reserve(weights.byteLength);
-      const SLICE = 16 * 1024 * 1024;
-      for (let off = 0; off < weights.byteLength; off += SLICE) {
-        staging.push(weights.subarray(off, Math.min(off + SLICE, weights.byteLength)));
+      const sink = {
+        begin: (prefix, totalBytes) => {
+          let plan = JSON.parse(staging.plan(prefix, totalBytes));
+          if (plan.status === "need_prefix") {
+            const need = Number(plan.need_bytes);
+            if (need > prefix.byteLength) {
+              throw new Error(
+                `staging.plan needs a ${need}-byte header prefix but only ${prefix.byteLength} bytes streamed`,
+              );
+            }
+            plan = JSON.parse(staging.plan(prefix.subarray(0, need), totalBytes));
+          }
+          if (plan.status !== "planned") throw new Error(`staging.plan: ${plan.status}`);
+          post({ type: "plan", segments: plan.segments });
+          staging.push(prefix);
+        },
+        push: (chunk) => staging.push(chunk),
+      };
+
+      let lastPct = -1;
+      let sidecars;
+      try {
+        ({ sidecars } = await loadModel(data.model, model, sink, (loaded, total, fromCache) => {
+          const pct = Math.floor((loaded / total) * 100);
+          if (pct !== lastPct) {
+            lastPct = pct;
+            post({ type: "progress", loaded, total, fromCache });
+          }
+        }));
+      } catch (err) {
+        staging.free(); // never keep unverified bytes staged
+        throw err;
       }
       for (const s of sidecars) staging.set_sidecar(s.name, s.bytes);
 
@@ -88,11 +191,26 @@ async function dispatch(data) {
       }
       engine = pkg.WasmEngine.from_staging(staging);
       modelId = engine.model_id();
+
+      // ARM THE POOL ONLY NOW. A rayon worker parked in `Atomics.wait` blocks a
+      // shared-memory `grow`, and everything above this line — staging the
+      // segments, hydrating the engine — is nothing but grows. Arming before
+      // hydration deadlocks the load; arming after costs nothing.
+      if (threaded && threads === 1) {
+        stage("threads");
+        await pkg.initThreadPool(targetThreads());
+        // rayon's own count, not the number we asked for.
+        threads = pkg.thread_count();
+      }
+
       stage("ready");
       return {
         model_id: modelId,
         license: engine.license_notice(),
         route: pkg.int8_route(),
+        threads,
+        threaded,
+        pkg: pkgDir,
       };
     }
     case "recognize": {

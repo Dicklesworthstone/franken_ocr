@@ -727,6 +727,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1093,8 +1102,10 @@ dependencies = [
  "franken_ocr",
  "image",
  "js-sys",
+ "rayon",
  "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-rayon",
 ]
 
 [[package]]
@@ -1165,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-core",
  "fsqlite-error",
@@ -1180,7 +1191,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ast"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-types",
  "smallvec",
@@ -1188,7 +1199,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-btree"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "foldhash",
  "fsqlite-error",
@@ -1204,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1240,14 +1251,14 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-error"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "fsqlite-ext-fts5"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1258,7 +1269,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-icu"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1268,7 +1279,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-json"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1279,7 +1290,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-misc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1291,7 +1302,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-ext-rtree"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-error",
  "fsqlite-func",
@@ -1300,7 +1311,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-func"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "fsqlite-error",
@@ -1310,7 +1321,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-mvcc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "blake3",
@@ -1334,7 +1345,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-observability"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-types",
  "parking_lot",
@@ -1344,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-pager"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "asupersync",
@@ -1367,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-parser"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "fsqlite-ast",
  "fsqlite-error",
@@ -1379,7 +1390,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-planner"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "blake3",
  "fsqlite-ast",
@@ -1395,7 +1406,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-types"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "bitflags",
@@ -1413,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vdbe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "crossbeam-deque",
@@ -1434,7 +1445,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-vfs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "advisory-lock",
  "asupersync",
@@ -1451,7 +1462,7 @@ dependencies = [
 
 [[package]]
 name = "fsqlite-wal"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "asupersync",
  "blake3",
@@ -2677,6 +2688,7 @@ checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
 dependencies = [
  "either",
  "rayon-core",
+ "wasm_sync",
 ]
 
 [[package]]
@@ -2687,6 +2699,7 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+ "wasm_sync",
 ]
 
 [[package]]
@@ -3411,12 +3424,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "wasm-bindgen-rayon"
+version = "1.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a16c60a56c81e4dc3b9c43d76ba5633e1c0278211d59a9cb07d61b6cd1c6583"
+dependencies = [
+ "crossbeam-channel",
+ "js-sys",
+ "rayon",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "wasm-bindgen-shared"
 version = "0.2.126"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1b4cb0cc549fcf58d7dfc081778139b3d283a081644e833e84682ad71cea24"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm_sync"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cff360cade7fec41ff0e9d2cda57fe58258c5f16def0e21302394659e6bbb0ea"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

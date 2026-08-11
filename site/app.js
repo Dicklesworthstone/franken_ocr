@@ -51,8 +51,8 @@ worker.onmessage = ({ data }) => {
 worker.onerror = (e) => setStatus(`worker error: ${e.message}`, "err");
 
 // ── UI state ────────────────────────────────────────────────────────────────
-const MODEL_ID = "tromr";
-const model = MODELS[MODEL_ID];
+let modelId = "tromr";
+let model = MODELS[modelId];
 let engineReady = false;
 let busy = false;
 let currentImage = null; // {bytes: ArrayBuffer, url: objectURL, name}
@@ -91,9 +91,33 @@ function onProgress({ loaded, total, fromCache }) {
     (rate > 0 ? ` — ${fmtMB(rate)} MB/s${eta !== null ? `, ~${eta}s left` : ""}` : "");
 }
 
+// ── model selection ─────────────────────────────────────────────────────────
+function refreshModelUi() {
+  const mb = totalBytes(model) / 1048576;
+  $("model-size").textContent = mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(0)} MB`;
+  $("consent-text").textContent =
+    `This downloads the ${$("model-size").textContent} ${model.label} model into your ` +
+    `browser's cache. After that it works offline.` +
+    (model.desktopOnly
+      ? " It needs ~3.5 GB of memory — desktop browsers only, and the download is large."
+      : "") +
+    " Continue?";
+}
+
+$("model-select").addEventListener("change", (e) => {
+  modelId = e.target.value;
+  model = MODELS[modelId];
+  engineReady = false; // a different model must be loaded before running
+  $("load-model").disabled = false;
+  $("consent").hidden = true;
+  refreshModelUi();
+  setStatus(`Selected ${model.label}. Load the model to begin.`);
+  refreshRunButton();
+});
+
 // ── boot ────────────────────────────────────────────────────────────────────
 async function boot() {
-  $("model-size").textContent = `${fmtMB(totalBytes(model))} MB`;
+  refreshModelUi();
   if (lastCrumb && ["download", "stage-weights", "hydrate"].includes(lastCrumb)) {
     setStatus(
       `The last visit ended during "${lastCrumb}". If this keeps happening, use the reset page.`,
@@ -124,11 +148,11 @@ $("consent-yes").addEventListener("click", async () => {
   $("consent").hidden = true;
   setStatus("Downloading + verifying model…");
   try {
-    const r = await call("load", { model: MODEL_ID });
+    const r = await call("load", { model: modelId });
     engineReady = true;
     $("progress-wrap").hidden = true;
     $("license").textContent = r.license;
-    setStatus(`Model ready (${r.model_id}, int8 route: ${r.route}). Drop a sheet-music image.`, "ok");
+    setStatus(`Model ready (${r.model_id}, int8 route: ${r.route}). Drop an image.`, "ok");
     $("drop").classList.add("armed");
     refreshRunButton();
   } catch (err) {
@@ -176,9 +200,10 @@ document.addEventListener("paste", (e) => {
   if (item) acceptFile(item.getAsFile());
 });
 $("sample").addEventListener("click", async () => {
-  const resp = await fetch(`./assets/sample-staff.png?v=@SITEV@`);
+  const name = modelId === "tromr" ? "sample-staff.png" : "sample-doc.png";
+  const resp = await fetch(`./assets/${name}?v=@SITEV@`);
   const blob = await resp.blob();
-  acceptFile(new File([blob], "sample-staff.png", { type: "image/png" }));
+  acceptFile(new File([blob], name, { type: "image/png" }));
 });
 
 function showPreview() {
@@ -271,10 +296,14 @@ function drawOverlay(music) {
 
 $("download-xml").addEventListener("click", () => {
   if (!lastResult) return;
-  const blob = new Blob([lastResult.output], { type: "application/vnd.recordare.musicxml+xml" });
+  const isMusic = lastResult.model_id === "tromr";
+  const blob = new Blob([lastResult.output], {
+    type: isMusic ? "application/vnd.recordare.musicxml+xml" : "text/markdown",
+  });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
-  a.download = (currentImage?.name?.replace(/\.[^.]+$/, "") || "score") + ".musicxml";
+  a.download =
+    (currentImage?.name?.replace(/\.[^.]+$/, "") || "output") + (isMusic ? ".musicxml" : ".md");
   a.click();
   URL.revokeObjectURL(a.href);
 });
