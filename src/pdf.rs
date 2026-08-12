@@ -1337,6 +1337,191 @@ mod tests {
     /// A minimal one-page PDF whose only object is a single image XObject — the
     /// shared scaffold for the round-trip tests. `image_xobject` is `None` for a
     /// page with no image (the vector/text case).
+    /// A synthetic document whose pages each either carry a full-page image or
+    /// carry none. An image-free page is exactly the "born-digital vector page"
+    /// the renderer refuses, so this builds a document with real skips in it
+    /// without needing a JPEG-2000 fixture.
+    fn build_multi_page_pdf(pages_spec: &[Option<lopdf::Stream>]) -> std::path::PathBuf {
+        use lopdf::{Object, dictionary};
+
+        let mut doc = lopdf::Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let mut kids: Vec<Object> = Vec::new();
+        for image_xobject in pages_spec {
+            let resources = match image_xobject.clone() {
+                Some(stream) => {
+                    let image_id = doc.add_object(stream);
+                    dictionary! { "XObject" => dictionary! { "Im0" => image_id } }
+                }
+                None => dictionary! {},
+            };
+            let resources_id = doc.add_object(resources);
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Resources" => resources_id,
+                "MediaBox" => vec![0_i64.into(), 0_i64.into(), 100_i64.into(), 100_i64.into()],
+            });
+            kids.push(page_id.into());
+        }
+        let count = i64::try_from(pages_spec.len()).expect("page count fits");
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => count,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "focr_pdf_walk_{}_{}.pdf",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        doc.save(&path).expect("save synthesized pdf");
+        path
+    }
+
+    /// A small JPEG image XObject, the "this page is a scan" case.
+    fn jpeg_xobject() -> lopdf::Stream {
+        use image::{ImageBuffer, Rgb};
+        use lopdf::{Stream, dictionary};
+        use std::io::Cursor;
+
+        let (w, h) = (16u32, 12u32);
+        let src = DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, _| {
+            Rgb([(x * 16) as u8, 64, 128])
+        }));
+        let mut jpeg = Vec::new();
+        src.write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .expect("encode jpeg");
+        Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => i64::from(w),
+                "Height" => i64::from(h),
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        )
+        .with_compression(false)
+    }
+
+    #[test]
+    fn walk_reads_every_readable_page_and_skips_the_rest_with_reasons() {
+        // Page 2 has no image: the renderer refuses it, and the walk must carry
+        // on — one bad page in a book cannot cost the other pages.
+        let path = build_multi_page_pdf(&[Some(jpeg_xobject()), None, Some(jpeg_xobject())]);
+        let pages = PdfPages::open(&path).expect("open");
+        let selected = select_pages(None, pages.len()).expect("all pages");
+
+        let mut events: Vec<String> = Vec::new();
+        let outcome = walk_document(
+            &pages,
+            &selected,
+            |page, image| {
+                assert!(image.width() > 0, "page {page} rasterized");
+                Ok((format!("text of page {page}"), Vec::new()))
+            },
+            &mut |event| match event {
+                DocumentEvent::PageStarted {
+                    page,
+                    index,
+                    selected,
+                } => {
+                    events.push(format!("start {page} ({index}/{selected})"));
+                }
+                DocumentEvent::PageDone(p) => events.push(format!("done {}", p.page)),
+                DocumentEvent::PageSkipped(s) => events.push(format!("skip {}", s.page)),
+            },
+        )
+        .expect("walk succeeds when at least one page reads");
+
+        assert_eq!(outcome.total_pages, 3);
+        assert_eq!(
+            outcome.pages.iter().map(|p| p.page).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(outcome.skipped[0].page, 2);
+        assert!(
+            !outcome.skipped[0].reason.is_empty(),
+            "a skip must carry the engine's reason"
+        );
+        assert_eq!(outcome.markdown(), "text of page 1\n\ntext of page 3");
+        // Observed in source order, one start per attempted page.
+        assert_eq!(
+            events,
+            vec![
+                "start 1 (0/3)".to_string(),
+                "done 1".into(),
+                "start 2 (1/3)".into(),
+                "skip 2".into(),
+                "start 3 (2/3)".into(),
+                "done 3".into(),
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn walk_aborts_immediately_on_a_document_level_failure() {
+        let path = build_multi_page_pdf(&[Some(jpeg_xobject()), Some(jpeg_xobject())]);
+        let pages = PdfPages::open(&path).expect("open");
+        let selected = select_pages(None, pages.len()).expect("all pages");
+
+        let mut attempts = 0usize;
+        let err = walk_document(
+            &pages,
+            &selected,
+            |_page, _image| {
+                attempts += 1;
+                Err(FocrError::ModelNotFound("no model".into()))
+            },
+            &mut |_| {},
+        )
+        .expect_err("a missing model ends the run");
+
+        assert!(matches!(err, FocrError::ModelNotFound(_)), "got {err:?}");
+        // The point of the classification: it must NOT grind through the rest of
+        // the book reporting one skip per page.
+        assert_eq!(
+            attempts, 1,
+            "aborted on the first page, not after all of them"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn walk_with_no_readable_page_errors_with_the_first_reason() {
+        let path = build_multi_page_pdf(&[None, None]);
+        let pages = PdfPages::open(&path).expect("open");
+        let selected = select_pages(None, pages.len()).expect("all pages");
+
+        let err = walk_document(
+            &pages,
+            &selected,
+            |_page, _image| Ok((String::new(), Vec::new())),
+            &mut |_| {},
+        )
+        .expect_err("nothing readable");
+        assert!(matches!(err, FocrError::InputDecode(_)), "got {err:?}");
+        // "nothing worked" still has to say WHY.
+        assert!(!err.to_string().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn build_single_page_pdf(image_xobject: Option<lopdf::Stream>) -> std::path::PathBuf {
         use lopdf::{Object, dictionary};
 
