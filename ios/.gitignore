@@ -8,3 +8,8 @@ FrankenOCR.xcodeproj/
 xcuserdata/
 *.xcworkspace/xcuserdata/
 DerivedData/
+
+# Simulator screenshots taken while verifying a change (`xcrun simctl io …
+# screenshot`). Each is a couple of megabytes and none of them is source.
+# Matched here rather than relying on a narrower root-level rule.
+.*.png
