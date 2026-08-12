@@ -3542,6 +3542,73 @@ mod tests {
         Ok(())
     }
 
+    /// bd-K2 acceptance: hoisting the streamed lane's per-block hydration OUT
+    /// of the view loop (views-inner [`forward_core_views`]) reproduces the
+    /// views-outer nest ([`forward_core`], one hydration sweep per view)
+    /// BIT-FOR-BIT. `block_at` hands out an OWNED clone per request, exactly as
+    /// [`forward_streamed_views`] hands out a freshly dequantized block, and
+    /// `low_mem = true` selects the same bounded global-attention kernel the
+    /// streamed lane uses.
+    #[test]
+    fn streamed_views_inner_equals_views_outer_byte_for_byte() -> FocrResult<()> {
+        let h = 240;
+        let win = 240;
+        let gh = h / PATCH;
+        let gw = win / PATCH;
+        let w = tiny_weights_nontrivial(gh, gw);
+        // The "streamed" head: block-free, blocks arrive from `block_at`.
+        let mut head = tiny_weights_nontrivial(gh, gw);
+        head.blocks = Vec::new();
+        let blocks = w.blocks.clone();
+        let mut hydrate = |i: usize| -> FocrResult<std::borrow::Cow<'static, BlockP>> {
+            Ok(std::borrow::Cow::Owned(blocks[i].clone()))
+        };
+
+        // Two same-size views (the deployed unlimited page) plus a smaller one,
+        // so per-view geometry (rel-pos interpolation on the global blocks) is
+        // exercised too.
+        let small = 128usize;
+        let views = [
+            nontrivial_image(h, win, 1),
+            nontrivial_image(h, win, 2),
+            nontrivial_image(small, small, 3),
+        ];
+        let dims = [(h, win), (h, win), (small, small)];
+
+        // views-outer: a full hydration sweep per view (the old shape).
+        let mut per_view = Vec::new();
+        for (view, &(vh, vw)) in views.iter().zip(dims.iter()) {
+            per_view.push(forward_core(
+                &head,
+                view,
+                vh,
+                vw,
+                DEPTH,
+                &mut hydrate,
+                true,
+            )?);
+        }
+
+        // views-inner: ONE hydration sweep, every view through each block.
+        let refs: Vec<&Mat> = views.iter().collect();
+        let hoisted = forward_core_views(&head, &refs, &dims, DEPTH, &mut hydrate, true)?;
+
+        assert_eq!(hoisted.len(), per_view.len());
+        for (i, (outer, inner)) in per_view.iter().zip(hoisted.iter()).enumerate() {
+            assert_eq!(outer.shape(), inner.shape(), "view {i} shape");
+            assert_eq!(
+                outer.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                inner.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                "view {i}: hydration-hoisted SAM must be bit-identical to per-view"
+            );
+        }
+        // Non-degeneracy + the views really differ (a cross-view leak or a
+        // stale activation would otherwise pass trivially).
+        assert!(per_view[0].data.iter().any(|&v| v != 0.0));
+        assert_ne!(per_view[0].data, per_view[1].data);
+        Ok(())
+    }
+
     #[test]
     fn batched_sam_rejects_ragged_and_empty() {
         let h = 32;

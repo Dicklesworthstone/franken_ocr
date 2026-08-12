@@ -1476,12 +1476,11 @@ mod tests {
     /// forward ([`clip_weights_from_with`] + [`forward_from_sam`]) on a small
     /// synthetic tower — proving the wasm-lane residency mode changes WHERE
     /// weights live, never a single output bit.
-    #[test]
-    fn streamed_clip_forward_is_bit_identical_to_cached() {
-        let cfg = tiny_cfg();
+    /// The small synthetic `model.vision_model.*` tower the streamed-parity
+    /// gates run on (`num_positions = num_patches + 1`, so no abs-pos interp).
+    fn synth_clip_tower(cfg: &ClipConfig, num_patches: usize) -> Weights {
         let dim = cfg.hidden_size;
-        let num_patches = 4usize;
-        let num_positions = num_patches + 1; // no abs-pos interpolation needed
+        let num_positions = num_patches + 1;
         let p = "model.vision_model";
 
         let mut b = FocrqBuilder::new();
@@ -1547,7 +1546,15 @@ mod tests {
             );
             add(format!("{base}.mlp.fc2.bias"), vec![dim], salt + 12);
         }
-        let weights = Weights::from_bytes(b.build()).expect("synthetic tower parses");
+        Weights::from_bytes(b.build()).expect("synthetic tower parses")
+    }
+
+    #[test]
+    fn streamed_clip_forward_is_bit_identical_to_cached() {
+        let cfg = tiny_cfg();
+        let dim = cfg.hidden_size;
+        let num_patches = 4usize;
+        let weights = synth_clip_tower(&cfg, num_patches);
 
         // Channel-major SAM x3 features [dim, num_patches] — both entrypoints
         // transpose identically.
@@ -1574,6 +1581,62 @@ mod tests {
         );
         // Non-degeneracy: the output actually carries signal.
         assert!(cached.data.iter().any(|&v| v != 0.0));
+    }
+
+    /// bd-K2 acceptance: hoisting the per-block hydration OUT of the view loop
+    /// ([`forward_from_sam_streamed_views`], views-inner) yields BIT-IDENTICAL
+    /// features to running each view through its own streamed forward
+    /// (views-outer) — the loop nest reorders, the math does not.
+    #[test]
+    fn streamed_clip_views_inner_is_bit_identical_to_views_outer() {
+        let cfg = tiny_cfg();
+        let dim = cfg.hidden_size;
+        let num_patches = 4usize;
+        let weights = synth_clip_tower(&cfg, num_patches);
+
+        // Widely separated salts: `synth_values` folds the salt in AFTER the
+        // multiply and then shifts off the low 33 bits, so nearby salts collide
+        // into the SAME view — which would make this gate pass vacuously.
+        let views: Vec<Mat> = (0..3)
+            .map(|v| {
+                Mat::from_vec(
+                    dim,
+                    num_patches,
+                    synth_values(
+                        dim * num_patches,
+                        (v as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                    ),
+                )
+            })
+            .collect();
+
+        // views-outer: one full streamed sweep per view (the old shape).
+        let per_view: Vec<Mat> = views
+            .iter()
+            .map(|sam| {
+                forward_from_sam_streamed(&cfg, &weights, sam).expect("per-view streamed runs")
+            })
+            .collect();
+
+        // views-inner: ONE hydration sweep, all views through each block.
+        let refs: Vec<&Mat> = views.iter().collect();
+        let hoisted = forward_from_sam_streamed_views(&cfg, &weights, &refs)
+            .expect("views-inner streamed runs");
+
+        assert_eq!(hoisted.len(), per_view.len());
+        for (v, (a, b)) in per_view.iter().zip(hoisted.iter()).enumerate() {
+            assert_eq!(a.shape(), b.shape(), "view {v} shape");
+            assert_eq!(
+                a.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                b.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+                "view {v}: hydration-hoisted CLIP must be bit-identical to per-view"
+            );
+        }
+        // Non-degeneracy: the views really are distinct going in AND coming
+        // out, so a cross-view leak or a stale activation cannot pass this.
+        assert!(per_view[0].data.iter().any(|&x| x != 0.0));
+        assert_ne!(views[0].data, views[1].data);
+        assert_ne!(per_view[0].data, per_view[1].data);
     }
 
     // ── weight hydration error paths ───────────────────────────────────────
