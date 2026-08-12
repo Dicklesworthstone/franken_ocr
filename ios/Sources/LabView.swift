@@ -294,7 +294,7 @@ struct LabView: View {
                             Stepper(
                                 value: $model.previewPage, in: 1...model.pdfPageCount,
                                 onEditingChanged: { editing in
-                                    if !editing { model.loadPreviewPage() }
+                                    if !editing { Task { await model.loadPreviewPage() } }
                                 }
                             ) {
                                 Text("\(model.previewPage) of \(model.pdfPageCount)")
