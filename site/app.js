@@ -499,14 +499,22 @@ function paintLedger() {
 }
 
 /// The whole document's text, with page markers — the shape the CLI writes.
+///
+/// Markdown pages concatenate into one valid document; MusicXML pages do not
+/// (each is a complete XML document), so that lane gets plain-text separators
+/// and the download is named `.txt` rather than pretending to be a score file.
 function ledgerDocument() {
+  const music = isMusic(modelId);
   return pageLedger
     .filter((r) => r.state === "done" || r.state === "skipped")
-    .map((r) =>
-      r.state === "done"
-        ? `<!-- page ${r.page} -->\n\n${r.output}`
-        : `<!-- page ${r.page} skipped: ${r.reason} -->`,
-    )
+    .map((r) => {
+      const label =
+        r.state === "done"
+          ? `page ${r.page}`
+          : `page ${r.page} skipped: ${r.reason}`;
+      const header = music ? `===== ${label} =====` : `<!-- ${label} -->`;
+      return r.state === "done" ? `${header}\n\n${r.output}` : header;
+    })
     .join("\n\n");
 }
 
@@ -1038,12 +1046,18 @@ function baseName() {
 $("download-xml").addEventListener("click", () => {
   if (!lastResult) return;
   const musicLane = isMusic(lastResult.model_id) || Boolean(lastResult.music);
-  saveBlob(
-    new Blob([lastResult.output], {
-      type: musicLane ? "application/vnd.recordare.musicxml+xml" : "text/markdown",
-    }),
-    baseName() + (musicLane ? ".musicxml" : ".md"),
-  );
+  // A multi-page music run is a BUNDLE of separate scores: each page is a
+  // complete XML document with its own declaration and root element, so the
+  // concatenation is not valid XML and no score reader will open it. Name it
+  // honestly rather than handing over a broken `.musicxml`.
+  const bundled = musicLane && pageLedger.filter((r) => r.state === "done").length > 1;
+  const type = bundled
+    ? "text/plain"
+    : musicLane
+      ? "application/vnd.recordare.musicxml+xml"
+      : "text/markdown";
+  const ext = bundled ? "-pages.txt" : musicLane ? ".musicxml" : ".md";
+  saveBlob(new Blob([lastResult.output], { type }), baseName() + ext);
 });
 
 $("download-html").addEventListener("click", () => {

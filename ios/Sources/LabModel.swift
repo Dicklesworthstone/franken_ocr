@@ -569,20 +569,37 @@ final class LabModel {
 
     /// The whole document's combined text, with page markers — the same shape
     /// the CLI writes for a multi-page run.
+    ///
+    /// Markdown pages concatenate into one valid document. MusicXML pages do
+    /// NOT: each page is a complete XML document with its own declaration and
+    /// root element, so gluing several together produces something that is not
+    /// valid XML and that no score reader will open. For that lane the pages are
+    /// bundled as plain text with explicit separators, and
+    /// [`exportFilename`] names the file `.txt` so it never claims to be
+    /// MusicXML.
     var documentText: String {
         guard !pageOutcomes.isEmpty else { return recognition?.output ?? "" }
+        let music = spec.producesMusicXML
         return pageOutcomes.compactMap { outcome -> String? in
             switch outcome.state {
             case .done:
-                return "<!-- page \(outcome.id) -->\n\n\(outcome.text)"
+                let header = music
+                    ? "===== page \(outcome.id) ====="
+                    : "<!-- page \(outcome.id) -->"
+                return "\(header)\n\n\(outcome.text)"
             case .skipped(let reason):
-                return "<!-- page \(outcome.id) skipped: \(reason) -->"
+                return music
+                    ? "===== page \(outcome.id) skipped: \(reason) ====="
+                    : "<!-- page \(outcome.id) skipped: \(reason) -->"
             case .queued, .running:
                 return nil
             }
         }
         .joined(separator: "\n\n")
     }
+
+    /// How many pages actually produced output in this run.
+    private var producedPageCount: Int { completedPageCount }
 
     private func ensureEngineLoaded() async throws {
         if await engine.isLoaded { return }
@@ -625,9 +642,14 @@ final class LabModel {
 
     /// What to write when the user exports. A document walk exports the whole
     /// document, not the page that happens to be on screen.
+    ///
+    /// A multi-page music run is a BUNDLE of separate scores, not one MusicXML
+    /// file, so it is named `.txt`. Handing someone a `.musicxml` that no reader
+    /// can open would be worse than an honest extension.
     var exportFilename: String {
         let stem = (imageName as NSString?)?.deletingPathExtension ?? "page"
-        return spec.producesMusicXML ? "\(stem).musicxml" : "\(stem).md"
+        guard spec.producesMusicXML else { return "\(stem).md" }
+        return producedPageCount > 1 ? "\(stem)-pages.txt" : "\(stem).musicxml"
     }
 
     /// The text an export or the source view should show.
