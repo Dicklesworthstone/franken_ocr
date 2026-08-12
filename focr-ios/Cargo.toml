@@ -1,0 +1,56 @@
+# focr-ios — the native-app boundary for franken_ocr (the FocrCore.xcframework
+# source).
+#
+# Mirrors the proven `focr-wasm` shape and the frankentts `ftts-ffi` shape: a
+# staticlib over the core library with `--no-default-features`, a hand-written C
+# ABI, a hand-written header, and a hand-written modulemap. No UniFFI, no
+# cbindgen, no swift-bridge — the surface is small enough that a generated
+# binding would be more machinery than contract.
+#
+# Where this DIFFERS from focr-wasm, and why it matters: the browser has to
+# stage weight bytes INTO linear memory, so a 3 GB artifact is 3 GB of dirty
+# heap and the playground gates it to desktop. A phone can map the file instead.
+# The engine therefore loads from a PATH here, not from staged bytes, so
+# `Weights::load` reaches the mmap island and those 3 GB become clean,
+# evictable, file-backed pages that jetsam does not count the way it counts
+# anonymous memory. That single difference is what makes the flagship model an
+# iPhone proposition at all.
+[package]
+name = "focr-ios"
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+description = "iOS/Apple (C ABI) boundary crate for the franken_ocr engine"
+publish = false
+
+[lib]
+name = "focr_ios"
+# staticlib for the xcframework slices; rlib so `cargo test -p focr-ios` can
+# exercise the error-path helpers on the host without an Xcode toolchain.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# `mmap` is the load-bearing one (see the header comment). `pdf` gives the app
+# the same in-process scanned-PDF rasterization the CLI and the playground use.
+# Everything else `native` would pull — asupersync, fsqlite, clap, ctrlc, uuid —
+# is deliberately absent: an app target wants none of it, and `nix`'s
+# process/signal/user surface is exactly the kind of dependency that turns an
+# App Store build into an argument.
+franken_ocr = { path = "..", default-features = false, features = [
+    "pdf",
+    "mmap",
+] }
+# Same major as the library so `image::DynamicImage` is ONE type across the
+# boundary. Slim decode set plus the encoders the figure/PDF paths hand back.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
+serde_json = "1"
+
+[lints.rust]
+# NOT `unsafe_code = "forbid"` like the library root: a C ABI is definitionally
+# an unsafe boundary. Deny by default, with small named islands that each carry
+# a SAFETY note — the same discipline `simd/arm.rs` and `weights.rs::mmap_island`
+# use inside the library.
+unsafe_code = "deny"

@@ -1,0 +1,55 @@
+# xcodegen spec for the FrankenOCR app. The .xcodeproj is GENERATED from this
+# file and is gitignored — this is the source of truth, so a project setting is
+# reviewable as a diff instead of buried in a pbxproj.
+#
+#   ios/build-rust.sh          # build FocrCore.xcframework (after any Rust change)
+#   cd ios && xcodegen generate
+#   open FrankenOCR.xcodeproj
+name: FrankenOCR
+options:
+  bundleIdPrefix: com.frankenocr
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    DEVELOPMENT_TEAM: AU8V2Z6NKY
+    CODE_SIGN_STYLE: Automatic
+    # The Rust simulator slice is built for aarch64-apple-ios-sim only. An Intel
+    # Mac would otherwise try to link an x86_64 simulator binary that does not
+    # exist and fail with an inscrutable "undefined symbols" wall.
+    EXCLUDED_ARCHS[sdk=iphonesimulator*]: x86_64
+
+targets:
+  FrankenOCR:
+    type: application
+    platform: iOS
+    # Universal. iPad is not an afterthought here: the large models want RAM,
+    # and an iPad Pro has both the memory headroom and the screen width for the
+    # side-by-side page/transcription layout the phone has to stack.
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenocr.FrankenOCR
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FrankenOCR.entitlements
+        # The xcframework sits next to the project.
+        FRAMEWORK_SEARCH_PATHS: ["$(inherited)", "."]
+        SUPPORTS_MACCATALYST: false
+      configs:
+        Release:
+          SWIFT_COMPILATION_MODE: wholemodule
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+          ENABLE_NS_ASSERTIONS: false
+    sources:
+      - path: Sources
+      - path: Assets.xcassets
+    dependencies:
+      # Static library: there is nothing to embed, and embedding it would both
+      # bloat the bundle and confuse dyld.
+      - framework: FocrCore.xcframework
+        embed: false

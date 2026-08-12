@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  The default per-app ceiling is roughly 3.3 GB on an 8 GB device; this
+	  entitlement raises it to roughly 4-5 GB.
+
+	  The engine's DIRTY footprint is far below either number: the weight
+	  artifact is memory-mapped, so its 3 GB are clean file-backed pages the
+	  kernel may evict, and the vision tower streams per block instead of
+	  hydrating whole. What the headroom actually buys is tolerance for the
+	  page cache the mapping wants to keep hot — a MoE decode touches a wide,
+	  scattered slice of the expert bank, and being killed for successfully
+	  caching the file you are reading would be a poor trade.
+	-->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

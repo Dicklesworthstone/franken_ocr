@@ -1,0 +1,661 @@
+import PhotosUI
+import SwiftUI
+import UniformTypeIdentifiers
+
+/// The whole app: one laboratory screen mirroring the site's playground —
+/// 01 The specimen, 02 The page, 03 The transcription.
+///
+/// On a phone the three steps stack. On an iPad in landscape, steps 01+02 sit
+/// beside step 03, because a transcription is worth reading next to the page it
+/// came from and the tablet finally has the width for it.
+struct LabView: View {
+    @State private var model = LabModel()
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    @State private var photoItem: PhotosPickerItem?
+    @State private var showFileImporter = false
+    @State private var showCamera = false
+
+    private var isWide: Bool { sizeClass == .regular }
+
+    var body: some View {
+        ZStack {
+            LabBackground()
+            ScrollView {
+                VStack(spacing: 26) {
+                    header
+                    if isWide {
+                        HStack(alignment: .top, spacing: 20) {
+                            VStack(spacing: 20) {
+                                specimenCard
+                                pageCard
+                            }
+                            .frame(maxWidth: .infinity)
+                            transcriptionCard.frame(maxWidth: .infinity)
+                        }
+                    } else {
+                        specimenCard
+                        pageCard
+                        transcriptionCard
+                    }
+                    footer
+                }
+                .padding(.horizontal, isWide ? 28 : 18)
+                .padding(.vertical, 26)
+                .frame(maxWidth: 1180)
+                .frame(maxWidth: .infinity)
+            }
+        }
+        .preferredColorScheme(.dark)
+        .tint(Lab.accent)
+        .task { Engine.warmKernelPool() }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.didReceiveMemoryWarningNotification)
+        ) { _ in
+            model.releaseEngineIfIdle()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background { model.releaseEngineIfIdle() }
+        }
+        .photosPicker(isPresented: .constant(false), selection: $photoItem)
+        .onChange(of: photoItem) { _, item in load(photoItem: item) }
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.png, .jpeg, .pdf],
+            allowsMultipleSelection: false
+        ) { result in load(fileResult: result) }
+        .sheet(isPresented: $model.showSelftest) { selftestSheet }
+        .confirmationDialog(
+            "Download \(model.spec.totalBytes.humanBytes)?",
+            isPresented: $model.showConsent,
+            titleVisibility: .visible
+        ) {
+            Button("Download") { model.confirmDownload() }
+            Button("Not now", role: .cancel) {}
+        } message: {
+            Text(consentMessage)
+        }
+    }
+
+    private var consentMessage: String {
+        var text = "This downloads the \(model.spec.totalBytes.humanBytes) "
+            + "\(model.spec.label) model into this app. "
+            + "After that it works completely offline, and nothing you recognize "
+            + "ever leaves the device. The download resumes if it is interrupted."
+        if model.spec.id == "unlimited-ocr" {
+            text += " It is a large file and wants a recent, high-memory device."
+        }
+        return text
+    }
+
+    // ── Header ─────────────────────────────────────────────────────────────
+
+    private var header: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 11)
+                    .fill(LinearGradient(
+                        colors: [Color(hex: 0x04351F), Lab.accent],
+                        startPoint: .topLeading, endPoint: .bottomTrailing
+                    ))
+                Text("O")
+                    .font(.system(size: 21, weight: .black, design: .monospaced))
+                    .foregroundStyle(Lab.onAccent)
+            }
+            .frame(width: 40, height: 40)
+            .overlay(alignment: .topLeading) { Bolt(size: 11).offset(x: -4, y: -4) }
+            .overlay(alignment: .bottomTrailing) { Bolt(size: 11).offset(x: 4, y: 4) }
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text("franken_ocr")
+                    .font(.system(size: 16, weight: .heavy, design: .monospaced))
+                    .foregroundStyle(Lab.textPrimary)
+                Text("READS_LOCALLY")
+                    .font(.system(size: 8, weight: .heavy, design: .monospaced))
+                    .kerning(2.2)
+                    .foregroundStyle(Lab.accentInk)
+            }
+            Spacer()
+            Button {
+                model.runSelftest()
+            } label: {
+                Image(systemName: "checkmark.seal")
+                    .font(.system(size: 16, weight: .semibold))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Lab.accent)
+            .frame(width: 44, height: 44)
+            .accessibilityLabel("Verify the int8 kernels on this device")
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("FrankenOCR, reads locally")
+    }
+
+    // ── 01 The specimen ────────────────────────────────────────────────────
+
+    private var specimenCard: some View {
+        LabPanel {
+            VStack(alignment: .leading, spacing: 14) {
+                LabLabel(text: "01 · The specimen")
+
+                Picker("Model", selection: $model.spec.id.bound(
+                    get: { model.spec.id },
+                    set: { id in if let s = ModelCatalog.spec(id: id) { model.spec = s } }
+                )) {
+                    ForEach(ModelCatalog.all) { spec in
+                        Text("\(spec.label) · \(spec.totalBytes.humanBytes)").tag(spec.id)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(Lab.accent)
+
+                Text(model.spec.blurb)
+                    .font(.system(size: 13))
+                    .foregroundStyle(Lab.textDim)
+
+                if let info = model.info {
+                    // Hardware capability and the route actually executed are
+                    // reported separately, exactly as `robot backends` does —
+                    // collapsing them would overclaim on Apple silicon.
+                    KeyValueLine(key: "int8 route:",
+                                 value: "\(info.detected_tier) / \(info.dense_route)")
+                    KeyValueLine(key: "threads:", value: "\(info.threads)")
+                }
+
+                if !model.spec.isSupportedOnThisDevice {
+                    StatusLine(
+                        kind: .warn,
+                        text: "This device reports \(Int(ProcessInfo.processInfo.physicalMemory / 1_073_741_824)) GB "
+                            + "of memory. \(model.spec.shortName) wants more; it may be terminated mid-page."
+                    )
+                }
+
+                downloadControls
+                StatusLine(kind: model.statusKind, text: model.status)
+
+                if let license = model.licenseNotice ?? Optional(model.spec.license) {
+                    Text(license)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(Lab.textFaint)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var downloadControls: some View {
+        switch model.store.phase {
+        case .downloading(let asset, let done, let total, let eta):
+            VStack(alignment: .leading, spacing: 8) {
+                LabProgressBar(fraction: Double(done) / Double(max(total, 1)))
+                Text("\(asset) · \(done.humanBytes) / \(total.humanBytes) · \(eta)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(Lab.textDim)
+                Button("Cancel") { model.store.cancel() }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.red))
+            }
+
+        case .verifying(let asset):
+            HStack(spacing: 10) {
+                ProgressView().tint(Lab.accent)
+                Text("Verifying \(asset)…")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(Lab.textDim)
+            }
+
+        case .ready:
+            HStack(spacing: 10) {
+                Label("Installed", systemImage: "checkmark.circle.fill")
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(Lab.accent)
+                Spacer()
+                Button("Remove") { model.clearModel() }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.red))
+            }
+
+        case .failed(let message):
+            VStack(alignment: .leading, spacing: 8) {
+                StatusLine(kind: .err, text: message)
+                Button("Retry") { model.confirmDownload() }
+                    .buttonStyle(GhostButtonStyle())
+            }
+
+        case .idle:
+            Button("Load model (\(model.spec.totalBytes.humanBytes))") {
+                model.requestDownload()
+            }
+            .buttonStyle(PrimaryButtonStyle())
+            .disabled(!model.spec.isSupportedOnThisDevice)
+        }
+    }
+
+    // ── 02 The page ────────────────────────────────────────────────────────
+
+    private var pageCard: some View {
+        LabPanel {
+            VStack(alignment: .leading, spacing: 14) {
+                LabLabel(text: "02 · The page")
+
+                if let preview = model.previewImage {
+                    ZStack {
+                        Image(uiImage: preview)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                        if model.showLayoutBoxes, let recognition = model.recognition {
+                            LayoutOverlay(
+                                spans: recognition.layout,
+                                imageSize: preview.size,
+                                music: recognition.music
+                            )
+                        }
+                    }
+                    .frame(maxHeight: 340)
+                    .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
+                    .overlay(RoundedRectangle(cornerRadius: Lab.radius)
+                        .strokeBorder(Lab.line, lineWidth: 1))
+                } else {
+                    dropZone
+                }
+
+                inputButtons
+
+                if model.pdfPageCount > 1 {
+                    HStack(spacing: 10) {
+                        Text("Page")
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Lab.textDim)
+                        Stepper(
+                            value: $model.pdfPage, in: 1...model.pdfPageCount,
+                            onEditingChanged: { editing in if !editing { model.loadPDFPage() } }
+                        ) {
+                            Text("\(model.pdfPage) of \(model.pdfPageCount)")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(Lab.textMid)
+                        }
+                    }
+                    Text("Scanned PDFs only. Pages using JPEG 2000 or JBIG2 report a named error rather than a wrong result.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Lab.textFaint)
+                }
+
+                runControls
+
+                Text("Nothing here is uploaded. The image is read into memory and recognized on this device's own cores.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Lab.textFaint)
+            }
+        }
+    }
+
+    private var dropZone: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "doc.viewfinder")
+                .font(.system(size: 28))
+                .foregroundStyle(Lab.accent.opacity(0.8))
+            Text("Choose a page")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Lab.textMid)
+            Text("PNG, JPEG, or a scanned PDF")
+                .font(.system(size: 12))
+                .foregroundStyle(Lab.textFaint)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 34)
+        .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
+        .overlay(
+            RoundedRectangle(cornerRadius: Lab.radius)
+                .strokeBorder(style: StrokeStyle(lineWidth: 2, dash: [6, 5]))
+                .foregroundStyle(Lab.accent.opacity(0.35))
+        )
+        // iPad: dropping a file onto the zone is the natural gesture.
+        .dropDestination(for: Data.self) { items, _ in
+            guard let data = items.first else { return false }
+            model.accept(data: data, name: "dropped")
+            return true
+        }
+    }
+
+    private var inputButtons: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) { photoButton; filesButton; cameraButton }
+            VStack(spacing: 10) { photoButton; HStack(spacing: 10) { filesButton; cameraButton } }
+        }
+    }
+
+    private var photoButton: some View {
+        PhotosPicker(selection: $photoItem, matching: .images) {
+            Label("Photos", systemImage: "photo.on.rectangle")
+        }
+        .buttonStyle(GhostButtonStyle())
+    }
+
+    private var filesButton: some View {
+        Button { showFileImporter = true } label: {
+            Label("Files", systemImage: "folder")
+        }
+        .buttonStyle(GhostButtonStyle())
+    }
+
+    private var cameraButton: some View {
+        Button { showCamera = true } label: {
+            Label("Camera", systemImage: "camera")
+        }
+        .buttonStyle(GhostButtonStyle())
+        .fullScreenCover(isPresented: $showCamera) {
+            CameraPicker { data in
+                if let data { model.accept(data: data, name: "photo.jpg") }
+                showCamera = false
+            }
+            .ignoresSafeArea()
+        }
+    }
+
+    @ViewBuilder
+    private var runControls: some View {
+        if model.isRecognizing {
+            VStack(alignment: .leading, spacing: 10) {
+                LabProgressBar(fraction: model.progressFraction)
+                HStack {
+                    Text(model.progressDetail.isEmpty
+                         ? (model.isLoadingModel ? "Waking the model…" : "Starting…")
+                         : model.progressDetail)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Lab.textDim)
+                    Spacer()
+                    Text(String(format: "%.0fs", model.elapsed))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Lab.textFaint)
+                }
+                Button("Cancel") { model.cancel() }
+                    .buttonStyle(GhostButtonStyle(tint: Lab.red))
+            }
+        } else {
+            Button("Recognize") { model.recognize() }
+                .buttonStyle(PrimaryButtonStyle())
+                .disabled(!model.canRecognize)
+                .sensoryFeedback(.success, trigger: model.recognition?.output)
+        }
+    }
+
+    // ── 03 The transcription ───────────────────────────────────────────────
+
+    private var transcriptionCard: some View {
+        LabPanel {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack {
+                    LabLabel(text: "03 · The transcription")
+                    Spacer()
+                    if model.recognition != nil, !model.spec.producesMusicXML {
+                        Picker("View", selection: $model.viewSource) {
+                            Text("Rendered").tag(false)
+                            Text("Source").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: 190)
+                    }
+                }
+
+                if let recognition = model.recognition {
+                    resultMeta(recognition)
+
+                    if !recognition.layout.isEmpty {
+                        Toggle("Show layout boxes", isOn: $model.showLayoutBoxes)
+                            .font(.system(size: 12, design: .monospaced))
+                            .foregroundStyle(Lab.textDim)
+                            .tint(Lab.accent)
+                    }
+
+                    musicWarnings(recognition)
+
+                    Group {
+                        if model.viewSource || model.spec.producesMusicXML {
+                            ScrollView(.horizontal, showsIndicators: false) {
+                                Text(recognition.output)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(Lab.textMid)
+                                    .textSelection(.enabled)
+                                    .padding(12)
+                            }
+                            .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
+                        } else {
+                            MarkdownView(markdown: recognition.output)
+                        }
+                    }
+                    .frame(maxHeight: 420)
+
+                    ShareLink(
+                        item: TranscriptionFile(
+                            text: recognition.output,
+                            filename: model.exportFilename
+                        ),
+                        preview: SharePreview(model.exportFilename)
+                    ) {
+                        Label("Export \(model.exportFilename)", systemImage: "square.and.arrow.up")
+                    }
+                    .buttonStyle(GhostButtonStyle())
+                } else {
+                    Text("Output appears here: Markdown for a document page, MusicXML for a staff. These are the same bytes the CLI writes.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Lab.textFaint)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 26)
+                }
+            }
+        }
+    }
+
+    private func resultMeta(_ recognition: Recognition) -> some View {
+        var text = "\(model.spec.shortName) · \(recognition.output.count) characters"
+        if let music = recognition.music {
+            text = "\(music.staves.count) staff/staves recognized · "
+                + "\(music.skips.count) skipped · \(music.warnings.count) sanity warning(s)"
+        }
+        if let seconds = model.lastRunSeconds {
+            text += String(format: " · %.1fs on this device", seconds)
+        }
+        return KeyValueLine(key: "", value: text, valueColor: Lab.textDim)
+    }
+
+    @ViewBuilder
+    private func musicWarnings(_ recognition: Recognition) -> some View {
+        if let music = recognition.music, !music.warnings.isEmpty || !music.skips.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(music.skips) { skip in
+                    StatusLine(kind: .err,
+                               text: "staff \(skip.index + 1) skipped: \(skip.reason)")
+                }
+                ForEach(music.warnings) { warning in
+                    StatusLine(
+                        kind: .warn,
+                        text: "\(warning.kind) (part \(warning.part), measure \(warning.measure)): \(warning.detail)"
+                    )
+                }
+                Text("Sanity warnings are annotate-only observations the engine makes about its own transcription. Honest signal, not silent cleanup.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(Lab.textFaint)
+            }
+        }
+    }
+
+    // ── Selftest ───────────────────────────────────────────────────────────
+
+    private var selftestSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("This re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on THIS device, including the worst-case K=6848 accumulation row. It is the proof that the kernels are correct on hardware the binary was never built on.")
+                        .font(.system(size: 13))
+                        .foregroundStyle(Lab.textDim)
+                    Text(model.selftestJSON ?? "…")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Lab.textMid)
+                        .textSelection(.enabled)
+                }
+                .padding(18)
+            }
+            .background(LabBackground())
+            .navigationTitle("Kernel selftest")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    // ── Footer ─────────────────────────────────────────────────────────────
+
+    private var footer: some View {
+        VStack(spacing: 6) {
+            Text("Recognized locally. Nothing is uploaded, and there is no analytics of any kind.")
+                .font(.system(size: 11))
+                .foregroundStyle(Lab.textFaint)
+                .multilineTextAlignment(.center)
+            Text("© 2026 Jeffrey Emanuel · franken-ocr.com")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Lab.textFaint.opacity(0.7))
+        }
+        .padding(.top, 8)
+    }
+
+    // ── Input loading ──────────────────────────────────────────────────────
+
+    private func load(photoItem: PhotosPickerItem?) {
+        guard let photoItem else { return }
+        Task {
+            if let data = try? await photoItem.loadTransferable(type: Data.self) {
+                model.accept(data: data, name: "photo")
+            }
+        }
+    }
+
+    private func load(fileResult: Result<[URL], Error>) {
+        switch fileResult {
+        case .success(let urls):
+            guard let url = urls.first else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            guard let data = try? Data(contentsOf: url) else {
+                model.status = "Could not read that file."
+                model.statusKind = .err
+                return
+            }
+            model.accept(data: data, name: url.lastPathComponent)
+        case .failure(let error):
+            model.status = error.localizedDescription
+            model.statusKind = .err
+        }
+    }
+}
+
+/// Draws the engine's grounded layout boxes over the page.
+///
+/// The browser playground receives this array and never renders it. It is one
+/// of the clearest wins a native UI gets for free: you can see exactly what the
+/// model thought each region was.
+private struct LayoutOverlay: View {
+    let spans: [Recognition.LayoutSpan]
+    let imageSize: CGSize
+    let music: Recognition.MusicMeta?
+
+    var body: some View {
+        GeometryReader { geo in
+            // The image is drawn `.fit`, so derive the letterboxed content rect.
+            let scale = min(geo.size.width / imageSize.width,
+                            geo.size.height / imageSize.height)
+            let drawn = CGSize(width: imageSize.width * scale,
+                               height: imageSize.height * scale)
+            let origin = CGPoint(x: (geo.size.width - drawn.width) / 2,
+                                 y: (geo.size.height - drawn.height) / 2)
+
+            ZStack(alignment: .topLeading) {
+                ForEach(spans) { span in
+                    ForEach(Array(span.boxes.enumerated()), id: \.offset) { _, box in
+                        if box.count == 4 {
+                            let rect = CGRect(
+                                x: origin.x + CGFloat(box[0]) * scale,
+                                y: origin.y + CGFloat(box[1]) * scale,
+                                width: CGFloat(box[2] - box[0]) * scale,
+                                height: CGFloat(box[3] - box[1]) * scale
+                            )
+                            Rectangle()
+                                .strokeBorder(Lab.accent.opacity(0.85), lineWidth: 1)
+                                .frame(width: rect.width, height: rect.height)
+                                .offset(x: rect.minX, y: rect.minY)
+                        }
+                    }
+                }
+                // Skipped staves are drawn in the failure color, matching the
+                // site's music legend.
+                ForEach(music?.skips ?? []) { skip in
+                    if skip.bbox.count == 4 {
+                        let rect = CGRect(
+                            x: origin.x + CGFloat(skip.bbox[0]) * scale,
+                            y: origin.y + CGFloat(skip.bbox[1]) * scale,
+                            width: CGFloat(skip.bbox[2] - skip.bbox[0]) * scale,
+                            height: CGFloat(skip.bbox[3] - skip.bbox[1]) * scale
+                        )
+                        Rectangle()
+                            .strokeBorder(Lab.red.opacity(0.9), lineWidth: 1.5)
+                            .frame(width: rect.width, height: rect.height)
+                            .offset(x: rect.minX, y: rect.minY)
+                    }
+                }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// A transcription packaged for `ShareLink` with the right filename and type.
+struct TranscriptionFile: Transferable {
+    let text: String
+    let filename: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .plainText) { file in
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(file.filename)
+            try file.text.write(to: url, atomically: true, encoding: .utf8)
+            return SentTransferredFile(url)
+        }
+    }
+}
+
+/// Minimal camera bridge — `UIImagePickerController` is still the shortest path
+/// to a single still capture.
+struct CameraPicker: UIViewControllerRepresentable {
+    let onCapture: (Data?) -> Void
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = UIImagePickerController.isSourceTypeAvailable(.camera)
+            ? .camera : .photoLibrary
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_: UIImagePickerController, context _: Context) {}
+    func makeCoordinator() -> Coordinator { Coordinator(onCapture: onCapture) }
+
+    final class Coordinator: NSObject, UIImagePickerControllerDelegate,
+                             UINavigationControllerDelegate {
+        let onCapture: (Data?) -> Void
+        init(onCapture: @escaping (Data?) -> Void) { self.onCapture = onCapture }
+
+        func imagePickerController(
+            _: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            let image = info[.originalImage] as? UIImage
+            onCapture(image?.jpegData(compressionQuality: 0.92))
+        }
+
+        func imagePickerControllerDidCancel(_: UIImagePickerController) { onCapture(nil) }
+    }
+}
+
+private extension String {
+    /// Small shim so the model picker can bind through a computed selection.
+    func bound(get: @escaping () -> String, set: @escaping (String) -> Void) -> Binding<String> {
+        Binding(get: get, set: set)
+    }
+}
