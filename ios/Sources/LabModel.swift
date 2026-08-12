@@ -266,9 +266,14 @@ final class LabModel {
 
     // ── Input ──────────────────────────────────────────────────────────────
 
-    func accept(data: Data, name: String) {
+    /// Take a dropped/picked file.
+    ///
+    /// `async` because a PDF has to be parsed off the main actor, and callers
+    /// need a completion signal: returning before `pdf` is set would leave a
+    /// fast "pick then Recognize" tap doing nothing at all.
+    func accept(data: Data, name: String) async {
         if data.starts(with: Array("%PDF".utf8)) {
-            acceptPDF(data, name: name)
+            await acceptPDF(data, name: name)
         } else {
             acceptImage(data, name: name)
         }
@@ -290,31 +295,28 @@ final class LabModel {
         statusKind = .neutral
     }
 
-    private func acceptPDF(_ data: Data, name: String) {
+    private func acceptPDF(_ data: Data, name: String) async {
         // Parsing and rasterizing are off the main actor: this type is
         // main-actor isolated, and a scanned book is enough object graph that
         // doing either inline visibly freezes the UI.
         status = "Opening \(name)…"
         statusKind = .neutral
-        Task { [weak self] in
-            guard let self else { return }
-            guard let document = await PdfDocument.open(data: data) else {
-                self.status = "That PDF could not be parsed."
-                self.statusKind = .err
-                return
-            }
-            self.pdf = document
-            self.previewPage = 1
-            self.pageSelection = ""
-            self.imageName = name
-            self.recognition = nil
-            self.pageOutcomes = []
-            let pages = document.pageCount
-            await self.loadPreviewPage()
-            self.status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). "
-                + "Recognize reads the whole document."
-            self.statusKind = .neutral
+        guard let document = await PdfDocument.open(data: data) else {
+            status = "That PDF could not be parsed."
+            statusKind = .err
+            return
         }
+        pdf = document
+        previewPage = 1
+        pageSelection = ""
+        imageName = name
+        recognition = nil
+        pageOutcomes = []
+        let pages = document.pageCount
+        await loadPreviewPage()
+        status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). "
+            + "Recognize reads the whole document."
+        statusKind = .neutral
     }
 
     /// Render the page the user is looking at. Purely a preview — it does not

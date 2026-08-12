@@ -51,7 +51,7 @@ struct LabView: View {
         .tint(Lab.accent)
         .task {
             Engine.warmKernelPool()
-            loadDebugFixtureIfRequested()
+            await loadDebugFixtureIfRequested()
         }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didReceiveMemoryWarningNotification)
@@ -363,7 +363,7 @@ struct LabView: View {
         // iPad: dropping a file onto the zone is the natural gesture.
         .dropDestination(for: Data.self) { items, _ in
             guard let data = items.first else { return false }
-            model.accept(data: data, name: "dropped")
+            Task { await model.accept(data: data, name: "dropped") }
             return true
         }
     }
@@ -396,7 +396,7 @@ struct LabView: View {
         .buttonStyle(GhostButtonStyle())
         .fullScreenCover(isPresented: $showCamera) {
             CameraPicker { data in
-                if let data { model.accept(data: data, name: "photo.jpg") }
+                if let data { Task { await model.accept(data: data, name: "photo.jpg") } }
                 showCamera = false
             }
             .ignoresSafeArea()
@@ -666,12 +666,14 @@ struct LabView: View {
     /// multi-page document run can be driven from the command line instead of
     /// through the file picker. Compiled out of release builds entirely; the
     /// same shape as frankentts's `FTTS_DEBUG_*` harnesses.
-    private func loadDebugFixtureIfRequested() {
+    private func loadDebugFixtureIfRequested() async {
         #if DEBUG
         guard let path = ProcessInfo.processInfo.environment["FOCR_DEBUG_INPUT"],
               let data = FileManager.default.contents(atPath: path)
         else { return }
-        model.accept(data: data, name: (path as NSString).lastPathComponent)
+        // `await`, not fire-and-forget: a PDF is parsed off the main actor, so
+        // starting the run before acceptance completes would find nothing to do.
+        await model.accept(data: data, name: (path as NSString).lastPathComponent)
         if ProcessInfo.processInfo.environment["FOCR_DEBUG_RUN"] != nil {
             model.recognize()
         }
@@ -682,7 +684,7 @@ struct LabView: View {
         guard let photoItem else { return }
         Task {
             if let data = try? await photoItem.loadTransferable(type: Data.self) {
-                model.accept(data: data, name: "photo")
+                await model.accept(data: data, name: "photo")
             }
         }
     }
@@ -691,6 +693,8 @@ struct LabView: View {
         switch fileResult {
         case .success(let urls):
             guard let url = urls.first else { return }
+            // The security scope must be released only after the bytes are
+            // read, which happens here — `accept` works on the copy.
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             guard let data = try? Data(contentsOf: url) else {
@@ -698,7 +702,7 @@ struct LabView: View {
                 model.statusKind = .err
                 return
             }
-            model.accept(data: data, name: url.lastPathComponent)
+            Task { await model.accept(data: data, name: url.lastPathComponent) }
         case .failure(let error):
             model.status = error.localizedDescription
             model.statusKind = .err
