@@ -91,6 +91,8 @@ let threads = 1; // rayon's ACTUAL worker count, straight from rayon
 let pkg = null;
 let engine = null; // WasmEngine
 let modelId = null;
+// The open document's bytes, held once for the whole run (see `pdf-open`).
+let pdfBytes = null;
 // The manifest key the page asked for. `modelId` is the engine's own id for the
 // hydrated artifact, which need not be spelled the same way.
 let modelKey = null;
@@ -304,21 +306,31 @@ async function dispatch(data) {
     }
     // ── PDF support ──────────────────────────────────────────────────────
     // The same pure-Rust rasterizer the CLI uses (page /Rotate + placement
-    // matrix normalization included). Stateless: the PDF bytes cross per
-    // call. Pages with codecs that have no pure-Rust decoder (JPXDecode,
-    // JBIG2) reject with the engine's precise error string — surface it.
-    case "pdf-info": {
+    // matrix normalization included). Pages with codecs that have no pure-Rust
+    // decoder (JPXDecode, JBIG2) reject with the engine's precise error string —
+    // surface it verbatim so a document walk can skip that page with a reason.
+    //
+    // The bytes are held HERE, once, rather than crossing per page. Recognizing
+    // a whole 300-page scan would otherwise structured-clone the entire document
+    // three hundred times, which for a 50 MB book is 15 GB of pure copying.
+    case "pdf-open": {
       if (typeof pkg?.pdf_info !== "function") {
         throw new Error("this build has no PDF support (module predates it)");
       }
-      return { info: JSON.parse(pkg.pdf_info(new Uint8Array(data.bytes))) };
+      pdfBytes = new Uint8Array(data.bytes);
+      return { info: JSON.parse(pkg.pdf_info(pdfBytes)) };
+    }
+    case "pdf-close": {
+      pdfBytes = null;
+      return {};
     }
     case "pdf-render-page": {
       if (typeof pkg?.pdf_render_page !== "function") {
         throw new Error("this build has no PDF support (module predates it)");
       }
+      if (!pdfBytes) throw new Error("no PDF is open");
       // Structured-clone copies the PNG back (a few MB per page; fine).
-      return { png: pkg.pdf_render_page(new Uint8Array(data.bytes), data.page) };
+      return { png: pkg.pdf_render_page(pdfBytes, data.page) };
     }
     default:
       throw new Error(`unknown message type ${data.type}`);

@@ -124,6 +124,14 @@ const STAGE_LABELS = {
 
 let recognizeProgress = null;
 
+// Document-walk state. `documentIndex` is the page being read (null when the
+// run is a single image), so the bar can show the DOCUMENT's progress rather
+// than restarting from zero on every page.
+let documentIndex = null;
+let documentTotal = 0;
+let documentDone = 0;
+let cancelled = false;
+
 function resetRecognizeProgress() {
   recognizeProgress = { staff: 0, staves: 1, done: 0, stage: null };
 }
@@ -189,11 +197,23 @@ function onRecognizeProgress({ stage, current, total }) {
 }
 
 function paintRecognizeProgress(detail) {
-  // Capped at 99: only the returned result may show a full bar.
-  const pct = Math.min(Math.round(recognizeProgress.done * 100), 99);
+  // On a document walk the headline number is the DOCUMENT's — pages already
+  // finished plus how far into the current page we are. Without that second
+  // term a 40-page run would sit frozen for minutes at a time, which reads as
+  // a hang. Capped at 99: only the returned result may show a full bar.
+  const page = recognizeProgress?.done ?? 0;
+  const overall =
+    documentIndex === null || documentTotal === 0
+      ? page
+      : (documentIndex + page) / documentTotal;
+  const pct = Math.min(Math.round(overall * 100), 99);
   $("progress-wrap").hidden = false;
   $("progress-bar").style.width = `${pct}%`;
-  $("progress-text").textContent = `${pct}% (estimated) · ${detail}`;
+  const prefix =
+    documentIndex === null
+      ? ""
+      : `Page ${pageLedger[documentIndex]?.page ?? documentIndex + 1} of ${documentTotal} · ${documentDone} done · `;
+  $("progress-text").textContent = `${prefix}${pct}% (estimated) · ${detail}`;
 }
 
 function hideRecognizeProgress() {
@@ -324,14 +344,21 @@ let currentPdf = null; // {bytes: ArrayBuffer, name, pages}
 async function acceptPdf(file) {
   const bytes = await file.arrayBuffer();
   try {
-    const { info } = await call("pdf-info", { bytes: bytes.slice(0) });
-    currentPdf = { bytes, name: file.name, pages: info.pages };
+    // The worker keeps the bytes for the whole document; nothing re-sends them
+    // per page.
+    const { info } = await call("pdf-open", { bytes: bytes.slice(0) }, [bytes.slice(0)]);
+    currentPdf = { name: file.name, pages: info.pages };
     $("pdf-count").textContent = String(info.pages);
     $("pdf-page").max = String(info.pages);
     $("pdf-page").value = "1";
     $("pdf-bar").hidden = false;
-    setStatus(`PDF opened: ${info.pages} page(s). Pick a page and load it.`, "ok");
+    // Render the first page BEFORE the summary, so the summary is what the
+    // reader is left looking at rather than a transient "rendering…" line.
     await loadPdfPage(1);
+    setStatus(
+      `PDF opened: ${info.pages} page(s). Recognize reads the whole document.`,
+      "ok",
+    );
   } catch (err) {
     currentPdf = null;
     $("pdf-bar").hidden = true;
@@ -343,10 +370,7 @@ async function loadPdfPage(pageNo) {
   if (!currentPdf) return;
   setStatus(`Rendering PDF page ${pageNo}…`);
   try {
-    const { png } = await call("pdf-render-page", {
-      bytes: currentPdf.bytes.slice(0),
-      page: pageNo,
-    });
+    const { png } = await call("pdf-render-page", { page: pageNo });
     const blob = new Blob([png], { type: "image/png" });
     if (currentImage?.url) URL.revokeObjectURL(currentImage.url);
     const stem = currentPdf.name.replace(/\.pdf$/i, "");
@@ -356,13 +380,96 @@ async function loadPdfPage(pageNo) {
       name: `${stem}_p${pageNo}.png`,
     };
     showPreview();
-    setStatus(`PDF page ${pageNo} of ${currentPdf.pages} ready.`, "ok");
+    setStatus(`Page ${pageNo} of ${currentPdf.pages} shown.`, "ok");
     refreshRunButton();
+    return true;
   } catch (err) {
     // JPXDecode/JBIG2/vector pages come back with the engine's precise
     // error string; show it verbatim rather than a vague failure.
-    setStatus(`Page ${pageNo}: ${err.message}`, "err");
+    setStatus(`Page ${pageNo}: ${err.message}`, "warn");
+    return false;
   }
+}
+
+// ── page selection ─────────────────────────────────────────────────────────
+// Same grammar as the CLI's `--pages`: a comma-separated list of 1-based pages
+// and inclusive ranges. Empty means the whole document.
+function selectedPages() {
+  const total = currentPdf?.pages ?? 0;
+  if (!total) return [];
+  const spec = ($("pdf-range")?.value ?? "").trim();
+  if (!spec) return Array.from({ length: total }, (_, i) => i + 1);
+  const wanted = new Set();
+  for (const part of spec.split(",")) {
+    const piece = part.trim();
+    if (!piece) continue;
+    const dash = piece.indexOf("-");
+    if (dash > 0) {
+      const lo = Number(piece.slice(0, dash).trim());
+      const hi = Number(piece.slice(dash + 1).trim());
+      if (Number.isInteger(lo) && Number.isInteger(hi) && lo <= hi) {
+        for (let p = Math.max(1, lo); p <= Math.min(total, hi); p++) wanted.add(p);
+      }
+    } else {
+      const p = Number(piece);
+      if (Number.isInteger(p) && p >= 1 && p <= total) wanted.add(p);
+    }
+  }
+  return [...wanted].sort((a, b) => a - b);
+}
+
+// Exposed for site/harness/pdf-document.mjs so the page-range grammar is tested
+// against THIS implementation rather than a copy of it that can drift.
+window.__focrSelectedPages = selectedPages;
+
+// ── per-page ledger ────────────────────────────────────────────────────────
+// One row per page: what happened, and why if it did not. A page that cannot be
+// rasterized is recorded and skipped — one JPEG-2000 page in a 300-page scan
+// must not throw away the other 299.
+let pageLedger = []; // [{page, state, chars, ms, reason, output}]
+
+function resetLedger(pages) {
+  pageLedger = pages.map((page) => ({ page, state: "queued" }));
+  paintLedger();
+}
+
+function paintLedger() {
+  const host = $("page-ledger");
+  if (!host) return;
+  host.hidden = pageLedger.length === 0;
+  host.innerHTML = "";
+  for (const row of pageLedger) {
+    const li = document.createElement("li");
+    li.className = `ledger-row ledger-${row.state}`;
+    const num = document.createElement("span");
+    num.className = "ledger-num";
+    num.textContent = String(row.page);
+    const what = document.createElement("span");
+    what.className = "ledger-what";
+    if (row.state === "done") {
+      what.textContent = `${row.chars.toLocaleString()} characters · ${(row.ms / 1000).toFixed(1)}s`;
+    } else if (row.state === "skipped") {
+      what.textContent = `skipped: ${row.reason}`;
+    } else if (row.state === "running") {
+      what.textContent = "reading…";
+    } else {
+      what.textContent = "queued";
+    }
+    li.append(num, what);
+    host.appendChild(li);
+  }
+}
+
+/// The whole document's text, with page markers — the shape the CLI writes.
+function ledgerDocument() {
+  return pageLedger
+    .filter((r) => r.state === "done" || r.state === "skipped")
+    .map((r) =>
+      r.state === "done"
+        ? `<!-- page ${r.page} -->\n\n${r.output}`
+        : `<!-- page ${r.page} skipped: ${r.reason} -->`,
+    )
+    .join("\n\n");
 }
 
 $("pdf-load").addEventListener("click", () => {
@@ -432,20 +539,17 @@ function refreshRunButton() {
 $("run").addEventListener("click", async () => {
   if (busy) return;
   busy = true;
+  cancelled = false;
   refreshRunButton();
   $("cancel").hidden = false;
-  setStatus("Recognizing… (all compute stays in this tab)");
   resetRecognizeProgress();
   paintRecognizeProgress("Starting…");
   try {
-    const bytes = currentImage.bytes.slice(0);
-    // Only SmolVLM2 reads a question; the worker ignores it for the other lanes
-    // and, until the next wasm build exports the knob, for SmolVLM2 too.
-    const question = modelId === "smolvlm2" ? $("question").value.trim() : "";
-    const { result, ms } = await call("recognize", { bytes, question }, [bytes]);
-    lastResult = result;
-    renderResult(result, ms);
-    setStatus(`Done in ${(ms / 1000).toFixed(1)}s on this device.`, "ok");
+    if (currentPdf) {
+      await runDocument();
+    } else {
+      await runSinglePage();
+    }
   } catch (err) {
     setStatus(`Recognition failed: ${err.message}`, "err");
   } finally {
@@ -455,7 +559,115 @@ $("run").addEventListener("click", async () => {
     refreshRunButton();
   }
 });
-$("cancel").addEventListener("click", () => call("cancel"));
+
+async function runSinglePage() {
+  setStatus("Recognizing… (all compute stays in this tab)");
+  pageLedger = [];
+  paintLedger();
+  const bytes = currentImage.bytes.slice(0);
+  // Only SmolVLM2 reads a question; the worker ignores it for the other lanes.
+  const question = modelId === "smolvlm2" ? $("question").value.trim() : "";
+  const { result, ms } = await call("recognize", { bytes, question }, [bytes]);
+  lastResult = result;
+  renderResult(result, ms);
+  setStatus(`Done in ${(ms / 1000).toFixed(1)}s on this device.`, "ok");
+}
+
+/// Walk every selected page of the open document.
+///
+/// Sequential on purpose: one wasm engine, one forward at a time. Running pages
+/// concurrently would not be faster and would multiply peak linear memory by the
+/// number of pages in flight — which on the lane that already peaks near the
+/// wasm32 ceiling is how you lose the tab.
+async function runDocument() {
+  const pages = selectedPages();
+  if (!pages.length) {
+    setStatus("That page selection matched no pages.", "warn");
+    return;
+  }
+  resetLedger(pages);
+  documentTotal = pages.length;
+  documentDone = 0;
+
+  const started = performance.now();
+  const question = modelId === "smolvlm2" ? $("question").value.trim() : "";
+
+  for (let i = 0; i < pages.length; i++) {
+    if (cancelled) break;
+    const page = pages[i];
+    const row = pageLedger[i];
+    row.state = "running";
+    documentIndex = i;
+    paintLedger();
+    setStatus(`Page ${page} of ${currentPdf.pages} — ${documentDone} done`);
+
+    // Render. A failure here is this page's problem, not the run's.
+    let png;
+    try {
+      ({ png } = await call("pdf-render-page", { page }));
+    } catch (err) {
+      row.state = "skipped";
+      row.reason = err.message;
+      paintLedger();
+      continue;
+    }
+    if (cancelled) break;
+
+    // Show the page being read.
+    const blob = new Blob([png], { type: "image/png" });
+    if (currentImage?.url) URL.revokeObjectURL(currentImage.url);
+    const stem = currentPdf.name.replace(/\.pdf$/i, "");
+    const bytes = await blob.arrayBuffer();
+    currentImage = {
+      bytes,
+      url: URL.createObjectURL(blob),
+      name: `${stem}_p${page}.png`,
+    };
+    showPreview();
+
+    const pageStarted = performance.now();
+    try {
+      resetRecognizeProgress();
+      const { result } = await call(
+        "recognize",
+        { bytes: bytes.slice(0), question },
+        [bytes.slice(0)],
+      );
+      row.state = "done";
+      row.output = result.output;
+      row.chars = result.output.length;
+      row.ms = performance.now() - pageStarted;
+      documentDone++;
+      lastResult = result;
+    } catch (err) {
+      if (cancelled) break;
+      row.state = "skipped";
+      row.reason = err.message;
+    }
+    paintLedger();
+  }
+
+  documentIndex = null;
+  const seconds = (performance.now() - started) / 1000;
+  const skipped = pageLedger.filter((r) => r.state === "skipped").length;
+  // Render the whole document, not just the page that finished last.
+  if (lastResult) {
+    renderResult({ ...lastResult, output: ledgerDocument() }, seconds * 1000);
+  }
+  setStatus(
+    cancelled
+      ? `Cancelled after ${documentDone} of ${pages.length} pages.`
+      : `${documentDone} of ${pages.length} pages in ${seconds.toFixed(0)}s` +
+        `${skipped ? ` · ${skipped} skipped` : ""}, entirely on this device.`,
+    skipped || cancelled ? "warn" : "ok",
+  );
+}
+$("cancel").addEventListener("click", () => {
+  // Stop the WHOLE document, not just the page in flight: the engine cancels
+  // the current forward, and the flag stops the loop from starting the next.
+  cancelled = true;
+  call("cancel");
+});
 
 function renderResult(result, ms) {
   $("result-wrap").hidden = false;

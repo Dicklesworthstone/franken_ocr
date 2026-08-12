@@ -181,3 +181,6 @@ ios/.*-run.png
 # Local debug-run completion capture
 ios/.pdf-done.png
 ios/.*-done.png
+
+# Local iPad document-walk Simulator captures
+ios/.ipad-doc*.png

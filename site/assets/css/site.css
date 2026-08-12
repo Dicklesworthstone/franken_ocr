@@ -656,6 +656,28 @@ section.hero {
 }
 .warnings { color: var(--amber); font-size: 0.83rem; margin: 0; padding-left: 1.15rem; display: grid; gap: 0.3rem; }
 .warnings:empty { display: none; }
+
+/* Per-page ledger for a multi-page document run. Colors carry the same fixed
+   semantics as everywhere else on the page: emerald is a page that read,
+   red is one that was refused with a reason, faint is not started yet. A long
+   book scrolls inside its own box rather than pushing the transcription away. */
+.page-ledger {
+  list-style: none; margin: 0 0 0.9rem; padding: 0.35rem 0.6rem;
+  display: grid; gap: 0.1rem;
+  max-height: 11rem; overflow-y: auto;
+  background: var(--inset); border: 1px solid var(--line); border-radius: var(--r);
+  font-family: var(--mono); font-size: 0.74rem;
+}
+.page-ledger:empty { display: none; }
+.ledger-row { display: grid; grid-template-columns: 2.4rem 1fr; gap: 0.5rem; padding: 0.2rem 0; }
+.ledger-num { color: var(--fg-faint); text-align: right; }
+.ledger-what { color: var(--fg-dim); }
+.ledger-queued .ledger-what { color: var(--fg-faint); }
+.ledger-running .ledger-what { color: var(--fg-mid); }
+.ledger-running .ledger-num::after { content: " ›"; color: var(--accent); }
+.ledger-done .ledger-num::after { content: " ✓"; color: var(--accent); }
+.ledger-skipped .ledger-num::after { content: " ✕"; color: var(--red); }
+.ledger-skipped .ledger-what { color: var(--red); }
 #license { font-size: 0.76rem; color: var(--fg-faint); font-family: var(--mono); }
 #result-wrap { display: grid; gap: 0.9rem; }
 /* The placeholder explains what will appear in the empty right-hand column, and

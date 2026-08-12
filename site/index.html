@@ -154,13 +154,18 @@
             </div>
             <input type="file" id="file-input" accept="image/png,image/jpeg,application/pdf" hidden>
             <div id="pdf-bar" class="row" hidden>
-              <span class="kv">PDF: page
+              <span class="kv">Preview page
                 <input id="pdf-page" type="number" min="1" value="1"
-                  style="width:4.5rem" aria-label="PDF page number">
+                  style="width:4.5rem" aria-label="PDF preview page number">
                 of <span id="pdf-count">?</span></span>
-              <button id="pdf-load" class="btn">Load page</button>
-              <span class="kv">Scanned PDFs only; pages using JPEG&nbsp;2000 or JBIG2
-                report a named error rather than a wrong result.</span>
+              <button id="pdf-load" class="btn">Show</button>
+              <span class="kv">Pages
+                <input id="pdf-range" type="text" placeholder="all"
+                  style="width:7rem" aria-label="Pages to recognize, e.g. 3,5-9"></span>
+              <span class="kv">Recognize reads the whole document. Leave Pages empty
+                for every page, or give a range like 3,5-9. Pages using
+                JPEG&nbsp;2000 or JBIG2 are skipped with a named reason rather
+                than returning a wrong result.</span>
             </div>
             <div id="question-wrap" hidden>
               <label class="label" for="question">Ask about the photo</label>
@@ -190,6 +195,9 @@
             same bytes the CLI writes. You can read them rendered or raw, and download either the
             raw file or a self-contained styled HTML copy.
           </p>
+          <!-- One row per page of a document run: what happened, and why if it
+               did not. Visible while the walk is running, not only after. -->
+          <ul id="page-ledger" class="page-ledger" hidden aria-label="Per-page status"></ul>
           <div id="result-wrap" hidden>
             <div class="row spread">
               <div id="result-meta" class="kv"></div>
