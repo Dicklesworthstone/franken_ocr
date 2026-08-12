@@ -841,6 +841,11 @@ mod mmap_island {
         // memory-constrained device that is the difference between a working set
         // that fits and one that thrashes. Advice is a hint: a failure here
         // costs paging efficiency, never correctness, so it is not fatal.
+        //
+        // `madvise` is POSIX; `memmap2` gates both `Advice` and `advise` behind
+        // `cfg(unix)`, so this must be gated too or the Windows targets in the
+        // release matrix fail to compile.
+        #[cfg(unix)]
         let _ = map.advise(memmap2::Advice::Random);
         Ok(map)
     }
