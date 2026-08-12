@@ -443,9 +443,15 @@ function selectedPages() {
 
 /// Mirrors `pdf::is_fatal_to_document`: does this end the whole walk, or just
 /// this page? The worker prefixes engine errors with the failing stage, and a
-/// cancelled run is signalled by the flag rather than the message.
+/// cancelled run is signalled by the `cancelled` flag rather than the message.
+///
+/// Kept to the same three classes the engine uses. A timeout is deliberately
+/// NOT here — the stage budget is per-forward, so one slow page is a skip.
+/// Matching on text is a weaker test than the engine's typed check, so it is
+/// deliberately narrow: over-matching would abort a document for a page-level
+/// problem, which is the more damaging direction to be wrong in.
 function isFatalToDocument(message) {
-  return /model (artifact )?(was )?not found|no model is loaded|format|version mismatch|cancell?ed|budget|timed? ?out/i.test(
+  return /no model loaded|model (artifact )?(was )?not found|format or version mismatch|cancell?ed/i.test(
     message,
   );
 }
