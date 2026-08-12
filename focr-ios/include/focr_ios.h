@@ -126,19 +126,32 @@ void focr_request_cancel(void);
 void focr_reset_cancel(void);
 
 // ── PDF ────────────────────────────────────────────────────────────────────
+//
+// A PDF is opened ONCE and rendered many times. Parsing is not free — a scanned
+// book is tens of megabytes of object graph — so a render-by-bytes API would
+// re-parse the whole document for every page, which is exactly the wrong shape
+// for the common case of "OCR this entire 300-page scan".
 
-// Page count of a PDF held in memory. Writes to *out_pages, returns 0 on
-// success.
-int32_t focr_pdf_page_count(const uint8_t *pdf_bytes, size_t pdf_len,
-                            uint32_t *out_pages);
+// Opaque handle to an opened PDF.
+typedef struct FocrPdf FocrPdf;
 
-// Rasterize one 1-based PDF page to PNG bytes (caller frees with
-// focr_bytes_free). Pages whose codec has no pure-Rust decoder (JPEG 2000,
-// JBIG2) and born-digital vector pages fail with a message naming exactly what
-// was unsupported, rather than returning a wrong result.
-int32_t focr_pdf_render_page(const uint8_t *pdf_bytes, size_t pdf_len,
-                             uint32_t page, uint8_t **out_png,
-                             size_t *out_len);
+// Parse a PDF held in memory. The bytes are copied into an owned document, so
+// the caller may release them as soon as this returns. NULL on failure.
+FocrPdf *focr_pdf_open(const uint8_t *pdf_bytes, size_t pdf_len);
+
+// Release the document. Safe to call with NULL.
+void focr_pdf_close(FocrPdf *pdf);
+
+// Number of pages. Returns 0 for a NULL handle.
+uint32_t focr_pdf_page_count(const FocrPdf *pdf);
+
+// Rasterize one 1-based page to PNG bytes (caller frees with focr_bytes_free).
+// Pages whose codec has no pure-Rust decoder (JPEG 2000, JBIG2) and born-digital
+// vector pages fail with a message naming exactly what was unsupported, rather
+// than returning a wrong result — so a caller walking a whole document can skip
+// that page with a reason and keep going.
+int32_t focr_pdf_render_page(const FocrPdf *pdf, uint32_t page,
+                             uint8_t **out_png, size_t *out_len);
 
 // ── Decode options ─────────────────────────────────────────────────────────
 //

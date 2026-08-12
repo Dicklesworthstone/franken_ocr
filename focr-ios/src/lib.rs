@@ -569,62 +569,100 @@ pub extern "C" fn focr_reset_cancel() {
 
 // ── PDF ────────────────────────────────────────────────────────────────────
 
-/// See `focr_ios.h`.
-///
-/// # Safety
-/// `pdf_bytes` must be NULL or point to `pdf_len` initialized bytes valid for
-/// the call. `out_pages` must be NULL or a valid, aligned, writable `u32` slot.
-#[unsafe(no_mangle)]
-#[allow(unsafe_code)]
-pub unsafe extern "C" fn focr_pdf_page_count(
-    pdf_bytes: *const u8,
-    pdf_len: usize,
-    out_pages: *mut u32,
-) -> i32 {
-    guarded(EXIT_GENERIC, || {
-        clear_error();
-        // SAFETY: documented as NULL or `pdf_len` initialized bytes.
-        let Some(bytes) = (unsafe { ptr_island::opt_bytes(pdf_bytes, pdf_len) }) else {
-            set_error("focr_pdf_page_count: pdf_bytes was NULL");
-            return EXIT_USAGE;
-        };
-        let pages = match franken_ocr::pdf::PdfPages::from_bytes(bytes) {
-            Ok(pages) => pages.len(),
-            Err(err) => return fail("focr_pdf_page_count", &err),
-        };
-        // SAFETY: the caller's out-parameter.
-        if !unsafe { ptr_island::write_out(out_pages, u32::try_from(pages).unwrap_or(u32::MAX)) } {
-            set_error("focr_pdf_page_count: out_pages was NULL");
-            return EXIT_USAGE;
-        }
-        0
-    })
+/// An opened PDF. Parsing a document is not free — a scanned book is tens of
+/// megabytes of object graph — so the parse happens ONCE here and every page
+/// render borrows it. A stateless render-by-bytes API re-parses per page, which
+/// turns a 300-page document into 300 full parses.
+pub struct FocrPdf {
+    pages: franken_ocr::pdf::PdfPages,
 }
 
 /// See `focr_ios.h`.
 ///
 /// # Safety
 /// `pdf_bytes` must be NULL or point to `pdf_len` initialized bytes valid for
-/// the call. `out_png` and `out_len` must be NULL or valid writable slots; on
-/// success they receive a caller-owned buffer that must be released with
-/// [`focr_bytes_free`], passing back exactly the length returned.
+/// the duration of the call. The bytes are parsed into an owned document, so the
+/// caller may release them as soon as this returns. A non-NULL return must be
+/// released exactly once with [`focr_pdf_close`].
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_pdf_open(pdf_bytes: *const u8, pdf_len: usize) -> *mut FocrPdf {
+    guarded(std::ptr::null_mut(), || {
+        clear_error();
+        // SAFETY: documented as NULL or `pdf_len` initialized bytes.
+        let Some(bytes) = (unsafe { ptr_island::opt_bytes(pdf_bytes, pdf_len) }) else {
+            set_error("focr_pdf_open: pdf_bytes was NULL");
+            return std::ptr::null_mut();
+        };
+        match franken_ocr::pdf::PdfPages::from_bytes(bytes) {
+            Ok(pages) => Box::into_raw(Box::new(FocrPdf { pages })),
+            Err(err) => {
+                fail("focr_pdf_open", &err);
+                std::ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// See `focr_ios.h`.
+///
+/// # Safety
+/// `pdf` must be NULL or a handle from [`focr_pdf_open`] that has not been
+/// closed. Closing NULL is a no-op; closing twice is undefined.
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_pdf_close(pdf: *mut FocrPdf) {
+    if pdf.is_null() {
+        return;
+    }
+    guarded((), || {
+        // SAFETY: non-null by the check above, and documented as a live handle.
+        drop(unsafe { Box::from_raw(pdf) });
+    });
+}
+
+/// See `focr_ios.h`.
+///
+/// # Safety
+/// `pdf` must be NULL or a live handle from [`focr_pdf_open`].
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_pdf_page_count(pdf: *const FocrPdf) -> u32 {
+    guarded(0, || {
+        if pdf.is_null() {
+            set_error("focr_pdf_page_count: pdf was NULL");
+            return 0;
+        }
+        // SAFETY: non-null by the check above, and documented as a live handle.
+        let pdf = unsafe { &*pdf };
+        u32::try_from(pdf.pages.len()).unwrap_or(u32::MAX)
+    })
+}
+
+/// See `focr_ios.h`.
+///
+/// # Safety
+/// `pdf` must be NULL or a live handle from [`focr_pdf_open`]. `out_png` and
+/// `out_len` must be NULL or valid writable slots; on success they receive a
+/// caller-owned buffer that must be released with [`focr_bytes_free`], passing
+/// back exactly the length returned.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
 pub unsafe extern "C" fn focr_pdf_render_page(
-    pdf_bytes: *const u8,
-    pdf_len: usize,
+    pdf: *const FocrPdf,
     page: u32,
     out_png: *mut *mut u8,
     out_len: *mut usize,
 ) -> i32 {
     guarded(EXIT_GENERIC, || {
         clear_error();
-        // SAFETY: documented as NULL or `pdf_len` initialized bytes.
-        let Some(bytes) = (unsafe { ptr_island::opt_bytes(pdf_bytes, pdf_len) }) else {
-            set_error("focr_pdf_render_page: pdf_bytes was NULL");
+        if pdf.is_null() {
+            set_error("focr_pdf_render_page: pdf was NULL");
             return EXIT_USAGE;
-        };
-        let png = match render_pdf_page_png(bytes, page) {
+        }
+        // SAFETY: non-null by the check above, and documented as a live handle.
+        let pdf = unsafe { &*pdf };
+        let png = match render_pdf_page_png(&pdf.pages, page) {
             Ok(png) => png,
             Err(err) => return fail("focr_pdf_render_page", &err),
         };
@@ -650,8 +688,7 @@ pub unsafe extern "C" fn focr_pdf_render_page(
 /// picker); `PdfPages::render` is 0-based. Converting here rather than in Swift
 /// keeps the off-by-one in one place, next to the range check that produces the
 /// error message naming the real page count.
-fn render_pdf_page_png(pdf_bytes: &[u8], page: u32) -> FocrResult<Vec<u8>> {
-    let pages = franken_ocr::pdf::PdfPages::from_bytes(pdf_bytes)?;
+fn render_pdf_page_png(pages: &franken_ocr::pdf::PdfPages, page: u32) -> FocrResult<Vec<u8>> {
     if page == 0 {
         return Err(FocrError::Usage(format!(
             "PDF pages are 1-based; this document has {} page(s)",
@@ -792,8 +829,16 @@ mod tests {
                 ),
                 EXIT_USAGE
             );
+            assert_eq!(focr_pdf_page_count(std::ptr::null()), 0);
+            assert!(focr_pdf_open(std::ptr::null(), 0).is_null());
+            focr_pdf_close(std::ptr::null_mut());
             assert_eq!(
-                focr_pdf_page_count(std::ptr::null(), 0, std::ptr::null_mut()),
+                focr_pdf_render_page(
+                    std::ptr::null(),
+                    1,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut()
+                ),
                 EXIT_USAGE
             );
             // Closing NULL is explicitly a no-op.
