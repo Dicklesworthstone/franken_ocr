@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>franken_ocr — a 3-billion-parameter OCR model in your browser tab</title>
-<meta name="description" content="A pure-Rust, CPU-only OCR engine for hand-ported vision-language models. Baidu's Unlimited-OCR document model and the TrOMR sheet-music model run fully in your browser — no server, no upload, no Python, no GPU.">
+<title>franken_ocr: a 3-billion-parameter OCR model in your browser tab</title>
+<meta name="description" content="A pure-Rust, CPU-only OCR engine for hand-ported vision-language models. Baidu's Unlimited-OCR document model runs fully in your browser, alongside three smaller lanes. No server, no upload, no Python, no GPU.">
 <meta name="theme-color" content="#060b09">
 <link rel="canonical" href="https://franken-ocr.com/">
-<meta property="og:title" content="franken_ocr — a 3-billion-parameter OCR model in your browser tab">
+<meta property="og:title" content="franken_ocr: a 3-billion-parameter OCR model in your browser tab">
 <meta property="og:description" content="Baidu Unlimited-OCR, hand-ported to Rust, quantized to int4, compiled to WebAssembly. Your documents never leave the page.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="https://franken-ocr.com/assets/og.jpg">
@@ -53,12 +53,12 @@
     <h1>A 3-billion-parameter<br>OCR model. <em>In this tab.</em></h1>
     <p class="lede">
       <strong>franken_ocr</strong> hand-ports vision-language models into memory-safe Rust with
-      model-specific CPU kernels — no PyTorch, no Python, no CUDA, no GPU, no FFI at inference.
+      model-specific CPU kernels. No PyTorch, no Python, no CUDA, no GPU, no FFI at inference.
       The same code that ships as the <code>focr</code> CLI compiles to WebAssembly, so
-      Baidu's Unlimited-OCR document model and the TrOMR sheet-music model run
-      <strong>entirely on your CPU, in this page</strong>. Your documents never leave it — the
-      CSP's <code>connect-src 'self'</code> makes that a browser-enforced promise rather than a
-      privacy-policy one.
+      <strong>Baidu's Unlimited-OCR</strong> reads your document pages
+      <strong>entirely on your CPU, in this page</strong>, with three smaller models alongside it.
+      Your documents never leave the tab, and the CSP's <code>connect-src 'self'</code> makes that
+      a browser-enforced promise rather than a privacy-policy one.
     </p>
     <p class="hero-cta">
       <a class="btn primary" href="#playground">Try it in your browser</a>
@@ -86,12 +86,14 @@
       <p class="eyebrow">Live · in this tab</p>
       <h2>Run it <em>right now</em>.</h2>
       <p class="lede">
-        Two models, both executed by hand-written Rust kernels compiled to wasm, entirely on your
-        CPU. <strong>TrOMR</strong> (58 MB) turns sheet-music scans into MusicXML and runs
-        anywhere, phones included. <strong>Baidu Unlimited-OCR</strong> (2.8 GB int4, desktop
-        Chrome) parses document pages into Markdown. Every download is SHA-256-verified against a
-        pinned manifest and cached for next time. There is no server behind this panel and no
-        mocked demo.
+        Four models, all executed by hand-written Rust kernels compiled to wasm, entirely on your
+        CPU. <strong>Baidu Unlimited-OCR</strong> (2.8 GB int4, desktop) is the default: it parses
+        a whole document page into Markdown, tables and LaTeX included. <strong>TrOMR</strong>
+        (58 MB) turns sheet-music scans into MusicXML and runs anywhere, phones included.
+        <strong>GOT-OCR2</strong> (776 MB) and <strong>SmolVLM2</strong> (1.0 GB) are the
+        specialist lanes, for structured formulas and tables and for photo description. Every
+        download is SHA-256-verified against a pinned manifest and cached for next time. There is
+        no server behind this panel and no mocked demo.
       </p>
     </div>
 
@@ -105,10 +107,14 @@
             <div class="row">
               <label class="sr-only" for="model-select">Model</label>
               <select id="model-select" class="btn">
-                <option value="tromr">TrOMR — sheet music → MusicXML (58 MB)</option>
-                <option value="unlimited-ocr">Baidu Unlimited-OCR — documents → Markdown (2.8 GB, desktop)</option>
+                <option value="unlimited-ocr" selected>Baidu Unlimited-OCR: documents → Markdown (2.8 GB, desktop)</option>
+                <option value="tromr">TrOMR: sheet music → MusicXML (58 MB)</option>
+                <option value="got-ocr2">GOT-OCR2: formulas &amp; tables (776 MB, desktop)</option>
+                <option value="smolvlm2">SmolVLM2: photo description (1.0 GB, desktop)</option>
               </select>
-              <button id="load-model" class="btn primary" disabled>Load model (<span id="model-size">…</span>)</button>
+              <!-- One flex child, deliberately: `.btn` sets gap:0.5rem, so a bare
+                   <span> inside the label renders as "Load model ( 2.8 GB )". -->
+              <button id="load-model" class="btn primary" disabled><span>Load model (<span id="model-size">…</span>)</span></button>
               <button id="clear-cache" class="btn danger" title="Remove the downloaded model from this browser's cache">Clear cache</button>
             </div>
             <p class="kv">int8 route: <code id="route">…</code></p>
@@ -128,8 +134,8 @@
             </div>
 
             <div id="status" class="status">Starting engine…</div>
-            <div id="reset-hint" hidden class="kv">Something crashed last time —
-              <a href="./reset.html">reset page</a>.</div>
+            <div id="reset-hint" hidden class="kv">Something crashed last time.
+              <a href="./reset.html">Reset page</a>.</div>
           </div>
 
           <div class="pg-step">
@@ -144,6 +150,14 @@
               </div>
             </div>
             <input type="file" id="file-input" accept="image/png,image/jpeg" hidden>
+            <div id="question-wrap" hidden>
+              <label class="label" for="question">Ask about the photo</label>
+              <input id="question" class="text-input" type="text" maxlength="200"
+                aria-describedby="question-note"
+                placeholder="Leave blank for a plain description.">
+              <p class="micro" id="question-note">SmolVLM2 answers short factual questions about a
+                photo. Long free-form answers drift between builds; short ones do not.</p>
+            </div>
             <div class="row">
               <button id="run" class="btn primary" disabled>Recognize</button>
               <button id="cancel" class="btn danger" hidden>Cancel</button>
@@ -160,37 +174,54 @@
         <div class="pg-col">
           <p class="label">03 · The transcription</p>
           <p class="note" id="result-placeholder">
-            Output appears here: MusicXML for a staff, Markdown for a document page — the same
-            bytes the CLI writes, downloadable with one click.
+            Output appears here: Markdown for a document page, MusicXML for a staff. These are the
+            same bytes the CLI writes. You can read them rendered or raw, and download either the
+            raw file or a self-contained styled HTML copy.
           </p>
           <div id="result-wrap" hidden>
             <div class="row spread">
               <div id="result-meta" class="kv"></div>
-              <button id="download-xml" class="btn" hidden>Download result</button>
+              <div class="seg" id="view-toggle" role="group" aria-label="Result view" hidden>
+                <button id="view-rendered" class="seg-btn" aria-pressed="true">Rendered</button>
+                <button id="view-source" class="seg-btn" aria-pressed="false">Source</button>
+              </div>
             </div>
             <ul id="warnings" class="warnings"></ul>
             <pre id="output" class="output"></pre>
-            <div class="legend">
+            <!-- Model output is untrusted text. It is rendered inside a sandbox with
+                 no scripts and no same-origin privileges, and the passthrough HTML is
+                 filtered to a table-only tag allowlist before it ever gets there. -->
+            <iframe id="rendered" class="rendered" title="Rendered transcription"
+              sandbox="" hidden></iframe>
+            <div class="row">
+              <button id="download-xml" class="btn" hidden>Download .md</button>
+              <button id="download-html" class="btn" hidden>Styled HTML (.html)</button>
+            </div>
+            <div class="legend" id="music-legend" hidden>
               <span class="sw-ok"><i></i>recognized staves</span>
               <span class="sw-skip"><i></i>skipped, with the reason listed</span>
               <span class="sw-warn"><i></i>sanity warnings</span>
             </div>
-            <p class="micro">
+            <p class="micro" id="music-note" hidden>
               “Sanity warnings” are annotate-only observations the engine makes about its own
-              transcription — overfull bars, impossible durations. Honest signal, not silent
+              transcription: overfull bars, impossible durations. Honest signal, not silent
               cleanup.
             </p>
           </div>
           <p class="note">
-            <strong>What to expect.</strong> TrOMR takes roughly a second or two per staff.
-            Unlimited-OCR is a different animal: on the seven-page measurement corpus it took
-            <strong>80 to 250 seconds per page</strong> in Chromium, with a cold model load of
-            about 95 seconds on top. On a cross-origin-isolated Chrome the decode spreads across
-            eight worker threads; everywhere else it runs the serial simd128 build.
+            <strong>What to expect.</strong> Unlimited-OCR took <strong>80 to 250 seconds per
+            page</strong> in Chromium across the seven-page measurement corpus, with a cold model
+            load of about 95 seconds on top. On a cross-origin-isolated Chrome the decode spreads
+            across eight worker threads; everywhere else it runs the serial simd128 build. GOT-OCR2
+            measured 140 to 224 seconds a page and SmolVLM2 242 to 309 seconds a caption, both in
+            Node on the same V8 wasm engine Chrome uses. TrOMR is the quick one, roughly a second
+            or two per staff.
           </p>
           <p class="note">
-            The 2.8 GB artifact needs roughly 3.5 GB of memory to hydrate, which is why it is
-            gated to desktop browsers. If your device cannot hold it, TrOMR still will.
+            The 2.8 GB artifact needs roughly 3.5 GB of memory to hydrate, which is why it is gated
+            to desktop browsers. GOT-OCR2 peaks at 3.4 GB of wasm memory and SmolVLM2 at 2.8 GB,
+            so both are gated the same way. If your device cannot hold any of them, TrOMR still
+            runs.
           </p>
           <div id="license" class="kv"></div>
         </div>
@@ -206,10 +237,10 @@
       <p class="eyebrow">The anatomy</p>
       <h2>What a page <em>becomes</em>.</h2>
       <p class="lede">
-        Unlimited-OCR is not an OCR box with a language model bolted on. It is one forward pass
-        that turns pixels into 256 visual tokens and then <em>writes</em> the page as Markdown,
-        one token at a time, out of a 129,280-entry vocabulary. Every shape below is fixed at
-        compile time in this port, which is exactly why the kernels can be hand-written.
+        Unlimited-OCR never detects a text box and then reads it. One forward pass turns pixels
+        into 256 visual tokens and then <em>writes</em> the page as Markdown, one token at a time,
+        out of a 129,280-entry vocabulary. Every shape below is fixed at compile time in this port,
+        which is exactly why the kernels can be hand-written.
       </p>
     </div>
 
@@ -223,12 +254,12 @@
         <li data-name="Page image" data-shape="1024×1024×3" data-kind="input">
           <h3>The page image</h3>
           <p>Decoded in-tab, resized and normalized by the same preprocessing code the native
-          CLI runs — certified exact against the Python reference before any kernel work was
+          CLI runs, and certified exact against the Python reference before any kernel work was
           allowed to start. Nothing is uploaded; the bytes go from your file picker into a
           worker.</p>
         </li>
         <li data-name="SAM-ViT-B" data-shape="4096 × 768" data-cost="12 blocks" data-kind="vision">
-          <h3>SAM-ViT-B — the layout reader</h3>
+          <h3>SAM-ViT-B, the layout reader</h3>
           <p>A 16×16 patch embedding turns the page into a 64×64 grid of 4,096 tokens at width
           768, then twelve transformer blocks run windowed attention (window 14) with global
           attention at blocks 2, 5, 8 and 11, plus decomposed relative-position bias. This is the
@@ -236,13 +267,13 @@
         </li>
         <li data-name="Conv compressor" data-shape="256 × 1024" data-cost="16× fewer tokens" data-kind="vision">
           <h3>The 16× token compressor</h3>
-          <p>A convolutional neck — 1×1, layernorm, 3×3, layernorm, then two stride-2
-          convolutions — collapses 4,096 tokens into 256 at width 1024. Sixteen times fewer
+          <p>A convolutional neck (1×1, layernorm, 3×3, layernorm, then two stride-2
+          convolutions) collapses 4,096 tokens into 256 at width 1024. Sixteen times fewer
           tokens reach the decoder, and the decoder's attention cost is what dominates a long
           page. This single block is the reason a whole scanned page fits in one pass.</p>
         </li>
         <li data-name="CLIP-L/14" data-shape="256 × 1024" data-cost="24 layers" data-kind="vision">
-          <h3>CLIP-L/14 — the semantic reader</h3>
+          <h3>CLIP-L/14, the semantic reader</h3>
           <p>Twenty-four layers at width 1024 with sixteen heads, fused directly onto the SAM
           output: CLIP's embedding layer takes SAM's feature map as its patch embeddings instead
           of re-reading the image. SAM contributes <em>where</em>, CLIP contributes
@@ -251,25 +282,25 @@
         <li data-name="Linear projector" data-shape="2048 → 1280" data-kind="vision">
           <h3>Concatenate, then project</h3>
           <p>The two towers are concatenated channel-wise into 2,048 dimensions and a single
-          linear layer maps them to the decoder's 1,280-wide residual stream. One matrix — and
-          the exact concatenation order was resolved from the reference implementation rather
-          than guessed, because getting it backwards produces plausible-looking garbage.</p>
+          linear layer maps them to the decoder's 1,280-wide residual stream. One matrix; and the
+          exact concatenation order was resolved from the reference implementation rather than
+          guessed, because getting it backwards produces plausible-looking garbage.</p>
         </li>
         <li data-name="MoE decoder" data-shape="12 layers × 1280" data-cost="64 experts, top-6" data-kind="decoder">
           <h3>The DeepSeek-V2 mixture-of-experts decoder</h3>
           <p>Twelve layers, hidden size 1,280, ten attention heads of dimension 128. Layer 0 is a
           dense SwiGLU MLP; layers 1 through 11 are mixture-of-experts: 64 routed experts plus 2
           fused shared experts, with a softmax router picking the top 6 greedily and
-          <em>no</em> renormalization. Attention is R-SWA — a read-only reference block holding
-          the whole visual prefill, plus a 128-slot ring that slides. Memory stays flat while the
-          page grows.</p>
+          <em>no</em> renormalization. Attention is R-SWA: a read-only reference block holding the
+          whole visual prefill, plus a 128-slot ring that slides. Memory stays flat while the page
+          grows.</p>
         </li>
         <li data-name="Markdown" data-shape="vocab 129,280" data-kind="output">
           <h3>Out comes Markdown</h3>
           <p>The final RMSNorm feeds an lm_head GEMV from 1,280 to 129,280 logits, and greedy
           decoding writes the page: headings, paragraphs, tables, LaTeX, layout boxes. The
-          browser writes exactly what the CLI writes, from exactly the same artifact — that
-          equality is measured, not assumed.</p>
+          browser writes exactly what the CLI writes, from exactly the same artifact, and that
+          equality is measured rather than assumed.</p>
         </li>
       </ol>
     </div>
@@ -278,8 +309,8 @@
       <p class="label">Why 3.3 billion parameters fit in a tab at all</p>
       <p class="note viz-intro">
         A mixture-of-experts layer stores 64 expert MLPs and runs six of them. The router is a
-        single f32 matrix that is <strong>never quantized</strong> — quantizing it drifts expert
-        selection, and a wrong expert is not a rounding error, it is a different answer. Watch
+        single f32 matrix that is <strong>never quantized</strong>. Drift the router and it selects
+        a different expert, which produces a different answer rather than a rounded one. Watch
         which six light up as tokens stream past.
       </p>
       <div id="moe-viz" class="viz-scroll viz-wide"></div>
@@ -290,9 +321,9 @@
         <div class="card-num">01</div>
         <h3>Every dimension is a constant</h3>
         <p class="note">A general framework pays a generality tax on every op: dynamic dtype
-        dispatch, arbitrary shapes, autograd bookkeeping. Here the shapes — 1,280 hidden, 10
-        heads, 64 experts, window 128, vocab 129,280 — are compile-time constants, so each kernel
-        is written for its exact case. There is no generic runtime underneath.</p>
+        dispatch, arbitrary shapes, autograd bookkeeping. Here the shapes (1,280 hidden, 10 heads,
+        64 experts, window 128, vocab 129,280) are compile-time constants, so each kernel is
+        written for its exact case. There is no generic runtime underneath.</p>
       </article>
       <article class="card accent">
         <div class="card-num">02</div>
@@ -307,8 +338,8 @@
         <h3>Every fast kernel has a slow twin</h3>
         <p class="note">Each accelerated int8 kernel ships with a bit-identical scalar oracle,
         and <code>focr robot selftest</code> re-proves the dispatched kernel on <em>your</em>
-        CPU — including the browser's, where the wasm build reports its route the same way the
-        playground above prints it.</p>
+        CPU, the browser's included: the wasm build reports its route the same way the playground
+        above prints it.</p>
       </article>
     </div>
   </div>
@@ -344,9 +375,8 @@
         <p class="label">Where the 3.00 GB actually goes</p>
         <p class="note viz-intro">
           Read straight out of the shipped artifact's own tensor table. Grey is what the component
-          weighed in bf16; green is what it weighs now. The vision tower does not move at all —
-          it is 27% of the file and stays bf16 because it is the stage with no error budget to
-          spend.
+          weighed in bf16; green is what it weighs now. The vision tower does not move at all. It
+          is 27% of the file and stays bf16 because it is the stage with no error budget to spend.
         </p>
         <div class="table-scroll">
           <table data-bars-max="4.9" data-bars-value="2" data-bars-ref="1" data-bars-unit=" GB">
@@ -370,9 +400,9 @@
           <h3>What calibration changed</h3>
           <p class="note">Round-to-nearest is the naive recipe: clip each group at its own
           maximum and hope. The shipped artifact instead runs an <strong>importance-weighted clip
-          search</strong> — candidate clipping ranges scored by how much they disturb the
-          activations that actually flow through, using statistics gathered from a 13-page run
-          over real scans — plus an <strong>AWQ-style scale fold</strong> into
+          search</strong>, scoring candidate clipping ranges by how much they disturb the
+          activations that actually flow through, using statistics gathered from a 13-page run over
+          real scans. On top of that sits an <strong>AWQ-style scale fold</strong> into
           <code>down_proj</code>. Coverage: 2,148 of 2,148 int4 tensors.</p>
           <p class="note">It bought a measured 10.9% relative reduction in character error on the
           hardest page and did not regress a single page. That is the honest size of the win: a
@@ -380,10 +410,11 @@
         </article>
         <article class="card">
           <h3>What stays in high precision, and why</h3>
-          <p class="note">The <strong>router</strong> stays bf16 — a drifted gate picks a
-          different expert, and that is a different answer, not a small one. The <strong>vision
-          tower</strong> stays bf16: every downstream token is conditioned on its 256 outputs, so
-          error there is not local. <strong>Layernorms</strong> stay bf16 because they are free.
+          <p class="note">The <strong>router</strong> stays bf16, because a drifted gate picks a
+          different expert, and that is a different answer rather than a small one. The
+          <strong>vision tower</strong> stays bf16: every downstream token is conditioned on its
+          256 outputs, so error there is not local. <strong>Layernorms</strong> stay bf16 because
+          they are free.
           Attention, <code>lm_head</code> and the embedding table go to int8 per-channel, where
           measurement said it was safe.</p>
         </article>
@@ -392,7 +423,7 @@
 
     <p class="viz-caption reveal mt">
       A note on units, because they matter here: the artifact is <span class="mono">3,003,988,117</span>
-      bytes — 3.00 GB decimal, which your browser will report as 2.8 GB because it divides by
+      bytes, or 3.00 GB decimal, which your browser will report as 2.8 GB because it divides by
       1024. Both numbers describe the same file.
     </p>
   </div>
@@ -418,14 +449,15 @@
         <li data-stat="4.16 GB artifact" data-rail="size">
           <h3>The artifact did not fit the address space</h3>
           <p data-kind="wall">The CLI's Unlimited-OCR artifact is 4,157,448,783 bytes. wasm32
-          addresses at most 4 GiB — <span class="mono">4,294,967,296</span> bytes — of linear
-          memory, total, for everything.</p>
+          addresses at most 4 GiB of linear memory (<span class="mono">4,294,967,296</span> bytes)
+          in total, for everything.</p>
           <p data-kind="why">That leaves about 137 MB for the engine, the activations, the KV
-          ring and the vision scratch buffers. It is not a tight fit; it is not a fit.</p>
+          ring and the vision scratch buffers. There is no arrangement of those numbers that
+          fits.</p>
           <p data-kind="fix">A wasm-only quantization recipe: int4 on the expert bulk, int8 on
           attention, <code>lm_head</code> and embeddings, bf16 on the vision tower and the router.
           6.67 GB of bf16 source becomes a 3.00 GB artifact that the native resolver refuses to
-          serve as a default — this file exists for one lane only.</p>
+          serve as a default. This file exists for one lane only.</p>
         </li>
         <li data-stat="5.7 → 3.6 GB" data-rail="residency">
           <h3>Fitting on disk is not fitting in memory</h3>
@@ -442,8 +474,9 @@
           <h3>One allocation cannot exceed 2 GiB</h3>
           <p data-kind="wall">wasm32 caps a <em>single</em> allocation at 2 GiB. A 3.00 GB blob
           has nowhere to land as one object, however much total memory is free.</p>
-          <p data-kind="why">The obvious workaround — chop it every 1 GiB — cuts tensors in half,
-          and a tensor that spans two allocations cannot be borrowed as one slice by a kernel.</p>
+          <p data-kind="why">The obvious workaround, chopping it every 1 GiB, cuts tensors in
+          half, and a tensor that spans two allocations cannot be borrowed as one slice by a
+          kernel.</p>
           <p data-kind="fix">The staging planner reads the artifact's own header out of the first
           4 MiB of the stream, then cuts the blob into <strong>≤1 GiB segments at tensor
           boundaries</strong>. Every tensor stays contiguous inside exactly one segment, so every
@@ -453,8 +486,8 @@
           <h3>Chrome refuses a 3 GB ArrayBuffer</h3>
           <p data-kind="wall">Buffering the download to hash it before handing it over fails
           outright: <span class="mono">Array buffer allocation failed</span>, measured at 3.0 GB.</p>
-          <p data-kind="why">Verification appears to need the whole file at once — you cannot
-          check a SHA-256 you have not finished reading — and WebCrypto's digest API cannot be
+          <p data-kind="why">Verification appears to need the whole file at once, since you cannot
+          check a SHA-256 you have not finished reading, and WebCrypto's digest API cannot be
           streamed.</p>
           <p data-kind="fix">The weight bytes are never materialized JavaScript-side. Each fetch
           chunk is fed to an incremental SHA-256, pushed into the wasm staging sink, and teed into
@@ -465,14 +498,15 @@
         <li data-stat="two modules" data-rail="threads">
           <h3>Threads are a link-time decision</h3>
           <p data-kind="wall">wasm threads need a shared memory and TLS exports chosen when the
-          module is <em>linked</em>, not a flag you pass at runtime.</p>
+          module is <em>linked</em>. There is no runtime flag for it.</p>
           <p data-kind="why">And feature detection is not enough: <code>SharedArrayBuffer</code>
           also exists on iOS under COOP/COEP, where growing a shared memory toward 2 GB reclaims
           the tab.</p>
-          <p data-kind="fix">Two modules ship — serial, and shared-memory with atomics — chosen by
-          an <strong>allow-list</strong>: cross-origin-isolated Blink only. A byte-sized blob
-          worker proves the CSP permits the rayon pool's spawn path <em>before</em> a single weight
-          byte downloads, the instantiated memory is checked to be genuinely shared, and the pool
+          <p data-kind="fix">Two modules ship, one serial and one shared-memory with atomics, and
+          an <strong>allow-list</strong> picks between them: cross-origin-isolated Blink only. A
+          byte-sized blob worker proves the CSP permits the rayon pool's spawn path <em>before</em>
+          a single weight byte downloads, the instantiated memory is checked to be genuinely
+          shared, and the pool
           is armed only after hydration, because a worker parked in <code>Atomics.wait</code>
           blocks the memory growth that hydration is made of.</p>
         </li>
@@ -490,7 +524,7 @@
       <article class="card">
         <h3>Crash breadcrumbs</h3>
         <p class="note">The worker posts a stage name before every dangerous step, and the page
-        commits it synchronously to storage — so an out-of-memory kill still leaves evidence.
+        commits it synchronously to storage, so an out-of-memory kill still leaves evidence.
         A breadcrumb naming a hydration stage suppresses auto-load on the next visit and offers a
         reset page instead of a silent second crash.</p>
       </article>
@@ -498,8 +532,8 @@
         <h3>Split at the 2 GiB release cap</h3>
         <p class="note">GitHub caps a release asset at 2 GiB, so the artifact ships as ordered
         byte-split parts. The loader streams them as <em>one</em> logical byte stream and pins
-        each part's digest as well as the whole file's — the split is a delivery detail that never
-        reaches the engine.</p>
+        each part's digest as well as the whole file's, so the split stays a delivery detail that
+        never reaches the engine.</p>
       </article>
     </div>
   </div>
@@ -599,7 +633,7 @@
         <article class="card">
           <h3>The one page that fell over</h3>
           <p class="note">Unguarded, the hardest page tipped the wasm decode into a degenerate
-          repetition loop — CER 0.3489 against the native int4 decode. The playground applies the
+          repetition loop, CER 0.3489 against the native int4 decode. The playground applies the
           repetition guard the CLI manual already documents
           (<code>no_repeat_ngram = 20</code>), set from the model manifest and labeled there, and
           a native user can reproduce the browser's behaviour with the identical knob. It is a
@@ -611,7 +645,7 @@
           <a href="https://github.com/Dicklesworthstone/franken_ocr/blob/main/docs/DISCREPANCIES.md">docs/DISCREPANCIES.md</a>,
           which records the model commit, the fixture hashes, the CPU feature string, the exact
           command, what the reference behaviour was, what ours is, the kill switch, and a review
-          date. Negative results get entries too — that is the point of keeping the file.</p>
+          date. Negative results get entries too; that is the point of keeping the file.</p>
         </article>
       </div>
     </div>
@@ -626,7 +660,7 @@
       <h2>Five models, one <em>binary</em>.</h2>
       <p class="lede">
         Each one is a separate hand-port with its own kernels and its own parity ladder. The CLI
-        carries all five; the browser carries the two that fit its rules.
+        carries all five; the browser carries the four that fit inside wasm32's address space.
       </p>
     </div>
     <div class="panel reveal">
@@ -643,28 +677,28 @@
               <td>General document OCR → Markdown, tables, LaTeX, layout boxes</td>
               <td class="num">4.16 GB<br><span class="micro">3.00 GB int4 in-browser</span></td>
               <td class="yes">default</td>
-              <td class="yes">desktop</td>
+              <td class="yes lane">✅ this page (desktop)</td>
             </tr>
             <tr>
               <td><strong>Polyphonic-TrOMR</strong> <span class="micro">NetEase</span></td>
               <td>Sheet music → MusicXML, full page or staff crop</td>
               <td class="num">58 MB</td>
               <td class="yes">yes</td>
-              <td class="yes">everywhere</td>
+              <td class="yes lane">✅ this page (everywhere)</td>
             </tr>
             <tr>
               <td><strong>GOT-OCR2</strong></td>
               <td>Formulas, tables, charts, geometry, molecular structures</td>
               <td class="num">776 MB</td>
               <td class="yes">yes</td>
-              <td class="no">possible next</td>
+              <td class="yes lane">✅ this page (desktop)</td>
             </tr>
             <tr>
               <td><strong>SmolVLM2</strong></td>
               <td>Photo description and visual question answering</td>
               <td class="num">1.01 GB</td>
               <td class="yes">yes</td>
-              <td class="no">—</td>
+              <td class="yes lane">✅ this page (desktop)</td>
             </tr>
             <tr>
               <td><strong>OneChart</strong></td>
@@ -687,8 +721,8 @@
       <p class="eyebrow">Take it home</p>
       <h2>One static <em>binary</em>.</h2>
       <p class="lede">
-        The full product — all five models, PDFs, batching, robot/agent mode — with no runtime,
-        no Python, and nothing to configure.
+        The full product: all five models, PDFs, batching, robot/agent mode, with no runtime, no
+        Python, and nothing to configure.
       </p>
     </div>
     <div class="panel reveal">
@@ -706,7 +740,7 @@ focr ocr --model tromr.int8.focrq --task music score.png -o score.musicxml
 <span class="c"># prove the dispatched kernels on your own CPU</span>
 focr robot selftest</pre>
       <p class="note viz-foot">
-        macOS (Apple Silicon and Intel), Linux (x86-64 and ARM64), Windows (x86-64 and ARM64) —
+        macOS (Apple Silicon and Intel), Linux (x86-64 and ARM64), Windows (x86-64 and ARM64):
         six platforms, each with a SHA-256 sidecar. Runtime ISA dispatch picks NEON, SDOT, SMMLA,
         AVX2, AVX-VNNI or AVX-512-VNNI per host, so there is one binary per architecture rather
         than one per microarchitecture. The CLI is faster than the tab and certified deeper; the
@@ -741,10 +775,12 @@ focr robot selftest</pre>
       <div>
         <h2 class="footer-head">Licenses</h2>
         <ul>
-          <li>Engine — MIT, with the OpenAI/Anthropic rider</li>
-          <li>Unlimited-OCR weights — MIT, © 2026 Baidu</li>
-          <li>Polyphonic-TrOMR weights — Apache-2.0, NetEase</li>
-          <li>Inter &amp; JetBrains Mono — SIL Open Font License 1.1</li>
+          <li>Engine: MIT, with the OpenAI/Anthropic rider</li>
+          <li>Unlimited-OCR weights: MIT, © 2026 Baidu</li>
+          <li>Polyphonic-TrOMR weights: Apache-2.0, NetEase</li>
+          <li>GOT-OCR2 weights: Apache-2.0, Ucas-HaoranWei</li>
+          <li>SmolVLM2 weights: Apache-2.0, HuggingFaceTB</li>
+          <li>Inter &amp; JetBrains Mono: SIL Open Font License 1.1</li>
         </ul>
       </div>
     </div>

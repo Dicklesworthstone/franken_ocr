@@ -241,6 +241,13 @@ pub struct SidecarBundle {
     pub qwen_tiktoken: Option<Vec<u8>>,
     /// TrOMR WordLevel tables in stream order `[rhythm, pitch, lift, note]`.
     pub music_tables: Option<[String; 4]>,
+    /// The OneChart / OPT slow-tokenizer triple in order
+    /// `[vocab.json, merges.txt, added_tokens.json]` (D9) — the byte-loaded
+    /// analog of the `from_opt_dir` directory beside the artifact. OneChart is
+    /// the one zoo arch whose tokenizer is three files rather than one, so it
+    /// needs its own slot; every other arch uses `tokenizer_json` or
+    /// `qwen_tiktoken`.
+    pub opt_triple: Option<[Vec<u8>; 3]>,
 }
 
 pub struct OcrModel {
@@ -3222,6 +3229,9 @@ impl OcrModel {
             // Byte-loaded models carry the payload directly (no "beside").
             if let Some(bytes) = &self.sidecars.tokenizer_json {
                 return crate::tokenizer::Tokenizer::from_json_bytes(bytes);
+            }
+            if let Some([vocab, merges, added]) = &self.sidecars.opt_triple {
+                return crate::tokenizer::Tokenizer::from_opt_files(vocab, merges, added);
             }
             // The tokenizer ships beside the weights; OneChart uses the OPT
             // slow-tokenizer triple instead of tokenizer.json (D9).

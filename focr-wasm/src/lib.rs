@@ -206,6 +206,83 @@ pub fn set_no_repeat_ngram(n: u32) {
     });
 }
 
+/// Select GOT-OCR2's `OCR with format:` mode for the NEXT recognition — the
+/// browser analog of the CLI's `--format` / `--task formula|tables|chart|…`
+/// (which imply it) and of `FOCR_GOT_FORMAT`.
+///
+/// This is not a convenience: GOT's whole reason to exist in the zoo is the
+/// structured output plain mode cannot produce (LaTeX formulas, HTML tables,
+/// molecular SMILES, geometry, `**kern` music). wasm has no environment, so
+/// without this export the browser could only ever reach the plain `OCR: `
+/// mode. Default `false` ⇒ byte-identical to plain-mode behavior.
+#[wasm_bindgen]
+pub fn set_got_format(on: bool) {
+    franken_ocr::native_engine::force_got_format(on);
+}
+
+/// Set (or clear, with an empty string) the SmolVLM2 describe/VQA question —
+/// the browser analog of `--question` / `FOCR_SMOLVLM2_QUESTION`. Cleared (the
+/// default) ⇒ the model-card caption prompt, i.e. plain image description.
+#[wasm_bindgen]
+pub fn set_smolvlm2_question(question: &str) {
+    franken_ocr::native_engine::set_smolvlm2_question(if question.is_empty() {
+        None
+    } else {
+        Some(question.to_string())
+    });
+}
+
+/// Sniff + parse a PDF and report its shape as JSON: `{"pages": N}`.
+///
+/// The playground calls this once per uploaded PDF to drive its page picker;
+/// the bytes cross the boundary per call (no session object — a scanned PDF is
+/// a few MB, and statelessness keeps the worker protocol trivial).
+///
+/// # Errors
+/// A non-PDF payload (no `%PDF-` magic) or a parse failure, each named.
+#[wasm_bindgen]
+pub fn pdf_info(bytes: &[u8]) -> Result<String, JsValue> {
+    if !franken_ocr::pdf::looks_like_pdf_bytes(bytes) {
+        return Err(js_err(
+            "pdf.sniff",
+            "not a PDF: missing the %PDF- magic prefix",
+        ));
+    }
+    let pages =
+        franken_ocr::pdf::PdfPages::from_bytes(bytes).map_err(|e| js_err("pdf.parse", e))?;
+    Ok(serde_json::json!({ "pages": pages.len() }).to_string())
+}
+
+/// Rasterize one PDF page (1-based, matching the CLI's `--pages` convention)
+/// to PNG bytes.
+///
+/// The raster rides the exact native pipeline — largest image XObject, codec
+/// dispatch, page `/Rotate` + content-matrix rotation normalization — so the
+/// PNG this returns is pixel-identical to what `focr ocr file.pdf` would feed
+/// the model for that page. JS previews it in an `<img>` and passes it back
+/// through the existing [`WasmEngine::recognize`] path unchanged.
+///
+/// # Errors
+/// Parse failures, an out-of-range page, and unsupported codecs — a
+/// `JPXDecode`/`JBIG2Decode` page surfaces the library's precise existing
+/// error text (…"no pure-Rust decoder; rasterize this PDF out of band and
+/// retry"), never a panic.
+#[wasm_bindgen]
+pub fn pdf_render_page(bytes: &[u8], page: u32) -> Result<Vec<u8>, JsValue> {
+    if page == 0 {
+        return Err(js_err("pdf.render", "page numbers are 1-based"));
+    }
+    let pages =
+        franken_ocr::pdf::PdfPages::from_bytes(bytes).map_err(|e| js_err("pdf.parse", e))?;
+    let img = pages
+        .render(page as usize - 1)
+        .map_err(|e| js_err("pdf.render", e))?;
+    let mut png = Vec::new();
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .map_err(|e| js_err("pdf.encode_png", e))?;
+    Ok(png)
+}
+
 /// Staging area for a model arriving over the network as chunks: exactly one
 /// copy of the weight blob lives here, reserved up front, plus the (small)
 /// tokenizer sidecars keyed by their canonical zoo filenames.
@@ -224,6 +301,9 @@ pub struct ModelStaging {
     sidecars: SidecarBundle,
     /// TrOMR WordLevel tables staged individually until all four are present.
     music: [Option<String>; 4],
+    /// OneChart's OPT slow-tokenizer triple `[vocab.json, merges.txt,
+    /// added_tokens.json]`, staged individually until all three are present.
+    opt: [Option<Vec<u8>>; 3],
 }
 
 impl Default for ModelStaging {
@@ -246,6 +326,7 @@ impl ModelStaging {
             filled: 0,
             sidecars: SidecarBundle::default(),
             music: [None, None, None, None],
+            opt: [None, None, None],
         }
     }
 
@@ -377,8 +458,10 @@ impl ModelStaging {
     }
 
     /// Attach one tokenizer sidecar by its canonical zoo filename:
-    /// `tokenizer.json`, `qwen.tiktoken`, or the four TrOMR tables
-    /// `tokenizer_{rhythm,pitch,lift,note}.json`.
+    /// `tokenizer.json`, `qwen.tiktoken`, the four TrOMR tables
+    /// `tokenizer_{rhythm,pitch,lift,note}.json`, or OneChart's OPT
+    /// slow-tokenizer triple `vocab.json` / `merges.txt` /
+    /// `added_tokens.json`.
     pub fn set_sidecar(&mut self, name: &str, bytes: &[u8]) -> Result<(), JsValue> {
         let as_text = || {
             String::from_utf8(bytes.to_vec())
@@ -391,6 +474,9 @@ impl ModelStaging {
             "tokenizer_pitch.json" => self.music[1] = Some(as_text()?),
             "tokenizer_lift.json" => self.music[2] = Some(as_text()?),
             "tokenizer_note.json" => self.music[3] = Some(as_text()?),
+            "vocab.json" => self.opt[0] = Some(bytes.to_vec()),
+            "merges.txt" => self.opt[1] = Some(bytes.to_vec()),
+            "added_tokens.json" => self.opt[2] = Some(bytes.to_vec()),
             other => {
                 return Err(js_err(
                     "staging.set_sidecar",
@@ -430,6 +516,7 @@ impl WasmEngine {
             filled,
             mut sidecars,
             music,
+            opt,
         } = staging;
         if expected == 0 {
             return Err(js_err("engine.from_staging", "staging was never planned"));
@@ -463,6 +550,19 @@ impl WasmEngine {
             return Err(js_err(
                 "engine.from_staging",
                 "partial TrOMR tokenizer set: all four tables are required",
+            ));
+        }
+        if opt.iter().all(Option::is_some) {
+            let [vocab, merges, added] = opt;
+            sidecars.opt_triple = Some([
+                vocab.expect("checked"),
+                merges.expect("checked"),
+                added.expect("checked"),
+            ]);
+        } else if opt.iter().any(Option::is_some) {
+            return Err(js_err(
+                "engine.from_staging",
+                "partial OPT tokenizer set: vocab.json, merges.txt, and added_tokens.json are all required",
             ));
         }
         // One segment or several, the loader validates coverage/ordering and

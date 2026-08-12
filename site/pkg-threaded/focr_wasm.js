@@ -73,7 +73,7 @@ export class ModelStaging {
         let deferred3_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passArray8ToWasm0(header_prefix, wasm.__wbindgen_export2);
+            const ptr0 = passArray8ToWasm0(header_prefix, wasm.__wbindgen_export3);
             const len0 = WASM_VECTOR_LEN;
             wasm.modelstaging_plan(retptr, this.__wbg_ptr, ptr0, len0, total_bytes);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -91,7 +91,7 @@ export class ModelStaging {
             return getStringFromWasm0(ptr2, len2);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred3_0, deferred3_1, 1);
+            wasm.__wbindgen_export2(deferred3_0, deferred3_1, 1);
         }
     }
     /**
@@ -105,7 +105,7 @@ export class ModelStaging {
     push(chunk) {
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_export2);
+            const ptr0 = passArray8ToWasm0(chunk, wasm.__wbindgen_export3);
             const len0 = WASM_VECTOR_LEN;
             wasm.modelstaging_push(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -135,9 +135,9 @@ export class ModelStaging {
     set_sidecar(name, bytes) {
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passStringToWasm0(name, wasm.__wbindgen_export2, wasm.__wbindgen_export3);
+            const ptr0 = passStringToWasm0(name, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
             const len0 = WASM_VECTOR_LEN;
-            const ptr1 = passArray8ToWasm0(bytes, wasm.__wbindgen_export2);
+            const ptr1 = passArray8ToWasm0(bytes, wasm.__wbindgen_export3);
             const len1 = WASM_VECTOR_LEN;
             wasm.modelstaging_set_sidecar(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -224,7 +224,7 @@ export class WasmEngine {
             return getStringFromWasm0(r0, r1);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred1_0, deferred1_1, 1);
+            wasm.__wbindgen_export2(deferred1_0, deferred1_1, 1);
         }
     }
     /**
@@ -244,7 +244,7 @@ export class WasmEngine {
             return getStringFromWasm0(r0, r1);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred1_0, deferred1_1, 1);
+            wasm.__wbindgen_export2(deferred1_0, deferred1_1, 1);
         }
     }
     /**
@@ -258,7 +258,7 @@ export class WasmEngine {
         let deferred3_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passArray8ToWasm0(image_bytes, wasm.__wbindgen_export2);
+            const ptr0 = passArray8ToWasm0(image_bytes, wasm.__wbindgen_export3);
             const len0 = WASM_VECTOR_LEN;
             wasm.wasmengine_recognize(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -276,7 +276,7 @@ export class WasmEngine {
             return getStringFromWasm0(ptr2, len2);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred3_0, deferred3_1, 1);
+            wasm.__wbindgen_export2(deferred3_0, deferred3_1, 1);
         }
     }
     /**
@@ -293,7 +293,7 @@ export class WasmEngine {
         let deferred3_1;
         try {
             const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
-            const ptr0 = passArray8ToWasm0(image_bytes, wasm.__wbindgen_export2);
+            const ptr0 = passArray8ToWasm0(image_bytes, wasm.__wbindgen_export3);
             const len0 = WASM_VECTOR_LEN;
             wasm.wasmengine_recognize_json(retptr, this.__wbg_ptr, ptr0, len0);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
@@ -311,7 +311,7 @@ export class WasmEngine {
             return getStringFromWasm0(ptr2, len2);
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
-            wasm.__wbindgen_export(deferred3_0, deferred3_1, 1);
+            wasm.__wbindgen_export2(deferred3_0, deferred3_1, 1);
         }
     }
 }
@@ -335,7 +335,7 @@ export function engine_info() {
         return getStringFromWasm0(r0, r1);
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
-        wasm.__wbindgen_export(deferred1_0, deferred1_1, 1);
+        wasm.__wbindgen_export2(deferred1_0, deferred1_1, 1);
     }
 }
 
@@ -376,7 +376,7 @@ export function int8_route() {
         return getStringFromWasm0(r0, r1);
     } finally {
         wasm.__wbindgen_add_to_stack_pointer(16);
-        wasm.__wbindgen_export(deferred1_0, deferred1_1, 1);
+        wasm.__wbindgen_export2(deferred1_0, deferred1_1, 1);
     }
 }
 
@@ -409,6 +409,35 @@ export function reset_cancel() {
  */
 export function set_no_repeat_ngram(n) {
     wasm.set_no_repeat_ngram(n);
+}
+
+/**
+ * Install (or, with `None`/`undefined`, remove) the live progress callback for
+ * the SYNCHRONOUS `recognize` call — the seam that lets the playground show
+ * "vision block 12/36" instead of a frozen tab for minutes.
+ *
+ * The callback is invoked as `f(stage: string, current: number, total: number)`
+ * (`total === 0` means indeterminate) from INSIDE the forward's call stack, on
+ * the thread that entered `recognize_json`. That is the only way progress can
+ * escape at all: the worker is blocked in one synchronous wasm call, so nothing
+ * asynchronous can run until it returns.
+ *
+ * Three rules make this safe and cheap:
+ *
+ * * **The engine hooks sit on outer, sequential loops only** (per vision block,
+ *   per decoded token, never inside a rayon body), so the `js_sys::Function` —
+ *   which is emphatically NOT `Send`, whatever the sink signature says — is only
+ *   ever called from the JS-owning worker thread. The `Send`/`Sync` promise
+ *   below is the wasm single-threaded-JS invariant written down, not a claim
+ *   that a `Function` can cross a thread.
+ * * **A throwing callback cannot poison a run.** The `Result` is discarded: a
+ *   broken progress handler must never be able to fail a recognition.
+ * * **Zero cost when unset.** `set_progress_sink(None)` disarms the engine's
+ *   relaxed-atomic fast path, and the native build never installs anything.
+ * @param {Function | null} [f]
+ */
+export function set_progress_callback(f) {
+    wasm.set_progress_callback(isLikeNone(f) ? 0 : addHeapObject(f));
 }
 
 /**
@@ -507,6 +536,10 @@ function __wbg_get_imports(memory) {
         __wbg___wbindgen_throw_344f42d3211c4765: function(arg0, arg1) {
             throw new Error(getStringFromWasm0(arg0, arg1));
         },
+        __wbg_call_44b7209e1e252e6a: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
+            const ret = getObject(arg0).call(getObject(arg1), getObject(arg2), getObject(arg3), getObject(arg4));
+            return addHeapObject(ret);
+        }, arguments); },
         __wbg_error_5d345173be594081: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
@@ -556,7 +589,12 @@ function __wbg_get_imports(memory) {
             const ret = getObject(arg0).timeOrigin;
             return ret;
         },
-        __wbindgen_cast_0000000000000001: function(arg0, arg1) {
+        __wbindgen_cast_0000000000000001: function(arg0) {
+            // Cast intrinsic for `F64 -> Externref`.
+            const ret = arg0;
+            return addHeapObject(ret);
+        },
+        __wbindgen_cast_0000000000000002: function(arg0, arg1) {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return addHeapObject(ret);
@@ -628,6 +666,14 @@ function getUint8ArrayMemory0() {
 }
 
 function getObject(idx) { return heap[idx]; }
+
+function handleError(f, args) {
+    try {
+        return f.apply(this, args);
+    } catch (e) {
+        wasm.__wbindgen_export(addHeapObject(e));
+    }
+}
 
 let heap = new Array(1024).fill(undefined);
 heap.push(undefined, null, true, false);

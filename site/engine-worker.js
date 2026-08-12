@@ -91,6 +91,9 @@ let threads = 1; // rayon's ACTUAL worker count, straight from rayon
 let pkg = null;
 let engine = null; // WasmEngine
 let modelId = null;
+// The manifest key the page asked for. `modelId` is the engine's own id for the
+// hydrated artifact, which need not be spelled the same way.
+let modelKey = null;
 
 function post(msg) {
   self.postMessage(msg);
@@ -175,6 +178,15 @@ async function dispatch(data) {
       // reset to the engine default when the model declares none.
       pkg.set_no_repeat_ngram(model.decodeGuard ?? 0);
 
+      // Per-model knobs that exist as wasm exports only after the next
+      // site/build.sh run. Guarded by `typeof` so the currently shipped pkg
+      // still loads both new lanes at their defaults: GOT in plain mode,
+      // SmolVLM2 caption-only. The knobs light up on rebuild with no further
+      // change here.
+      if (data.model === "got-ocr2" && typeof pkg.set_got_format === "function") {
+        pkg.set_got_format(false); // plain mode; the format lane is a UI choice we do not offer yet
+      }
+
       stage("download");
       // The weight bytes STREAM straight from fetch (or the cache) into wasm
       // staging — Chrome refuses a single multi-GB ArrayBuffer, so they are
@@ -227,6 +239,7 @@ async function dispatch(data) {
       }
       engine = pkg.WasmEngine.from_staging(staging);
       modelId = engine.model_id();
+      modelKey = data.model;
 
       // ARM THE POOL ONLY NOW. A rayon worker parked in `Atomics.wait` blocks a
       // shared-memory `grow`, and everything above this line — staging the
@@ -252,6 +265,16 @@ async function dispatch(data) {
     case "recognize": {
       if (!engine) throw new Error("no model loaded");
       stage("recognize");
+      // SmolVLM2's question, when the page supplied one AND the wasm build
+      // exports the setter. Before that build lands the lane still runs, it
+      // just captions instead of answering.
+      if (
+        modelKey === "smolvlm2" &&
+        data.question &&
+        typeof pkg.set_smolvlm2_question === "function"
+      ) {
+        pkg.set_smolvlm2_question(data.question);
+      }
       pkg.reset_cancel();
       const t0 = performance.now();
       relayProgress = true;

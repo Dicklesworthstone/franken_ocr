@@ -27,6 +27,14 @@ const RELEASES = {
       "tokenizer.json",
     ]),
   },
+  "got-ocr2": {
+    base: "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/",
+    files: new Set(["got-ocr2.int8.focrq", "qwen.tiktoken"]),
+  },
+  smolvlm2: {
+    base: "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-smolvlm2-v1/",
+    files: new Set(["smolvlm2.int8.focrq", "tokenizer.json"]),
+  },
 };
 
 export async function onRequest({ request, params }) {

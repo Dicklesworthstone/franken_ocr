@@ -463,9 +463,14 @@ html.js .reveal {
 html.js .reveal.revealed { opacity: 1; transform: none; }
 
 /* --------------------------------------------------------------------- hero */
-.hero {
+/* `section.hero`, not `.hero`: the hero IS the first section, so the
+   `section:first-of-type { padding-top: 0 }` reset above outranks a bare class
+   and the eyebrow + first H1 line end up underneath the fixed pill header.
+   The two-class selector wins, and the value clears the header's own offset
+   (0.7rem) plus its height plus real breathing room, at both widths. */
+section.hero {
   position: relative;
-  padding: calc(var(--header-h) + 4.5rem) 0 3rem;
+  padding: calc(var(--header-h) + 5.2rem) 0 3rem;
   text-align: center;
 }
 .hero h1 {
@@ -529,6 +534,10 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 }
 .consent p { margin: 0; color: var(--fg-mid); font-size: 0.92rem; line-height: 1.6; }
 
+/* The download bar and the recognize bar are the same two elements; they never
+   run at the same time. The inset well makes the bar read as part of the panel
+   rather than a floating strip, and the stage line under it is monospace so a
+   ticking token count does not shuffle the text sideways. */
 .progress {
   height: 9px;
   border-radius: 6px;
@@ -541,6 +550,72 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
   width: 0;
   background: linear-gradient(90deg, var(--accent-deep), var(--accent));
   transition: width 0.25s ease;
+}
+#progress-wrap {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--inset);
+  padding: 0.8rem 0.9rem;
+}
+#progress-text {
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-mid);
+  overflow-wrap: anywhere;
+}
+
+/* A free-text prompt for the one lane that takes one. */
+.text-input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--inset);
+  color: var(--fg);
+  font: 400 0.92rem/1.5 var(--sans);
+  padding: 0.65rem 0.85rem;
+  min-height: 44px;
+}
+.text-input::placeholder { color: var(--fg-faint); }
+.text-input:focus { border-color: rgba(52, 211, 153, 0.42); outline-offset: 1px; }
+#question-wrap { display: grid; gap: 0.5rem; }
+
+/* Segmented Rendered / Source control. */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  background: rgba(255, 255, 255, 0.025);
+  padding: 2px;
+  flex: 0 0 auto;
+}
+.seg-btn {
+  border: 0;
+  background: none;
+  cursor: pointer;
+  border-radius: var(--r-pill);
+  color: var(--fg-faint);
+  font: 800 0.68rem/1 var(--sans);
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  padding: 0.5rem 0.85rem;
+  transition: color 0.18s, background 0.18s;
+}
+.seg-btn:hover { color: var(--accent); }
+.seg-btn[aria-pressed="true"] {
+  background: rgba(16, 185, 129, 0.14);
+  color: var(--accent);
+}
+@media (pointer: coarse) { .seg-btn { min-height: 44px; } }
+
+/* The rendered view is a sandboxed iframe (no scripts, no same-origin), so the
+   page cannot measure its content height. It gets a fixed frame with its own
+   scroll, matching the source <pre> it replaces. */
+.rendered {
+  width: 100%;
+  height: 24rem;
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--inset);
+  display: block;
 }
 
 .drop {
@@ -715,7 +790,13 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
 .stat-dim { color: var(--fg-faint); font-size: 0.55em; font-weight: 700; }
 
 /* ------------------------------------------------------------------- tables */
-.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--r); }
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  border-radius: var(--r);
+  /* The caption below sizes itself to the VISIBLE box, not the table. */
+  container-type: inline-size;
+}
 @media (max-width: 760px) {
   /* Same affordance as the wide diagrams: a fading right edge is the only
      "there is more over here" signal a phone gets. */
@@ -725,8 +806,23 @@ html.js .reveal.revealed { opacity: 1; transform: none; }
   }
 }
 table { width: 100%; border-collapse: collapse; font-size: 0.88rem; min-width: 460px; }
-#models table { min-width: 680px; }
-caption { text-align: left; color: var(--fg-faint); font-size: 0.8rem; padding-bottom: 0.8rem; line-height: 1.5; }
+#models table { min-width: 760px; }
+/* A caption is laid out at the TABLE's width, so inside a horizontal scroller a
+   long one runs off the right edge and gets clipped with no way to reach it.
+   Pinning it to the scroller's left edge and sizing it to the container's
+   inline size makes it wrap where the reader can actually see it. */
+caption {
+  text-align: left;
+  color: var(--fg-faint);
+  font-size: 0.8rem;
+  padding-bottom: 0.8rem;
+  line-height: 1.5;
+  position: sticky;
+  left: 0;
+  width: 100cqw;
+}
+/* The browser column is a verdict, not prose: it must not wrap mid-phrase. */
+td.lane { white-space: nowrap; }
 th, td { text-align: left; padding: 0.72rem 0.8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
 thead th {
   color: #10b981;

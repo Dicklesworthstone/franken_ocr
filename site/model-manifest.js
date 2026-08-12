@@ -56,6 +56,64 @@ export const MODELS = {
       { name: "tokenizer.json", bytes: 9979544, sha256: "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4" },
     ],
   },
+  "got-ocr2": {
+    label: "GOT-OCR2 (structured: formulas, tables, molecules)",
+    license: "GOT-OCR2.0 - Copyright (c) 2024 Ucas-HaoranWei, Apache-2.0",
+    // Measured in Node (same V8/wasm engine as Chrome): the 776 MiB artifact
+    // stages into ONE segment, hydrates in <1 s, and recognizes
+    // tests/fixtures/got/sample_text.png in 140-224 s. Output is byte-identical
+    // to the native aarch64 CLI on the plain page AND on both format-mode
+    // fixtures (formula.png, table.png) — GOT is the exact-parity lane.
+    //
+    // MEMORY (the number that decides the tab): wasm linear memory peaks at
+    // 3456 MB during recognize — the f32 SAM-ViT-B tower hydrates whole, since
+    // the streamed-vision residency mode is keyed to the unlimited wasm recipe
+    // only. That is ~640 MB under the wasm32 4 GiB ceiling, so this lane is
+    // desktop-Chrome-class: process RSS (723 MB) understates it by 5x because
+    // macOS does not resident-back the untouched pages.
+    desktopOnly: true,
+    weights: {
+      name: "got-ocr2.int8.focrq",
+      bytes: 813877416,
+      sha256: "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f",
+    },
+    sidecars: [
+      { name: "qwen.tiktoken", bytes: 2561218, sha256: "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186" },
+    ],
+  },
+  smolvlm2: {
+    label: "SmolVLM2 (photo description / VQA)",
+    license: "SmolVLM2-500M-Video-Instruct (HuggingFaceTB) - Apache-2.0",
+    // Measured in Node: the 1.01 GiB artifact plans to TWO segments (the ≤1 GiB
+    // wasm32 segmentation, bd-syf2), hydrates in <1 s, and captions
+    // tests/fixtures/smolvlm2/sample_photo.png in 242-309 s. wasm linear memory
+    // peaks at 2811 MB (the f32 SigLIP tower hydrates whole), so this lane is
+    // desktop-Chrome-class like GOT; peak process RSS was only 704 MB, which is
+    // NOT the browser-relevant figure.
+    //
+    // PARITY NOTE (honest, measured): the ~300-token free-form caption diverges
+    // from the native aarch64 CLI's wording after the first sentence. It is not
+    // the int8 kernel tier — forcing native to scalar (FOCR_FORCE_ARCH=scalar)
+    // reproduces native's wording, not wasm's — so it is f32 associativity
+    // drift (SigLIP tower) amplified by a low-margin free-form decode. Both
+    // captions describe the same photo correctly.
+    //
+    // The sharper probe says the wasm lane is sound: on the three short factual
+    // VQA cases of tests/fixtures/smolvlm2/vqa_fixtures.json, wasm reproduced
+    // the committed PyTorch oracle answer EXACTLY on all three, while the
+    // native CLI matched the oracle on only one of the three. Short constrained
+    // decodes agree; long free-form ones drift. GOT, whose decode is short, is
+    // byte-identical native↔wasm on all three of its fixtures.
+    desktopOnly: true,
+    weights: {
+      name: "smolvlm2.int8.focrq",
+      bytes: 1087397293,
+      sha256: "4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc",
+    },
+    sidecars: [
+      { name: "tokenizer.json", bytes: 3548256, sha256: "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a" },
+    ],
+  },
 };
 
 export function totalBytes(model) {

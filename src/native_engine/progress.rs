@@ -171,10 +171,7 @@ mod tests {
         let seen: Arc<StdMutex<Vec<ProgressEvent>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
         set_progress_sink(Some(Box::new(move |ev| {
-            sink_seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(ev);
+            sink_seen.lock().unwrap_or_else(|e| e.into_inner()).push(ev);
         })));
         assert!(enabled());
         emit("preprocess", 0, 0);

@@ -154,6 +154,32 @@ export function reset_cancel(): void;
 export function set_no_repeat_ngram(n: number): void;
 
 /**
+ * Install (or, with `None`/`undefined`, remove) the live progress callback for
+ * the SYNCHRONOUS `recognize` call — the seam that lets the playground show
+ * "vision block 12/36" instead of a frozen tab for minutes.
+ *
+ * The callback is invoked as `f(stage: string, current: number, total: number)`
+ * (`total === 0` means indeterminate) from INSIDE the forward's call stack, on
+ * the thread that entered `recognize_json`. That is the only way progress can
+ * escape at all: the worker is blocked in one synchronous wasm call, so nothing
+ * asynchronous can run until it returns.
+ *
+ * Three rules make this safe and cheap:
+ *
+ * * **The engine hooks sit on outer, sequential loops only** (per vision block,
+ *   per decoded token, never inside a rayon body), so the `js_sys::Function` —
+ *   which is emphatically NOT `Send`, whatever the sink signature says — is only
+ *   ever called from the JS-owning worker thread. The `Send`/`Sync` promise
+ *   below is the wasm single-threaded-JS invariant written down, not a claim
+ *   that a `Function` can cross a thread.
+ * * **A throwing callback cannot poison a run.** The `Result` is discarded: a
+ *   broken progress handler must never be able to fail a recognition.
+ * * **Zero cost when unset.** `set_progress_sink(None)` disarms the engine's
+ *   relaxed-atomic fast path, and the native build never installs anything.
+ */
+export function set_progress_callback(f?: Function | null): void;
+
+/**
  * Rayon's *actual* worker count in this module right now.
  *
  * This is the honest test of the threaded lane: the build flags, the presence
@@ -188,6 +214,7 @@ export interface InitOutput {
     readonly modelstaging_push: (a: number, b: number, c: number, d: number) => void;
     readonly modelstaging_segment_count: (a: number) => number;
     readonly modelstaging_set_sidecar: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly set_progress_callback: (a: number) => void;
     readonly wasmengine_free_engine: (a: number) => void;
     readonly wasmengine_from_staging: (a: number, b: number) => void;
     readonly wasmengine_license_notice: (a: number, b: number) => void;
@@ -200,10 +227,11 @@ export interface InitOutput {
     readonly reset_cancel: () => void;
     readonly thread_count: () => number;
     readonly wasm_memory: () => number;
+    readonly __wbindgen_export: (a: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
-    readonly __wbindgen_export: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_export2: (a: number, b: number) => number;
-    readonly __wbindgen_export3: (a: number, b: number, c: number, d: number) => number;
+    readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
+    readonly __wbindgen_export3: (a: number, b: number) => number;
+    readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_start: () => void;
 }
 
