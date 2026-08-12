@@ -49,7 +49,10 @@ struct LabView: View {
         }
         .preferredColorScheme(.dark)
         .tint(Lab.accent)
-        .task { Engine.warmKernelPool() }
+        .task {
+            Engine.warmKernelPool()
+            loadDebugFixtureIfRequested()
+        }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didReceiveMemoryWarningNotification)
         ) { _ in
@@ -649,6 +652,22 @@ struct LabView: View {
     }
 
     // ── Input loading ──────────────────────────────────────────────────────
+
+    /// Debug-only: load a fixture named by `FOCR_DEBUG_INPUT` at launch, so a
+    /// multi-page document run can be driven from the command line instead of
+    /// through the file picker. Compiled out of release builds entirely; the
+    /// same shape as frankentts's `FTTS_DEBUG_*` harnesses.
+    private func loadDebugFixtureIfRequested() {
+        #if DEBUG
+        guard let path = ProcessInfo.processInfo.environment["FOCR_DEBUG_INPUT"],
+              let data = FileManager.default.contents(atPath: path)
+        else { return }
+        model.accept(data: data, name: (path as NSString).lastPathComponent)
+        if ProcessInfo.processInfo.environment["FOCR_DEBUG_RUN"] != nil {
+            model.recognize()
+        }
+        #endif
+    }
 
     private func load(photoItem: PhotosPickerItem?) {
         guard let photoItem else { return }

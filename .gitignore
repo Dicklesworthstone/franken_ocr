@@ -173,3 +173,7 @@ crates/*/target/
 ios/.ipad-shot.png
 ios/.launch-shot.png
 ios/.*-shot.png
+
+# Local debug-run Simulator capture (FOCR_DEBUG_RUN)
+ios/.pdf-run.png
+ios/.*-run.png
