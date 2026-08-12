@@ -369,6 +369,12 @@ impl OcrEngine {
     /// [`FocrError::Other`] if the runtime fails to build (e.g. the OS refuses to
     /// spawn worker threads).
     pub fn new() -> FocrResult<Self> {
+        // Install the kernel pool at the documented budget BEFORE any forward
+        // can touch rayon. This is the chokepoint every library and CLI consumer
+        // passes through; without it the kernels silently run on rayon's own
+        // default (logical cores), which oversubscribes the int8 GEMMs on any
+        // SMT host, and their workers never get an Apple QoS class.
+        let _ = init_kernel_pool();
         // Small blocking pool is a guard, not the mechanism: exactly one live
         // forward at a time runs the N-core kernel fan-out (doctrine #5).
         let runtime = RuntimeBuilder::new()
