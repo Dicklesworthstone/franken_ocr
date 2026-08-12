@@ -283,22 +283,46 @@ struct LabView: View {
                 inputButtons
 
                 if model.pdfPageCount > 1 {
-                    HStack(spacing: 10) {
-                        Text("Page")
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(Lab.textDim)
-                        Stepper(
-                            value: $model.pdfPage, in: 1...model.pdfPageCount,
-                            onEditingChanged: { editing in if !editing { model.loadPDFPage() } }
-                        ) {
-                            Text("\(model.pdfPage) of \(model.pdfPageCount)")
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 10) {
+                            Text("Preview")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(Lab.textDim)
+                            Stepper(
+                                value: $model.previewPage, in: 1...model.pdfPageCount,
+                                onEditingChanged: { editing in
+                                    if !editing { model.loadPreviewPage() }
+                                }
+                            ) {
+                                Text("\(model.previewPage) of \(model.pdfPageCount)")
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(Lab.textMid)
+                            }
+                            .disabled(model.isRecognizing)
+                        }
+
+                        HStack(spacing: 8) {
+                            Text("Pages")
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(Lab.textDim)
+                            TextField("all", text: $model.pageSelection)
                                 .font(.system(size: 12, design: .monospaced))
                                 .foregroundStyle(Lab.textMid)
+                                .textFieldStyle(.plain)
+                                .autocorrectionDisabled()
+                                .keyboardType(.numbersAndPunctuation)
+                                .padding(.vertical, 7).padding(.horizontal, 10)
+                                .background(Lab.inset, in: RoundedRectangle(cornerRadius: 8))
+                                .overlay(RoundedRectangle(cornerRadius: 8)
+                                    .strokeBorder(Lab.line, lineWidth: 1))
+                                .disabled(model.isRecognizing)
                         }
+
+                        Text("Recognize reads the whole document. Leave Pages empty for all \(model.pdfPageCount), or give a range like 3,5-9. Pages using JPEG 2000 or JBIG2 are skipped with a named reason rather than returning a wrong result.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Lab.textFaint)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    Text("Scanned PDFs only. Pages using JPEG 2000 or JBIG2 report a named error rather than a wrong result.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(Lab.textFaint)
                 }
 
                 runControls
@@ -380,7 +404,18 @@ struct LabView: View {
     private var runControls: some View {
         if model.isRecognizing {
             VStack(alignment: .leading, spacing: 10) {
-                LabProgressBar(fraction: model.progressFraction)
+                LabProgressBar(
+                    fraction: model.isDocumentRun
+                        ? model.documentProgressFraction
+                        : model.progressFraction
+                )
+                if model.isDocumentRun {
+                    // The document line first: on a 40-page run this is the
+                    // number that matters, and the page's own stage sits under it.
+                    Text(model.documentDetail)
+                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                        .foregroundStyle(Lab.accent)
+                }
                 HStack {
                     Text(model.progressDetail.isEmpty
                          ? (model.isLoadingModel ? "Waking the model…" : "Starting…")
@@ -421,6 +456,10 @@ struct LabView: View {
                     }
                 }
 
+                if model.isDocumentRun {
+                    pageLedger
+                }
+
                 if let recognition = model.recognition {
                     resultMeta(recognition)
 
@@ -433,10 +472,12 @@ struct LabView: View {
 
                     musicWarnings(recognition)
 
+                    // On a document run this is every recognized page joined
+                    // with page markers, not just the page last finished.
                     Group {
                         if model.viewSource || model.spec.producesMusicXML {
                             ScrollView(.horizontal, showsIndicators: false) {
-                                Text(recognition.output)
+                                Text(model.displayText)
                                     .font(.system(size: 12, design: .monospaced))
                                     .foregroundStyle(Lab.textMid)
                                     .textSelection(.enabled)
@@ -444,14 +485,14 @@ struct LabView: View {
                             }
                             .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
                         } else {
-                            MarkdownView(markdown: recognition.output)
+                            MarkdownView(markdown: model.displayText)
                         }
                     }
                     .frame(maxHeight: 420)
 
                     ShareLink(
                         item: TranscriptionFile(
-                            text: recognition.output,
+                            text: model.displayText,
                             filename: model.exportFilename
                         ),
                         preview: SharePreview(model.exportFilename)
@@ -470,8 +511,74 @@ struct LabView: View {
         }
     }
 
+    /// One row per page: what happened, and why if it did not.
+    private var pageLedger: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(model.pageOutcomes) { outcome in
+                HStack(alignment: .top, spacing: 10) {
+                    Text(String(format: "%3d", outcome.id))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(Lab.textFaint)
+                    icon(for: outcome.state)
+                    Text(label(for: outcome.state))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(color(for: outcome.state))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.vertical, 4)
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Page \(outcome.id), \(label(for: outcome.state))")
+            }
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
+        .overlay(RoundedRectangle(cornerRadius: Lab.radius).strokeBorder(Lab.line, lineWidth: 1))
+        // A long book should not push the transcription off the screen.
+        .frame(maxHeight: 220)
+        .fixedSize(horizontal: false, vertical: model.pageOutcomes.count <= 6)
+    }
+
+    @ViewBuilder
+    private func icon(for state: PageOutcome.State) -> some View {
+        switch state {
+        case .queued:
+            Image(systemName: "circle.dotted")
+                .font(.system(size: 11)).foregroundStyle(Lab.textFaint)
+        case .running:
+            ProgressView().controlSize(.mini).tint(Lab.accent)
+        case .done:
+            Image(systemName: "checkmark.circle.fill")
+                .font(.system(size: 11)).foregroundStyle(Lab.accent)
+        case .skipped:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 11)).foregroundStyle(Lab.red)
+        }
+    }
+
+    private func label(for state: PageOutcome.State) -> String {
+        switch state {
+        case .queued: "queued"
+        case .running: "reading…"
+        case .done(let characters, let seconds):
+            String(format: "%d characters · %.1fs", characters, seconds)
+        case .skipped(let reason): "skipped: \(reason)"
+        }
+    }
+
+    private func color(for state: PageOutcome.State) -> Color {
+        switch state {
+        case .queued: Lab.textFaint
+        case .running: Lab.textMid
+        case .done: Lab.textDim
+        case .skipped: Lab.red
+        }
+    }
+
     private func resultMeta(_ recognition: Recognition) -> some View {
-        var text = "\(model.spec.shortName) · \(recognition.output.count) characters"
+        var text = "\(model.spec.shortName) · \(model.displayText.count) characters"
         if let music = recognition.music {
             text = "\(music.staves.count) staff/staves recognized · "
                 + "\(music.skips.count) skipped · \(music.warnings.count) sanity warning(s)"

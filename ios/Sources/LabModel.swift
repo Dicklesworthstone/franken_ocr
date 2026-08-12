@@ -97,6 +97,9 @@ final class LabModel {
     var showLayoutBoxes = false
     var viewSource = false
 
+    /// Index into `pageOutcomes` of the page being read, if any.
+    var currentPageIndex: Int?
+
     private var timer: Timer?
     private var recognizeTask: Task<Void, Never>?
     /// Guards against a stale run publishing over a newer one.
@@ -123,7 +126,10 @@ final class LabModel {
     var isInstalled: Bool { store.phase == .ready }
 
     var canRecognize: Bool {
-        isInstalled && imageData != nil && !isRecognizing && spec.isSupportedOnThisDevice
+        guard isInstalled, !isRecognizing, spec.isSupportedOnThisDevice else { return false }
+        // A document is runnable even if its FIRST page failed to preview —
+        // the other pages may be perfectly readable.
+        return imageData != nil || (pdf != nil && !selectedPages().isEmpty)
     }
 
     /// A monotonic, honest progress fraction.
@@ -147,6 +153,20 @@ final class LabModel {
         return min(0.99, stage.precedingWeight + within * stage.weight)
     }
 
+    /// Progress across the WHOLE document: pages already finished, plus how far
+    /// into the current page we are. Without the second term a 40-page run would
+    /// sit frozen for minutes at a time, which reads as a hang.
+    var documentProgressFraction: Double {
+        let total = pageOutcomes.count
+        guard total > 0 else { return progressFraction }
+        let finished = pageOutcomes.filter(\.isTerminal).count
+        let current = currentPageIndex != nil ? progressFraction : 0
+        return min(0.999, (Double(finished) + current) / Double(total))
+    }
+
+    /// True when this run is a document walk rather than a single image.
+    var isDocumentRun: Bool { !pageOutcomes.isEmpty }
+
     var progressIsEstimated: Bool { (progress?.total ?? 0) == 0 }
 
     private var estimatedTokens: Int {
@@ -158,16 +178,40 @@ final class LabModel {
     }
 
     var progressDetail: String {
-        guard let progress else { return "" }
-        let percent = Int(progressFraction * 100)
+        guard let progress else {
+            return isDocumentRun ? "Rendering page…" : ""
+        }
         let qualifier = progressIsEstimated ? " (estimated)" : ""
-        var detail = "\(percent)%\(qualifier) · \(progress.stage.label)"
+        // On a document run the leading percentage is the DOCUMENT's, because
+        // that is the number a person actually wants; the page's own stage
+        // detail follows it.
+        let headline = isDocumentRun
+            ? "\(Int(documentProgressFraction * 100))%\(qualifier)"
+            : "\(Int(progressFraction * 100))%\(qualifier)"
+        var detail = "\(headline) · \(progress.stage.label)"
         if progress.total > 0 {
-            detail += " · \(progress.current)/\(progress.total)"
+            detail += " \(progress.current)/\(progress.total)"
         } else if progress.current > 0 {
             detail += " · \(progress.current) tokens"
         }
         return detail
+    }
+
+    /// "Page 7 of 40 · 6 done · 1 skipped" — the document-level line.
+    var documentDetail: String {
+        guard isDocumentRun else { return "" }
+        let total = pageOutcomes.count
+        let done = completedPageCount
+        let skipped = pageOutcomes.filter { if case .skipped = $0.state { true } else { false } }.count
+        var parts: [String] = []
+        if let index = currentPageIndex {
+            parts.append("Page \(pageOutcomes[index].id) of \(total)")
+        } else {
+            parts.append("\(total) page\(total == 1 ? "" : "s")")
+        }
+        parts.append("\(done) done")
+        if skipped > 0 { parts.append("\(skipped) skipped") }
+        return parts.joined(separator: " · ")
     }
 
     // ── Model lifecycle ────────────────────────────────────────────────────
@@ -287,7 +331,7 @@ final class LabModel {
     // ── Recognition ────────────────────────────────────────────────────────
 
     func recognize() {
-        guard canRecognize, let imageData else { return }
+        guard canRecognize else { return }
         generation += 1
         let runGeneration = generation
         isRecognizing = true
@@ -297,8 +341,13 @@ final class LabModel {
         statusKind = .neutral
         status = "Working…"
 
-        // A minutes-long forward must not be interrupted by the screen
-        // sleeping, which suspends the app.
+        // Seed the per-page rows up front so the whole plan is visible from the
+        // first second: you can see it is going to do 40 pages before it starts.
+        let pages = pdf != nil ? selectedPages() : []
+        pageOutcomes = pages.map { PageOutcome(id: $0) }
+
+        // A minutes-long run must not be interrupted by the screen sleeping,
+        // which suspends the app. A whole document is much longer still.
         UIApplication.shared.isIdleTimerDisabled = true
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.elapsed += 0.5 }
@@ -312,38 +361,144 @@ final class LabModel {
                 self.timer = nil
                 self.isRecognizing = false
                 self.recognizeTask = nil
+                self.progress = nil
             }
             do {
                 try await self.ensureEngineLoaded()
-                let started = Date()
-                let result = try await self.engine.recognize(imageData: imageData) { update in
+                if self.pdf != nil {
+                    try await self.recognizeDocument(generation: runGeneration)
+                } else {
+                    try await self.recognizeSingleImage(generation: runGeneration)
+                }
+            } catch let error as EngineError where error.isCancellation {
+                guard runGeneration == self.generation else { return }
+                self.statusKind = .warn
+                self.status = self.pageOutcomes.isEmpty
+                    ? "Cancelled."
+                    : "Cancelled after \(self.completedPageCount) of \(self.pageOutcomes.count) pages."
+            } catch {
+                guard runGeneration == self.generation else { return }
+                self.statusKind = .err
+                self.status = error.localizedDescription
+            }
+        }
+    }
+
+    /// The plain single-image path.
+    private func recognizeSingleImage(generation runGeneration: Int) async throws {
+        guard let imageData else { return }
+        let started = Date()
+        let result = try await engine.recognize(imageData: imageData) { [weak self] update in
+            Task { @MainActor [weak self] in
+                guard let self, runGeneration == self.generation else { return }
+                self.progress = update
+            }
+        }
+        guard runGeneration == generation else { return }
+        let seconds = Date().timeIntervalSince(started)
+        lastRunSeconds = seconds
+        recognition = result
+        statusKind = .ok
+        status = String(
+            format: "Done in %.1fs · %d characters, entirely on this device.",
+            seconds, result.output.count
+        )
+    }
+
+    /// Walk every selected page of the document.
+    ///
+    /// Sequential on purpose: the engine admits ONE forward at a time (each page
+    /// already fans out across every core internally), so running pages
+    /// concurrently would not be faster and would multiply peak memory by the
+    /// number of pages in flight — on a phone, the fastest way to get killed.
+    ///
+    /// A page that fails to rasterize is recorded with its reason and the walk
+    /// continues, matching the CLI: one JPEG-2000 page in a 300-page scan must
+    /// not throw away the other 299.
+    private func recognizeDocument(generation runGeneration: Int) async throws {
+        guard let pdf else { return }
+        let started = Date()
+
+        for (index, outcome) in pageOutcomes.enumerated() {
+            guard runGeneration == generation else { return }
+            try Task.checkCancellation()
+            let page = outcome.id
+
+            pageOutcomes[index].state = .running
+            currentPageIndex = index
+            status = "Page \(page) of \(pdfPageCount) — \(completedPageCount) done"
+
+            // Render. A failure here is this page's problem, not the run's.
+            let png: Data
+            do {
+                png = try pdf.renderPage(page)
+            } catch {
+                pageOutcomes[index].state = .skipped(reason: error.localizedDescription)
+                continue
+            }
+
+            // Show the page currently being read.
+            previewPage = page
+            previewImage = UIImage(data: png)
+
+            let pageStarted = Date()
+            do {
+                let result = try await engine.recognize(imageData: png) { [weak self] update in
                     Task { @MainActor [weak self] in
                         guard let self, runGeneration == self.generation else { return }
                         self.progress = update
                     }
                 }
-                guard runGeneration == self.generation else { return }
-                let seconds = Date().timeIntervalSince(started)
-                self.lastRunSeconds = seconds
-                self.recognition = result
-                self.progress = nil
-                self.statusKind = .ok
-                self.status = String(
-                    format: "Done in %.1fs · %d characters, entirely on this device.",
-                    seconds, result.output.count
+                guard runGeneration == generation else { return }
+                pageOutcomes[index].text = result.output
+                pageOutcomes[index].state = .done(
+                    characters: result.output.count,
+                    seconds: Date().timeIntervalSince(pageStarted)
                 )
+                // Keep the most recent page's layout for the box overlay.
+                recognition = result
             } catch let error as EngineError where error.isCancellation {
-                guard runGeneration == self.generation else { return }
-                self.statusKind = .warn
-                self.status = "Cancelled."
-                self.progress = nil
+                throw error
             } catch {
-                guard runGeneration == self.generation else { return }
-                self.statusKind = .err
-                self.status = error.localizedDescription
-                self.progress = nil
+                // A decode failure on one page is also survivable.
+                pageOutcomes[index].state = .skipped(reason: error.localizedDescription)
+            }
+            progress = nil
+        }
+
+        guard runGeneration == generation else { return }
+        currentPageIndex = nil
+        let seconds = Date().timeIntervalSince(started)
+        lastRunSeconds = seconds
+        let done = completedPageCount
+        let skipped = pageOutcomes.filter { if case .skipped = $0.state { true } else { false } }.count
+        statusKind = skipped == 0 ? .ok : .warn
+        status = String(
+            format: "%d of %d pages in %.0fs%@, entirely on this device.",
+            done, pageOutcomes.count, seconds,
+            skipped == 0 ? "" : " · \(skipped) skipped"
+        )
+    }
+
+    var completedPageCount: Int {
+        pageOutcomes.filter { if case .done = $0.state { true } else { false } }.count
+    }
+
+    /// The whole document's combined text, with page markers — the same shape
+    /// the CLI writes for a multi-page run.
+    var documentText: String {
+        guard !pageOutcomes.isEmpty else { return recognition?.output ?? "" }
+        return pageOutcomes.compactMap { outcome -> String? in
+            switch outcome.state {
+            case .done:
+                return "<!-- page \(outcome.id) -->\n\n\(outcome.text)"
+            case .skipped(let reason):
+                return "<!-- page \(outcome.id) skipped: \(reason) -->"
+            case .queued, .running:
+                return nil
             }
         }
+        .joined(separator: "\n\n")
     }
 
     private func ensureEngineLoaded() async throws {
@@ -385,9 +540,15 @@ final class LabModel {
         }
     }
 
-    /// What to write when the user exports.
+    /// What to write when the user exports. A document walk exports the whole
+    /// document, not the page that happens to be on screen.
     var exportFilename: String {
         let stem = (imageName as NSString?)?.deletingPathExtension ?? "page"
         return spec.producesMusicXML ? "\(stem).musicxml" : "\(stem).md"
+    }
+
+    /// The text an export or the source view should show.
+    var displayText: String {
+        isDocumentRun ? documentText : (recognition?.output ?? "")
     }
 }
