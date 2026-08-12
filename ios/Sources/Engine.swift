@@ -106,6 +106,20 @@ struct EngineError: LocalizedError {
     var errorDescription: String? { message }
     var isCancellation: Bool { kind == .cancelled }
 
+    /// Whether this ends a whole document walk or just the page that hit it.
+    ///
+    /// Mirrors `pdf::is_fatal_to_document` in the engine, and must stay in step
+    /// with it: a page whose codec has no pure-Rust decoder is survivable, but a
+    /// missing model, a cancelled run, or a format mismatch means the run itself
+    /// is over. `timeout` is deliberately survivable — the stage budget is
+    /// per-forward, so one slow page is a skip, not a verdict on the whole book.
+    var isFatalToDocument: Bool {
+        switch kind {
+        case .modelNotFound, .cancelled, .formatMismatch: true
+        case .generic, .usage, .inputDecode, .timeout: false
+        }
+    }
+
     /// Read the calling thread's error slot. Must be called on the SAME thread
     /// that made the failing call — inside the actor, that is guaranteed.
     static func fromNative(code: Int32) -> EngineError {
@@ -276,6 +290,21 @@ actor Engine {
 final class PdfDocument: @unchecked Sendable {
     private let handle: OpaquePointer
     let pageCount: Int
+
+    /// Parse off the main actor.
+    ///
+    /// Parsing is real work — a scanned book is tens of megabytes of object
+    /// graph — and every caller here is main-actor isolated, so doing it inline
+    /// freezes the UI for as long as it takes.
+    static func open(data: Data) async -> PdfDocument? {
+        await Task.detached(priority: .userInitiated) { PdfDocument(data: data) }.value
+    }
+
+    /// Rasterize off the main actor. Same reason as `open`, per page — and a
+    /// document walk does this once for every page in the book.
+    func page(_ page: Int) async throws -> Data {
+        try await Task.detached(priority: .userInitiated) { try self.renderPage(page) }.value
+    }
 
     /// Returns nil if the bytes are not a PDF this build can parse.
     init?(data: Data) {

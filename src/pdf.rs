@@ -927,14 +927,18 @@ pub fn select_pages(spec: Option<&str>, page_count: usize) -> FocrResult<Vec<usi
 /// format mismatch is the *document's* problem: skipping 300 pages one at a time
 /// and reporting "300 skipped" would be a slow, confusing way to say "you never
 /// had a model loaded".
+///
+/// This set is exactly the one `cli.rs` has used for its own page loops since
+/// before this function existed, and it must stay that way: the CLI's behavior
+/// is the documented one, and a divergence here would silently change what
+/// `focr ocr book.pdf` does. In particular `Timeout` is deliberately NOT fatal —
+/// the stage budget is per-forward, so one slow page is a skip, not a verdict on
+/// the rest of the book.
 #[must_use]
 pub fn is_fatal_to_document(err: &FocrError) -> bool {
     matches!(
         err,
-        FocrError::ModelNotFound(_)
-            | FocrError::Cancelled
-            | FocrError::FormatMismatch(_)
-            | FocrError::Timeout(_)
+        FocrError::ModelNotFound(_) | FocrError::Cancelled | FocrError::FormatMismatch(_)
     )
 }
 
@@ -1106,7 +1110,10 @@ mod tests {
         assert_eq!(select_pages(Some("3,1"), 5).expect("ok"), vec![0, 2]);
         assert_eq!(select_pages(Some("2-4"), 5).expect("ok"), vec![1, 2, 3]);
         // Overlapping ranges collapse rather than repeating a page.
-        assert_eq!(select_pages(Some("1-3,2-4"), 5).expect("ok"), vec![0, 1, 2, 3]);
+        assert_eq!(
+            select_pages(Some("1-3,2-4"), 5).expect("ok"),
+            vec![0, 1, 2, 3]
+        );
     }
 
     #[test]
@@ -1136,13 +1143,18 @@ mod tests {
         assert!(!is_fatal_to_document(&FocrError::InputDecode(
             "JPXDecode: no pure-Rust decoder".into()
         )));
-        assert!(!is_fatal_to_document(&FocrError::NotImplemented("x".into())));
+        assert!(!is_fatal_to_document(&FocrError::NotImplemented(
+            "x".into()
+        )));
+        // The stage budget is PER FORWARD, so one slow page is a skip, not a
+        // verdict on the rest of the book. This matches what cli.rs has always
+        // done; changing it would silently change `focr ocr book.pdf`.
+        assert!(!is_fatal_to_document(&FocrError::Timeout("x".into())));
         // These say the run itself is over; skipping 300 pages one at a time
         // would be a slow way to report "you never had a model".
         assert!(is_fatal_to_document(&FocrError::ModelNotFound("x".into())));
         assert!(is_fatal_to_document(&FocrError::Cancelled));
         assert!(is_fatal_to_document(&FocrError::FormatMismatch("x".into())));
-        assert!(is_fatal_to_document(&FocrError::Timeout("x".into())));
     }
 
     // ── outcome assembly ───────────────────────────────────────────────────

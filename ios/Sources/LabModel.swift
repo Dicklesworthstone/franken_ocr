@@ -127,9 +127,12 @@ final class LabModel {
 
     var canRecognize: Bool {
         guard isInstalled, !isRecognizing, spec.isSupportedOnThisDevice else { return false }
-        // A document is runnable even if its FIRST page failed to preview —
-        // the other pages may be perfectly readable.
-        return imageData != nil || (pdf != nil && !selectedPages().isEmpty)
+        // A document is runnable even if its FIRST page failed to preview — the
+        // other pages may be perfectly readable. Deliberately does NOT resolve
+        // the page selection: this is read on every SwiftUI body evaluation, and
+        // an invalid spec is reported when Recognize is pressed, not by silently
+        // disabling the button with no explanation.
+        return imageData != nil || pdf != nil
     }
 
     /// A monotonic, honest progress fraction.
@@ -288,30 +291,38 @@ final class LabModel {
     }
 
     private func acceptPDF(_ data: Data, name: String) {
-        guard let document = PdfDocument(data: data) else {
-            status = "That PDF could not be parsed."
-            statusKind = .err
-            return
-        }
-        pdf = document
-        previewPage = 1
-        pageSelection = ""
-        imageName = name
-        recognition = nil
-        pageOutcomes = []
-        let pages = document.pageCount
-        status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). "
-            + "Recognize reads the whole document."
+        // Parsing and rasterizing are off the main actor: this type is
+        // main-actor isolated, and a scanned book is enough object graph that
+        // doing either inline visibly freezes the UI.
+        status = "Opening \(name)…"
         statusKind = .neutral
-        loadPreviewPage()
+        Task { [weak self] in
+            guard let self else { return }
+            guard let document = await PdfDocument.open(data: data) else {
+                self.status = "That PDF could not be parsed."
+                self.statusKind = .err
+                return
+            }
+            self.pdf = document
+            self.previewPage = 1
+            self.pageSelection = ""
+            self.imageName = name
+            self.recognition = nil
+            self.pageOutcomes = []
+            let pages = document.pageCount
+            await self.loadPreviewPage()
+            self.status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). "
+                + "Recognize reads the whole document."
+            self.statusKind = .neutral
+        }
     }
 
     /// Render the page the user is looking at. Purely a preview — it does not
     /// constrain what `recognize()` covers.
-    func loadPreviewPage() {
+    func loadPreviewPage() async {
         guard let pdf else { return }
         do {
-            let png = try pdf.renderPage(previewPage)
+            let png = try await pdf.page(previewPage)
             imageData = png
             previewImage = UIImage(data: png)
         } catch {
@@ -324,27 +335,52 @@ final class LabModel {
         }
     }
 
+    /// A malformed or out-of-range page selection.
+    struct PageSpecError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
     /// Resolve `pageSelection` into 1-based page numbers in source order with
-    /// duplicates removed. Empty selection means the whole document. Mirrors the
-    /// CLI's `--pages` grammar so the two agree.
-    func selectedPages() -> [Int] {
+    /// duplicates removed. Empty selection means the whole document.
+    ///
+    /// Mirrors `pdf::select_pages` in the engine, including its refusals:
+    /// out-of-range and malformed pages **throw, naming the real page count**,
+    /// rather than being quietly dropped. Silently ignoring "9" on a 3-page
+    /// document leaves the reader believing page 9 was read.
+    func selectedPages() throws -> [Int] {
         let total = pdfPageCount
         guard total > 0 else { return [] }
         let spec = pageSelection.trimmingCharacters(in: .whitespaces)
         guard !spec.isEmpty else { return Array(1...total) }
 
+        func bad(_ what: String) -> PageSpecError {
+            PageSpecError(
+                message: "Pages \"\(spec)\": \(what) (expected 1-based pages/ranges "
+                    + "like \"1,5-9\"; this document has \(total) page(s))"
+            )
+        }
+        func one(_ token: Substring) throws -> Int {
+            let text = token.trimmingCharacters(in: .whitespaces)
+            guard let n = Int(text), String(n) == text else {
+                throw bad("unparseable page \"\(text)\"")
+            }
+            if n == 0 { throw bad("page 0 (pages are 1-based)") }
+            if n > total { throw bad("page \(n) is out of range") }
+            return n
+        }
+
         var wanted: Set<Int> = []
-        for part in spec.components(separatedBy: ",") {
+        for part in spec.split(separator: ",", omittingEmptySubsequences: false) {
             let piece = part.trimmingCharacters(in: .whitespaces)
-            guard !piece.isEmpty else { continue }
-            if let dash = piece.firstIndex(of: "-") {
-                let lo = Int(piece[piece.startIndex..<dash].trimmingCharacters(in: .whitespaces))
-                let hi = Int(piece[piece.index(after: dash)...].trimmingCharacters(in: .whitespaces))
-                if let lo, let hi, lo <= hi {
-                    for p in lo...hi where p >= 1 && p <= total { wanted.insert(p) }
-                }
-            } else if let p = Int(piece), p >= 1, p <= total {
-                wanted.insert(p)
+            guard !piece.isEmpty else { throw bad("empty element") }
+            if let dash = piece.firstIndex(of: "-"), dash != piece.startIndex {
+                let lo = try one(piece[piece.startIndex..<dash])
+                let hi = try one(piece[piece.index(after: dash)...])
+                guard lo <= hi else { throw bad("reversed range \"\(piece)\"") }
+                for p in lo...hi { wanted.insert(p) }
+            } else {
+                wanted.insert(try one(piece[...]))
             }
         }
         return wanted.sorted()
@@ -365,7 +401,26 @@ final class LabModel {
 
         // Seed the per-page rows up front so the whole plan is visible from the
         // first second: you can see it is going to do 40 pages before it starts.
-        let pages = pdf != nil ? selectedPages() : []
+        // A bad page spec is a usage error reported here, before any work.
+        let pages: [Int]
+        if pdf != nil {
+            do {
+                pages = try selectedPages()
+            } catch {
+                isRecognizing = false
+                statusKind = .warn
+                status = error.localizedDescription
+                return
+            }
+            if pages.isEmpty {
+                isRecognizing = false
+                statusKind = .warn
+                status = "That page selection matched no pages."
+                return
+            }
+        } else {
+            pages = []
+        }
         pageOutcomes = pages.map { PageOutcome(id: $0) }
 
         // A minutes-long run must not be interrupted by the screen sleeping,
@@ -450,10 +505,11 @@ final class LabModel {
             currentPageIndex = index
             status = "Page \(page) of \(pdfPageCount) — \(completedPageCount) done"
 
-            // Render. A failure here is this page's problem, not the run's.
+            // Render, off the main actor. A failure here is this page's
+            // problem, not the run's.
             let png: Data
             do {
-                png = try pdf.renderPage(page)
+                png = try await pdf.page(page)
             } catch {
                 pageOutcomes[index].state = .skipped(reason: error.localizedDescription)
                 continue
@@ -479,10 +535,15 @@ final class LabModel {
                 )
                 // Keep the most recent page's layout for the box overlay.
                 recognition = result
-            } catch let error as EngineError where error.isCancellation {
+            } catch let error as EngineError where error.isFatalToDocument {
+                // Mirrors `pdf::is_fatal_to_document`. A missing model or a
+                // format mismatch is the DOCUMENT's problem: skipping 300 pages
+                // one at a time would be a slow, confusing way to report that
+                // there was never a model loaded.
                 throw error
             } catch {
-                // A decode failure on one page is also survivable.
+                // Anything else — an undecodable page codec, a bad raster — is
+                // this page's problem, and the other pages still deserve to run.
                 pageOutcomes[index].state = .skipped(reason: error.localizedDescription)
             }
             progress = nil

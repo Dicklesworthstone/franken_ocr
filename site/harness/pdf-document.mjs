@@ -97,8 +97,15 @@ try {
     out.range = window.__focrSelectedPages?.() ?? null;
     set("3,1");
     out.unordered = window.__focrSelectedPages?.() ?? null;
+    // Out-of-range must THROW, not silently drop — the same contract
+    // `pdf::select_pages` enforces in the engine.
     set("99");
-    out.outOfRange = window.__focrSelectedPages?.() ?? null;
+    try {
+      window.__focrSelectedPages();
+      out.outOfRange = "no error";
+    } catch (e) {
+      out.outOfRange = e.message;
+    }
     set("");
     return out;
   });
@@ -114,9 +121,11 @@ try {
       JSON.stringify(ranges.unordered),
     );
     check(
-      "out-of-range pages are dropped",
-      Array.isArray(ranges.outOfRange) && ranges.outOfRange.length === 0,
-      JSON.stringify(ranges.outOfRange),
+      "out-of-range page is a usage error naming the count",
+      typeof ranges.outOfRange === "string" &&
+        /out of range/.test(ranges.outOfRange) &&
+        new RegExp(`${pages} page\\(s\\)`).test(ranges.outOfRange),
+      ranges.outOfRange,
     );
   }
 

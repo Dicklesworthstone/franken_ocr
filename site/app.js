@@ -346,7 +346,13 @@ async function acceptPdf(file) {
   try {
     // The worker keeps the bytes for the whole document; nothing re-sends them
     // per page.
-    const { info } = await call("pdf-open", { bytes: bytes.slice(0) }, [bytes.slice(0)]);
+    // ONE copy, both named in the payload and listed for transfer. Passing two
+    // separate `slice(0)` calls would put a buffer in the transfer list that is
+    // not in the message: the payload would be structured-CLONED (a full copy of
+    // the document) and the transferred buffer discarded — the exact copy this
+    // is meant to avoid.
+    const owned = bytes.slice(0);
+    const { info } = await call("pdf-open", { bytes: owned }, [owned]);
     currentPdf = { name: file.name, pages: info.pages };
     $("pdf-count").textContent = String(info.pages);
     $("pdf-page").max = String(info.pages);
@@ -399,23 +405,49 @@ function selectedPages() {
   if (!total) return [];
   const spec = ($("pdf-range")?.value ?? "").trim();
   if (!spec) return Array.from({ length: total }, (_, i) => i + 1);
+
+  // Out-of-range and malformed pages THROW rather than being dropped, matching
+  // `pdf::select_pages` in the engine and the documented CLI behavior. Silently
+  // ignoring "9" on a 3-page document leaves the reader believing page 9 was
+  // read; the error names the real count instead.
+  const bad = (what) => {
+    throw new Error(
+      `Pages "${spec}": ${what} (expected 1-based pages/ranges like "1,5-9"; ` +
+        `this document has ${total} page(s))`,
+    );
+  };
+  const one = (tok) => {
+    const t = tok.trim();
+    if (!/^\d+$/.test(t)) bad(`unparseable page "${t}"`);
+    const n = Number(t);
+    if (n === 0) bad("page 0 (pages are 1-based)");
+    if (n > total) bad(`page ${n} is out of range`);
+    return n;
+  };
   const wanted = new Set();
   for (const part of spec.split(",")) {
     const piece = part.trim();
-    if (!piece) continue;
+    if (!piece) bad("empty element");
     const dash = piece.indexOf("-");
     if (dash > 0) {
-      const lo = Number(piece.slice(0, dash).trim());
-      const hi = Number(piece.slice(dash + 1).trim());
-      if (Number.isInteger(lo) && Number.isInteger(hi) && lo <= hi) {
-        for (let p = Math.max(1, lo); p <= Math.min(total, hi); p++) wanted.add(p);
-      }
+      const lo = one(piece.slice(0, dash));
+      const hi = one(piece.slice(dash + 1));
+      if (lo > hi) bad(`reversed range "${piece}"`);
+      for (let p = lo; p <= hi; p++) wanted.add(p);
     } else {
-      const p = Number(piece);
-      if (Number.isInteger(p) && p >= 1 && p <= total) wanted.add(p);
+      wanted.add(one(piece));
     }
   }
   return [...wanted].sort((a, b) => a - b);
+}
+
+/// Mirrors `pdf::is_fatal_to_document`: does this end the whole walk, or just
+/// this page? The worker prefixes engine errors with the failing stage, and a
+/// cancelled run is signalled by the flag rather than the message.
+function isFatalToDocument(message) {
+  return /model (artifact )?(was )?not found|no model is loaded|format|version mismatch|cancell?ed|budget|timed? ?out/i.test(
+    message,
+  );
 }
 
 // Exposed for site/harness/pdf-document.mjs so the page-range grammar is tested
@@ -580,7 +612,14 @@ async function runSinglePage() {
 /// number of pages in flight — which on the lane that already peaks near the
 /// wasm32 ceiling is how you lose the tab.
 async function runDocument() {
-  const pages = selectedPages();
+  let pages;
+  try {
+    pages = selectedPages();
+  } catch (err) {
+    // A bad page spec is a usage error, reported before any work starts.
+    setStatus(err.message, "warn");
+    return;
+  }
   if (!pages.length) {
     setStatus("That page selection matched no pages.", "warn");
     return;
@@ -628,11 +667,11 @@ async function runDocument() {
     const pageStarted = performance.now();
     try {
       resetRecognizeProgress();
-      const { result } = await call(
-        "recognize",
-        { bytes: bytes.slice(0), question },
-        [bytes.slice(0)],
-      );
+      // One copy, transferred (see the note in acceptPdf). `bytes` itself stays
+      // with `currentImage` for the preview, so it must not be the transferred
+      // buffer — transferring detaches it.
+      const owned = bytes.slice(0);
+      const { result } = await call("recognize", { bytes: owned, question }, [owned]);
       row.state = "done";
       row.output = result.output;
       row.chars = result.output.length;
@@ -641,6 +680,8 @@ async function runDocument() {
       lastResult = result;
     } catch (err) {
       if (cancelled) break;
+      // A document-level failure ends the run; a page-level one skips the page.
+      if (isFatalToDocument(err.message)) throw err;
       row.state = "skipped";
       row.reason = err.message;
     }
@@ -650,9 +691,15 @@ async function runDocument() {
   documentIndex = null;
   const seconds = (performance.now() - started) / 1000;
   const skipped = pageLedger.filter((r) => r.state === "skipped").length;
-  // Render the whole document, not just the page that finished last.
-  if (lastResult) {
-    renderResult({ ...lastResult, output: ledgerDocument() }, seconds * 1000);
+  // Promote the WHOLE document to `lastResult`, not just the page that finished
+  // last. The download handlers read `lastResult.output`, so leaving the final
+  // page there would show the whole document on screen while saving one page of
+  // it — silent data loss. Gated on a page having actually read this run:
+  // `lastResult` survives across runs, so an all-skipped document would
+  // otherwise redraw the previous document's layout and music payload.
+  if (documentDone > 0 && lastResult) {
+    lastResult = { ...lastResult, output: ledgerDocument() };
+    renderResult(lastResult, seconds * 1000);
   }
   setStatus(
     cancelled
