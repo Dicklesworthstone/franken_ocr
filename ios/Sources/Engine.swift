@@ -255,24 +255,48 @@ actor Engine {
 
     // ── PDF ────────────────────────────────────────────────────────────────
 
-    nonisolated static func pdfPageCount(_ data: Data) throws -> Int {
-        var pages: UInt32 = 0
-        let code = data.withUnsafeBytes { raw -> Int32 in
+    // PDF work lives on `PdfDocument` below — it is independent of the engine
+    // and must stay callable while a recognition is in flight.
+
+    deinit {
+        if let handle { focr_engine_close(handle) }
+    }
+}
+
+/// An opened PDF.
+///
+/// Parsed once; every page render borrows that parse. The alternative — handing
+/// the raw bytes across the boundary per page — re-parses the whole document
+/// each time, which is the wrong shape for "OCR this entire scan" and gets
+/// quadratically worse as the book gets longer.
+///
+/// Not an actor: rendering is pure with respect to the document, and the
+/// document is immutable once opened. It is a `final class` so `deinit` can
+/// close the handle exactly once.
+final class PdfDocument: @unchecked Sendable {
+    private let handle: OpaquePointer
+    let pageCount: Int
+
+    /// Returns nil if the bytes are not a PDF this build can parse.
+    init?(data: Data) {
+        let opened = data.withUnsafeBytes { raw -> OpaquePointer? in
             let base = raw.bindMemory(to: UInt8.self).baseAddress
-            return focr_pdf_page_count(base, raw.count, &pages)
+            return focr_pdf_open(base, raw.count)
         }
-        guard code == 0 else { throw EngineError.fromNative(code: code) }
-        return Int(pages)
+        guard let opened else { return nil }
+        handle = opened
+        pageCount = Int(focr_pdf_page_count(opened))
     }
 
     /// Rasterize one 1-based page to PNG data.
-    nonisolated static func pdfRenderPage(_ data: Data, page: Int) throws -> Data {
+    ///
+    /// Throws rather than returning nil so the caller can record WHY a page was
+    /// skipped — "JPXDecode: no pure-Rust decoder" is a materially different
+    /// outcome from a corrupt file, and a document walk should say which.
+    func renderPage(_ page: Int) throws -> Data {
         var ptr: UnsafeMutablePointer<UInt8>?
         var len = 0
-        let code = data.withUnsafeBytes { raw -> Int32 in
-            let base = raw.bindMemory(to: UInt8.self).baseAddress
-            return focr_pdf_render_page(base, raw.count, UInt32(page), &ptr, &len)
-        }
+        let code = focr_pdf_render_page(handle, UInt32(page), &ptr, &len)
         guard code == 0, let ptr else { throw EngineError.fromNative(code: code) }
         // Copy out, then hand the buffer back with the EXACT length we were
         // given — the free function reconstitutes a Box from (ptr, len).
@@ -281,9 +305,7 @@ actor Engine {
         return copied
     }
 
-    deinit {
-        if let handle { focr_engine_close(handle) }
-    }
+    deinit { focr_pdf_close(handle) }
 }
 
 /// Holds the active progress closure and owns the C trampoline.

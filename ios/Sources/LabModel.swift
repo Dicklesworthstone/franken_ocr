@@ -2,6 +2,32 @@ import Foundation
 import SwiftUI
 import UIKit
 
+/// What happened to one page of a document.
+///
+/// A page that cannot be rasterized (JPEG 2000, JBIG2, a born-digital vector
+/// page) must not take the whole document down with it — the CLI skips it with a
+/// named reason and keeps going, and so does this.
+struct PageOutcome: Identifiable {
+    enum State {
+        case queued
+        case running
+        case done(characters: Int, seconds: Double)
+        case skipped(reason: String)
+    }
+
+    /// 1-based source page number, which is also the identity a person sees.
+    let id: Int
+    var state: State = .queued
+    var text: String = ""
+
+    var isTerminal: Bool {
+        switch state {
+        case .done, .skipped: true
+        case .queued, .running: false
+        }
+    }
+}
+
 /// The one place app state lives.
 ///
 /// Everything UI-facing is main-actor and `@Observable`; the single thread
@@ -37,10 +63,18 @@ final class LabModel {
     var previewImage: UIImage?
     var imageName: String?
 
-    /// Loaded PDF, if the input was a document.
-    var pdfData: Data?
-    var pdfPageCount: Int = 0
-    var pdfPage: Int = 1
+    /// Loaded PDF, if the input was a document. Parsed once and reused for
+    /// every page render.
+    var pdf: PdfDocument?
+    var pdfPageCount: Int { pdf?.pageCount ?? 0 }
+    /// The page shown in the preview. Recognition covers the whole selection,
+    /// not just this page — this only drives what you are looking at.
+    var previewPage: Int = 1
+    /// CLI-style page selection (`3,5-9`). Empty means every page.
+    var pageSelection: String = ""
+
+    /// One row per page in the current run.
+    var pageOutcomes: [PageOutcome] = []
 
     /// SmolVLM2's question. Kept even when another model is selected so it
     /// survives a round trip through the picker.
@@ -177,8 +211,8 @@ final class LabModel {
             statusKind = .warn
             return
         }
-        pdfData = nil
-        pdfPageCount = 0
+        pdf = nil
+        pageOutcomes = []
         imageData = data
         previewImage = image
         imageName = name
@@ -188,38 +222,66 @@ final class LabModel {
     }
 
     private func acceptPDF(_ data: Data, name: String) {
-        do {
-            let pages = try Engine.pdfPageCount(data)
-            pdfData = data
-            pdfPageCount = pages
-            pdfPage = 1
-            imageName = name
-            recognition = nil
-            status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). Pick a page to render."
-            statusKind = .neutral
-            loadPDFPage()
-        } catch {
-            status = error.localizedDescription
+        guard let document = PdfDocument(data: data) else {
+            status = "That PDF could not be parsed."
             statusKind = .err
+            return
         }
+        pdf = document
+        previewPage = 1
+        pageSelection = ""
+        imageName = name
+        recognition = nil
+        pageOutcomes = []
+        let pages = document.pageCount
+        status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). "
+            + "Recognize reads the whole document."
+        statusKind = .neutral
+        loadPreviewPage()
     }
 
-    func loadPDFPage() {
-        guard let pdfData else { return }
+    /// Render the page the user is looking at. Purely a preview — it does not
+    /// constrain what `recognize()` covers.
+    func loadPreviewPage() {
+        guard let pdf else { return }
         do {
-            let png = try Engine.pdfRenderPage(pdfData, page: pdfPage)
+            let png = try pdf.renderPage(previewPage)
             imageData = png
             previewImage = UIImage(data: png)
-            status = "Page \(pdfPage) of \(pdfPageCount) rendered."
-            statusKind = .ok
         } catch {
             // The engine names exactly what was unsupported (JPEG 2000, JBIG2,
             // a born-digital vector page) rather than returning a wrong result.
             imageData = nil
             previewImage = nil
             status = error.localizedDescription
-            statusKind = .err
+            statusKind = .warn
         }
+    }
+
+    /// Resolve `pageSelection` into 1-based page numbers in source order with
+    /// duplicates removed. Empty selection means the whole document. Mirrors the
+    /// CLI's `--pages` grammar so the two agree.
+    func selectedPages() -> [Int] {
+        let total = pdfPageCount
+        guard total > 0 else { return [] }
+        let spec = pageSelection.trimmingCharacters(in: .whitespaces)
+        guard !spec.isEmpty else { return Array(1...total) }
+
+        var wanted: Set<Int> = []
+        for part in spec.components(separatedBy: ",") {
+            let piece = part.trimmingCharacters(in: .whitespaces)
+            guard !piece.isEmpty else { continue }
+            if let dash = piece.firstIndex(of: "-") {
+                let lo = Int(piece[piece.startIndex..<dash].trimmingCharacters(in: .whitespaces))
+                let hi = Int(piece[piece.index(after: dash)...].trimmingCharacters(in: .whitespaces))
+                if let lo, let hi, lo <= hi {
+                    for p in lo...hi where p >= 1 && p <= total { wanted.insert(p) }
+                }
+            } else if let p = Int(piece), p >= 1, p <= total {
+                wanted.insert(p)
+            }
+        }
+        return wanted.sorted()
     }
 
     // ── Recognition ────────────────────────────────────────────────────────
