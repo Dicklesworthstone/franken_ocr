@@ -196,9 +196,14 @@ pub extern "C" fn focr_engine_info_json() -> *const c_char {
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `out_json` must be NULL or a valid, aligned, writable `char *` slot. On
+/// success it receives a caller-owned string that must be released with
+/// [`focr_string_free`].
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_selftest_json(out_json: *mut *mut c_char) -> i32 {
+pub unsafe extern "C" fn focr_selftest_json(out_json: *mut *mut c_char) -> i32 {
     guarded(EXIT_GENERIC, || {
         clear_error();
         let report = franken_ocr::simd::selftest();
@@ -265,9 +270,14 @@ fn cstring_or_empty(value: &str) -> CString {
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `artifact_path` must be NULL or point to a NUL-terminated UTF-8 string that
+/// stays valid for the duration of the call. A non-NULL return is a handle the
+/// caller owns and must release exactly once with [`focr_engine_close`].
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_engine_open(artifact_path: *const c_char) -> *mut FocrEngine {
+pub unsafe extern "C" fn focr_engine_open(artifact_path: *const c_char) -> *mut FocrEngine {
     guarded(std::ptr::null_mut(), || {
         clear_error();
         // SAFETY: documented as NULL or a valid NUL-terminated string.
@@ -297,9 +307,14 @@ pub extern "C" fn focr_engine_open(artifact_path: *const c_char) -> *mut FocrEng
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `engine` must be NULL, or a handle returned by [`focr_engine_open`] that has
+/// not already been closed. Closing the same handle twice is undefined; closing
+/// NULL is an explicit no-op.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_engine_close(engine: *mut FocrEngine) {
+pub unsafe extern "C" fn focr_engine_close(engine: *mut FocrEngine) {
     if engine.is_null() {
         return;
     }
@@ -326,9 +341,13 @@ unsafe fn engine_ref<'a>(engine: *const FocrEngine) -> Option<&'a FocrEngine> {
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `engine` must be NULL or a live handle from [`focr_engine_open`]. The
+/// returned pointer is owned by the engine and is valid only until it is closed.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_engine_model_id(engine: *const FocrEngine) -> *const c_char {
+pub unsafe extern "C" fn focr_engine_model_id(engine: *const FocrEngine) -> *const c_char {
     // SAFETY: documented as NULL or a live engine handle.
     match unsafe { engine_ref(engine) } {
         Some(engine) => engine.model_id.as_ptr(),
@@ -337,9 +356,13 @@ pub extern "C" fn focr_engine_model_id(engine: *const FocrEngine) -> *const c_ch
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `engine` must be NULL or a live handle from [`focr_engine_open`]. The
+/// returned pointer is owned by the engine and is valid only until it is closed.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_engine_license(engine: *const FocrEngine) -> *const c_char {
+pub unsafe extern "C" fn focr_engine_license(engine: *const FocrEngine) -> *const c_char {
     // SAFETY: documented as NULL or a live engine handle.
     match unsafe { engine_ref(engine) } {
         Some(engine) => engine.license.as_ptr(),
@@ -401,9 +424,16 @@ fn recognize_envelope(engine: &FocrEngine, image_bytes: &[u8]) -> FocrResult<Str
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `engine` must be NULL or a live handle from [`focr_engine_open`], and access
+/// to that handle must be serialized — it is not thread-safe. `image_bytes` must
+/// be NULL or point to `image_len` initialized bytes valid for the call.
+/// `out_json` must be NULL or a valid writable `char *` slot, which on success
+/// receives a caller-owned string to release with [`focr_string_free`].
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_recognize_json(
+pub unsafe extern "C" fn focr_recognize_json(
     engine: *mut FocrEngine,
     image_bytes: *const u8,
     image_len: usize,
@@ -480,9 +510,19 @@ fn progress_slot() -> &'static Mutex<Option<ProgressTarget>> {
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `ctx` is never dereferenced here — it is an opaque token handed back to
+/// `func` — but the caller must keep whatever it points at alive for as long as
+/// the callback is installed, and must clear the callback (`func = None`) before
+/// releasing it. `func` may be invoked from any thread, so it must be
+/// thread-safe and non-blocking.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_set_progress_callback(func: Option<FocrProgressFn>, ctx: *mut c_void) {
+pub unsafe extern "C" fn focr_set_progress_callback(
+    func: Option<FocrProgressFn>,
+    ctx: *mut c_void,
+) {
     guarded((), || {
         let target = func.map(|func| ProgressTarget { func, ctx });
         if let Ok(mut slot) = progress_slot().lock() {
@@ -530,9 +570,13 @@ pub extern "C" fn focr_reset_cancel() {
 // ── PDF ────────────────────────────────────────────────────────────────────
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `pdf_bytes` must be NULL or point to `pdf_len` initialized bytes valid for
+/// the call. `out_pages` must be NULL or a valid, aligned, writable `u32` slot.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_pdf_page_count(
+pub unsafe extern "C" fn focr_pdf_page_count(
     pdf_bytes: *const u8,
     pdf_len: usize,
     out_pages: *mut u32,
@@ -558,9 +602,15 @@ pub extern "C" fn focr_pdf_page_count(
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `pdf_bytes` must be NULL or point to `pdf_len` initialized bytes valid for
+/// the call. `out_png` and `out_len` must be NULL or valid writable slots; on
+/// success they receive a caller-owned buffer that must be released with
+/// [`focr_bytes_free`], passing back exactly the length returned.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_pdf_render_page(
+pub unsafe extern "C" fn focr_pdf_render_page(
     pdf_bytes: *const u8,
     pdf_len: usize,
     page: u32,
@@ -612,9 +662,7 @@ fn render_pdf_page_png(pdf_bytes: &[u8], page: u32) -> FocrResult<Vec<u8>> {
     let mut png = Vec::new();
     image
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-        .map_err(|e| {
-            FocrError::InputDecode(format!("could not encode page {page} as PNG: {e}"))
-        })?;
+        .map_err(|e| FocrError::InputDecode(format!("could not encode page {page} as PNG: {e}")))?;
     Ok(png)
 }
 
@@ -642,9 +690,13 @@ pub extern "C" fn focr_set_got_format(on: bool) {
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `question` must be NULL or point to a NUL-terminated UTF-8 string valid for
+/// the duration of the call. The contents are copied; the caller keeps ownership.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_set_smolvlm2_question(question: *const c_char) {
+pub unsafe extern "C" fn focr_set_smolvlm2_question(question: *const c_char) {
     guarded((), || {
         // SAFETY: documented as NULL or a valid NUL-terminated string.
         let question = unsafe { ptr_island::opt_str(question) }.unwrap_or("");
@@ -659,9 +711,13 @@ pub extern "C" fn focr_set_smolvlm2_question(question: *const c_char) {
 // ── Memory ─────────────────────────────────────────────────────────────────
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `s` must be NULL, or a pointer this library returned through a `char **`
+/// out-parameter and that has not already been freed.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_string_free(s: *mut c_char) {
+pub unsafe extern "C" fn focr_string_free(s: *mut c_char) {
     if s.is_null() {
         return;
     }
@@ -671,9 +727,14 @@ pub extern "C" fn focr_string_free(s: *mut c_char) {
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `ptr` must be NULL, or a buffer this library returned with EXACTLY this
+/// `len`, not already freed. The length is part of the contract: it is used to
+/// reconstitute the owning box, so a wrong length is undefined behavior.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
-pub extern "C" fn focr_bytes_free(ptr: *mut u8, len: usize) {
+pub unsafe extern "C" fn focr_bytes_free(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
@@ -683,6 +744,10 @@ pub extern "C" fn focr_bytes_free(ptr: *mut u8, len: usize) {
 }
 
 #[cfg(test)]
+// The tests exercise the C ABI as a C caller would, so they read back the
+// `const char *` returns. Same island discipline as the exports above: the
+// pointers under test are ones this crate just produced and still owns.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
@@ -714,24 +779,35 @@ mod tests {
 
     #[test]
     fn null_arguments_are_usage_errors_not_crashes() {
-        assert_eq!(
-            focr_recognize_json(std::ptr::null_mut(), std::ptr::null(), 0, std::ptr::null_mut()),
-            EXIT_USAGE
-        );
-        assert_eq!(
-            focr_pdf_page_count(std::ptr::null(), 0, std::ptr::null_mut()),
-            EXIT_USAGE
-        );
-        // Closing NULL is explicitly a no-op.
-        focr_engine_close(std::ptr::null_mut());
-        focr_string_free(std::ptr::null_mut());
-        focr_bytes_free(std::ptr::null_mut(), 0);
+        // SAFETY: every pointer here is NULL, which each entry point documents
+        // as a usage error it must detect and report rather than dereference.
+        // Proving exactly that is the point of this test.
+        unsafe {
+            assert_eq!(
+                focr_recognize_json(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut()
+                ),
+                EXIT_USAGE
+            );
+            assert_eq!(
+                focr_pdf_page_count(std::ptr::null(), 0, std::ptr::null_mut()),
+                EXIT_USAGE
+            );
+            // Closing NULL is explicitly a no-op.
+            focr_engine_close(std::ptr::null_mut());
+            focr_string_free(std::ptr::null_mut());
+            focr_bytes_free(std::ptr::null_mut(), 0);
+        }
     }
 
     #[test]
     fn opening_a_missing_artifact_reports_model_not_found() {
         let path = CString::new("/nonexistent/focr-ios/model.focrq").expect("literal");
-        let engine = focr_engine_open(path.as_ptr());
+        // SAFETY: `path` is a live CString for the duration of the call.
+        let engine = unsafe { focr_engine_open(path.as_ptr()) };
         assert!(engine.is_null());
         let message = unsafe { CStr::from_ptr(focr_last_error_message()) }
             .to_str()
@@ -758,12 +834,15 @@ mod tests {
     #[test]
     fn selftest_proves_the_int8_kernels_on_this_host() {
         let mut out: *mut c_char = std::ptr::null_mut();
-        let code = focr_selftest_json(&raw mut out);
+        // SAFETY: `out` is a live, writable slot; the returned string is owned
+        // by this caller and is freed exactly once below.
+        let code = unsafe { focr_selftest_json(&raw mut out) };
         assert!(!out.is_null(), "selftest must always return its report");
         let json = unsafe { CStr::from_ptr(out) }.to_str().expect("utf8");
         let parsed: serde_json::Value = serde_json::from_str(json).expect("valid json");
         assert_eq!(parsed["all_ok"], serde_json::Value::Bool(true));
         assert_eq!(code, 0, "int8 GEMM must match the scalar oracle: {json}");
-        focr_string_free(out);
+        // SAFETY: `out` came from this library and has not been freed.
+        unsafe { focr_string_free(out) };
     }
 }

@@ -139,16 +139,38 @@ struct LabView: View {
             VStack(alignment: .leading, spacing: 14) {
                 LabLabel(text: "01 · The specimen")
 
-                Picker("Model", selection: $model.spec.id.bound(
-                    get: { model.spec.id },
-                    set: { id in if let s = ModelCatalog.spec(id: id) { model.spec = s } }
-                )) {
+                // A `Picker` with `.menu` style centers its own label and
+                // ignores the frame alignment around it, which breaks the left
+                // rail every other element in this panel sits on. A `Menu` lets
+                // the label be laid out explicitly.
+                Menu {
                     ForEach(ModelCatalog.all) { spec in
-                        Text("\(spec.label) · \(spec.totalBytes.humanBytes)").tag(spec.id)
+                        Button {
+                            model.spec = spec
+                        } label: {
+                            if spec.id == model.spec.id {
+                                Label("\(spec.label) · \(spec.totalBytes.humanBytes)",
+                                      systemImage: "checkmark")
+                            } else {
+                                Text("\(spec.label) · \(spec.totalBytes.humanBytes)")
+                            }
+                        }
                     }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("\(model.spec.label) · \(model.spec.totalBytes.humanBytes)")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(Lab.accent)
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.system(size: 11, weight: .bold))
+                            .foregroundStyle(Lab.accent.opacity(0.75))
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
                 }
-                .pickerStyle(.menu)
-                .tint(Lab.accent)
+                .accessibilityLabel("Model: \(model.spec.label)")
 
                 Text(model.spec.blurb)
                     .font(.system(size: 13))
@@ -284,6 +306,9 @@ struct LabView: View {
                 Text("Nothing here is uploaded. The image is read into memory and recognized on this device's own cores.")
                     .font(.system(size: 11))
                     .foregroundStyle(Lab.textFaint)
+                    // Inside a constrained column this truncates to one line
+                    // unless it is told it may grow vertically.
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -653,9 +678,3 @@ struct CameraPicker: UIViewControllerRepresentable {
     }
 }
 
-private extension String {
-    /// Small shim so the model picker can bind through a computed selection.
-    func bound(get: @escaping () -> String, set: @escaping (String) -> Void) -> Binding<String> {
-        Binding(get: get, set: set)
-    }
-}

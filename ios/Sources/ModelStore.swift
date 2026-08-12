@@ -404,7 +404,7 @@ final class ModelStore {
         if canStreamHash {
             digest = streaming.finalize().hexString
         } else {
-            digest = try Self.hashFile(at: destination)
+            digest = try await Self.hashFile(at: destination)
         }
         guard digest == expectedDigest else {
             try? FileManager.default.removeItem(at: destination)
@@ -413,8 +413,11 @@ final class ModelStore {
     }
 
     /// Hash a file 8 MiB at a time, off the main actor.
-    private static func hashFile(at url: URL) throws -> String {
-        try Task.detached(priority: .utility) {
+    ///
+    /// `Task.detached` matters here: `ModelStore` is `@MainActor`, and hashing
+    /// 3 GB on the main actor would freeze the UI for the whole verification.
+    private static func hashFile(at url: URL) async throws -> String {
+        try await Task.detached(priority: .utility) {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             var hasher = SHA256()
@@ -422,7 +425,7 @@ final class ModelStore {
                 hasher.update(data: block)
             }
             return hasher.finalize().hexString
-        }.result.get()
+        }.value
     }
 
     private static func eta(done: Int, total: Int, since: Date) -> String {
