@@ -1,0 +1,9 @@
+pkg=/Users/jemanuel/projects/franken_ocr/site/pkg route=WasmSimd128
+planned 3 segment(s), 2.80 GiB
+load+hydrate 0.4 s  model=unlimited-ocr
+recognize 48.92 s   130 chars
+  stage vision                   32.16 s
+  stage prefill                  10.70 s
+  stage decode                   6.05 s
+  stage preprocess               0.01 s
+  stage postprocess              0.00 s

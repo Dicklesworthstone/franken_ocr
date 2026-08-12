@@ -12,7 +12,11 @@ export const modelstaging_plan: (a: number, b: number, c: number, d: number, e: 
 export const modelstaging_push: (a: number, b: number, c: number, d: number) => void;
 export const modelstaging_segment_count: (a: number) => number;
 export const modelstaging_set_sidecar: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const pdf_info: (a: number, b: number, c: number) => void;
+export const pdf_render_page: (a: number, b: number, c: number, d: number) => void;
+export const set_got_format: (a: number) => void;
 export const set_progress_callback: (a: number) => void;
+export const set_smolvlm2_question: (a: number, b: number) => void;
 export const wasmengine_free_engine: (a: number) => void;
 export const wasmengine_from_staging: (a: number, b: number) => void;
 export const wasmengine_license_notice: (a: number, b: number) => void;

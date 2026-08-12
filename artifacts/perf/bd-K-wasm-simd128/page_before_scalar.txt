@@ -1,0 +1,9 @@
+pkg=/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/1a1fb67b-0a94-4cac-a2d8-53dc6a100500/scratchpad/pkg-before route=Scalar
+planned 3 segment(s), 2.80 GiB
+load+hydrate 0.5 s  model=unlimited-ocr
+recognize 131.78 s   130 chars
+  stage prefill                  68.22 s
+  stage decode                   33.12 s
+  stage vision                   30.43 s
+  stage preprocess               0.01 s
+  stage postprocess              0.00 s

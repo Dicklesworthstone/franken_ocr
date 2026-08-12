@@ -1,0 +1,13 @@
+route_id            = 1
+int8 selftest       = 0 failures / 44 cases
+int4 packed parity  = 0 failing lanes
+s8s8 attn qkv/o  m=1 k=1280 n=1280       scalar     11.4 ms  dispatch      5.8 ms  1.97x  [5.74 -> 11.32 GMAC/s]  checksum =
+s8s8 lm_head     m=1 k=1280 n=16384      scalar     49.2 ms  dispatch     38.4 ms  1.28x  [2.56 -> 3.28 GMAC/s]  checksum =
+s8s8 prefill     m=16 k=1280 n=1280      scalar     16.7 ms  dispatch      7.7 ms  2.16x  [6.27 -> 13.54 GMAC/s]  checksum =
+u8s8 attn        m=1 k=1280 n=1280       scalar     12.2 ms  dispatch      5.7 ms  2.13x  [5.37 -> 11.42 GMAC/s]  checksum =
+s4s8 expert up   m=1 k=1280 n=896 g16    scalar     15.5 ms  dispatch      2.7 ms  5.80x  [1.48 -> 8.58 GMAC/s]  checksum =
+s4s8 expert down m=1 k=896 n=1280 g16    scalar     15.9 ms  dispatch      2.7 ms  5.90x  [1.44 -> 8.51 GMAC/s]  checksum =
+s4s8 dense down  m=1 k=6848 n=256 g16    scalar     12.6 ms  dispatch      2.8 ms  4.48x  [1.39 -> 6.22 GMAC/s]  checksum =
+s4s8 prefill     m=8 k=1280 n=896 g16    scalar     24.2 ms  dispatch      3.7 ms  6.56x  [1.52 -> 9.95 GMAC/s]  checksum =
+s8s8 lm_head REAL m=1 k=1280 n=129280    scalar    323.1 ms  dispatch    278.6 ms  1.16x  [1.54 -> 1.78 GMAC/s]  checksum =
+s4s8 DRAM-scale  m=1 k=1280 n=8192 g16   scalar     48.3 ms  dispatch     13.6 ms  3.56x  [1.30 -> 4.63 GMAC/s]  checksum =

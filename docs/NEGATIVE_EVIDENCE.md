@@ -891,6 +891,84 @@ claims.
   agent: NavyTiger
   evidence dir: artifacts/perf/bd-2mo.30/profile-head-58cf4e1/
 
+2026-08-11 | PROVISIONAL_LOCAL_WIN | wasm32 simd128 int8/int4 kernel island, src/simd/wasm128.rs (+ dispatch IsaTier::WasmSimd128, int4::igemm_s4s8_packed wasm arm)
+  claim_id: CLAIM-wasm-simd128-int8-int4-browser-lane   evidence_id: artifacts/perf/bd-K-wasm-simd128/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    page fixture tests/fixtures/got/sample_text.png
+    unlimited-ocr.wasm-int4.focrq sha256 2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187
+      (release models-unlimited-wasm-v1; parts 95e8bc99… / 1b667334…, pinned in site/model-manifest.js)
+    tokenizer.json sha256 a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4
+  CPU feature string: wasm32+simd128 (dispatched tier asserted per module via int8_route(): "Scalar" before, "WasmSimd128" after)
+  exact command + env:
+    ./site/build.sh   # serial lane: -C target-feature=+simd128
+    node scratchpad/smoke-unlimited.mjs <pkgDir>   # Node v25.4.0/V8, Apple M4, 1 thread, serial (unshared) lane
+    kernel micro-bench: node scratchpad/bench.mjs against a scratch cdylib linking this crate
+      --no-default-features for wasm32-unknown-unknown with +simd128 (interleaved ABBA, 5 pairs, min-of-pairs)
+    before = same tree with src/simd/{dispatch,int4,mod,scalar}.rs from 8f79ef1 and no wasm128 module,
+      identical flags, built into scratchpad/pkg-before; nothing else differs
+  fallback / kill-switch state: no runtime switch — simd128 is a MODULE-LEVEL wasm feature (the engine
+    either accepts the module or refuses it; there is nothing to detect at runtime and no env in a tab).
+    Building without +simd128 compiles the same entrypoints straight onto the scalar oracle.
+    artifact recipe = wasm experts-int4 (g16) + attn/lm_head/embed int8; allocator=system
+  measured before -> after vs reference: no external reference exists for this lane (there is no ONNX/torch
+    inside wasm), so the reference is our own pre-island build in the SAME harness — hence
+    PROVISIONAL_LOCAL_WIN, not WIN. Warm, best of interleaved runs:
+      recognize end-to-end 131.78 s -> 48.92 s   ratio 2.69x
+      prefill              68.22 s -> 10.70 s    ratio 6.38x
+      decode               33.12 s ->  6.05 s    ratio 5.47x
+      vision (f32/bf16; does NOT route through this island — the control) 30.43 s -> 32.16 s  ratio 0.95x
+    kernel level (GMAC/s, scalar -> dispatch): int4 packed expert GEMV 1.52 -> 9.95 (6.6x, m=8),
+      0.93 -> 5.79 (5.7x, m=1 k=1280 n=896); int8 GEMV L2-resident 4.34 -> 9.55 (2.2x);
+      int8 GEMV at the real lm_head shape (k=1280 n=129280, 165 MB/token) 1.54 -> 1.78 (1.16x, memory-bound)
+  bit-exact correctness proof: recognize output BYTE-IDENTICAL across six runs (3 per module),
+    sha256 c521e4f0d43c8d40cf8d100adb4a8d71e5148bbe91785de14030afcd723a9b6a; simd::selftest() on the BUILT
+    artifact = 0 failures / 44 cases (both operand domains, K tails, model GEMV shapes, K=6848 overflow
+    stress); an 11-shape int4 battery (g16 and g32, ragged tails, k=6848, m>1) is f32-bit-identical to
+    igemm_s4s8_packed_scalar; every timed micro-bench shape also compares scalar/dispatch checksums.
+    Native is untouched: cargo test --locked green, and no native code path changed except the shared
+    assert_gemm_shapes extraction in scalar.rs (identical panic messages, same order).
+  disposition: KEEP
+  do-not-retry: "do not re-derive the int8 GEMV lever on wasm expecting more than ~2x — 4 widenings +
+    2 i32x4.dot_i16x8_s + 2 adds per 16 bytes is ~2.0 MACs/op and the big shapes are memory-bound
+    (frankentts NE-003 reproduced here). Do not port this island's shape to native: on aarch64/x86 LLVM
+    autovectorizes the scalar loop and hand SIMD measured ~5x SLOWER (doctrine #3)."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: task-K wasm perf pass
+  evidence dir: artifacts/perf/bd-K-wasm-simd128/
+
+2026-08-11 | NEGATIVE(retained-for-proof) | simd128 int8 GEMV on the full-vocab lm_head (k=1280, n=129280)
+  claim_id: CLAIM-wasm-simd128-lmhead-gemv   evidence_id: artifacts/perf/bd-K-wasm-simd128/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    unlimited-ocr.wasm-int4.focrq sha256 2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187
+      (lm_head is int8 under the wasm recipe: [129280, 1280] = 165 MB touched per decoded token)
+  CPU feature string: wasm32+simd128
+  exact command + env: node scratchpad/bench.mjs (interleaved ABBA, 5 pairs), Node v25.4.0/V8, Apple M4,
+    single thread; shapes k=1280 n in {1280, 16384, 129280}
+  fallback / kill-switch state: none — the same kernel serves every shape; nothing was reverted
+  measured before -> after vs reference: the island's win COLLAPSES with working-set size, because the
+    GEMV is bandwidth-bound, not issue-bound:
+      n=1280   (1.6 MB, L2-resident)  4.34 -> 9.55 GMAC/s  2.20x
+      n=16384  (21 MB)                1.46 -> 2.19 GMAC/s  1.50x
+      n=129280 (165 MB, real lm_head) 1.54 -> 1.78 GMAC/s  1.16x
+    A pure streaming-read probe in the same module measures ~1.26 GB/s beyond ~21 MB (3.3-3.5 GB/s
+    inside L2), i.e. the 165 MB lm_head stream is at the engine's memory wall and no int8 kernel can
+    move it. Register-blocking over output columns was NOT spent: frankentts NE-004 already measured
+    +3% (not the predicted +23%) for exactly this m=1 load-bound GEMV regime.
+  bit-exact correctness proof: same battery as the entry above (0/44 selftest failures; page output
+    byte-identical) — the kernel is CORRECT everywhere, it simply does not pay at this shape.
+  disposition: KEEP (the kernel is retained; the CLAIM that SIMD would speed up lm_head is rejected)
+  do-not-retry: "do not spend another instruction-level lever on the wasm lm_head GEMV — it is at the
+    engine memory wall (~1.2-1.8 GB/s single-thread). The only levers that can move it are TRAFFIC
+    (an int4 lm_head, which changes numerics and belongs to the quant recipe, not the kernel) and
+    THREADS (the shipped pkg-threaded lane already splits it across the rayon worker team). Reopen only
+    with a measured >2 GB/s single-thread wasm read on the target engine."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: task-K wasm perf pass
+  evidence dir: artifacts/perf/bd-K-wasm-simd128/
+
+
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`
 hash) and a paired `artifacts/perf/<bead>/` evidence dir. Shape to follow (a

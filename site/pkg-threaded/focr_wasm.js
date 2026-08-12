@@ -127,8 +127,10 @@ export class ModelStaging {
     }
     /**
      * Attach one tokenizer sidecar by its canonical zoo filename:
-     * `tokenizer.json`, `qwen.tiktoken`, or the four TrOMR tables
-     * `tokenizer_{rhythm,pitch,lift,note}.json`.
+     * `tokenizer.json`, `qwen.tiktoken`, the four TrOMR tables
+     * `tokenizer_{rhythm,pitch,lift,note}.json`, or OneChart's OPT
+     * slow-tokenizer triple `vocab.json` / `merges.txt` /
+     * `added_tokens.json`.
      * @param {string} name
      * @param {Uint8Array} bytes
      */
@@ -381,6 +383,85 @@ export function int8_route() {
 }
 
 /**
+ * Sniff + parse a PDF and report its shape as JSON: `{"pages": N}`.
+ *
+ * The playground calls this once per uploaded PDF to drive its page picker;
+ * the bytes cross the boundary per call (no session object — a scanned PDF is
+ * a few MB, and statelessness keeps the worker protocol trivial).
+ *
+ * # Errors
+ * A non-PDF payload (no `%PDF-` magic) or a parse failure, each named.
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+export function pdf_info(bytes) {
+    let deferred3_0;
+    let deferred3_1;
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.pdf_info(retptr, ptr0, len0);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        var ptr2 = r0;
+        var len2 = r1;
+        if (r3) {
+            ptr2 = 0; len2 = 0;
+            throw takeObject(r2);
+        }
+        deferred3_0 = ptr2;
+        deferred3_1 = len2;
+        return getStringFromWasm0(ptr2, len2);
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+        wasm.__wbindgen_export2(deferred3_0, deferred3_1, 1);
+    }
+}
+
+/**
+ * Rasterize one PDF page (1-based, matching the CLI's `--pages` convention)
+ * to PNG bytes.
+ *
+ * The raster rides the exact native pipeline — largest image XObject, codec
+ * dispatch, page `/Rotate` + content-matrix rotation normalization — so the
+ * PNG this returns is pixel-identical to what `focr ocr file.pdf` would feed
+ * the model for that page. JS previews it in an `<img>` and passes it back
+ * through the existing [`WasmEngine::recognize`] path unchanged.
+ *
+ * # Errors
+ * Parse failures, an out-of-range page, and unsupported codecs — a
+ * `JPXDecode`/`JBIG2Decode` page surfaces the library's precise existing
+ * error text (…"no pure-Rust decoder; rasterize this PDF out of band and
+ * retry"), never a panic.
+ * @param {Uint8Array} bytes
+ * @param {number} page
+ * @returns {Uint8Array}
+ */
+export function pdf_render_page(bytes, page) {
+    try {
+        const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+        const ptr0 = passArray8ToWasm0(bytes, wasm.__wbindgen_export3);
+        const len0 = WASM_VECTOR_LEN;
+        wasm.pdf_render_page(retptr, ptr0, len0, page);
+        var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+        var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+        var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+        var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+        if (r3) {
+            throw takeObject(r2);
+        }
+        var v2 = getArrayU8FromWasm0(r0, r1).slice();
+        wasm.__wbindgen_export2(r0, r1 * 1, 1);
+        return v2;
+    } finally {
+        wasm.__wbindgen_add_to_stack_pointer(16);
+    }
+}
+
+/**
  * Request cooperative cancellation of the in-flight recognition: the decode
  * loop observes the flag at its next checkpoint and returns a `Cancelled`
  * error. Call [`reset_cancel`] before the next run.
@@ -394,6 +475,22 @@ export function request_cancel() {
  */
 export function reset_cancel() {
     wasm.reset_cancel();
+}
+
+/**
+ * Select GOT-OCR2's `OCR with format:` mode for the NEXT recognition — the
+ * browser analog of the CLI's `--format` / `--task formula|tables|chart|…`
+ * (which imply it) and of `FOCR_GOT_FORMAT`.
+ *
+ * This is not a convenience: GOT's whole reason to exist in the zoo is the
+ * structured output plain mode cannot produce (LaTeX formulas, HTML tables,
+ * molecular SMILES, geometry, `**kern` music). wasm has no environment, so
+ * without this export the browser could only ever reach the plain `OCR: `
+ * mode. Default `false` ⇒ byte-identical to plain-mode behavior.
+ * @param {boolean} on
+ */
+export function set_got_format(on) {
+    wasm.set_got_format(on);
 }
 
 /**
@@ -438,6 +535,18 @@ export function set_no_repeat_ngram(n) {
  */
 export function set_progress_callback(f) {
     wasm.set_progress_callback(isLikeNone(f) ? 0 : addHeapObject(f));
+}
+
+/**
+ * Set (or clear, with an empty string) the SmolVLM2 describe/VQA question —
+ * the browser analog of `--question` / `FOCR_SMOLVLM2_QUESTION`. Cleared (the
+ * default) ⇒ the model-card caption prompt, i.e. plain image description.
+ * @param {string} question
+ */
+export function set_smolvlm2_question(question) {
+    const ptr0 = passStringToWasm0(question, wasm.__wbindgen_export3, wasm.__wbindgen_export4);
+    const len0 = WASM_VECTOR_LEN;
+    wasm.set_smolvlm2_question(ptr0, len0);
 }
 
 /**
@@ -543,6 +652,9 @@ function __wbg_get_imports(memory) {
         __wbg_error_5d345173be594081: function(arg0, arg1) {
             console.error(getStringFromWasm0(arg0, arg1));
         },
+        __wbg_getRandomValues_127d43fea0fcc894: function() { return handleError(function (arg0) {
+            globalThis.crypto.getRandomValues(getObject(arg0));
+        }, arguments); },
         __wbg_instanceof_Window_05ba1ee4f6781663: function(arg0) {
             let result;
             try {
@@ -553,6 +665,14 @@ function __wbg_get_imports(memory) {
             const ret = result;
             return ret;
         },
+        __wbg_length_1f0964f4a5e2c6d8: function(arg0) {
+            const ret = getObject(arg0).length;
+            return ret;
+        },
+        __wbg_new_with_length_e6785c33c8e4cce8: function(arg0) {
+            const ret = new Uint8Array(arg0 >>> 0);
+            return addHeapObject(ret);
+        },
         __wbg_now_e7c6795a7f81e10f: function(arg0) {
             const ret = getObject(arg0).now();
             return ret;
@@ -560,6 +680,9 @@ function __wbg_get_imports(memory) {
         __wbg_performance_3fcf6e32a7e1ed0a: function(arg0) {
             const ret = getObject(arg0).performance;
             return addHeapObject(ret);
+        },
+        __wbg_prototypesetcall_4770620bbe4688a0: function(arg0, arg1, arg2) {
+            Uint8Array.prototype.set.call(getArrayU8FromWasm0(arg0, arg1), getObject(arg2));
         },
         __wbg_startWorkers_622cedd0d351664e: function(arg0, arg1, arg2) {
             const ret = startWorkers(takeObject(arg0), takeObject(arg1), wbg_rayon_PoolBuilder.__wrap(arg2));
@@ -585,6 +708,10 @@ function __wbg_get_imports(memory) {
             const ret = typeof window === 'undefined' ? null : window;
             return isLikeNone(ret) ? 0 : addHeapObject(ret);
         },
+        __wbg_subarray_3ed232c8a6baee09: function(arg0, arg1, arg2) {
+            const ret = getObject(arg0).subarray(arg1 >>> 0, arg2 >>> 0);
+            return addHeapObject(ret);
+        },
         __wbg_timeOrigin_f3d5cb4f4a06c2b7: function(arg0) {
             const ret = getObject(arg0).timeOrigin;
             return ret;
@@ -606,7 +733,7 @@ function __wbg_get_imports(memory) {
         __wbindgen_object_drop_ref: function(arg0) {
             takeObject(arg0);
         },
-        memory: memory || new WebAssembly.Memory({initial:28,maximum:65536,shared:true}),
+        memory: memory || new WebAssembly.Memory({initial:30,maximum:65536,shared:true}),
     };
     return {
         __proto__: null,
@@ -643,6 +770,11 @@ function dropObject(idx) {
     if (idx < 1028) return;
     heap[idx] = heap_next;
     heap_next = idx;
+}
+
+function getArrayU8FromWasm0(ptr, len) {
+    ptr = ptr >>> 0;
+    return getUint8ArrayMemory0().subarray(ptr / 1, ptr / 1 + len);
 }
 
 let cachedDataViewMemory0 = null;
