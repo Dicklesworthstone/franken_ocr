@@ -515,7 +515,21 @@ struct LabView: View {
     }
 
     /// One row per page: what happened, and why if it did not.
+    ///
+    /// Scrolls on its own for a long book. A plain stack under a `maxHeight`
+    /// would CLIP the overflow rather than scroll it, leaving the tail of a
+    /// 300-page ledger unreachable.
     private var pageLedger: some View {
+        ScrollView(.vertical) {
+            pageLedgerRows
+        }
+        .frame(maxHeight: model.pageOutcomes.count > 6 ? 220 : .infinity)
+        .fixedSize(horizontal: false, vertical: model.pageOutcomes.count <= 6)
+        .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
+        .overlay(RoundedRectangle(cornerRadius: Lab.radius).strokeBorder(Lab.line, lineWidth: 1))
+    }
+
+    private var pageLedgerRows: some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(model.pageOutcomes) { outcome in
                 HStack(alignment: .top, spacing: 10) {
@@ -537,11 +551,6 @@ struct LabView: View {
         .padding(.vertical, 4)
         .padding(.horizontal, 10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
-        .overlay(RoundedRectangle(cornerRadius: Lab.radius).strokeBorder(Lab.line, lineWidth: 1))
-        // A long book should not push the transcription off the screen.
-        .frame(maxHeight: 220)
-        .fixedSize(horizontal: false, vertical: model.pageOutcomes.count <= 6)
     }
 
     @ViewBuilder
