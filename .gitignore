@@ -155,3 +155,21 @@ crates/*/target/
 # === multi-repo ephemeral hygiene 2026-08-06 ===
 # br/doctor per-run artifacts
 .doctor/
+
+# === multi-repo ephemeral patterns ===
+# Cloudflare Pages / Wrangler local cache (site deploys do not need this)
+.wrangler/
+# br frankensqlite VFS namespace sidecars — per-machine, like -wal/-shm
+.beads/beads.db-fsqlite-ns-*
+.ee/ee.db-fsqlite-ns-*
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+.beads/.write.lock.stale-*
+.beads/last-touched
+# Eidetic Engine / NTM local runtime
+.ee/
+.ntm/
+# Local iOS Simulator / device QA captures (dotfiles next to the app sources)
+ios/.ipad-shot.png
+ios/.launch-shot.png
+ios/.*-shot.png
