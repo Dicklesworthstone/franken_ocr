@@ -841,9 +841,338 @@ fn inherited<'a>(doc: &'a Document, mut id: ObjectId, key: &[u8]) -> Option<&'a 
     None
 }
 
+// ── The document walk ──────────────────────────────────────────────────────
+//
+// ONE implementation of "OCR every selected page of this document", shared by
+// every front end. It lived in `cli.rs` first, which meant the CLI was the only
+// caller that got it right: the iOS app and the browser playground each grew
+// their own page loop, and each got the error classification and the page-spec
+// grammar subtly wrong. Anything that walks a PDF goes through here.
+//
+// The walk is parameterized by the recognizer rather than by an engine type, so
+// the same code serves the CLI (`OcrEngine`), the `focr-ios` boundary
+// (`OcrModel`), and any embedder — none of which share a type.
+
+/// Resolve a `--pages` spec into 0-based page indices, in source order with
+/// duplicates removed. `None` selects the whole document.
+///
+/// Out-of-range and malformed pages are **usage errors naming the real page
+/// count**, not silently dropped: asking for page 400 of a 200-page book is a
+/// mistake worth reporting, and a frontend that quietly ignores it leaves the
+/// user believing pages were read that never were.
+///
+/// # Errors
+/// [`FocrError::Usage`] for an unparseable element, page 0 (pages are 1-based),
+/// a page past the end, a reversed range, or an empty element.
+pub fn select_pages(spec: Option<&str>, page_count: usize) -> FocrResult<Vec<usize>> {
+    let Some(spec) = spec else {
+        return Ok((0..page_count).collect());
+    };
+    let usage = |what: &str| {
+        FocrError::Usage(format!(
+            "--pages {spec:?}: {what} (expected 1-based pages/ranges like \"1,5-9\"; \
+             this document has {page_count} page(s))"
+        ))
+    };
+    let parse_one = |tok: &str| -> FocrResult<usize> {
+        let n: usize = tok
+            .trim()
+            .parse()
+            .map_err(|_| usage(&format!("unparseable page {tok:?}")))?;
+        if n == 0 {
+            return Err(usage("page 0 (pages are 1-based)"));
+        }
+        if n > page_count {
+            return Err(usage(&format!("page {n} is out of range")));
+        }
+        Ok(n - 1)
+    };
+    let mut selected = Vec::new();
+    let mut seen = vec![false; page_count];
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(usage("empty element"));
+        }
+        let range = match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (parse_one(a)?, parse_one(b)?);
+                if a > b {
+                    return Err(usage(&format!("reversed range {part:?}")));
+                }
+                a..=b
+            }
+            None => {
+                let n = parse_one(part)?;
+                n..=n
+            }
+        };
+        for idx in range {
+            if !seen[idx] {
+                seen[idx] = true;
+                selected.push(idx);
+            }
+        }
+    }
+    selected.sort_unstable();
+    Ok(selected)
+}
+
+/// Whether an error ends the whole document walk or just this page.
+///
+/// The distinction is the load-bearing part of a document run, and it is easy to
+/// get wrong in the permissive direction. A page whose codec has no pure-Rust
+/// decoder is *this page's* problem — one JPEG-2000 page in a 300-page scan must
+/// not throw away the other 299. But a missing model, a cancelled run, or a
+/// format mismatch is the *document's* problem: skipping 300 pages one at a time
+/// and reporting "300 skipped" would be a slow, confusing way to say "you never
+/// had a model loaded".
+#[must_use]
+pub fn is_fatal_to_document(err: &FocrError) -> bool {
+    matches!(
+        err,
+        FocrError::ModelNotFound(_)
+            | FocrError::Cancelled
+            | FocrError::FormatMismatch(_)
+            | FocrError::Timeout(_)
+    )
+}
+
+/// One page that was read.
+#[derive(Debug, Clone)]
+pub struct DocumentPage {
+    /// 1-based source page number.
+    pub page: usize,
+    /// The page's recognized text.
+    pub markdown: String,
+    /// Grounded spans, when the recognizer produced them.
+    pub layout: Vec<crate::native_engine::LayoutSpan>,
+    /// Wall time for this page alone.
+    pub duration: std::time::Duration,
+}
+
+/// One page that was refused, and why.
+#[derive(Debug, Clone)]
+pub struct SkippedPage {
+    /// 1-based source page number.
+    pub page: usize,
+    /// The engine's own message — "JPXDecode: no pure-Rust decoder", not a
+    /// paraphrase.
+    pub reason: String,
+}
+
+/// The result of walking a document.
+#[derive(Debug, Clone, Default)]
+pub struct DocumentOutcome {
+    /// Pages that read, in source order.
+    pub pages: Vec<DocumentPage>,
+    /// Pages that were skipped, in source order.
+    pub skipped: Vec<SkippedPage>,
+    /// Pages in the source document.
+    pub total_pages: usize,
+}
+
+impl DocumentOutcome {
+    /// The whole document as one markdown string, pages joined by a blank line
+    /// — the same shape `focr ocr book.pdf` writes.
+    #[must_use]
+    pub fn markdown(&self) -> String {
+        self.pages
+            .iter()
+            .map(|p| p.markdown.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// Total wall time across the pages that read.
+    #[must_use]
+    pub fn duration(&self) -> std::time::Duration {
+        self.pages.iter().map(|p| p.duration).sum()
+    }
+}
+
+/// Progress across a document walk, reported before and after each page so a
+/// caller can drive a ledger and a total-progress bar without tracking state.
+#[derive(Debug, Clone, Copy)]
+pub enum DocumentEvent<'a> {
+    /// About to render and read this page. `index` is 0-based within the
+    /// selection; `selected` is how many pages the walk will attempt.
+    PageStarted {
+        page: usize,
+        index: usize,
+        selected: usize,
+    },
+    /// This page read.
+    PageDone(&'a DocumentPage),
+    /// This page was refused; the walk continues.
+    PageSkipped(&'a SkippedPage),
+}
+
+/// Walk `selected` pages of `pages`, rendering each and handing it to
+/// `recognize`.
+///
+/// `recognize` receives the 1-based page number and the rasterized image, and
+/// returns that page's text plus layout. Errors are classified by
+/// [`is_fatal_to_document`]: a fatal one aborts and propagates; anything else is
+/// recorded as a skip and the walk continues.
+///
+/// The walk is **sequential by construction**, and that is a correctness
+/// property, not a simplification: the engine admits one forward at a time (each
+/// page already fans out across every core internally), so concurrent pages
+/// would not be faster and would multiply peak memory by the number in flight.
+///
+/// # Errors
+/// A fatal per-page error, or [`FocrError::InputDecode`] when the selection
+/// produced no readable page at all — carrying the first page's reason, so
+/// "nothing worked" still says why.
+pub fn walk_document<R>(
+    pages: &PdfPages,
+    selected: &[usize],
+    mut recognize: R,
+    observer: &mut dyn FnMut(DocumentEvent<'_>),
+) -> FocrResult<DocumentOutcome>
+where
+    R: FnMut(usize, DynamicImage) -> FocrResult<(String, Vec<crate::native_engine::LayoutSpan>)>,
+{
+    let mut outcome = DocumentOutcome {
+        total_pages: pages.len(),
+        ..Default::default()
+    };
+    // Kept as text, not as the error: the reason a page was refused is what a
+    // caller needs, and the first one is the most useful when nothing worked.
+    let mut first_reason: Option<String> = None;
+
+    for (index, &idx) in selected.iter().enumerate() {
+        let page = idx + 1;
+        observer(DocumentEvent::PageStarted {
+            page,
+            index,
+            selected: selected.len(),
+        });
+
+        let started = std::time::Instant::now();
+        let attempt = pages
+            .render(idx)
+            .and_then(|image| recognize(page, image))
+            .map(|(markdown, layout)| DocumentPage {
+                page,
+                markdown,
+                layout,
+                duration: started.elapsed(),
+            });
+
+        match attempt {
+            Ok(done) => {
+                outcome.pages.push(done);
+                observer(DocumentEvent::PageDone(
+                    outcome.pages.last().expect("just pushed"),
+                ));
+            }
+            Err(err) if is_fatal_to_document(&err) => return Err(err),
+            Err(err) => {
+                let reason = err.to_string();
+                if first_reason.is_none() {
+                    first_reason = Some(reason.clone());
+                }
+                outcome.skipped.push(SkippedPage { page, reason });
+                observer(DocumentEvent::PageSkipped(
+                    outcome.skipped.last().expect("just pushed"),
+                ));
+            }
+        }
+    }
+
+    if outcome.pages.is_empty() {
+        return Err(FocrError::InputDecode(first_reason.unwrap_or_else(|| {
+            "the page selection produced no decodable pages".to_string()
+        })));
+    }
+    Ok(outcome)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── page selection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn no_spec_selects_every_page() {
+        assert_eq!(select_pages(None, 4).expect("ok"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn spec_is_1_based_sorted_and_deduped() {
+        assert_eq!(select_pages(Some("3,1"), 5).expect("ok"), vec![0, 2]);
+        assert_eq!(select_pages(Some("2-4"), 5).expect("ok"), vec![1, 2, 3]);
+        // Overlapping ranges collapse rather than repeating a page.
+        assert_eq!(select_pages(Some("1-3,2-4"), 5).expect("ok"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn out_of_range_is_a_usage_error_naming_the_page_count() {
+        // Silently dropping this is the bug: the user would believe page 9 was
+        // read. The message has to name the real count.
+        let err = select_pages(Some("9"), 3).expect_err("must reject");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+        let text = err.to_string();
+        assert!(text.contains("out of range"), "{text}");
+        assert!(text.contains("3 page(s)"), "{text}");
+    }
+
+    #[test]
+    fn zero_reversed_and_empty_elements_are_rejected() {
+        for bad in ["0", "3-1", "1,,2", "x"] {
+            let err = select_pages(Some(bad), 5).expect_err(bad);
+            assert!(matches!(err, FocrError::Usage(_)), "{bad}: {err:?}");
+        }
+    }
+
+    // ── fatal vs skippable ─────────────────────────────────────────────────
+
+    #[test]
+    fn only_document_level_failures_are_fatal() {
+        // A page the renderer cannot decode is this page's problem.
+        assert!(!is_fatal_to_document(&FocrError::InputDecode(
+            "JPXDecode: no pure-Rust decoder".into()
+        )));
+        assert!(!is_fatal_to_document(&FocrError::NotImplemented("x".into())));
+        // These say the run itself is over; skipping 300 pages one at a time
+        // would be a slow way to report "you never had a model".
+        assert!(is_fatal_to_document(&FocrError::ModelNotFound("x".into())));
+        assert!(is_fatal_to_document(&FocrError::Cancelled));
+        assert!(is_fatal_to_document(&FocrError::FormatMismatch("x".into())));
+        assert!(is_fatal_to_document(&FocrError::Timeout("x".into())));
+    }
+
+    // ── outcome assembly ───────────────────────────────────────────────────
+
+    #[test]
+    fn markdown_joins_pages_with_a_blank_line_and_trims() {
+        let outcome = DocumentOutcome {
+            pages: vec![
+                DocumentPage {
+                    page: 1,
+                    markdown: "one\n\n".into(),
+                    layout: Vec::new(),
+                    duration: std::time::Duration::from_millis(10),
+                },
+                DocumentPage {
+                    page: 2,
+                    markdown: "two".into(),
+                    layout: Vec::new(),
+                    duration: std::time::Duration::from_millis(20),
+                },
+            ],
+            skipped: vec![SkippedPage {
+                page: 3,
+                reason: "JBIG2Decode".into(),
+            }],
+            total_pages: 3,
+        };
+        assert_eq!(outcome.markdown(), "one\n\ntwo");
+        assert_eq!(outcome.duration(), std::time::Duration::from_millis(30));
+    }
 
     fn synth_page(w: u32, h: u32, text_cols: &[(u32, u32)]) -> DynamicImage {
         // White canvas with black "text block" columns [x0, x1).
