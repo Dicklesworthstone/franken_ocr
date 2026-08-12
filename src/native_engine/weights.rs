@@ -447,7 +447,7 @@ enum Backing {
     /// Fully-owned bytes (`std::fs::read` / in-memory blobs).
     Owned(Vec<u8>),
     /// Read-only file mapping.
-    #[cfg(feature = "native")]
+    #[cfg(feature = "mmap")]
     Mapped(memmap2::Mmap),
     /// Contiguous, ordered, non-overlapping pieces covering `[0, len)`.
     Segmented {
@@ -464,7 +464,7 @@ impl Backing {
     fn len(&self) -> u64 {
         match self {
             Backing::Owned(v) => v.len() as u64,
-            #[cfg(feature = "native")]
+            #[cfg(feature = "mmap")]
             Backing::Mapped(m) => m.len() as u64,
             Backing::Segmented { len, .. } => *len,
         }
@@ -481,7 +481,7 @@ impl Backing {
         }
         match self {
             Backing::Owned(_) => Some((0, usize::try_from(start).ok()?)),
-            #[cfg(feature = "native")]
+            #[cfg(feature = "mmap")]
             Backing::Mapped(_) => Some((0, usize::try_from(start).ok()?)),
             Backing::Segmented { segments, .. } => {
                 // Rightmost segment whose start is <= `start`.
@@ -508,7 +508,7 @@ impl Backing {
                 debug_assert_eq!(idx, 0);
                 v
             }
-            #[cfg(feature = "native")]
+            #[cfg(feature = "mmap")]
             Backing::Mapped(m) => {
                 debug_assert_eq!(idx, 0);
                 m
@@ -529,7 +529,7 @@ impl std::fmt::Debug for Backing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Backing::Owned(v) => write!(f, "Backing::Owned({} bytes)", v.len()),
-            #[cfg(feature = "native")]
+            #[cfg(feature = "mmap")]
             Backing::Mapped(m) => write!(f, "Backing::Mapped({} bytes)", m.len()),
             Backing::Segmented { segments, len } => write!(
                 f,
@@ -817,7 +817,7 @@ impl PartialEq for SharedBytes {
 /// The ONE unsafe call in the loader — the read-only mmap island, mirroring
 /// the `simd::arm`/`simd::x86` island pattern (crate policy is
 /// `deny(unsafe_code)` with documented, minimal islands).
-#[cfg(feature = "native")]
+#[cfg(feature = "mmap")]
 #[allow(unsafe_code)]
 mod mmap_island {
     /// Map `file` read-only.
@@ -832,17 +832,47 @@ mod mmap_island {
     pub(super) fn map_readonly(file: &std::fs::File) -> std::io::Result<memmap2::Mmap> {
         // SAFETY: the explicit opt-in asserts an immutable artifact inode; see
         // the function doc for the complete deployment envelope.
-        unsafe { memmap2::Mmap::map(file) }
+        let map = unsafe { memmap2::Mmap::map(file) }?;
+        // Tell the kernel not to read ahead. The access pattern over a MoE
+        // artifact is emphatically NOT sequential: a token routes to 6 of 64
+        // experts per layer, so touching one expert's rows under the default
+        // sequential heuristic drags in neighboring experts this token will
+        // never read — inflating resident pages and stealing IO bandwidth. On a
+        // memory-constrained device that is the difference between a working set
+        // that fits and one that thrashes. Advice is a hint: a failure here
+        // costs paging efficiency, never correctness, so it is not fatal.
+        let _ = map.advise(memmap2::Advice::Random);
+        Ok(map)
     }
 }
 
+/// Whether to enter the mmap island for this load.
+///
+/// `FOCR_MMAP` is the explicit operator switch everywhere, and its absence means
+/// "owned bytes" on every desktop and server target — the safe default, because
+/// a concurrent writer truncating the artifact's inode faults the process, and a
+/// path/rename convention is not an enforceable immutability mechanism
+/// (`docs/NEGATIVE_EVIDENCE.md`, mmap-as-default REJECTED).
+///
+/// **iOS inverts that default, because iOS supplies the mechanism that was
+/// missing.** The artifact lives inside the app's own container, which the
+/// sandbox makes unreachable to every other process on the device; nothing but
+/// this app can open it for writing, and this app never rewrites an installed
+/// artifact in place (the downloader stages to a temp file and renames, which
+/// leaves the mapped inode untouched). That is the enforceable immutability the
+/// rejection asked for, so the trade flips: mapping turns a 3 GB blob from dirty
+/// anonymous heap — which is what jetsam counts and kills for — into clean
+/// file-backed pages the kernel may evict and re-read at will. On a phone that
+/// is not a throughput tweak, it is the difference between running and being
+/// terminated. `FOCR_MMAP=0` still forces the owned path back for diagnostics.
 pub(super) fn mmap_requested() -> bool {
-    std::env::var("FOCR_MMAP").ok().is_some_and(|value| {
-        matches!(
+    match std::env::var("FOCR_MMAP").ok() {
+        Some(value) => matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "1" | "on" | "true" | "yes"
-        )
-    })
+        ),
+        None => cfg!(target_os = "ios"),
+    }
 }
 
 impl Default for Weights {
@@ -906,11 +936,11 @@ impl Weights {
         path: &Path,
         mmap_requested: bool,
     ) -> FocrResult<Self> {
-        #[cfg(feature = "native")]
+        #[cfg(feature = "mmap")]
         if mmap_requested && let Ok(map) = mmap_island::map_readonly(&file) {
             return Self::from_backing(Backing::Mapped(map));
         }
-        #[cfg(not(feature = "native"))]
+        #[cfg(not(feature = "mmap"))]
         let _ = mmap_requested; // no mmap island in the core build
 
         // Header validation advances the descriptor offset. Rewind this SAME

@@ -1146,6 +1146,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "focr-ios"
+version = "0.1.0"
+dependencies = [
+ "franken_ocr",
+ "image",
+ "serde_json",
+]
+
+[[package]]
 name = "focr-wasm"
 version = "0.1.0"
 dependencies = [
@@ -1236,6 +1245,7 @@ dependencies = [
  "getrandom 0.4.3",
  "half",
  "image",
+ "libc",
  "lopdf",
  "memmap2",
  "num_cpus",

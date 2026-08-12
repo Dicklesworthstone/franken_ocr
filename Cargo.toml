@@ -134,6 +134,15 @@ web-time = "1"
 # unchanged; on native targets this target block never applies.
 getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 
+# Apple thread-QoS seam (`lib.rs::apple_qos`). A thread that never asks for a
+# QoS class is fair game for the efficiency cores, and every parallel section
+# here is a fork-join whose barrier waits for its slowest member — so one
+# demoted kernel worker paces the whole dispatch. `pthread_set_qos_class_self_np`
+# is the only entry point for that, and it lives in libc. Apple-only: no other
+# platform has the call, and no other platform needs it.
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Property-based test plumbing (bd-10sb.1): generator-driven invariants for
 # the SIMD==scalar / i32-overflow / preprocess-geometry / parser-robustness
@@ -154,12 +163,20 @@ native = [
     "dep:ctrlc",
     "dep:fsqlite",
     "dep:fsqlite-types",
-    "dep:memmap2",
     "dep:uuid",
+    "mmap",
     "pdf",
     "image/default",
     "image/rayon",
 ]
+# The read-only mmap loader island (`weights.rs::mmap_island`). Split OUT of
+# `native` so an embedded build can map weights WITHOUT the CLI's async runtime,
+# SQL store, and signal handling: on iOS the mapping is the whole memory
+# argument (a 3 GB artifact becomes clean, evictable, file-backed pages instead
+# of dirty anonymous heap), while asupersync/fsqlite/nix are exactly the
+# dependencies an app target does not want. `native` still implies it, so the
+# CLI is unchanged and `FOCR_MMAP` keeps meaning what it always meant.
+mmap = ["dep:memmap2"]
 # PDF rasterization (src/pdf.rs). Separate from `native` so the browser build
 # can opt in independently: lopdf's `getrandom` pull compiles on
 # wasm32-unknown-unknown via the target-gated `wasm_js`-featured getrandom dep
@@ -171,7 +188,7 @@ mimalloc = []
 # The browser/wasm boundary crate (site/pkg's source) shares this workspace so
 # it rides the same lockfile, patches, and profiles as the library it wraps.
 [workspace]
-members = ["focr-wasm"]
+members = ["focr-ios", "focr-wasm"]
 
 # The current asupersync 0.3.8 build input is not yet on crates.io (the index
 # tops out at 0.3.6); it lives in the sibling `../asupersync` checkout.
