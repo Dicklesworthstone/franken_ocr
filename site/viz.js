@@ -650,7 +650,7 @@ function buildBits() {
     paint(
       (2 * bitsPerWeight(16) + bitsPerWeight(32)) / 3,
       "16 / 16 / 32",
-      "The shipped mix: <b>gate_proj</b> and <b>down_proj</b> at group 16, <b>up_proj</b> at group 32 — " +
+      "The shipped mix: <b>gate_proj</b> and <b>down_proj</b> at group 16, <b>up_proj</b> at group 32; " +
         "which lands within 1 MB of the artifact's measured 1.716 GB expert bank.",
     );
   });

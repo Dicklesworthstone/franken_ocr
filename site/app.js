@@ -296,7 +296,14 @@ $("consent-yes").addEventListener("click", async () => {
     $("drop").classList.add("armed");
     refreshRunButton();
   } catch (err) {
-    setStatus(`Model load failed: ${err.message}`, "err");
+    // wasm memory never shrinks, so an allocation failure usually means an
+    // earlier model's pages are still held; a fresh tab starts clean.
+    const oom = /memory allocation failed|cannot reserve/.test(err.message);
+    setStatus(
+      `Model load failed: ${err.message}` +
+        (oom ? " Reload this tab and load the model first; the download is cached." : ""),
+      "err",
+    );
     $("load-model").disabled = false;
   }
 });
@@ -308,12 +315,75 @@ $("clear-cache").addEventListener("click", async () => {
   setStatus("Model cache cleared.", "ok");
 });
 
-// ── image input: picker, drag-drop, paste, sample ──────────────────────────
+// ── image input: picker, drag-drop, paste, sample, PDF ─────────────────────
+// A PDF keeps its bytes here; pages rasterize on demand in the worker through
+// the same pure-Rust renderer the CLI uses, and the resulting PNG feeds the
+// ordinary recognize path unchanged.
+let currentPdf = null; // {bytes: ArrayBuffer, name, pages}
+
+async function acceptPdf(file) {
+  const bytes = await file.arrayBuffer();
+  try {
+    const { info } = await call("pdf-info", { bytes: bytes.slice(0) });
+    currentPdf = { bytes, name: file.name, pages: info.pages };
+    $("pdf-count").textContent = String(info.pages);
+    $("pdf-page").max = String(info.pages);
+    $("pdf-page").value = "1";
+    $("pdf-bar").hidden = false;
+    setStatus(`PDF opened: ${info.pages} page(s). Pick a page and load it.`, "ok");
+    await loadPdfPage(1);
+  } catch (err) {
+    currentPdf = null;
+    $("pdf-bar").hidden = true;
+    setStatus(`PDF failed to open: ${err.message}`, "err");
+  }
+}
+
+async function loadPdfPage(pageNo) {
+  if (!currentPdf) return;
+  setStatus(`Rendering PDF page ${pageNo}…`);
+  try {
+    const { png } = await call("pdf-render-page", {
+      bytes: currentPdf.bytes.slice(0),
+      page: pageNo,
+    });
+    const blob = new Blob([png], { type: "image/png" });
+    if (currentImage?.url) URL.revokeObjectURL(currentImage.url);
+    const stem = currentPdf.name.replace(/\.pdf$/i, "");
+    currentImage = {
+      bytes: await blob.arrayBuffer(),
+      url: URL.createObjectURL(blob),
+      name: `${stem}_p${pageNo}.png`,
+    };
+    showPreview();
+    setStatus(`PDF page ${pageNo} of ${currentPdf.pages} ready.`, "ok");
+    refreshRunButton();
+  } catch (err) {
+    // JPXDecode/JBIG2/vector pages come back with the engine's precise
+    // error string; show it verbatim rather than a vague failure.
+    setStatus(`Page ${pageNo}: ${err.message}`, "err");
+  }
+}
+
+$("pdf-load").addEventListener("click", () => {
+  const n = Math.max(1, Math.min(Number($("pdf-page").value) || 1, currentPdf?.pages ?? 1));
+  $("pdf-page").value = String(n);
+  loadPdfPage(n);
+});
+
 function acceptFile(file) {
-  if (!file || !/^image\/(png|jpe?g)$/.test(file.type)) {
-    setStatus("PNG or JPEG images only.", "warn");
+  if (!file) return;
+  const isPdf = file.type === "application/pdf" || /\.pdf$/i.test(file.name);
+  if (isPdf) {
+    acceptPdf(file);
     return;
   }
+  if (!/^image\/(png|jpe?g)$/.test(file.type)) {
+    setStatus("PNG, JPEG, or PDF only.", "warn");
+    return;
+  }
+  currentPdf = null;
+  $("pdf-bar").hidden = true;
   file.arrayBuffer().then((bytes) => {
     if (currentImage?.url) URL.revokeObjectURL(currentImage.url);
     currentImage = { bytes, url: URL.createObjectURL(file), name: file.name };

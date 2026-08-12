@@ -11,6 +11,9 @@
 <meta property="og:description" content="Baidu Unlimited-OCR, hand-ported to Rust, quantized to int4, compiled to WebAssembly. Your documents never leave the page.">
 <meta property="og:type" content="website">
 <meta property="og:image" content="https://franken-ocr.com/assets/og.jpg">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="franken_ocr: a 3-billion-parameter OCR model, in your browser tab. Pure Rust, int4, WebAssembly; your documents never leave the page.">
 <meta property="og:url" content="https://franken-ocr.com/">
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:image" content="https://franken-ocr.com/assets/og.jpg">
@@ -142,14 +145,23 @@
             <p class="label">02 · The page</p>
             <div id="drop" class="drop" role="button" tabindex="0"
               aria-label="Drop an image here, or activate to choose a file">
-              <span id="drop-hint">Drop an image here (PNG or JPEG), click to pick a file,
+              <span id="drop-hint">Drop an image or scanned PDF here (PNG, JPEG, PDF), click to pick a file,
                 or paste one from the clipboard.</span>
               <div class="preview-stack">
                 <img id="preview" alt="the page you are about to recognize" hidden>
                 <canvas id="overlay" hidden></canvas>
               </div>
             </div>
-            <input type="file" id="file-input" accept="image/png,image/jpeg" hidden>
+            <input type="file" id="file-input" accept="image/png,image/jpeg,application/pdf" hidden>
+            <div id="pdf-bar" class="row" hidden>
+              <span class="kv">PDF: page
+                <input id="pdf-page" type="number" min="1" value="1"
+                  style="width:4.5rem" aria-label="PDF page number">
+                of <span id="pdf-count">?</span></span>
+              <button id="pdf-load" class="btn">Load page</button>
+              <span class="kv">Scanned PDFs only; pages using JPEG&nbsp;2000 or JBIG2
+                report a named error rather than a wrong result.</span>
+            </div>
             <div id="question-wrap" hidden>
               <label class="label" for="question">Ask about the photo</label>
               <input id="question" class="text-input" type="text" maxlength="200"

@@ -968,6 +968,143 @@ claims.
   agent: task-K wasm perf pass
   evidence dir: artifacts/perf/bd-K-wasm-simd128/
 
+2026-08-11 | NEGATIVE(retained-for-proof) | hand-written wasm32 f32x4 GEMM microkernel for the vision path
+    (planned seam: a `cfg(target_arch = "wasm32")` arm inside ft-kernel-cpu's `gemm::sgemm_mm` chokepoint)
+  claim_id: CLAIM-wasm-vision-f32-hand-gemm   evidence_id: artifacts/perf/bd-K2-wasm-vision-f32/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    page fixture tests/fixtures/got/sample_text.png (1024x1024)
+    unlimited-ocr.wasm-int4.focrq sha256 2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187
+    shipped module site/pkg/focr_wasm_bg.wasm sha256 a11eb9099557456da89bc4ecd48082366c4371ec6fb7d837a5ebcc376e7f45ca
+  CPU feature string: wasm32+simd128 (Node v25.4.0/V8, Apple M4, single thread, serial pkg)
+  exact command + env:
+    wasm2wat site/pkg/focr_wasm_bg.wasm  # opcode census + microkernel identification
+    node artifacts/perf/bd-K2-wasm-vision-f32/sgemm_probe.mjs  # ABBA, 5 pairs, min-of-pairs
+    two builds of the same scratch cdylib (wbench-lib.rs / wbench-Cargo.toml, both archived here),
+    identical but for CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+simd128"
+  fallback / kill-switch state: NOT IMPLEMENTED — the lever was never spent. Its PRECONDITION was
+    falsified at the profile-first step (PERF-RITUAL step 2), so no code was written and none reverted.
+  measured before -> after vs reference: THE PREMISE WAS WRONG BY ~3-4x. The premise held that the wasm
+    f32 path runs `matrixmultiply`'s generic scalar fallback at "3-5 GFLOP/s" because the crate "has no
+    wasm simd128 kernels (aarch64/x86 only)". It does have one, and it is already live:
+      - matrixmultiply 0.3.11 `src/sgemm_kernel.rs` defines `KernelWasmSimd` (MR=8, NR=8, ALIGNMENT=16)
+        and `kernel_target_wasm_simd`, gated `cfg(all(target_arch="wasm32", target_feature="simd128"))`,
+        and `detect()` selects it ahead of `KernelFallback` under exactly that cfg.
+      - `site/build.sh` already passes `-C target-feature=+simd128` via
+        CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS, which reaches DEPENDENCIES, not just our crates.
+      - the SHIPPED module contains that microkernel verbatim: an 8-shuffle `splat_lane` sequence
+        (i8x16.shuffle over lanes 12-15 / 8-11 / 4-7 / 0-3) feeding 16 f32x4.mul + 16 f32x4.add per
+        k-step, in two functions (masked + unmasked). Whole-module census: 294 f32x4.mul, 186 f32x4.add,
+        265 i8x16.shuffle, 0 relaxed-simd ops.
+      - same-crate A/B, +simd128 vs no-simd128, interleaved ABBA, reproduced at loadavg 36 / 40 / 50:
+        SAM qkv m=4096 k=768 n=2304   3.20 -> 14.14 GF/s (4.42x) | rerun 4.43 -> 12.37 (2.79x)
+        SAM proj m=4096 k=768 n=768   3.47 -> 13.56 GF/s (3.90x) | rerun 3.26 -> 14.58 (4.48x)
+        SAM mlp m=4096 k=768 n=3072   5.70 -> 23.05 GF/s (4.04x) | rerun 3.09 ->  8.81 (2.85x)
+        win-attn QK m=196 k=64 n=196  4.35 -> 16.68 GF/s (3.83x) | rerun 3.48 -> 10.89 (3.13x)
+        CLIP proj m=577 k=1024 n=1024 5.14 -> 22.42 GF/s (4.37x) | rerun 3.33 ->  9.28 (2.79x)
+        The scalar-fallback arm measures 3.1-5.7 GF/s — i.e. the premise's "3-5 GFLOP/s" figure is the
+        number for a kernel we are NOT running. A least-contended min-of-15 read the live kernel at
+        20.97-31.46 GF/s. Against an estimated no-FMA simd128 issue ceiling of ~34 GF/s (44 v128 ops
+        per k-step for 128 flops, ~2.4 v128 ops/cycle observed), the shipped kernel is ~60-90% of
+        ceiling. A hand f32x4-across-output-columns kernel cannot find 2-4x in a 1.1-1.6x envelope,
+        and would have to beat a packed, A/B-panel-blocked 8x8 register-tile with a naive one.
+    Host was contended (loadavg 33-54) for the whole pass; all GF/s here are attribution-only,
+    `publishable_timing: false`. See REFUSED-CAPTURES.md in the evidence dir. The DIRECTION (2.79-4.48x
+    on 5/5 shapes, 3/3 runs, both arms interleaved in one process) is what this row rests on.
+  bit-exact correctness proof: not applicable to a lever that was never implemented — but the probe
+    establishes a fact the NEXT attempt needs: the simd128 8x8 kernel and the generic 8x4 fallback are
+    BIT-IDENTICAL on all 5 shapes (checksum `=` in every row above). MR/NR blocking does not perturb
+    per-element k-order; only KC does. So `matrixmultiply`'s k-accumulation IS strictly sequential per
+    output element, and a k-sequential hand kernel WOULD have been bit-identical — the plan's numerics
+    risk was real but was never the binding constraint. Throughput was.
+  disposition: REVERT (never implemented — the precondition was falsified before the lever was spent,
+    so the absence of the hand kernel IS the kept state; matrixmultiply's own simd128 kernel stays)
+  do-not-retry: "do not write a hand f32 GEMM microkernel for wasm32 — matrixmultiply >=0.3.9 already
+    ships a packed 8x8 simd128 sgemm register-tile and `-C target-feature=+simd128` already selects it
+    in both shipped lanes. Verify before re-planning with:
+      wasm2wat site/pkg/focr_wasm_bg.wasm | grep -c 'i8x16.shuffle 12 13 14 15 12 13 14 15'
+    (nonzero == the microkernel is live). Reopen ONLY if (a) that grep returns 0 after a toolchain or
+    matrixmultiply bump, or (b) a profile shows the f32 GEMM below ~15 GF/s single-thread on a QUIET
+    host. The remaining f32 headroom is FMA, not lane width, and wasm has no deterministic FMA — see
+    the relaxed-simd row below."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: task-K2 wasm vision perf pass
+  evidence dir: artifacts/perf/bd-K2-wasm-vision-f32/
+
+2026-08-11 | NEGATIVE(retained-for-proof) | `-C target-feature=+relaxed-simd` to arm matrixmultiply's
+    `f32x4_relaxed_madd` FMA path in the wasm sgemm microkernel (site/build.sh flags)
+  claim_id: CLAIM-wasm-relaxed-simd-fma-vision   evidence_id: artifacts/perf/bd-K2-wasm-vision-f32/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    unlimited-ocr.wasm-int4.focrq sha256 2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187
+  CPU feature string: wasm32+simd128+relaxed-simd (Node v25.4.0/V8, Apple M4)
+  exact command + env:
+    third build of the archived scratch cdylib with
+      CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+simd128,+relaxed-simd"
+    node artifacts/perf/bd-K2-wasm-vision-f32/relaxed_probe.mjs
+    wasm-dis wbench-relaxed.wasm | grep -c relaxed_madd   -> 48 (the flag reaches the microkernel)
+  fallback / kill-switch state: NOT SHIPPED. site/build.sh is unchanged; the shipped modules contain
+    zero relaxed-simd opcodes (census above). This row exists so the option is priced, not taken.
+  measured before -> after vs reference: TIMING REFUSED. The capture was physically incoherent under
+    contention (59.61 GF/s on m=4096 k=768 n=2304 alongside 23.17 GF/s on the SMALLER n=768 shape in
+    the same run) and is discarded per PERF-RITUAL §2, not averaged. The flag does reach the kernel
+    (48 relaxed_madd sites) and the mechanism is real: it replaces 16 f32x4.mul + 16 f32x4.add per
+    k-step with 16 fused ops, so the instruction-count argument alone is worth up to ~1.8x on the
+    vision GEMM. That number is UNMEASURED here and must not be quoted.
+  bit-exact correctness proof: FAILS, load-insensitively and by design. `checksum DIFFER` on 5/5 shapes
+    against the shipped +simd128 build. This is not an implementation defect: `f32x4.relaxed_madd` is
+    non-deterministic BY SPEC — an engine may fuse (single rounding) or not (double rounding), so the
+    same module can produce different f32 bits in Chrome, Safari, and Node, and our own goldens would
+    stop being reproducible across browsers. NEGATIVE_EVIDENCE already records that a 1.1e-8 probability
+    drift in the vision path flipped greedy tokens on a real page; FMA-vs-mul-add drift is larger than
+    that and would be UNCONTROLLED per engine.
+  disposition: REVERT — site/build.sh keeps its `-C target-feature=+simd128` and gains nothing. Escalated
+    to the orchestrator as a DISC candidate rather than landed: it trades cross-browser output
+    reproducibility (and iOS Safari < 18.4 / Chrome < 114 / Firefox < 120, which would REFUSE the module
+    outright at instantiation) for an unquantified GEMM speedup.
+  do-not-retry: "do not add +relaxed-simd to site/build.sh as a perf lever. It is not bit-exact, it is
+    not deterministic across engines, and it narrows the supported browser floor on the lane whose whole
+    point is old iPhones. Reopen only as an explicit DISC with (1) a measured ratio from a QUIET host,
+    (2) a per-engine output-parity matrix across Chrome/Safari/Node on a real page, and (3) a decision
+    to gate it behind a THIRD shipped module rather than replacing the +simd128 lane."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: task-K2 wasm vision perf pass
+  evidence dir: artifacts/perf/bd-K2-wasm-vision-f32/
+
+2026-08-11 | NEGATIVE(retained-for-proof) | simd128 hand-vectorization of the bf16->f32 widen in the
+    streamed-vision hydration lane (`src/native_engine/weights.rs::decode_f32`, BF16 arm)
+  claim_id: CLAIM-wasm-bf16-widen-simd   evidence_id: artifacts/perf/bd-K2-wasm-vision-f32/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    unlimited-ocr.wasm-int4.focrq sha256 2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187
+  CPU feature string: wasm32+simd128
+  exact command + env: node artifacts/perf/bd-K2-wasm-vision-f32/glue_probe.mjs (bench_bf16_widen,
+    16M elements per round, same two builds as the sgemm row)
+  fallback / kill-switch state: NOT IMPLEMENTED. No code written.
+  measured before -> after vs reference: the widen is at the ENGINE MEMORY WALL, not issue-bound, so
+    the lane width is not the lever. 16M elements = 32 MB read + 64 MB written = 96 MB of traffic in
+    88.6-129.8 ms => 0.74-1.08 GB/s, which sits on the ~1.26 GB/s beyond-L2 streaming ceiling that
+    bd-K-wasm-simd128 already measured on this engine. The +simd128 : no-simd128 ratio was 0.95x then
+    1.26x on consecutive runs (i.e. indistinguishable from noise in BOTH directions), consistent with
+    both compiles being wall-limited rather than one being scalar. Timing attribution-only.
+  bit-exact correctness proof: checksum `=` between the two builds — bf16->f32 is a pure 16-bit left
+    shift and is bit-exact under any vectorization, so correctness was never the obstacle here either.
+  disposition: REVERT (never implemented — precondition falsified: memory-bound, not compute-bound)
+  do-not-retry: "do not simd128 the bf16->f32 widen. It is the same predicate that killed the wasm
+    lm_head GEMV: at ~0.8-1.1 GB/s it is already at the engine's memory wall, and no instruction-level
+    lever moves a wall. The only live levers on hydration are TRAFFIC and THREADS. The specific traffic
+    lever left on the table: `native_engine::mod.rs::vision_tower` loops views-outer and calls
+    `vision_sam::forward_streamed` / the streamed CLIP forward PER VIEW, re-hydrating the SAME bf16
+    block weights once per view (2 views for a 1024x1024 gundam page: 1 tile + 1 global). Hoisting the
+    block loop outside the view loop would cut hydration traffic ~2x and is BIT-EXACT by construction
+    (views are mathematically independent; only the hydration order changes). Cost: hold all views'
+    activations concurrently (~37 MB) plus one block's f32 weights (~28 MB) — cheap against the ~700 MB
+    headroom. NOT attempted here: the expected whole-page win (~5-8%) is below what a loadavg-40 host
+    can resolve, and PERF-RITUAL forbids landing a lever whose gate cannot be evaluated."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: task-K2 wasm vision perf pass
+  evidence dir: artifacts/perf/bd-K2-wasm-vision-f32/
+
 
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`

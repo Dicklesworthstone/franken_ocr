@@ -1,0 +1,7 @@
+# host loadavg at capture: load averages: 36.53 39.90 42.99
+route nosimd=0 simd=1
+SAM qkv     m=4096 k=768 n=2304    nosimd   4.43 GF/s  simd128  12.37 GF/s  2.79x  checksum =
+SAM proj    m=4096 k=768 n=768     nosimd   3.26 GF/s  simd128  14.58 GF/s  4.48x  checksum =
+SAM mlp up  m=4096 k=768 n=3072    nosimd   3.09 GF/s  simd128   8.81 GF/s  2.85x  checksum =
+win attn QK m=196  k=64  n=196     nosimd   3.48 GF/s  simd128  10.89 GF/s  3.13x  checksum =
+CLIP proj   m=577  k=1024 n=1024   nosimd   3.33 GF/s  simd128   9.28 GF/s  2.79x  checksum =

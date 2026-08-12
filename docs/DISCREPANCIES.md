@@ -293,7 +293,7 @@ since exact-token OCR fails in the tail.
     envelope + SER over its crop corpus, and extend the alpha-variance rule
     if real rendered-PNG (transparent-background) staves appear there.
 
-## DISC-005: the wasm-only int4 browser artifact — quantization tail on degraded newsprint + platform f32 decode drift
+## DISC-008: the wasm-only int4 browser artifact — quantization tail on degraded newsprint + platform f32 decode drift
 - claim_id / evidence_id: CLAIM-WASM-INT4-V2 → scratchpad corpus receipts
     (`corpus/MANIFEST.json`, `cer_v1_vs_v2.tsv`, `corpus/browser/REPORT*.json`,
     session 2026-08-10..11); to be re-homed under `artifacts/parity/bd-b8ta/` at
@@ -329,7 +329,7 @@ since exact-token OCR fails in the tail.
     repetition-guard `no_repeat_ngram=20` (the README-documented
     `FOCR_NO_REPEAT_NGRAM` mitigation) is applied via the model manifest's
     `decodeGuard`; the native CLI can reproduce it with the same knob.
-- Measured impact (v2 artifact, true Levenshtein):
+- Measured impact: (v2 artifact, true Levenshtein)
     * Quantization fidelity, native int4 vs native bf16 decode: CER 0 on 3/7
       pages, ≤0.0006 on 2, 0.0155 on one fixture, **0.1562 on the degraded 1886
       newsprint page** (v1 RTN was 0.1753; calibration closed 10.9% relative;

@@ -187,6 +187,18 @@ async function dispatch(data) {
         pkg.set_got_format(false); // plain mode; the format lane is a UI choice we do not offer yet
       }
 
+      // Free the PREVIOUS model BEFORE staging the next one. The 4 GiB wasm
+      // heap cannot hold two multi-GB models at once, and wasm memory never
+      // shrinks — a model switch that staged first and freed at hydrate time
+      // failed exactly here ("cannot reserve segment 0"). The cost is honest:
+      // if this load fails, the previous model is gone too (its bytes are
+      // still in the cache, so reloading it is a re-verify, not a re-download).
+      if (engine) {
+        engine.free_engine();
+        engine = null;
+        modelId = null;
+      }
+
       stage("download");
       // The weight bytes STREAM straight from fetch (or the cache) into wasm
       // staging — Chrome refuses a single multi-GB ArrayBuffer, so they are
@@ -233,10 +245,6 @@ async function dispatch(data) {
       for (const s of sidecars) staging.set_sidecar(s.name, s.bytes);
 
       stage("hydrate");
-      if (engine) {
-        engine.free_engine();
-        engine = null;
-      }
       engine = pkg.WasmEngine.from_staging(staging);
       modelId = engine.model_id();
       modelKey = data.model;
@@ -293,6 +301,24 @@ async function dispatch(data) {
       // Cooperative: the decode loop observes the flag at its next token.
       pkg?.request_cancel();
       return {};
+    }
+    // ── PDF support ──────────────────────────────────────────────────────
+    // The same pure-Rust rasterizer the CLI uses (page /Rotate + placement
+    // matrix normalization included). Stateless: the PDF bytes cross per
+    // call. Pages with codecs that have no pure-Rust decoder (JPXDecode,
+    // JBIG2) reject with the engine's precise error string — surface it.
+    case "pdf-info": {
+      if (typeof pkg?.pdf_info !== "function") {
+        throw new Error("this build has no PDF support (module predates it)");
+      }
+      return { info: JSON.parse(pkg.pdf_info(new Uint8Array(data.bytes))) };
+    }
+    case "pdf-render-page": {
+      if (typeof pkg?.pdf_render_page !== "function") {
+        throw new Error("this build has no PDF support (module predates it)");
+      }
+      // Structured-clone copies the PNG back (a few MB per page; fine).
+      return { png: pkg.pdf_render_page(new Uint8Array(data.bytes), data.page) };
     }
     default:
       throw new Error(`unknown message type ${data.type}`);

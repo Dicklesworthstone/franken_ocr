@@ -1,0 +1,53 @@
+# KernelWasmSimd 8x8 f32 microkernel, located in the SHIPPED site/pkg/focr_wasm_bg.wasm
+# module sha256: a11eb9099557456da89bc4ecd48082366c4371ec6fb7d837a5ebcc376e7f45ca
+# signature: 8x i8x16.shuffle splat_lane (lanes 12-15 / 8-11 / 4-7 / 0-3) + 16x f32x4.mul/add per k-step
+# whole-module simd opcode census:
+#   f32x4.mul              294
+#   f32x4.add              186
+#   f32x4.splat            146
+#   i8x16.shuffle          265
+#   v128.load              4488
+#   i32x4.dot_i16x8_s      16
+#   relaxed                0
+
+# func 63 k-loop body (first 40 simd ops):
+        v128.load align=1
+        i8x16.shuffle 12 13 14 15 12 13 14 15 12 13 14 15 12 13 14 15
+        v128.load align=1
+        f32x4.mul
+        f32x4.add
+        i8x16.shuffle 8 9 10 11 8 9 10 11 8 9 10 11 8 9 10 11
+        f32x4.mul
+        f32x4.add
+        i8x16.shuffle 4 5 6 7 4 5 6 7 4 5 6 7 4 5 6 7
+        f32x4.mul
+        f32x4.add
+        i8x16.shuffle 0 1 2 3 0 1 2 3 0 1 2 3 0 1 2 3
+        f32x4.mul
+        f32x4.add
+        v128.load align=1
+        i8x16.shuffle 12 13 14 15 12 13 14 15 12 13 14 15 12 13 14 15
+        f32x4.mul
+        f32x4.add
+        i8x16.shuffle 8 9 10 11 8 9 10 11 8 9 10 11 8 9 10 11
+        f32x4.mul
+        f32x4.add
+        i8x16.shuffle 4 5 6 7 4 5 6 7 4 5 6 7 4 5 6 7
+        f32x4.mul
+        f32x4.add
+        i8x16.shuffle 0 1 2 3 0 1 2 3 0 1 2 3 0 1 2 3
+        f32x4.mul
+        f32x4.add
+        v128.load align=1
+        f32x4.mul
+        f32x4.add
+        f32x4.mul
+        f32x4.add
+        f32x4.mul
+        f32x4.add
+        f32x4.mul
+        f32x4.add
+        f32x4.mul
+        f32x4.add
+        f32x4.mul
+        f32x4.add
