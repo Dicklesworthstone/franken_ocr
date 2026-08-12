@@ -28,6 +28,10 @@ name = "focr_ios"
 # staticlib for the xcframework slices; rlib so `cargo test -p focr-ios` can
 # exercise the error-path helpers on the host without an Xcode toolchain.
 crate-type = ["staticlib", "rlib"]
+# There are no doc examples to run — every item here is an `extern "C"` symbol
+# whose caller is Swift, not Rust — and rustdoc cannot resolve the dependency
+# graph for a staticlib target anyway.
+doctest = false
 
 [dependencies]
 # `mmap` is the load-bearing one (see the header comment). `pdf` gives the app

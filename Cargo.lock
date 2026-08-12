@@ -1263,6 +1263,7 @@ dependencies = [
 name = "fsqlite"
 version = "0.3.0"
 dependencies = [
+ "asupersync 0.4.3",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-ext-fts5",
