@@ -696,6 +696,45 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-mmap-load/
 
+2026-08-12 | PROVISIONAL_LOCAL_WIN | mmap as the DEFAULT on iOS only (`weights.rs::mmap_requested` -> `cfg!(target_os = "ios")`), plus `MADV_RANDOM`
+  claim_id: CLAIM-bd-r9po-ios-mmap-residency   evidence_id: artifacts/perf/bd-r9po/ios-mmap-residency/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+    wasm-int4 recipe `.focrq` sha256 2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187 (3,003,988,117 bytes,
+      recipe `unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1`; parts + whole verified against the pins in site/model-manifest.js)
+    tokenizer.json sha256 a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4
+    sample-doc.png (site/assets/sample-doc.png)
+  CPU feature string: Apple M4 Pro arm64 (10P+4E, 64 GB), aarch64+neon+dotprod, dense route Autovec; warm filesystem cache
+  exact command + env:
+    two runs, `FOCR_MMAP=<0|1> FOCR_MODEL_PATH=<wasm-int4 .focrq> /usr/bin/time -l <release focr> ocr site/assets/sample-doc.png`
+  fallback / kill-switch state: `FOCR_MMAP` still outranks the platform default in BOTH directions, so `FOCR_MMAP=0` restores
+    owned bytes on iOS and `FOCR_MMAP=1` still opts in everywhere else. Desktop/server default is UNCHANGED (owned bytes).
+  measured before -> after vs reference:
+    owned bytes  -> max RSS 3,574,841,344 B; peak memory footprint 3,561,901,056 B; 11.83 s wall
+    mmap+RANDOM  -> max RSS 3,391,455,232 B; peak memory footprint   547,081,216 B; 11.93 s wall
+    Peak memory footprint (`phys_footprint`, the dirty-anonymous accounting jetsam terminates on) falls 6.51x, -84.6%.
+    Max RSS barely moves because it still counts the clean file-backed pages currently resident — that is the whole point:
+    those pages are evictable under pressure, and the metric that decides whether an iOS app is killed is the footprint.
+    Wall is a wash here (+0.8%, one sample/mode, warm cache) — this lever is bought for residency, not throughput.
+  bit-exact correctness proof:
+    both runs' Markdown stdout is byte-identical (sha256 2e597eb978c6ab57608d69cf5d4f3c9db29a46865cda05b620f0afeb54b550a0
+    for BOTH owned.stdout.md and mapped.stdout.md in the evidence dir). Mapping changes where bytes live, never what they are.
+  disposition: ACCEPT FOR iOS ONLY. This does not reopen the desktop default rejected on 2026-07-10 above.
+    That entry's do-not-retry demanded "an enforceable immutability mechanism, not a path/rename convention" before any
+    default could change. iOS supplies one that a desktop cannot: the artifact lives inside the app's own container, which
+    the sandbox makes unreachable to every other process on the device, and the downloader stages to a temp file and renames,
+    so the mapped inode is never rewritten in place. The concurrent-same-inode-truncate fault that sank the desktop default
+    has no actor who could cause it here. The lever is also not being taken on throughput evidence, which is what that
+    do-not-retry specifically forbade — it is taken on a 6.5x residency reduction that is the difference between the flagship
+    model running on a phone and being terminated.
+  do-not-retry: "do not generalize this to macOS/Linux/Windows. The argument is the iOS sandbox, not the mapping; on a
+    general-purpose OS any process with write access can still truncate the inode and fault us. Revisit only with a
+    per-platform immutability proof of the same strength."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: Claude Opus 5
+  evidence dir: artifacts/perf/bd-r9po/ios-mmap-residency/
+
 2026-07-10 | NEGATIVE(reverted) | split the 277-token reference prefill into smaller sequential chunks (`FOCR_PREFILL_CHUNK`)
   claim_id: CLAIM-bd-2mo30-prefill-chunk-sweep   evidence_id: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-prefill-chunk/
   model source commit + fixture hash:

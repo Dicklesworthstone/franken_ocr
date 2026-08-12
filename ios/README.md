@@ -47,6 +47,26 @@ anonymous heap that jetsam counts and kills for. Two supporting pieces:
 The `increased-memory-limit` entitlement is there for the page cache, not for the
 heap.
 
+### Measured
+
+One page of `site/assets/sample-doc.png` through the 3.0 GB int4 artifact, Apple
+M4 Pro, warm cache, one sample per mode (`docs/NEGATIVE_EVIDENCE.md`,
+CLAIM-bd-r9po-ios-mmap-residency):
+
+| | owned bytes | mmap + `MADV_RANDOM` |
+|---|---:|---:|
+| peak memory footprint (`phys_footprint`) | 3,561,901,056 | **547,081,216** |
+| max RSS | 3,574,841,344 | 3,391,455,232 |
+| wall | 11.83 s | 11.93 s |
+
+Footprint — the dirty-anonymous accounting jetsam terminates on — falls **6.5×,
+to 0.55 GB**. Max RSS barely moves because it still counts clean file-backed
+pages, and that is the point: those are evictable. Output is byte-identical
+across both modes.
+
+This is an M4 Pro measurement, not a phone measurement. It establishes that the
+residency argument holds; it says nothing about A-series wall time.
+
 ## Engine changes this app depends on
 
 | change | why |
