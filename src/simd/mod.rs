@@ -17,6 +17,12 @@
 //!   `unsafe` intrinsic island lives there.
 //! * [`x86`] — x86-64 kernels: AVX-512-VNNI, AVX-VNNI, AVX2. Compiled only on
 //!   `target_arch = "x86_64"`.
+//! * [`wasm128`] — the browser lane: `i32x4.dot_i16x8_s` int8 kernels and the
+//!   in-register nibble-unpack int4 kernel. Compiled only on
+//!   `target_arch = "wasm32"`, and accelerated only under
+//!   `-C target-feature=+simd128` (a module-level wasm feature — the engine
+//!   either has it or refuses the module, so there is nothing to detect at
+//!   runtime).
 //! * [`int4`] — int4 (2 nibbles/byte, per-group scales) unpack-to-int8 path; the
 //!   decode-bandwidth wedge (doctrine #4). Portable (the unpack is scalar; it
 //!   feeds the same dispatched int8 GEMM), so it is built on every target.
@@ -59,6 +65,8 @@ pub mod scalar;
 // to the always-present `scalar` floor.
 #[cfg(target_arch = "aarch64")]
 pub mod arm;
+#[cfg(target_arch = "wasm32")]
+pub mod wasm128;
 #[cfg(target_arch = "x86_64")]
 pub mod x86;
 

@@ -66,6 +66,35 @@ pub(crate) fn checked_len(context: &str, lhs: usize, rhs: usize, expr: &str) -> 
     len.unwrap_or(0)
 }
 
+/// The shared GEMM shape/length contract check (identical messages in every
+/// backend, so a violation reads the same whichever tier is dispatched).
+///
+/// Split out of the oracles so the accelerated islands (`arm`/`x86`/`wasm128`)
+/// assert the *same* contract without re-deriving the format strings.
+///
+/// # Panics
+/// On `m*k` / `n*k` / `m*n` overflow, or any buffer length mismatch.
+#[track_caller]
+pub(crate) fn assert_gemm_shapes(
+    context: &str,
+    a_len: usize,
+    b_len: usize,
+    out_len: usize,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
+    let want_a = checked_len(context, m, k, "m*k");
+    let want_b = checked_len(context, n, k, "n*k");
+    let want_out = checked_len(context, m, n, "m*n");
+    assert_eq!(a_len, want_a, "{context}: a.len {a_len} != m*k {want_a}");
+    assert_eq!(b_len, want_b, "{context}: b.len {b_len} != n*k {want_b}");
+    assert_eq!(
+        out_len, want_out,
+        "{context}: out.len {out_len} != m*n {want_out}"
+    );
+}
+
 /// `C[M,N] += A[M,K] (i8, row-major) · B[N,K] (i8, output-channel-major)` into
 /// the i32 buffer `out` (the S8S8 reference oracle).
 ///
@@ -76,30 +105,7 @@ pub(crate) fn checked_len(context: &str, lhs: usize, rhs: usize, expr: &str) -> 
 /// Panics on a length-contract violation: `a.len() != m*k`, `b.len() != n*k`,
 /// or `out.len() != m*n` (a programming error, caught early like `Mat`).
 pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    let a_len = checked_len("igemm_s8s8", m, k, "m*k");
-    let b_len = checked_len("igemm_s8s8", n, k, "n*k");
-    let out_len = checked_len("igemm_s8s8", m, n, "m*n");
-    assert_eq!(
-        a.len(),
-        a_len,
-        "igemm_s8s8: a.len {} != m*k {}",
-        a.len(),
-        a_len
-    );
-    assert_eq!(
-        b.len(),
-        b_len,
-        "igemm_s8s8: b.len {} != n*k {}",
-        b.len(),
-        b_len
-    );
-    assert_eq!(
-        out.len(),
-        out_len,
-        "igemm_s8s8: out.len {} != m*n {}",
-        out.len(),
-        out_len
-    );
+    assert_gemm_shapes("igemm_s8s8", a.len(), b.len(), out.len(), m, k, n);
     for i in 0..m {
         let a_row = &a[i * k..i * k + k];
         let out_row = &mut out[i * n..i * n + n];
@@ -127,30 +133,7 @@ pub fn igemm_s8s8(a: &[i8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i
 /// # Panics
 /// As [`igemm_s8s8`] (length-contract violations).
 pub fn igemm_u8s8(a: &[u8], b: &[i8], m: usize, k: usize, n: usize, out: &mut [i32]) {
-    let a_len = checked_len("igemm_u8s8", m, k, "m*k");
-    let b_len = checked_len("igemm_u8s8", n, k, "n*k");
-    let out_len = checked_len("igemm_u8s8", m, n, "m*n");
-    assert_eq!(
-        a.len(),
-        a_len,
-        "igemm_u8s8: a.len {} != m*k {}",
-        a.len(),
-        a_len
-    );
-    assert_eq!(
-        b.len(),
-        b_len,
-        "igemm_u8s8: b.len {} != n*k {}",
-        b.len(),
-        b_len
-    );
-    assert_eq!(
-        out.len(),
-        out_len,
-        "igemm_u8s8: out.len {} != m*n {}",
-        out.len(),
-        out_len
-    );
+    assert_gemm_shapes("igemm_u8s8", a.len(), b.len(), out.len(), m, k, n);
     for i in 0..m {
         let a_row = &a[i * k..i * k + k];
         let out_row = &mut out[i * n..i * n + n];

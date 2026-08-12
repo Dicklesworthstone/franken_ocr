@@ -60,6 +60,11 @@ pub enum IsaTier {
     /// aarch64 FEAT_MATMUL_INT8 SMMLA / i8mm (8 int8 MACs/i32 lane, 2x2 tile) —
     /// the register-blocked wedge (doctrine #4).
     Smmla = 5,
+    /// wasm32 SIMD128 (`i32x4.dot_i16x8_s`) — the browser lane. Reachable only
+    /// on `target_arch = "wasm32"` compiled with `+simd128`, where it is the
+    /// ONLY non-scalar tier, so its rank relative to the native variants never
+    /// decides anything (the available set is disjoint per arch).
+    WasmSimd128 = 6,
 }
 
 impl IsaTier {
@@ -77,6 +82,7 @@ impl IsaTier {
             IsaTier::Avx512Vnni => "x86_64+avx512vnni",
             IsaTier::Sdot => "aarch64+neon+dotprod",
             IsaTier::Smmla => "aarch64+neon+i8mm",
+            IsaTier::WasmSimd128 => "wasm32+simd128",
         }
     }
 
@@ -91,6 +97,7 @@ impl IsaTier {
             IsaTier::Avx512Vnni => "avx512vnni",
             IsaTier::Sdot => "sdot",
             IsaTier::Smmla => "smmla",
+            IsaTier::WasmSimd128 => "wasmsimd128",
         }
     }
 }
@@ -107,6 +114,7 @@ pub enum EffectiveI8Route {
     Avx512Vnni,
     Sdot,
     Smmla,
+    WasmSimd128,
 }
 
 impl EffectiveI8Route {
@@ -120,6 +128,7 @@ impl EffectiveI8Route {
             Self::Avx512Vnni => "avx512vnni",
             Self::Sdot => "sdot",
             Self::Smmla => "smmla",
+            Self::WasmSimd128 => "wasmsimd128",
         }
     }
 
@@ -133,6 +142,7 @@ impl EffectiveI8Route {
             Self::Avx512Vnni => IsaTier::Avx512Vnni.feature_string(),
             Self::Sdot => IsaTier::Sdot.feature_string(),
             Self::Smmla => IsaTier::Smmla.feature_string(),
+            Self::WasmSimd128 => IsaTier::WasmSimd128.feature_string(),
         }
     }
 
@@ -145,6 +155,7 @@ impl EffectiveI8Route {
             IsaTier::Avx512Vnni => Self::Avx512Vnni,
             IsaTier::Sdot => Self::Sdot,
             IsaTier::Smmla => Self::Smmla,
+            IsaTier::WasmSimd128 => Self::WasmSimd128,
         }
     }
 
@@ -277,6 +288,17 @@ fn detect() -> Caps {
         }
     }
 
+    // ── wasm32: SIMD128 > scalar ────────────────────────────────────────────
+    //
+    // simd128 is a MODULE-LEVEL wasm feature, not a CPU feature: a module built
+    // with it either instantiates on an engine that has it or is refused
+    // outright, so `cfg!(target_feature = ...)` (compile time) is the whole
+    // detection — the engine's refusal IS the runtime check. Nothing to probe.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        available.push(IsaTier::WasmSimd128);
+    }
+
     // Scalar is always available and always last (the floor).
     available.push(IsaTier::Scalar);
 
@@ -336,7 +358,16 @@ fn igemm_s8s8_with_route(
     {
         super::x86::igemm_s8s8_with_route(a, b, m, k, n, out)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        super::wasm128::igemm_s8s8(a, b, m, k, n, out);
+        EffectiveI8Route::WasmSimd128
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         super::scalar::igemm_s8s8(a, b, m, k, n, out);
         EffectiveI8Route::Scalar
@@ -410,7 +441,16 @@ fn igemm_u8s8_with_route(
     {
         super::x86::igemm_u8s8_with_route(a, b, m, k, n, out)
     }
-    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        super::wasm128::igemm_u8s8(a, b, m, k, n, out);
+        EffectiveI8Route::WasmSimd128
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        target_arch = "x86_64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         super::scalar::igemm_u8s8(a, b, m, k, n, out);
         EffectiveI8Route::Scalar

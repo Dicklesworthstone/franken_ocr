@@ -451,7 +451,19 @@ pub fn igemm_s4s8_packed(
         // (or falls back to `s4s8_packed_kernel_scalar` for `ArmTier::None`).
         super::arm::igemm_s4s8_packed(a, b_packed, scales, group, m, k, n, out);
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    {
+        // Browser lane: `wasm128` extracts both nibbles in-register and MACs
+        // them with `i32x4.dot_i16x8_s`, bit-identical to the scalar reference.
+        // This is the ONE place the native "never hand-roll SIMD" law inverts:
+        // wasm has no int8 dot instruction, so LLVM cannot autovectorize the
+        // `kk & 1` nibble branch and emits byte-at-a-time scalar code.
+        super::wasm128::igemm_s4s8_packed(a, b_packed, scales, group, m, k, n, out);
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )))]
     {
         // x86 / other: no native int4 MAC kernel is implemented — the scalar
         // reference is the path (the parity test skips-with-success on x86: the
