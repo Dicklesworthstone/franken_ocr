@@ -1564,62 +1564,16 @@ where
 /// ranges) against a document's page count into 0-based indices, in source
 /// order, deduplicated (bd-av64.11). `None` ⇒ every page.
 ///
+/// The grammar itself lives in [`pdf::select_pages`] so the CLI, the library,
+/// the iOS app, and the browser playground cannot drift apart on what
+/// `--pages 3,5-9` means — they did, before it was shared.
+///
 /// # Errors
 /// [`FocrError::Usage`] on an empty/garbled spec, a zero page (pages are
 /// 1-based), a reversed range, or a page past `page_count` (the error names
 /// the document's page count).
 fn parse_page_spec(spec: Option<&str>, page_count: usize) -> FocrResult<Vec<usize>> {
-    let Some(spec) = spec else {
-        return Ok((0..page_count).collect());
-    };
-    let usage = |what: &str| {
-        FocrError::Usage(format!(
-            "--pages {spec:?}: {what} (expected 1-based pages/ranges like \"1,5-9\"; \
-             this document has {page_count} page(s))"
-        ))
-    };
-    let parse_one = |tok: &str| -> FocrResult<usize> {
-        let n: usize = tok
-            .trim()
-            .parse()
-            .map_err(|_| usage(&format!("unparseable page {tok:?}")))?;
-        if n == 0 {
-            return Err(usage("page 0 (pages are 1-based)"));
-        }
-        if n > page_count {
-            return Err(usage(&format!("page {n} is out of range")));
-        }
-        Ok(n - 1)
-    };
-    let mut selected = Vec::new();
-    let mut seen = vec![false; page_count];
-    for part in spec.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return Err(usage("empty element"));
-        }
-        let range = match part.split_once('-') {
-            Some((a, b)) => {
-                let (a, b) = (parse_one(a)?, parse_one(b)?);
-                if a > b {
-                    return Err(usage(&format!("reversed range {part:?}")));
-                }
-                a..=b
-            }
-            None => {
-                let n = parse_one(part)?;
-                n..=n
-            }
-        };
-        for idx in range {
-            if !seen[idx] {
-                seen[idx] = true;
-                selected.push(idx);
-            }
-        }
-    }
-    selected.sort_unstable();
-    Ok(selected)
+    pdf::select_pages(spec, page_count)
 }
 
 /// The logical pages of one rasterized PDF page: the page itself, or its
