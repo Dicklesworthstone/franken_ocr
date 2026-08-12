@@ -218,6 +218,10 @@ function paintRecognizeProgress(detail) {
 
 function hideRecognizeProgress() {
   recognizeProgress = null;
+  // Clear the document context too. A run that ended early (a fatal page error)
+  // would otherwise leave `documentIndex` pointing into the old ledger and
+  // prefix the NEXT single-image run with "Page 7 of 40".
+  documentIndex = null;
   $("progress-wrap").hidden = true;
   $("progress-bar").style.width = "0%";
   $("progress-text").textContent = "";
@@ -535,7 +539,15 @@ function acceptFile(file) {
     setStatus("PNG, JPEG, or PDF only.", "warn");
     return;
   }
-  currentPdf = null;
+  if (currentPdf) {
+    // Release the document the worker is holding. Without this, switching from
+    // a 50 MB scan to a small PNG leaves the whole PDF resident in the worker
+    // for the rest of the session.
+    currentPdf = null;
+    call("pdf-close").catch(() => {});
+  }
+  pageLedger = [];
+  paintLedger();
   $("pdf-bar").hidden = true;
   file.arrayBuffer().then((bytes) => {
     if (currentImage?.url) URL.revokeObjectURL(currentImage.url);

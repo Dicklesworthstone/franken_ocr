@@ -317,8 +317,12 @@ async function dispatch(data) {
       if (typeof pkg?.pdf_info !== "function") {
         throw new Error("this build has no PDF support (module predates it)");
       }
-      pdfBytes = new Uint8Array(data.bytes);
-      return { info: JSON.parse(pkg.pdf_info(pdfBytes)) };
+      // Parse FIRST, commit second: a document that fails to open must not be
+      // left resident, and must not replace a document that opened fine.
+      const candidate = new Uint8Array(data.bytes);
+      const info = JSON.parse(pkg.pdf_info(candidate));
+      pdfBytes = candidate;
+      return { info };
     }
     case "pdf-close": {
       pdfBytes = null;
