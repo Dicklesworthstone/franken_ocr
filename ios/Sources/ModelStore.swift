@@ -33,6 +33,10 @@ struct ModelSpec: Sendable, Identifiable {
     let shortName: String
     let license: String
     let releaseTag: String
+    /// `owner/repo[/subdir]` on HuggingFace, or nil while no public mirror
+    /// exists for this model. Mirrors `models/manifest-v2.json`, which is the
+    /// source of truth for what is actually published where.
+    let huggingFaceRepo: String?
     let weights: ModelAsset
     let sidecars: [ModelAsset]
     /// Sliding no-repeat n-gram guard applied at load. 0 leaves the engine
@@ -50,8 +54,25 @@ struct ModelSpec: Sendable, Identifiable {
 
     var totalBytes: Int { weights.bytes + sidecars.reduce(0) { $0 + $1.bytes } }
 
-    var baseURL: URL {
-        URL(string: "https://github.com/Dicklesworthstone/franken_ocr/releases/download/\(releaseTag)/")!
+    /// Where to fetch this model's files, best host first.
+    ///
+    /// HuggingFace leads: it serves ranged requests, sits behind a CDN, has no
+    /// per-file size cap, and does not 503 the way GitHub release assets do
+    /// under load. GitHub stays as the fallback so a download still completes if
+    /// one host is unreachable — every byte is digest-verified on arrival, so
+    /// mixing hosts across a resumed transfer is safe by construction.
+    ///
+    /// The `huggingFaceRepo` path must be a PUBLIC repo; a private one answers
+    /// 401 and the fallback silently becomes the only route.
+    var baseURLs: [URL] {
+        var urls: [URL] = []
+        if let hf = huggingFaceRepo {
+            urls.append(URL(string: "https://huggingface.co/\(hf)/resolve/main/")!)
+        }
+        urls.append(
+            URL(string: "https://github.com/Dicklesworthstone/franken_ocr/releases/download/\(releaseTag)/")!
+        )
+        return urls
     }
 
     /// Whether this device has the memory to attempt the model.
@@ -68,6 +89,11 @@ enum ModelCatalog {
         shortName: "Unlimited-OCR",
         license: "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
         releaseTag: "models-unlimited-wasm-v1",
+        // No HuggingFace mirror published for the wasm-int4 artifact yet, so
+        // this lane is GitHub-only and carries that host's 503 risk. HF has no
+        // 2 GiB per-file cap either, so a mirror could ship the 3.0 GB artifact
+        // whole and retire the two-part split entirely (bd, see beads).
+        huggingFaceRepo: nil,
         weights: ModelAsset(
             name: "unlimited-ocr.wasm-int4.focrq",
             bytes: 3_003_988_117,
@@ -100,6 +126,10 @@ enum ModelCatalog {
         shortName: "TrOMR",
         license: "Polyphonic-TrOMR (NetEase) - Apache-2.0",
         releaseTag: "models-tromr-v1",
+        // Matches the mirror `models/manifest-v2.json` already lists. NOTE: at
+        // the time of writing that repo answers 401, so this path is a no-op
+        // until it is made public — the GitHub fallback carries the download.
+        huggingFaceRepo: "Dicklesworthstone/franken_ocr-weights/tromr",
         weights: ModelAsset(
             name: "tromr.int8.focrq",
             bytes: 61_107_485,
@@ -259,37 +289,71 @@ final class ModelStore {
 
         for sidecar in spec.sidecars {
             try Task.checkCancellation()
-            try await fetch(asset: sidecar, from: spec.baseURL, into: dir)
+            try await fetch(asset: sidecar, from: spec.baseURLs, into: dir)
         }
 
         try Task.checkCancellation()
         if spec.weights.parts.isEmpty {
-            try await fetch(asset: spec.weights, from: spec.baseURL, into: dir)
+            try await fetch(asset: spec.weights, from: spec.baseURLs, into: dir)
         } else {
-            try await fetchSplit(spec.weights, from: spec.baseURL, into: dir)
+            try await fetchSplit(spec.weights, from: spec.baseURLs, into: dir)
         }
     }
 
     /// Download one whole asset, resuming if a partial file exists.
-    private func fetch(asset: ModelAsset, from base: URL, into dir: URL) async throws {
+    private func fetch(asset: ModelAsset, from bases: [URL], into dir: URL) async throws {
         let destination = dir.appendingPathComponent(asset.name)
         if let size = try? FileManager.default
             .attributesOfItem(atPath: destination.path)[.size] as? Int, size == asset.bytes {
             return // already have it, verified when it landed
         }
-        try await downloadRanged(
-            url: base.appendingPathComponent(asset.name),
+        try await downloadWithFallback(
+            bases: bases,
+            file: asset.name,
             to: destination,
             expectedBytes: asset.bytes,
-            expectedDigest: asset.sha256,
-            label: asset.name
+            expectedDigest: asset.sha256
         )
+    }
+
+    /// Try each host in turn. The digest check is what makes this safe: a
+    /// partial file from a host that died mid-transfer is resumed against the
+    /// next host, and the whole is verified before it counts as installed.
+    ///
+    /// Cancellation is never a reason to try the next host — that would turn a
+    /// user's Cancel into a retry storm.
+    private func downloadWithFallback(
+        bases: [URL],
+        file: String,
+        to destination: URL,
+        expectedBytes: Int,
+        expectedDigest: String
+    ) async throws {
+        var lastError: Error?
+        for base in bases {
+            do {
+                try await downloadRanged(
+                    url: base.appendingPathComponent(file),
+                    to: destination,
+                    expectedBytes: expectedBytes,
+                    expectedDigest: expectedDigest,
+                    label: file
+                )
+                return
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+            ?? ModelStoreError.badResponse(file)
     }
 
     /// Download an asset that ships as ordered byte-split parts, then
     /// concatenate. Each part is verified on arrival; the concatenated whole is
     /// verified before it is allowed to become the artifact.
-    private func fetchSplit(_ asset: ModelAsset, from base: URL, into dir: URL) async throws {
+    private func fetchSplit(_ asset: ModelAsset, from bases: [URL], into dir: URL) async throws {
         let destination = dir.appendingPathComponent(asset.name)
         if let size = try? FileManager.default
             .attributesOfItem(atPath: destination.path)[.size] as? Int, size == asset.bytes {
@@ -303,12 +367,12 @@ final class ModelStore {
             let have = (try? FileManager.default
                 .attributesOfItem(atPath: partURL.path)[.size] as? Int) ?? 0
             if have != part.bytes {
-                try await downloadRanged(
-                    url: base.appendingPathComponent(part.name),
+                try await downloadWithFallback(
+                    bases: bases,
+                    file: part.name,
                     to: partURL,
                     expectedBytes: part.bytes,
-                    expectedDigest: part.sha256,
-                    label: part.name
+                    expectedDigest: part.sha256
                 )
             }
             partURLs.append(partURL)
