@@ -142,15 +142,28 @@ final class LabModel {
     var progressFraction: Double {
         guard let progress else { return 0 }
         let stage = progress.stage
-        let denominator: Double = if progress.total > 0 {
-            Double(progress.total)
-        } else {
-            Double(estimatedTokens)
-        }
-        let within = denominator > 0
-            ? min(1, Double(progress.current) / denominator)
-            : 0
+        let within = min(1, Double(progress.current) / Double(denominator(for: progress)))
         return min(0.99, stage.precedingWeight + within * stage.weight)
+    }
+
+    /// How many units this stage is expected to take.
+    ///
+    /// The vision and staff stages report a real denominator (blocks, staves)
+    /// and it is used as-is. Decode does not: the engine reports the max-token
+    /// CAP (32768), not an expectation, because EOS is not predictable. Dividing
+    /// by the cap pins decode near zero — and decode is half the bar — so a page
+    /// would look frozen for its entire second half. Fall back to the per-model
+    /// token estimate, the same one the browser lane uses, and label the result
+    /// estimated rather than pretending it is measured.
+    private func denominator(for progress: ProgressUpdate) -> Int {
+        let reported = Int(progress.total)
+        guard progress.stage == .decode else {
+            return reported > 0 ? reported : estimatedTokens
+        }
+        // A cap-sized "total" is not a prediction. Only trust it when it is
+        // tighter than our own estimate (a caller-set --max-length below it).
+        if reported > 0, reported < estimatedTokens { return reported }
+        return estimatedTokens
     }
 
     /// Progress across the WHOLE document: pages already finished, plus how far
@@ -167,7 +180,13 @@ final class LabModel {
     /// True when this run is a document walk rather than a single image.
     var isDocumentRun: Bool { !pageOutcomes.isEmpty }
 
-    var progressIsEstimated: Bool { (progress?.total ?? 0) == 0 }
+    /// True when the bar is extrapolating rather than counting — decode always
+    /// is, because the number of tokens a page will produce is not knowable
+    /// until EOS arrives.
+    var progressIsEstimated: Bool {
+        guard let progress else { return false }
+        return progress.total == 0 || progress.stage == .decode
+    }
 
     private var estimatedTokens: Int {
         switch spec.id {
@@ -189,10 +208,13 @@ final class LabModel {
             ? "\(Int(documentProgressFraction * 100))%\(qualifier)"
             : "\(Int(progressFraction * 100))%\(qualifier)"
         var detail = "\(headline) · \(progress.stage.label)"
-        if progress.total > 0 {
+        if progress.stage == .decode {
+            // Show the honest count, not a fraction of a cap nobody will reach.
+            if progress.current > 0 { detail += " · \(progress.current) tokens" }
+        } else if progress.total > 0 {
             detail += " \(progress.current)/\(progress.total)"
         } else if progress.current > 0 {
-            detail += " · \(progress.current) tokens"
+            detail += " · \(progress.current)"
         }
         return detail
     }
