@@ -384,6 +384,15 @@ const DECODE_STATELESS_ENV: &str = "FOCR_DECODE_STATELESS";
 /// and retained-memory comparisons.
 const UNLIMITED_VISION_CACHE_ENV: &str = "FOCR_UNLIMITED_VISION_CACHE";
 
+/// How many views the streamed (wasm-residency) vision lane keeps in flight
+/// while a hydrated block is live (bd-K2 per-view hydration hoist). Every view
+/// in a chunk shares ONE hydration sweep of the bf16 blob; the price is one
+/// live `[gh·gw, 768]` f32 SAM activation per view (~13 MB at 1024², ~5 MB per
+/// 640² Gundam tile), so the cap bounds the transient on tile-heavy pages while
+/// still covering the 2-view page the unlimited path produces. Chunking cannot
+/// change results — the views are independent.
+const STREAMED_VIEW_CHUNK: usize = 8;
+
 fn unlimited_vision_cache_enabled_for(value: Option<&str>) -> bool {
     !matches!(
         value
@@ -3282,6 +3291,14 @@ impl OcrModel {
             views.len() as u64
                 * (vision_sam::DEPTH as u64 + vision_clip::ClipConfig::default().num_layers as u64),
         );
+        if wasm_residency {
+            // bd-K2 per-view hydration hoist: the streamed lane re-dequants the
+            // SAME bf16 blocks once per view, so a 2-view page pays the whole
+            // hydration traffic twice. Run the views INSIDE the block loop
+            // instead (hydrate block -> all views -> drop). Streamed lane ONLY;
+            // the cached/conservative arm below is untouched.
+            return self.vision_tower_streamed_views(&views);
+        }
         for view in views {
             // SAM tower -> [1024, 16*16] x3 feature (flatten(2) layout, OQ-6).
             let ts = Instant::now();
@@ -3330,6 +3347,65 @@ impl OcrModel {
                 tb.elapsed().as_secs_f64()
             ));
             features.push(projected);
+        }
+        Ok(features)
+    }
+
+    /// The streamed (wasm-residency) vision lane with the per-view hydration
+    /// **hoisted out of the view loop** (bd-K2).
+    ///
+    /// Before (views-outer): `for view { for block { hydrate; run; drop } }` —
+    /// with `V` views per page the whole bf16→f32 block-dequant traffic of the
+    /// SAM tower (12 blocks) + CLIP tower (24 blocks) is paid `V` times.
+    ///
+    /// After (views-inner): `for block { hydrate; for view { run }; drop }` —
+    /// paid ONCE per page, i.e. `V`× less hydration traffic. The cost is `V`
+    /// live activations instead of one (~13 MB per 1024² view), bounded further
+    /// by [`STREAMED_VIEW_CHUNK`].
+    ///
+    /// Bit-identical by construction: views are mathematically independent, so
+    /// interleaving them reorders nothing within a view — no batching, no
+    /// restacking, no reassociation. See
+    /// `vision_sam::forward_streamed_views` / `vision_clip::
+    /// forward_from_sam_streamed_views` and their parity gates.
+    ///
+    /// # Errors
+    /// As [`Self::vision_tower`]'s streamed arm.
+    fn vision_tower_streamed_views(&self, views: &[Mat]) -> FocrResult<Vec<Mat>> {
+        let clip_cfg = vision_clip::ClipConfig::default();
+        let mut features = Vec::with_capacity(views.len());
+        for chunk in views.chunks(STREAMED_VIEW_CHUNK) {
+            let view_refs: Vec<&Mat> = chunk.iter().collect();
+            let ts = Instant::now();
+            let sams =
+                vision_sam::forward_streamed_views(&self.weights, &view_refs, "model.sam_model")?;
+            timing_log(&format!(
+                "  vision.sam(streamed x{}) {:.2}s",
+                view_refs.len(),
+                ts.elapsed().as_secs_f64()
+            ));
+            let tc = Instant::now();
+            let sam_refs: Vec<&Mat> = sams.iter().collect();
+            let clips =
+                vision_clip::forward_from_sam_streamed_views(&clip_cfg, &self.weights, &sam_refs)?;
+            timing_log(&format!(
+                "  vision.clip(streamed x{}) {:.2}s",
+                sam_refs.len(),
+                tc.elapsed().as_secs_f64()
+            ));
+            // The projector is small (~10 MB) but was likewise re-hydrated per
+            // view by `vision_bridge::forward`; hoist it too. Same builder, so
+            // `forward_with` is the same math `forward` performs.
+            let tb = Instant::now();
+            let projector = vision_bridge::projector_weights_from(&self.weights)?;
+            for (clip, sam) in clips.iter().zip(sams.iter()) {
+                features.push(vision_bridge::forward_with(&projector, clip, sam)?);
+            }
+            timing_log(&format!(
+                "  vision.bridge(streamed x{}) {:.2}s",
+                clips.len(),
+                tb.elapsed().as_secs_f64()
+            ));
         }
         Ok(features)
     }

@@ -103,7 +103,8 @@ pub(crate) enum DenseI8Route {
 ///
 /// On non-AArch64 builds this is always [`ArmTier::None`].
 ///
-/// **Apple Silicon prefers SDOT over SMMLA.** Every macOS/aarch64 host (M-series)
+/// **Apple Silicon prefers SDOT over SMMLA.** Every Apple aarch64 core (M-series
+/// on macOS, A-series on iOS)
 /// issues `SMMLA`/i8mm at *half* the rate of `SDOT`, so SMMLA's 2× MACs per
 /// instruction exactly cancel — measured on an Apple M4, SMMLA delivers 0.994× of
 /// SDOT's int8 MACs/second (`vmmlaq_s32` 5.31 Ginstr/s vs `vdotq_s32`
@@ -129,11 +130,17 @@ pub(crate) enum DenseI8Route {
 /// the int4 packed path keeps its SDOT kernels (its scalar fallback is the
 /// ledgered 5.8x-slower unpack path), and the offline-SMMLA packed-B path
 /// is unaffected. `FOCR_INT8_AUTOVEC=0` restores the SDOT dispatch.
+///
+/// Gated on `target_vendor = "apple"` rather than `target_os = "macos"`: the
+/// measurement is about how an Apple core issues the SDOT micro-tile versus the
+/// fused autovec loop, which is a core property shared by M-series and A-series.
+/// iOS re-measurement is tracked separately; until it lands, A-series inherits
+/// the M-series route rather than silently taking the un-measured SDOT branch.
 fn autovec_preferred() -> bool {
     use std::sync::OnceLock;
     static PREF: OnceLock<bool> = OnceLock::new();
     *PREF.get_or_init(|| {
-        cfg!(target_os = "macos")
+        cfg!(target_vendor = "apple")
             && !matches!(
                 std::env::var("FOCR_INT8_AUTOVEC").ok().as_deref(),
                 Some("0") | Some("off") | Some("false") | Some("no")
@@ -191,7 +198,9 @@ fn detect_tier_uncached() -> ArmTier {
         }
 
         // Apple Silicon: SDOT > SMMLA (i8mm is half-rate; see fn docs).
-        #[cfg(target_os = "macos")]
+        // `target_vendor`, not `target_os`: the half-rate i8mm issue is a
+        // property of the Apple core, so A-series (iOS) must land here too.
+        #[cfg(target_vendor = "apple")]
         {
             if has_dotprod {
                 return ArmTier::Sdot;
@@ -201,7 +210,7 @@ fn detect_tier_uncached() -> ArmTier {
             }
         }
         // Other aarch64: SMMLA > SDOT (i8mm may be full-rate).
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         {
             if has_i8mm {
                 return ArmTier::Smmla;

@@ -167,17 +167,94 @@ pub fn thread_budget() -> usize {
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
-            .unwrap_or_else(num_cpus::get_physical)
+            .unwrap_or_else(default_thread_budget)
     })
+}
+
+/// The no-override default width. Physical cores everywhere (hyperthreads
+/// oversubscribe the int8 GEMMs) EXCEPT on iOS, where one core is left to the
+/// UI: an A-series part is 2 performance + 4 efficiency cores, the app's own
+/// main thread has to stay responsive during a minutes-long forward, and a
+/// team barrier waits for its slowest member — so claiming every core makes the
+/// forward contend with the UI thread that is drawing its own progress bar.
+fn default_thread_budget() -> usize {
+    let physical = num_cpus::get_physical();
+    if cfg!(target_os = "ios") {
+        physical.saturating_sub(1).max(1)
+    } else {
+        physical
+    }
+}
+
+/// Install the process-wide kernel rayon pool at [`thread_budget()`] width,
+/// returning the width actually in force.
+///
+/// Two things this fixes, both invisible until you look:
+///
+/// 1. **The budget was documented but never installed.** `thread_budget()` says
+///    every pool-sizing consumer reads it, but nothing ever handed it to rayon,
+///    so the kernels ran on rayon's own default (`available_parallelism`, i.e.
+///    LOGICAL cores). On a non-SMT Apple part those agree and the bug is
+///    invisible; on an SMT x86 host it silently oversubscribes the int8 GEMMs
+///    that doctrine §7.5 says must not be oversubscribed.
+///
+/// 2. **Apple demotes un-classified threads to the efficiency cores.** A thread
+///    that never asks for a QoS class is fair game for the E-cores. Every
+///    parallel section here is a fork-join over `par_chunks_mut`, so ONE demoted
+///    worker sets the pace of the whole dispatch. Each worker asks for the same
+///    class the caller's work runs at.
+///
+/// Idempotent and never fatal: if a global pool already exists (another
+/// embedder built one first) the existing pool stands and its width is
+/// returned. Call before the first forward; `kernel_pool_width()` calls it.
+pub fn init_kernel_pool() -> usize {
+    static INIT: OnceLock<usize> = OnceLock::new();
+    *INIT.get_or_init(|| {
+        let width = thread_budget();
+        // An Err here means a global pool was already installed — a legitimate
+        // embedder choice, not our call to override. Fall through and report.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(width)
+            .thread_name(|i| format!("focr-kernel-{i}"))
+            .start_handler(|_| apple_qos::pin_worker_to_user_initiated())
+            .build_global();
+        rayon::current_num_threads()
+    })
+}
+
+/// Apple thread-QoS island. The only `unsafe` here is one `pthread` call that
+/// takes no pointer and returns an ignored status code.
+mod apple_qos {
+    /// Ask for `QOS_CLASS_USER_INITIATED` on the calling thread.
+    ///
+    /// A no-op off Apple platforms. Errors are deliberately ignored: failing to
+    /// get a QoS class costs throughput, never correctness, and a kernel worker
+    /// is not a place to fail a forward from.
+    #[cfg(target_vendor = "apple")]
+    #[allow(unsafe_code)]
+    pub(super) fn pin_worker_to_user_initiated() {
+        // SAFETY: `pthread_set_qos_class_self_np` acts on the calling thread
+        // only, takes a scalar class and a scalar relative priority (no
+        // pointers, no borrowed memory, nothing to outlive the call), and is
+        // documented as callable from any thread at any time. The return value
+        // is an errno-style status we intentionally discard.
+        unsafe {
+            libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_USER_INITIATED, 0);
+        }
+    }
+
+    #[cfg(not(target_vendor = "apple"))]
+    pub(super) fn pin_worker_to_user_initiated() {}
 }
 
 /// The kernel rayon pool's CURRENT width — the diagnostic the capacity
 /// certificate (bd-re8.18) records before/after the many-pages soak to prove
 /// no second pool was spawned and the width never grew mid-run (the N×
 /// oversubscription class doctrine #5 forbids). First call instantiates the
-/// global pool, which is exactly what the kernels themselves use.
+/// global pool at the documented budget, which is exactly what the kernels
+/// themselves use.
 pub fn kernel_pool_width() -> usize {
-    rayon::current_num_threads()
+    init_kernel_pool()
 }
 
 // ── Bounded per-page result streaming (bd-223.2 scaffold) ───────────────────

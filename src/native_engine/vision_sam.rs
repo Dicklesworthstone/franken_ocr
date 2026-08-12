@@ -630,6 +630,70 @@ pub(crate) fn forward_streamed(weights: &Weights, image: &Mat, prefix: &str) -> 
     out
 }
 
+/// [`forward_streamed`] over several views at once, hydrating each block ONCE
+/// and running EVERY view through it before dropping it (bd-K2 per-view
+/// hydration hoist). The head hydrates once as well.
+///
+/// The `i`-th result is bit-identical to `forward_streamed(weights, images[i],
+/// prefix)`: only the loop nest changes (views-inner instead of views-outer),
+/// and the views are mathematically independent — see [`forward_core_views`]
+/// and the `streamed_views_is_bit_identical_to_per_view` gate.
+///
+/// Cost: one live activation per view (`[gh·gw, 768]` f32) instead of one, in
+/// exchange for `V`× less bf16→f32 block-hydration traffic.
+///
+/// # Errors
+/// As [`forward_streamed`], plus an empty view list.
+pub(crate) fn forward_streamed_views(
+    weights: &Weights,
+    images: &[&Mat],
+    prefix: &str,
+) -> FocrResult<Vec<Mat>> {
+    if images.is_empty() {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam::forward_streamed_views: empty view list"
+        )));
+    }
+    let mut dims = Vec::with_capacity(images.len());
+    for image in images {
+        if image.rows != 3 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam::forward: expected 3 input channels, got {}",
+                image.rows
+            )));
+        }
+        let side = (image.cols as f64).sqrt() as usize;
+        if side * side != image.cols {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam::forward: image.cols {} is not a perfect square",
+                image.cols
+            )));
+        }
+        dims.push((side, side));
+    }
+    let th = Instant::now();
+    let head = sam_head_from(weights, prefix)?;
+    super::timing_log(&format!(
+        "    sam.hydrate(head) {:.2}s",
+        th.elapsed().as_secs_f64()
+    ));
+    let tf = Instant::now();
+    let out = forward_core_views(
+        &head,
+        images,
+        &dims,
+        DEPTH,
+        &mut |i| Ok(std::borrow::Cow::Owned(sam_block_from(weights, prefix, i)?)),
+        true,
+    );
+    super::timing_log(&format!(
+        "    sam.forward(streamed, {} views) {:.2}s",
+        images.len(),
+        tf.elapsed().as_secs_f64()
+    ));
+    out
+}
+
 /// The shared SAM tower core: patch embed + pos embed, `depth` transformer
 /// blocks obtained from `block_at` (borrowed from a cached [`SamWeights`] or
 /// hydrated per use and dropped), then the neck/net convs. ONE body serves the
@@ -645,88 +709,144 @@ fn forward_core<'w>(
     block_at: &mut dyn FnMut(usize) -> FocrResult<std::borrow::Cow<'w, BlockP>>,
     low_mem: bool,
 ) -> FocrResult<Mat> {
-    if image.rows != 3 {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "vision_sam: expected 3 input channels, got {}",
-            image.rows
-        )));
-    }
-    if h == 0 || win == 0 {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "vision_sam: spatial dims ({h},{win}) must be non-zero"
-        )));
-    }
-    let expected_cols = checked_shape_mul("vision_sam", h, win, "H*W")?;
-    if image.cols != expected_cols {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "vision_sam: image.cols {} != H*W {}*{} ({})",
-            image.cols,
-            h,
-            win,
-            expected_cols
-        )));
-    }
-    if !h.is_multiple_of(PATCH) || !win.is_multiple_of(PATCH) {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "vision_sam: spatial dims ({h},{win}) must be multiples of patch {PATCH}"
-        )));
-    }
-    let gh = h / PATCH;
-    let gw = win / PATCH;
+    let mut out = forward_core_views(
+        w,
+        std::slice::from_ref(&image),
+        &[(h, win)],
+        depth,
+        block_at,
+        low_mem,
+    )?;
+    Ok(out.remove(0))
+}
 
-    // ── patch embed: Conv2d(3->768, k16, s16), then permute B,C,H,W->B,H,W,C.
-    // conv2d kernel wants pre-padded NCHW; patch embed has no padding.
+/// [`forward_core`] over `V` independent views with the **view loop inside the
+/// block loop** (bd-K2 per-view hydration hoist): each block is obtained ONCE
+/// from `block_at` and applied to every view's activation before the next block
+/// is requested. For the streamed lane that turns `V` full hydration sweeps of
+/// the bf16 blob into ONE.
+///
+/// Bit-identity is by construction, not by measurement: view `i`'s activation
+/// only ever meets view `i`'s own data, and it passes through exactly the same
+/// sequence of kernel calls with exactly the same shapes as it would in the
+/// views-outer nest ([`forward_core`] is literally this function at `V == 1`).
+/// Reordering *independent* computations cannot move a bit; nothing here is
+/// reassociated, restacked, or batched.
+///
+/// Views may differ in geometry (`dims[i]` is that view's `(H, W)`), since every
+/// stage runs per view with that view's own grid.
+fn forward_core_views<'w>(
+    w: &SamWeights,
+    images: &[&Mat],
+    dims: &[(usize, usize)],
+    depth: usize,
+    block_at: &mut dyn FnMut(usize) -> FocrResult<std::borrow::Cow<'w, BlockP>>,
+    low_mem: bool,
+) -> FocrResult<Vec<Mat>> {
+    if images.len() != dims.len() {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_sam: {} views but {} geometries",
+            images.len(),
+            dims.len()
+        )));
+    }
     let dim = w.patch_embed.out_ch;
-    let conv_out = conv_apply(&w.patch_embed, &image.data, h, win, 0, PATCH)?;
-    ensure_flat_len("vision_sam patch_embed output", &conv_out, dim, gh, gw)?;
-    // conv_out is [1, dim, gh, gw] (channel-major). Tokens we carry as
-    // [gh*gw, dim] (spatial-major rows) for the transformer (NHWC flattened).
-    let mut x = nchw_to_nhwc_rows(&conv_out, dim, gh, gw);
+    // ── per-view validation + patch embed + abs pos-embed. ──────────────────
+    // (Identical checks, in the identical order, to the single-view core.)
+    let mut grids = Vec::with_capacity(images.len());
+    let mut xs = Vec::with_capacity(images.len());
+    for (image, &(h, win)) in images.iter().zip(dims.iter()) {
+        if image.rows != 3 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam: expected 3 input channels, got {}",
+                image.rows
+            )));
+        }
+        if h == 0 || win == 0 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam: spatial dims ({h},{win}) must be non-zero"
+            )));
+        }
+        let expected_cols = checked_shape_mul("vision_sam", h, win, "H*W")?;
+        if image.cols != expected_cols {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam: image.cols {} != H*W {}*{} ({})",
+                image.cols,
+                h,
+                win,
+                expected_cols
+            )));
+        }
+        if !h.is_multiple_of(PATCH) || !win.is_multiple_of(PATCH) {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "vision_sam: spatial dims ({h},{win}) must be multiples of patch {PATCH}"
+            )));
+        }
+        let gh = h / PATCH;
+        let gw = win / PATCH;
 
-    // ── abs pos-embed (added once before the blocks; bicubic-interp if needed).
-    let pos = abs_pos(&w.pos_embed, w.pos_grid_h, w.pos_grid_w, dim, gh, gw)?;
-    for (xv, pv) in x.data.iter_mut().zip(pos.iter()) {
-        *xv += *pv;
+        // ── patch embed: Conv2d(3->768, k16, s16), permute B,C,H,W->B,H,W,C.
+        // conv2d kernel wants pre-padded NCHW; patch embed has no padding.
+        let conv_out = conv_apply(&w.patch_embed, &image.data, h, win, 0, PATCH)?;
+        ensure_flat_len("vision_sam patch_embed output", &conv_out, dim, gh, gw)?;
+        // conv_out is [1, dim, gh, gw] (channel-major). Tokens we carry as
+        // [gh*gw, dim] (spatial-major rows) for the transformer (NHWC flat).
+        let mut x = nchw_to_nhwc_rows(&conv_out, dim, gh, gw);
+
+        // ── abs pos-embed (added once before the blocks; bicubic if needed).
+        let pos = abs_pos(&w.pos_embed, w.pos_grid_h, w.pos_grid_w, dim, gh, gw)?;
+        for (xv, pv) in x.data.iter_mut().zip(pos.iter()) {
+            *xv += *pv;
+        }
+        grids.push((gh, gw));
+        xs.push(x);
     }
 
-    // ── 12 transformer blocks.
+    // ── 12 transformer blocks; ONE hydration per block, all views inside. ──
     let tb = Instant::now();
     for i in 0..depth {
         let blk = block_at(i)?;
-        x = block_forward_impl(&blk, &x, gh, gw, low_mem)?;
-        // Sequential, on the thread that entered the forward — the only place
-        // a progress event may be raised (see `super::progress`).
-        super::progress::vision_step();
+        for (x, &(gh, gw)) in xs.iter_mut().zip(grids.iter()) {
+            *x = block_forward_impl(&blk, x, gh, gw, low_mem)?;
+            // Sequential, on the thread that entered the forward — the only
+            // place a progress event may be raised (see `super::progress`).
+            super::progress::vision_step();
+        }
     }
     super::timing_log(&format!(
         "    sam.blocks {:.2}s",
         tb.elapsed().as_secs_f64()
     ));
 
-    // ── neck: x is [gh*gw, dim] NHWC rows; neck operates NCHW.
-    // permute(0,3,1,2): NHWC-rows -> NCHW flat.
-    let x_nchw = nhwc_rows_to_nchw(&x, dim, gh, gw);
+    // ── per-view neck + net_2 + net_3. ──────────────────────────────────────
+    let mut out = Vec::with_capacity(xs.len());
+    for (x, &(gh, gw)) in xs.iter().zip(grids.iter()) {
+        // neck: x is [gh*gw, dim] NHWC rows; neck operates NCHW.
+        // permute(0,3,1,2): NHWC-rows -> NCHW flat.
+        let x_nchw = nhwc_rows_to_nchw(x, dim, gh, gw);
 
-    // neck conv1: 768 -> 256, k1, no pad.
-    let nc1 = conv_apply(&w.neck_conv1, &x_nchw, gh, gw, 0, 1)?;
-    ensure_flat_len("vision_sam neck_conv1 output", &nc1, NECK_CH, gh, gw)?;
-    let nc1 = layer_norm_2d(&nc1, &w.neck_ln1, NECK_CH, gh, gw)?;
-    // neck conv2: 256 -> 256, k3, pad1.
-    let nc2 = conv_apply(&w.neck_conv2, &nc1, gh, gw, 1, 1)?;
-    ensure_flat_len("vision_sam neck_conv2 output", &nc2, NECK_CH, gh, gw)?;
-    let neck = layer_norm_2d(&nc2, &w.neck_ln2, NECK_CH, gh, gw)?;
+        // neck conv1: 768 -> 256, k1, no pad.
+        let nc1 = conv_apply(&w.neck_conv1, &x_nchw, gh, gw, 0, 1)?;
+        ensure_flat_len("vision_sam neck_conv1 output", &nc1, NECK_CH, gh, gw)?;
+        let nc1 = layer_norm_2d(&nc1, &w.neck_ln1, NECK_CH, gh, gw)?;
+        // neck conv2: 256 -> 256, k3, pad1.
+        let nc2 = conv_apply(&w.neck_conv2, &nc1, gh, gw, 1, 1)?;
+        ensure_flat_len("vision_sam neck_conv2 output", &nc2, NECK_CH, gh, gw)?;
+        let neck = layer_norm_2d(&nc2, &w.neck_ln2, NECK_CH, gh, gw)?;
 
-    // net_2: 256 -> 512, k3, s2, p1 -> grid /2.
-    let (gh2, gw2) = (gh.div_ceil(2), gw.div_ceil(2));
-    let x2 = conv_apply(&w.net2, &neck, gh, gw, 1, 2)?;
-    ensure_flat_len("vision_sam net2 output", &x2, NET2_CH, gh2, gw2)?;
-    // net_3: 512 -> 1024, k3, s2, p1 -> grid /2 again.
-    let (gh3, gw3) = (gh2.div_ceil(2), gw2.div_ceil(2));
-    let x3 = conv_apply(&w.net3, &x2, gh2, gw2, 1, 2)?;
-    ensure_flat_len("vision_sam net3 output", &x3, OUT_CH, gh3, gw3)?;
+        // net_2: 256 -> 512, k3, s2, p1 -> grid /2.
+        let (gh2, gw2) = (gh.div_ceil(2), gw.div_ceil(2));
+        let x2 = conv_apply(&w.net2, &neck, gh, gw, 1, 2)?;
+        ensure_flat_len("vision_sam net2 output", &x2, NET2_CH, gh2, gw2)?;
+        // net_3: 512 -> 1024, k3, s2, p1 -> grid /2 again.
+        let (gh3, gw3) = (gh2.div_ceil(2), gw2.div_ceil(2));
+        let x3 = conv_apply(&w.net3, &x2, gh2, gw2, 1, 2)?;
+        ensure_flat_len("vision_sam net3 output", &x3, OUT_CH, gh3, gw3)?;
 
-    // x3 is [OUT_CH, gh3*gw3] NCHW flat — exactly flatten(2) layout.
-    Ok(Mat::from_vec(OUT_CH, gh3 * gw3, x3))
+        // x3 is [OUT_CH, gh3*gw3] NCHW flat — exactly flatten(2) layout.
+        out.push(Mat::from_vec(OUT_CH, gh3 * gw3, x3));
+    }
+    Ok(out)
 }
 
 /// Batched SAM tower over `V` views (images) in ONE forward (bd-1azu.10).

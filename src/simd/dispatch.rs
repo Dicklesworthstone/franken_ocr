@@ -233,11 +233,17 @@ fn detect() -> Caps {
     let mut available: Vec<IsaTier> = Vec::new();
 
     // ── aarch64 ─────────────────────────────────────────────────────────────
-    // Apple Silicon (macOS/aarch64): SDOT > SMMLA. i8mm issues at half-rate on
-    // every M-series core, so SMMLA's 2x MACs/instruction cancel out (measured on
-    // M4: 0.994x SDOT) and it also pays a 2x2 operand repack the dot path skips —
-    // so SDOT is the faster int8 kernel here. Other aarch64 (e.g. Neoverse):
-    // SMMLA > SDOT, where i8mm can be full-rate. Mirrors `arm::detect_tier`.
+    // Apple Silicon (aarch64 + Apple vendor — M-series on macOS, A-series on
+    // iOS): SDOT > SMMLA. i8mm issues at half-rate on every Apple core, so
+    // SMMLA's 2x MACs/instruction cancel out (measured on M4: 0.994x SDOT) and
+    // it also pays a 2x2 operand repack the dot path skips — so SDOT is the
+    // faster int8 kernel here. Other aarch64 (e.g. Neoverse): SMMLA > SDOT,
+    // where i8mm can be full-rate. Mirrors `arm::detect_tier`.
+    //
+    // The predicate is `target_vendor`, NOT `target_os`: half-rate i8mm is a
+    // property of the Apple core, not of macOS. Gating on `target_os = "macos"`
+    // silently dropped every iOS build into the Neoverse branch and preferred
+    // the measured-slower SMMLA kernel on A-series silicon.
     #[cfg(target_arch = "aarch64")]
     {
         // `is_aarch64_feature_detected!` is safe: it reads HWCAP / sysctl and is
@@ -245,7 +251,7 @@ fn detect() -> Caps {
         // thus only ever select) a tier whose feature is confirmed present.
         let has_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
         let has_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
-        #[cfg(target_os = "macos")]
+        #[cfg(target_vendor = "apple")]
         {
             if has_dotprod {
                 available.push(IsaTier::Sdot);
@@ -254,7 +260,7 @@ fn detect() -> Caps {
                 available.push(IsaTier::Smmla);
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(target_vendor = "apple"))]
         {
             if has_i8mm {
                 available.push(IsaTier::Smmla);

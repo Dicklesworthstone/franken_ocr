@@ -314,6 +314,64 @@ pub(crate) fn forward_from_sam_streamed(
     out
 }
 
+/// [`forward_from_sam_streamed`] over several views at once, hydrating each of
+/// the `cfg.num_layers` blocks ONCE and running EVERY view through it before
+/// dropping it (bd-K2 per-view hydration hoist). The embeddings/pre-LN head is
+/// read once as well.
+///
+/// The `i`-th result is bit-identical to `forward_from_sam_streamed(cfg,
+/// weights, sam_features_per_view[i])` — only the loop nest changes; see
+/// [`forward_with_supplied_views`] and the
+/// `streamed_views_is_bit_identical_to_per_view` gate.
+///
+/// # Errors
+/// As [`forward_from_sam_streamed`], plus an empty view list.
+pub(crate) fn forward_from_sam_streamed_views(
+    cfg: &ClipConfig,
+    weights: &Weights,
+    sam_features_per_view: &[&Mat],
+) -> FocrResult<Vec<Mat>> {
+    if sam_features_per_view.is_empty() {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_clip::forward_from_sam_streamed_views: empty view list"
+        )));
+    }
+    let mut sam_mats = Vec::with_capacity(sam_features_per_view.len());
+    for sam_features in sam_features_per_view {
+        ensure_mat_data_len(sam_features, "vision_clip forward sam_features")?;
+        // Same SAM channel-major -> token-major transpose as `forward_from_sam`.
+        let sam_t = transpose(&sam_features.data, sam_features.rows, sam_features.cols)?;
+        sam_mats.push(Mat::from_vec(sam_features.cols, sam_features.rows, sam_t));
+    }
+
+    let p = "model.vision_model";
+    let pos_name = format!("{p}.embeddings.position_embedding.weight");
+    let (num_positions, _pos_dim) = tensor_rank2_shape(weights, &pos_name)?;
+    let class_embedding = weights.vec(&format!("{p}.embeddings.class_embedding"))?;
+    let position_embedding = weights.vec(&pos_name)?;
+    let pre_layernorm = LayerNormParams {
+        weight: weights.vec(&format!("{p}.pre_layrnorm.weight"))?,
+        bias: weights.vec(&format!("{p}.pre_layrnorm.bias"))?,
+    };
+    let sam_refs: Vec<&Mat> = sam_mats.iter().collect();
+    let tb = Instant::now();
+    let out = forward_with_supplied_views(
+        cfg,
+        &class_embedding,
+        &position_embedding,
+        num_positions,
+        &pre_layernorm,
+        &sam_refs,
+        &mut |l| Ok(std::borrow::Cow::Owned(clip_block_from(weights, l)?)),
+    );
+    super::timing_log(&format!(
+        "    clip.blocks(streamed, {} views) {:.2}s",
+        sam_refs.len(),
+        tb.elapsed().as_secs_f64()
+    ));
+    out
+}
+
 /// Hydrate ONE CLIP transformer block from the `model.vision_model.*` tensors —
 /// the same reads and the same [`LinearParams::from_row_major`] finish the
 /// whole-tower [`clip_weights_from`] performs for that layer, factored so the
@@ -514,31 +572,70 @@ fn forward_with_supplied<'w>(
     sam_features: &Mat,
     block_at: &mut dyn FnMut(usize) -> FocrResult<std::borrow::Cow<'w, ClipBlockWeights>>,
 ) -> FocrResult<Mat> {
-    let dim = cfg.hidden_size;
-    // ── Embeddings ([SPEC-048]) ────────────────────────────────────────────
-    // Prepend the class token, then add the (interpolated) abs-pos embedding.
-    let mut x = prepend_class_token(class_embedding, sam_features)?;
-    let seq = x.rows; // num_patches + 1
-    let pos = abs_pos_for_len(position_embedding, num_positions, dim, seq)?;
-    add_in_place(&mut x, &pos)?;
-
-    // ── pre_layrnorm ([SPEC-049], deepencoder.py:470-473) ──────────────────
-    x = nn::layer_norm(
-        &x,
-        Some(&pre_layernorm.weight),
-        Some(&pre_layernorm.bias),
-        cfg.pre_layernorm_eps,
+    let mut out = forward_with_supplied_views(
+        cfg,
+        class_embedding,
+        position_embedding,
+        num_positions,
+        pre_layernorm,
+        std::slice::from_ref(&sam_features),
+        block_at,
     )?;
+    Ok(out.remove(0))
+}
+
+/// [`forward_with_supplied`] over `V` independent views with the **view loop
+/// inside the block loop** (bd-K2 per-view hydration hoist): each block is
+/// obtained ONCE from `block_at` and applied to every view before the next
+/// block is requested, so the streamed lane pays ONE hydration sweep of the
+/// bf16 blob instead of `V`.
+///
+/// Bit-identity is by construction: this is not batching. Each view keeps its
+/// own `[seq, dim]` activation and passes through exactly the same
+/// [`transformer_block`] calls, with the same shapes, that it would in the
+/// views-outer nest — [`forward_with_supplied`] IS this function at `V == 1`.
+/// Views may differ in `seq`.
+#[allow(clippy::too_many_arguments)]
+fn forward_with_supplied_views<'w>(
+    cfg: &ClipConfig,
+    class_embedding: &[f32],
+    position_embedding: &[f32],
+    num_positions: usize,
+    pre_layernorm: &LayerNormParams,
+    sam_features_per_view: &[&Mat],
+    block_at: &mut dyn FnMut(usize) -> FocrResult<std::borrow::Cow<'w, ClipBlockWeights>>,
+) -> FocrResult<Vec<Mat>> {
+    let dim = cfg.hidden_size;
+    let mut xs = Vec::with_capacity(sam_features_per_view.len());
+    for sam_features in sam_features_per_view {
+        // ── Embeddings ([SPEC-048]) ────────────────────────────────────────
+        // Prepend the class token, then add the (interpolated) abs-pos embed.
+        let mut x = prepend_class_token(class_embedding, sam_features)?;
+        let seq = x.rows; // num_patches + 1
+        let pos = abs_pos_for_len(position_embedding, num_positions, dim, seq)?;
+        add_in_place(&mut x, &pos)?;
+
+        // ── pre_layrnorm ([SPEC-049], deepencoder.py:470-473) ──────────────
+        x = nn::layer_norm(
+            &x,
+            Some(&pre_layernorm.weight),
+            Some(&pre_layernorm.bias),
+            cfg.pre_layernorm_eps,
+        )?;
+        xs.push(x);
+    }
 
     // ── the transformer blocks (24 in the deployed config) ────────────────
     for l in 0..cfg.num_layers {
         let block = block_at(l)?;
-        x = transformer_block(cfg, &block, &x)?;
-        // Sequential, on the thread that entered the forward — the only place
-        // a progress event may be raised (see `super::progress`).
-        super::progress::vision_step();
+        for x in &mut xs {
+            *x = transformer_block(cfg, &block, x)?;
+            // Sequential, on the thread that entered the forward — the only
+            // place a progress event may be raised (see `super::progress`).
+            super::progress::vision_step();
+        }
     }
-    Ok(x)
+    Ok(xs)
 }
 
 /// Batched CLIP tower over `V` views in ONE forward (bd-1azu.10).
