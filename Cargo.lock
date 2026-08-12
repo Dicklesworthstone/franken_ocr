@@ -1233,6 +1233,7 @@ dependencies = [
  "fsqlite-types",
  "ft-core",
  "ft-kernel-cpu",
+ "getrandom 0.4.3",
  "half",
  "image",
  "lopdf",

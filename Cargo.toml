@@ -124,6 +124,15 @@ memmap2 = { version = "0.9", optional = true }
 # every native target, so the native code path is byte-identical.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = "1"
+# lopdf's dependency graph reaches getrandom 0.4 (lopdf -> rand 0.10 and
+# lopdf's own object-ID randomization on WRITE paths the OCR pipeline never
+# calls) — but the dep must still COMPILE on wasm32-unknown-unknown, where
+# getrandom has no default backend. getrandom 0.4 selects its JS
+# (crypto.getRandomValues) backend from the `wasm_js` cargo feature alone —
+# unlike 0.3, NO `--cfg getrandom_backend` RUSTFLAGS line is needed. Optional +
+# tied to the `pdf` feature below, so the wasm core build without `pdf` is
+# unchanged; on native targets this target block never applies.
+getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 
 [dev-dependencies]
 # Property-based test plumbing (bd-10sb.1): generator-driven invariants for
@@ -151,10 +160,12 @@ native = [
     "image/default",
     "image/rayon",
 ]
-# Native PDF rasterization (src/pdf.rs). Separate from `native` only because
-# its dependency set (lopdf/fax/flate2) is the part the browser build drops;
-# lopdf's `getrandom` pull has no wasm32-unknown-unknown backend configured.
-pdf = ["dep:lopdf", "dep:fax", "dep:flate2"]
+# PDF rasterization (src/pdf.rs). Separate from `native` so the browser build
+# can opt in independently: lopdf's `getrandom` pull compiles on
+# wasm32-unknown-unknown via the target-gated `wasm_js`-featured getrandom dep
+# above, so `--no-default-features --features pdf` is a valid wasm core build
+# (focr-wasm enables it for the playground's scanned-PDF path).
+pdf = ["dep:lopdf", "dep:fax", "dep:flate2", "dep:getrandom"]
 mimalloc = []
 
 # The browser/wasm boundary crate (site/pkg's source) shares this workspace so

@@ -62,6 +62,14 @@ pub fn looks_like_pdf(path: &Path) -> bool {
     matches!(file.read_exact(&mut head), Ok(())) && head == PDF_MAGIC
 }
 
+/// Whether `bytes` look like a PDF: the `%PDF-` magic prefix. The in-memory
+/// twin of [`looks_like_pdf`] for callers (the browser/wasm boundary) that
+/// hold the document as bytes and have no filesystem path to sniff.
+#[must_use]
+pub fn looks_like_pdf_bytes(bytes: &[u8]) -> bool {
+    bytes.starts_with(PDF_MAGIC)
+}
+
 /// A lazily-rendered PDF: the parsed document plus its page object ids in order.
 ///
 /// Pages are rendered one at a time via [`PdfPages::render`] so a 600-page book
@@ -81,12 +89,30 @@ impl PdfPages {
     pub fn open(path: &Path) -> FocrResult<Self> {
         let doc = Document::load(path)
             .map_err(|e| FocrError::InputDecode(format!("parse PDF {}: {e}", path.display())))?;
+        Self::from_document(doc, &path.display().to_string())
+    }
+
+    /// Parse a PDF already held in memory (the browser/wasm path, where the
+    /// document arrives as bytes and there is no filesystem). Does not render
+    /// any page yet. Everything downstream — page iteration, rasterization,
+    /// rotation normalization — is the exact same code [`Self::open`] uses, so
+    /// the two constructors render byte-identical pages for the same input.
+    ///
+    /// # Errors
+    /// [`FocrError::InputDecode`] if the bytes cannot be parsed as a PDF.
+    pub fn from_bytes(bytes: &[u8]) -> FocrResult<Self> {
+        let doc = Document::load_mem(bytes)
+            .map_err(|e| FocrError::InputDecode(format!("parse PDF bytes: {e}")))?;
+        Self::from_document(doc, "bytes")
+    }
+
+    /// Shared tail of both constructors: collect the page ids in order and
+    /// reject empty documents. `what` names the input in the error message
+    /// (a path for [`Self::open`], `"bytes"` for [`Self::from_bytes`]).
+    fn from_document(doc: Document, what: &str) -> FocrResult<Self> {
         let pages: Vec<ObjectId> = doc.get_pages().into_values().collect();
         if pages.is_empty() {
-            return Err(FocrError::InputDecode(format!(
-                "PDF {} has no pages",
-                path.display()
-            )));
+            return Err(FocrError::InputDecode(format!("PDF {what} has no pages")));
         }
         Ok(Self { doc, pages })
     }
@@ -873,6 +899,73 @@ mod tests {
         assert!(!looks_like_pdf(Path::new("/x/y/page.png")));
         // Missing file, no .pdf extension -> not a PDF (no panic).
         assert!(!looks_like_pdf(Path::new("/no/such/file.bin")));
+    }
+
+    #[test]
+    fn looks_like_pdf_bytes_by_magic() {
+        assert!(looks_like_pdf_bytes(b"%PDF-1.5\n..."));
+        assert!(!looks_like_pdf_bytes(b"\x89PNG\r\n\x1a\n"));
+        assert!(!looks_like_pdf_bytes(b"%PDF")); // truncated magic
+        assert!(!looks_like_pdf_bytes(b""));
+    }
+
+    /// `from_bytes(read(file))` must produce byte-identical page rasters to
+    /// `open(file)` — the two constructors share every line after the parser
+    /// entry, and this pins that contract for the wasm boundary that rides
+    /// `from_bytes`.
+    #[test]
+    fn from_bytes_renders_identically_to_open() {
+        use image::{ImageBuffer, Rgb};
+        use lopdf::{Stream, dictionary};
+        use std::io::Cursor;
+
+        let (w, h) = (24u32, 18u32);
+        let src = DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
+            Rgb([(x * 10) as u8, (y * 13) as u8, 200])
+        }));
+        let mut jpeg = Vec::new();
+        src.write_to(&mut Cursor::new(&mut jpeg), image::ImageFormat::Jpeg)
+            .expect("encode jpeg");
+        let image = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => i64::from(w),
+                "Height" => i64::from(h),
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpeg,
+        )
+        .with_compression(false);
+        let path = build_single_page_pdf(Some(image));
+
+        let by_path = PdfPages::open(&path).expect("open by path");
+        let bytes = std::fs::read(&path).expect("read pdf bytes");
+        assert!(looks_like_pdf_bytes(&bytes));
+        let by_bytes = PdfPages::from_bytes(&bytes).expect("open from bytes");
+
+        assert_eq!(by_path.len(), by_bytes.len());
+        let a = by_path.render(0).expect("render by path");
+        let b = by_bytes.render(0).expect("render from bytes");
+        assert_eq!((a.width(), a.height()), (b.width(), b.height()));
+        assert_eq!(
+            a.to_rgb8().into_raw(),
+            b.to_rgb8().into_raw(),
+            "open() and from_bytes() rasters must be byte-identical"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Junk bytes must surface the precise parse error, not a panic; an empty
+    /// but well-formed document must report "has no pages".
+    #[test]
+    fn from_bytes_rejects_junk_with_named_error() {
+        let Err(err) = PdfPages::from_bytes(b"not a pdf at all") else {
+            panic!("junk must error");
+        };
+        assert!(err.to_string().contains("parse PDF bytes"), "got: {err}");
     }
 
     #[test]

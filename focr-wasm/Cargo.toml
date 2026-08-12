@@ -17,7 +17,11 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-franken_ocr = { path = "..", default-features = false }
+# `pdf` (and nothing else from `native`): the playground accepts scanned PDFs,
+# rasterized in-wasm by the same src/pdf.rs code the CLI uses. lopdf's
+# getrandom-0.4 pull compiles on wasm32 via the library's target-gated
+# `wasm_js`-featured getrandom dep (no RUSTFLAGS cfg needed on 0.4).
+franken_ocr = { path = "..", default-features = false, features = ["pdf"] }
 # Same major as the library so `image::DynamicImage` is ONE type across the
 # boundary; slim decode set (the site sends PNG/JPEG bytes).
 image = { version = "0.25", default-features = false, features = [
