@@ -14,6 +14,7 @@
             "size": 1957046720,
             "sha256": "a45aa7674f38190974a2e61bdaeb8eca0d5039a6631406c1126f6614140ec7f6",
             "urls": [
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr.v0.7.0.int8.focrq.part00",
               "https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.7.0/unlimited-ocr.v0.7.0.int8.focrq.part00"
             ]
           },
@@ -21,6 +22,7 @@
             "size": 1957046720,
             "sha256": "0081dbab8005f9bae0abae32fea6f85d20b507697ee55f2daff8d66137f9d5a8",
             "urls": [
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr.v0.7.0.int8.focrq.part01",
               "https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.7.0/unlimited-ocr.v0.7.0.int8.focrq.part01"
             ]
           },
@@ -28,6 +30,7 @@
             "size": 243355343,
             "sha256": "62d34bc6acb431e0b261e8d42c0834886f3b260083c3db2ba46fde5d0d6d2eec",
             "urls": [
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr.v0.7.0.int8.focrq.part02",
               "https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.7.0/unlimited-ocr.v0.7.0.int8.focrq.part02"
             ]
           }

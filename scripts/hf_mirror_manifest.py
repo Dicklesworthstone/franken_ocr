@@ -41,7 +41,8 @@ def collect_assets(node, out):
             gh = next((u for u in urls if "github.com" in u), None)
             hf = next((u for u in urls if "huggingface.co" in u), None)
             sha = node.get("sha256")
-            size = node.get("bytes")
+            # Part records spell it `size`; asset records spell it `bytes`.
+            size = node.get("bytes", node.get("size"))
             if gh and sha:
                 out.append({"gh": gh, "hf": hf, "sha256": sha, "bytes": size})
         for value in node.values():
