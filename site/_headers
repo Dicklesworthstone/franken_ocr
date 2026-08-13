@@ -4,8 +4,17 @@
 # site/pkg-threaded) available at all; they also cost nothing and enable fine
 # timers for the serial lane.
 #
-# CSP: connect-src 'self' is the enforceable form of "your image never leaves
-# this page". 'wasm-unsafe-eval' is required for WebAssembly.compileStreaming;
+# CSP connect-src: 'self' plus the Hugging Face weight CDN, and NOTHING else.
+# Model weights are fetched straight from Hugging Face so multi-gigabyte
+# downloads do not cross this site's bandwidth; `*.hf.co` is required because
+# huggingface.co 302s to a region-specific CDN host (us.aws.cdn.hf.co and
+# friends). That is a real, deliberate weakening of the old `connect-src 'self'`
+# — it is now "the page may talk to the weight CDN", not "the page may talk to
+# nobody". What it still enforces is the part that matters: those are the ONLY
+# origins reachable, the traffic to them is one-way downloads of public
+# hash-pinned files, and there is no origin the page could POST a document to.
+# The page copy says exactly this; keep the two in step.
+# 'wasm-unsafe-eval' is required for WebAssembly.compileStreaming;
 # 'unsafe-eval' rides along because Safari only learned the wasm token in 16.4.
 # worker-src needs blob: for the threaded lane: wasm-bindgen-rayon's no-bundler
 # helper self-spawns each rayon worker from a blob URL of its own script (so the
@@ -19,7 +28,7 @@
 /*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https://huggingface.co https://*.hf.co; media-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'
   X-Content-Type-Options: nosniff
 
 /index.html

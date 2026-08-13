@@ -60,8 +60,10 @@
       The same code that ships as the <code>focr</code> CLI compiles to WebAssembly, so
       <strong>Baidu's Unlimited-OCR</strong> reads your document pages
       <strong>entirely on your CPU, in this page</strong>, with three smaller models alongside it.
-      Your documents never leave the tab, and the CSP's <code>connect-src 'self'</code> makes that
-      a browser-enforced promise rather than a privacy-policy one.
+      Your documents never leave the tab. The page's CSP allows exactly two things:
+      itself, and the Hugging Face CDN it downloads model weights from — so there is
+      no origin it could upload a document to, and that is browser-enforced rather
+      than a privacy-policy promise.
     </p>
     <p class="hero-cta">
       <a class="btn primary" href="#playground">Try it in your browser</a>
@@ -780,8 +782,9 @@ focr robot selftest</pre>
         <h2 class="footer-head">franken_ocr</h2>
         <p class="note">A pure-Rust, memory-safe, CPU-only OCR engine for hand-ported
         vision-language models. Nothing on this page phones home, and there is no analytics of any
-        kind; the CSP's <code>connect-src 'self'</code> is the enforceable version of that
-        sentence.</p>
+        kind. The CSP's <code>connect-src</code> lists only this site and the Hugging Face
+        CDN the model weights download from — public, hash-pinned files, fetched one
+        way — which is the enforceable version of that sentence.</p>
       </div>
       <div>
         <h2 class="footer-head">Project</h2>

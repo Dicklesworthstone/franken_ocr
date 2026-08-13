@@ -3,10 +3,12 @@
 // The wasm engine refuses a mismatched byte count and the loader refuses a
 // mismatched digest, so a truncated or tampered download can never hydrate.
 //
-// Assets are fetched same-origin from /model/<model>/<file>, which the Pages
-// Function (functions/model/[[path]].js) proxies to the GitHub release —
-// release assets send no CORS headers, so the browser cannot fetch them
-// cross-origin.
+// Assets are fetched DIRECTLY from the Hugging Face weight repo, which sends
+// CORS headers and serves ranged requests — so a multi-gigabyte download never
+// crosses this site's own bandwidth. The same-origin Pages Function
+// (functions/model/[[path]].js) remains as a fallback and forwards to Hugging
+// Face first, then the GitHub release; GitHub release assets send no CORS
+// headers at all, which is why they can only ever be reached through that proxy.
 export const MODELS = {
   tromr: {
     label: "Polyphonic-TrOMR (sheet music → MusicXML)",

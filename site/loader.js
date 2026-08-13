@@ -26,8 +26,64 @@ import { Sha256 } from "./sha256.js";
 const CACHE_NAME = "focr-models-v1";
 const PREFIX_BYTES = 4 * 1024 * 1024;
 
+// Where a model file comes from, best source first.
+//
+// Hugging Face is fetched DIRECTLY, cross-origin. It serves ranged requests,
+// sits behind a CDN, and — unlike GitHub release assets — sends CORS headers
+// (`access-control-allow-origin`, reflected on the 302 and `*` on the CDN it
+// redirects to), so the browser can stream from it without a same-origin hop.
+// Going direct means multi-gigabyte model downloads never cross this site's own
+// bandwidth bill.
+//
+// The same-origin Pages Function stays as the fallback: it forwards to the same
+// two upstreams server-side, so a Hugging Face outage (or a CSP/extension that
+// blocks the cross-origin fetch) still resolves.
+//
+// Every byte is SHA-256-verified against the pinned manifest no matter which
+// source answered, so switching sources — even mid-asset, between parts — cannot
+// yield a mixed or corrupt artifact.
+const HF_BASE = "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/";
+
+// Per-model subdirectory inside the weights repo. Mirrors the layout in
+// models/manifest-v2.json, which is the source of truth for what is published.
+const HF_SUBDIR = {
+  "unlimited-ocr": "",
+  "got-ocr2": "",
+  smolvlm2: "smolvlm2/",
+  onechart: "onechart/",
+  tromr: "tromr/",
+};
+
+/** Cache key. Stable across sources, so a fallback still hits a warm cache. */
 function assetUrl(modelId, name) {
   return `/model/${modelId}/${name}`;
+}
+
+/** Candidate sources for one file, best first. */
+function assetSources(modelId, name) {
+  const subdir = HF_SUBDIR[modelId];
+  const sources = [];
+  if (subdir !== undefined) sources.push(`${HF_BASE}${subdir}${name}`);
+  sources.push(assetUrl(modelId, name)); // same-origin proxy fallback
+  return sources;
+}
+
+/** Fetch from the first source that answers; throws if none do. */
+async function fetchFromAnySource(modelId, name) {
+  let lastError;
+  for (const url of assetSources(modelId, name)) {
+    try {
+      const response = await fetch(url);
+      if (response.ok || response.status === 206) return response;
+      lastError = new Error(`${name}: HTTP ${response.status}`);
+      await response.body?.cancel();
+    } catch (err) {
+      // A cross-origin failure (CSP, offline, DNS) is not fatal on its own —
+      // that is what the same-origin fallback is for.
+      lastError = err;
+    }
+  }
+  throw lastError ?? new Error(`${name}: no source answered`);
 }
 
 async function sha256HexOneShot(buf) {
@@ -50,8 +106,7 @@ async function fetchVerifiedSmall(modelId, spec, onProgress) {
     await cache.delete(url);
   }
 
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`fetch ${spec.name}: HTTP ${resp.status}`);
+  const resp = await fetchFromAnySource(modelId, spec.name);
   const buf = new Uint8Array(await resp.arrayBuffer());
   if (buf.byteLength !== spec.bytes) {
     throw new Error(`${spec.name}: got ${buf.byteLength} of ${spec.bytes} bytes`);
@@ -138,11 +193,11 @@ class WeightsPump {
 }
 
 /** Get one part's reader: cache hit, else fetch teed into the cache. */
-async function partReader(cache, url) {
+async function partReader(cache, url, modelId, partName) {
   const cached = await cache.match(url);
   if (cached?.body) return { reader: cached.body.getReader(), fromCache: true, cachePut: null };
-  const resp = await fetch(url);
-  if (!resp.ok || !resp.body) throw new Error(`fetch ${url}: HTTP ${resp.status}`);
+  const resp = await fetchFromAnySource(modelId, partName);
+  if (!resp.body) throw new Error(`fetch ${partName}: no response body`);
   const [toSink, toCache] = resp.body.tee();
   const cachePut = cache
     .put(url, new Response(toCache, { headers: { "content-type": "application/octet-stream" } }))
@@ -165,7 +220,7 @@ async function streamWeights(modelId, spec, sink, onProgress) {
     const url = assetUrl(modelId, part.name);
     let src;
     try {
-      src = await partReader(cache, url);
+      src = await partReader(cache, url, modelId, part.name);
       await pump.drain(src.reader, part, src.fromCache);
     } catch (err) {
       if (src?.cachePut) await src.cachePut;
