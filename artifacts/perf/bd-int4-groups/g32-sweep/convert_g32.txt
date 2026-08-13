@@ -1,0 +1,1 @@
+[focr] convert: wrote /Users/jemanuel/.cache/franken_ocr/models/unlimited-g32.focrq (generic quant int4: 2710 tensors, 50 int8 + 2148 int4, 6672547120 -> 2793637840 bytes) source_sha256=2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6 quant_recipe=unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1

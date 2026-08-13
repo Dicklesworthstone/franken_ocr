@@ -3205,7 +3205,11 @@ impl OcrModel {
     /// A missing or mis-shaped OneChart tensor.
     fn onechart_statics(&self) -> FocrResult<&onechart::OnechartStatics> {
         self.onechart_statics.get_or_try_init(|| {
-            onechart::hydrate_statics(&self.weights, self.arch().vision_tower_prefix())
+            onechart::hydrate_statics(
+                &self.weights,
+                self.arch().vision_tower_prefix(),
+                stream_vision_tower(),
+            )
         })
     }
 

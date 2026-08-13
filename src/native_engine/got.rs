@@ -75,11 +75,12 @@ pub const IMAGE_TOKEN_LEN: usize = 256;
 /// transpose → `[256, 1024]` → the `mm_projector_vary` `Linear(1024→1024)+bias` →
 /// `[256, 1024]` token-major features. All high-precision (BF16→f32).
 ///
+/// When `statics.sam` is `None` the tower streams per block from `weights` under
+/// its recorded prefix, which also selects the bounded global-attention kernel.
+/// Both arms run the same `forward_core` body, so the features are bit-identical.
+///
 /// # Errors
 /// The first vision-stage error (missing/mis-shaped tensor or kernel failure).
-/// When `statics.sam` is `None` the tower streams per block from `weights` under
-/// `prefix`, which also selects the bounded global-attention kernel. Both arms
-/// run the same `forward_core` body, so the features are bit-identical.
 pub fn vision_features(weights: &Weights, statics: &GotStatics, image: &Mat) -> FocrResult<Mat> {
     let side = (image.cols as f64).sqrt() as usize;
     if side * side != image.cols || image.rows != 3 {
@@ -320,8 +321,7 @@ mod tests {
         ))
         .expect("sample image");
 
-        let statics =
-            hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
+        let statics = hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
         let text = recognize(&weights, &statics, &tk, &img, 64, false).expect("recognize");
         eprintln!("[B11 e2e] {text:?}");
         assert_eq!(
@@ -362,8 +362,7 @@ mod tests {
         ))
         .expect("page 2");
 
-        let statics =
-            hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
+        let statics = hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
         let solo: Vec<String> = [&img1, &img2]
             .iter()
             .map(|im| {
@@ -412,8 +411,7 @@ mod tests {
             .expect("tiktoken");
         let img = image::open(&path).expect("corpus image");
 
-        let statics =
-            hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
+        let statics = hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
         let text = recognize(&weights, &statics, &tk, &img, 512, true).expect("recognize --format");
         eprintln!("[format corpus {asset}] {text:?}");
         assert!(!text.is_empty(), "{asset}: `--format` output is empty");
@@ -531,11 +529,9 @@ mod tests {
         assert_eq!(img_flat.len(), 3 * side * side, "image not [3,1024,1024]");
         let image = Mat::from_vec(3, side * side, img_flat);
 
-        let statics =
-            hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
-        let embeds =
-            build_inputs_embeds(&weights, &statics, &image, &prompt_ids)
-                .expect("build inputs_embeds");
+        let statics = hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
+        let embeds = build_inputs_embeds(&weights, &statics, &image, &prompt_ids)
+            .expect("build inputs_embeds");
         assert_eq!(embeds.rows, prompt_ids.len());
         assert_eq!(embeds.cols, 1024);
 

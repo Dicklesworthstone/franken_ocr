@@ -1,0 +1,150 @@
+{
+  "reference": "/Users/jemanuel/.cache/franken_ocr/corpus/ref_bf16",
+  "candidate": "/Users/jemanuel/.cache/franken_ocr/corpus/arm_g32",
+  "aggregate_cer": 0.08620467157052523,
+  "total_edits": 4676,
+  "total_reference_chars": 54243,
+  "pages": [
+    {
+      "page": "page_0009",
+      "ref_chars": 105,
+      "cand_chars": 135,
+      "edits": 44,
+      "cer": 0.41904761904761906
+    },
+    {
+      "page": "page_0590",
+      "ref_chars": 11762,
+      "cand_chars": 9651,
+      "edits": 4370,
+      "cer": 0.3715354531542255
+    },
+    {
+      "page": "page_0645",
+      "ref_chars": 3256,
+      "cand_chars": 3315,
+      "edits": 108,
+      "cer": 0.033169533169533166
+    },
+    {
+      "page": "page_0019",
+      "ref_chars": 2447,
+      "cand_chars": 2472,
+      "edits": 53,
+      "cer": 0.021659174499387004
+    },
+    {
+      "page": "page_0105",
+      "ref_chars": 1961,
+      "cand_chars": 1961,
+      "edits": 21,
+      "cer": 0.010708822029576747
+    },
+    {
+      "page": "page_0358",
+      "ref_chars": 2658,
+      "cand_chars": 2662,
+      "edits": 13,
+      "cer": 0.004890895410082769
+    },
+    {
+      "page": "page_0086",
+      "ref_chars": 2445,
+      "cand_chars": 2449,
+      "edits": 11,
+      "cer": 0.004498977505112475
+    },
+    {
+      "page": "page_0014",
+      "ref_chars": 528,
+      "cand_chars": 530,
+      "edits": 2,
+      "cer": 0.003787878787878788
+    },
+    {
+      "page": "page_0250",
+      "ref_chars": 2467,
+      "cand_chars": 2469,
+      "edits": 9,
+      "cer": 0.0036481556546412645
+    },
+    {
+      "page": "page_0400",
+      "ref_chars": 2734,
+      "cand_chars": 2734,
+      "edits": 8,
+      "cer": 0.002926115581565472
+    },
+    {
+      "page": "page_0126",
+      "ref_chars": 2747,
+      "cand_chars": 2740,
+      "edits": 8,
+      "cer": 0.0029122679286494356
+    },
+    {
+      "page": "page_0547",
+      "ref_chars": 2781,
+      "cand_chars": 2786,
+      "edits": 8,
+      "cer": 0.002876663070837828
+    },
+    {
+      "page": "page_0179",
+      "ref_chars": 2553,
+      "cand_chars": 2554,
+      "edits": 6,
+      "cer": 0.0023501762632197414
+    },
+    {
+      "page": "page_0023",
+      "ref_chars": 2542,
+      "cand_chars": 2542,
+      "edits": 5,
+      "cer": 0.001966955153422502
+    },
+    {
+      "page": "page_0107",
+      "ref_chars": 2577,
+      "cand_chars": 2577,
+      "edits": 5,
+      "cer": 0.0019402405898331393
+    },
+    {
+      "page": "page_0557",
+      "ref_chars": 2538,
+      "cand_chars": 2537,
+      "edits": 3,
+      "cer": 0.001182033096926714
+    },
+    {
+      "page": "page_0437",
+      "ref_chars": 1435,
+      "cand_chars": 1435,
+      "edits": 1,
+      "cer": 0.0006968641114982578
+    },
+    {
+      "page": "page_0136",
+      "ref_chars": 1716,
+      "cand_chars": 1716,
+      "edits": 1,
+      "cer": 0.0005827505827505828
+    },
+    {
+      "page": "page_0091",
+      "ref_chars": 2461,
+      "cand_chars": 2461,
+      "edits": 0,
+      "cer": 0.0
+    },
+    {
+      "page": "page_0108",
+      "ref_chars": 2530,
+      "cand_chars": 2530,
+      "edits": 0,
+      "cer": 0.0
+    }
+  ],
+  "missing": []
+}

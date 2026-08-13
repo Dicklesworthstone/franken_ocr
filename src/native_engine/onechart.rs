@@ -39,9 +39,17 @@ pub const HIDDEN: usize = 768;
 /// `Linear(1024→768, bias=True)` (census §3). Returns `[256, 768]`
 /// token-major rows, ready for the `<imgpad>` splice.
 ///
+/// When `statics.sam` is `None` the tower streams per block from `weights`,
+/// which also selects the bounded global-attention kernel. Both arms run the
+/// same `forward_core` body, so the features are bit-identical.
+///
 /// # Errors
 /// A tower/hydration error, or a projector shape violation.
-pub fn vision_features(statics: &OnechartStatics, image: &Mat) -> FocrResult<Mat> {
+pub fn vision_features(
+    weights: &Weights,
+    statics: &OnechartStatics,
+    image: &Mat,
+) -> FocrResult<Mat> {
     let side = (image.cols as f64).sqrt() as usize;
     if side * side != image.cols || image.rows != 3 {
         return Err(crate::FocrError::Other(anyhow::anyhow!(
@@ -50,7 +58,10 @@ pub fn vision_features(statics: &OnechartStatics, image: &Mat) -> FocrResult<Mat
             image.cols
         )));
     }
-    let sam = vision_sam::forward_with(&statics.sam, image, side, side)?; // [1024, 256]
+    let sam = match statics.sam.as_ref() {
+        Some(tower) => vision_sam::forward_with(tower, image, side, side)?, // [1024, 256]
+        None => vision_sam::forward_streamed(weights, image, &statics.prefix)?,
+    };
     let sam_t = transpose(&sam); // [256, 1024] token-major
     statics.proj.apply(&sam_t) // [256, 768]
 }
@@ -60,8 +71,11 @@ pub fn vision_features(statics: &OnechartStatics, image: &Mat) -> FocrResult<Mat
 /// and cached on the [`super::OcrModel`] (bd-av64.10 pass 6 idiom: the page
 /// loop re-widened all three per page).
 pub struct OnechartStatics {
-    /// The hydrated SAM-ViT-B tower (`model.vision_tower`).
-    pub sam: vision_sam::SamWeights,
+    /// The hydrated SAM-ViT-B tower (`model.vision_tower`), or `None` when the
+    /// tower streams per block instead of being retained.
+    pub sam: Option<vision_sam::SamWeights>,
+    /// The SAM tensor-name prefix, kept so the streamed arm can re-read blocks.
+    pub prefix: String,
     /// The `mm_projector` `Linear(1024→768)+bias` (pre-transposed).
     pub proj: Linear,
     /// The widened `[vocab, hidden]` OPT embed table.
@@ -72,10 +86,21 @@ pub struct OnechartStatics {
 ///
 /// # Errors
 /// A missing or mis-shaped tensor.
-pub fn hydrate_statics(weights: &Weights, prefix: &str) -> FocrResult<OnechartStatics> {
+pub fn hydrate_statics(
+    weights: &Weights,
+    prefix: &str,
+    stream_vision: bool,
+) -> FocrResult<OnechartStatics> {
     let th = Instant::now();
     let statics = OnechartStatics {
-        sam: vision_sam::sam_weights_from(weights, prefix)?,
+        // Streaming skips the retained f32 tower; the per-block path hydrates
+        // and drops one block at a time from the same bf16 source.
+        sam: if stream_vision {
+            None
+        } else {
+            Some(vision_sam::sam_weights_from(weights, prefix)?)
+        },
+        prefix: prefix.to_string(),
         proj: Linear::from_row_major(
             &weights.vec("model.mm_projector.weight")?,
             weights.vec("model.mm_projector.bias")?,
@@ -85,7 +110,8 @@ pub fn hydrate_statics(weights: &Weights, prefix: &str) -> FocrResult<OnechartSt
         embed: weights.mat("model.decoder.embed_tokens.weight")?,
     };
     super::timing_log(&format!(
-        "  onechart.hydrate(cached) {:.2}s",
+        "  onechart.hydrate({}) {:.2}s",
+        if stream_vision { "streamed" } else { "cached" },
         th.elapsed().as_secs_f64()
     ));
     Ok(statics)
@@ -331,7 +357,7 @@ pub fn recognize(
 ) -> FocrResult<ChartResult> {
     let tv = Instant::now();
     let image = crate::preprocess::onechart_view_tensor(img);
-    let vision = vision_features(statics, &image)?;
+    let vision = vision_features(weights, statics, &image)?;
     let prompt_ids = chart_prompt_ids(tk)?;
     let embeds = build_inputs_embeds(statics, &vision, &prompt_ids)?;
     super::timing_log(&format!(
@@ -447,7 +473,7 @@ pub fn recognize_batch(
     let mut caps: Vec<usize> = Vec::with_capacity(imgs.len());
     for img in imgs {
         let image = crate::preprocess::onechart_view_tensor(img);
-        let vision = vision_features(statics, &image)?;
+        let vision = vision_features(weights, statics, &image)?;
         let embeds = build_inputs_embeds(statics, &vision, &prompt_ids)?;
         // OQ-D7: the learned position table has 4096 usable rows — hard-stop.
         caps.push(max_new.min(4096usize.saturating_sub(embeds.rows)));
@@ -503,7 +529,7 @@ mod tests {
         // An empty weights bundle must fail loud (missing tower tensors), not
         // panic — the ModelNotFound/FormatMismatch rail.
         let w = Weights::default();
-        assert!(hydrate_statics(&w, "model.vision_tower").is_err());
+        assert!(hydrate_statics(&w, "model.vision_tower", false).is_err());
     }
 
     /// **D4-prefill — the OPT decoder vs the torch oracle** (skip-with-SUCCESS
@@ -558,7 +584,7 @@ mod tests {
         assert_eq!(prompt_ids.len(), 308, "measured census prompt length");
 
         let weights = Weights::load(std::path::Path::new(&model_path)).expect("weights");
-        let statics = hydrate_statics(&weights, "model.vision_tower").expect("statics");
+        let statics = hydrate_statics(&weights, "model.vision_tower", false).expect("statics");
         let vision = Mat::from_vec(VISION_TOKENS, HIDDEN, read_f32(&proj_path));
         let embeds = build_inputs_embeds(&statics, &vision, &prompt_ids).expect("splice");
         let cfg = super::super::decoder_qwen2::DecoderConfig::onechart();
@@ -664,7 +690,7 @@ mod tests {
 
         // HARD leg: f32.
         let weights = Weights::load(std::path::Path::new(&f32_path)).expect("f32 weights");
-        let statics = hydrate_statics(&weights, "model.vision_tower").expect("f32 statics");
+        let statics = hydrate_statics(&weights, "model.vision_tower", false).expect("f32 statics");
         let res = recognize(&weights, &statics, &tk, &img, 512).expect("recognize");
         eprintln!("[D6 e2e f32] json: {}", res.json_text);
         eprintln!(
@@ -710,7 +736,7 @@ mod tests {
         let int8_path = format!("{dir}/onechart.int8.focrq");
         if std::path::Path::new(&int8_path).is_file() {
             let w8 = Weights::load(std::path::Path::new(&int8_path)).expect("int8 artifact");
-            let statics8 = hydrate_statics(&w8, "model.vision_tower").expect("int8 statics");
+            let statics8 = hydrate_statics(&w8, "model.vision_tower", false).expect("int8 statics");
             if let Ok(r8) = recognize(&w8, &statics8, &tk, &img, 256) {
                 let n_vals = ["30", "45", "25", "10"]
                     .iter()
@@ -780,7 +806,7 @@ mod tests {
         let mut n_valid_json = 0usize;
         let mut head_dists = Vec::new();
         let mut value_errs = Vec::new();
-        let statics = hydrate_statics(weights, "model.vision_tower").expect("statics");
+        let statics = hydrate_statics(weights, "model.vision_tower", false).expect("statics");
         let charts = manifest["charts"].as_array().unwrap();
         for chart in charts {
             let file = chart["file"].as_str().unwrap();
@@ -1005,7 +1031,7 @@ mod tests {
             Weights::load(std::path::Path::new(&model_path)).expect("weights")
         };
         let vision = Mat::from_vec(VISION_TOKENS, HIDDEN, read_f32(&proj_path));
-        let statics = hydrate_statics(&weights, "model.vision_tower").expect("statics");
+        let statics = hydrate_statics(&weights, "model.vision_tower", false).expect("statics");
         let embeds = build_inputs_embeds(&statics, &vision, &prompt_ids).expect("splice");
         let cfg = super::super::decoder_qwen2::DecoderConfig::onechart();
 
@@ -1103,9 +1129,9 @@ mod tests {
         assert_eq!(want.len(), VISION_TOKENS * HIDDEN, "proj_out not [256,768]");
 
         let weights = Weights::load(std::path::Path::new(&model_path)).expect("weights");
-        let statics = hydrate_statics(&weights, "model.vision_tower").expect("statics");
+        let statics = hydrate_statics(&weights, "model.vision_tower", false).expect("statics");
         let image = Mat::from_vec(3, 1024 * 1024, pre);
-        let ours = vision_features(&statics, &image).expect("vision");
+        let ours = vision_features(&weights, &statics, &image).expect("vision");
         assert_eq!((ours.rows, ours.cols), (VISION_TOKENS, HIDDEN));
 
         let mut dot = 0.0f64;

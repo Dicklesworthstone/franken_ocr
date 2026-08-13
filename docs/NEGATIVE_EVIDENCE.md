@@ -696,6 +696,54 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-mmap-load/
 
+2026-08-13 | NEGATIVE(reverted) | coarsen the wasm int4 expert group size to a uniform g32 (`FOCR_INT4_GROUPS=32`)
+  claim_id: CLAIM-int4-groups-g32-sweep   evidence_id: artifacts/perf/bd-int4-groups/g32-sweep/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    model-00001-of-000001.safetensors sha256 2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6
+      (downloaded from baidu/Unlimited-OCR and digest-verified before conversion)
+    shipped arm: unlimited-ocr.wasm-int4.focrq sha256 2653831ccd7f481f898f80ae5c95fa1ec7ee2a5a18005d3c927ddf64ed75e187 (3,003,988,117 B)
+    swept arm:   unlimited-g32.focrq          sha256 8ac49215b1c3281f3231a12b077a330c9aac0f0907faa004039f40093a9a3695 (2,793,637,840 B)
+    corpus: the 20 archive pages, page_0590.png sha256 6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3
+      (matches the pin in DISCREPANCIES.md, so this is the same corpus the published rows used)
+  CPU feature string: Apple M4 Pro arm64, aarch64+neon+dotprod, dense route Autovec
+  exact command + env:
+    reference: `FOCR_MODEL_PATH=<bf16 safetensors dir> scripts/corpus_cer.py run` over all 20 pages
+    arms:      `FOCR_INT4_GROUPS=32 focr convert <bf16> -o unlimited-g32.focrq --quant int4`, then
+               `scripts/corpus_cer.py run <artifact> <pages> <out>` and `... score <ref> <cand> --budget 0.25`
+  fallback / kill-switch state: `FOCR_INT4_GROUPS` unset restores the shipped per-tensor policy
+    (g16 gate/down, g32 up). The recipe id is UNCHANGED by design: it names the dtype policy, which is
+    identical across group sizes, and it gates decode routing in five places — minting a new id per
+    sweep point would change the route and confound the measurement.
+  measured before -> after vs reference:
+    REFERENCE IS THE bf16-SOURCE DECODE, i.e. this measures DIVERGENCE from full precision, not
+    accuracy. `docs/DISCREPANCIES.md` is explicit that no ground truth exists for these scans.
+    size:            3,003,988,117 -> 2,793,637,840 B (-210,350,277, -7.0%)
+    aggregate CER:   0.1142820 -> 0.0862047   <-- LOOKS like a 25% improvement. It is not.
+    page_0590 is 96.3% of the baseline's edits and 93.5% of the swept arm's, and is catastrophically
+    diverged in BOTH (0.5075 / 0.3715). A page already in a degenerate repeat/truncation regime moves
+    chaotically under any perturbation, so its swing is noise, not signal, and it swamps the aggregate.
+    Decision-relevant numbers, with that page removed:
+      aggregate EXCLUDING page_0590: 0.0054142 -> 0.0072032  (+33.0% MORE divergence)
+      per-page verdict: 12 WORSE, 6 better, 2 unchanged
+      pages byte-identical to the bf16 decode: 5 -> 2
+      worst single regression: page_0009 0.0095238 -> 0.4190476 (a 105-char page)
+  bit-exact correctness proof: n/a — this lever is deliberately numerics-affecting. The proof obligation
+    here is the corpus itself, and it fails: the swept arm reproduces the full-precision decode on
+    fewer pages and diverges further on the pages that are not already broken.
+  disposition: REVERT. 7% of artifact size is not worth a third more divergence on every well-behaved
+    page. The shipped g16/g32 split is the measured sensitivity order and it earns its metadata cost.
+    The `FOCR_INT4_GROUPS` knob is KEPT as an experiment-only sweep lever (it changes nothing unset),
+    but no swept artifact ships.
+  do-not-retry: "do not re-run a uniform-group sweep on aggregate CER alone. This corpus has one page
+    (page_0590) carrying >90% of all edits in every arm, so the aggregate is a proxy for that page's
+    coin flip. Any future quantization sweep MUST report the per-page verdict and the aggregate with
+    the degenerate page excluded, or it will conclude the opposite of the truth — as the raw aggregate
+    does here."
+  per-lever tally: W 0 / L 1 / N 0
+  agent: Claude Opus 5
+  evidence dir: artifacts/perf/bd-int4-groups/g32-sweep/
+
 2026-08-12 | PROVISIONAL_LOCAL_WIN | mmap as the DEFAULT on iOS only (`weights.rs::mmap_requested` -> `cfg!(target_os = "ios")`), plus `MADV_RANDOM`
   claim_id: CLAIM-bd-r9po-ios-mmap-residency   evidence_id: artifacts/perf/bd-r9po/ios-mmap-residency/
   model source commit + fixture hash:
@@ -720,7 +768,7 @@ claims.
   bit-exact correctness proof:
     both runs' Markdown stdout is byte-identical (sha256 2e597eb978c6ab57608d69cf5d4f3c9db29a46865cda05b620f0afeb54b550a0
     for BOTH owned.stdout.md and mapped.stdout.md in the evidence dir). Mapping changes where bytes live, never what they are.
-  disposition: ACCEPT FOR iOS ONLY. This does not reopen the desktop default rejected on 2026-07-10 above.
+  disposition: KEEP, for iOS only. This does not reopen the desktop default rejected on 2026-07-10 above.
     That entry's do-not-retry demanded "an enforceable immutability mechanism, not a path/rename convention" before any
     default could change. iOS supplies one that a desktop cannot: the artifact lives inside the app's own container, which
     the sandbox makes unreachable to every other process on the device, and the downloader stages to a temp file and renames,
