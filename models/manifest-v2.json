@@ -68,8 +68,8 @@
                 "size": 813877416,
                 "sha256": "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f",
                 "urls": [
-                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/got-ocr2.int8.focrq",
-                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/got-ocr2.int8.focrq"
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/got-ocr2.int8.focrq",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/got-ocr2.int8.focrq"
                 ]
               }
             ]
@@ -85,8 +85,8 @@
             "size": 2561218,
             "sha256": "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186",
             "urls": [
-              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/qwen.tiktoken",
-              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/qwen.tiktoken"
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/qwen.tiktoken",
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-got-ocr2-v1/qwen.tiktoken"
             ]
           }
         ]
@@ -106,8 +106,8 @@
                 "size": 1087397293,
                 "sha256": "4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc",
                 "urls": [
-                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-smolvlm2-v1/smolvlm2.int8.focrq",
-                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/smolvlm2/smolvlm2.int8.focrq"
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/smolvlm2/smolvlm2.int8.focrq",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-smolvlm2-v1/smolvlm2.int8.focrq"
                 ]
               }
             ]
@@ -123,8 +123,8 @@
             "size": 3548256,
             "sha256": "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a",
             "urls": [
-              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-smolvlm2-v1/tokenizer.json",
-              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/smolvlm2/tokenizer.json"
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/smolvlm2/tokenizer.json",
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-smolvlm2-v1/tokenizer.json"
             ]
           }
         ]
@@ -144,8 +144,8 @@
                 "size": 362863824,
                 "sha256": "618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2",
                 "urls": [
-                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/onechart.int8.focrq",
-                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/onechart.int8.focrq"
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/onechart.int8.focrq",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/onechart.int8.focrq"
                 ]
               }
             ]
@@ -161,8 +161,8 @@
             "size": 999355,
             "sha256": "32b29acf82d3333462eb4b13416760f2aef956052e8fea1749fe5b20f866a4bf",
             "urls": [
-              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/vocab.json",
-              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/vocab.json"
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/vocab.json",
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/vocab.json"
             ]
           }
         ]
@@ -177,8 +177,8 @@
               "size": 456318,
               "sha256": "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
               "urls": [
-                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/merges.txt",
-                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/merges.txt"
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/merges.txt",
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/merges.txt"
               ]
             }
           ]
@@ -192,8 +192,8 @@
               "size": 82,
               "sha256": "e1b04af1435ff5b45b9a2b524edd38b2abbb71e9e747e80fb70cf547941c6e87",
               "urls": [
-                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/added_tokens.json",
-                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/added_tokens.json"
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/onechart/added_tokens.json",
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-onechart-v1/added_tokens.json"
               ]
             }
           ]
@@ -214,8 +214,8 @@
                 "size": 61107485,
                 "sha256": "cced11c0f05656dd54cc615a15939c472dc8f916f04ae154ea4a0364839f845a",
                 "urls": [
-                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tromr.int8.focrq",
-                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tromr.int8.focrq"
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tromr.int8.focrq",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tromr.int8.focrq"
                 ]
               }
             ]
@@ -232,8 +232,8 @@
                 "size": 86168002,
                 "sha256": "a9d41485a98534ad0a1f7c1ec624f0a92f3f092c7dc30ac5af636b50dc465edc",
                 "urls": [
-                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tromr.focrq",
-                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tromr.focrq"
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tromr.focrq",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tromr.focrq"
                 ]
               }
             ]
@@ -249,8 +249,8 @@
             "size": 10743,
             "sha256": "603bfef760e8424f7808acba423532b4beb2d88dbf085f81add6a8e543a34035",
             "urls": [
-              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_rhythm.json",
-              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_rhythm.json"
+              "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_rhythm.json",
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_rhythm.json"
             ]
           }
         ]
@@ -265,8 +265,8 @@
               "size": 2682,
               "sha256": "2382e8b20c1473290e200789604656b3a06bdf4b55a0818a0f7d175e8cb64ade",
               "urls": [
-                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_pitch.json",
-                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_pitch.json"
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_pitch.json",
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_pitch.json"
               ]
             }
           ]
@@ -280,8 +280,8 @@
               "size": 979,
               "sha256": "b61ba09cecd5bc343e6a038a2e26718b54cd3c08e8f9b72013ecf80c3cac86b2",
               "urls": [
-                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_lift.json",
-                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_lift.json"
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_lift.json",
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_lift.json"
               ]
             }
           ]
@@ -295,8 +295,8 @@
               "size": 830,
               "sha256": "504d886d11e3c1fe92893abd46edfc68dfbe7a8eb83e6b51646532dad8a485e1",
               "urls": [
-                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_note.json",
-                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_note.json"
+                "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/tromr/tokenizer_note.json",
+                "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-tromr-v1/tokenizer_note.json"
               ]
             }
           ]
