@@ -762,13 +762,33 @@ claims.
                mmap, STREAMED tower       1,965,229,976   ( 5.06 s)   -1.74 GB vs cached, -47.0%
     OneChart   mmap, cached tower         2,701,052,640   ( 6.95 s)
                mmap, STREAMED tower       2,499,676,752   ( 4.45 s)   -0.20 GB vs cached,  -7.5%
+    !! THE ONECHART STREAMED ROW ABOVE IS WRONG. CORRECTED 2026-08-13 — see below. !!
+
+  CORRECTION (2026-08-13, same day, before this entry was relied on):
+    The OneChart streamed arm was measured with a binary that PREDATED its own wiring. OneChart's
+    statics accessor did not pass `stream_vision_tower()` until commit 43c72d6, so `FOCR_STREAM_VISION=1`
+    was inert for that model and the "streamed" arm silently ran the retained tower. The 0.20 GB gap I
+    recorded was run-to-run mmap variance, not a lever effect — and I then reasoned FROM that noise to
+    the conclusion that OneChart was not phone-viable, which was false.
+    The tell was in the number itself and I missed it: 0.20 GB is SMALLER than the ~382 MB f32 tower the
+    switch removes, so the arm could not have been streaming. A residency win that is smaller than the
+    object it frees is not a small win, it is a broken measurement.
+    Re-measured with the current binary, paired back-to-back, two rounds each:
+      OneChart   mmap, cached tower       2,434,632,224 / 2,590,444,184   (4.69 s / 4.23 s)
+                 mmap, STREAMED tower       810,730,552 /   806,732,856   (5.23 s / 4.98 s)
+                                          -1.70 GB vs cached, -67.6%
+    GOT-OCR2 re-verified on the same binary and reproduces the original row within noise:
+      GOT-OCR2   cached   3,846,164,344 / 3,645,312,720   streamed 1,961,363,328 / 1,942,538,136
+    Output stayed byte-identical in every arm (OneChart d7f9b42f…, GOT 747eef72…), which is exactly why
+    the bad number survived: the correctness gate was green and only the residency claim was wrong.
+    Timing claim also corrected: the original "streaming is also FASTER on both models" does not hold up
+    under paired runs. GOT is a wash (streamed 4.95-5.20 s vs cached 4.91-6.97 s, the cached spread being
+    mmap warm-up), and OneChart streaming is slightly SLOWER (4.98-5.23 s vs 4.23-4.69 s). Treat vision
+    streaming as a residency lever that is roughly time-neutral, not a free speedup.
     Two independent effects, both from the same switch: the ~382 MB f32 tower is never retained, and
     `forward_streamed` sets `low_mem=true`, which selects the bounded query-slab global attention in
-    place of the unbounded kernel `forward_with` was using (~0.8 GB of transient scratch). Streaming is
-    also FASTER on both models, which is not the usual direction for a residency lever — less allocator
-    and memory traffic outweighs re-reading blocks from the mapped blob.
-    OneChart's win is an order of magnitude smaller than GOT's and is reported as such rather than
-    averaged in; at 2.50 GB it is NOT yet a comfortable phone number, and it stays out of the iOS picker.
+    place of the unbounded kernel `forward_with` was using (~0.8 GB of transient scratch).
+    At 0.81 GB OneChart is the SMALLEST of the four models, not the one that misses the bar.
   bit-exact correctness proof:
     stdout is byte-identical between the cached and streamed arms for BOTH models — sha256
     747eef72fc1e4c6a3130646eee5469493790f3b8494ece5bfb10af6f2f8598c5 (GOT, both arms) and
@@ -779,11 +799,15 @@ claims.
     selects). End-to-end gate on real weights: `got::tests::streamed_vision_is_bit_identical_to_cached`,
     model-gated on `FOCR_GOT_MODEL`, skip-with-success when the artifact is absent — a synthetic tower
     cannot drive it because `forward_core` hardcodes the real neck geometry (256/512/1024).
-  disposition: KEEP. GOT-OCR2 at 1.97 GB is phone-viable for the first time and is now in the iOS model
-    picker; OneChart is kept streamed (it is strictly better) but stays out of the picker on its number.
+  disposition: KEEP. GOT-OCR2 at 1.97 GB and OneChart at 0.81 GB are both phone-viable and both are now
+    in the iOS model picker (OneChart added on the corrected number, not the original one).
   do-not-retry: "do not gate vision residency on an artifact's recipe string again. The previous gate
     (`artifact_stores_gated_int8`, the Unlimited-OCR wasm recipe id) is exactly why two models that
     could use this path never got it, and why both shipped hydrating a tower they did not need."
+  do-not-retry: "do not A/B an env-gated lever without first proving the gate is LIVE in the binary
+    under test. One assert that the two arms differ at all — a log line, a differing timing, anything —
+    would have caught the inert OneChart switch immediately. Byte-identical output across arms is NOT
+    evidence the lever ran; for a residency lever it is expected either way."
   per-lever tally: W 1 / L 0 / N 0
   agent: Claude Opus 5
   evidence dir: artifacts/perf/bd-f81z/streamed-vision/

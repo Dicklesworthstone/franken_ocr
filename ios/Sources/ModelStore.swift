@@ -216,6 +216,39 @@ enum ModelCatalog {
         producesMusicXML: false
     )
 
+    static let oneChart = ModelSpec(
+        id: "onechart",
+        label: "OneChart",
+        shortName: "OneChart",
+        license: "OneChart (kppkkp) - Apache-2.0",
+        releaseTag: "models-onechart-v1",
+        huggingFaceRepo: "Dicklesworthstone/franken_ocr-weights",
+        huggingFaceSubdir: "onechart",
+        weights: ModelAsset(
+            name: "onechart.int8.focrq",
+            bytes: 362_863_824,
+            sha256: "618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2"
+        ),
+        sidecars: [
+            ModelAsset(name: "vocab.json",
+                       bytes: 999_355,
+                       sha256: "32b29acf82d3333462eb4b13416760f2aef956052e8fea1749fe5b20f866a4bf"),
+            ModelAsset(name: "merges.txt",
+                       bytes: 456_318,
+                       sha256: "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5"),
+            ModelAsset(name: "added_tokens.json",
+                       bytes: 82,
+                       sha256: "e1b04af1435ff5b45b9a2b524edd38b2abbb71e9e747e80fb70cf547941c6e87"),
+        ],
+        decodeGuard: 0,
+        // MEASURED with the streamed SAM tower: 806,732,856-810,730,552 bytes
+        // across paired runs, down from ~2.5 GB retained. The smallest of the
+        // four by a wide margin, so 4 GB is generous rather than tight.
+        minimumDeviceMemory: 4 * 1024 * 1024 * 1024,
+        blurb: "Charts into structured data: series, labels, and values you can paste into a sheet.",
+        producesMusicXML: false
+    )
+
     /// The models this build actually runs.
     ///
     /// GOT-OCR2 earned its place by measurement: streaming its SAM tower per
@@ -228,11 +261,13 @@ enum ModelCatalog {
     /// than a free win — it costs ~6% wall time, because streaming gives up the
     /// frame-batched tower — so streaming is default-ON for iOS only.
     ///
-    /// OneChart is still absent, and for a reason worth keeping written down:
-    /// streaming bought it only 0.20 GB (2.70 -> 2.50 GB), which is not yet a
-    /// comfortable phone number. Shipping it now would ship a model that gets
-    /// the app killed.
-    static let all: [ModelSpec] = [unlimitedOCR, gotOCR2, smolVLM2, tromr]
+    /// OneChart was excluded here on a measurement that turned out to be
+    /// broken: its streamed arm had been timed against a binary that predated
+    /// its own wiring, so the switch was inert and the 0.20 GB "win" was noise.
+    /// Re-measured, it streams to 0.81 GB — the smallest of the four. The
+    /// correction and the tell that should have caught it are written up in
+    /// `docs/NEGATIVE_EVIDENCE.md`.
+    static let all: [ModelSpec] = [unlimitedOCR, gotOCR2, smolVLM2, oneChart, tromr]
 
     static func spec(id: String) -> ModelSpec? { all.first { $0.id == id } }
 }
