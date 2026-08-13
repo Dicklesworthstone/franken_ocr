@@ -410,6 +410,30 @@ fn unlimited_vision_cache_enabled() -> bool {
     })
 }
 
+/// Stream the vision tower per block instead of retaining a hydrated f32 copy.
+///
+/// This is the residency lever for the models whose tower is NOT covered by the
+/// Unlimited-OCR wasm recipe gate: GOT-OCR2 and OneChart hydrate a ~382 MB f32
+/// SAM tower AND run the unbounded global-attention kernel (~0.8 GB of transient
+/// scratch), which together are most of why they measure over 3 GB. Streaming
+/// hydrates one block at a time from the same bf16 source and selects the
+/// bounded query-slab attention, which is bit-identical by construction (both
+/// arms run one `forward_core` body).
+///
+/// Default ON for iOS, where the whole point is fitting a phone, and OFF
+/// elsewhere so desktop keeps the throughput of a retained tower. `FOCR_STREAM_VISION`
+/// overrides in both directions for A/B measurement.
+fn stream_vision_tower() -> bool {
+    static STREAM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *STREAM.get_or_init(|| match std::env::var("FOCR_STREAM_VISION").ok() {
+        Some(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "on" | "true" | "yes"
+        ),
+        None => cfg!(target_os = "ios"),
+    })
+}
+
 /// Use the experimental all-int8 decoder cache instead of the conservative
 /// recipe path. A truthy value requests it, but the request is accepted only
 /// when `FOCR_INT8_ATTN` and `FOCR_INT8_LMHEAD` are also truthy because this
@@ -3166,7 +3190,11 @@ impl OcrModel {
     /// A missing or mis-shaped GOT tensor.
     fn got_statics(&self) -> FocrResult<&got::GotStatics> {
         self.got_statics.get_or_try_init(|| {
-            got::hydrate_statics(&self.weights, self.arch().vision_tower_prefix())
+            got::hydrate_statics(
+                &self.weights,
+                self.arch().vision_tower_prefix(),
+                stream_vision_tower(),
+            )
         })
     }
 
