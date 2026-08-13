@@ -1286,9 +1286,20 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         .and_then(|p| crate::storage::RunStore::open(&p))
         .and_then(|store| store.insert_run(&record))
     {
-        let _ = progress::try_stderr_message(format_args!(
-            "[focr] run-store note (telemetry only, run unaffected): {e}"
-        ));
+        // Robot mode contracts for a machine-readable stream and NOTHING else
+        // on stderr, so the human note is dropped there rather than corrupting
+        // a consumer's parse. The store is best-effort telemetry either way,
+        // and the run's own outcome is already reported as a `run_error`
+        // event with the same exit code.
+        //
+        // This is reachable on any user whose `~/.cache/franken_ocr/runs.db`
+        // is unhealthy — an empty `_meta` is enough — which is a property of
+        // the machine, not of the run being recorded.
+        if !robot_mode {
+            let _ = progress::try_stderr_message(format_args!(
+                "[focr] run-store note (telemetry only, run unaffected): {e}"
+            ));
+        }
     }
     outcome
 }

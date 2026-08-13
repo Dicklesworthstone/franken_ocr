@@ -33,10 +33,15 @@ struct ModelSpec: Sendable, Identifiable {
     let shortName: String
     let license: String
     let releaseTag: String
-    /// `owner/repo[/subdir]` on HuggingFace, or nil while no public mirror
-    /// exists for this model. Mirrors `models/manifest-v2.json`, which is the
-    /// source of truth for what is actually published where.
+    /// `owner/repo` on HuggingFace, or nil while no public mirror exists for
+    /// this model. Mirrors `models/manifest-v2.json`, which is the source of
+    /// truth for what is actually published where.
     let huggingFaceRepo: String?
+    /// Path inside the repo, e.g. `"tromr/"`, or `""` for the repo root. Kept
+    /// SEPARATE from the repo id because the resolve URL interleaves them —
+    /// `…/{repo}/resolve/main/{subdir}{file}` — so folding the subdirectory into
+    /// the repo field silently produces a 404 that falls back to GitHub.
+    let huggingFaceSubdir: String
     let weights: ModelAsset
     let sidecars: [ModelAsset]
     /// Sliding no-repeat n-gram guard applied at load. 0 leaves the engine
@@ -67,7 +72,7 @@ struct ModelSpec: Sendable, Identifiable {
     var baseURLs: [URL] {
         var urls: [URL] = []
         if let hf = huggingFaceRepo {
-            urls.append(URL(string: "https://huggingface.co/\(hf)/resolve/main/")!)
+            urls.append(URL(string: "https://huggingface.co/\(hf)/resolve/main/\(huggingFaceSubdir)")!)
         }
         urls.append(
             URL(string: "https://github.com/Dicklesworthstone/franken_ocr/releases/download/\(releaseTag)/")!
@@ -89,11 +94,12 @@ enum ModelCatalog {
         shortName: "Unlimited-OCR",
         license: "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
         releaseTag: "models-unlimited-wasm-v1",
-        // No HuggingFace mirror published for the wasm-int4 artifact yet, so
-        // this lane is GitHub-only and carries that host's 503 risk. HF has no
-        // 2 GiB per-file cap either, so a mirror could ship the 3.0 GB artifact
-        // whole and retire the two-part split entirely (bd, see beads).
-        huggingFaceRepo: nil,
+        // Both split parts are mirrored at the repo root. HF has no 2 GiB
+        // per-file cap, so the whole 3.0 GB artifact is published there too and
+        // the two-part split could eventually be retired — but only once GitHub
+        // stops being the fallback, since it cannot serve the unsplit file.
+        huggingFaceRepo: "Dicklesworthstone/franken_ocr-weights",
+        huggingFaceSubdir: "", // repo root
         weights: ModelAsset(
             name: "unlimited-ocr.wasm-int4.focrq",
             bytes: 3_003_988_117,
@@ -129,7 +135,8 @@ enum ModelCatalog {
         // Matches the mirror `models/manifest-v2.json` already lists. NOTE: at
         // the time of writing that repo answers 401, so this path is a no-op
         // until it is made public — the GitHub fallback carries the download.
-        huggingFaceRepo: "Dicklesworthstone/franken_ocr-weights/tromr",
+        huggingFaceRepo: "Dicklesworthstone/franken_ocr-weights",
+        huggingFaceSubdir: "tromr/",
         weights: ModelAsset(
             name: "tromr.int8.focrq",
             bytes: 61_107_485,
@@ -151,15 +158,81 @@ enum ModelCatalog {
         producesMusicXML: true
     )
 
+    static let gotOCR2 = ModelSpec(
+        id: "got-ocr2",
+        label: "GOT-OCR2",
+        shortName: "GOT-OCR2",
+        license: "GOT-OCR2.0 - Copyright (c) 2024 Ucas-HaoranWei, Apache-2.0",
+        releaseTag: "models-got-ocr2-v1",
+        huggingFaceRepo: "Dicklesworthstone/franken_ocr-weights",
+        huggingFaceSubdir: "", // repo root
+        weights: ModelAsset(
+            name: "got-ocr2.int8.focrq",
+            bytes: 813_877_416,
+            sha256: "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f"
+        ),
+        sidecars: [
+            ModelAsset(name: "qwen.tiktoken",
+                       bytes: 2_561_218,
+                       sha256: "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186"),
+        ],
+        decodeGuard: 0, // GOT carries its own upstream guard of 20
+        // MEASURED, not guessed: with the streamed vision tower this peaks at
+        // 1,965,229,976 bytes of footprint on an M4 Pro (down from 3.71 GB with
+        // the tower retained). 6 GB-class devices report ~5.7 GB, which clears
+        // it with room; 4 GB devices do not.
+        minimumDeviceMemory: 5 * 1024 * 1024 * 1024,
+        blurb: "Structured output the default cannot produce: formulas, tables, charts, molecules.",
+        producesMusicXML: false
+    )
+
+    static let smolVLM2 = ModelSpec(
+        id: "smolvlm2",
+        label: "SmolVLM2",
+        shortName: "SmolVLM2",
+        license: "SmolVLM2-500M-Video-Instruct (HuggingFaceTB) - Apache-2.0",
+        releaseTag: "models-smolvlm2-v1",
+        huggingFaceRepo: "Dicklesworthstone/franken_ocr-weights",
+        huggingFaceSubdir: "smolvlm2",
+        weights: ModelAsset(
+            name: "smolvlm2.int8.focrq",
+            bytes: 1_087_397_293,
+            sha256: "4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc"
+        ),
+        sidecars: [
+            ModelAsset(name: "tokenizer.json",
+                       bytes: 3_548_256,
+                       sha256: "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a"),
+        ],
+        decodeGuard: 0, // upstream SmolVLM2 has no repetition guard
+        // MEASURED, not guessed: with the streamed SigLIP tower this peaks at
+        // 1,191,758,008-1,195,198,648 bytes of footprint on an M4 Pro across
+        // paired runs (down from 2.03 GB with the tower retained). That is the
+        // smallest of the three, but the bar stays at 4 GB rather than dropping
+        // further: a 4 GB device reports well under 4 GB usable, and this is a
+        // generative model whose decode length the user controls.
+        minimumDeviceMemory: 4 * 1024 * 1024 * 1024,
+        blurb: "Ask a question about a photo, or get a plain-language description.",
+        producesMusicXML: false
+    )
+
     /// The models this build actually runs.
     ///
-    /// GOT-OCR2, SmolVLM2, and OneChart are intentionally absent: each hydrates
-    /// its vision tower to f32 whole (measured wasm peaks of 3.4 GB, 2.8 GB),
-    /// because the streamed per-block residency mode is keyed to the
-    /// Unlimited-OCR recipe. Extending that mode to their towers is the work
-    /// that earns them a place here; shipping them before it would be shipping
-    /// a model that gets the app killed.
-    static let all: [ModelSpec] = [unlimitedOCR, tromr]
+    /// GOT-OCR2 earned its place by measurement: streaming its SAM tower per
+    /// block (instead of retaining a 382 MB f32 copy and running the unbounded
+    /// global-attention kernel) took its peak footprint from 3.71 GB to 1.97 GB,
+    /// byte-identical output. See `docs/NEGATIVE_EVIDENCE.md`.
+    ///
+    /// SmolVLM2 joined the same way: its SigLIP tower now streams per block,
+    /// 2.03 GB -> 1.19 GB, byte-identical. That one is an honest trade rather
+    /// than a free win — it costs ~6% wall time, because streaming gives up the
+    /// frame-batched tower — so streaming is default-ON for iOS only.
+    ///
+    /// OneChart is still absent, and for a reason worth keeping written down:
+    /// streaming bought it only 0.20 GB (2.70 -> 2.50 GB), which is not yet a
+    /// comfortable phone number. Shipping it now would ship a model that gets
+    /// the app killed.
+    static let all: [ModelSpec] = [unlimitedOCR, gotOCR2, smolVLM2, tromr]
 
     static func spec(id: String) -> ModelSpec? { all.first { $0.id == id } }
 }

@@ -188,6 +188,40 @@ struct LabView: View {
                     KeyValueLine(key: "threads:", value: "\(info.threads)")
                 }
 
+                if model.spec.id == "got-ocr2" {
+                    Toggle("Structured output", isOn: $model.gotFormat)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Lab.textMid)
+                        .tint(Lab.accent)
+                    Text("GOT's `OCR with format:` mode: LaTeX formulas, HTML tables, molecular SMILES, geometry. Off, it reads plain text, which the default model already does faster.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Lab.textFaint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if model.spec.id == "smolvlm2" {
+                    // SmolVLM2 has no instruction modes — the task IS the
+                    // question, so this field is the whole control surface for
+                    // the model. Empty restores the model-card caption prompt,
+                    // which is why it is optional rather than validated.
+                    Text("Question")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Lab.textMid)
+                    TextField("Can you describe this image?", text: $model.question, axis: .vertical)
+                        .font(.system(size: 13))
+                        .foregroundStyle(Lab.textPrimary)
+                        .textFieldStyle(.plain)
+                        .lineLimit(1 ... 3)
+                        .textInputAutocapitalization(.sentences)
+                        .submitLabel(.done)
+                        .padding(8)
+                        .background(Lab.inset, in: RoundedRectangle(cornerRadius: 8))
+                    Text("Ask anything about the photo. Left blank, it writes a plain description.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(Lab.textFaint)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
                 if !model.spec.isSupportedOnThisDevice {
                     StatusLine(
                         kind: .warn,

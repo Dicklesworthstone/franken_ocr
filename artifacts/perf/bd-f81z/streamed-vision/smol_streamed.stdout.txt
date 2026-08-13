@@ -1,0 +1,7 @@
+The image is a screenshot of a webpage. The webpage is titled "Hello GOT-OCR2.0" and it contains a text box with the following content:
+
+```
+The quick brown fox jumps over the lazy dog.
+```
+
+Below the text box, there is a line of code

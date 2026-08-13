@@ -3220,7 +3220,7 @@ impl OcrModel {
     /// A missing or mis-shaped SmolVLM2 tensor.
     fn smol_statics(&self) -> FocrResult<&smolvlm2::SmolStatics> {
         self.smol_statics
-            .get_or_try_init(|| smolvlm2::hydrate_statics(&self.weights))
+            .get_or_try_init(|| smolvlm2::hydrate_statics(&self.weights, stream_vision_tower()))
     }
 
     /// Connector + int8 prefill for ONE page whose vision features are ALREADY

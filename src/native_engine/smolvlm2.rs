@@ -114,16 +114,30 @@ pub fn describe_prompt_ids(
 ///
 /// # Errors
 /// A hydration/forward error, or a shape violation.
-pub fn vision_rows(statics: &SmolStatics, frames: &[f32], n_frames: usize) -> FocrResult<Mat> {
-    let sw = &statics.siglip;
-    // The frame-batched tower (bd-av64.10): one transformer pass over all
-    // frames stacked, byte-identical to the sequential per-frame path
-    // (vision_siglip::tests::batched_frames_match_sequential_byte_for_byte).
-    // FOCR_SIGLIP_SEQ=1 is the kill-switch back to the per-frame loop.
-    let post = if std::env::var_os("FOCR_SIGLIP_SEQ").is_some_and(|v| v == "1") {
-        vision_siglip::forward_frames(sw, frames, n_frames)?
-    } else {
-        vision_siglip::forward_frames_batched(sw, frames, n_frames)?
+pub fn vision_rows(
+    weights: &Weights,
+    statics: &SmolStatics,
+    frames: &[f32],
+    n_frames: usize,
+) -> FocrResult<Mat> {
+    // Three arms, all byte-identical to each other:
+    //   * streamed  — no retained tower, one block live at a time
+    //     (vision_siglip::tests::streamed_frames_match_whole_tower_hydration)
+    //   * batched   — one transformer pass over all frames stacked, the
+    //     desktop default (bd-av64.10)
+    //     (vision_siglip::tests::batched_frames_match_sequential_byte_for_byte)
+    //   * sequential — the per-frame reference loop; FOCR_SIGLIP_SEQ=1 is its
+    //     kill-switch, and it only applies to the retained-tower arms since the
+    //     streamed path is already sequential over frames.
+    let post = match statics.siglip.as_ref() {
+        Some(sw) => {
+            if std::env::var_os("FOCR_SIGLIP_SEQ").is_some_and(|v| v == "1") {
+                vision_siglip::forward_frames(sw, frames, n_frames)?
+            } else {
+                vision_siglip::forward_frames_batched(sw, frames, n_frames)?
+            }
+        }
+        None => vision_siglip::forward_frames_streamed(weights, &statics.prefix, frames, n_frames)?,
     };
 
     let ps_cols = vision_siglip::EMBED_DIM * PS_SCALE * PS_SCALE; // 12288
@@ -149,19 +163,32 @@ pub fn vision_rows(statics: &SmolStatics, frames: &[f32], n_frames: usize) -> Fo
 /// hydrated ONCE and cached on the [`super::OcrModel`] (bd-av64.10 pass 6/7
 /// idiom: the describe/VQA path re-widened all three per call).
 pub struct SmolStatics {
-    /// The hydrated SigLIP tower (`model.vision_model`).
-    pub siglip: vision_siglip::SiglipWeights,
+    /// The hydrated SigLIP tower (`model.vision_model`), or `None` when the
+    /// tower is streamed per block — see [`hydrate_statics`].
+    pub siglip: Option<vision_siglip::SiglipWeights>,
     /// The `modality_projection` `Linear(12288→960, no bias)` (pre-transposed).
     pub proj: Linear,
     /// The widened (untied) `[vocab, hidden]` text embed table.
     pub embed: Mat,
+    /// The vision tower's tensor-name prefix, kept so the streamed arm can
+    /// re-address blocks after hydration.
+    pub prefix: String,
 }
+
+/// The SigLIP tower's tensor-name prefix (the SMOLVLM2 descriptor's
+/// `vision_tower_prefix()`).
+const VISION_PREFIX: &str = "model.vision_model";
 
 /// Hydrate a [`SmolStatics`] from the artifact.
 ///
+/// `stream_vision` drops the retained SigLIP tower (~340 MB of f32) in favour
+/// of hydrating one encoder block at a time inside
+/// [`vision_siglip::forward_frames_streamed`]. Bit-identical either way; the
+/// trade is peak residency against re-reading blocks from the mapped blob.
+///
 /// # Errors
 /// A missing or mis-shaped tensor.
-pub fn hydrate_statics(weights: &Weights) -> FocrResult<SmolStatics> {
+pub fn hydrate_statics(weights: &Weights, stream_vision: bool) -> FocrResult<SmolStatics> {
     let th = Instant::now();
     let ps_cols = vision_siglip::EMBED_DIM * PS_SCALE * PS_SCALE; // 12288
     let proj = weights.mat("model.connector.modality_projection.proj.weight")?;
@@ -173,12 +200,22 @@ pub fn hydrate_statics(weights: &Weights) -> FocrResult<SmolStatics> {
         )));
     }
     let statics = SmolStatics {
-        siglip: vision_siglip::siglip_weights_from(weights, "model.vision_model")?,
+        siglip: if stream_vision {
+            None
+        } else {
+            Some(vision_siglip::siglip_weights_from(weights, VISION_PREFIX)?)
+        },
         proj: Linear::from_row_major(&proj.data, Vec::new(), 960, ps_cols)?,
         embed: weights.mat("model.text_model.embed_tokens.weight")?,
+        prefix: VISION_PREFIX.to_string(),
     };
     super::timing_log(&format!(
-        "  smolvlm2.hydrate(cached) {:.2}s",
+        "  smolvlm2.hydrate({}) {:.2}s",
+        if stream_vision {
+            "streamed vision"
+        } else {
+            "cached"
+        },
         th.elapsed().as_secs_f64()
     ));
     Ok(statics)
@@ -223,7 +260,7 @@ pub fn recognize(
 ) -> FocrResult<String> {
     let tv = Instant::now();
     let pre = preprocess::preprocess_smolvlm2(img)?;
-    let vision = vision_rows(statics, &pre.frames, pre.n_frames)?;
+    let vision = vision_rows(weights, statics, &pre.frames, pre.n_frames)?;
     let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, question)?;
     let inputs_embeds = build_inputs_embeds(statics, &vision, &prompt_ids)?;
     super::timing_log(&format!(
@@ -267,7 +304,7 @@ pub fn recognize_batch(
     let mut caps: Vec<usize> = Vec::with_capacity(imgs.len());
     for img in imgs {
         let pre = preprocess::preprocess_smolvlm2(img)?;
-        let vision = vision_rows(statics, &pre.frames, pre.n_frames)?;
+        let vision = vision_rows(weights, statics, &pre.frames, pre.n_frames)?;
         let prompt_ids = describe_prompt_ids(tk, pre.rows, pre.cols, question)?;
         let embeds = build_inputs_embeds(statics, &vision, &prompt_ids)?;
         caps.push(max_new.min(MAX_POSITION.saturating_sub(embeds.rows)));
@@ -434,8 +471,8 @@ mod tests {
         cases: &[(String, String)],
         pre: &preprocess::Smolvlm2Preprocessed,
     ) -> usize {
-        let statics = hydrate_statics(weights).expect("statics");
-        let vision = vision_rows(&statics, &pre.frames, pre.n_frames).expect("vision");
+        let statics = hydrate_statics(weights, false).expect("statics");
+        let vision = vision_rows(weights, &statics, &pre.frames, pre.n_frames).expect("vision");
         let cfg = DecoderConfig::smolvlm2();
         let mut n_match = 0;
         for (q, oracle_answer) in cases {
@@ -641,7 +678,9 @@ mod tests {
             .map(|c| f32::from_le_bytes(*c))
             .collect();
         let oracle_vision = Mat::from_vec(pre.n_frames * IMG_SLOTS_PER_FRAME, 960, conn);
-        let statics = hydrate_statics(&weights).expect("statics");
+        // Oracle-vision leg: the tower is never run here, so stream it and skip
+        // ~340 MB of pointless hydration.
+        let statics = hydrate_statics(&weights, true).expect("statics");
         let embeds_ov = build_inputs_embeds(&statics, &oracle_vision, &prompt_ids).expect("splice");
 
         // Leg 0: MEASURE our decoder's logit drift at the prefill seam using
@@ -711,8 +750,8 @@ mod tests {
         assert_near_tie_divergence("leg 1 (oracle vision)", &ids_ov, &want, &fx);
 
         // Leg 2: full native pipeline + faithfulness eyeball.
-        let statics = hydrate_statics(&weights).expect("statics");
-        let vision = vision_rows(&statics, &pre.frames, pre.n_frames).expect("vision");
+        let statics = hydrate_statics(&weights, false).expect("statics");
+        let vision = vision_rows(&weights, &statics, &pre.frames, pre.n_frames).expect("vision");
         let inputs_embeds = build_inputs_embeds(&statics, &vision, &prompt_ids).expect("splice");
         let ids = decoder_qwen2::generate_greedy_kvcache(
             &weights,

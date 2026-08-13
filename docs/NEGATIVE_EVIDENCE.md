@@ -696,6 +696,98 @@ claims.
   agent: BrownFox
   evidence dir: artifacts/perf/bd-2mo.30/profile-recipe-5733407/ab-mmap-load/
 
+2026-08-13 | PROVISIONAL_LOCAL_WIN | stream the SigLIP vision tower per block for SmolVLM2 (`FOCR_STREAM_VISION`)
+  claim_id: CLAIM-bd-f81z-streamed-vision-smolvlm2   evidence_id: artifacts/perf/bd-f81z/streamed-vision/
+  model source commit + fixture hash:
+    smolvlm2.int8.focrq  sha256 4ad2ac89e47c83ad… (1,087,397,293 B, pulled from the HF mirror;
+      tokenizer.json sha256 5ece781dc8d2b2f3… both digests match `models/manifest-v2.json`)
+    page: site/assets/sample-doc.png; `--task describe`, `FOCR_MAX_NEW_TOKENS=64`
+  CPU feature string: Apple M4 Pro arm64, aarch64+neon+dotprod, dense route Autovec
+  exact command + env:
+    `FOCR_MMAP=1 FOCR_STREAM_VISION=<0|1> FOCR_MAX_NEW_TOKENS=64 /usr/bin/time -l \
+       focr ocr site/assets/sample-doc.png --model smolvlm2.int8.focrq --task describe`
+  fallback / kill-switch state: `FOCR_STREAM_VISION` overrides in both directions; unset defaults ON for
+    `target_os = "ios"` and OFF elsewhere. Desktop therefore keeps the faster retained+batched arm.
+  measured before -> after vs reference:
+    Peak memory footprint is `phys_footprint`, the metric jetsam actually kills on, not max RSS.
+    Paired back-to-back runs (the machine had concurrent builds at loadavg ~9-14, so wall-clock is
+    reported from the paired runs only; the footprint numbers are stable to <0.3% across all runs):
+      cached (retained + batched)    2,026,097,544 / 2,025,491,336 B   13.50 s / 13.58 s
+      STREAMED (per-block)           1,195,198,648 / 1,191,758,008 B   14.41 s / 14.29 s
+                                     -833 MB, -41.1%                  +6.0% slower
+    This one is an HONEST TRADE, not a free win — unlike the GOT-OCR2/OneChart SAM streaming above,
+    which was both smaller AND faster. Streaming SigLIP costs ~6% wall time because it gives up the
+    frame-batched tower. That is why it is default-ON for iOS only.
+  bit-exact correctness proof:
+    stdout is byte-identical between arms: sha256 32aaaa606329aedb2eac048e09802bfc… for BOTH
+    (`smol_cached.stdout.txt`, `smol_streamed.stdout.txt` in the evidence dir under its SHA256SUMS).
+    CI gate: `vision_siglip::tests::streamed_frames_match_whole_tower_hydration` — a fully synthetic
+    1-block artifact at the real widths, 2 frames, compared `to_bits()` against the retained
+    `forward_frames`, with non-degeneracy and frames-differ guards. It runs unconditionally (no model
+    needed), unlike the GOT gate which must be armed with `FOCR_GOT_MODEL`. Depth is the only axis the
+    synthetic can shrink: every SigLIP width is a compile-time constant that `siglip_weights_from`
+    shape-checks, so a full-depth synthetic tower would be ~340 MB in a unit test.
+    Drift-proofing: `siglip_weights_from` now BUILDS its `blocks[i]` by calling `siglip_block_from`, the
+    same function the streamed loop calls, so the two arms cannot diverge by construction.
+  sub-lever tried and REVERTED inside this one: keep the frames stacked and run
+    `encoder_block_batched` per streamed block, to avoid giving up the batched GEMM. Measured
+    1,683,834,608 B (`smol_streamed_batched_REJECTED.time.txt`) — it handed back most of the
+    residency win, because batching widens every MLP intermediate to `[F·TOKENS, INTERMEDIATE]`
+    (~163 MB at 13 frames vs ~12.6 MB per frame). Reverted to the per-frame inner loop and the
+    reasoning is pinned in the `forward_frames_streamed` doc comment.
+  disposition: KEEP. 1.19 GB peak makes SmolVLM2 the SMALLEST of the three phone-viable models
+    (GOT-OCR2 1.97 GB, unlimited-ocr the flagship), so it joins the iOS picker.
+  do-not-retry: "do not re-batch the streamed SigLIP inner loop for speed without measuring
+    phys_footprint. It looks like a free throughput win and is not: it costs ~490 MB of peak."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: Claude Opus 5
+  evidence dir: artifacts/perf/bd-f81z/streamed-vision/
+
+2026-08-13 | PROVISIONAL_LOCAL_WIN | stream the SAM vision tower per block for GOT-OCR2 and OneChart (`FOCR_STREAM_VISION`)
+  claim_id: CLAIM-bd-f81z-streamed-vision-got-onechart   evidence_id: artifacts/perf/bd-f81z/streamed-vision/
+  model source commit + fixture hash:
+    got-ocr2.int8.focrq  sha256 4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f (813,877,416 B)
+    onechart.int8.focrq  sha256 618189a8e975f0cf3e36d43e1825d1a33d1357c9571a0ef3f36f3c6056e24ef2 (362,863,824 B)
+    page: site/assets/sample-doc.png; `FOCR_MAX_NEW_TOKENS=64` so the run measures
+      hydration + vision peak rather than an unbounded decode
+  CPU feature string: Apple M4 Pro arm64, aarch64+neon+dotprod, dense route Autovec
+  exact command + env:
+    `FOCR_MMAP=1 FOCR_STREAM_VISION=<0|1> FOCR_MAX_NEW_TOKENS=64 /usr/bin/time -l focr ocr --model <artifact> <page>`
+  fallback / kill-switch state: `FOCR_STREAM_VISION` overrides in both directions; unset defaults ON for
+    `target_os = "ios"` and OFF elsewhere, so desktop keeps the retained-tower throughput unless asked.
+  measured before -> after vs reference:
+    Peak memory footprint is `phys_footprint`, the metric jetsam actually kills on, not max RSS.
+    GOT-OCR2   owned bytes                4,529,164,032   (19.68 s)
+               mmap, cached tower         3,709,996,824   ( 8.02 s)
+               mmap, STREAMED tower       1,965,229,976   ( 5.06 s)   -1.74 GB vs cached, -47.0%
+    OneChart   mmap, cached tower         2,701,052,640   ( 6.95 s)
+               mmap, STREAMED tower       2,499,676,752   ( 4.45 s)   -0.20 GB vs cached,  -7.5%
+    Two independent effects, both from the same switch: the ~382 MB f32 tower is never retained, and
+    `forward_streamed` sets `low_mem=true`, which selects the bounded query-slab global attention in
+    place of the unbounded kernel `forward_with` was using (~0.8 GB of transient scratch). Streaming is
+    also FASTER on both models, which is not the usual direction for a residency lever — less allocator
+    and memory traffic outweighs re-reading blocks from the mapped blob.
+    OneChart's win is an order of magnitude smaller than GOT's and is reported as such rather than
+    averaged in; at 2.50 GB it is NOT yet a comfortable phone number, and it stays out of the iOS picker.
+  bit-exact correctness proof:
+    stdout is byte-identical between the cached and streamed arms for BOTH models — sha256
+    747eef72fc1e4c6a3130646eee5469493790f3b8494ece5bfb10af6f2f8598c5 (GOT, both arms) and
+    d7f9b42fa26e34ee… (OneChart, both arms); the four files are in the evidence dir under its SHA256SUMS.
+    Component gates: `vision_sam::tests::sam_block_from_matches_whole_tower_hydration` (a streamed block
+    hydrates to the same weights the cached tower holds) and
+    `vision_sam::tests::bounded_global_attention_is_bit_identical` (the low_mem kernel the streamed arm
+    selects). End-to-end gate on real weights: `got::tests::streamed_vision_is_bit_identical_to_cached`,
+    model-gated on `FOCR_GOT_MODEL`, skip-with-success when the artifact is absent — a synthetic tower
+    cannot drive it because `forward_core` hardcodes the real neck geometry (256/512/1024).
+  disposition: KEEP. GOT-OCR2 at 1.97 GB is phone-viable for the first time and is now in the iOS model
+    picker; OneChart is kept streamed (it is strictly better) but stays out of the picker on its number.
+  do-not-retry: "do not gate vision residency on an artifact's recipe string again. The previous gate
+    (`artifact_stores_gated_int8`, the Unlimited-OCR wasm recipe id) is exactly why two models that
+    could use this path never got it, and why both shipped hydrating a tower they did not need."
+  per-lever tally: W 1 / L 0 / N 0
+  agent: Claude Opus 5
+  evidence dir: artifacts/perf/bd-f81z/streamed-vision/
+
 2026-08-13 | NEGATIVE(reverted) | coarsen the wasm int4 expert group size to a uniform g32 (`FOCR_INT4_GROUPS=32`)
   claim_id: CLAIM-int4-groups-g32-sweep   evidence_id: artifacts/perf/bd-int4-groups/g32-sweep/
   model source commit + fixture hash:

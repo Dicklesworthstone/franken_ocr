@@ -2823,7 +2823,6 @@ mod tests {
     /// is the cached forward core — pinned structurally here by comparing a
     /// hydrated block against the whole-tower build on synthetic weights.
     #[test]
-    #[test]
     fn sam_block_from_matches_whole_tower_hydration() -> FocrResult<()> {
         use crate::quant::focrq::FocrqBuilder;
 

@@ -80,6 +80,11 @@ final class LabModel {
     /// survives a round trip through the picker.
     var question: String = ""
 
+    /// GOT-OCR2's `OCR with format:` mode. This is the whole reason GOT is in
+    /// the picker — in plain mode it produces roughly what the default model
+    /// does, only slower. On for that lane by default.
+    var gotFormat: Bool = true
+
     // ── Run state ──────────────────────────────────────────────────────────
     var isRecognizing = false
     var isLoadingModel = false
@@ -444,6 +449,10 @@ final class LabModel {
             }
             do {
                 try await self.ensureEngineLoaded()
+                // Per-RUN options. These are process-global setters that apply
+                // to the next recognition, so applying them only at engine load
+                // would silently ignore a toggle flipped afterwards.
+                await self.applyPerRunOptions()
                 if self.pdf != nil {
                     try await self.recognizeDocument(generation: runGeneration)
                 } else {
@@ -613,10 +622,22 @@ final class LabModel {
         if spec.decodeGuard > 0 {
             await engine.setNoRepeatNgram(spec.decodeGuard)
         }
-        if spec.id == "smolvlm2" {
-            await engine.setSmolVLM2Question(question)
-        }
         licenseNotice = await engine.licenseNotice
+    }
+
+    /// Options that belong to the RUN rather than to the loaded engine. The
+    /// engine exposes these as process-global setters that take effect on the
+    /// next recognition, so they are re-applied every run — otherwise a toggle
+    /// flipped after the model loaded would be silently ignored.
+    private func applyPerRunOptions() async {
+        switch spec.id {
+        case "smolvlm2":
+            await engine.setSmolVLM2Question(question)
+        case "got-ocr2":
+            await engine.setGotFormat(gotFormat)
+        default:
+            break
+        }
     }
 
     func cancel() {

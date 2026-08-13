@@ -96,32 +96,40 @@ pub struct SiglipWeights {
 /// [`FocrError::ModelNotFound`]/[`FocrError::FormatMismatch`] from the weight
 /// accessors for missing tensors; [`FocrError::Other`] on any shape drift.
 pub fn siglip_weights_from(weights: &Weights, prefix: &str) -> FocrResult<SiglipWeights> {
-    let p = prefix;
-    let linear = |name: &str, out: usize, in_: usize| -> FocrResult<Linear> {
-        let w = weights.vec(&format!("{name}.weight"))?;
-        let b = weights.vec(&format!("{name}.bias"))?;
-        if w.len() != out * in_ || b.len() != out {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "vision_siglip {name}: weight/bias len ({}, {}) != ([{out},{in_}], {out})",
-                w.len(),
-                b.len()
-            )));
-        }
-        Linear::from_row_major(&w, b, out, in_)
-    };
-    let ln = |name: &str| -> FocrResult<LayerNormP> {
-        let w = weights.vec(&format!("{name}.weight"))?;
-        let b = weights.vec(&format!("{name}.bias"))?;
-        if w.len() != EMBED_DIM || b.len() != EMBED_DIM {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "vision_siglip {name}: affine len ({}, {}) != {EMBED_DIM}",
-                w.len(),
-                b.len()
-            )));
-        }
-        Ok(LayerNormP { w, b })
-    };
+    let statics = siglip_statics_from(weights, prefix)?;
+    let mut blocks = Vec::with_capacity(DEPTH);
+    for i in 0..DEPTH {
+        blocks.push(siglip_block_from(weights, prefix, i)?);
+    }
+    Ok(SiglipWeights {
+        patch_embed: statics.patch_embed,
+        pos_embed: statics.pos_embed,
+        blocks,
+        post_ln: statics.post_ln,
+    })
+}
 
+/// The tower's non-block tensors: patch-embed conv, learned position table, and
+/// the final `post_layernorm`. Every frame needs all three, and together they
+/// are ~2.4 MB against ~28.3 MB for a single encoder block, so the streamed
+/// path holds them for the whole forward and streams only the blocks.
+pub(crate) struct SiglipStatics {
+    /// `{prefix}.embeddings.patch_embedding`.
+    pub patch_embed: Conv,
+    /// `{prefix}.embeddings.position_embedding.weight`, `[TOKENS, EMBED_DIM]`.
+    pub pos_embed: Vec<f32>,
+    /// `{prefix}.post_layernorm`.
+    pub post_ln: LayerNormP,
+}
+
+/// Hydrate the non-block tensors alone. Shared by [`siglip_weights_from`] and
+/// [`forward_frames_streamed`] so the two arms cannot drift.
+///
+/// # Errors
+/// [`FocrError::ModelNotFound`]/[`FocrError::FormatMismatch`] for a missing
+/// tensor; [`FocrError::Other`] on any shape drift.
+pub(crate) fn siglip_statics_from(weights: &Weights, prefix: &str) -> FocrResult<SiglipStatics> {
+    let p = prefix;
     let pe_w = weights.vec(&format!("{p}.embeddings.patch_embedding.weight"))?;
     let pe_b = weights.vec(&format!("{p}.embeddings.patch_embedding.bias"))?;
     if pe_w.len() != EMBED_DIM * 3 * PATCH * PATCH || pe_b.len() != EMBED_DIM {
@@ -148,26 +156,88 @@ pub fn siglip_weights_from(weights: &Weights, prefix: &str) -> FocrResult<Siglip
         )));
     }
 
-    let mut blocks = Vec::with_capacity(DEPTH);
-    for i in 0..DEPTH {
-        let b = format!("{p}.encoder.layers.{i}");
-        blocks.push(SiglipBlockP {
-            ln1: ln(&format!("{b}.layer_norm1"))?,
-            q: linear(&format!("{b}.self_attn.q_proj"), EMBED_DIM, EMBED_DIM)?,
-            k: linear(&format!("{b}.self_attn.k_proj"), EMBED_DIM, EMBED_DIM)?,
-            v: linear(&format!("{b}.self_attn.v_proj"), EMBED_DIM, EMBED_DIM)?,
-            out: linear(&format!("{b}.self_attn.out_proj"), EMBED_DIM, EMBED_DIM)?,
-            ln2: ln(&format!("{b}.layer_norm2"))?,
-            fc1: linear(&format!("{b}.mlp.fc1"), INTERMEDIATE, EMBED_DIM)?,
-            fc2: linear(&format!("{b}.mlp.fc2"), EMBED_DIM, INTERMEDIATE)?,
-        });
-    }
-
-    Ok(SiglipWeights {
+    Ok(SiglipStatics {
         patch_embed,
         pos_embed,
-        blocks,
-        post_ln: ln(&format!("{p}.post_layernorm"))?,
+        post_ln: block_ln(weights, &format!("{p}.post_layernorm"))?,
+    })
+}
+
+/// One `{name}.weight`/`{name}.bias` linear, shape-checked against `[out, in_]`.
+fn block_linear(weights: &Weights, name: &str, out: usize, in_: usize) -> FocrResult<Linear> {
+    let w = weights.vec(&format!("{name}.weight"))?;
+    let b = weights.vec(&format!("{name}.bias"))?;
+    if w.len() != out * in_ || b.len() != out {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_siglip {name}: weight/bias len ({}, {}) != ([{out},{in_}], {out})",
+            w.len(),
+            b.len()
+        )));
+    }
+    Linear::from_row_major(&w, b, out, in_)
+}
+
+/// One `{name}.weight`/`{name}.bias` LayerNorm affine, checked against `EMBED_DIM`.
+fn block_ln(weights: &Weights, name: &str) -> FocrResult<LayerNormP> {
+    let w = weights.vec(&format!("{name}.weight"))?;
+    let b = weights.vec(&format!("{name}.bias"))?;
+    if w.len() != EMBED_DIM || b.len() != EMBED_DIM {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_siglip {name}: affine len ({}, {}) != {EMBED_DIM}",
+            w.len(),
+            b.len()
+        )));
+    }
+    Ok(LayerNormP { w, b })
+}
+
+/// Hydrate encoder block `i` alone (`{prefix}.encoder.layers.{i}.*`).
+///
+/// This is the single definition of a block's tensor names and shapes:
+/// [`siglip_weights_from`] calls it to build the retained tower, and
+/// [`forward_frames_streamed`] calls it one block at a time. The two paths
+/// cannot drift apart, which is what makes the streamed arm bit-identical by
+/// construction rather than by a hand-maintained parallel copy (the SAM
+/// precedent: `vision_sam::sam_block_from`).
+///
+/// # Errors
+/// [`FocrError::ModelNotFound`]/[`FocrError::FormatMismatch`] for a missing
+/// tensor; [`FocrError::Other`] on any shape drift.
+pub(crate) fn siglip_block_from(
+    weights: &Weights,
+    prefix: &str,
+    i: usize,
+) -> FocrResult<SiglipBlockP> {
+    let b = format!("{prefix}.encoder.layers.{i}");
+    Ok(SiglipBlockP {
+        ln1: block_ln(weights, &format!("{b}.layer_norm1"))?,
+        q: block_linear(
+            weights,
+            &format!("{b}.self_attn.q_proj"),
+            EMBED_DIM,
+            EMBED_DIM,
+        )?,
+        k: block_linear(
+            weights,
+            &format!("{b}.self_attn.k_proj"),
+            EMBED_DIM,
+            EMBED_DIM,
+        )?,
+        v: block_linear(
+            weights,
+            &format!("{b}.self_attn.v_proj"),
+            EMBED_DIM,
+            EMBED_DIM,
+        )?,
+        out: block_linear(
+            weights,
+            &format!("{b}.self_attn.out_proj"),
+            EMBED_DIM,
+            EMBED_DIM,
+        )?,
+        ln2: block_ln(weights, &format!("{b}.layer_norm2"))?,
+        fc1: block_linear(weights, &format!("{b}.mlp.fc1"), INTERMEDIATE, EMBED_DIM)?,
+        fc2: block_linear(weights, &format!("{b}.mlp.fc2"), EMBED_DIM, INTERMEDIATE)?,
     })
 }
 
@@ -208,7 +278,17 @@ pub fn forward_frame(w: &SiglipWeights, pixels: &[f32]) -> FocrResult<Mat> {
 /// `(i-1)/32` in f32 for `1 ≤ i ≤ 31`), verified bit-level against the live
 /// module.
 pub(crate) fn embed_frame(w: &SiglipWeights, pixels: &[f32]) -> FocrResult<Mat> {
-    let nchw = vision_sam::conv_apply(&w.patch_embed, pixels, IMG_SIDE, IMG_SIDE, 0, PATCH)?;
+    embed_frame_parts(&w.patch_embed, &w.pos_embed, pixels)
+}
+
+/// [`embed_frame`] against the two tensors it actually reads, so the streamed
+/// path can run it from a [`SiglipStatics`] without a hydrated block vector.
+pub(crate) fn embed_frame_parts(
+    patch_embed: &Conv,
+    pos_embed: &[f32],
+    pixels: &[f32],
+) -> FocrResult<Mat> {
+    let nchw = vision_sam::conv_apply(patch_embed, pixels, IMG_SIDE, IMG_SIDE, 0, PATCH)?;
     let mut x = vision_sam::nchw_to_nhwc_rows(&nchw, EMBED_DIM, GRID, GRID);
     let bucket = |i: usize| i.saturating_sub(1);
     for r in 0..GRID {
@@ -216,7 +296,7 @@ pub(crate) fn embed_frame(w: &SiglipWeights, pixels: &[f32]) -> FocrResult<Mat> 
             let t = r * GRID + c;
             let pos_id = bucket(r) * GRID + bucket(c);
             let row = x.row_mut(t);
-            let pos = &w.pos_embed[pos_id * EMBED_DIM..(pos_id + 1) * EMBED_DIM];
+            let pos = &pos_embed[pos_id * EMBED_DIM..(pos_id + 1) * EMBED_DIM];
             for (v, p) in row.iter_mut().zip(pos) {
                 *v += p;
             }
@@ -264,6 +344,105 @@ pub fn forward_frames(w: &SiglipWeights, pixels: &[f32], n_frames: usize) -> Foc
         )?);
     }
     Ok(out)
+}
+
+/// [`forward_frames`] without ever holding the whole tower: hydrate one encoder
+/// block at a time from `weights`, apply it, drop it. Same `[1024, 768]` rows
+/// per frame, bit-identical (gated by
+/// `tests::streamed_frames_match_whole_tower_hydration`).
+///
+/// **Block-major, not frame-major.** The loop nest is inverted relative to
+/// [`forward_frames`]: the outer loop walks the 12 blocks and the inner loop
+/// walks the frames, so each block is hydrated exactly ONCE for the whole
+/// call instead of once per frame. Frame-major streaming would pay
+/// `DEPTH * n_frames` hydrations; SmolVLM2 sends up to 13 frames (a 4×4 tiling
+/// plus the global view), so that is 156 hydrations against 12 here. The cost
+/// is holding every frame's `[1024, 768]` activation at once — 3.1 MB each,
+/// ~41 MB at 13 frames — against ~311 MB saved by not retaining 11 of the 12
+/// blocks. Inverting the nest is safe precisely because frames are
+/// independent: no arithmetic within a frame is reordered, which is why the
+/// result stays bit-identical rather than merely close.
+///
+/// **Why not [`encoder_block_batched`] over the stacked frames?** Tried and
+/// rejected on measurement, 2026-08-13: stacking the frames raised peak
+/// footprint to 1.68 GB against 1.20 GB for this per-frame inner loop (same
+/// page, same artifact, byte-identical output), i.e. it gave back most of what
+/// streaming buys. Batching widens every MLP intermediate to
+/// `[F·TOKENS, INTERMEDIATE]` — ~163 MB at 13 frames against ~12.6 MB per
+/// frame — which directly inflates the peak this function exists to lower.
+/// Batching remains the right default for the RETAINED tower
+/// ([`forward_frames_batched`]), where the block weights are already resident
+/// and only the activation width changes. The two levers do not compose; do
+/// not "fix" this loop by re-batching it without re-measuring the footprint.
+///
+/// # Errors
+/// [`FocrError::Other`] on a length/frame-count mismatch or any per-frame
+/// failure; the weight accessors' errors for a missing tensor.
+pub fn forward_frames_streamed(
+    weights: &Weights,
+    prefix: &str,
+    pixels: &[f32],
+    n_frames: usize,
+) -> FocrResult<Vec<Mat>> {
+    forward_frames_streamed_depth(weights, prefix, pixels, n_frames, DEPTH)
+}
+
+/// [`forward_frames_streamed`] over the first `depth` encoder blocks.
+///
+/// Production always passes [`DEPTH`]. The parameter exists so
+/// `tests::streamed_frames_match_whole_tower_hydration` can gate the real loop
+/// nest against a 1-block synthetic artifact: every SigLIP dimension is
+/// compile-time fixed (`EMBED_DIM` 768, `INTERMEDIATE` 3072) and
+/// [`siglip_weights_from`] shape-checks against those constants, so a synthetic
+/// tower cannot be narrowed — a full-depth one would be ~340 MB of f32 in a
+/// unit test. Depth is the only axis left to shrink.
+fn forward_frames_streamed_depth(
+    weights: &Weights,
+    prefix: &str,
+    pixels: &[f32],
+    n_frames: usize,
+    depth: usize,
+) -> FocrResult<Vec<Mat>> {
+    let frame_len = 3 * IMG_SIDE * IMG_SIDE;
+    if n_frames == 0 || pixels.len() != n_frames * frame_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "vision_siglip forward_frames_streamed: buffer len {} != n_frames {n_frames} * {frame_len}",
+            pixels.len()
+        )));
+    }
+    let statics = siglip_statics_from(weights, prefix)?;
+
+    let mut xs = Vec::with_capacity(n_frames);
+    for f in 0..n_frames {
+        xs.push(embed_frame_parts(
+            &statics.patch_embed,
+            &statics.pos_embed,
+            &pixels[f * frame_len..(f + 1) * frame_len],
+        )?);
+    }
+
+    // The streaming seam: exactly one block's f32 parameters (~28.3 MB) are
+    // live at a time, hydrated here and dropped at the end of the iteration.
+    //
+    // Frames are applied one at a time INSIDE the block, deliberately — see
+    // the "why not batched" note on this function.
+    for i in 0..depth {
+        let blk = siglip_block_from(weights, prefix, i)?;
+        for x in &mut xs {
+            encoder_block(&blk, x)?;
+        }
+    }
+
+    xs.iter()
+        .map(|x| {
+            nn::layer_norm(
+                x,
+                Some(&statics.post_ln.w),
+                Some(&statics.post_ln.b),
+                LN_EPS,
+            )
+        })
+        .collect()
 }
 
 /// Bidirectional multi-head attention over one frame's tokens: separate
@@ -762,5 +941,145 @@ mod tests {
         let w = synthetic_weights_depth(1);
         assert!(forward_frames_batched(&w, &[0.0; 7], 1).is_err());
         assert!(forward_frames_batched(&w, &[], 0).is_err());
+    }
+
+    /// The streamed tower is bit-identical to the retained one.
+    ///
+    /// This gates the loop-nest inversion, which is the actual risk in
+    /// [`forward_frames_streamed`]: it walks blocks outermost and frames
+    /// innermost, the opposite of [`forward_frames`]. Two frames is the
+    /// smallest case that can catch a cross-frame state leak; one frame would
+    /// make both nests the same loop.
+    ///
+    /// Block hydration itself needs no gate here: [`siglip_weights_from`]
+    /// builds `blocks[i]` by *calling* [`siglip_block_from`], so the retained
+    /// and streamed arms read a block through one shared definition and cannot
+    /// drift. And bit-identity against the default *batched* arm follows by
+    /// transitivity through `batched_frames_match_sequential_byte_for_byte`.
+    ///
+    /// Depth 1, real widths: every SigLIP dimension is a compile-time constant
+    /// that `siglip_weights_from` shape-checks, so the synthetic tower cannot
+    /// be narrowed and a full-depth one would be ~340 MB.
+    #[test]
+    fn streamed_frames_match_whole_tower_hydration() -> FocrResult<()> {
+        use crate::native_engine::vision_sam::test_support::synth_values;
+        use crate::quant::focrq::{FocrqBuilder, WriteDType};
+
+        let p = "model.vision_model";
+        let mut b = FocrqBuilder::new();
+        {
+            // Salts are spread by 2^40: synth_values folds the salt in AFTER
+            // the multiply and shifts 33 low bits off, so adjacent salts would
+            // collide into byte-identical tensors and weaken the comparison.
+            let mut add = |name: String, shape: Vec<usize>, idx: u64| {
+                let len: usize = shape.iter().product();
+                let bytes: Vec<u8> = synth_values(len, idx << 40)
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                b.add_tensor(name, WriteDType::F32, shape, bytes)
+                    .expect("valid synthetic f32 tensor");
+            };
+            add(
+                format!("{p}.embeddings.patch_embedding.weight"),
+                vec![EMBED_DIM, 3, PATCH, PATCH],
+                1,
+            );
+            add(
+                format!("{p}.embeddings.patch_embedding.bias"),
+                vec![EMBED_DIM],
+                2,
+            );
+            add(
+                format!("{p}.embeddings.position_embedding.weight"),
+                vec![TOKENS, EMBED_DIM],
+                3,
+            );
+            add(format!("{p}.post_layernorm.weight"), vec![EMBED_DIM], 4);
+            add(format!("{p}.post_layernorm.bias"), vec![EMBED_DIM], 5);
+
+            let l = format!("{p}.encoder.layers.0");
+            add(format!("{l}.layer_norm1.weight"), vec![EMBED_DIM], 6);
+            add(format!("{l}.layer_norm1.bias"), vec![EMBED_DIM], 7);
+            add(format!("{l}.layer_norm2.weight"), vec![EMBED_DIM], 8);
+            add(format!("{l}.layer_norm2.bias"), vec![EMBED_DIM], 9);
+            for (i, proj) in ["q_proj", "k_proj", "v_proj", "out_proj"]
+                .into_iter()
+                .enumerate()
+            {
+                let i = i as u64;
+                add(
+                    format!("{l}.self_attn.{proj}.weight"),
+                    vec![EMBED_DIM, EMBED_DIM],
+                    10 + i * 2,
+                );
+                add(
+                    format!("{l}.self_attn.{proj}.bias"),
+                    vec![EMBED_DIM],
+                    11 + i * 2,
+                );
+            }
+            add(
+                format!("{l}.mlp.fc1.weight"),
+                vec![INTERMEDIATE, EMBED_DIM],
+                18,
+            );
+            add(format!("{l}.mlp.fc1.bias"), vec![INTERMEDIATE], 19);
+            add(
+                format!("{l}.mlp.fc2.weight"),
+                vec![EMBED_DIM, INTERMEDIATE],
+                20,
+            );
+            add(format!("{l}.mlp.fc2.bias"), vec![EMBED_DIM], 21);
+        }
+        let weights = Weights::from_bytes(b.build()).expect("synthetic SigLIP parses");
+
+        // The retained arm, hand-assembled at depth 1 (siglip_weights_from
+        // would demand all DEPTH blocks).
+        let statics = siglip_statics_from(&weights, p)?;
+        let retained = SiglipWeights {
+            patch_embed: statics.patch_embed.clone(),
+            pos_embed: statics.pos_embed.clone(),
+            blocks: vec![siglip_block_from(&weights, p, 0)?],
+            post_ln: LayerNormP {
+                w: statics.post_ln.w.clone(),
+                b: statics.post_ln.b.clone(),
+            },
+        };
+
+        let frames = 2usize;
+        let frame_len = 3 * IMG_SIDE * IMG_SIDE;
+        // Distinct per frame, so a leak across the inverted nest shows up.
+        let pixels: Vec<f32> = (0..frames * frame_len)
+            .map(|i| ((i % 251) as f32) / 251.0 - 0.5)
+            .collect();
+
+        let want = forward_frames(&retained, &pixels, frames)?;
+        let got = forward_frames_streamed_depth(&weights, p, &pixels, frames, 1)?;
+
+        assert_eq!(got.len(), frames);
+        assert_eq!(want.len(), got.len());
+        let mut nonzero = 0usize;
+        for (f, (a, c)) in want.iter().zip(&got).enumerate() {
+            assert_eq!(a.shape(), c.shape(), "frame {f} shape");
+            for (i, (x, y)) in a.data.iter().zip(&c.data).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "frame {f} element {i}: {x} vs {y}"
+                );
+                if *y != 0.0 {
+                    nonzero += 1;
+                }
+            }
+        }
+        // Guard against the vacuous pass where both arms return all zeros.
+        assert!(nonzero > 0, "streamed output is degenerate (all zeros)");
+        // The two frames must actually differ, or the cross-frame claim is empty.
+        assert_ne!(
+            got[0].data, got[1].data,
+            "frames are identical; the inversion is untested"
+        );
+        Ok(())
     }
 }

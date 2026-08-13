@@ -1960,11 +1960,27 @@ mod tests {
         for (part, (size, sha256, filename)) in primary.focrq.parts.iter().zip(expected_parts) {
             assert_eq!(part.size, size);
             assert_eq!(part.sha256, sha256);
-            assert_eq!(part.urls.len(), 1);
+            // Two sources, and the ORDER is the contract: HuggingFace is tried
+            // first and GitHub is the fallback. GitHub Releases started
+            // returning 503s under load (2026-08-12), which is what motivated
+            // the mirror; a silent re-ordering here would put every download
+            // back on the flaky source, so the order is pinned, not just the
+            // membership.
+            assert_eq!(part.urls.len(), 2);
             assert!(part.urls.iter().all(|url| url.ends_with(filename)));
-            assert!(part.urls[0].contains(&format!(
-                "/releases/download/v{UNLIMITED_OCR_ARTIFACT_VERSION}/"
-            )));
+            assert!(
+                part.urls[0].starts_with("https://huggingface.co/")
+                    && part.urls[0].contains("/resolve/"),
+                "part {filename}: primary url is not the HuggingFace mirror: {}",
+                part.urls[0]
+            );
+            assert!(
+                part.urls[1].contains(&format!(
+                    "/releases/download/v{UNLIMITED_OCR_ARTIFACT_VERSION}/"
+                )),
+                "part {filename}: fallback url is not the pinned GitHub release: {}",
+                part.urls[1]
+            );
         }
 
         let mut legacy = primary.clone();
