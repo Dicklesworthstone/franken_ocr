@@ -314,13 +314,57 @@ pub fn safetensors_to_focrq_calibrated(
 ///
 /// Only meaningful for names classified [`WasmInt4Policy::ExpertInt4`]; the
 /// group size is recorded per tensor record, so the reader never guesses.
+///
+/// # Experiment override
+///
+/// `FOCR_INT4_GROUPS` replaces the shipped per-tensor choice with one uniform
+/// group size (`16`, `32`, `64`, `128`) so the size-vs-divergence curve can be
+/// swept without editing source per run. It deliberately does NOT change the
+/// recipe id: the id names the DTYPE policy ("experts int4, attention int8,
+/// lm_head int8"), which is identical across group sizes, and it gates decode
+/// routing in five places in the runtime — minting a new id per sweep point
+/// would change the route and confound the measurement the sweep exists to
+/// take. The group size lives in each tensor record, so two artifacts remain
+/// distinguishable by inspection as well as by SHA-256.
+///
+/// An artifact built with this override is an EXPERIMENT ARTIFACT. It must
+/// never be published under a shipped filename; the manifest pins the shipped
+/// bytes by digest, and a sweep point that matched a shipped name would be a
+/// supply-chain lie.
 #[must_use]
 pub fn wasm_int4_group_size(name: &str) -> usize {
+    if let Some(uniform) = int4_group_override() {
+        return uniform;
+    }
     if name.ends_with(".up_proj.weight") {
         32
     } else {
         16
     }
+}
+
+/// Read `FOCR_INT4_GROUPS` once. An unset, empty, or unparseable value keeps the
+/// shipped per-tensor policy — a typo must not silently produce a differently
+/// quantized artifact.
+fn int4_group_override() -> Option<usize> {
+    use std::sync::OnceLock;
+    // Read ONCE: a conversion must not change quantization policy partway
+    // through its own tensor loop.
+    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    *OVERRIDE
+        .get_or_init(|| parse_group_override(std::env::var("FOCR_INT4_GROUPS").ok().as_deref()))
+}
+
+/// The pure half of [`int4_group_override`], so the accepted set is testable
+/// without touching process environment (which a `OnceLock` would latch and
+/// leak into every other test in the binary).
+fn parse_group_override(raw: Option<&str>) -> Option<usize> {
+    let parsed = raw?.trim().parse::<usize>().ok()?;
+    // int4 packs two nibbles per byte and scales are per group, so a group must
+    // divide the row evenly at these shapes; the model's K values are all
+    // multiples of 128. Anything else is a typo, and a typo must not silently
+    // produce a differently quantized artifact.
+    matches!(parsed, 16 | 32 | 64 | 128).then_some(parsed)
 }
 
 /// The [`ConvertQuant::Int4`] arm: emit the wasm/browser Unlimited-OCR artifact
@@ -1409,6 +1453,25 @@ mod tests {
         "model.norm.weight",
         "vision_model.patch_embed.weight",
     ];
+
+    #[test]
+    fn group_override_accepts_only_valid_group_sizes() {
+        // The sweep points.
+        for good in ["16", "32", "64", "128", " 32 "] {
+            assert_eq!(
+                parse_group_override(Some(good)),
+                Some(good.trim().parse().expect("literal")),
+                "{good:?}"
+            );
+        }
+        // Unset keeps the shipped per-tensor policy.
+        assert_eq!(parse_group_override(None), None);
+        // A typo must fall back to the shipped policy rather than silently
+        // producing a differently quantized artifact.
+        for bad in ["", "0", "17", "24", "g32", "thirty-two", "-16", "1e2"] {
+            assert_eq!(parse_group_override(Some(bad)), None, "{bad:?}");
+        }
+    }
 
     #[test]
     fn wasm_int4_group_sizes_follow_measured_sensitivity_order() {
