@@ -1,4 +1,4 @@
-# FrankenOCR — the iOS/iPadOS app
+# FrankenOCR for iPhone and iPad
 
 The franken-ocr.com playground, rebuilt as a native app. Same engine: the Swift
 here drives the identical `OcrModel` entry points the `focr` CLI and the browser
@@ -25,24 +25,24 @@ the privacy manifest are the source.
 
 ## Why a phone can run the flagship at all
 
-The browser playground gates Unlimited-OCR to desktop, and the reason is not
-compute — it is that WebAssembly has no mmap. A wasm module must stage the
-whole 3.0 GB artifact into linear memory, so 3.0 GB of the measured ~3.6 GB
+The browser playground gates Unlimited-OCR to desktop for a reason that has
+nothing to do with compute: WebAssembly has no mmap. A wasm module must stage
+the whole 3.0 GB artifact into linear memory, so 3.0 GB of the measured ~3.6 GB
 peak is the blob itself, and no residency trick can move it.
 
 A native app maps the file instead. `focr-ios` therefore loads the engine from a
 **path**, not from bytes, so `Weights::load` reaches the mmap island and the
-artifact becomes clean, file-backed pages the kernel may evict — not the dirty
-anonymous heap that jetsam counts and kills for. Two supporting pieces:
+artifact becomes clean, file-backed pages the kernel may evict, rather than the
+dirty anonymous heap that jetsam counts and kills for. Two supporting pieces:
 
 - **`MADV_RANDOM`.** A MoE decode routes to 6 of 64 experts per layer, so the
-  default sequential read-ahead would fault in neighbouring experts the token
+  default sequential read-ahead would fault in neighboring experts the token
   never reads. The advice is what keeps the resident working set near the bytes
   actually used.
 - **Streamed vision.** The per-block SAM/CLIP path (already in the engine, and
   gated bit-identical against the cached path) replaces ~1.6 GB of hydrated f32
   tower with tens of MB of scratch. It engages automatically, because it keys off
-  the artifact's recipe string — and this app ships that recipe.
+  the artifact's recipe string, and this app ships that recipe.
 
 The `increased-memory-limit` entitlement is there for the page cache, not for the
 heap.
@@ -59,10 +59,10 @@ CLAIM-bd-r9po-ios-mmap-residency):
 | max RSS | 3,574,841,344 | 3,391,455,232 |
 | wall | 11.83 s | 11.93 s |
 
-Footprint — the dirty-anonymous accounting jetsam terminates on — falls **6.5×,
-to 0.55 GB**. Max RSS barely moves because it still counts clean file-backed
-pages, and that is the point: those are evictable. Output is byte-identical
-across both modes.
+Peak footprint is the dirty-anonymous accounting that jetsam terminates on, and
+it falls **6.5×, to 0.55 GB**. Max RSS barely moves because it still counts
+clean file-backed pages, and that is the point: those are evictable. Output is
+byte-identical across both modes.
 
 This is an M4 Pro measurement, not a phone measurement. It establishes that the
 residency argument holds; it says nothing about A-series wall time.
@@ -87,10 +87,11 @@ on A-series hardware. Same rule the ledgers use.
 ## Not in this version
 
 - GOT-OCR2, SmolVLM2, and OneChart. Each hydrates its vision tower to f32 whole
-  (measured wasm peaks of 3.4 GB and 2.8 GB) because the streamed residency mode
-  keys off the Unlimited-OCR recipe. Extending it to their towers is what earns
-  them a place in the picker; shipping them first would ship a model that gets
-  the app killed.
-- Figure extraction, multi-page cross-referencing (`--multi-page`), and batch
-  mode.
+  (measured wasm peaks of 3.4 GB for GOT-OCR2, 2.8 GB for SmolVLM2) because the
+  streamed residency mode keys off the Unlimited-OCR recipe. Extending it to
+  their towers is what earns them a place in the picker; shipping them first
+  would put a model on the phone that gets the app killed.
+- Cross-page parsing (`--multi-page`), where page N can reference pages 1..N-1.
+  The app reads every page of a document, but each page independently.
+- Figure extraction and batch mode.
 - App Store submission artifacts beyond the privacy manifest and entitlement.

@@ -14,15 +14,16 @@ tags:
 
 # franken_ocr weights
 
-Quantized weight artifacts for [`franken_ocr`](https://github.com/Dicklesworthstone/franken_ocr)
-— a pure-Rust, memory-safe, CPU-only OCR engine that runs a small family of
-hand-ported vision-language models with no general ML framework: no PyTorch, no
-Python, no CUDA, no FFI at inference, no GPU.
+Quantized weight artifacts for
+[`franken_ocr`](https://github.com/Dicklesworthstone/franken_ocr), a pure-Rust,
+memory-safe, CPU-only OCR engine that runs a small family of hand-ported
+vision-language models with no general ML framework: no PyTorch, no Python, no
+CUDA, no FFI at inference, no GPU.
 
-These are **runtime artifacts in the project's own `.focrq` container**, not
-Hugging Face `transformers` checkpoints. They are consumed by the `focr` CLI,
-the browser playground at [franken-ocr.com](https://franken-ocr.com), and the
-FrankenOCR iOS app. They will not load in `transformers`.
+These are **runtime artifacts in the project's own `.focrq` container**, consumed
+by the `focr` CLI, the browser playground at
+[franken-ocr.com](https://franken-ocr.com), and the FrankenOCR iOS app. They are
+not `transformers` checkpoints and will not load with `from_pretrained`.
 
 ## Why this mirror exists
 
@@ -51,7 +52,7 @@ with Reference Sliding Window Attention) transformed from the 6.67 GB bf16
 checkpoint to 3.00 GB:
 
 - **MoE routed + shared experts → int4**, group size 16 for `gate_proj` and
-  `down_proj`, 32 for `up_proj` — the measured sensitivity order.
+  `down_proj`, 32 for `up_proj`, following the measured sensitivity order.
 - **Attention q/k/v/o, `lm_head`, `embed_tokens` → int8** per-channel.
 - **Vision tower, projector, MoE router gate, and all norms stay BF16.**
   Quantizing the vision encoder wrecks OCR; every downstream token is
@@ -61,23 +62,26 @@ Quantization is calibration-aware (importance-weighted clip search plus an AWQ
 `down_proj` fold over a 13-page activation-statistics run), measured strictly
 better than plain round-to-nearest on every corpus page.
 
-**Honest accuracy note.** int4 costs something real on dense material: on an
+**Where int4 costs something.** Dense material pays for it: on an
 1886 newsprint page the measured character error rate is 0.156. Calibration
 bought a 10.9% relative reduction on the hardest page without regressing any
-page — a real improvement, not a fix. The per-page receipts live in
+page. That is the honest size of the win: a real improvement, not a fix. The
+per-page receipts live in
 [`docs/DISCREPANCIES.md`](https://github.com/Dicklesworthstone/franken_ocr/blob/main/docs/DISCREPANCIES.md).
 
 This artifact is **not** the native CLI default. `focr pull` installs a separate
 conservative 4.16 GB artifact that keeps attention and `lm_head` at high
-precision. This one exists for memory-constrained targets: the browser, where
-the whole model must fit WebAssembly's 4 GiB linear memory, and phones.
+precision. This one exists for memory-constrained targets: phones, and the
+browser, where the whole model must fit WebAssembly's 4 GiB linear memory.
 
 ## Usage
 
 ```bash
-# CLI
-focr pull                      # installs the conservative native default
-FOCR_MODEL_PATH=/path/to/unlimited-ocr.wasm-int4.focrq focr ocr page.png
+# This artifact loads by explicit path; a bare `focr pull` installs the
+# conservative native default instead.
+export FOCR_MODEL_PATH=/path/to/unlimited-ocr.wasm-int4.focrq
+
+focr ocr page.png
 focr ocr book.pdf --pages 3,5-9 -o excerpt.md
 ```
 
