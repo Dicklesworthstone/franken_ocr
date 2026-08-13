@@ -2119,6 +2119,110 @@ fn clamp_idx(i: isize, n: usize) -> usize {
     }
 }
 
+/// Synthetic-tower construction shared by this module's tests and by the
+/// model-level tests in `got`/`onechart`, which need a SAM tower to prove their
+/// streamed and cached vision arms agree. Extracted rather than copied so the
+/// three callers cannot drift into testing three different towers.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{DEPTH, GLOBAL_BLOCKS, NUM_HEADS, PATCH, WINDOW};
+    use crate::quant::focrq::{FocrqBuilder, WriteDType};
+
+    /// Deterministic pseudo-random values in a small symmetric range. The salt
+    /// is folded in AFTER the multiply and the low bits are shifted off, so
+    /// nearby salts must be kept far apart or they collide into the same tensor.
+    pub(crate) fn synth_values(len: usize, salt: u64) -> Vec<f32> {
+        (0..len)
+            .map(|i| {
+                let raw = ((i as u64)
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(salt)
+                    >> 33) as u32;
+                (raw as f32 / u32::MAX as f32 - 0.5) * 0.3
+            })
+            .collect()
+    }
+
+    /// Write every tensor a SAM-ViT-B tower needs under `prefix`, at a reduced
+    /// `dim` (must divide `NUM_HEADS`) so the test stays fast. Geometry matches
+    /// the real tower's leaf names exactly, which is what lets GOT/OneChart
+    /// (`model.vision_tower_high` / `model.vision_tower`) reuse it.
+    pub(crate) fn add_synth_sam_tower(b: &mut FocrqBuilder, prefix: &str, dim: usize) {
+        let f32_bytes =
+            |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
+        let mut add = |name: String, shape: Vec<usize>, salt: u64| {
+            let len: usize = shape.iter().product();
+            b.add_tensor(
+                name,
+                WriteDType::F32,
+                shape,
+                f32_bytes(&synth_values(len, salt)),
+            )
+            .expect("valid synthetic f32 tensor");
+        };
+
+        add(
+            format!("{prefix}.patch_embed.proj.weight"),
+            vec![dim, 3, PATCH, PATCH],
+            1,
+        );
+        add(format!("{prefix}.patch_embed.proj.bias"), vec![dim], 2);
+        add(format!("{prefix}.pos_embed"), vec![1, 4, 4, dim], 3);
+        for (idx, name) in ["neck.0", "neck.2"].iter().enumerate() {
+            let ch = 8usize;
+            let in_ch = if idx == 0 { dim } else { ch };
+            add(
+                format!("{prefix}.{name}.weight"),
+                vec![ch, in_ch, 1, 1],
+                10 + idx as u64,
+            );
+        }
+        for (idx, name) in ["neck.1", "neck.3"].iter().enumerate() {
+            add(format!("{prefix}.{name}.weight"), vec![8], 20 + idx as u64);
+            add(format!("{prefix}.{name}.bias"), vec![8], 30 + idx as u64);
+        }
+        add(format!("{prefix}.net_2.weight"), vec![8, 8, 3, 3], 40);
+        add(format!("{prefix}.net_3.weight"), vec![8, 8, 3, 3], 41);
+
+        let hd = dim / NUM_HEADS;
+        for i in 0..DEPTH {
+            let bb = format!("{prefix}.blocks.{i}");
+            let salt = 1000 * (i as u64 + 1);
+            let rel_rows = if GLOBAL_BLOCKS.contains(&i) {
+                2 * 4 - 1 // global grid 4
+            } else {
+                2 * WINDOW - 1
+            };
+            add(format!("{bb}.norm1.weight"), vec![dim], salt + 1);
+            add(format!("{bb}.norm1.bias"), vec![dim], salt + 2);
+            add(
+                format!("{bb}.attn.qkv.weight"),
+                vec![3 * dim, dim],
+                salt + 3,
+            );
+            add(format!("{bb}.attn.qkv.bias"), vec![3 * dim], salt + 4);
+            add(format!("{bb}.attn.proj.weight"), vec![dim, dim], salt + 5);
+            add(format!("{bb}.attn.proj.bias"), vec![dim], salt + 6);
+            add(format!("{bb}.attn.rel_pos_h"), vec![rel_rows, hd], salt + 7);
+            add(format!("{bb}.attn.rel_pos_w"), vec![rel_rows, hd], salt + 8);
+            add(format!("{bb}.norm2.weight"), vec![dim], salt + 9);
+            add(format!("{bb}.norm2.bias"), vec![dim], salt + 10);
+            add(
+                format!("{bb}.mlp.lin1.weight"),
+                vec![4 * dim, dim],
+                salt + 11,
+            );
+            add(format!("{bb}.mlp.lin1.bias"), vec![4 * dim], salt + 12);
+            add(
+                format!("{bb}.mlp.lin2.weight"),
+                vec![dim, 4 * dim],
+                salt + 13,
+            );
+            add(format!("{bb}.mlp.lin2.bias"), vec![dim], salt + 14);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2719,89 +2823,16 @@ mod tests {
     /// is the cached forward core — pinned structurally here by comparing a
     /// hydrated block against the whole-tower build on synthetic weights.
     #[test]
+    #[test]
     fn sam_block_from_matches_whole_tower_hydration() -> FocrResult<()> {
-        use crate::quant::focrq::{FocrqBuilder, WriteDType};
+        use crate::quant::focrq::FocrqBuilder;
 
         let prefix = "model.sam_model";
         let dim = 24usize; // divisible by NUM_HEADS = 12
         let mut b = FocrqBuilder::new();
-        let f32_bytes =
-            |values: &[f32]| -> Vec<u8> { values.iter().flat_map(|v| v.to_le_bytes()).collect() };
-        let synth = |len: usize, salt: u64| -> Vec<f32> {
-            (0..len)
-                .map(|i| {
-                    let raw = ((i as u64)
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(salt)
-                        >> 33) as u32;
-                    (raw as f32 / u32::MAX as f32 - 0.5) * 0.3
-                })
-                .collect()
-        };
-        let mut add = |name: String, shape: Vec<usize>, salt: u64| {
-            let len = shape.iter().product();
-            b.add_tensor(name, WriteDType::F32, shape, f32_bytes(&synth(len, salt)))
-                .expect("valid synthetic f32 tensor");
-        };
-        // Head tensors (small) + DEPTH blocks.
-        add(
-            format!("{prefix}.patch_embed.proj.weight"),
-            vec![dim, 3, PATCH, PATCH],
-            1,
-        );
-        add(format!("{prefix}.patch_embed.proj.bias"), vec![dim], 2);
-        add(format!("{prefix}.pos_embed"), vec![1, 4, 4, dim], 3);
-        for (idx, name) in ["neck.0", "neck.2"].iter().enumerate() {
-            let ch = 8usize;
-            let in_ch = if idx == 0 { dim } else { ch };
-            add(
-                format!("{prefix}.{name}.weight"),
-                vec![ch, in_ch, 1, 1],
-                10 + idx as u64,
-            );
-        }
-        for (idx, name) in ["neck.1", "neck.3"].iter().enumerate() {
-            add(format!("{prefix}.{name}.weight"), vec![8], 20 + idx as u64);
-            add(format!("{prefix}.{name}.bias"), vec![8], 30 + idx as u64);
-        }
-        add(format!("{prefix}.net_2.weight"), vec![8, 8, 3, 3], 40);
-        add(format!("{prefix}.net_3.weight"), vec![8, 8, 3, 3], 41);
-        let hd = dim / NUM_HEADS;
-        for i in 0..DEPTH {
-            let bb = format!("{prefix}.blocks.{i}");
-            let salt = 1000 * (i as u64 + 1);
-            let rel_rows = if GLOBAL_BLOCKS.contains(&i) {
-                2 * 4 - 1 // global grid 4
-            } else {
-                2 * WINDOW - 1
-            };
-            add(format!("{bb}.norm1.weight"), vec![dim], salt + 1);
-            add(format!("{bb}.norm1.bias"), vec![dim], salt + 2);
-            add(
-                format!("{bb}.attn.qkv.weight"),
-                vec![3 * dim, dim],
-                salt + 3,
-            );
-            add(format!("{bb}.attn.qkv.bias"), vec![3 * dim], salt + 4);
-            add(format!("{bb}.attn.proj.weight"), vec![dim, dim], salt + 5);
-            add(format!("{bb}.attn.proj.bias"), vec![dim], salt + 6);
-            add(format!("{bb}.attn.rel_pos_h"), vec![rel_rows, hd], salt + 7);
-            add(format!("{bb}.attn.rel_pos_w"), vec![rel_rows, hd], salt + 8);
-            add(format!("{bb}.norm2.weight"), vec![dim], salt + 9);
-            add(format!("{bb}.norm2.bias"), vec![dim], salt + 10);
-            add(
-                format!("{bb}.mlp.lin1.weight"),
-                vec![4 * dim, dim],
-                salt + 11,
-            );
-            add(format!("{bb}.mlp.lin1.bias"), vec![4 * dim], salt + 12);
-            add(
-                format!("{bb}.mlp.lin2.weight"),
-                vec![dim, 4 * dim],
-                salt + 13,
-            );
-            add(format!("{bb}.mlp.lin2.bias"), vec![dim], salt + 14);
-        }
+        // Shared with the streamed-vs-cached gate above, so both prove their
+        // claim about the SAME tower.
+        test_support::add_synth_sam_tower(&mut b, prefix, dim);
         let weights = Weights::from_bytes(b.build()).expect("synthetic SAM parses");
 
         let whole = sam_weights_from(&weights, prefix)?;

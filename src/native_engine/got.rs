@@ -298,6 +298,57 @@ fn transpose(m: &Mat) -> Mat {
 mod tests {
     use super::*;
 
+    /// Streamed vision residency must be a RESIDENCY change and nothing else.
+    ///
+    /// `hydrate_statics(.., stream_vision = true)` leaves `sam: None` and routes
+    /// `vision_features` through the per-block path, which additionally selects
+    /// the bounded global-attention kernel. Doctrine #1: a memory lever that
+    /// moves one output bit is a rejected lever, so this compares raw bit
+    /// patterns rather than an epsilon.
+    ///
+    /// Model-gated (`FOCR_GOT_MODEL`), skip-with-success when the artifact is
+    /// absent, because a synthetic tower cannot drive this: `forward_core`
+    /// hardcodes the real neck geometry (256/512/1024) and synthesizing those
+    /// tensors would be tens of MB of test data. The component-level proof that
+    /// this composes is already in `vision_sam`:
+    /// `sam_block_from_matches_whole_tower_hydration` (a streamed block hydrates
+    /// to the same weights the cached tower holds) plus
+    /// `bounded_global_attention_is_bit_identical` (the low_mem kernel the
+    /// streamed arm selects). This test is the end-to-end confirmation on real
+    /// weights.
+    #[test]
+    fn streamed_vision_is_bit_identical_to_cached() {
+        let Ok(model) = std::env::var("FOCR_GOT_MODEL") else {
+            return;
+        };
+        let weights = Weights::load(std::path::Path::new(&model)).expect("load GOT weights");
+        let img = image::open(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/got/sample_text.png"
+        ))
+        .expect("sample image");
+        let image = preprocess::got_view_tensor(&img);
+
+        let cached = hydrate_statics(&weights, "model.vision_tower_high", false).expect("cached");
+        let streamed =
+            hydrate_statics(&weights, "model.vision_tower_high", true).expect("streamed");
+        assert!(cached.sam.is_some(), "cached arm retains the tower");
+        assert!(
+            streamed.sam.is_none(),
+            "streamed arm must NOT retain the tower — that is the whole point"
+        );
+
+        let a = vision_features(&weights, &cached, &image).expect("cached vision");
+        let b = vision_features(&weights, &streamed, &image).expect("streamed vision");
+        assert_eq!(a.shape(), b.shape());
+        assert_eq!(
+            a.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+            b.data.iter().map(|f| f.to_bits()).collect::<Vec<u32>>(),
+            "streamed GOT vision features must be bit-identical to the cached tower"
+        );
+        assert!(a.data.iter().any(|&v| v != 0.0), "features carry signal");
+    }
+
     /// **B11 — the committed GOT `focr ocr` e2e regression gate.** Runs the WHOLE
     /// pipeline (preprocess → vision → splice → KV-cache decode → tiktoken) on the
     /// committed `sample_text.png` and asserts the exact golden text (the forward is
