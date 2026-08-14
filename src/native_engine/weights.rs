@@ -562,6 +562,16 @@ impl Weights {
         Self::from_backing(Backing::Owned(bytes))
     }
 
+    /// Exact backing bytes indexed by this loaded model.
+    ///
+    /// Provenance-critical in-memory callers use this to prove that the model
+    /// identity they return describes the same owned buffer every tensor read
+    /// will address, rather than a separate pre-read of the artifact path.
+    #[must_use]
+    pub(crate) fn source_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Test-only probe: did this load take the mmap backing?
     #[cfg(test)]
     pub(super) fn is_mapped(&self) -> bool {

@@ -14,7 +14,13 @@ sections as they land.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- TrOMR page results now expose the exact detector staff count and a typed
+  segmentation disposition, distinguishing zero-detection whole-image fallback
+  from a genuinely detected single staff even though both retain the certified
+  whole-image recognition route. Library metadata, JSON, robot events, and
+  immutable replay evidence carry the same additive fields.
 
 ## [0.7.2] - 2026-07-12
 

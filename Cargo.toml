@@ -16,13 +16,54 @@ readme = "README.md"
 [[bin]]
 name = "franken_ocr"
 path = "src/main.rs"
+required-features = ["cli-run-store"]
 
 [[bin]]
 name = "focr"
 path = "src/bin/focr.rs"
+required-features = ["cli-run-store"]
+
+# Integration targets that exercise the real CLI binary or introspect the
+# feature-gated clap surface. Keeping these declarations beside the binary
+# targets makes `--no-default-features --all-targets` an honest embedded-library
+# check: Cargo skips only tests whose stated contract requires `cli-run-store`.
+[[test]]
+name = "agent_ergonomics_regression"
+path = "tests/agent_ergonomics_regression.rs"
+required-features = ["cli-run-store"]
+
+[[test]]
+name = "cli_robot_golden"
+path = "tests/cli_robot_golden.rs"
+required-features = ["cli-run-store"]
+
+[[test]]
+name = "doctor_fixtures"
+path = "tests/doctor_fixtures.rs"
+required-features = ["cli-run-store"]
+
+[[test]]
+name = "fault_suite"
+path = "tests/fault_suite.rs"
+required-features = ["cli-run-store"]
+
+[[test]]
+name = "metamorphic"
+path = "tests/metamorphic.rs"
+required-features = ["cli-run-store"]
+
+[[test]]
+name = "progress_stderr_discipline"
+path = "tests/progress_stderr_discipline.rs"
+required-features = ["cli-run-store"]
+
+[[test]]
+name = "surface_matrix"
+path = "tests/surface_matrix.rs"
+required-features = ["cli-run-store"]
 
 [dependencies]
-clap = { version = "4.5", features = ["derive", "env"] }
+clap = { version = "4.5", features = ["derive", "env"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -34,14 +75,15 @@ anyhow = "1"
 #
 # asupersync: orchestration/cancellation/IO only — the engine owns exactly one
 # Runtime below the sync public API (plan §3.3). default-features=false keeps the
-# surface minimal. The sibling ../asupersync checkout at 0.3.8 satisfies
-# ">=0.3.5,<0.4".
-asupersync = { version = ">=0.3.5, <0.4", default-features = false, features = [
+# surface minimal. Pin the same published runtime used by the accepted
+# Frankensqlite dependency graph so standalone and embedded builds resolve one
+# reviewed version without depending on a sibling source checkout.
+asupersync = { version = "=0.3.10", default-features = false, features = [
     "tls-webpki-roots",
 ] }
 # Ctrl+C -> cooperative shutdown (bd-223.2): the CLI installs the handler; the
 # library exposes request_shutdown() so embedders can drive it themselves.
-ctrlc = "3.4"
+ctrlc = { version = "3.4", optional = true }
 # Physical-core count for the FOCR_THREADS budget (hyperthreads oversubscribe
 # the int8 GEMMs — plan §7.5; logical count stays a robot diagnostic only).
 num_cpus = "1.16"
@@ -54,18 +96,32 @@ ft-core = { path = "../frankentorch/crates/ft-core" }
 # SIMD bulk f16->f32 dequant; `std` enables the runtime aarch64 fp16 / x86 f16c
 # vector paths. Pinned to ft-core's major version.
 half = { version = "2", features = ["std"] }
-# Durable run state + telemetry on frankensqlite — NEVER rusqlite (plan §10).
-fsqlite = { path = "../frankensqlite/crates/fsqlite" }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }
+# Durable standalone-CLI run state + telemetry on frankensqlite — NEVER
+# rusqlite (plan §10). Embedded library consumers can disable default features;
+# PDF decode and model inference do not require the run store.
+fsqlite = { path = "../frankensqlite/crates/fsqlite", optional = true }
+fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types", optional = true }
 # Image decode/resize/normalize/pad/tile — the preprocess front end (plan §6.2).
 image = "0.25"
-# Native PDF page rasterization (src/pdf.rs): `focr ocr file.pdf` extracts each
-# page's image XObject and decodes it through the same pipeline a PNG takes — no
-# out-of-band poppler/pdftoppm. `lopdf` is the container/xref/object/stream parser
-# (pure Rust, no FFI); we write the image-codec dispatch ourselves. default-features
-# are off to drop the date/serde/tokio surface (chrono/jiff/time/rayon) the
-# scanned-image path never touches; the mandatory parser+crypto core stays.
+# Native PDF page rendering and selectable-text extraction (src/pdf.rs):
+# `focr ocr file.pdf` uses the hand-written image-codec/MRC paths for scans or
+# the exact bounded vector/text dialect emitted by MTDT's score-PDF writer. There
+# is no out-of-band poppler/pdftoppm. `lopdf` is only the pure-Rust, no-FFI
+# container/xref/object/stream parser; provider code owns rendering, glyph paint,
+# and text semantics. Default features are off to drop the date/serde/tokio
+# surface (chrono/jiff/time/rayon) these bounded paths never touch; the mandatory
+# parser+crypto core stays.
 lopdf = { version = "0.43", default-features = false }
+# Born-digital PDF glyph outlines (bd-0a7.4.1): lopdf already brings this exact
+# pure-Rust crate into the locked graph. Declaring the same version directly
+# exposes its bounded, callback-based TrueType `glyf` outline parser to the
+# in-process renderer; it adds no FFI, subprocess, network, or second PDF engine.
+ttf-parser = "0.25"
+# Pure-Rust scalar decoders for the two codecs used by layered MRC scan PDFs.
+# Keep default features disabled: Hayro's optional SIMD feature is intentionally
+# outside this crate's `unsafe_code = "deny"` dependency posture.
+hayro-jpeg2000 = { version = "=0.4.0", default-features = false }
+hayro-jbig2 = { version = "=0.3.0", default-features = false }
 # Pure-Rust CCITT Group 4 (T.6) fax decoder for bilevel scanned PDFs (the common
 # black-and-white scan filter). Already in the lock graph; no FFI.
 fax = "0.2"
@@ -82,6 +138,11 @@ flate2 = "1"
 # ft-kernel-cpu, but the decode GEMV falls below its threading threshold and was
 # running single-threaded. Already in the lock graph via ft-kernel-cpu.
 rayon = "1"
+# Exact-consumption BLAKE3 identities for embedded callers whose artifact
+# graph uses BLAKE3 addressing (notably MTDT). The same retained buffers also
+# receive SHA-256 identities below; this direct dependency is already locked
+# through frankensqlite and adds no FFI, subprocess, network, or parser surface.
+blake3 = "1"
 # Provenance hashing for `focr convert`: the deterministic sha256 of the source
 # safetensors shard, stamped into the `.focrq` header (`source_sha256`) so a
 # converted artifact is traceable to its bf16 origin. Pure-Rust RustCrypto, no
@@ -89,7 +150,7 @@ rayon = "1"
 # not dev-only, or the lib fails to build outside the test profile.
 sha2 = "0.10"
 # RunStore run ids (bd-223.4).
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 # Currently-unwired opt-in: declaring the feature makes `#[cfg(feature =
 # "mimalloc")]` in benches/support/perf_harness.rs a KNOWN cfg (no unexpected-cfg
@@ -109,16 +170,15 @@ memmap2 = "0.9"
 proptest = "1"
 
 [features]
+default = ["cli-run-store"]
+cli-run-store = [
+    "dep:clap",
+    "dep:ctrlc",
+    "dep:fsqlite",
+    "dep:fsqlite-types",
+    "dep:uuid",
+]
 mimalloc = []
-
-# The current asupersync 0.3.8 build input is not yet on crates.io (the index
-# tops out at 0.3.6); it lives in the sibling `../asupersync` checkout.
-# Patch crates-io to that path so the whole dependency graph —
-# franken_ocr's direct dep AND the fsqlite/frankentorch path-deps that pin
-# `0.3.4` — unifies on the single local 0.3.8 (which satisfies both ^0.3.4 and
-# >=0.3.5,<0.4). One asupersync in the tree; no version skew.
-[patch.crates-io]
-asupersync = { path = "../asupersync" }
 
 [lints.rust]
 unsafe_code = "deny"

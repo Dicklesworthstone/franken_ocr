@@ -25,7 +25,7 @@ records `transformers_version "4.46.3"` (an export tag), while the **runtime** i
 torch == 2.10.0
 transformers == 4.57.1
 Pillow == 12.1.1
-pymupdf == 1.27.2.2     # PDF -> image at 300 DPI (out-of-band; v1 is image-only, plan §7.7)
+pymupdf == 1.27.2.2     # reference-oracle fixture generation only; runtime PDF ingestion is native Rust (plan §7.7)
 ```
 
 The reference oracle (`scripts/gen_reference_fixtures.py`) asserts these at runtime

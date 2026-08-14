@@ -121,24 +121,51 @@ pub fn page_skipped_event(page: usize, err: &FocrError) -> Value {
     })
 }
 
-/// One `staff` event from a TrOMR full-page music run (bd-av64.2): the
-/// detector found `total` staves; this staff either recognized into the
-/// MusicXML (`status: "ok"`) or was skipped with a reason. Additive to the
-/// v1 event set (a consumer ignoring unknown kinds is unaffected), matching
-/// the `page` precedent from bd-fck1.
+/// One `staff` event from a TrOMR full-page music run (bd-av64.2).
+///
+/// `total` is the number of inference attempts emitted for this page. The
+/// detector count and route disposition are separate because zero detections
+/// still produce one whole-image fallback attempt. This row either recognized into a local
+/// semantic stream (`status: "ok"`) or was skipped with a reason. The real
+/// page bbox stays distinct from bd-av64.16's padded inference canvas. This
+/// evidence is row-local and makes no system/part claim. Additive to the v1
+/// event set, matching the `page` precedent from bd-fck1.
 pub fn staff_event(
     index: usize,
     total: usize,
-    bbox: (usize, usize, usize, usize),
-    status: &str,
+    detected_staff_count: usize,
+    staff_segmentation_disposition:
+        crate::native_engine::tromr::TromrStaffSegmentationDispositionV1,
+    geometry: crate::preprocess::staff_detect::StaffCropGeometry,
+    outcome: crate::native_engine::tromr::StaffInferenceOutcome,
     reason: Option<&str>,
 ) -> Value {
+    debug_assert!(staff_segmentation_disposition.is_consistent_with(detected_staff_count));
+    let bbox = geometry.source_bbox;
+    let status = match outcome {
+        crate::native_engine::tromr::StaffInferenceOutcome::Recognized => "ok",
+        crate::native_engine::tromr::StaffInferenceOutcome::Skipped => "skipped",
+    };
     let mut event = serde_json::json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
         "event": "staff",
         "staff": index + 1,
         "total": total,
+        "detected_staff_count": detected_staff_count,
+        "staff_segmentation_disposition": staff_segmentation_disposition,
         "bbox": [bbox.0, bbox.1, bbox.2, bbox.3],
+        "source_bbox": [bbox.0, bbox.1, bbox.2, bbox.3],
+        "inference_canvas": {
+            "width": geometry.canvas_width,
+            "height": geometry.canvas_height,
+        },
+        "padding": {
+            "top": geometry.padding.top,
+            "right": geometry.padding.right,
+            "bottom": geometry.padding.bottom,
+            "left": geometry.padding.left,
+        },
+        "outcome": outcome.as_str(),
         "status": status,
     });
     if let Some(reason) = reason {
@@ -170,16 +197,75 @@ mod tests {
     /// bbox array, status, and a reason only when skipped.
     #[test]
     fn staff_event_shapes_ok_and_skipped() {
-        let ok = staff_event(0, 5, (0, 292, 1168, 115), "ok", None);
+        let unpadded =
+            crate::preprocess::staff_detect::StaffCropGeometry::unpadded((0, 292, 1168, 115));
+        let ok = staff_event(
+            0,
+            5,
+            5,
+            crate::native_engine::tromr::TromrStaffSegmentationDispositionV1::MultipleStavesDetectedPerCropRecognition,
+            unpadded,
+            crate::native_engine::tromr::StaffInferenceOutcome::Recognized,
+            None,
+        );
         assert_eq!(ok["event"], "staff");
         assert_eq!(ok["staff"], 1);
         assert_eq!(ok["total"], 5);
+        assert_eq!(ok["detected_staff_count"], 5);
+        assert_eq!(
+            ok["staff_segmentation_disposition"],
+            "multiple_staves_detected_per_crop_recognition"
+        );
         assert_eq!(ok["bbox"], serde_json::json!([0, 292, 1168, 115]));
+        assert_eq!(ok["source_bbox"], ok["bbox"]);
+        assert_eq!(ok["inference_canvas"]["width"], 1168);
+        assert_eq!(ok["inference_canvas"]["height"], 115);
+        assert_eq!(ok["padding"]["top"], 0);
+        assert_eq!(ok["outcome"], "recognized");
         assert_eq!(ok["status"], "ok");
         assert!(ok.get("reason").is_none());
-        let skip = staff_event(3, 5, (0, 663, 1168, 114), "skipped", Some("1280 clamp"));
+        let fallback = staff_event(
+            0,
+            1,
+            0,
+            crate::native_engine::tromr::TromrStaffSegmentationDispositionV1::NoStaffDetectedWholeImageFallback,
+            unpadded,
+            crate::native_engine::tromr::StaffInferenceOutcome::Recognized,
+            None,
+        );
+        assert_eq!(fallback["staff"], 1);
+        assert_eq!(fallback["total"], 1);
+        assert_eq!(fallback["detected_staff_count"], 0);
+        assert_eq!(
+            fallback["staff_segmentation_disposition"],
+            "no_staff_detected_whole_image_fallback"
+        );
+        let skip = staff_event(
+            3,
+            5,
+            5,
+            crate::native_engine::tromr::TromrStaffSegmentationDispositionV1::MultipleStavesDetectedPerCropRecognition,
+            crate::preprocess::staff_detect::StaffCropGeometry {
+                source_bbox: (0, 663, 1168, 100),
+                canvas_width: 1168,
+                canvas_height: 117,
+                padding: crate::preprocess::staff_detect::StaffPadding {
+                    top: 8,
+                    right: 0,
+                    bottom: 9,
+                    left: 0,
+                },
+            },
+            crate::native_engine::tromr::StaffInferenceOutcome::Skipped,
+            Some("decoder error"),
+        );
         assert_eq!(skip["staff"], 4);
-        assert_eq!(skip["reason"], "1280 clamp");
+        assert_eq!(skip["bbox"], serde_json::json!([0, 663, 1168, 100]));
+        assert_eq!(skip["inference_canvas"]["height"], 117);
+        assert_eq!(skip["padding"]["top"], 8);
+        assert_eq!(skip["padding"]["bottom"], 9);
+        assert_eq!(skip["outcome"], "skipped");
+        assert_eq!(skip["reason"], "decoder error");
         assert!(EVENT_KINDS.contains(&"staff"), "schema advertises staff");
     }
 

@@ -165,8 +165,10 @@ lift end-to-end.
 - Stop: all batch rows have emitted rhythm `[EOS]`=2 (`cumsum ≥ 1`), or 256 steps.
 - **Port decision (doctrine #8):** reference decode is *nondeterministic by construction*.
   Our default = per-head **argmax** (deterministic); the L4 gate runs argmax on BOTH sides
-  (oracle patched to argmax). Sampled mode only behind a kill-switch env
-  (`FOCR_TROMR_SAMPLE=1`), divergence measured and logged in `docs/DISCREPANCIES.md`.
+  (oracle patched to argmax). Every core entry point accepts the versioned
+  `TromrRecognitionOptionsV1`; seeded top-k/T=0.2 sampling requires an explicit u64 seed.
+  Only the standalone CLI maps `FOCR_TROMR_SAMPLE` plus `FOCR_TROMR_SEED` into that object.
+  Divergence is measured and logged in `docs/DISCREPANCIES.md`.
 - Batch note: upstream `torch.cat` of per-image tensors requires equal W — mixed-width
   batching is broken upstream; we run staves sequentially (doctrine #5), so no delta.
 
@@ -438,7 +440,9 @@ bd-3kix) extends to staves — synthesize via Verovio/MuseScore renders with kno
 - **OQ-T6 RESOLVED (DISC-007, measured):** on REAL staves argmax and top-k/T=0.2
   sampling produce IDENTICAL streams (SER equal on all 4 committed examples);
   the apparent argmax collapse was the upstream opaque-alpha blank-input bug.
-  Default = argmax; `FOCR_TROMR_SAMPLE=1` + `FOCR_TROMR_SEED` = seeded sampling.
+  Default = explicit argmax. `TromrRecognitionOptionsV1` selects seeded sampling
+  only with an explicit seed; the CLI compatibility variables map strictly into
+  that same value and are never read by core staff/page/split functions.
 - **RESOLVED by source this census:** `on_attn` out-proj is bias-free (x_transformers.py:577
   + checkpoint); decoder LN eps 1e-5 vs encoder 1e-6 (§4/§2b); note head inference-dead
   (§5); note_mask train-only; pos-emb scale 1/16 (§4); backbone final norm Identity;

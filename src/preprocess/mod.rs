@@ -74,6 +74,38 @@ pub const CROP_THRESHOLD: u32 = 640;
 /// `modeling_unlimitedocr.py:872`).
 pub const PAD_FILL: u8 = 127;
 
+/// Canonical DISC-007 Gray8 input represented to TrOMR before resize and
+/// normalization. Staff detection and provenance capture call this same
+/// helper, so exact-input evidence cannot drift from model preprocessing.
+pub(crate) fn tromr_gray8_input(img: &DynamicImage) -> FocrResult<staff_detect::TromrGray8CropV1> {
+    let (width, height) = (img.width() as usize, img.height() as usize);
+    if width == 0 || height == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "tromr preprocess: degenerate {width}x{height} input"
+        )));
+    }
+    let rgba = img.color().has_alpha().then(|| img.to_rgba8());
+    let alpha_is_ink = rgba
+        .as_ref()
+        .is_some_and(|rgba| rgba.pixels().any(|p| p.0[3] < 255));
+    let pixels = if alpha_is_ink {
+        rgba.expect("alpha-bearing image was converted once")
+            .pixels()
+            .map(|p| 255 - p.0[3])
+            .collect()
+    } else {
+        img.to_rgb8()
+            .pixels()
+            .map(|p| {
+                let [r, g, b] = p.0;
+                ((4899 * u32::from(r) + 9617 * u32::from(g) + 1868 * u32::from(b) + 8192) >> 14)
+                    .min(255) as u8
+            })
+            .collect()
+    };
+    staff_detect::TromrGray8CropV1::from_tightly_packed(pixels, width, height)
+}
+
 // ── modes ───────────────────────────────────────────────────────────────────
 
 /// The preprocessing mode the caller selects (the `crop_mode` flag plus its
@@ -427,7 +459,9 @@ pub(crate) fn decode_path(path: &Path) -> FocrResult<DynamicImage> {
 }
 
 /// Decode raw image bytes into an EXIF-transposed [`DynamicImage`] ([SPEC-020]).
-fn decode_bytes(bytes: &[u8]) -> FocrResult<DynamicImage> {
+/// `pub(crate)` so the immutable TrOMR input bundle can decode the exact owned
+/// buffer it hashes, without a second path open.
+pub(crate) fn decode_bytes(bytes: &[u8]) -> FocrResult<DynamicImage> {
     let reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| FocrError::InputDecode(format!("sniff bytes: {e}")))?;
@@ -1008,30 +1042,7 @@ fn bilinear_u8(src: &[u8], w: usize, h: usize, nw: usize, nh: usize) -> Vec<u8> 
 /// clamp (the E5 front end guarantees the bound; a raw over-wide crop is a
 /// clean error, never undefined crop-indexing — spec §2b).
 pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
-    let (w, h) = (img.width() as usize, img.height() as usize);
-    if w == 0 || h == 0 {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "tromr preprocess: degenerate {w}x{h} input"
-        )));
-    }
-    // The ink gray plane. The inverted-alpha convention applies ONLY when
-    // the alpha channel varies: upstream applies 255−alpha to EVERY
-    // 4-channel input, which BLANKS fully-opaque PNGs (their own demo
-    // staves are opaque RGBA — measured 2026-07-06, DISC-007). A deliberate,
-    // documented divergence; opaque-alpha images take the RGB luma path.
-    let alpha_is_ink = img.color().has_alpha() && img.to_rgba8().pixels().any(|p| p.0[3] < 255);
-    let gray: Vec<u8> = if alpha_is_ink {
-        img.to_rgba8().pixels().map(|p| 255 - p.0[3]).collect()
-    } else {
-        img.to_rgb8()
-            .pixels()
-            .map(|p| {
-                let [r, g, b] = p.0;
-                ((4899 * u32::from(r) + 9617 * u32::from(g) + 1868 * u32::from(b) + 8192) >> 14)
-                    .min(255) as u8
-            })
-            .collect()
-    };
+    let (gray, w, h) = tromr_gray8_input(img)?.into_tightly_packed();
     let new_h = crate::native_engine::tromr::IMG_H;
     let new_w = ((new_h as f64 / h as f64 * w as f64) as usize) / 16 * 16;
     if new_w == 0 {

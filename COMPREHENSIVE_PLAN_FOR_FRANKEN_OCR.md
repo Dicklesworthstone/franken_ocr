@@ -605,7 +605,7 @@ Two `[[bin]]` (`focr` short + `franken_ocr` long), both → `src/main.rs`. **`fn
 
 | Subcommand | Purpose |
 |-----------|---------|
-| `focr ocr <image>` | Primary: parse a document **image** → markdown (human default) or `--json`. **v1 is IMAGE-ONLY** (PDF: §7.7) |
+| `focr ocr <image-or-pdf>` | Primary: parse a document image or an admitted native-PDF scan/MRC or exact MTDT vector/text page → markdown (human default) or `--json`; unsupported PDF composition refuses under §7.7. |
 | `focr ocr --robot` (or `focr robot run`) | Streaming **NDJSON** events for agents |
 | `focr convert <safetensors> -o <.focrq> [--arch ...] [--quant int8\|int4]` | Offline weight transformation (§5) |
 | `focr robot schema` | Self-describing event/contract schema (versioned) |
@@ -635,9 +635,39 @@ Two `[[bin]]` (`focr` short + `franken_ocr` long), both → `src/main.rs`. **`fn
 
 5-target release matrix (`.github/workflows/dist.yml`): linux x86-64/arm64, darwin x86-64/arm64, windows-msvc x86-64. Static where possible; one self-contained `focr` per target. Runtime SIMD dispatch means **one binary per arch** auto-selects the best int8 path (AMX/VNNI/SMMLA/SDOT) — no per-microarch builds. `install.sh` curl-pipe installer; tar.gz/zip archives + SHA-256 checksums.
 
-### 7.7 PDF input is OUT OF SCOPE for v1 (image-only) — [OPEN decision]
+### 7.7 Native PDF input has bounded scan/MRC and exact MTDT vector/text subsets — [RESOLVED]
 
-The reference rasterizes PDFs with **pymupdf at 300 DPI**. A pure-Rust raster at **byte-parity** with MuPDF is a large, unscoped sub-project, and *any* pixel mismatch changes OCR output and would blow the **L0 preprocessing parity gate** (§8.2). So **v1 accepts images only**; PDFs are rasterized **out-of-band** (the user runs `pdftoppm`/`pymupdf` and passes pages as images). Re-introducing native PDF is an explicit decision: (a) bundle `pdfium`/MuPDF behind a feature flag (re-adds a C dependency — weigh against G3's pure-Rust single binary), or (b) a pure-Rust renderer **plus a rasterization-parity gate vs pymupdf@300DPI**. Until then, `pdf` does not appear in the CLI surface.
+PDF ingestion is owned by the reusable Rust library in `src/pdf.rs`; neither the
+CLI nor an embedding caller shells out to a PDF rasterizer. `lopdf` supplies the
+container/page/resource parser with default features disabled. Provider-owned
+decode dispatch handles JPEG, CCITT Group 4, raw Flate/LZW rasters, pure-Rust
+JPX/JPEG 2000 (`hayro-jpeg2000`), and JBIG2 (`hayro-jbig2`). The admitted layered
+MRC form interprets content-stream `q`/`Q`/`cm`/named-`Do` order and deterministically
+composes one opaque full-page base followed by same-CTM soft-masked overlays.
+
+Pages with no image XObjects take a separate pure-Rust renderer for the exact
+bounded vector/path and embedded TrueType glyph dialect emitted by MTDT's
+score-PDF writer plus the bounded embedded Type1C representation emitted by
+LilyPond. The same retained immutable `PdfPages` input exposes selectable-text
+schema v2: MTDT Type0/Identity-H requires a complete embedded ToUnicode mapping;
+LilyPond Type1C uses its exact one-byte WinAnsi + Differences map. Every source
+code and glyph name is retained, deterministic WinAnsi/AGL names may map to
+Unicode, and music names such as `noteheads.s2` remain explicitly opaque rather
+than being fabricated or omitted. Rendering and text decode share the
+provider-owned content stream and Type1C loader; neither path reopens a
+diagnostic path, launches a process, or guesses an incomplete mapping.
+
+This is not a claim to be a general PDF renderer. Bounds cover content bytes and
+operations, graphics-state depth, vector contours and segments, fonts and glyphs,
+output and supersampling pixels, encoded and decoded scan sizes, layer count,
+aggregate working pixels, masks, and JBIG2 globals. Arbitrary vector/text paint
+outside the MTDT writer dialect, unsupported fonts or CMaps, partial mosaics,
+nested Form XObjects, reflections/skew, unsupported blend state, or other
+unimplemented composition semantics refuse with the exact capability that must
+be added inside `franken_ocr::pdf`. The conformance gates use exact MTDT
+render/text fixtures plus structural checks and a public-domain layered scan
+replay with an image-tolerance contract; lossy JPEG 2000 output is not mislabeled
+as cross-platform byte parity.
 
 ---
 
@@ -840,7 +870,7 @@ Per the `/idea-wizard` review, the single highest-EV move is **not a kernel** �
 | **frankentorch gaps** (no image I/O, no f32 bicubic, no GPU) | LOW-MED | Build the image front end fresh (`image`/`fast_image_resize`); build f32 bicubic; GPU is out of scope (Phase 6 stretch) and CPU-only frankentorch is *aligned* with our priority. |
 | **Reference-version drift** (config 4.46.3 vs runtime 4.57.1) | LOW | Pin the oracle to README's runtime (`transformers==4.57.1`, `torch==2.10.0`); freeze fixtures; record the pin. |
 | **End-to-end may not beat the CPU baseline in v1** (f32 vision tower vs MKL/oneDNN; frankentorch's own profiling tags it slower on some ops) | MED | **G2 reframed (§1.1) to per-stage honesty**: first prove which CPU baseline is legitimate (CPU-patched HF, llama.cpp, or ONNX); target the *decode* win (int8/int4), report vision-prefill parity-or-slower openly; "end-to-end faster" is a post-int4 / optional-int8-vision stretch, not a v1 gate. The unbuilt tiled SMMLA/VNNI GEMM (§3.2, §6.2) is the lever that narrows it. |
-| **PDF rasterization parity** (CLI/README must not over-promise) | MED | **v1 is image-only (§7.7)**; PDFs rasterized out-of-band. Native PDF only behind an explicit decision (pdfium feature vs pure-Rust + a rasterization-parity gate vs pymupdf@300DPI); `pdf` stays off the CLI surface until then. |
+| **PDF rasterization correctness** (CLI/README must not over-promise) | MED | The pure-Rust bounded scan/MRC paths and exact MTDT-writer vector/text render plus selectable-text path in §7.7 are live. Exact codec/structure/operator/font/CMap refusals prevent unsupported PDF composition from being approximated. Unit coverage, exact MTDT fixtures, and a public-domain JPX+JBIG2 MRC replay gate the admitted subsets; general vector/text PDF rendering remains explicitly unsupported and any expansion must be implemented in-library. |
 | **Tokenizer mismatch** (pure-Rust BPE vs `LlamaTokenizerFast`) | MED | A wrong token id corrupts every downstream gate; dedicated tokenizer conformance corpus (OQ-16, §8.3), token-id-exact, frozen golden id sequences, before any decoder parity work. |
 
 ---

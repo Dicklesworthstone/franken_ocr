@@ -20,11 +20,15 @@
 #![deny(unsafe_code)]
 
 pub mod adaptive;
+#[cfg(feature = "cli-run-store")]
 pub mod cli;
 pub mod conformance;
 pub mod dist;
 pub mod doctor;
 pub mod error;
+pub mod music_diagnostics;
+pub mod music_execution;
+pub mod music_input;
 pub mod native_engine;
 pub mod pdf;
 pub mod preprocess;
@@ -32,14 +36,37 @@ pub mod progress;
 pub mod quant;
 pub mod robot;
 pub mod simd;
+#[cfg(feature = "cli-run-store")]
 pub mod storage;
 pub mod tokenizer;
 
+#[cfg(feature = "cli-run-store")]
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
+pub use music_diagnostics::{
+    MUSIC_DIAGNOSTICS_SCHEMA_VERSION, MUSIC_DIAGNOSTICS_TIMING_CONTRACT,
+    MusicInputPreparationDiagnosticsV1, MusicRunOutcomeV1, ProcessResourceDiagnosticsV1,
+    TromrExecutionDiagnosticsV1, TromrForwardAttemptDiagnosticsV1,
+};
+pub use music_execution::{
+    MAX_TROMR_FORWARD_ATTEMPTS, MAX_TROMR_PAGE_BUDGET_MS, MusicCancellationToken,
+    TROMR_EXECUTION_OPTIONS_SCHEMA_VERSION, TromrExecutionOptionsV1,
+};
 /// Multi-model architecture descriptors + registry (the "model zoo" foundation,
 /// epic bd-3jo6 / A1). Additive metadata layer; the live forward is unchanged.
 pub use native_engine::model_arch;
+pub use native_engine::tromr::{
+    TROMR_RECOGNITION_OPTIONS_SCHEMA_VERSION, TromrDecodeModeV1, TromrRecognitionOptionsV1,
+    TromrSplitPolicyV1, TromrStaffResamplerV1, TromrStaffSegmentationDispositionV1,
+};
+pub use native_engine::tromr_lineage::{
+    TROMR_LINEAGE_CANONICAL_SHA256, TROMR_LINEAGE_CONTRACT_ID, TROMR_LINEAGE_SCHEMA_VERSION,
+    TromrArtifactRoleV1, TromrConversionReplayV1, TromrConversionStepV1, TromrEvidenceClassV1,
+    TromrLineageArtifactV1, TromrLineageReceiptV1, TromrNegativeTrainingEvidenceV1,
+    TromrObservedArtifactV1, TromrOfficialFileV1, TromrPaperAuthorityV1, TromrProviderIdentityV1,
+    TromrProviderSourceV1, TromrTrainingAvailabilityV1, TromrTrainingFieldV1,
+    TromrUpstreamSourceV1, tromr_lineage_receipt,
+};
 pub use native_engine::{ExtractedFigure, LayoutSpan, RecognizedDocument};
 
 use std::path::Path;
@@ -239,16 +266,21 @@ pub struct OcrEngine {
     runtime: Runtime,
     /// The lazily-loaded, shared model (one read-only weight blob per engine).
     model: Mutex<Option<Arc<OcrModel>>>,
+    /// Explicit immutable TrOMR mechanics applied to every ordinary engine call.
+    /// This belongs to the request/engine, never the path-keyed global model cache.
+    tromr_options: TromrRecognitionOptionsV1,
 }
 
 impl OcrEngine {
     /// Take (consume) the staff-level metadata from the most recent TrOMR
     /// music forward on this engine's cached model, if any (bd-av64.2): the
-    /// recognized staves' detection indices + page-space bboxes and any
-    /// per-staff skips. Returns `None` when no model is loaded, the loaded
-    /// model has run no music forward since the last take, or the last
-    /// forward was not a music run. The CLI uses this to emit robot `staff`
-    /// events and the `--json` `staves` array.
+    /// recognized row fragments with their exact model-native semantic streams,
+    /// detection indices, and page-space bboxes; any per-row skips; and
+    /// bd-av64.16's source-vs-inference-canvas evidence for every attempt.
+    /// Fragments deliberately carry no system or persistent-part identity.
+    /// Returns `None` when no model is loaded, the loaded model has run no music
+    /// forward since the last take, or the last forward was not a music run. The
+    /// CLI uses this to emit robot `staff` events and the `--json` `staves` array.
     #[must_use]
     pub fn take_music_page_meta(&self) -> Option<native_engine::MusicPageMeta> {
         self.model
@@ -256,6 +288,170 @@ impl OcrEngine {
             .ok()
             .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone))
             .and_then(|model| model.take_music_meta())
+    }
+
+    /// Run TrOMR over a provider-owned immutable input bundle and return both
+    /// row-local recognition evidence and exact-consumption identities.
+    ///
+    /// Unlike the legacy path APIs, this method never reopens source, model, or
+    /// tokenizer paths: [`music_input::ImmutableMusicInputBundle`] already owns
+    /// the exact bytes parsed by every component. The returned provenance is
+    /// produced by franken_ocr itself; embedders must not reconstruct it from
+    /// separate pre-hash reads. The bundle's explicit recognition options are
+    /// passed into the same option-aware provider path as ordinary engine calls.
+    ///
+    /// # Errors
+    /// Any TrOMR forward error, a missing page metadata handoff (an internal
+    /// contract violation), or a provider-returned replay identity mismatch.
+    pub fn recognize_immutable_music(
+        &self,
+        bundle: music_input::ImmutableMusicInputBundle,
+    ) -> FocrResult<music_input::ImmutableMusicRecognition> {
+        self.recognize_immutable_music_with_cancellation(bundle, MusicCancellationToken::new())
+    }
+
+    /// Run immutable TrOMR recognition with an explicit bounded execution policy
+    /// and a per-request cooperative cancellation token.
+    ///
+    /// Unlike [`Self::recognize_immutable_music`], this additive entry point lets
+    /// an embedder retain a clone of `cancellation` and cancel this request
+    /// without affecting another engine or request. The blocking worker is
+    /// awaited to terminal completion: timeout or cancellation is observed
+    /// inside the TrOMR loop, and this method never returns while that worker is
+    /// still consuming CPU.
+    ///
+    /// # Errors
+    /// Invalid execution options, cancellation, explicit budget exhaustion, any
+    /// TrOMR forward error, or a provider provenance/meta contract violation.
+    pub fn recognize_immutable_music_with_execution(
+        &self,
+        bundle: music_input::ImmutableMusicInputBundle,
+        execution_options: TromrExecutionOptionsV1,
+        cancellation: MusicCancellationToken,
+    ) -> FocrResult<music_input::ImmutableMusicRecognition> {
+        let execution_options = execution_options.validate()?;
+        if bundle.provenance().execution_options != execution_options {
+            return Err(FocrError::Usage(format!(
+                "explicit TrOMR execution policy does not match immutable bundle receipt: bundle={} requested={}",
+                bundle.provenance().execution_options_identity,
+                execution_options.replay_identity()?
+            )));
+        }
+        self.recognize_immutable_music_with_cancellation(bundle, cancellation)
+    }
+
+    /// Run immutable TrOMR recognition with the replay-bound execution policy
+    /// carried by `bundle` and a per-request cooperative cancellation token.
+    ///
+    /// # Errors
+    /// Cancellation, explicit budget exhaustion, any TrOMR forward error, or a
+    /// provider provenance/meta contract violation.
+    pub fn recognize_immutable_music_with_cancellation(
+        &self,
+        bundle: music_input::ImmutableMusicInputBundle,
+        cancellation: MusicCancellationToken,
+    ) -> FocrResult<music_input::ImmutableMusicRecognition> {
+        self.recognize_immutable_music_observed(bundle, cancellation)
+            .map(|success| success.recognition)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Run immutable TrOMR recognition and preserve runtime diagnostics on
+    /// either success or typed failure.
+    ///
+    /// Failure deliberately carries no MusicXML or page metadata. Measurements
+    /// are process-local and noncanonical; they never affect replay identity.
+    pub fn recognize_immutable_music_observed(
+        &self,
+        bundle: music_input::ImmutableMusicInputBundle,
+        cancellation: MusicCancellationToken,
+    ) -> Result<
+        music_input::ImmutableMusicRecognitionWithDiagnostics,
+        music_input::ImmutableMusicRecognitionFailure,
+    > {
+        let (model, raster, source_bytes, recognition_options, execution_options, provenance) =
+            bundle.into_parts();
+        let execution_options_identity = provenance.execution_options_identity.clone();
+        let execution_options_json = execution_options.canonical_json().map_err(|error| {
+            music_input::ImmutableMusicRecognitionFailure {
+                diagnostics: Box::new(music_diagnostics::TromrExecutionDiagnosticsV1::unavailable(
+                    execution_options_identity.clone(),
+                    &error,
+                )),
+                error,
+            }
+        })?;
+        // Start the monotonic allowance before scheduling so blocking-pool
+        // queueing and forward-admission contention consume declared time.
+        let mut execution = music_execution::TromrExecutionContext::new(
+            execution_options,
+            cancellation,
+        )
+        .map_err(|error| music_input::ImmutableMusicRecognitionFailure {
+            diagnostics: Box::new(music_diagnostics::TromrExecutionDiagnosticsV1::unavailable(
+                execution_options_identity.clone(),
+                &error,
+            )),
+            error,
+        })?;
+        let outer_failure_identity = execution_options_identity.clone();
+        self.run_blocking_stage_to_completion(move || {
+            execution.mark_worker_started();
+            native_engine::timing_log(&format!(
+                "tromr.execution_options identity={execution_options_identity} \
+                 value={execution_options_json}"
+            ));
+            debug_assert_eq!(
+                u64::try_from(source_bytes.len()).unwrap_or(u64::MAX),
+                provenance.source.byte_len,
+                "retained source bytes must match provider provenance"
+            );
+            let result = (|| {
+                let (musicxml, page_meta) = model.recognize_dynamic_with_tromr_execution_context(
+                    raster,
+                    recognition_options,
+                    &mut execution,
+                )?;
+                if page_meta.recognition_options != provenance.recognition_options
+                    || page_meta.recognition_options_identity
+                        != provenance.recognition_options_identity
+                {
+                    return Err(FocrError::Other(anyhow::anyhow!(
+                        "immutable TrOMR provider options identity diverged from bundle provenance"
+                    )));
+                }
+                music_input::ImmutableMusicRecognition::from_provider_output(
+                    musicxml, page_meta, provenance,
+                )
+            })();
+            let attempts_started = execution.attempts_started();
+            let earned_allowance_ms = execution.earned_allowance_ms().unwrap_or(u64::MAX);
+            let elapsed_ms = execution.elapsed_ms();
+            native_engine::timing_log(&format!(
+                "tromr.execution attempts_started={} earned_allowance_ms={} elapsed_ms={}",
+                attempts_started, earned_allowance_ms, elapsed_ms
+            ));
+            let diagnostics = execution.finish_diagnostics(&result);
+            Ok(match result {
+                Ok(recognition) => Ok(music_input::ImmutableMusicRecognitionWithDiagnostics {
+                    recognition,
+                    diagnostics,
+                }),
+                Err(error) => Err(music_input::ImmutableMusicRecognitionFailure {
+                    error,
+                    diagnostics: Box::new(diagnostics),
+                }),
+            })
+        })
+        .unwrap_or_else(|error| {
+            Err(music_input::ImmutableMusicRecognitionFailure {
+                diagnostics: Box::new(music_diagnostics::TromrExecutionDiagnosticsV1::unavailable(
+                    outer_failure_identity,
+                    &error,
+                )),
+                error,
+            })
+        })
     }
 
     /// Construct the engine, building the single owned `asupersync` runtime
@@ -268,6 +464,20 @@ impl OcrEngine {
     /// [`FocrError::Other`] if the runtime fails to build (e.g. the OS refuses to
     /// spawn worker threads).
     pub fn new() -> FocrResult<Self> {
+        Self::new_with_tromr_options(TromrRecognitionOptionsV1::deterministic())
+    }
+
+    /// Construct an engine with explicit TrOMR inference mechanics.
+    ///
+    /// Options are validated once and stored on the engine, outside the global
+    /// path-keyed [`OcrModel`] cache. Every path/in-memory/layout/figure/batch
+    /// call forwards this same value when the loaded architecture is TrOMR.
+    ///
+    /// # Errors
+    /// Options validation errors, or [`FocrError::Other`] if the runtime fails
+    /// to build.
+    pub fn new_with_tromr_options(options: TromrRecognitionOptionsV1) -> FocrResult<Self> {
+        let tromr_options = options.validate()?;
         // Small blocking pool is a guard, not the mechanism: exactly one live
         // forward at a time runs the N-core kernel fan-out (doctrine #5).
         let runtime = RuntimeBuilder::new()
@@ -279,7 +489,14 @@ impl OcrEngine {
         Ok(Self {
             runtime,
             model: Mutex::new(None),
+            tromr_options,
         })
+    }
+
+    /// The normalized TrOMR mechanics applied by ordinary engine calls.
+    #[must_use]
+    pub const fn tromr_recognition_options(&self) -> TromrRecognitionOptionsV1 {
+        self.tromr_options
     }
 
     /// Resolve the configured model artifact path ([`MODEL_PATH_ENV`] override,
@@ -378,13 +595,14 @@ impl OcrEngine {
     pub fn recognize_with_model(&self, model_path: &Path, image_path: &Path) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
         let image_path = image_path.to_path_buf();
+        let tromr_options = self.tromr_options;
         // One owned runtime; the per-page forward is the only blocking work and
         // is driven sequentially on the runtime blocking pool, never inline on
         // the async polling thread (no nested runtime, no concurrent forwards).
         self.run_blocking_stage_with_budget(
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize(&image_path),
+            move || model.recognize_with_tromr_options(&image_path, tromr_options),
         )
     }
 
@@ -415,10 +633,11 @@ impl OcrEngine {
         image: image::DynamicImage,
     ) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
+        let tromr_options = self.tromr_options;
         self.run_blocking_stage_with_budget(
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_dynamic(image),
+            move || model.recognize_dynamic_with_tromr_options(image, tromr_options),
         )
     }
 
@@ -443,10 +662,11 @@ impl OcrEngine {
     ) -> FocrResult<RecognizedDocument> {
         let model = self.model_at(model_path)?;
         let image_path = image_path.to_path_buf();
+        let tromr_options = self.tromr_options;
         self.run_blocking_stage_with_budget(
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_with_layout(&image_path),
+            move || model.recognize_with_layout_and_tromr_options(&image_path, tromr_options),
         )
     }
 
@@ -473,10 +693,11 @@ impl OcrEngine {
         image: image::DynamicImage,
     ) -> FocrResult<RecognizedDocument> {
         let model = self.model_at(model_path)?;
+        let tromr_options = self.tromr_options;
         self.run_blocking_stage_with_budget(
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_dynamic_with_layout(image),
+            move || model.recognize_dynamic_with_layout_and_tromr_options(image, tromr_options),
         )
     }
 
@@ -505,10 +726,11 @@ impl OcrEngine {
     ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
         let model = self.model_at(model_path)?;
         let image_path = image_path.to_path_buf();
+        let tromr_options = self.tromr_options;
         self.run_blocking_stage_with_budget(
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_with_figures(&image_path),
+            move || model.recognize_with_figures_and_tromr_options(&image_path, tromr_options),
         )
     }
 
@@ -535,10 +757,11 @@ impl OcrEngine {
         image: image::DynamicImage,
     ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
         let model = self.model_at(model_path)?;
+        let tromr_options = self.tromr_options;
         self.run_blocking_stage_with_budget(
             "forward",
             Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_dynamic_with_figures(image),
+            move || model.recognize_dynamic_with_figures_and_tromr_options(image, tromr_options),
         )
     }
 
@@ -577,6 +800,7 @@ impl OcrEngine {
         images: &[&Path],
     ) -> FocrResult<Vec<FocrResult<String>>> {
         let model = self.model_at(model_path)?;
+        let tromr_options = self.tromr_options;
         let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
         let count = u32::try_from(owned.len().max(1)).unwrap_or(u32::MAX);
         let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
@@ -585,7 +809,7 @@ impl OcrEngine {
             .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
         self.run_blocking_stage_with_budget("forward-batch", budget, move || {
             let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
-            Ok(model.recognize_batch(&refs))
+            Ok(model.recognize_batch_with_tromr_options(&refs, tromr_options))
         })
     }
 
@@ -719,6 +943,15 @@ impl OcrEngine {
             }
         })
     }
+
+    fn run_blocking_stage_to_completion<T, F>(&self, op: F) -> FocrResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> FocrResult<T> + Send + 'static,
+    {
+        self.runtime
+            .block_on(asupersync::runtime::spawn_blocking(op))
+    }
 }
 
 #[cfg(test)]
@@ -730,6 +963,62 @@ mod tests {
             "{{\"test\":\"{test}\",\"phase\":\"{phase}\",\"outcome\":\"{outcome}\"{}{extra}}}",
             if extra.is_empty() { "" } else { "," }
         );
+    }
+
+    #[test]
+    fn immutable_music_public_path_never_uses_ambient_stage_budget() {
+        let source = include_str!("lib.rs");
+        let (_, tail) = source
+            .split_once("    pub fn recognize_immutable_music(")
+            .expect("immutable music entrypoint");
+        let (immutable_path, _) = tail
+            .split_once("    /// Construct the engine")
+            .expect("end of immutable music entrypoint group");
+        assert!(!immutable_path.contains("FOCR_STAGE_BUDGET"));
+        assert!(!immutable_path.contains("stage_budget("));
+        assert!(!immutable_path.contains("run_blocking_stage_with_budget"));
+        assert!(immutable_path.contains("run_blocking_stage_to_completion"));
+    }
+
+    #[test]
+    fn engine_traces_one_explicit_tromr_options_value_outside_model_cache() {
+        let default_engine = OcrEngine::new().expect("default engine builds");
+        assert_eq!(
+            default_engine.tromr_recognition_options(),
+            TromrRecognitionOptionsV1::deterministic()
+        );
+
+        let sampled = TromrRecognitionOptionsV1 {
+            decode_mode: TromrDecodeModeV1::SeededTopKTemperature,
+            seed: Some(42),
+            split_policy: TromrSplitPolicyV1::ExperimentalBarlineSegments,
+            ..TromrRecognitionOptionsV1::deterministic()
+        };
+        let sampled_engine =
+            OcrEngine::new_with_tromr_options(sampled).expect("configured engine builds");
+        assert_eq!(sampled_engine.tromr_recognition_options(), sampled);
+        assert!(
+            sampled_engine
+                .model
+                .lock()
+                .expect("model cache lock")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn engine_refuses_invalid_tromr_options_before_runtime_or_model_load() {
+        let invalid = TromrRecognitionOptionsV1 {
+            decode_mode: TromrDecodeModeV1::SeededTopKTemperature,
+            seed: None,
+            ..TromrRecognitionOptionsV1::deterministic()
+        };
+        let error = match OcrEngine::new_with_tromr_options(invalid) {
+            Ok(_) => panic!("missing sampling seed must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), "usage");
+        assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
     }
 
     /// bd-223.2: dropping the engine shuts down its owned runtime and pools.
@@ -1042,6 +1331,81 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(500),
             "timeout wrapper waited for the whole blocking closure"
+        );
+    }
+
+    #[test]
+    fn explicit_music_timeout_returns_only_after_blocking_worker_quiesces() {
+        let engine = OcrEngine::new().expect("runtime builds");
+        let active = Arc::new(AtomicBool::new(false));
+        let worker_active = Arc::clone(&active);
+        let options = TromrExecutionOptionsV1 {
+            setup_budget_ms: 1,
+            per_forward_attempt_budget_ms: 1,
+            max_forward_attempts: 1,
+            ..TromrExecutionOptionsV1::default()
+        };
+        let started = std::time::Instant::now();
+        let error = engine
+            .run_blocking_stage_to_completion(move || {
+                worker_active.store(true, Ordering::Release);
+                let context = music_execution::TromrExecutionContext::new(
+                    options,
+                    MusicCancellationToken::new(),
+                )?;
+                std::thread::sleep(Duration::from_millis(20));
+                let result = context.checkpoint("quiescence-probe");
+                worker_active.store(false, Ordering::Release);
+                result
+            })
+            .expect_err("expired explicit allowance must time out");
+        assert!(matches!(error, FocrError::Timeout(_)));
+        assert!(
+            started.elapsed() >= Duration::from_millis(20),
+            "completion join returned before the worker reached its checkpoint"
+        );
+        assert!(
+            !active.load(Ordering::Acquire),
+            "public return left a blocking worker active"
+        );
+    }
+
+    #[test]
+    fn per_request_music_cancellation_quiesces_and_engine_remains_reusable() {
+        let engine = OcrEngine::new().expect("runtime builds");
+        let cancellation = MusicCancellationToken::new();
+        let cancel_handle = cancellation.clone();
+        let active = Arc::new(AtomicBool::new(false));
+        let worker_active = Arc::clone(&active);
+        let canceler = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            cancel_handle.cancel();
+        });
+        let error = engine
+            .run_blocking_stage_to_completion(move || {
+                worker_active.store(true, Ordering::Release);
+                let context = music_execution::TromrExecutionContext::new(
+                    TromrExecutionOptionsV1::default(),
+                    cancellation,
+                )?;
+                let result: FocrResult<()> = loop {
+                    std::thread::sleep(Duration::from_millis(1));
+                    if let Err(error) = context.checkpoint("cancel-quiescence-probe") {
+                        break Err(error);
+                    }
+                };
+                worker_active.store(false, Ordering::Release);
+                result
+            })
+            .expect_err("request cancellation must terminate the worker");
+        canceler.join().expect("canceler exits");
+        assert!(matches!(error, FocrError::Cancelled));
+        assert!(!active.load(Ordering::Acquire));
+        assert_eq!(
+            engine
+                .run_blocking_stage_to_completion(|| Ok(7u8))
+                .expect("engine accepts later independent work"),
+            7
         );
     }
 

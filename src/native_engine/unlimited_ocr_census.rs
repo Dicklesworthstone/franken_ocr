@@ -39,6 +39,7 @@ const DIFF_PREVIEW_LIMIT: usize = 6;
 /// Refuse conversion inputs whose output the production artifact loader would
 /// later reject. The conservative Unlimited-OCR format is bound to the exact
 /// pinned source shard, not merely a same-shaped safetensors serialization.
+#[cfg(any(test, feature = "cli-run-store"))]
 pub(crate) fn validate_conversion_source_sha256(actual: &[u8; 32]) -> FocrResult<()> {
     let actual = actual
         .iter()

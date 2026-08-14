@@ -283,7 +283,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `run_start` event | §7.3 | MUST | present | SURF | bd-223.3 | carries schema_version; contract test |
 | `stage` event (name, seq, elapsed, budget) | §7.3 | MUST | present | SURF | bd-223.3 | contract test |
 | `page` event (per-page text/bbox, streaming) | §7.3 | MUST | present | SURF | bd-wp8.3 | incl per-page skip signal (bd-fck1, v0.3.0); bounded-stream scaffold bd-223.2 |
-| `staff` event (TrOMR staff result) | §7.3 | MUST | present | SURF | bd-av64.2 | additive v1 music event; carries 1-based staff index, total, bbox, status, and optional skip reason |
+| `staff` event (TrOMR staff result) | §7.3 | MUST | present | SURF | bd-av64.2 | additive v1 music event; carries 1-based attempt index, attempt total, exact detected-staff count, typed segmentation disposition, bbox, status, and optional skip reason |
 | `music_warning` event (TrOMR sanity annotation) | §7.3 | MUST | present | SURF | bd-av64.5 | additive v1 music event; reports staff-level key/time/bar-sum warnings without failing OCR |
 | `run_complete` event | §7.3 | MUST | present | SURF | bd-223.3 | contract test |
 | `run_error` event (carries exit code) | §7.3 | MUST | present | SURF | bd-223.5 | contract test |

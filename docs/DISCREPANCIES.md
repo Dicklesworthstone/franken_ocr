@@ -275,9 +275,11 @@ since exact-token OCR fails in the tail.
     maxabs exactly 1 u8 LSB, 0/102400 pixels past 1.5 LSB, and the
     output-level gate (our preprocess → certified encoder+decoder) stays
     TOKEN-EXACT.
-- Fallback / kill-switch state: `FOCR_TROMR_SAMPLE=1` enables the upstream
-    sampling arithmetic from a pinned PCG32 seed (`FOCR_TROMR_SEED`,
-    default 0) — deterministic per seed; the default is per-head argmax.
+- Fallback state: `TromrRecognitionOptionsV1` explicitly selects upstream
+    sampling arithmetic with a required PCG32 seed — deterministic per seed;
+    the default is per-head argmax. The standalone CLI maps
+    `FOCR_TROMR_SAMPLE=1` plus a required `FOCR_TROMR_SEED` into that object;
+    core recognition reads neither variable and has no silent seed default.
 - Resolution: ACCEPTED as a deliberate, justified divergence from upstream's
     literal code — their convention self-evidently blanks their own demo
     inputs; ours preserves the ink convention exactly where alpha carries ink

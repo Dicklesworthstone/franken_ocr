@@ -51,8 +51,8 @@ The exact-recipe artifact emits EOS on `page0590` and passes the complete 20-pag
 |---|---|
 | **One portable binary** | No Python, no CUDA, no FFI at inference, no GPU. Current release assets are about 13 to 17 MB; portable to hosts where `ort`/CUDA cannot build. |
 | **Works offline** | Once compatible weights are installed, inference never touches the network. Zoo pulls install under `~/.cache/franken_ocr/models`; the v0.7.0 default is the versioned conservative Unlimited-OCR artifact. Weight bytes are owned by default; trusted immutable deployments can opt into mmap with `FOCR_MMAP=1`. |
-| **Embeddable Rust API** | `OcrEngine` exposes synchronous, blocking calls for Markdown, structured layout, figure extraction, in-memory images, and load-once batches. |
-| **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; page `/Rotate` and image-placement rotations are honored, `--pages` selects exact PDF pages, `--split-spreads` can split two-page book scans, and `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
+| **Embeddable Rust API** | `OcrEngine` exposes synchronous, blocking calls for Markdown, structured layout, figure extraction, in-memory images, load-once batches, and provider-owned immutable TrOMR inputs. `pdf::PdfPages` accepts owned bytes or a bounded reader, retains the exact parsed bytes, renders admitted pages, and decodes selectable text from the exact MTDT writer dialect. |
+| **Native PDFs and figures** | PDF pages are rasterized in process with pure Rust. The bounded renderer covers scanned single-image and layered-MRC pages plus the exact vector/text dialect emitted by MTDT's score-PDF writer; arbitrary PDF composition still refuses. Page `/Rotate` and image-placement rotations are honored, `--pages` selects exact PDF pages, `--split-spreads` can split two-page book scans, and `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
 | **Cross-page parsing** | `--multi-page` runs the Unlimited-OCR `infer_multi` contract over selected PDF pages or an image list, producing one document with `<PAGE>` boundaries instead of unrelated page parses. |
 | **Model zoo with compatibility status** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. `focr models` reports compatible and blocked pull entries with recipe metadata. All five runtime models are pullable in v0.7.0. Planned descriptors: TrOCR and pix2tex. |
 | **Measured int8 decode path** | Historical rows show the custom int8 kernels can accelerate decoder work. The v0.7.0 exact-recipe artifact passes the hard-page termination and corpus-CER budget. Raw BF16 is only an all-high-precision native diagnostic when paired with `FOCR_DECODE_STATELESS=1`; the default cached decode applies the conservative int8 FFN/expert cache regardless of source storage. |
@@ -74,7 +74,7 @@ The exact-recipe artifact emits EOS on `page0590` and passes the complete 20-pag
 
 | Layer | What is live today |
 |---|---|
-| **Inputs** | PNG/JPG-style images, scanned PDFs, selected PDF page ranges, split book spreads, image batches, full sheet-music pages, and single staff crops. |
+| **Inputs** | PNG/JPG-style images, bounded scanned PDFs, exact MTDT-authored vector/text score PDFs, selected PDF page ranges, split book spreads, image batches, full sheet-music pages, and single staff crops. |
 | **Model routing** | Unlimited-OCR for general documents, GOT-OCR2 for structured OCR modes, SmolVLM2 for describe/VQA, OneChart for chart data, and TrOMR for MusicXML. |
 | **Runtime core** | `OcrEngine` owns one asupersync runtime, caches one model per process, exposes blocking Rust calls, and records best-effort run telemetry through fsqlite. |
 | **CPU execution** | Fixed-shape Rust forwards call scalar-or-proven SIMD kernels. Apple Silicon advertises SDOT/SMMLA hardware but uses measured-faster LLVM autovec for ordinary dense int8 by default; Intel/AMD selects AVX-512-VNNI, AVX-VNNI, AVX2, or scalar. |
@@ -163,7 +163,7 @@ With `FOCR_MODEL_PATH` set, default-model inference runs fully offline. Compatib
 
 **Scanned books are addressable.** PDF input no longer means "the whole document or nothing." `--pages 3,5-9` selects source pages with 1-based ranges, reports out-of-range requests against the document page count, and keeps source page numbers in JSON/robot output. The native renderer applies both PDF page `/Rotate` metadata and the rotation implied by the image placement matrix, which fixes scanned-book files that store portrait page images but display them landscape through a rotated `cm` transform. `--split-spreads` is opt-in for common two-page book scans: a wide rasterized page with a near-blank center gutter becomes left and right logical pages, while pages without a qualifying gutter pass through unsplit.
 
-**TrOMR page OMR is resilient.** TrOMR accepts either a staff crop or a full printed/scanned page. The page path runs pure-Rust staff detection with global deskew, trims horizontal page margins to the detected ink extent, grows wide staff bands toward neighbor midlines so they fit the model's 1280-column position budget where possible, orders crops top-to-bottom, recognizes each staff sequentially through the certified ResNetV2 plus ViT encoder and four-head decoder, merges the semantic streams, and emits partwise MusicXML. If a band is still too wide, setting `FOCR_TROMR_SPLIT=1` arms an experimental rescue that detects thin full-span barlines, splits the band into in-budget segments, and splices the streams (off by default: isolated segments measurably lose absolute pitch registration, so this trades content fidelity for recognition coverage; the skip with a named reason is the honest default). If one detected staff fails, the page still succeeds with the staves that recognized and logs the skipped staff's bbox and reason; if every staff fails, the error names each staff reason. JSON output includes the ordered `staves` array for music runs, and robot mode emits one `staff` event for each recognized or skipped staff before `run_complete`. The MusicXML emitter also adds annotate-only sanity comments for overfull bars, underfull middle bars, impossible durations, and cross-staff key mismatches; JSON and robot mode expose the same observations as `warnings` and `music_warning` events. Remaining TrOMR work is narrower: optional `**kern` export, camera-photo dewarp, and broader corpus-quality metrics.
+**TrOMR page OMR is resilient and explicitly replayable.** TrOMR accepts either a staff crop or a full printed/scanned page. The page path runs pure-Rust staff detection with global deskew, trims horizontal page margins to the detected ink extent, grows wide staff bands toward neighbor midlines so they fit the model's 1280-column position budget where possible, orders crops top-to-bottom, recognizes each row sequentially through the certified ResNetV2 plus ViT encoder and four-head decoder, and returns an ordered attempt ledger plus row-local `MusicRowFragment` values. The legacy CLI still serializes recognized rows as `P1..PN` in partwise MusicXML, but that is a compatibility container rather than inferred system or persistent-part topology. Every library call receives a versioned `TromrRecognitionOptionsV1`; the default is argmax, split disabled, and the fixed `cv2_linear_u8_v1` staff resampler. If a band is still too wide, the named `experimental_barline_segments` policy can detect thin full-span barlines, split the band into in-budget segments, and splice the streams (off by default: isolated segments measurably lose absolute pitch registration, so this trades content fidelity for recognition coverage; the skip with a named reason is the honest default). Core recognition never reads TrOMR environment variables. The standalone CLI parses its legacy variables once into the same typed object. If one detected staff fails, the page still succeeds with the staves that recognized and logs the skipped staff's bbox and reason; if every staff fails, the error names each staff reason. JSON output includes `detected_staff_count`, `staff_segmentation_disposition`, the ordered `staves` array, `tromr_recognition_options`, and `tromr_recognition_options_identity`; robot mode carries the same count and disposition on every `staff` attempt event before `run_complete`. The MusicXML emitter also adds annotate-only sanity comments for overfull bars, underfull middle bars, impossible durations, and cross-staff key mismatches; JSON and robot mode expose the same observations as `warnings` and `music_warning` events. Remaining TrOMR work is narrower: optional `**kern` export, camera-photo dewarp, and broader corpus-quality metrics.
 
 **Performance claims are ledgered.** The A11 zoo gauntlet records native runs beside pinned Hugging Face CPU references for GOT-OCR2, SmolVLM2, and OneChart. Decode-per-token speedups are documented where the native path is ahead, and full end-to-end rows stay in the ledger even when artifact loading or preprocessing makes the total slower. The CPU backend also records losing rows, such as the f32 TrOMR baseline, instead of turning them into marketing claims. The README summarizes measured rows; `docs/PERF_LEDGER.md` is the audit trail.
 
@@ -353,9 +353,12 @@ structured JSON carries the rendered `markdown` plus a `layout` array, one
 source-image pixels. A PDF nests these under a per-page `pages` array; split
 spreads become separate logical page entries with the same source `page` number
 and a `"half": "left"` or `"right"` marker. This is the same shape `--json`
-prints to stdout. TrOMR music runs also include a `staves` array in source order;
-each entry carries the 1-based staff number, page-space bbox, `recognized` or
-`skipped` status, and an optional skip reason.
+prints to stdout. TrOMR music runs also include `detected_staff_count`,
+`staff_segmentation_disposition`, and a `staves` attempt array in source order;
+each entry carries the 1-based attempt number, page-space bbox, `recognized` or
+`skipped` status, and an optional skip reason. The exact normalized controls are
+returned as `tromr_recognition_options`, with their canonical SHA-256 replay key
+in `tromr_recognition_options_identity`.
 
 **Figures (`--extract-figures`).** The model sees figures/photos/diagrams it does not
 transcribe to text. With `--extract-figures`, those regions are cropped out of the
@@ -378,6 +381,22 @@ splitting. `--split-spreads` is also PDF-only and off by default. It looks for
 wide raster pages with a near-blank vertical gutter near the center, then OCRs
 the left and right halves as separate logical pages; no qualifying gutter means
 the page remains unsplit.
+
+Pages with no image XObject take a separate bounded path for the exact
+vector/path and embedded TrueType glyph dialect emitted by MTDT's score-PDF
+writer plus the Type1C dialect emitted by LilyPond. Embedders can call
+`PdfPages::selectable_text` for schema-v2 runs: MTDT Type0/Identity-H requires a
+complete embedded ToUnicode map, while LilyPond Type1C uses its exact one-byte
+WinAnsi + Differences map. Every source code and glyph name is retained; music
+glyphs without Unicode are marked incomplete rather than guessed or omitted.
+Unicode recovery for simple fonts is limited to WinAnsi, a pinned Adobe Glyph
+List 2.0 legacy-name subset, and case-exact uppercase `uniXXXX`/`uXXXXX`
+production names. Each run snapshots the true start matrix after prior glyph
+widths and `TJ` adjustments; a checked-in LilyPond PDF freezes exact text,
+opaque music-glyph, position, mapping-hash, and page-identity goldens.
+This is deliberately not a general PDF interpreter: unrecognized paint, font,
+form, transparency, or composition semantics refuse in `franken_ocr::pdf`
+instead of being approximated or routed to another program.
 
 **Multi-page cross-page parsing (`--multi-page`).** By default every page is
 parsed independently. `--multi-page` instead runs ONE pass over the whole
@@ -522,7 +541,64 @@ scripts/tromr_music_e2e.sh
 scripts/realscan_music_gate.sh
 ```
 
-The TrOMR runtime accepts a single staff crop or a full printed/scanned page. If the detector finds multiple staves, it deskews the page globally, crops staves top-to-bottom, recognizes each staff through the same certified single-staff path, and emits one MusicXML part per staff; if it finds fewer than two staves, it treats the whole image as the staff input. For genuinely over-wide systems, the page path uses the five detected staff-line anchors to find thin barline columns, splits at the farthest usable barline within the positional budget, recognizes each segment sequentially, and concatenates the semantic stream while suppressing continuation clef/key/time artifacts. A multi-staff page succeeds when at least one staff recognizes, logging skipped staves with bbox and reason; an all-fail page errors with every staff reason named. The published int8 artifact is 61 MB and quantizes the 40 decoder-GEMM candidate tensors; the 86 MB f32 artifact stays published for bit-exact reference work. The int8 default is accepted with a ledgered discrepancy on one degraded Spohr page where both int8 and f32 garble differently while the corpus gate verdict stays unchanged. Local conversion is still available when you have your own TrOMR checkpoint.
+The TrOMR runtime accepts a single staff crop or a full printed/scanned page. On
+a full page it deskews globally, detects and crops candidate rows top-to-bottom,
+and returns an ordered attempt ledger. Each successful `MusicRowFragment`
+contains the exact model-native semantic stream, route-local attempt index,
+page-space bbox, and source-versus-inference-canvas evidence; failed rows retain their bbox
+and typed reason. These fragments deliberately carry no system membership,
+staff-slot identity, persistent part, measure alignment, or publication claim.
+
+For CLI compatibility, successful rows are still serialized as `P1..PN` in a
+partwise MusicXML container. That numbering is not validated score topology and
+must not be treated as instrument or cross-system identity. A consumer that
+needs a manipulable score must resolve those relationships and materialize the
+target artifact downstream. If the detector finds zero or one row, the whole
+image is treated as the staff input; `staff_segmentation_disposition`
+distinguishes zero-detection fallback from a detected single staff. With the explicit
+`experimental_barline_segments` policy, genuinely over-wide systems use the
+five detected staff-line anchors to find thin barline columns, split at the
+farthest usable barline within the positional budget, recognize each segment
+sequentially, and concatenate the semantic stream while suppressing
+continuation clef/key/time artifacts. A multi-row page succeeds when at least
+one row recognizes, logging skipped rows with bbox and reason; an all-fail page
+errors with every row reason named.
+
+The published int8 artifact is 61 MB and quantizes the 40 decoder-GEMM candidate
+tensors; the 86 MB f32 artifact stays published for bit-exact reference work.
+The int8 default is accepted with a ledgered discrepancy on one degraded Spohr
+page where both int8 and f32 garble differently while the corpus gate verdict
+stays unchanged. Local conversion is still available when you have your own
+TrOMR checkpoint.
+
+Embedders should pass the controls explicitly. `OcrEngine` retains them outside
+the path-keyed model cache and applies the same value to path, in-memory, layout,
+figure, and independent-batch calls:
+
+```rust
+use franken_ocr::{
+    OcrEngine, TromrRecognitionOptionsV1, TromrSplitPolicyV1,
+};
+
+fn recognize(score_image_path: &std::path::Path) -> franken_ocr::FocrResult<String> {
+    let options = TromrRecognitionOptionsV1 {
+        split_policy: TromrSplitPolicyV1::Disabled,
+        ..TromrRecognitionOptionsV1::deterministic()
+    };
+    let engine = OcrEngine::new_with_tromr_options(options)?;
+    let musicxml = engine.recognize(score_image_path)?;
+    let meta = engine.take_music_page_meta().expect("TrOMR metadata");
+    assert_eq!(meta.recognition_options, options);
+    Ok(musicxml)
+}
+```
+
+For provenance-critical PDFs or images, use
+`music_input::ImmutableMusicInputBundle` and
+`OcrEngine::recognize_immutable_music`. That path owns and hashes the exact
+source, model, and tokenizer bytes consumed by the native PDF/image parser and
+TrOMR forward, then verifies the provider-returned options identity against the
+bundle receipt. It does not invoke an external PDF renderer or CLI subprocess.
 
 The real-scan music corpus lives in `tests/fixtures/realscan_music/`. It starts with public-domain Spohr page and staff fixtures, tier-1 attributes that can be verified by eye, and one frozen MusicXML regression anchor. `scripts/realscan_music_gate.sh` is model-gated and exits successfully when local TrOMR weights are absent; when weights are present it checks attributes, frozen anchors, and page-level `staff` event floors. This is the real-scan regression base for the TrOMR lane, not a claim that broad note-level SER coverage is complete.
 
@@ -562,9 +638,10 @@ the live health payload, state-aware next commands, command templates, and the
 exit-code dictionary.
 
 For TrOMR music runs, robot mode adds a `staff` event before `run_complete` for
-each detected staff. The event carries the 1-based staff index, total detected
-staff count, page-space bbox, `recognized` or `skipped` status, and optional
-reason. Music runs can also emit `music_warning` events for annotate-only
+each inference attempt. The event carries the 1-based attempt index, total
+attempt count, exact `detected_staff_count`, typed
+`staff_segmentation_disposition`, page-space bbox, `recognized` or `skipped`
+status, and optional reason. Music runs can also emit `music_warning` events for annotate-only
 musical sanity observations: overfull bars, underfull non-final bars,
 impossible note durations, and cross-staff key mismatches. Existing consumers
 can ignore these additive events; strict consumers should refresh their schema
@@ -728,9 +805,9 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_GOT_NO_REPEAT_NGRAM` | Override the GOT-OCR2 global no-repeat n-gram size (default 20, matching the upstream model; `0` disables the repetition guard). |
 | `FOCR_GOT_FORMAT` | Force GOT-OCR2's `OCR with format:` structured-output mode, the env analog of `--format` and the format-implying `--task` values. |
 | `FOCR_SMOLVLM2_QUESTION` | The smolvlm2 describe/VQA question (the env analog of `--question`; the CLI flag outranks it; default: the model-card caption prompt). |
-| `FOCR_TROMR_SAMPLE` | Enable TrOMR's upstream top-k/T=0.2 sampling arithmetic from a deterministic PCG32 seed. Unset uses the default per-head argmax path. |
-| `FOCR_TROMR_SEED` | Seed for `FOCR_TROMR_SAMPLE`; defaults to `0`. Same seed means the same TrOMR decode stream on every supported CPU. |
-| `FOCR_TROMR_SPLIT` | `1` arms the experimental barline-split rescue for staff bands too wide for the 1280-column position budget. Off by default: split segments lose absolute pitch registration (measured), so the default is an honest per-staff skip. |
+| `FOCR_TROMR_SAMPLE` | Standalone-CLI compatibility input. `1/true/yes/on` selects seeded top-k/T=0.2 sampling; `0/false/no/off` selects deterministic argmax. Empty or unknown values are usage errors. The library core never reads it. |
+| `FOCR_TROMR_SEED` | Explicit u64 seed required exactly when `FOCR_TROMR_SAMPLE` is true and rejected with argmax. There is no silent seed default. Same seed means the same TrOMR decode stream on every supported CPU. The library core never reads it. |
+| `FOCR_TROMR_SPLIT` | Standalone-CLI compatibility input. `1/true/yes/on` selects the named `experimental_barline_segments` policy; false-like values keep splitting disabled. Unknown values are usage errors. The library core never reads it. |
 | `FOCR_MAX_NEW_TOKENS` | Cap the number of generated tokens (the engine's `max_length`; default 32768). An explicit `--max-length` flag outranks it. Capping never changes the per-step math, so a capped run's tokens are a true prefix of the full run's. |
 | `FOCR_DECODE_INT8` | Request the experimental all-int8 Unlimited-OCR decoder. Truthy values require both `FOCR_INT8_ATTN=1` and `FOCR_INT8_LMHEAD=1`; otherwise the command fails with a usage error. The default is the conservative recipe path. |
 | `FOCR_INT8_ATTN` | Independent accuracy gate for int8 attention q/k/v/o weights. Default off. It does not select the all-int8 decoder by itself. |
@@ -738,6 +815,10 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_DECODE_STATELESS` | Force the stateless re-prefill decoder, kept as a parity oracle for the cached decode path. |
 | `FOCR_QKV_FUSED` | Controls fused q/k/v projection inside the experimental all-int8 decoder. Default is on within that experiment; set `0`, `off`, `false`, or `no` for its older three-call comparison path. |
 | `FOCR_BATCH_SPINE` | Arm continuous batching. For Unlimited-OCR, the current R-SWA spine requires the explicitly gated all-int8 decoder; without it, pages use the conservative sequential path. The dense zoo spine covers GOT-OCR2, SmolVLM2, and OneChart. Set `1`, `on`, or `true` to arm it. |
+
+TrOMR always records `cv2_linear_u8_v1` as its staff resampler. Generic
+`FOCR_RESAMPLE` settings used by other model paths do not affect TrOMR output or
+its replay identity.
 | `FOCR_BATCH_SIZE` | Maximum in-flight stream count for the continuous-batch spine. Defaults to 128 when the spine is armed; blank, invalid, or `0` also use that default, and larger values are capped at 256. |
 | `FOCR_BATCH_PACK` | When present, admit pending streams by similar prefill length inside the batch scheduler. Output order is restored before return, and each stream's tokens stay independent; unset preserves submission-order admission. |
 | `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |
@@ -879,7 +960,7 @@ What this is and is not:
 
 - **Unlimited-OCR has a documented hard-page tail.** The v0.7.0 exact-recipe artifact keeps attention and `lm_head` high precision, emits EOS on `page0590`, and passes the complete 20-page CER budget, but `page0590` remains high at normalized CER 0.6164886. The release is hash-verified and does not claim the unavailable three-party OpenPGP certificate. For the slow native all-high-precision diagnostic, combine raw BF16 with `FOCR_DECODE_STATELESS=1`; raw storage alone still takes the conservative cached int8 FFN/expert route.
 - **TrOMR int8 is default, with a documented fallback.** `focr pull tromr` fetches the smaller `tromr.int8.focrq` artifact. The corpus gate stays green, but the discrepancy ledger records one degraded public-domain Spohr page where int8 and f32 diverge into different bad token streams. Use `focr pull tromr --quant f32` and `--model tromr.focrq` when you need bit-exact reference behavior.
-- **Image and PDF input.** PNG, JPG, and similar, plus native PDF: `focr ocr file.pdf` rasterizes pages in process (pure Rust, no FFI, no out-of-band `pdftoppm`) and OCRs the document. The renderer applies page-level and image-placement rotations before OCR, so common scanned-book PDFs that display a rotated image through the content stream are not fed sideways to the model. `--pages` lets you run only the source pages you need, and `--split-spreads` can split common two-page book scans when the gutter is clear enough. The fast path covers common scanned-PDF codecs: JPEG (`DCTDecode`), CCITT Group 4 fax, and `FlateDecode`/LZW raw rasters. Two image codecs with no production-quality pure-Rust decoder, `JPXDecode` (JPEG 2000) and `JBIG2Decode`, plus born-digital vector/text pages, are reported with a precise error naming what was unsupported. Rasterize that PDF out of band and retry.
+- **Image and PDF input.** PNG, JPG, and similar, plus native PDF: `focr ocr file.pdf` rasterizes admitted pages in process (pure Rust, no FFI, no helper executable) and OCRs the document. The renderer applies page-level and image-placement rotations before OCR, so common scanned-book PDFs that display a rotated image through the content stream are not fed sideways to the model. `--pages` lets you run only the source pages you need, and `--split-spreads` can split common two-page book scans when the gutter is clear enough. The bounded scan path covers JPEG (`DCTDecode`), CCITT Group 4 fax, `FlateDecode`/LZW raw rasters, pure-Rust `JPXDecode` (JPEG 2000), `JBIG2Decode`, and same-CTM layered MRC pages composed from an opaque base plus soft-masked overlays. A distinct zero-image path renders MTDT's exact embedded TrueType dialect plus LilyPond's bounded embedded Type1C dialect. `PdfPages::selectable_text` schema v2 decodes MTDT Type0/Identity-H plus complete ToUnicode and LilyPond Type1C/WinAnsi + Differences; source codes and glyph names are preserved, with opaque music glyphs marked incomplete instead of guessed. This is not general born-digital PDF support: arbitrary vector/text operators, fonts or CMaps outside those exact contracts, partial mosaics, nested Form XObjects, unsupported transforms, and unsupported blend/composition forms return a precise error naming the capability that must be implemented inside `franken_ocr::pdf`; the runtime never recommends an external rasterizer.
 - **Native Windows x86_64 is proven end-to-end; ARM64 has a narrower proof.** The `x86_64-pc-windows-msvc` binary runs full OCR on real Windows 10 with the same model, vision tower, and DeepSeek-V2 decoder as macOS and Linux. The ARM64 MSVC binary builds and passes the no-weights CLI/robot smoke suite on a native hosted Windows 11 ARM runner (dist run `29048523156`), and the PowerShell installer selects its stable asset name. Full model OCR and installer e2e on an ARM64 Windows machine remain release-verification obligations. `focr.exe robot selftest` covers the int8 GEMM scalar-oracle contract, including K=6848. `focr pull` performs native multi-part download, reassembly, and SHA-256 verification. The model cache resolves to `%LOCALAPPDATA%\franken_ocr\models`, falling back to `%USERPROFILE%\.cache\franken_ocr\models`; on macOS and Linux it stays at `~/.cache/franken_ocr/models`.
 - **A few models, not any model.** Generality is a deliberate non-goal. `franken_ocr` runs a small family of hand-ported models: Unlimited-OCR by default, GOT-OCR2 for structured formats, SmolVLM2 for image description/VQA, OneChart for chart-to-data extraction, and TrOMR for sheet-music OMR on full printed/scanned pages or staff crops. TrOCR and pix2tex remain descriptor-only roadmap items. Each ready model is transformed offline, distributed through the manifest with required sidecars, and certified against its reference before it ships. It will not become a generic inference runtime that loads arbitrary checkpoints.
 - **Not benchmark SOTA.** Unlimited-OCR is strong but not the OmniDocBench leader. The aim is fidelity to this model, bounded generated-token KV for long-document parsing on CPU, and speed on commodity hardware, not topping a benchmark.

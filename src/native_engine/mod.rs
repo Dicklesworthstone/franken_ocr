@@ -37,6 +37,7 @@ pub(crate) mod spec;
 pub mod tensor;
 pub mod token_compress;
 pub mod tromr;
+pub mod tromr_lineage;
 pub(crate) mod unlimited_ocr_census;
 pub mod vision_bridge;
 pub mod vision_clip;
@@ -67,6 +68,8 @@ struct ExclusiveGate {
 }
 
 impl ExclusiveGate {
+    const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_millis(10);
+
     const fn new() -> Self {
         Self {
             occupied: std::sync::atomic::AtomicBool::new(false),
@@ -103,6 +106,47 @@ impl ExclusiveGate {
                 .wake
                 .wait(waiter)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn acquire_with_checkpoint(
+        &self,
+        mut checkpoint: impl FnMut() -> FocrResult<()>,
+    ) -> FocrResult<ExclusivePermit<'_>> {
+        use std::sync::atomic::Ordering;
+
+        checkpoint()?;
+        if self
+            .occupied
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            let permit = ExclusivePermit { gate: self };
+            checkpoint()?;
+            return Ok(permit);
+        }
+
+        let mut waiter = self
+            .waiters
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            checkpoint()?;
+            if self
+                .occupied
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                drop(waiter);
+                let permit = ExclusivePermit { gate: self };
+                checkpoint()?;
+                return Ok(permit);
+            }
+            let (next_waiter, _) = self
+                .wake
+                .wait_timeout(waiter, Self::CHECKPOINT_WAIT)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            waiter = next_waiter;
         }
     }
 
@@ -143,6 +187,13 @@ impl<T> FallibleOnce<T> {
     const fn new() -> Self {
         Self {
             value: OnceLock::new(),
+            init: ExclusiveGate::new(),
+        }
+    }
+
+    fn initialized(value: T) -> Self {
+        Self {
+            value: OnceLock::from(value),
             init: ExclusiveGate::new(),
         }
     }
@@ -866,19 +917,149 @@ pub fn model_resolution_search_dirs() -> Vec<PathBuf> {
     model_search_dirs()
 }
 
+/// One recognized TrOMR row fragment, before any system or persistent-part
+/// topology has been inferred.
+///
+/// The route-local attempt index and bounding box remain in page space, and
+/// `semantic` is the exact model-native stream emitted for that row. The index
+/// is detector-owned except for zero-detection whole-image fallback. This type deliberately
+/// has no system, staff-slot, part, measure-alignment, or publication fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MusicRowFragment {
+    /// 0-based route-local attempt index over every attempted row, including
+    /// skips. Zero-detection fallback synthesizes index 0.
+    pub detection_index: usize,
+    /// Page-space source bounding box `(x, y, width, height)`.
+    pub bbox: tromr::StaffBBox,
+    /// Exact merged extended-PrIMuS semantic stream for this row.
+    pub semantic: String,
+    /// Ordered candidate evidence for every exact forward input used to
+    /// produce this row. Split segments remain independent prefix chains.
+    pub forward_candidate_lattices: Vec<tromr::TromrForwardCandidateLatticeV1>,
+}
+
 /// Staff-level metadata from a TrOMR full-page music forward (bd-av64.2):
-/// what the staff detector found and what the per-staff recognition did with
-/// it. Surfaced through [`OcrModel::take_music_meta`] so the CLI can emit
-/// robot `staff` events and the `--json` `staves` array without widening the
-/// shared `(text, w, h)` forward contract.
-#[derive(Debug, Clone)]
+/// what the staff detector found and what the per-row recognition did with it.
+/// Surfaced through [`OcrModel::take_music_meta`] so embedders can consume
+/// row-local semantics without interpreting the legacy combined MusicXML as
+/// resolved topology, while the CLI can still emit robot `staff` events and the
+/// `--json` `staves` array.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MusicPageMeta {
-    /// `(detection index, page-space bbox)` per RECOGNIZED staff, top-to-bottom.
+    /// Exact crop-eligible staff count returned by detection before route
+    /// selection, recognition, or skips.
+    pub detected_staff_count: usize,
+    /// Provider-owned explanation of the route selected from the detector
+    /// count. One inference attempt does not imply one detected staff.
+    pub staff_segmentation_disposition: tromr::TromrStaffSegmentationDispositionV1,
+    /// Recognized row fragments in route order. These are not systems or
+    /// persistent parts; skipped per-crop detection indices remain gaps.
+    pub fragments: Vec<MusicRowFragment>,
+    /// `(route-local attempt index, page-space bbox)` per recognized row.
     pub staves: Vec<(usize, tromr::StaffBBox)>,
     /// Staves that failed per-staff recognition (index, bbox, reason).
     pub skips: Vec<tromr::StaffSkip>,
+    /// Ordered source/canvas/outcome evidence for every attempted staff row.
+    /// This is row-local preprocessing evidence, not system/part topology.
+    pub staff_evidence: Vec<tromr::StaffInferenceEvidence>,
+    /// Complete pixel-free detector candidate/residual and transform ledger.
+    pub staff_detection: crate::preprocess::staff_detect::StaffDetectionEvidenceV1,
     /// Annotate-only musical-sanity observations (bd-av64.5).
     pub warnings: Vec<tromr::MusicWarning>,
+    /// Exact normalized TrOMR inference mechanics used by every row attempt.
+    pub recognition_options: tromr::TromrRecognitionOptionsV1,
+    /// Provider-computed SHA-256 identity of the canonical options JSON.
+    pub recognition_options_identity: String,
+}
+
+impl MusicPageMeta {
+    /// Whether unresolved detector residuals block a complete-page claim while
+    /// leaving recognized row drafts available for explicit selection/review.
+    #[must_use]
+    pub const fn publication_blocked(&self) -> bool {
+        self.staff_detection.residual.unresolved
+    }
+
+    /// Revalidate the detector evidence and refuse complete-page publication
+    /// until every retained staff-like residual candidate is resolved.
+    pub fn require_complete_for_publication(&self) -> FocrResult<()> {
+        self.staff_detection.require_complete()
+    }
+}
+
+fn music_page_meta(page: &tromr::PageRecognition) -> MusicPageMeta {
+    debug_assert!(
+        page.staff_segmentation_disposition
+            .is_consistent_with(page.detected_staff_count)
+    );
+    let fragments = page
+        .staves
+        .iter()
+        .map(|(detection_index, result, bbox)| MusicRowFragment {
+            detection_index: *detection_index,
+            bbox: *bbox,
+            semantic: result.semantic.clone(),
+            forward_candidate_lattices: result.forward_candidate_lattices.clone(),
+        })
+        .collect();
+    let semantics: Vec<String> = page
+        .staves
+        .iter()
+        .map(|(_, result, _)| result.semantic.clone())
+        .collect();
+
+    MusicPageMeta {
+        detected_staff_count: page.detected_staff_count,
+        staff_segmentation_disposition: page.staff_segmentation_disposition,
+        fragments,
+        staves: page
+            .staves
+            .iter()
+            .map(|(detection_index, _, bbox)| (*detection_index, *bbox))
+            .collect(),
+        skips: page.skips.clone(),
+        staff_evidence: page.staff_evidence.clone(),
+        staff_detection: page.staff_detection.clone(),
+        warnings: tromr::sanity_warnings(&semantics),
+        recognition_options: page.options,
+        recognition_options_identity: page.options_identity.clone(),
+    }
+}
+
+fn clear_music_meta_slot(slot: &std::sync::Mutex<Option<MusicPageMeta>>) {
+    if let Ok(mut slot) = slot.lock() {
+        *slot = None;
+    }
+}
+
+fn publish_music_meta_after_checkpoint(
+    slot: &std::sync::Mutex<Option<MusicPageMeta>>,
+    meta: MusicPageMeta,
+    checkpoint: FocrResult<()>,
+) -> FocrResult<()> {
+    checkpoint?;
+    if let Ok(mut slot) = slot.lock() {
+        *slot = Some(meta);
+    }
+    Ok(())
+}
+
+fn complete_explicit_music_publication(
+    meta: MusicPageMeta,
+    checkpoint: FocrResult<()>,
+) -> FocrResult<MusicPageMeta> {
+    checkpoint?;
+    meta.require_complete_for_publication()?;
+    Ok(meta)
+}
+
+fn complete_explicit_music_review_draft(
+    meta: MusicPageMeta,
+    checkpoint: FocrResult<()>,
+) -> FocrResult<MusicPageMeta> {
+    checkpoint?;
+    meta.staff_detection.validate()?;
+    Ok(meta)
 }
 
 /// One parsed layout span from the model's grounding output: a ref/det label
@@ -1617,6 +1798,49 @@ struct PagePrefill {
 }
 
 impl OcrModel {
+    fn from_loaded_parts(
+        path: PathBuf,
+        weights: Weights,
+        tromr_tokenizer: Option<crate::tokenizer::music::MusicTokenizer>,
+    ) -> Self {
+        Self {
+            path,
+            weights,
+            decode_params: decode_params_from_env(),
+            decoder_cache_i8: FallibleOnce::new(),
+            decoder_cache: FallibleOnce::new(),
+            clip_cache: FallibleOnce::new(),
+            unlimited_vision: FallibleOnce::new(),
+            got_statics: FallibleOnce::new(),
+            onechart_statics: FallibleOnce::new(),
+            smol_statics: FallibleOnce::new(),
+            tokenizer: FallibleOnce::new(),
+            got_tokenizer: FallibleOnce::new(),
+            tromr_tokenizer: tromr_tokenizer
+                .map_or_else(FallibleOnce::new, FallibleOnce::initialized),
+            music_meta: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn from_owned_tromr_parts(
+        path_label: PathBuf,
+        weights: Weights,
+        tokenizer: crate::tokenizer::music::MusicTokenizer,
+    ) -> FocrResult<Arc<Self>> {
+        if weights.model_id() != "tromr" {
+            return Err(FocrError::FormatMismatch(format!(
+                "immutable music input model declares architecture {:?}, expected \"tromr\"",
+                weights.model_id()
+            )));
+        }
+        validate_unlimited_ocr_quant_recipe(&weights)?;
+        Ok(Arc::new(Self::from_loaded_parts(
+            path_label,
+            weights,
+            Some(tokenizer),
+        )))
+    }
+
     /// Resolve `path` to a concrete model artifact (`.focrq` blob or a
     /// safetensors directory) — the header-sniff / search-path logic
     /// (`native_model_available`, bd-223.7).
@@ -1681,22 +1905,7 @@ impl OcrModel {
         // `FOCR_MMAP=1` is an explicit opt-in for trusted immutable artifacts;
         // mmap failures retain the owned-buffer fallback.
         let weights = load_weights_from_resolved_model(&resolved)?;
-        let model = Arc::new(Self {
-            path: resolved.clone(),
-            weights,
-            decode_params: decode_params_from_env(),
-            decoder_cache_i8: FallibleOnce::new(),
-            decoder_cache: FallibleOnce::new(),
-            clip_cache: FallibleOnce::new(),
-            unlimited_vision: FallibleOnce::new(),
-            got_statics: FallibleOnce::new(),
-            onechart_statics: FallibleOnce::new(),
-            smol_statics: FallibleOnce::new(),
-            tokenizer: FallibleOnce::new(),
-            got_tokenizer: FallibleOnce::new(),
-            tromr_tokenizer: FallibleOnce::new(),
-            music_meta: std::sync::Mutex::new(None),
-        });
+        let model = Arc::new(Self::from_loaded_parts(resolved.clone(), weights, None));
 
         let mut guard = model_cache_guard()?;
         *guard = Some((resolved, Arc::downgrade(&model)));
@@ -1748,6 +1957,23 @@ impl OcrModel {
     /// if a required tensor is absent from the loaded weights, or an image-decode
     /// error from [`preprocess::preprocess_image`].
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
+        self.forward_with_tromr_options(
+            image_path,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Forward one path with explicit TrOMR mechanics. Non-TrOMR architectures
+    /// ignore the validated value; TrOMR records it in [`MusicPageMeta`].
+    ///
+    /// # Errors
+    /// As [`Self::forward`], plus explicit options validation failures.
+    pub fn forward_with_tromr_options(
+        &self,
+        image_path: &Path,
+        tromr_options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<(String, u32, u32)> {
+        let tromr_options = tromr_options.validate()?;
         let _admission = forward_admission().acquire();
         if self.arch().id() == "got-ocr2" {
             return self.forward_got(&preprocess::decode_path(image_path)?);
@@ -1759,7 +1985,7 @@ impl OcrModel {
             return self.forward_onechart(&preprocess::decode_path(image_path)?);
         }
         if self.arch().id() == "tromr" {
-            return self.forward_tromr(&preprocess::decode_path(image_path)?);
+            return self.forward_tromr(&preprocess::decode_path(image_path)?, tromr_options);
         }
         let t = std::time::Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
@@ -1778,6 +2004,22 @@ impl OcrModel {
     /// # Errors
     /// As [`Self::forward`] (sans the file-open path).
     pub fn forward_dynamic(&self, img: image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+        self.forward_dynamic_with_tromr_options(
+            img,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Forward one in-memory image with explicit TrOMR mechanics.
+    ///
+    /// # Errors
+    /// As [`Self::forward_dynamic`], plus explicit options validation failures.
+    pub fn forward_dynamic_with_tromr_options(
+        &self,
+        img: image::DynamicImage,
+        tromr_options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<(String, u32, u32)> {
+        let tromr_options = tromr_options.validate()?;
         let _admission = forward_admission().acquire();
         if self.arch().id() == "got-ocr2" {
             return self.forward_got(&img);
@@ -1789,7 +2031,7 @@ impl OcrModel {
             return self.forward_onechart(&img);
         }
         if self.arch().id() == "tromr" {
-            return self.forward_tromr(&img);
+            return self.forward_tromr(&img, tromr_options);
         }
         let t = std::time::Instant::now();
         let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
@@ -1888,12 +2130,59 @@ impl OcrModel {
         self.music_meta.lock().ok().and_then(|mut slot| slot.take())
     }
 
-    fn forward_tromr(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
+    fn forward_tromr(
+        &self,
+        img: &image::DynamicImage,
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
         let t = std::time::Instant::now();
         let (w, h) = img.dimensions();
         let tk = self.tromr_tokenizer()?;
-        let page = tromr::recognize_page(&self.weights, tk, img)?;
+        let page = tromr::recognize_page_with_options(&self.weights, tk, img, options)?;
+        let (xml, meta, w, h) = self.assemble_tromr_forward(page, w, h, t)?;
+        let meta = complete_explicit_music_publication(meta, Ok(()))?;
+        self.publish_music_meta(meta);
+        Ok((xml, w, h))
+    }
+
+    fn forward_tromr_with_execution_context(
+        &self,
+        img: &image::DynamicImage,
+        options: tromr::TromrRecognitionOptionsV1,
+        execution: &mut crate::music_execution::TromrExecutionContext,
+    ) -> FocrResult<(String, MusicPageMeta, u32, u32)> {
+        use image::GenericImageView;
+        self.clear_music_meta();
+        let t = std::time::Instant::now();
+        let (w, h) = img.dimensions();
+        let tk = self.tromr_tokenizer()?;
+        let page = tromr::recognize_page_with_execution_context(
+            &self.weights,
+            tk,
+            img,
+            options,
+            execution,
+        )?;
+        let assembly_started = std::time::Instant::now();
+        let assembled = self.assemble_tromr_forward(page, w, h, t);
+        execution.record_musicxml_assembly(assembly_started.elapsed());
+        let (xml, meta, w, h) = assembled?;
+        let publication_started = std::time::Instant::now();
+        let checkpoint = execution.checkpoint("page-publication");
+        let publication = complete_explicit_music_review_draft(meta, checkpoint);
+        execution.record_publication(publication_started.elapsed());
+        let meta = publication?;
+        Ok((xml, meta, w, h))
+    }
+
+    fn assemble_tromr_forward(
+        &self,
+        page: tromr::PageRecognition,
+        w: u32,
+        h: u32,
+        started: std::time::Instant,
+    ) -> FocrResult<(String, MusicPageMeta, u32, u32)> {
         let total = page.staves.len() + page.skips.len();
         for skip in &page.skips {
             // Human-visible skip note on stderr (the bd-fck1 PDF page-skip
@@ -1912,7 +2201,7 @@ impl OcrModel {
         }
         timing_log(&format!(
             "tromr forward {:.2}s ({}/{} staves recognized, semantic {} chars total)",
-            t.elapsed().as_secs_f64(),
+            started.elapsed().as_secs_f64(),
             page.staves.len(),
             total,
             page.staves
@@ -1920,24 +2209,12 @@ impl OcrModel {
                 .map(|(_, r, _)| r.semantic.len())
                 .sum::<usize>()
         ));
-        let semantics: Vec<String> = page
-            .staves
-            .iter()
-            .map(|(_, r, _)| r.semantic.clone())
-            .collect();
-        let warnings = tromr::sanity_warnings(&semantics);
-        for w in &warnings {
+        let music_meta = music_page_meta(&page);
+        for w in &music_meta.warnings {
             timing_log(&format!(
                 "  tromr.sanity {} part {} measure {}: {}",
                 w.kind, w.part, w.measure, w.detail
             ));
-        }
-        if let Ok(mut slot) = self.music_meta.lock() {
-            *slot = Some(MusicPageMeta {
-                staves: page.staves.iter().map(|(i, _, b)| (*i, *b)).collect(),
-                skips: page.skips.clone(),
-                warnings,
-            });
         }
         let xml = if page.staves.len() == 1 {
             page.staves
@@ -1954,7 +2231,15 @@ impl OcrModel {
                 .collect();
             tromr::staves_to_musicxml(&semantics)?
         };
-        Ok((xml, w, h))
+        Ok((xml, music_meta, w, h))
+    }
+
+    fn clear_music_meta(&self) {
+        clear_music_meta_slot(&self.music_meta);
+    }
+
+    fn publish_music_meta(&self, meta: MusicPageMeta) {
+        let _ = publish_music_meta_after_checkpoint(&self.music_meta, meta, Ok(()));
     }
 
     /// The TrOMR 4-table WordLevel music tokenizer, loaded from the
@@ -2057,7 +2342,22 @@ impl OcrModel {
     /// Propagates [`Self::forward`] (today, the preprocess `NotImplemented`) or a
     /// postprocess validation error.
     pub fn recognize(&self, image_path: &Path) -> FocrResult<String> {
-        let (decoded, image_w, image_h) = self.forward(image_path)?;
+        self.recognize_with_tromr_options(
+            image_path,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Recognize one path with explicit TrOMR inference mechanics.
+    ///
+    /// # Errors
+    /// As [`Self::recognize`], plus explicit options validation failures.
+    pub fn recognize_with_tromr_options(
+        &self,
+        image_path: &Path,
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<String> {
+        let (decoded, image_w, image_h) = self.forward_with_tromr_options(image_path, options)?;
         postprocess::finalize(&decoded, image_w, image_h)
     }
 
@@ -2069,8 +2369,47 @@ impl OcrModel {
     /// # Errors
     /// As [`Self::recognize`] (sans the file-open path).
     pub fn recognize_dynamic(&self, img: image::DynamicImage) -> FocrResult<String> {
-        let (decoded, image_w, image_h) = self.forward_dynamic(img)?;
+        self.recognize_dynamic_with_tromr_options(
+            img,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Recognize one in-memory image with explicit TrOMR inference mechanics.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_dynamic`], plus explicit options validation failures.
+    pub fn recognize_dynamic_with_tromr_options(
+        &self,
+        img: image::DynamicImage,
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<String> {
+        let (decoded, image_w, image_h) = self.forward_dynamic_with_tromr_options(img, options)?;
         postprocess::finalize(&decoded, image_w, image_h)
+    }
+
+    pub(crate) fn recognize_dynamic_with_tromr_execution_context(
+        &self,
+        img: image::DynamicImage,
+        options: tromr::TromrRecognitionOptionsV1,
+        execution: &mut crate::music_execution::TromrExecutionContext,
+    ) -> FocrResult<(String, MusicPageMeta)> {
+        let options = options.validate()?;
+        let admission_started = std::time::Instant::now();
+        let admission = forward_admission()
+            .acquire_with_checkpoint(|| execution.checkpoint("forward-admission"));
+        execution.record_forward_admission(admission_started.elapsed());
+        let _admission = admission?;
+        if self.arch().id() != "tromr" {
+            return Err(FocrError::FormatMismatch(format!(
+                "explicit TrOMR execution context cannot run model architecture {}",
+                self.arch().id()
+            )));
+        }
+        let (decoded, meta, image_w, image_h) =
+            self.forward_tromr_with_execution_context(&img, options, execution)?;
+        let musicxml = postprocess::finalize(&decoded, image_w, image_h)?;
+        Ok((musicxml, meta))
     }
 
     /// Recognize one document image end-to-end, returning the markdown AND the
@@ -2084,7 +2423,22 @@ impl OcrModel {
     /// # Errors
     /// As [`Self::recognize`].
     pub fn recognize_with_layout(&self, image_path: &Path) -> FocrResult<RecognizedDocument> {
-        let (decoded, image_w, image_h) = self.forward(image_path)?;
+        self.recognize_with_layout_and_tromr_options(
+            image_path,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Recognize one path with layout and explicit TrOMR inference mechanics.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_with_layout`], plus options validation failures.
+    pub fn recognize_with_layout_and_tromr_options(
+        &self,
+        image_path: &Path,
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<RecognizedDocument> {
+        let (decoded, image_w, image_h) = self.forward_with_tromr_options(image_path, options)?;
         Self::finalize_document(&decoded, image_w, image_h)
     }
 
@@ -2097,7 +2451,22 @@ impl OcrModel {
         &self,
         img: image::DynamicImage,
     ) -> FocrResult<RecognizedDocument> {
-        let (decoded, image_w, image_h) = self.forward_dynamic(img)?;
+        self.recognize_dynamic_with_layout_and_tromr_options(
+            img,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Recognize one in-memory image with layout and explicit TrOMR mechanics.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_dynamic_with_layout`], plus options validation failures.
+    pub fn recognize_dynamic_with_layout_and_tromr_options(
+        &self,
+        img: image::DynamicImage,
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<RecognizedDocument> {
+        let (decoded, image_w, image_h) = self.forward_dynamic_with_tromr_options(img, options)?;
         Self::finalize_document(&decoded, image_w, image_h)
     }
 
@@ -2133,7 +2502,22 @@ impl OcrModel {
         &self,
         image_path: &Path,
     ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
-        let (decoded, image_w, image_h) = self.forward(image_path)?;
+        self.recognize_with_figures_and_tromr_options(
+            image_path,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Recognize one path with figures and explicit TrOMR mechanics.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_with_figures`], plus options validation failures.
+    pub fn recognize_with_figures_and_tromr_options(
+        &self,
+        image_path: &Path,
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        let (decoded, image_w, image_h) = self.forward_with_tromr_options(image_path, options)?;
         let document = Self::finalize_document(&decoded, image_w, image_h)?;
         let figures = if postprocess::figure_refs(&decoded, image_w, image_h, "").is_empty() {
             Vec::new()
@@ -2153,11 +2537,26 @@ impl OcrModel {
         &self,
         img: image::DynamicImage,
     ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
+        self.recognize_dynamic_with_figures_and_tromr_options(
+            img,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Recognize one in-memory image with figures and explicit TrOMR mechanics.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_dynamic_with_figures`], plus options validation failures.
+    pub fn recognize_dynamic_with_figures_and_tromr_options(
+        &self,
+        img: image::DynamicImage,
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
         // The forward consumes `img`; retain the source pixels for cropping. Only
         // the figure path pays this clone (figureless callers use
         // `recognize_dynamic_with_layout`), and it is dwarfed by the forward.
         let source = img.clone();
-        let (decoded, image_w, image_h) = self.forward_dynamic(img)?;
+        let (decoded, image_w, image_h) = self.forward_dynamic_with_tromr_options(img, options)?;
         let document = Self::finalize_document(&decoded, image_w, image_h)?;
         let figures = Self::crop_figures(&decoded, &source, image_w, image_h, "");
         Ok((document, figures))
@@ -2463,6 +2862,21 @@ impl OcrModel {
 
     #[must_use]
     pub fn recognize_batch(&self, image_paths: &[&Path]) -> Vec<FocrResult<String>> {
+        self.recognize_batch_with_tromr_options(
+            image_paths,
+            tromr::TromrRecognitionOptionsV1::deterministic(),
+        )
+    }
+
+    /// Recognize independent images while applying one explicit TrOMR options
+    /// value to every TrOMR row/page. Other architecture batch paths are
+    /// unchanged.
+    #[must_use]
+    pub fn recognize_batch_with_tromr_options(
+        &self,
+        image_paths: &[&Path],
+        options: tromr::TromrRecognitionOptionsV1,
+    ) -> Vec<FocrResult<String>> {
         // The spine reproduces the int8 R-SWA cached decode (`generate_cached_i8`),
         // which `generate` selects only when int8 is requested AND the stateless
         // O(n^2) oracle is NOT forced. Engage the spine under EXACTLY that
@@ -2496,7 +2910,10 @@ impl OcrModel {
             }
         }
         if !spine {
-            return image_paths.iter().map(|p| self.recognize(p)).collect();
+            return image_paths
+                .iter()
+                .map(|p| self.recognize_with_tromr_options(p, options))
+                .collect();
         }
         let _admission = forward_admission().acquire();
         match self.recognize_batch_spine(image_paths) {
@@ -3900,6 +4317,459 @@ impl OcrModel {
 mod tests {
     use super::*;
 
+    fn music_options() -> (tromr::TromrRecognitionOptionsV1, String) {
+        let options = tromr::TromrRecognitionOptionsV1::deterministic();
+        let identity = options.replay_identity().expect("test options identity");
+        (options, identity)
+    }
+
+    fn music_result(semantic: &str) -> tromr::MusicResult {
+        let (options, options_identity) = music_options();
+        tromr::MusicResult {
+            semantic: semantic.to_owned(),
+            musicxml: format!("<row>{semantic}</row>"),
+            options,
+            options_identity,
+            forward_candidate_lattices: vec![
+                tromr::TromrForwardCandidateLatticeV1::new(
+                    0,
+                    tromr::synthetic_candidate_lattice_for_test(1, true),
+                )
+                .expect("test forward candidate"),
+            ],
+        }
+    }
+
+    fn staff_attempt(
+        index: usize,
+        bbox: tromr::StaffBBox,
+        outcome: tromr::StaffInferenceOutcome,
+        reason: Option<&str>,
+    ) -> tromr::StaffInferenceEvidence {
+        tromr::StaffInferenceEvidence {
+            index,
+            geometry: crate::preprocess::staff_detect::StaffCropGeometry::unpadded(bbox),
+            route: tromr::TromrRowInferenceRouteV1::NoDetectedStaffWholeRasterFallback,
+            forward_inputs: vec![tromr::TromrForwardInputV1 {
+                gray8: crate::preprocess::staff_detect::TromrGray8CropV1::from_tightly_packed(
+                    vec![255; bbox.2 * bbox.3],
+                    bbox.2,
+                    bbox.3,
+                )
+                .expect("test Gray8 input"),
+                source_space: tromr::TromrModelInputSourceSpaceV1::SelectedPageRaster,
+                source_bbox_xywh: bbox,
+                padding: crate::preprocess::staff_detect::StaffPadding::default(),
+                staff_lines_y_in_canvas: None,
+            }],
+            review_crop_gray8: None,
+            review_crop_geometry: None,
+            staff_lines: None,
+            outcome,
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    fn empty_music_meta(label: &str) -> MusicPageMeta {
+        let (recognition_options, recognition_options_identity) = music_options();
+        MusicPageMeta {
+            detected_staff_count: 0,
+            staff_segmentation_disposition:
+                tromr::TromrStaffSegmentationDispositionV1::NoStaffDetectedWholeImageFallback,
+            fragments: Vec::new(),
+            staves: Vec::new(),
+            skips: Vec::new(),
+            staff_evidence: Vec::new(),
+            staff_detection: crate::preprocess::staff_detect::synthetic_complete_evidence_for_test(
+                1,
+                1,
+                &[],
+            ),
+            warnings: Vec::new(),
+            recognition_options,
+            recognition_options_identity: format!("{recognition_options_identity}:{label}"),
+        }
+    }
+
+    fn unresolved_music_meta(label: &str) -> MusicPageMeta {
+        let mut meta = empty_music_meta(label);
+        meta.staff_detection =
+            crate::preprocess::staff_detect::synthetic_unresolved_evidence_for_test(
+                20,
+                40,
+                &[(
+                    crate::preprocess::staff_detect::StaffCropGeometry::unpadded((0, 4, 20, 12)),
+                    [5, 7, 9, 11, 13],
+                    [1, 3, 5, 7, 9],
+                )],
+                [17, 19, 21, 23, 26],
+            );
+        meta
+    }
+
+    #[test]
+    fn unresolved_detector_context_is_a_review_draft_but_not_a_complete_publication() {
+        let draft =
+            complete_explicit_music_review_draft(unresolved_music_meta("review-draft"), Ok(()))
+                .expect("structurally valid review draft survives");
+        assert!(draft.publication_blocked());
+        draft
+            .staff_detection
+            .validate()
+            .expect("draft detector ledger validates");
+
+        let error =
+            complete_explicit_music_publication(unresolved_music_meta("full-publication"), Ok(()))
+                .expect_err("full-page publication must refuse unresolved residual evidence");
+        assert!(
+            error
+                .to_string()
+                .contains("unresolved staff-like residual ink"),
+            "unexpected publication error: {error}"
+        );
+    }
+
+    #[test]
+    fn terminal_publication_checkpoint_clears_stale_meta_and_publishes_nothing() {
+        for terminal in [
+            FocrError::Timeout("publication probe".to_owned()),
+            FocrError::Cancelled,
+        ] {
+            let slot = std::sync::Mutex::new(Some(empty_music_meta("stale")));
+            clear_music_meta_slot(&slot);
+            let error = complete_explicit_music_publication(empty_music_meta("new"), Err(terminal))
+                .expect_err("terminal checkpoint must refuse metadata publication");
+            assert!(matches!(
+                error,
+                FocrError::Timeout(_) | FocrError::Cancelled
+            ));
+            assert!(
+                slot.lock().expect("metadata slot").take().is_none(),
+                "a failed final checkpoint leaked stale or new page metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn immutable_meta_rendezvous_keeps_each_result_request_local() {
+        let gate = Arc::new(ExclusiveGate::new());
+        let (a_assembled_tx, a_assembled_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_a_tx, release_a_rx) = std::sync::mpsc::sync_channel(1);
+        let (a_result_tx, a_result_rx) = std::sync::mpsc::sync_channel(1);
+        let gate_a = Arc::clone(&gate);
+        let request_a = std::thread::spawn(move || {
+            let admission = gate_a.acquire();
+            let meta = complete_explicit_music_publication(empty_music_meta("request-a"), Ok(()))
+                .expect("request A publication checkpoint");
+            a_assembled_tx
+                .send(())
+                .expect("rendezvous receiver remains live");
+            release_a_rx.recv().expect("release request A admission");
+            drop(admission);
+            a_result_tx.send(meta).expect("request A result receiver");
+        });
+
+        a_assembled_rx
+            .recv()
+            .expect("request A assembled while holding admission");
+        let (b_result_tx, b_result_rx) = std::sync::mpsc::sync_channel(1);
+        let gate_b = Arc::clone(&gate);
+        let request_b = std::thread::spawn(move || {
+            let _admission = gate_b.acquire();
+            let meta = complete_explicit_music_publication(empty_music_meta("request-b"), Ok(()))
+                .expect("request B publication checkpoint");
+            b_result_tx.send(meta).expect("request B result receiver");
+        });
+        release_a_tx.send(()).expect("release request A");
+
+        let result_b = b_result_rx.recv().expect("request B returns local meta");
+        let result_a = a_result_rx.recv().expect("request A returns local meta");
+        request_a.join().expect("request A exits");
+        request_b.join().expect("request B exits");
+        assert!(
+            result_a
+                .recognition_options_identity
+                .ends_with(":request-a")
+        );
+        assert!(
+            result_b
+                .recognition_options_identity
+                .ends_with(":request-b")
+        );
+        assert_ne!(
+            result_a.recognition_options_identity,
+            result_b.recognition_options_identity
+        );
+    }
+
+    #[test]
+    fn music_page_meta_owns_one_exact_topology_free_fragment() {
+        let bbox = (12, 34, 560, 96);
+        let (options, options_identity) = music_options();
+        let detector_crops = [(
+            crate::preprocess::staff_detect::StaffCropGeometry::unpadded(bbox),
+            [35, 37, 39, 41, 43],
+            [1, 3, 5, 7, 9],
+        )];
+        let (staff_detection, retained_staff_detection) =
+            tromr::synthetic_staff_detection_pair_for_test(600, 140, &detector_crops);
+        let mut page = tromr::PageRecognition {
+            detected_staff_count: 1,
+            staff_segmentation_disposition:
+                tromr::TromrStaffSegmentationDispositionV1::SingleStaffDetectedWholeImageRecognition,
+            staves: vec![(0, music_result(""), bbox)],
+            skips: Vec::new(),
+            staff_evidence: vec![staff_attempt(
+                0,
+                bbox,
+                tromr::StaffInferenceOutcome::Recognized,
+                None,
+            )],
+            staff_detection,
+            retained_staff_detection,
+            options,
+            options_identity,
+        };
+
+        let meta = music_page_meta(&page);
+        assert_eq!(meta.detected_staff_count, 1);
+        assert_eq!(
+            meta.staff_segmentation_disposition,
+            tromr::TromrStaffSegmentationDispositionV1::SingleStaffDetectedWholeImageRecognition
+        );
+        assert_eq!(
+            meta.fragments.len(),
+            1,
+            "one recognized row yields one fragment"
+        );
+        let fragment = &meta.fragments[0];
+        let MusicRowFragment {
+            detection_index,
+            bbox: actual_bbox,
+            semantic,
+            forward_candidate_lattices,
+        } = fragment;
+        eprintln!(
+            "music_row_fragment index={detection_index} expected_bbox={bbox:?} actual_bbox={actual_bbox:?} semantic_bytes={}",
+            semantic.len()
+        );
+        assert_eq!(*detection_index, 0, "single-row detection index changed");
+        assert_eq!(*actual_bbox, bbox, "single-row source bbox changed");
+        assert!(
+            semantic.is_empty(),
+            "empty model semantics must remain empty"
+        );
+        assert_eq!(forward_candidate_lattices.len(), 1);
+        assert_eq!(forward_candidate_lattices[0].forward_input_index, 0);
+        assert_eq!(
+            forward_candidate_lattices[0].candidate_lattice.positions[0].prefix_length,
+            1
+        );
+
+        page.staves[0]
+            .1
+            .semantic
+            .push_str("mutated-after-projection");
+        page.staves[0].1.forward_candidate_lattices.clear();
+        assert!(
+            meta.fragments[0].semantic.is_empty(),
+            "metadata must own a stable clone of the exact forward result"
+        );
+        assert_eq!(
+            meta.fragments[0].forward_candidate_lattices.len(),
+            1,
+            "metadata must own a stable clone of candidate evidence"
+        );
+    }
+
+    #[test]
+    fn music_page_meta_preserves_ordered_split_candidate_lattices() {
+        let bbox = (12, 34, 960, 96);
+        let (options, options_identity) = music_options();
+        let mut result = music_result("clef-G2+note-C4_quarter+barline");
+        result.forward_candidate_lattices = vec![
+            tromr::TromrForwardCandidateLatticeV1::new(
+                0,
+                tromr::synthetic_candidate_lattice_for_test(2, true),
+            )
+            .expect("first split lattice"),
+            tromr::TromrForwardCandidateLatticeV1::new(
+                1,
+                tromr::synthetic_candidate_lattice_for_test(3, true),
+            )
+            .expect("second split lattice"),
+        ];
+        result
+            .validate_forward_candidate_lattices(2)
+            .expect("split result validates");
+        let mut attempt = staff_attempt(0, bbox, tromr::StaffInferenceOutcome::Recognized, None);
+        attempt.route = tromr::TromrRowInferenceRouteV1::ExperimentalSplitSegments;
+        attempt
+            .forward_inputs
+            .push(attempt.forward_inputs[0].clone());
+        let detector_crops = [(
+            crate::preprocess::staff_detect::StaffCropGeometry::unpadded(bbox),
+            [35, 37, 39, 41, 43],
+            [1, 3, 5, 7, 9],
+        )];
+        let (staff_detection, retained_staff_detection) =
+            tromr::synthetic_staff_detection_pair_for_test(1_000, 140, &detector_crops);
+        let page = tromr::PageRecognition {
+            detected_staff_count: 1,
+            staff_segmentation_disposition:
+                tromr::TromrStaffSegmentationDispositionV1::SingleStaffDetectedWholeImageRecognition,
+            staves: vec![(0, result, bbox)],
+            skips: Vec::new(),
+            staff_evidence: vec![attempt],
+            staff_detection,
+            retained_staff_detection,
+            options,
+            options_identity,
+        };
+
+        let meta = music_page_meta(&page);
+        let candidates = &meta.fragments[0].forward_candidate_lattices;
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.forward_input_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(candidates[0].candidate_lattice.positions.len(), 2);
+        assert_eq!(candidates[1].candidate_lattice.positions.len(), 3);
+        assert_eq!(
+            candidates[0].candidate_lattice.positions[0].prefix_length,
+            1
+        );
+        assert_eq!(
+            candidates[1].candidate_lattice.positions[0].prefix_length,
+            1
+        );
+        assert_eq!(
+            candidates[0].candidate_lattice.positions[0].prefix_sha256,
+            candidates[1].candidate_lattice.positions[0].prefix_sha256
+        );
+    }
+
+    #[test]
+    fn music_page_meta_preserves_fragment_indices_across_a_skipped_row() {
+        let first_bbox = (10, 100, 900, 82);
+        let skipped_bbox = (10, 220, 900, 84);
+        let last_bbox = (10, 340, 900, 80);
+        let skipped_reason = "decoder rejected row-local token stream";
+        let (options, options_identity) = music_options();
+        let detector_crops = [
+            (
+                crate::preprocess::staff_detect::StaffCropGeometry::unpadded(first_bbox),
+                [101, 103, 105, 107, 109],
+                [1, 3, 5, 7, 9],
+            ),
+            (
+                crate::preprocess::staff_detect::StaffCropGeometry::unpadded(skipped_bbox),
+                [221, 223, 225, 227, 229],
+                [1, 3, 5, 7, 9],
+            ),
+            (
+                crate::preprocess::staff_detect::StaffCropGeometry::unpadded(last_bbox),
+                [341, 343, 345, 347, 349],
+                [1, 3, 5, 7, 9],
+            ),
+        ];
+        let (staff_detection, retained_staff_detection) =
+            tromr::synthetic_staff_detection_pair_for_test(920, 430, &detector_crops);
+        let page = tromr::PageRecognition {
+            detected_staff_count: 3,
+            staff_segmentation_disposition:
+                tromr::TromrStaffSegmentationDispositionV1::MultipleStavesDetectedPerCropRecognition,
+            staves: vec![
+                (0, music_result("clef-G2+note-C4_quarter"), first_bbox),
+                (2, music_result("clef-F4+note-C3_half"), last_bbox),
+            ],
+            skips: vec![tromr::StaffSkip {
+                index: 1,
+                bbox: skipped_bbox,
+                reason: skipped_reason.to_owned(),
+            }],
+            staff_evidence: vec![
+                staff_attempt(
+                    0,
+                    first_bbox,
+                    tromr::StaffInferenceOutcome::Recognized,
+                    None,
+                ),
+                staff_attempt(
+                    1,
+                    skipped_bbox,
+                    tromr::StaffInferenceOutcome::Skipped,
+                    Some(skipped_reason),
+                ),
+                staff_attempt(2, last_bbox, tromr::StaffInferenceOutcome::Recognized, None),
+            ],
+            staff_detection,
+            retained_staff_detection,
+            options,
+            options_identity,
+        };
+
+        let meta = music_page_meta(&page);
+        assert_eq!(meta.detected_staff_count, 3);
+        assert_eq!(
+            meta.staff_segmentation_disposition,
+            tromr::TromrStaffSegmentationDispositionV1::MultipleStavesDetectedPerCropRecognition
+        );
+        let observed: Vec<(usize, tromr::StaffBBox, &str)> = meta
+            .fragments
+            .iter()
+            .map(|fragment| {
+                eprintln!(
+                    "music_row_fragment index={} bbox={:?} semantic_bytes={}",
+                    fragment.detection_index,
+                    fragment.bbox,
+                    fragment.semantic.len()
+                );
+                (
+                    fragment.detection_index,
+                    fragment.bbox,
+                    fragment.semantic.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            vec![
+                (0, first_bbox, "clef-G2+note-C4_quarter"),
+                (2, last_bbox, "clef-F4+note-C3_half"),
+            ],
+            "recognized fragments were dropped, duplicated, reordered, renumbered, or changed"
+        );
+        assert_eq!(
+            meta.staves,
+            vec![(0, first_bbox), (2, last_bbox)],
+            "legacy recognized-row geometry must match the fragment handoff"
+        );
+        assert_eq!(meta.skips.len(), 1, "the skipped middle row disappeared");
+        assert_eq!(meta.skips[0].index, 1, "the skipped row was renumbered");
+        assert_eq!(meta.skips[0].bbox, skipped_bbox, "the skipped bbox changed");
+        assert_eq!(
+            meta.skips[0].reason, skipped_reason,
+            "the skipped reason changed"
+        );
+        assert_eq!(
+            meta.staff_evidence.len(),
+            3,
+            "the complete recognized/skipped attempt ledger was not retained"
+        );
+        assert_eq!(
+            meta.staff_evidence
+                .iter()
+                .map(|attempt| attempt.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "attempt evidence no longer preserves detector order"
+        );
+    }
+
     #[test]
     fn forward_admission_serializes_concurrent_callers() {
         use std::sync::Barrier;
@@ -3927,6 +4797,72 @@ mod tests {
         });
         assert_eq!(max_live.load(Ordering::SeqCst), 1);
         assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn explicit_forward_admission_observes_cancellation_without_leaking_permit() {
+        let gate = ExclusiveGate::new();
+        let holder = gate.acquire();
+        let cancellation = crate::MusicCancellationToken::new();
+        let cancel_handle = cancellation.clone();
+        let context = crate::music_execution::TromrExecutionContext::new(
+            crate::TromrExecutionOptionsV1::default(),
+            cancellation,
+        )
+        .expect("execution context");
+        let canceler = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+            cancel_handle.cancel();
+        });
+        let started = std::time::Instant::now();
+        let error = match gate.acquire_with_checkpoint(|| context.checkpoint("forward-admission")) {
+            Ok(_) => panic!("contended admission must observe request cancellation"),
+            Err(error) => error,
+        };
+        canceler.join().expect("canceler exits");
+        assert!(matches!(error, FocrError::Cancelled));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "bounded admission wait did not poll cancellation promptly"
+        );
+
+        drop(holder);
+        let _next = gate
+            .acquire_with_checkpoint(|| Ok(()))
+            .expect("cancelled contender did not leak the permit");
+    }
+
+    #[test]
+    fn explicit_forward_admission_observes_setup_deadline_without_leaking_permit() {
+        let gate = ExclusiveGate::new();
+        let holder = gate.acquire();
+        let options = crate::TromrExecutionOptionsV1 {
+            setup_budget_ms: 15,
+            per_forward_attempt_budget_ms: 1,
+            max_forward_attempts: 1,
+            ..crate::TromrExecutionOptionsV1::default()
+        };
+        let context = crate::music_execution::TromrExecutionContext::new(
+            options,
+            crate::MusicCancellationToken::new(),
+        )
+        .expect("execution context");
+        let started = std::time::Instant::now();
+        let error = match gate.acquire_with_checkpoint(|| context.checkpoint("forward-admission")) {
+            Ok(_) => panic!("contended admission must consume setup allowance"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, FocrError::Timeout(_)));
+        assert!(started.elapsed() >= std::time::Duration::from_millis(15));
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "bounded admission wait did not poll the setup deadline promptly"
+        );
+
+        drop(holder);
+        let _next = gate
+            .acquire_with_checkpoint(|| Ok(()))
+            .expect("timed-out contender did not leak the permit");
     }
 
     #[test]

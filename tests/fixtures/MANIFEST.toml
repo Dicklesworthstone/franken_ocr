@@ -24,6 +24,7 @@
 "onechart" = { kind = "regenerated-committed", script = "scripts/gen_reference_fixtures_onechart.py" }
 "tromr" = { kind = "regenerated-committed", script = "scripts/gen_reference_fixtures_tromr.py", note = "tokenizer tables are upstream-frozen bytes" }
 "realscan_music" = { kind = "committed", note = "public-domain Spohr real-scan music corpus; tiered truth plus frozen MusicXML anchor (bd-av64.6)" }
+"lilypond_selectable_text.pdf" = { kind = "committed", note = "frozen one-page LilyPond score PDF for exact Type1C text/glyph-name/position goldens; sha256 45f761953b230720aea5a686d6504a5547ae46d6c40e97248347d54d1292bd68" }
 "ladder_scorecard" = { kind = "regenerated-committed", script = "scripts/ladder_scorecard.sh", note = "the L0-L5 per-commit parity receipt, armed + unarmed shapes (bd-re8.19)" }
 "multi_page" = { kind = "regenerated-committed", script = "scripts/baseline/run_baidu_reference_multi.py", note = "frozen infer_multi oracle raw+meta (2/10/20-page legs; the 20-page fixture is the reference-collapse upper bound — bd-1gv.26/bd-1465, DISC-004)" }
 "PROVENANCE.md" = { kind = "committed", note = "this catalogue's prose twin" }

@@ -987,8 +987,7 @@ fn write_ocr_output(
     let contents = if want_json {
         let mut value = rec.to_json(figures);
         if let Some(meta) = music_meta {
-            value["staves"] = music_meta_to_json(meta);
-            value["warnings"] = music_warnings_to_json(meta);
+            attach_music_meta(&mut value, meta);
         }
         let mut s = serde_json::to_string_pretty(&value).map_err(|e| {
             FocrError::Other(anyhow::anyhow!(
@@ -1303,7 +1302,8 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // (e.g. `--extract-figures` without a place to put the subfolder) fires fast.
     let figure_plan = FigurePlan::resolve(&args)?;
 
-    let engine = OcrEngine::new()?;
+    let tromr_options = tromr_options_from_env()?;
+    let engine = OcrEngine::new_with_tromr_options(tromr_options)?;
     // A `.pdf` (or `%PDF-`-magic) input rasterizes each page and OCRs them as one
     // document; everything else is a single decoded image. Both funnel through
     // `recognize_with_autodownload` so model resolution + the first-run download
@@ -1387,17 +1387,16 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // once per run; None for every non-music run.
     let music_meta = engine.take_music_page_meta();
     if robot_mode && let Some(meta) = &music_meta {
-        let total = meta.staves.len() + meta.skips.len();
-        for (index, bbox) in &meta.staves {
-            emit(&robot::staff_event(*index, total, *bbox, "ok", None));
-        }
-        for skip in &meta.skips {
+        let total = meta.staff_evidence.len();
+        for evidence in &meta.staff_evidence {
             emit(&robot::staff_event(
-                skip.index,
+                evidence.index,
                 total,
-                skip.bbox,
-                "skipped",
-                Some(&skip.reason),
+                meta.detected_staff_count,
+                meta.staff_segmentation_disposition,
+                evidence.geometry,
+                evidence.outcome,
+                evidence.reason.as_deref(),
             ));
         }
         for w in &meta.warnings {
@@ -1451,8 +1450,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     } else if args.json {
         let mut value = recognition.to_json(&figures);
         if let Some(meta) = &music_meta {
-            value["staves"] = music_meta_to_json(meta);
-            value["warnings"] = music_warnings_to_json(meta);
+            attach_music_meta(&mut value, meta);
         }
         emit(&value);
     } else {
@@ -1461,10 +1459,88 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     Ok(())
 }
 
+fn legacy_tromr_bool(name: &str, raw: Option<OsString>) -> FocrResult<bool> {
+    let Some(raw) = raw else {
+        return Ok(false);
+    };
+    let value = raw.into_string().map_err(|_| {
+        FocrError::Usage(format!(
+            "{name} must be Unicode and one of 1/0, true/false, yes/no, or on/off"
+        ))
+    })?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(FocrError::Usage(format!(
+            "{name}={value:?} is invalid; expected 1/0, true/false, yes/no, or on/off"
+        ))),
+    }
+}
+
+fn tromr_options_from_lookup(
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> FocrResult<native_engine::tromr::TromrRecognitionOptionsV1> {
+    use native_engine::tromr::{TromrDecodeModeV1, TromrRecognitionOptionsV1, TromrSplitPolicyV1};
+
+    let sampling = legacy_tromr_bool("FOCR_TROMR_SAMPLE", lookup("FOCR_TROMR_SAMPLE"))?;
+    let seed = match lookup("FOCR_TROMR_SEED") {
+        None => None,
+        Some(raw) => {
+            let value = raw.into_string().map_err(|_| {
+                FocrError::Usage("FOCR_TROMR_SEED must be a Unicode u64 integer".into())
+            })?;
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return Err(FocrError::Usage(
+                    "FOCR_TROMR_SEED must be a non-empty u64 integer".into(),
+                ));
+            }
+            Some(trimmed.parse::<u64>().map_err(|_| {
+                FocrError::Usage(format!(
+                    "FOCR_TROMR_SEED={value:?} is invalid; expected a u64 integer"
+                ))
+            })?)
+        }
+    };
+    let split = legacy_tromr_bool("FOCR_TROMR_SPLIT", lookup("FOCR_TROMR_SPLIT"))?;
+
+    TromrRecognitionOptionsV1 {
+        decode_mode: if sampling {
+            TromrDecodeModeV1::SeededTopKTemperature
+        } else {
+            TromrDecodeModeV1::Argmax
+        },
+        seed,
+        split_policy: if split {
+            TromrSplitPolicyV1::ExperimentalBarlineSegments
+        } else {
+            TromrSplitPolicyV1::Disabled
+        },
+        ..TromrRecognitionOptionsV1::deterministic()
+    }
+    .validate()
+}
+
+fn tromr_options_from_env() -> FocrResult<native_engine::tromr::TromrRecognitionOptionsV1> {
+    tromr_options_from_lookup(|name| std::env::var_os(name))
+}
+
+fn attach_music_meta(value: &mut serde_json::Value, meta: &native_engine::MusicPageMeta) {
+    value["detected_staff_count"] = serde_json::json!(meta.detected_staff_count);
+    value["staff_segmentation_disposition"] =
+        serde_json::json!(meta.staff_segmentation_disposition);
+    value["staves"] = music_meta_to_json(meta);
+    value["warnings"] = music_warnings_to_json(meta);
+    value["tromr_recognition_options"] = serde_json::json!(meta.recognition_options);
+    value["tromr_recognition_options_identity"] =
+        serde_json::json!(meta.recognition_options_identity);
+}
+
 /// The `--json` `staves` array for a music run (bd-av64.2): one entry per
-/// DETECTED staff in detection order — recognized staves as `status: "ok"`,
-/// failed ones as `status: "skipped"` with the reason. Absent entirely for
-/// non-music runs, so every existing consumer's shape is unchanged.
+/// inference attempt in route order, recognized rows as `status: "ok"` and
+/// failed ones as `status: "skipped"`. `detected_staff_count` and
+/// `staff_segmentation_disposition` distinguish zero-detection fallback from a
+/// detected single staff. Absent entirely for non-music runs.
 /// The `--json` `warnings` array for a music run (bd-av64.5): annotate-only
 /// musical-sanity observations, machine-stable kinds. Absent for non-music
 /// runs.
@@ -1486,29 +1562,36 @@ fn music_warnings_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Va
 
 fn music_meta_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Value {
     let mut entries: Vec<(usize, serde_json::Value)> = meta
-        .staves
+        .staff_evidence
         .iter()
-        .map(|(index, bbox)| {
-            (
-                *index,
-                serde_json::json!({
-                    "staff": index + 1,
-                    "bbox": [bbox.0, bbox.1, bbox.2, bbox.3],
-                    "status": "ok",
-                }),
-            )
+        .map(|evidence| {
+            let bbox = evidence.geometry.source_bbox;
+            let status = match evidence.outcome {
+                native_engine::tromr::StaffInferenceOutcome::Recognized => "ok",
+                native_engine::tromr::StaffInferenceOutcome::Skipped => "skipped",
+            };
+            let mut value = serde_json::json!({
+                "staff": evidence.index + 1,
+                "bbox": [bbox.0, bbox.1, bbox.2, bbox.3],
+                "source_bbox": [bbox.0, bbox.1, bbox.2, bbox.3],
+                "inference_canvas": {
+                    "width": evidence.geometry.canvas_width,
+                    "height": evidence.geometry.canvas_height,
+                },
+                "padding": {
+                    "top": evidence.geometry.padding.top,
+                    "right": evidence.geometry.padding.right,
+                    "bottom": evidence.geometry.padding.bottom,
+                    "left": evidence.geometry.padding.left,
+                },
+                "outcome": evidence.outcome.as_str(),
+                "status": status,
+            });
+            if let Some(reason) = &evidence.reason {
+                value["reason"] = serde_json::json!(reason);
+            }
+            (evidence.index, value)
         })
-        .chain(meta.skips.iter().map(|skip| {
-            (
-                skip.index,
-                serde_json::json!({
-                    "staff": skip.index + 1,
-                    "bbox": [skip.bbox.0, skip.bbox.1, skip.bbox.2, skip.bbox.3],
-                    "status": "skipped",
-                    "reason": skip.reason,
-                }),
-            )
-        }))
         .collect();
     entries.sort_by_key(|(index, _)| *index);
     serde_json::Value::Array(entries.into_iter().map(|(_, v)| v).collect())
@@ -1765,8 +1848,8 @@ fn recognize_pdf_multi_page(
 /// time, so a long book never holds every raster at once.
 ///
 /// **Per-page resilience (mirrors the `ocr-batch` path):** a page that cannot be
-/// rendered or recognized — an unsupported codec (`JPXDecode`/`JBIG2Decode`), a
-/// vector/text page, a per-page decode or timeout error — is SKIPPED, so one bad
+/// rendered or recognized — an unsupported vector/composition form, a malformed
+/// codec stream, a per-page decode error, or a timeout — is SKIPPED, so one bad
 /// page never discards (nor wastes the compute already spent on) the OCR of every
 /// other page. The skip is surfaced so it is never silent: a structured `page`
 /// NDJSON event ([`robot::page_skipped_event`]) in robot mode, else a human stderr
@@ -2049,7 +2132,8 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             ..Default::default()
         });
     }
-    let engine = OcrEngine::new()?;
+    let tromr_options = tromr_options_from_env()?;
+    let engine = OcrEngine::new_with_tromr_options(tromr_options)?;
     let model = args.model.clone();
     let count = args.images.len();
     let total = std::time::Instant::now();
@@ -3059,6 +3143,130 @@ fn exit_code_byte(err: &FocrError) -> u8 {
 mod tests {
     use super::*;
 
+    fn synthetic_staff_evidence(
+        index: usize,
+        geometry: crate::preprocess::staff_detect::StaffCropGeometry,
+        outcome: native_engine::tromr::StaffInferenceOutcome,
+        reason: Option<&str>,
+    ) -> native_engine::tromr::StaffInferenceEvidence {
+        let width = geometry.canvas_width;
+        let height = geometry.canvas_height;
+        let review_lines = [10, 20, 30, 40, 50];
+        let gray8 = crate::preprocess::staff_detect::TromrGray8CropV1::from_tightly_packed(
+            vec![255; width * height],
+            width,
+            height,
+        )
+        .expect("synthetic row pixels");
+        native_engine::tromr::StaffInferenceEvidence {
+            index,
+            geometry,
+            route: native_engine::tromr::TromrRowInferenceRouteV1::DetectedStaffCrop,
+            forward_inputs: vec![native_engine::tromr::TromrForwardInputV1 {
+                gray8: gray8.clone(),
+                source_space: native_engine::tromr::TromrModelInputSourceSpaceV1::ReviewCropCanvas,
+                source_bbox_xywh: (0, 0, width, height),
+                padding: geometry.padding,
+                staff_lines_y_in_canvas: Some(review_lines),
+            }],
+            review_crop_gray8: Some(gray8),
+            review_crop_geometry: Some(geometry),
+            staff_lines: Some(native_engine::tromr::TromrStaffLineEvidenceV1 {
+                accepted_detector_lines_y_in_globally_deskewed_raster: review_lines
+                    .map(|line| geometry.source_bbox.1 + line),
+                review_crop_staff_lines_y_in_canvas: review_lines,
+            }),
+            outcome,
+            reason: reason.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn tromr_cli_env_defaults_to_explicit_deterministic_options() {
+        let mut reads = Vec::new();
+        let options = tromr_options_from_lookup(|name| {
+            reads.push(name.to_owned());
+            assert_ne!(name, "FOCR_RESAMPLE", "generic resampler is not TrOMR");
+            None
+        })
+        .expect("unset legacy env is deterministic");
+        assert_eq!(
+            options,
+            native_engine::tromr::TromrRecognitionOptionsV1::deterministic()
+        );
+        assert_eq!(
+            reads,
+            ["FOCR_TROMR_SAMPLE", "FOCR_TROMR_SEED", "FOCR_TROMR_SPLIT"]
+        );
+    }
+
+    #[test]
+    fn tromr_cli_env_normalizes_seeded_sampling_and_experimental_split() {
+        let options = tromr_options_from_lookup(|name| match name {
+            "FOCR_TROMR_SAMPLE" => Some(OsString::from("yes")),
+            "FOCR_TROMR_SEED" => Some(OsString::from(" 18446744073709551615 ")),
+            "FOCR_TROMR_SPLIT" => Some(OsString::from("ON")),
+            other => panic!("unexpected lookup: {other}"),
+        })
+        .expect("explicit sampling contract");
+        assert_eq!(
+            options.decode_mode,
+            native_engine::tromr::TromrDecodeModeV1::SeededTopKTemperature
+        );
+        assert_eq!(options.seed, Some(u64::MAX));
+        assert_eq!(
+            options.split_policy,
+            native_engine::tromr::TromrSplitPolicyV1::ExperimentalBarlineSegments
+        );
+        assert_eq!(
+            options.staff_resampler,
+            native_engine::tromr::TromrStaffResamplerV1::Cv2LinearU8V1
+        );
+    }
+
+    #[test]
+    fn tromr_cli_env_false_values_do_not_enable_sampling_or_split() {
+        for false_value in ["0", "false", "NO", "off"] {
+            let options = tromr_options_from_lookup(|name| match name {
+                "FOCR_TROMR_SAMPLE" | "FOCR_TROMR_SPLIT" => Some(OsString::from(false_value)),
+                "FOCR_TROMR_SEED" => None,
+                other => panic!("unexpected lookup: {other}"),
+            })
+            .expect("false-like values are explicit false");
+            assert_eq!(
+                options,
+                native_engine::tromr::TromrRecognitionOptionsV1::deterministic()
+            );
+        }
+    }
+
+    #[test]
+    fn tromr_cli_env_refuses_ambiguous_or_invalid_combinations() {
+        let cases = [
+            (Some(""), None, None),
+            (Some("perhaps"), None, None),
+            (Some("1"), None, None),
+            (None, Some("7"), None),
+            (Some("1"), Some("-1"), None),
+            (Some("1"), Some("18446744073709551616"), None),
+            (None, None, Some("split-it")),
+        ];
+        for (sample, seed, split) in cases {
+            let error = tromr_options_from_lookup(|name| {
+                let value = match name {
+                    "FOCR_TROMR_SAMPLE" => sample,
+                    "FOCR_TROMR_SEED" => seed,
+                    "FOCR_TROMR_SPLIT" => split,
+                    other => panic!("unexpected lookup: {other}"),
+                };
+                value.map(OsString::from)
+            })
+            .expect_err("invalid legacy environment must refuse");
+            assert_eq!(error.kind(), "usage");
+            assert_eq!(error.exit_code(), crate::error::EXIT_USAGE);
+        }
+    }
+
     #[test]
     fn every_error_variant_maps_to_process_exit_byte_from_error_contract() {
         let cases = [
@@ -3568,29 +3776,137 @@ mod tests {
     /// staves in DETECTION order, 1-based, with reasons only on skips.
     #[test]
     fn music_meta_json_interleaves_in_detection_order() {
+        let recognition_options = native_engine::tromr::TromrRecognitionOptionsV1::deterministic();
+        let recognition_options_identity = recognition_options
+            .replay_identity()
+            .expect("test options identity");
         let meta = native_engine::MusicPageMeta {
+            detected_staff_count: 3,
+            staff_segmentation_disposition:
+                native_engine::tromr::TromrStaffSegmentationDispositionV1::MultipleStavesDetectedPerCropRecognition,
+            fragments: vec![
+                native_engine::MusicRowFragment {
+                    detection_index: 0,
+                    bbox: (0, 10, 800, 100),
+                    semantic: "clef-G2+note-C4_quarter".into(),
+                    forward_candidate_lattices: Vec::new(),
+                },
+                native_engine::MusicRowFragment {
+                    detection_index: 2,
+                    bbox: (0, 300, 800, 100),
+                    semantic: "clef-F4+note-C3_quarter".into(),
+                    forward_candidate_lattices: Vec::new(),
+                },
+            ],
             staves: vec![(0, (0, 10, 800, 100)), (2, (0, 300, 800, 100))],
             skips: vec![native_engine::tromr::StaffSkip {
                 index: 1,
-                bbox: (0, 150, 800, 90),
-                reason: "resized width 1296 exceeds the 1280 position clamp".into(),
+                bbox: (0, 150, 800, 80),
+                reason: "decoder error after padding".into(),
             }],
+            staff_evidence: vec![
+                synthetic_staff_evidence(
+                    0,
+                    crate::preprocess::staff_detect::StaffCropGeometry::unpadded((
+                        0, 10, 800, 100,
+                    )),
+                    native_engine::tromr::StaffInferenceOutcome::Recognized,
+                    None,
+                ),
+                synthetic_staff_evidence(
+                    1,
+                    crate::preprocess::staff_detect::StaffCropGeometry {
+                        source_bbox: (0, 150, 800, 80),
+                        canvas_width: 800,
+                        canvas_height: 90,
+                        padding: crate::preprocess::staff_detect::StaffPadding {
+                            top: 5,
+                            right: 0,
+                            bottom: 5,
+                            left: 0,
+                        },
+                    },
+                    native_engine::tromr::StaffInferenceOutcome::Skipped,
+                    Some("decoder error after padding"),
+                ),
+                synthetic_staff_evidence(
+                    2,
+                    crate::preprocess::staff_detect::StaffCropGeometry::unpadded((
+                        0, 300, 800, 100,
+                    )),
+                    native_engine::tromr::StaffInferenceOutcome::Recognized,
+                    None,
+                ),
+            ],
+            staff_detection:
+                crate::preprocess::staff_detect::synthetic_complete_evidence_for_test(
+                    800,
+                    500,
+                    &[
+                        (
+                            crate::preprocess::staff_detect::StaffCropGeometry::unpadded((
+                                0, 10, 800, 100,
+                            )),
+                            [20, 30, 40, 50, 60],
+                            [10, 20, 30, 40, 50],
+                        ),
+                        (
+                            crate::preprocess::staff_detect::StaffCropGeometry {
+                                source_bbox: (0, 150, 800, 80),
+                                canvas_width: 800,
+                                canvas_height: 90,
+                                padding: crate::preprocess::staff_detect::StaffPadding {
+                                    top: 5,
+                                    right: 0,
+                                    bottom: 5,
+                                    left: 0,
+                                },
+                            },
+                            [160, 170, 180, 190, 200],
+                            [10, 20, 30, 40, 50],
+                        ),
+                        (
+                            crate::preprocess::staff_detect::StaffCropGeometry::unpadded((
+                                0, 300, 800, 100,
+                            )),
+                            [310, 320, 330, 340, 350],
+                            [10, 20, 30, 40, 50],
+                        ),
+                    ],
+                ),
             warnings: Vec::new(),
+            recognition_options,
+            recognition_options_identity: recognition_options_identity.clone(),
         };
-        let v = music_meta_to_json(&meta);
-        let arr = v.as_array().expect("array");
+        let mut v = serde_json::json!({});
+        attach_music_meta(&mut v, &meta);
+        let arr = v["staves"].as_array().expect("array");
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["staff"], 1);
         assert_eq!(arr[0]["status"], "ok");
         assert!(arr[0].get("reason").is_none());
         assert_eq!(arr[1]["staff"], 2);
         assert_eq!(arr[1]["status"], "skipped");
-        assert!(
-            arr[1]["reason"].as_str().unwrap_or("").contains("1280"),
-            "skip carries the reason"
-        );
+        assert_eq!(arr[1]["outcome"], "skipped");
+        assert_eq!(arr[1]["reason"], "decoder error after padding");
+        assert_eq!(arr[1]["source_bbox"], serde_json::json!([0, 150, 800, 80]));
+        assert_eq!(arr[1]["inference_canvas"]["height"], 90);
+        assert_eq!(arr[1]["padding"]["top"], 5);
         assert_eq!(arr[2]["staff"], 3);
         assert_eq!(arr[2]["bbox"], serde_json::json!([0, 300, 800, 100]));
+        assert_eq!(v["detected_staff_count"], 3);
+        assert_eq!(
+            v["staff_segmentation_disposition"],
+            "multiple_staves_detected_per_crop_recognition"
+        );
+        assert_eq!(
+            v["tromr_recognition_options"],
+            serde_json::json!(recognition_options)
+        );
+        assert_eq!(
+            v["tromr_recognition_options_identity"],
+            recognition_options_identity
+        );
     }
 
     #[test]

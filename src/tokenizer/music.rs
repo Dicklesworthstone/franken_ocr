@@ -100,7 +100,17 @@ pub struct MusicTokenizer {
     pitch: WordLevelTable,
     lift: WordLevelTable,
     note: WordLevelTable,
+    source_bytes: [Vec<u8>; 4],
 }
+
+/// Fixed tokenizer-table order used by the TrOMR artifact bundle and its
+/// provenance surface: rhythm, pitch, lift, then note.
+pub const TOKENIZER_FILENAMES: [&str; 4] = [
+    "tokenizer_rhythm.json",
+    "tokenizer_pitch.json",
+    "tokenizer_lift.json",
+    "tokenizer_note.json",
+];
 
 /// The rhythm-stream special ids (spec §9 config anchors; the OTHER streams
 /// have no specials — their low ids are real tokens).
@@ -111,6 +121,46 @@ pub const BOS_ID: u32 = 1;
 pub const EOS_ID: u32 = 2;
 
 impl MusicTokenizer {
+    /// Parse and retain the exact four owned tokenizer buffers in
+    /// [`TOKENIZER_FILENAMES`] order.
+    ///
+    /// Inference decodes through tables parsed from these same buffers; callers
+    /// can therefore hash [`Self::source_bytes`] without a second path open or
+    /// a separate provenance read.
+    ///
+    /// # Errors
+    /// Malformed UTF-8/JSON, a non-WordLevel model, a non-dense id space, or a
+    /// vocab-size mismatch vs the TrOMR census.
+    pub fn from_owned_tables(source_bytes: [Vec<u8>; 4]) -> FocrResult<Self> {
+        let load = |index: usize, want: usize| -> FocrResult<WordLevelTable> {
+            let filename = TOKENIZER_FILENAMES[index];
+            let text = std::str::from_utf8(&source_bytes[index]).map_err(|error| {
+                FocrError::FormatMismatch(format!(
+                    "{filename}: tokenizer table is not UTF-8: {error}"
+                ))
+            })?;
+            let table = WordLevelTable::from_json(text, filename)?;
+            if table.id_to_token.len() != want {
+                return Err(FocrError::FormatMismatch(format!(
+                    "{filename}: {} ids, census expects {want} (spec §9)",
+                    table.id_to_token.len()
+                )));
+            }
+            Ok(table)
+        };
+        let rhythm = load(0, 260)?;
+        let pitch = load(1, 71)?;
+        let lift = load(2, 7)?;
+        let note = load(3, 2)?;
+        Ok(Self {
+            rhythm,
+            pitch,
+            lift,
+            note,
+            source_bytes,
+        })
+    }
+
     /// Load the four tables from `dir`, validating each against the censused
     /// vocab size (260/71/7/2 — spec §9). Missing file or wrong table shape is
     /// a clean [`FocrError::FormatMismatch`]/IO error, never a fallback.
@@ -119,30 +169,21 @@ impl MusicTokenizer {
     /// A missing/unreadable file, malformed JSON, a non-WordLevel model, a
     /// non-dense id space, or a vocab-size mismatch vs the census.
     pub fn from_dir(dir: &Path) -> FocrResult<Self> {
-        let load = |stem: &str, want: usize| -> FocrResult<WordLevelTable> {
-            let path = dir.join(format!("tokenizer_{stem}.json"));
-            let text = std::fs::read_to_string(&path).map_err(|e| {
+        let load = |filename: &str| -> FocrResult<Vec<u8>> {
+            let path = dir.join(filename);
+            std::fs::read(&path).map_err(|e| {
                 FocrError::ModelNotFound(format!(
                     "TrOMR tokenizer table missing: {}: {e}",
                     path.display()
                 ))
-            })?;
-            let table = WordLevelTable::from_json(&text, &path.display().to_string())?;
-            if table.id_to_token.len() != want {
-                return Err(FocrError::FormatMismatch(format!(
-                    "{}: {} ids, census expects {want} (spec §9)",
-                    path.display(),
-                    table.id_to_token.len()
-                )));
-            }
-            Ok(table)
+            })
         };
-        Ok(Self {
-            rhythm: load("rhythm", 260)?,
-            pitch: load("pitch", 71)?,
-            lift: load("lift", 7)?,
-            note: load("note", 2)?,
-        })
+        Self::from_owned_tables([
+            load(TOKENIZER_FILENAMES[0])?,
+            load(TOKENIZER_FILENAMES[1])?,
+            load(TOKENIZER_FILENAMES[2])?,
+            load(TOKENIZER_FILENAMES[3])?,
+        ])
     }
 
     fn table(&self, stream: Stream) -> &WordLevelTable {
@@ -159,6 +200,19 @@ impl MusicTokenizer {
     #[must_use]
     pub fn token(&self, stream: Stream, id: u32) -> Option<&str> {
         self.table(stream).token(id)
+    }
+
+    /// Exact tokenizer bytes parsed for `stream`, retained for the complete
+    /// lifetime of this tokenizer and every inference call that borrows it.
+    #[must_use]
+    pub fn source_bytes(&self, stream: Stream) -> &[u8] {
+        let index = match stream {
+            Stream::Rhythm => 0,
+            Stream::Pitch => 1,
+            Stream::Lift => 2,
+            Stream::Note => 3,
+        };
+        &self.source_bytes[index]
     }
 
     /// The pinned upstream detokenize (`staff2score.py::detokenize`): per id,
@@ -188,6 +242,32 @@ mod tests {
 
     fn load() -> MusicTokenizer {
         MusicTokenizer::from_dir(&fixture_dir()).expect("committed tables load")
+    }
+
+    fn fixture_bytes() -> [Vec<u8>; 4] {
+        TOKENIZER_FILENAMES.map(|filename| {
+            std::fs::read(fixture_dir().join(filename)).expect("committed tokenizer bytes")
+        })
+    }
+
+    #[test]
+    fn owned_tables_retain_the_exact_buffers_the_parser_consumed() {
+        let mut bytes = fixture_bytes();
+        bytes[0].push(b'\n');
+        let expected = bytes.clone();
+        let tk = MusicTokenizer::from_owned_tables(bytes).expect("owned tables parse");
+
+        for (index, stream) in [Stream::Rhythm, Stream::Pitch, Stream::Lift, Stream::Note]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                tk.source_bytes(stream),
+                expected[index],
+                "{stream:?} must retain the exact parser input"
+            );
+        }
+        assert_eq!(tk.token(Stream::Rhythm, 5), Some("barline"));
     }
 
     #[test]

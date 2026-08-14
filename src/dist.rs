@@ -19,6 +19,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -69,6 +70,11 @@ const MAX_NAME_BYTES: usize = 255;
 const MAX_RECIPE_BYTES: usize = 255;
 const MAX_URL_BYTES: usize = 4096;
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
+// Long enough for ordinary multi-gigabyte pulls without making an unattended
+// embedded caller disappear for hours. PullOptions lets an embedder declare a
+// workload-specific bound without ambient process state.
+const INSTALL_LOCK_WAIT_BUDGET: Duration = Duration::from_secs(15 * 60);
+const INSTALL_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 static STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -805,9 +811,22 @@ fn sha256_reader(mut reader: impl Read) -> std::io::Result<[u8; 32]> {
     Ok(hash.finalize().into())
 }
 
+#[derive(Debug)]
 struct InstallLock {
     _file: std::fs::File,
 }
+
+#[derive(Clone, Copy)]
+struct InstallLockWaitPolicy {
+    budget: Duration,
+    retry_interval: Duration,
+}
+
+#[cfg(test)]
+const DEFAULT_INSTALL_LOCK_WAIT_POLICY: InstallLockWaitPolicy = InstallLockWaitPolicy {
+    budget: INSTALL_LOCK_WAIT_BUDGET,
+    retry_interval: INSTALL_LOCK_RETRY_INTERVAL,
+};
 
 fn coordination_key(final_path: &Path) -> FocrResult<String> {
     let filename = final_path
@@ -846,7 +865,23 @@ pub(crate) fn pull_lock_path_for_staging(staging_path: &Path) -> Option<PathBuf>
 }
 
 impl InstallLock {
+    #[cfg(test)]
     fn acquire(final_path: &Path) -> FocrResult<Self> {
+        Self::acquire_with_policy(
+            final_path,
+            DEFAULT_INSTALL_LOCK_WAIT_POLICY,
+            crate::cancel_checkpoint,
+            |_| {},
+        )
+    }
+
+    fn acquire_with_policy(
+        final_path: &Path,
+        policy: InstallLockWaitPolicy,
+        mut cancel_checkpoint: impl FnMut() -> FocrResult<()>,
+        mut report_waiting: impl FnMut(Duration),
+    ) -> FocrResult<Self> {
+        debug_assert!(!policy.retry_interval.is_zero());
         let parent = final_path.parent().ok_or_else(|| {
             FocrError::Other(anyhow::anyhow!(
                 "install path {} has no parent directory",
@@ -899,18 +934,37 @@ impl InstallLock {
                 )));
             }
         }
-        file.try_lock().map_err(|error| match error {
-            std::fs::TryLockError::WouldBlock => FocrError::Timeout(format!(
-                "another pull is installing {} (lock {}; retry after it finishes)",
-                final_path.display(),
-                path.display()
-            )),
-            std::fs::TryLockError::Error(error) => FocrError::Other(anyhow::anyhow!(
-                "acquire install lock {}: {error}",
-                path.display()
-            )),
-        })?;
-        Ok(Self { _file: file })
+
+        let started = Instant::now();
+        let mut reported_waiting = false;
+        loop {
+            cancel_checkpoint()?;
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if !reported_waiting {
+                        report_waiting(policy.budget);
+                        reported_waiting = true;
+                    }
+                    let elapsed = started.elapsed();
+                    if elapsed >= policy.budget {
+                        return Err(FocrError::Timeout(format!(
+                            "timed out after waiting {} ms for another pull to install {} (lock {})",
+                            policy.budget.as_millis(),
+                            final_path.display(),
+                            path.display()
+                        )));
+                    }
+                    std::thread::sleep(policy.retry_interval.min(policy.budget - elapsed));
+                }
+                Err(std::fs::TryLockError::Error(error)) => {
+                    return Err(FocrError::Other(anyhow::anyhow!(
+                        "acquire install lock {}: {error}",
+                        path.display()
+                    )));
+                }
+            }
+        }
     }
 }
 
@@ -1030,6 +1084,56 @@ pub struct PullOutcome {
     pub from_cache: bool,
 }
 
+/// Explicit controls for one model-distribution operation.
+///
+/// This type is deliberately separate from model recognition options: it only
+/// governs artifact acquisition. It never reads environment variables, so an
+/// embedder can make concurrent-pull latency part of its declared request.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PullOptions {
+    install_lock_wait_budget: Duration,
+}
+
+impl PullOptions {
+    /// The agent-oriented default: wait at most 15 minutes for another pull to
+    /// commit the same artifact, while remaining cooperatively cancellable.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            install_lock_wait_budget: INSTALL_LOCK_WAIT_BUDGET,
+        }
+    }
+
+    /// Override the monotonic budget for waiting on another installer.
+    ///
+    /// A zero budget still attempts the lock once, then returns the stable
+    /// `timeout` error if it is held. This does not limit network transfer time.
+    #[must_use]
+    pub const fn with_install_lock_wait_budget(mut self, budget: Duration) -> Self {
+        self.install_lock_wait_budget = budget;
+        self
+    }
+
+    /// The declared monotonic budget for one contended artifact lock.
+    #[must_use]
+    pub const fn install_lock_wait_budget(self) -> Duration {
+        self.install_lock_wait_budget
+    }
+
+    const fn install_lock_wait_policy(self) -> InstallLockWaitPolicy {
+        InstallLockWaitPolicy {
+            budget: self.install_lock_wait_budget,
+            retry_interval: INSTALL_LOCK_RETRY_INTERVAL,
+        }
+    }
+}
+
+impl Default for PullOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Pick the quant entry for a pull. Exact match wins; otherwise, when the
 /// model publishes EXACTLY ONE quant, fall back to it — failing a pull over
 /// a default flag serves no one when the model's only artifact is
@@ -1066,6 +1170,28 @@ pub fn pull(
     quant: &str,
     manifest_source: &str,
     quiet: bool,
+    progress: impl FnMut(&str),
+) -> FocrResult<PullOutcome> {
+    pull_with_options(
+        model,
+        quant,
+        manifest_source,
+        quiet,
+        PullOptions::default(),
+        progress,
+    )
+}
+
+/// [`pull`] with explicit distribution controls for embedded callers.
+///
+/// On lock contention, `progress` receives exactly one line beginning with
+/// `waiting_install_lock:` for that artifact before the bounded wait begins.
+pub fn pull_with_options(
+    model: Option<&str>,
+    quant: &str,
+    manifest_source: &str,
+    quiet: bool,
+    options: PullOptions,
     mut progress: impl FnMut(&str),
 ) -> FocrResult<PullOutcome> {
     let runtime = RuntimeBuilder::new()
@@ -1171,15 +1297,22 @@ pub fn pull(
         &quant_entry.focrq,
         &focrq_path,
         quiet,
+        options,
         &mut progress,
     )?;
-    let tokenizer_cached =
-        install_file(&runtime, tokenizer, &tokenizer_path, quiet, &mut progress)?;
+    let tokenizer_cached = install_file(
+        &runtime,
+        tokenizer,
+        &tokenizer_path,
+        quiet,
+        options,
+        &mut progress,
+    )?;
     let mut from_cache = focrq_cached && tokenizer_cached;
     let mut sidecar_paths = Vec::with_capacity(sidecars.len());
     for sidecar in sidecars {
         let path = dir.join(&sidecar.filename);
-        let cached = install_file(&runtime, sidecar, &path, quiet, &mut progress)?;
+        let cached = install_file(&runtime, sidecar, &path, quiet, options, &mut progress)?;
         from_cache &= cached;
         sidecar_paths.push(path);
     }
@@ -1195,13 +1328,34 @@ pub fn pull(
 }
 
 /// Ensure one cache file is byte-perfect. Returns `true` for a cache hit and
-/// `false` when this call installed the file. A per-file `create_new` lock plus a
+/// `false` when this call installed the file. A per-file advisory lock plus a
 /// unique staging file prevents concurrent writers from sharing an inode.
 fn install_file(
     runtime: &asupersync::runtime::Runtime,
     file: &RemoteFile,
     final_path: &Path,
     quiet: bool,
+    options: PullOptions,
+    progress: &mut impl FnMut(&str),
+) -> FocrResult<bool> {
+    install_file_with_lock_policy(
+        runtime,
+        file,
+        final_path,
+        quiet,
+        options.install_lock_wait_policy(),
+        crate::cancel_checkpoint,
+        progress,
+    )
+}
+
+fn install_file_with_lock_policy(
+    runtime: &asupersync::runtime::Runtime,
+    file: &RemoteFile,
+    final_path: &Path,
+    quiet: bool,
+    lock_policy: InstallLockWaitPolicy,
+    cancel_checkpoint: impl FnMut() -> FocrResult<()>,
     progress: &mut impl FnMut(&str),
 ) -> FocrResult<bool> {
     if already_cached(final_path, file) {
@@ -1210,7 +1364,14 @@ fn install_file(
     }
     validate_install_target_type(final_path)?;
 
-    let _lock = InstallLock::acquire(final_path)?;
+    let _lock =
+        InstallLock::acquire_with_policy(final_path, lock_policy, cancel_checkpoint, |budget| {
+            progress(&format!(
+                "waiting_install_lock: another pull is installing {} (budget {} ms)",
+                final_path.display(),
+                budget.as_millis()
+            ));
+        })?;
     if already_cached(final_path, file) {
         progress(&format!("cached: {}", final_path.display()));
         return Ok(true);
@@ -1721,6 +1882,22 @@ mod tests {
     }
 
     #[test]
+    fn pull_options_expose_an_explicit_bounded_lock_wait() {
+        let defaults = PullOptions::default();
+        assert_eq!(
+            defaults.install_lock_wait_budget(),
+            Duration::from_secs(15 * 60)
+        );
+        let custom = defaults.with_install_lock_wait_budget(Duration::from_secs(2));
+        assert_eq!(custom.install_lock_wait_budget(), Duration::from_secs(2));
+        assert_eq!(
+            custom.install_lock_wait_policy().retry_interval,
+            INSTALL_LOCK_RETRY_INTERVAL,
+            "callers declare latency budget without controlling polling cadence"
+        );
+    }
+
+    #[test]
     fn install_coordination_is_exclusive_and_uses_unique_staging_files() {
         let suffix = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -1739,7 +1916,15 @@ mod tests {
 
         let first_lock = InstallLock::acquire(&first).expect("first lock");
         assert!(matches!(
-            InstallLock::acquire(&first),
+            InstallLock::acquire_with_policy(
+                &first,
+                InstallLockWaitPolicy {
+                    budget: Duration::from_millis(20),
+                    retry_interval: Duration::from_millis(2),
+                },
+                || Ok(()),
+                |_| {}
+            ),
             Err(FocrError::Timeout(_))
         ));
         let second_lock = InstallLock::acquire(&same_stem).expect("independent lock");
@@ -1774,6 +1959,281 @@ mod tests {
         )))
         .expect("remove second persistent lock file");
         std::fs::remove_dir(dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn default_install_lock_waits_and_acquires_after_release() {
+        let default_options = PullOptions::default();
+        assert_eq!(
+            default_options.install_lock_wait_budget(),
+            Duration::from_secs(15 * 60)
+        );
+        let suffix = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "focr_dist_lock_wait_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir_all(&dir).expect("create lock-wait test directory");
+        let final_path = dir.join("artifact.bin");
+        let owner = InstallLock::acquire(&final_path).expect("owner lock");
+        let waiter_path = final_path.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            let mut checkpoints = 0usize;
+            let mut waiting_reports = 0usize;
+            let acquired = InstallLock::acquire_with_policy(
+                &waiter_path,
+                default_options.install_lock_wait_policy(),
+                || {
+                    checkpoints += 1;
+                    if checkpoints == 1 {
+                        entered_tx.send(()).expect("signal first checkpoint");
+                    }
+                    Ok(())
+                },
+                |_| waiting_reports += 1,
+            );
+            (acquired, started.elapsed(), checkpoints, waiting_reports)
+        });
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter reached lock acquisition");
+        std::thread::sleep(Duration::from_millis(25));
+        drop(owner);
+
+        let (acquired, elapsed, checkpoints, waiting_reports) =
+            waiter.join().expect("join lock waiter");
+        let acquired = acquired.expect("waiter acquires released lock");
+        assert!(
+            elapsed >= Duration::from_millis(20),
+            "waiter returned before the owner released the lock: {elapsed:?}"
+        );
+        assert!(
+            checkpoints > 1,
+            "contention must retry through cancellation checkpoints"
+        );
+        assert_eq!(
+            waiting_reports, 1,
+            "one contention episode emits one waiting state"
+        );
+        drop(acquired);
+
+        std::fs::remove_file(dir.join(format!(
+            ".focr-pull-{}.lock",
+            coordination_key(&final_path).unwrap()
+        )))
+        .expect("remove persistent lock file");
+        std::fs::remove_dir(dir).expect("remove lock-wait test directory");
+    }
+
+    #[test]
+    fn contended_install_lock_timeout_is_bounded_and_typed() {
+        let suffix = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "focr_dist_lock_timeout_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir_all(&dir).expect("create lock-timeout test directory");
+        let final_path = dir.join("artifact.bin");
+        let owner = InstallLock::acquire(&final_path).expect("owner lock");
+        let started = Instant::now();
+        let mut waiting_reports = 0usize;
+
+        let error = InstallLock::acquire_with_policy(
+            &final_path,
+            InstallLockWaitPolicy {
+                budget: Duration::from_millis(30),
+                retry_interval: Duration::from_millis(2),
+            },
+            || Ok(()),
+            |_| waiting_reports += 1,
+        )
+        .expect_err("contended lock must exhaust its bounded wait policy");
+        let elapsed = started.elapsed();
+        assert!(matches!(&error, FocrError::Timeout(_)));
+        assert_eq!(error.kind(), "timeout");
+        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+        assert_eq!(waiting_reports, 1);
+        assert!(
+            elapsed >= Duration::from_millis(25),
+            "timeout fired before its declared budget: {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "short test budget was not honored: {elapsed:?}"
+        );
+
+        drop(owner);
+        std::fs::remove_file(dir.join(format!(
+            ".focr-pull-{}.lock",
+            coordination_key(&final_path).unwrap()
+        )))
+        .expect("remove persistent lock file");
+        std::fs::remove_dir(dir).expect("remove lock-timeout test directory");
+    }
+
+    #[test]
+    fn contended_install_lock_observes_cancellation_while_waiting() {
+        let suffix = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "focr_dist_lock_cancel_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir_all(&dir).expect("create lock-cancel test directory");
+        let final_path = dir.join("artifact.bin");
+        let owner = InstallLock::acquire(&final_path).expect("owner lock");
+        let mut checkpoints = 0usize;
+        let mut waiting_reports = 0usize;
+        let started = Instant::now();
+
+        let error = InstallLock::acquire_with_policy(
+            &final_path,
+            InstallLockWaitPolicy {
+                budget: Duration::from_secs(5),
+                retry_interval: Duration::from_millis(5),
+            },
+            || {
+                checkpoints += 1;
+                if checkpoints >= 3 {
+                    return Err(FocrError::Cancelled);
+                }
+                Ok(())
+            },
+            |_| waiting_reports += 1,
+        )
+        .expect_err("cancellation must interrupt the lock wait");
+        assert!(matches!(&error, FocrError::Cancelled));
+        assert_eq!(error.kind(), "cancelled");
+        assert_eq!(checkpoints, 3);
+        assert_eq!(waiting_reports, 1);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "cancellation was not observed at the retry cadence"
+        );
+
+        drop(owner);
+        std::fs::remove_file(dir.join(format!(
+            ".focr-pull-{}.lock",
+            coordination_key(&final_path).unwrap()
+        )))
+        .expect("remove persistent lock file");
+        std::fs::remove_dir(dir).expect("remove lock-cancel test directory");
+    }
+
+    #[test]
+    fn simultaneous_install_callers_converge_on_one_committed_artifact() {
+        const WAITERS: usize = 4;
+
+        let suffix = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "focr_dist_install_convergence_{}_{}",
+            std::process::id(),
+            suffix
+        ));
+        std::fs::create_dir_all(&dir).expect("create convergence test directory");
+        let final_path = dir.join("artifact.bin");
+        let artifact = b"one byte-perfect artifact shared by all pull callers";
+        let mut hasher = Sha256::new();
+        hasher.update(artifact);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let remote_file = RemoteFile {
+            filename: "artifact.bin".into(),
+            size: artifact.len() as u64,
+            sha256: hex32(&digest),
+            parts: Vec::new(),
+        };
+        let installer_lock = InstallLock::acquire(&final_path).expect("installer lock");
+        let runtime = RuntimeBuilder::new().build().expect("build test runtime");
+        let ready = std::sync::Arc::new(std::sync::Barrier::new(WAITERS + 1));
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let mut waiters = Vec::with_capacity(WAITERS);
+
+        for _ in 0..WAITERS {
+            let waiter_runtime = runtime.clone();
+            let waiter_file = remote_file.clone();
+            let waiter_path = final_path.clone();
+            let waiter_ready = std::sync::Arc::clone(&ready);
+            let waiter_waiting = waiting_tx.clone();
+            waiters.push(std::thread::spawn(move || {
+                let mut progress = Vec::new();
+                waiter_ready.wait();
+                let result = install_file_with_lock_policy(
+                    &waiter_runtime,
+                    &waiter_file,
+                    &waiter_path,
+                    true,
+                    PullOptions::default().install_lock_wait_policy(),
+                    || Ok(()),
+                    &mut |line| {
+                        if line.starts_with("waiting_install_lock: ") {
+                            waiter_waiting.send(()).expect("report lock wait");
+                        }
+                        progress.push(line.to_owned());
+                    },
+                );
+                (result, progress)
+            }));
+        }
+
+        ready.wait();
+        for _ in 0..WAITERS {
+            waiting_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("every simultaneous caller reports lock contention");
+        }
+        let (staging_path, mut staging_file) =
+            create_staging_file(&final_path).expect("create installer staging file");
+        staging_file
+            .write_all(artifact)
+            .expect("write complete staged artifact");
+        staging_file.sync_all().expect("sync staged artifact");
+        drop(staging_file);
+        commit_staging_file(&staging_path, &final_path).expect("commit staged artifact");
+        drop(installer_lock);
+
+        for waiter in waiters {
+            let (result, progress) = waiter.join().expect("join install waiter");
+            assert!(
+                result.expect("waiter converges through post-lock cache recheck"),
+                "a waiter must report the completed artifact as cached"
+            );
+            assert_eq!(progress.len(), 2);
+            assert_eq!(
+                progress[0],
+                format!(
+                    "waiting_install_lock: another pull is installing {} (budget {} ms)",
+                    final_path.display(),
+                    PullOptions::default()
+                        .install_lock_wait_budget()
+                        .as_millis()
+                )
+            );
+            assert!(progress[1].starts_with("cached: "));
+        }
+        assert_eq!(
+            std::fs::read(&final_path).expect("read converged artifact"),
+            artifact
+        );
+        let partials = std::fs::read_dir(&dir)
+            .expect("list convergence test directory")
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".partial"))
+            .count();
+        assert_eq!(partials, 0, "no staging residue may survive convergence");
+
+        std::fs::remove_file(final_path).expect("remove converged artifact");
+        std::fs::remove_file(dir.join(format!(
+            ".focr-pull-{}.lock",
+            coordination_key(&dir.join("artifact.bin")).unwrap()
+        )))
+        .expect("remove persistent lock file");
+        std::fs::remove_dir(dir).expect("remove convergence test directory");
     }
 
     #[test]
