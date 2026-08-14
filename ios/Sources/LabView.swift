@@ -901,11 +901,25 @@ struct TranscriptionFile: Transferable {
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .plainText) { file in
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent(file.filename)
+            let url = try Self.uniqueExportURL(filename: file.filename)
             try file.text.write(to: url, atomically: true, encoding: .utf8)
             return SentTransferredFile(url)
         }
+    }
+}
+
+extension TranscriptionFile {
+    /// A fresh directory per share, keeping the human-readable filename.
+    ///
+    /// A fixed temp path would let a second share overwrite the file while a
+    /// lazy consumer of the first (AirDrop reads on send) still holds it —
+    /// the same in-flight-share hazard frankentts's exporter guards against.
+    /// The system prunes its temp directory, so nothing accumulates.
+    static func uniqueExportURL(filename: String) throws -> URL {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent(filename)
     }
 }
 
@@ -920,8 +934,7 @@ struct HtmlDocumentFile: Transferable {
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .html) { file in
-            let url = FileManager.default.temporaryDirectory
-                .appendingPathComponent(file.filename)
+            let url = try TranscriptionFile.uniqueExportURL(filename: file.filename)
             let html = HtmlExport.document(provenance: file.provenance, sections: file.sections)
             try html.write(to: url, atomically: true, encoding: .utf8)
             return SentTransferredFile(url)

@@ -403,6 +403,10 @@ final class LabModel {
         recognition = nil
         progress = nil
         elapsed = 0
+        // Cleared up front: it is only assigned on successful completion, so
+        // a cancelled or mid-flight run would otherwise show — and export —
+        // the PREVIOUS run's timing as if it belonged to this result.
+        lastRunSeconds = nil
         statusKind = .neutral
         status = "Working…"
 
@@ -735,10 +739,10 @@ final class LabModel {
             title: exportStem,
             modelName: spec.shortName,
             characters: displayText.count,
-            // Mid-document-run, `lastRunSeconds` still holds the PREVIOUS
-            // run's total — stamping it into a partial export would be a
-            // provenance lie, so a running walk omits the timing instead.
-            seconds: isRecognizing ? nil : lastRunSeconds,
+            // Nil for a run that is still going or was cancelled — it is
+            // cleared at run start and assigned only on completion, so a
+            // partial export never inherits another run's timing.
+            seconds: lastRunSeconds,
             pageSummary: pageSummary
         )
         return (provenance, sections)

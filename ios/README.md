@@ -19,6 +19,22 @@ xcodebuild -project ios/FrankenOCR.xcodeproj -scheme FrankenOCR \
   -destination "generic/platform=iOS Simulator" CODE_SIGNING_ALLOWED=NO build
 ```
 
+App Store archive and upload:
+
+```bash
+xcodebuild -project ios/FrankenOCR.xcodeproj -scheme FrankenOCR \
+  -configuration Release -destination "generic/platform=iOS" \
+  -archivePath "$PWD/ios/build/FrankenOCR.xcarchive" archive
+
+xcodebuild -exportArchive \
+  -archivePath "$PWD/ios/build/FrankenOCR.xcarchive" \
+  -exportPath "$PWD/ios/build/export" \
+  -exportOptionsPlist ios/AppStoreExportOptions.plist
+```
+
+The export configuration keeps the checked-in marketing version and build
+number authoritative instead of letting App Store Connect renumber the binary.
+
 `FocrCore.xcframework/` and `FrankenOCR.xcodeproj/` are generated and
 gitignored. `project.yml`, `build-rust.sh`, `Sources/`, the entitlements, and
 the privacy manifest are the source.
@@ -94,4 +110,4 @@ on A-series hardware. Same rule the ledgers use.
 - Cross-page parsing (`--multi-page`), where page N can reference pages 1..N-1.
   The app reads every page of a document, but each page independently.
 - Figure extraction and batch mode.
-- App Store submission artifacts beyond the privacy manifest and entitlement.
+- Final App Store listing metadata, review notes, and device screenshots.

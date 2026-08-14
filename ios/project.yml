@@ -19,6 +19,7 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     DEVELOPMENT_TEAM: AU8V2Z6NKY
     CODE_SIGN_STYLE: Automatic
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     # The Rust simulator slice is built for aarch64-apple-ios-sim only. An Intel
     # Mac would otherwise try to link an x86_64 simulator binary that does not
     # exist and fail with an inscrutable "undefined symbols" wall.
