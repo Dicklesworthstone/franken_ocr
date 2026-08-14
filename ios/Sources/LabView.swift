@@ -2,6 +2,35 @@ import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
+private enum LabTextEntry: Hashable {
+    case smolQuestion
+    case pageSelection
+}
+
+private struct LabTextEntryFramePreferenceKey: PreferenceKey {
+    static let defaultValue: [LabTextEntry: CGRect] = [:]
+
+    static func reduce(
+        value: inout [LabTextEntry: CGRect],
+        nextValue: () -> [LabTextEntry: CGRect]
+    ) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private extension View {
+    func reportLabTextEntryFrame(_ entry: LabTextEntry) -> some View {
+        background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: LabTextEntryFramePreferenceKey.self,
+                    value: [entry: proxy.frame(in: .named("lab-text-entry-space"))]
+                )
+            }
+        }
+    }
+}
+
 /// The whole app: one laboratory screen mirroring the site's playground —
 /// 01 The specimen, 02 The page, 03 The transcription.
 ///
@@ -18,6 +47,8 @@ struct LabView: View {
     @State private var showCamera = false
     @State private var copied = false
     @State private var copyResetTask: Task<Void, Never>?
+    @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
+    @FocusState private var focusedTextEntry: LabTextEntry?
 
     private var isWide: Bool { sizeClass == .regular }
 
@@ -50,16 +81,27 @@ struct LabView: View {
             }
             .scrollDismissesKeyboard(.interactively)
         }
+        .coordinateSpace(name: "lab-text-entry-space")
+        .onPreferenceChange(LabTextEntryFramePreferenceKey.self) { frames in
+            textEntryFrames = frames
+        }
+        .simultaneousGesture(
+            SpatialTapGesture(coordinateSpace: .named("lab-text-entry-space"))
+                .onEnded { tap in
+                    guard focusedTextEntry != nil else { return }
+                    let tappedAField = textEntryFrames.values.contains { frame in
+                        frame.contains(tap.location)
+                    }
+                    if !tappedAField { focusedTextEntry = nil }
+                }
+        )
         .preferredColorScheme(.dark)
         .tint(Lab.accent)
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("Done") {
-                    UIApplication.shared.sendAction(
-                        #selector(UIResponder.resignFirstResponder),
-                        to: nil, from: nil, for: nil
-                    )
+                    focusedTextEntry = nil
                 }
                 .font(.system(size: 13, weight: .semibold))
             }
@@ -229,6 +271,7 @@ struct LabView: View {
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(Lab.textMid)
                     TextField("Can you describe this image?", text: $model.question, axis: .vertical)
+                        .focused($focusedTextEntry, equals: .smolQuestion)
                         .font(.system(size: 13))
                         .foregroundStyle(Lab.textPrimary)
                         .textFieldStyle(.plain)
@@ -237,6 +280,7 @@ struct LabView: View {
                         .submitLabel(.done)
                         .padding(8)
                         .background(Lab.inset, in: RoundedRectangle(cornerRadius: 8))
+                        .reportLabTextEntryFrame(.smolQuestion)
                     Text("Ask anything about the photo. Left blank, it writes a plain description.")
                         .font(.system(size: 11))
                         .foregroundStyle(Lab.textFaint)
@@ -364,6 +408,7 @@ struct LabView: View {
                                 .font(.system(size: 12, design: .monospaced))
                                 .foregroundStyle(Lab.textDim)
                             TextField("all", text: $model.pageSelection)
+                                .focused($focusedTextEntry, equals: .pageSelection)
                                 .font(.system(size: 12, design: .monospaced))
                                 .foregroundStyle(Lab.textMid)
                                 .textFieldStyle(.plain)
@@ -373,6 +418,7 @@ struct LabView: View {
                                 .background(Lab.inset, in: RoundedRectangle(cornerRadius: 8))
                                 .overlay(RoundedRectangle(cornerRadius: 8)
                                     .strokeBorder(Lab.line, lineWidth: 1))
+                                .reportLabTextEntryFrame(.pageSelection)
                                 .disabled(model.isRecognizing)
                         }
 
@@ -974,4 +1020,3 @@ struct CameraPicker: UIViewControllerRepresentable {
         func imagePickerControllerDidCancel(_: UIImagePickerController) { onCapture(nil) }
     }
 }
-
