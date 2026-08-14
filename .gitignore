@@ -164,7 +164,9 @@ crates/*/target/
 .ee/ee.db-fsqlite-ns-*
 *-fsqlite-ns-gate
 *-fsqlite-ns-use
-.beads/.write.lock.stale-*
+# Cover `.stale`, `.stale2`, and `.stale-<timestamp>`.
+.beads/.write.lock.stale
+.beads/.write.lock.stale*
 .beads/last-touched
 # Eidetic Engine / NTM local runtime
 .ee/
