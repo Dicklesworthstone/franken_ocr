@@ -9,3 +9,13 @@
 # Temporary
 last-touched
 *.tmp
+
+# br fsqlite-ns VFS sidecars — per-machine runtime state, like -wal/-shm.
+# Covers beads.db-fsqlite-ns-{gate,use} and vacuum copies named
+# .beads.db.schema-migration-<ts>-<pid>-0.vacuum-fsqlite-ns-{gate,use}.
+*-fsqlite-ns-gate
+*-fsqlite-ns-use
+
+# Merge artifacts (temporary files from 3-way merge)
+beads.base.jsonl
+beads.base.meta.json
