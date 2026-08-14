@@ -21,10 +21,6 @@ struct LabView: View {
 
     private var isWide: Bool { sizeClass == .regular }
 
-    private var modelInstalled: Bool {
-        if case .ready = model.store.phase { true } else { false }
-    }
-
     var body: some View {
         ZStack {
             LabBackground()
@@ -68,13 +64,12 @@ struct LabView: View {
                 .font(.system(size: 13, weight: .semibold))
             }
         }
-        // A long recognition is exactly when the screen must not sleep: the
-        // pipeline dies with the app suspension and the user comes back to
-        // nothing. Restored the moment the run ends either way.
-        .onChange(of: model.isRecognizing) { _, running in
-            UIApplication.shared.isIdleTimerDisabled = running
+        // Only the verifying → ready transition is a download finishing.
+        // `.ready` alone also appears when the picker lands on an
+        // already-installed model, which deserves no fanfare.
+        .sensoryFeedback(.success, trigger: model.store.phase) { old, new in
+            if case .verifying = old, case .ready = new { true } else { false }
         }
-        .sensoryFeedback(.success, trigger: modelInstalled) { _, installed in installed }
         .sensoryFeedback(.error, trigger: model.statusKind) { _, kind in kind == .err }
         .task {
             Engine.warmKernelPool()
@@ -570,42 +565,47 @@ struct LabView: View {
     /// and the clipboard for "paste this into Notes" — the lightest path,
     /// which a share sheet is a heavy way to spell.
     private var exportControls: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) { exportButtons }
-            VStack(spacing: 10) { exportButtons }
+        // Computed ONCE per render: `displayText` joins the whole document,
+        // and `ViewThatFits` measures both of its children, so putting these
+        // inside the button builder would redo a multi-megabyte join per
+        // layout candidate on a long book.
+        let text = model.displayText
+        let html = model.canExportHtml ? model.htmlExportPayload() : nil
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) { exportButtons(text: text, html: html) }
+            VStack(spacing: 10) { exportButtons(text: text, html: html) }
         }
     }
 
     @ViewBuilder
-    private var exportButtons: some View {
+    private func exportButtons(
+        text: String,
+        html: (provenance: HtmlExport.Provenance, sections: [HtmlExport.Section])?
+    ) -> some View {
         ShareLink(
-            item: TranscriptionFile(
-                text: model.displayText,
-                filename: model.exportFilename
-            ),
+            item: TranscriptionFile(text: text, filename: model.exportFilename),
             preview: SharePreview(model.exportFilename)
         ) {
             Label("Export \(model.exportFilename)", systemImage: "square.and.arrow.up")
         }
         .buttonStyle(GhostButtonStyle())
 
-        if model.canExportHtml {
-            let payload = model.htmlExportPayload()
+        if let html {
             ShareLink(
                 item: HtmlDocumentFile(
-                    provenance: payload.provenance,
-                    sections: payload.sections,
+                    provenance: html.provenance,
+                    sections: html.sections,
                     filename: model.htmlExportFilename
                 ),
                 preview: SharePreview(model.htmlExportFilename)
             ) {
-                Label("Export .html", systemImage: "richtext.page")
+                Label("Export .html", systemImage: "doc.richtext")
             }
             .buttonStyle(GhostButtonStyle())
         }
 
         Button {
-            UIPasteboard.general.string = model.displayText
+            UIPasteboard.general.string = text
             copied = true
             copyResetTask?.cancel()
             copyResetTask = Task {
@@ -808,6 +808,9 @@ struct LabView: View {
                 model.status = "Could not read that photo."
                 model.statusKind = .err
             }
+            // Cleared so picking the SAME photo again re-fires `onChange`;
+            // the nil round trip is absorbed by the guard above.
+            self.photoItem = nil
         }
     }
 

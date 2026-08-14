@@ -16,7 +16,8 @@ enum HtmlExport {
         let modelName: String
         let characters: Int
         let seconds: Double?
-        /// "5 pages · 1 skipped" on a document run, nil for a single page.
+        /// "5 pages recognized · 1 skipped" on a document run, nil for a
+        /// single page.
         let pageSummary: String?
     }
 
@@ -78,6 +79,9 @@ enum HtmlExport {
 
     private static func dateStamp() -> String {
         let formatter = DateFormatter()
+        // Pinned: with the device's own locale/calendar a Buddhist-calendar
+        // phone would stamp "2569-08-13" into the provenance line.
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: Date())
     }
@@ -179,9 +183,14 @@ enum HtmlExport {
                 continue
             }
             var attrs = ""
-            let attrRe = /(colspan|rowspan)\s*=\s*"?(\d{1,3})/.ignoresCase()
+            // Anchored so `data-colspan` cannot smuggle through, and deduped
+            // so a repeated attribute cannot emit invalid doubled HTML.
+            let attrRe = /(?:^|[\s"'])(colspan|rowspan)\s*=\s*"?(\d{1,3})/.ignoresCase()
+            var seen: Set<String> = []
             for attr in String(match.3).matches(of: attrRe) {
-                attrs += #" \#(attr.1.lowercased())="\#(attr.2)""#
+                let attrName = attr.1.lowercased()
+                guard seen.insert(attrName).inserted else { continue }
+                attrs += #" \#(attrName)="\#(attr.2)""#
             }
             out += "<\(name)\(attrs)>"
         }
@@ -223,6 +232,7 @@ enum HtmlExport {
     h1, h2, h3, h4, h5, h6 { color: #e8eef2; font-weight: 800; letter-spacing: -0.02em; line-height: 1.22; margin: 1.6rem 0 0.6rem; }
     h1 { font-size: 1.5rem; } h2 { font-size: 1.25rem; } h3 { font-size: 1.08rem; }
     h4, h5, h6 { font-size: 0.98rem; }
+    .doc-head + h1, .doc-head + h2, .doc-head + h3 { margin-top: 0.3rem; }
     p { margin: 0 0 0.9rem; }
     ul, ol { margin: 0 0 0.95rem; padding-left: 1.3rem; }
     li { margin-bottom: 0.3rem; }

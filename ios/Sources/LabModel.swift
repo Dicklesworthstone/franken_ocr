@@ -696,6 +696,13 @@ final class LabModel {
         (imageName as NSString?)?.deletingPathExtension ?? "page"
     }
 
+    /// OneChart's output is a structured-data dict, not Markdown; the
+    /// paragraph pass would collapse its newlines into one run-on line.
+    /// Present it as the code block it actually is.
+    private func htmlPageMarkdown(_ text: String) -> String {
+        spec.id == "onechart" ? "```\n\(text)\n```" : text
+    }
+
     /// Everything the styled HTML document needs, captured as plain values so
     /// the actual rendering can happen inside the share transfer instead of on
     /// every view update.
@@ -706,7 +713,8 @@ final class LabModel {
             for outcome in pageOutcomes {
                 switch outcome.state {
                 case .done:
-                    sections.append(.page(number: outcome.id, markdown: outcome.text))
+                    sections.append(.page(number: outcome.id,
+                                          markdown: htmlPageMarkdown(outcome.text)))
                 case .skipped(let reason):
                     sections.append(.skipped(number: outcome.id, reason: reason))
                 case .queued, .running:
@@ -717,16 +725,20 @@ final class LabModel {
                 if case .skipped = $0.state { true } else { false }
             }.count
             pageSummary = skips > 0
-                ? "\(completedPageCount) pages · \(skips) skipped"
+                ? "\(completedPageCount) pages recognized · \(skips) skipped"
                 : "\(completedPageCount) pages"
         } else {
-            sections.append(.page(number: nil, markdown: recognition?.output ?? ""))
+            sections.append(.page(number: nil,
+                                  markdown: htmlPageMarkdown(recognition?.output ?? "")))
         }
         let provenance = HtmlExport.Provenance(
             title: exportStem,
             modelName: spec.shortName,
             characters: displayText.count,
-            seconds: lastRunSeconds,
+            // Mid-document-run, `lastRunSeconds` still holds the PREVIOUS
+            // run's total — stamping it into a partial export would be a
+            // provenance lie, so a running walk omits the timing instead.
+            seconds: isRecognizing ? nil : lastRunSeconds,
             pageSummary: pageSummary
         )
         return (provenance, sections)
