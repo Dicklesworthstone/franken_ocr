@@ -16,8 +16,14 @@ struct LabView: View {
     @State private var photoItem: PhotosPickerItem?
     @State private var showFileImporter = false
     @State private var showCamera = false
+    @State private var copied = false
+    @State private var copyResetTask: Task<Void, Never>?
 
     private var isWide: Bool { sizeClass == .regular }
+
+    private var modelInstalled: Bool {
+        if case .ready = model.store.phase { true } else { false }
+    }
 
     var body: some View {
         ZStack {
@@ -46,9 +52,30 @@ struct LabView: View {
                 .frame(maxWidth: 1180)
                 .frame(maxWidth: .infinity)
             }
+            .scrollDismissesKeyboard(.interactively)
         }
         .preferredColorScheme(.dark)
         .tint(Lab.accent)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") {
+                    UIApplication.shared.sendAction(
+                        #selector(UIResponder.resignFirstResponder),
+                        to: nil, from: nil, for: nil
+                    )
+                }
+                .font(.system(size: 13, weight: .semibold))
+            }
+        }
+        // A long recognition is exactly when the screen must not sleep: the
+        // pipeline dies with the app suspension and the user comes back to
+        // nothing. Restored the moment the run ends either way.
+        .onChange(of: model.isRecognizing) { _, running in
+            UIApplication.shared.isIdleTimerDisabled = running
+        }
+        .sensoryFeedback(.success, trigger: modelInstalled) { _, installed in installed }
+        .sensoryFeedback(.error, trigger: model.statusKind) { _, kind in kind == .err }
         .task {
             Engine.warmKernelPool()
             await loadDebugFixtureIfRequested()
@@ -61,7 +88,6 @@ struct LabView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { model.releaseEngineIfIdle() }
         }
-        .photosPicker(isPresented: .constant(false), selection: $photoItem)
         .onChange(of: photoItem) { _, item in load(photoItem: item) }
         .fileImporter(
             isPresented: $showFileImporter,
@@ -527,16 +553,7 @@ struct LabView: View {
                     }
                     .frame(maxHeight: 420)
 
-                    ShareLink(
-                        item: TranscriptionFile(
-                            text: model.displayText,
-                            filename: model.exportFilename
-                        ),
-                        preview: SharePreview(model.exportFilename)
-                    ) {
-                        Label("Export \(model.exportFilename)", systemImage: "square.and.arrow.up")
-                    }
-                    .buttonStyle(GhostButtonStyle())
+                    exportControls
                 } else {
                     Text("Output appears here: Markdown for a document page, MusicXML for a staff. These are the same bytes the CLI writes.")
                         .font(.system(size: 13))
@@ -546,6 +563,60 @@ struct LabView: View {
                 }
             }
         }
+    }
+
+    /// The three ways a result leaves the app: the raw bytes as a file, the
+    /// same content as a styled self-contained web page (Markdown lanes only),
+    /// and the clipboard for "paste this into Notes" — the lightest path,
+    /// which a share sheet is a heavy way to spell.
+    private var exportControls: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) { exportButtons }
+            VStack(spacing: 10) { exportButtons }
+        }
+    }
+
+    @ViewBuilder
+    private var exportButtons: some View {
+        ShareLink(
+            item: TranscriptionFile(
+                text: model.displayText,
+                filename: model.exportFilename
+            ),
+            preview: SharePreview(model.exportFilename)
+        ) {
+            Label("Export \(model.exportFilename)", systemImage: "square.and.arrow.up")
+        }
+        .buttonStyle(GhostButtonStyle())
+
+        if model.canExportHtml {
+            let payload = model.htmlExportPayload()
+            ShareLink(
+                item: HtmlDocumentFile(
+                    provenance: payload.provenance,
+                    sections: payload.sections,
+                    filename: model.htmlExportFilename
+                ),
+                preview: SharePreview(model.htmlExportFilename)
+            ) {
+                Label("Export .html", systemImage: "richtext.page")
+            }
+            .buttonStyle(GhostButtonStyle())
+        }
+
+        Button {
+            UIPasteboard.general.string = model.displayText
+            copied = true
+            copyResetTask?.cancel()
+            copyResetTask = Task {
+                try? await Task.sleep(for: .seconds(1.6))
+                copied = false
+            }
+        } label: {
+            Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")
+        }
+        .buttonStyle(GhostButtonStyle())
+        .sensoryFeedback(.success, trigger: copied) { _, isCopied in isCopied }
     }
 
     /// One row per page: what happened, and why if it did not.
@@ -682,15 +753,27 @@ struct LabView: View {
     // ── Footer ─────────────────────────────────────────────────────────────
 
     private var footer: some View {
-        VStack(spacing: 6) {
+        VStack(spacing: 8) {
             Text("Recognized locally. Nothing is uploaded, and there is no analytics of any kind.")
                 .font(.system(size: 11))
                 .foregroundStyle(Lab.textFaint)
                 .multilineTextAlignment(.center)
-            Text("© 2026 Jeffrey Emanuel · franken-ocr.com")
+            // A string LITERAL, so `Text` parses the Markdown link — the same
+            // free tappable-link trick frankentts's footer uses.
+            Text("© 2026 Jeffrey Emanuel · [franken-ocr.com](https://franken-ocr.com)")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundStyle(Lab.textFaint.opacity(0.7))
+                .tint(Lab.accent.opacity(0.8))
+            Text(
+                "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."
+            )
+            .font(.system(size: 10, design: .monospaced))
+            .foregroundStyle(Lab.textFaint.opacity(0.72))
+            .tint(Lab.accent.opacity(0.8))
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 320)
         }
+        .frame(maxWidth: .infinity)
         .padding(.top, 8)
     }
 
@@ -717,8 +800,13 @@ struct LabView: View {
     private func load(photoItem: PhotosPickerItem?) {
         guard let photoItem else { return }
         Task {
+            // A failure here surfaces exactly as a file-importer failure does;
+            // silently doing nothing after a picker tap reads as a dead button.
             if let data = try? await photoItem.loadTransferable(type: Data.self) {
                 await model.accept(data: data, name: "photo")
+            } else {
+                model.status = "Could not read that photo."
+                model.statusKind = .err
             }
         }
     }
@@ -813,6 +901,26 @@ struct TranscriptionFile: Transferable {
             let url = FileManager.default.temporaryDirectory
                 .appendingPathComponent(file.filename)
             try file.text.write(to: url, atomically: true, encoding: .utf8)
+            return SentTransferredFile(url)
+        }
+    }
+}
+
+/// The same result as a styled, self-contained web page. The document is
+/// rendered inside the transfer, not on every view update — the payload is
+/// captured as plain values so a 300-page book costs nothing until the user
+/// actually shares it.
+struct HtmlDocumentFile: Transferable {
+    let provenance: HtmlExport.Provenance
+    let sections: [HtmlExport.Section]
+    let filename: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .html) { file in
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(file.filename)
+            let html = HtmlExport.document(provenance: file.provenance, sections: file.sections)
+            try html.write(to: url, atomically: true, encoding: .utf8)
             return SentTransferredFile(url)
         }
     }

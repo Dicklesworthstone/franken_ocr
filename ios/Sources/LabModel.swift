@@ -670,13 +670,65 @@ final class LabModel {
     /// file, so it is named `.txt`. Handing someone a `.musicxml` that no reader
     /// can open would be worse than an honest extension.
     var exportFilename: String {
-        let stem = (imageName as NSString?)?.deletingPathExtension ?? "page"
-        guard spec.producesMusicXML else { return "\(stem).md" }
-        return producedPageCount > 1 ? "\(stem)-pages.txt" : "\(stem).musicxml"
+        guard spec.producesMusicXML else { return "\(exportStem).md" }
+        return producedPageCount > 1 ? "\(exportStem)-pages.txt" : "\(exportStem).musicxml"
     }
 
     /// The text an export or the source view should show.
     var displayText: String {
         isDocumentRun ? documentText : (recognition?.output ?? "")
+    }
+
+    // ── HTML export ────────────────────────────────────────────────────────
+
+    /// The styled-HTML lane exists only where the output IS Markdown. A
+    /// MusicXML score belongs in a score reader, not a browser, and wrapping
+    /// it in a web page would only obscure that.
+    var canExportHtml: Bool {
+        recognition != nil && !spec.producesMusicXML
+    }
+
+    var htmlExportFilename: String {
+        "\(exportStem).html"
+    }
+
+    private var exportStem: String {
+        (imageName as NSString?)?.deletingPathExtension ?? "page"
+    }
+
+    /// Everything the styled HTML document needs, captured as plain values so
+    /// the actual rendering can happen inside the share transfer instead of on
+    /// every view update.
+    func htmlExportPayload() -> (provenance: HtmlExport.Provenance, sections: [HtmlExport.Section]) {
+        var sections: [HtmlExport.Section] = []
+        var pageSummary: String?
+        if isDocumentRun {
+            for outcome in pageOutcomes {
+                switch outcome.state {
+                case .done:
+                    sections.append(.page(number: outcome.id, markdown: outcome.text))
+                case .skipped(let reason):
+                    sections.append(.skipped(number: outcome.id, reason: reason))
+                case .queued, .running:
+                    break
+                }
+            }
+            let skips = pageOutcomes.filter {
+                if case .skipped = $0.state { true } else { false }
+            }.count
+            pageSummary = skips > 0
+                ? "\(completedPageCount) pages · \(skips) skipped"
+                : "\(completedPageCount) pages"
+        } else {
+            sections.append(.page(number: nil, markdown: recognition?.output ?? ""))
+        }
+        let provenance = HtmlExport.Provenance(
+            title: exportStem,
+            modelName: spec.shortName,
+            characters: displayText.count,
+            seconds: lastRunSeconds,
+            pageSummary: pageSummary
+        )
+        return (provenance, sections)
     }
 }
