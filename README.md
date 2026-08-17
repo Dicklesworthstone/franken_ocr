@@ -668,6 +668,18 @@ Set `FOCR_QKV_FUSED=0` to restore the older three-call path for comparison.
 
 **Correctness gates.** Every accelerated int8 GEMM has a bit-identical scalar fallback. `focr robot selftest` includes the doctrine worst case, `K=6848`, plus model-specific overflow rows for the ready int8 decoder families. It verifies parity and that every call executed the selected route; forced subprocess coverage sweeps every host-available ISA tier. The batch scheduler and decode cache are guarded by byte-identity tests against the proven sequential path.
 
+### Making it faster (practical checklist)
+
+There is no GPU backend: inference is CPU-only by design (see [Limitations](#limitations)), and a 3B-parameter VLM on CPU is minutes-per-page territory on ordinary hardware, not seconds. Within that envelope, these are the levers that actually move wall time, roughly in order of impact:
+
+1. **Rule out swapping first.** The default Unlimited-OCR artifact is ~4 GB on disk and inference peaks well above that; on an 8 GB machine the slowness is usually paging, not compute. Either add RAM headroom, close other large processes, or use a smaller model (below).
+2. **Match the model to the task.** For plain text/structured pages, `got-ocr2.int8.focrq` (~0.8 GB) loads and runs far lighter than the 4 GB Unlimited-OCR default; `onechart` (~0.3 GB) and `smolvlm2` (~1 GB) are likewise much smaller. `focr models` lists the zoo; `focr pull <model>` installs it.
+3. **Amortize the model load.** `focr ocr` pays the multi-GB artifact load on every invocation. For more than one image, always use `focr ocr-batch a.png b.png ...` (weights load once, results stream per page), or the library's `recognize_batch`. For the dense zoo models, `FOCR_BATCH_SPINE=1` additionally decodes multiple pages through shared batch steps.
+4. **Check the thread budget.** The kernel pool defaults to physical cores (`FOCR_THREADS` overrides it). If the host is shared or cgroup-limited, set it explicitly; oversubscription with hyperthreads or other tenants slows the int8 GEMMs down.
+5. **Verify the SIMD tier.** `focr robot backends` shows the detected ISA and the effective dense-int8 route. On x86 you want AVX-512-VNNI > AVX-VNNI > AVX2; plain scalar means an old CPU (or a mis-forced `FOCR_FORCE_ARCH`) and will be several times slower.
+6. **Cut the work.** `--pages 3,5-9` OCRs only the PDF pages you need; `FOCR_MAX_NEW_TOKENS` (or `--max-length`) caps runaway generations; `FOCR_MMAP=1` on immutable artifact inodes gives lazy page-in and OS page-cache reuse across repeated runs.
+7. **Measure before tuning further.** `FOCR_TIMING=1` prints the nested stage breakdown (artifact load, vision attention, decode, output) so you can see whether your pages are load-bound, vision-bound, or decode-bound.
+
 ---
 
 ## Conformance and Release Evidence
@@ -748,6 +760,7 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_BATCH_PACK` | When present, admit pending streams by similar prefill length inside the batch scheduler. Output order is restored before return, and each stream's tokens stay independent; unset preserves submission-order admission. |
 | `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |
 | `FOCR_UNLIMITED_VISION_CACHE` | Cache Unlimited-OCR's immutable SAM weights and pretransposed bridge projector on the loaded model (default). `0`/`off`/`false`/`no` restores per-page hydration for diagnostics and memory comparisons. |
+| `FOCR_THREADS` | Override the process-wide kernel thread budget. Default is the PHYSICAL core count (hyperthreads oversubscribe the int8 GEMMs; on iOS one core is left to the UI). Read once at startup; every pool-sizing consumer uses it. |
 | `FOCR_TIMING` | Emit nested native-forward timing rows for performance work, including SAM hydrate/forward/block/attention/MLP splits and decode/output stages. Interactive progress is disabled while this line-oriented trace is active. |
 | `FOCR_NO_PROGRESS` | Disable the interactive stderr progress bar shown during multi-page PDF and sequential `ocr-batch` runs (any value other than empty or `0`). The bar already auto-disables when stderr is not a TTY and in `--robot`/`--json` modes; this is the explicit opt-out for TTY sessions. |
 | `FOCR_FORCE_ARCH` | Force an available SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`avxvnni`/`avx512vnni`) for CPU dispatch; used by `robot selftest`, `robot backends`, and pinned perf runs. |
@@ -896,6 +909,8 @@ What this is and is not:
 ## FAQ
 
 **Is this affiliated with Baidu?** No. It is an independent pure-Rust reimplementation that runs Baidu's openly-licensed (MIT) model weights. The weights and any quantized derivative this project distributes carry the model notice surfaced by the binary and `.focrq` metadata: `Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License`.
+
+**Can it use my GPU?** No. There is no CUDA, Metal, or other GPU path in the inference stack; CPU is the product, and that portability (single binary, no driver stack, runs where `ort`/CUDA cannot build) is the point. A CUDA backend for the int8 expert FFN and `lm_head` GEMMs is tracked as an explicitly deferred stretch phase, gated on bit-equivalent-where-integer parity with the CPU kernels — no timeline. If a page is slow today, work through the [speed checklist](#making-it-faster-practical-checklist).
 
 **Why use this instead of llama.cpp or ONNX?** Both are excellent general runtimes. `franken_ocr` is a focused build: a small fixed set of hand-ported models lets the kernels specialize to each model's exact shapes and skip the generality tax. The whole thing ships as one Rust binary with no FFI and is portable to targets where `ort` or CUDA cannot build.
 
