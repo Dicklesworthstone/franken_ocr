@@ -27,6 +27,12 @@
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 ```
 
+Windows (native, PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex
+```
+
 </div>
 
 The installer detects your platform, resolves the latest published GitHub binary release (currently `v0.7.2`), verifies the downloaded asset by SHA256, and puts `focr` on your PATH. Install compatible model weights separately; after they are present, inference is offline.
