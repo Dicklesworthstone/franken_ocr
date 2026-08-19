@@ -1,4 +1,74 @@
 {
+  "agent_discovery": {
+    "backends": "focr robot backends",
+    "doctor": "focr doctor --json",
+    "health": "focr robot health",
+    "models": "focr models --json",
+    "selftest": "focr robot selftest",
+    "triage": "focr robot triage"
+  },
+  "environment_variables": [
+    {
+      "name": "FOCR_MODEL_PATH",
+      "summary": "override the model artifact path (a .focrq blob or safetensors directory)"
+    },
+    {
+      "name": "FOCR_MODEL_DIR",
+      "summary": "extra model search roots before the default cache"
+    },
+    {
+      "name": "FOCR_QUANT",
+      "summary": "pick the quant-suffixed artifact during cache resolution"
+    },
+    {
+      "name": "FOCR_THREADS",
+      "summary": "kernel thread budget (default: physical cores)"
+    },
+    {
+      "name": "FOCR_MAX_NEW_TOKENS",
+      "summary": "cap generated tokens (an explicit --max-length outranks it)"
+    },
+    {
+      "name": "FOCR_STAGE_BUDGET_FORWARD_MS",
+      "summary": "forward stage budget in ms (default 600000; 0 or `unlimited` disables the timeout)"
+    },
+    {
+      "name": "FOCR_TIMING",
+      "summary": "emit nested stage-timing rows on stderr (disables the resident daemon and progress bar)"
+    },
+    {
+      "name": "FOCR_NO_PROGRESS",
+      "summary": "disable the interactive stderr progress bar"
+    },
+    {
+      "name": "FOCR_MMAP",
+      "summary": "opt trusted immutable artifacts into read-only mmap"
+    },
+    {
+      "name": "FOCR_FORCE_ARCH",
+      "summary": "force a SIMD tier (sdot/smmla/scalar/avx2/avxvnni/avx512vnni)"
+    },
+    {
+      "name": "FOCR_RUN_STORE",
+      "summary": "override the run-history database path"
+    },
+    {
+      "name": "FOCR_NO_RESIDENT",
+      "summary": "1/true disables the resident warm-model daemon (flag analog: --no-resident)"
+    },
+    {
+      "name": "FOCR_RESIDENT_IDLE_SECS",
+      "summary": "resident daemon idle unload period (default 600)"
+    },
+    {
+      "name": "FOCR_RESIDENT_DIR",
+      "summary": "override the resident daemon state-file directory"
+    },
+    {
+      "name": "FOCR_RESIDENT_LOG",
+      "summary": "append resident daemon diagnostics to this file"
+    }
+  ],
   "events": [
     "run_start",
     "stage",
@@ -52,5 +122,6 @@
   ],
   "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "schema_version": 1,
-  "status": "skeleton — run_start/run_complete (carries `markdown`)/run_error are wired; the streaming stage/page event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+  "status": "live — run_start/run_complete (carries `markdown`)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested; `run_error` carries `recovery`",
+  "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr"
 }

@@ -17,3 +17,7 @@ Commands:
 Options:
   -h, --help     Print help
   -V, --version  Print version
+
+Agent orientation: `focr robot triage` (one JSON object: quick reference, live health, next commands, exit codes)
+Machine contract: `focr robot schema` | Kernel proof on this CPU: `focr robot selftest`
+Model zoo + pull status: `focr models --json` | Self-check/repair: `focr doctor`
