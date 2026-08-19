@@ -1,10 +1,24 @@
 [package]
 name = "franken_ocr"
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
-license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
+# MIT with the OpenAI/Anthropic rider is not an SPDX expression; ship the file
+# (the frankensqlite precedent for the same rider text).
+license-file = "LICENSE"
 description = "Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model (single-binary CLI: focr)"
 readme = "README.md"
+repository = "https://github.com/Dicklesworthstone/franken_ocr"
+# The tracked repo is ~180 MB (perf artifacts, fuzz corpus, historical dist
+# payloads, site); the crates.io package is the code. Prebuilt binaries remain
+# the supported install path (see README); the crate needs the pinned nightly
+# in rust-toolchain.toml on aarch64 (stdarch feature gates in src/lib.rs).
+include = [
+    "src/**",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE",
+    "rust-toolchain.toml",
+]
 
 # Two binaries from one ENTRYPOINT (the shared `franken_ocr::cli_main` in the
 # lib), but each from its OWN thin shim file so no source is shared across build
@@ -49,16 +63,16 @@ ctrlc = { version = "3.4", optional = true }
 num_cpus = "1.16"
 # FrankenTorch compute kernels for the in-process native OCR engine: int8 dynamic
 # linear (SDOT/VNNI), GEMM/sgemm, conv2d (im2col), sdpa, rms_norm, layer_norm.
-ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu", package = "frankentorch-kernel-cpu" }
+ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu", version = "0.1.0", package = "frankentorch-kernel-cpu" }
 # TensorMeta / DType / Device / Float16 — the meta types the kernel entrypoints take.
-ft-core = { path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
+ft-core = { path = "../frankentorch/crates/ft-core", version = "0.1.0", package = "frankentorch-core" }
 # Direct dep on `half` (the same crate ft-core re-exports as `Float16`) for its
 # SIMD bulk f16->f32 dequant; `std` enables the runtime aarch64 fp16 / x86 f16c
 # vector paths. Pinned to ft-core's major version.
 half = { version = "2", features = ["std"] }
 # Durable run state + telemetry on frankensqlite — NEVER rusqlite (plan §10).
-fsqlite = { path = "../frankensqlite/crates/fsqlite", optional = true }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types", optional = true }
+fsqlite = { path = "../frankensqlite/crates/fsqlite", version = "0.3.6", optional = true }
+fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types", version = "0.3.6", optional = true }
 # Image decode/resize/normalize/pad/tile — the preprocess front end (plan §6.2).
 # Core needs only png+jpeg; the `native` feature restores the full default
 # decoder set (and its rayon fan-out) so CLI behavior is unchanged. The wasm

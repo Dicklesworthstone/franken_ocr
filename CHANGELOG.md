@@ -14,6 +14,17 @@ sections as they land.
 
 ## [Unreleased]
 
+No changes yet.
+
+## [0.8.0] - 2026-08-19
+
+This release ships the resident warm-model daemon (GH #9), repairs the
+installer's latest-release resolution (GH #12), makes `focr --version`
+machine-parseable (GH #13), and adds the unlimited-timeout escape hatch
+(GH #10) plus agent-facing robot-schema self-description upgrades. The
+immutable `v0.7.0` Unlimited-OCR model artifact is unchanged and remains
+the embedded-manifest pin.
+
 ### Added
 
 - **Resident warm-model daemon (GH #9).** Eligible single-image `focr ocr` runs

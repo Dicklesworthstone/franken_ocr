@@ -7,8 +7,8 @@
 <div align="center">
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![source tag: v0.7.2](https://img.shields.io/badge/source_tag-v0.7.2-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/tree/v0.7.2)
-[![binary release: v0.7.2](https://img.shields.io/badge/binary_release-v0.7.2-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.7.2)
+[![source tag: v0.8.0](https://img.shields.io/badge/source_tag-v0.8.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/tree/v0.8.0)
+[![binary release: v0.8.0](https://img.shields.io/badge/binary_release-v0.8.0-blue.svg)](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.8.0)
 [![status: working](https://img.shields.io/badge/status-working-success.svg)](#quick-example)
 [![Rust Edition](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](https://doc.rust-lang.org/edition-guide/rust-2024/)
 [![toolchain: nightly](https://img.shields.io/badge/toolchain-nightly-purple.svg)](./rust-toolchain.toml)
@@ -35,11 +35,11 @@ irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install
 
 </div>
 
-The installer detects your platform, resolves the latest published GitHub binary release (currently `v0.7.2`), verifies the downloaded asset by SHA256, and puts `focr` on your PATH. Install compatible model weights separately; after they are present, inference is offline.
+The installer detects your platform, resolves the latest published GitHub binary release (currently `v0.8.0`), verifies the downloaded asset by SHA256, and puts `focr` on your PATH. Install compatible model weights separately; after they are present, inference is offline.
 
 ### Current Release
 
-`v0.7.2` ships raw executables for macOS Apple Silicon, macOS Intel, Linux x86-64, Linux ARM64, Windows x86-64, and Windows ARM64, each with a SHA256 sidecar. Its embedded schema-v2 manifest continues to pin the `v0.7.0` 4,157,448,783-byte Unlimited-OCR artifact using recipe `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`; `focr pull` verifies all three part hashes and the reassembled file before installation.
+`v0.8.0` ships raw executables for macOS Apple Silicon, macOS Intel, Linux x86-64, Linux ARM64, Windows x86-64, and Windows ARM64, each with a SHA256 sidecar. Its embedded schema-v2 manifest continues to pin the `v0.7.0` 4,157,448,783-byte Unlimited-OCR artifact using recipe `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`; `focr pull` verifies all three part hashes and the reassembled file before installation.
 
 The exact-recipe artifact emits EOS on `page0590` and passes the complete 20-page corpus budget at aggregate normalized CER 0.19307925. The release does not claim the strict three-party OpenPGP certificate: the committed fail-closed finalizer requires three independently controlled registry-pinned signers and production audit receipts, which are not available in this release process. The local corpus, model-census, installer, and binary checks are evidence, not a substitute for that governance claim.
 
@@ -189,7 +189,7 @@ With `FOCR_MODEL_PATH` set, default-model inference runs fully offline. Compatib
 
 `franken_ocr` is the only one of these built for a fixed, hand-tuned set of models on CPU.
 
-| | `franken_ocr` v0.7.2 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
+| | `franken_ocr` v0.8.0 | Official Unlimited-OCR | llama.cpp | ONNX Runtime |
 |---|---|---|---|---|
 | Language / runtime | Pure Rust, one binary | Python + HF transformers | C++ | C++ |
 | Primary target | CPU | CUDA GPU | CPU/GPU | CPU/GPU |
@@ -220,7 +220,7 @@ With `FOCR_MODEL_PATH` set, default-model inference runs fully offline. Compatib
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.sh | bash
 ```
 
-The script detects your OS and CPU architecture, downloads the matching asset from the latest published binary release, verifies the SHA256 sidecar, and installs `focr`. At the time this source tag was cut, the latest published binary release was `v0.7.2`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
+The script detects your OS and CPU architecture, downloads the matching asset from the latest published binary release, verifies the SHA256 sidecar, and installs `focr`. At the time this source tag was cut, the latest published binary release was `v0.8.0`. Under WSL it proceeds as Linux. Under native Git-Bash, MSYS, or Cygwin it points you at the PowerShell installer below and exits cleanly.
 
 On native Windows, install from PowerShell:
 
@@ -228,7 +228,7 @@ On native Windows, install from PowerShell:
 irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install.ps1 | iex
 ```
 
-This selects `focr-x86_64-pc-windows-msvc.exe` on AMD64 or `focr-aarch64-pc-windows-msvc.exe` on ARM64, verifies it by SHA256, and puts `focr` on your PATH. Both installers stage and execute the verified binary before an atomic replacement while holding a destination-scoped process lock, so a failed or concurrent update does not clobber a working install. Both Windows architectures are part of the v0.7.2 release matrix.
+This selects `focr-x86_64-pc-windows-msvc.exe` on AMD64 or `focr-aarch64-pc-windows-msvc.exe` on ARM64, verifies it by SHA256, and puts `focr` on your PATH. Both installers stage and execute the verified binary before an atomic replacement while holding a destination-scoped process lock, so a failed or concurrent update does not clobber a working install. Both Windows architectures are part of the v0.8.0 release matrix.
 
 ### Manual binary download
 
@@ -246,7 +246,7 @@ Release binaries are raw executables, not tar.gz archives. Each one is a single 
 Each asset has a `<asset>.sha256` sidecar in the standard `"<hex>  <asset>"` format. Download the binary and its sidecar from the release base URL, verify, then install. Example for Apple Silicon:
 
 ```bash
-base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.7.2
+base=https://github.com/Dicklesworthstone/franken_ocr/releases/download/v0.8.0
 asset=focr-aarch64-apple-darwin-neon-sdot-i8mm
 
 curl -fsSLO "$base/$asset"
