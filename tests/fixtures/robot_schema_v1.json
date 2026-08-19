@@ -67,6 +67,14 @@
     {
       "name": "FOCR_RESIDENT_LOG",
       "summary": "append resident daemon diagnostics to this file"
+    },
+    {
+      "name": "FOCR_RESIDENT_SPAWN_WAIT_SECS",
+      "summary": "how long a client waits for a freshly spawned daemon to accept (default 30)"
+    },
+    {
+      "name": "FOCR_RESIDENT_CLIENT_TIMEOUT_SECS",
+      "summary": "client-side reply timeout for a resident request (default 600)"
     }
   ],
   "events": [
