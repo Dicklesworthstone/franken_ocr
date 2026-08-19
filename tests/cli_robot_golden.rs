@@ -1766,18 +1766,22 @@ fn ocr_help_lists_reference_infer_args() {
     );
 }
 
-/// [C2] `--version` golden. Renders a long, attribution-bearing report; the
-/// package version is scrubbed so a `Cargo.toml` bump does not flap it.
+/// [C2] `--version` golden. GH #13 contract: stdout carries ONLY the
+/// machine-parseable `focr <semver>` line (so `focr --version | awk ...` is
+/// safe), while the attribution license lines go to stderr. The golden freezes
+/// the stdout line (version scrubbed); the license lines are asserted on
+/// stderr from the single source of truth.
 #[test]
 fn cli_version_golden() {
     let test = "cli_version_golden";
     let out = run_focr(&["--version"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
     let scrubbed = scrub(&stdout);
     tlog!(test,
         "case": "cli_version",
         "event": "assert",
-        "assertion": "--version prints version plus parseable license notices and exits 0",
+        "assertion": "--version prints ONLY `focr <semver>` on stdout, licenses on stderr, exits 0",
         "inputs": {"argv": ["--version"]},
         "raw": stdout.trim(),
         "scrubbed": scrubbed.trim(),
@@ -1788,11 +1792,20 @@ fn cli_version_golden() {
     assert_eq!(out.status.code(), Some(0), "--version must exit 0");
     assert!(
         scrubbed.contains("[version]"),
-        "--version output must contain the (scrubbed) version; got: {scrubbed:?}"
+        "--version stdout must contain the (scrubbed) version; got: {scrubbed:?}"
+    );
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "--version stdout must be exactly one machine-parseable line (GH #13); got: {stdout:?}"
     );
     assert!(
-        stdout.contains(&format!("model_license: {FOCR_MODEL_LICENSE_NOTICE}")),
-        "--version output must contain parseable model_license from the single source; got: {stdout:?}"
+        !stdout.contains("license"),
+        "--version stdout must not carry license prose (GH #13); got: {stdout:?}"
+    );
+    assert!(
+        stderr.contains(&format!("model_license: {FOCR_MODEL_LICENSE_NOTICE}")),
+        "--version stderr must carry the parseable model_license from the single source; got: {stderr:?}"
     );
     assert_golden(test, "cli_version", &scrubbed);
 }

@@ -129,6 +129,48 @@ impl FocrError {
         }
     }
 
+    /// One actionable next step per error category, deliberately separate from
+    /// the message so agents can branch on it without parsing prose (the
+    /// frankentts/franken_whisper `remediation`/`recovery` pattern). Surfaced
+    /// in the robot `run_error` payload as `recovery`.
+    #[must_use]
+    pub fn remediation(&self) -> &'static str {
+        match self {
+            FocrError::Usage(_) => {
+                "re-run with corrected arguments; `focr <command> --help` documents the surface, \
+                 and `focr robot triage` returns command templates"
+            }
+            FocrError::ModelNotFound(_) => {
+                "run `focr pull` to install the default model (or `focr pull <model>` for a zoo \
+                 model); pin an explicit artifact with --model or FOCR_MODEL_PATH"
+            }
+            FocrError::InputDecode(_) => {
+                "verify the input is a supported image (PNG/JPG/…) or a SCANNED image-based PDF; \
+                 born-digital/vector PDFs must be rasterized out of band first \
+                 (e.g. `pdftoppm -png -r 200`)"
+            }
+            FocrError::Timeout(_) => {
+                "raise the stage budget with FOCR_STAGE_BUDGET_FORWARD_MS (0 = unlimited), cap \
+                 generation with --max-length, or check for memory pressure/swapping"
+            }
+            FocrError::Cancelled => {
+                "the run was interrupted (Ctrl+C / cooperative shutdown); re-run to continue"
+            }
+            FocrError::FormatMismatch(_) => {
+                "the artifact/manifest does not match this binary's contract; re-run `focr pull` \
+                 for a compatible artifact and do not rename artifacts to bypass verification"
+            }
+            FocrError::NotImplemented(_) => {
+                "this surface is planned but not implemented; `focr models` shows ready vs \
+                 planned models and `focr robot triage` lists working commands"
+            }
+            FocrError::Other(_) => {
+                "inspect the message; `focr doctor` diagnoses local install/cache problems and \
+                 `focr robot health` reports model/threads/arch state"
+            }
+        }
+    }
+
     /// Stable machine-readable error category used by robot events.
     #[must_use]
     pub fn kind(&self) -> &'static str {

@@ -36,6 +36,8 @@ pub mod preprocess;
 pub mod progress;
 pub mod quant;
 #[cfg(feature = "native")]
+pub mod resident;
+#[cfg(feature = "native")]
 pub mod robot;
 pub mod simd;
 #[cfg(feature = "native")]
@@ -686,10 +688,12 @@ impl OcrEngine {
         let model = self.model_at(model_path)?;
         let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
         let count = u32::try_from(owned.len().max(1)).unwrap_or(u32::MAX);
-        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
-        let budget = per_image
-            .checked_mul(count)
-            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        let budget =
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
+                per_image
+                    .checked_mul(count)
+                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
+            });
         self.run_blocking_stage_with_budget("forward-batch", budget, move || {
             let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
             Ok(model.recognize_batch(&refs))
@@ -723,10 +727,12 @@ impl OcrEngine {
         let model = self.model_at(model_path)?;
         let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
         let count = u32::try_from(owned.len().max(1)).unwrap_or(u32::MAX);
-        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
-        let budget = per_image
-            .checked_mul(count)
-            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        let budget =
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
+                per_image
+                    .checked_mul(count)
+                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
+            });
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
             let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
             model.recognize_multi_page(&refs)
@@ -756,10 +762,12 @@ impl OcrEngine {
     ) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
         let count = u32::try_from(images.len().max(1)).unwrap_or(u32::MAX);
-        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
-        let budget = per_image
-            .checked_mul(count)
-            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        let budget =
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
+                per_image
+                    .checked_mul(count)
+                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
+            });
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
             model.recognize_multi_page_dynamic(images)
         })
@@ -781,29 +789,46 @@ impl OcrEngine {
     ) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
         let count = u32::try_from(images.len().max(1)).unwrap_or(u32::MAX);
-        let per_image = Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS);
-        let budget = per_image
-            .checked_mul(count)
-            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        let budget =
+            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
+                per_image
+                    .checked_mul(count)
+                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
+            });
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
             model.recognize_multi_page_dynamic_streaming(images, &mut *on_page)
         })
     }
 
-    fn stage_budget(stage: &str, default_ms: u64) -> Duration {
+    /// Stage wall-clock budget from `FOCR_STAGE_BUDGET_{stage}_MS`.
+    ///
+    /// `None` means "no budget": setting the variable to `0` or the literal
+    /// `unlimited` disables the stage timeout entirely (GH #10) — the stage
+    /// then runs until completion or cooperative cancellation. Unset or
+    /// unparsable values use the stage default.
+    fn stage_budget(stage: &str, default_ms: u64) -> Option<Duration> {
         let key = format!("FOCR_STAGE_BUDGET_{stage}_MS");
-        let millis = std::env::var(&key)
-            .ok()
-            .and_then(|raw| raw.parse::<u64>().ok())
-            .filter(|&ms| ms > 0)
-            .unwrap_or(default_ms);
-        Duration::from_millis(millis)
+        match std::env::var(&key) {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed == "0" || trimmed.eq_ignore_ascii_case("unlimited") {
+                    return None;
+                }
+                let millis = trimmed
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|&ms| ms > 0)
+                    .unwrap_or(default_ms);
+                Some(Duration::from_millis(millis))
+            }
+            Err(_) => Some(Duration::from_millis(default_ms)),
+        }
     }
 
     fn run_blocking_stage_with_budget<T, F>(
         &self,
         stage: &'static str,
-        budget: Duration,
+        budget: Option<Duration>,
         op: F,
     ) -> FocrResult<T>
     where
@@ -811,6 +836,11 @@ impl OcrEngine {
         F: FnOnce() -> FocrResult<T> + Send + 'static,
     {
         self.runtime.block_on(async move {
+            let Some(budget) = budget else {
+                // Budget disabled (`FOCR_STAGE_BUDGET_*_MS=0`): run to
+                // completion; cooperative cancellation remains the only bound.
+                return asupersync::runtime::spawn_blocking(op).await;
+            };
             match asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 budget,
@@ -854,7 +884,7 @@ mod tests {
 
         // The runtime is live: a trivial blocking stage round-trips.
         let out = engine
-            .run_blocking_stage_with_budget("drop-probe", Duration::from_secs(5), || Ok(42u8))
+            .run_blocking_stage_with_budget("drop-probe", Some(Duration::from_secs(5)), || Ok(42u8))
             .expect("stage runs");
         assert_eq!(out, 42);
         log_line(
@@ -895,8 +925,10 @@ mod tests {
     fn cancellation_token_into_closure_aborts() {
         reset_shutdown();
         let engine = OcrEngine::new().expect("engine builds");
-        let out =
-            engine.run_blocking_stage_with_budget("cancel-probe", Duration::from_secs(10), || {
+        let out = engine.run_blocking_stage_with_budget(
+            "cancel-probe",
+            Some(Duration::from_secs(10)),
+            || {
                 for step in 0..1_000_000u64 {
                     cancel_checkpoint()?;
                     if step == 3 {
@@ -906,7 +938,8 @@ mod tests {
                     }
                 }
                 Ok(0u64)
-            });
+            },
+        );
         reset_shutdown();
         assert!(
             matches!(out, Err(FocrError::Cancelled)),
@@ -1120,7 +1153,7 @@ mod tests {
     fn blocking_stage_runs_on_runtime_blocking_pool() {
         let engine = OcrEngine::new().expect("runtime builds");
         let thread_name = engine
-            .run_blocking_stage_with_budget("test", Duration::from_secs(1), || {
+            .run_blocking_stage_with_budget("test", Some(Duration::from_secs(1)), || {
                 let thread = std::thread::current();
                 Ok(thread.name().unwrap_or("<unnamed>").to_string())
             })
@@ -1136,7 +1169,7 @@ mod tests {
         let engine = OcrEngine::new().expect("runtime builds");
         let started = std::time::Instant::now();
         let err = engine
-            .run_blocking_stage_with_budget("test-timeout", Duration::from_millis(10), || {
+            .run_blocking_stage_with_budget("test-timeout", Some(Duration::from_millis(10)), || {
                 std::thread::sleep(Duration::from_millis(100));
                 Ok(())
             })

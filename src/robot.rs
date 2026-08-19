@@ -25,14 +25,93 @@ pub const EVENT_KINDS: &[&str] = &[
     "run_error",
 ];
 
+/// The environment variables an agent can steer runs with, self-described so a
+/// consumer never has to scrape the README. `(name, summary)` — additive rows
+/// keep the schema at v1.
+pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
+    (
+        "FOCR_MODEL_PATH",
+        "override the model artifact path (a .focrq blob or safetensors directory)",
+    ),
+    (
+        "FOCR_MODEL_DIR",
+        "extra model search roots before the default cache",
+    ),
+    (
+        "FOCR_QUANT",
+        "pick the quant-suffixed artifact during cache resolution",
+    ),
+    (
+        "FOCR_THREADS",
+        "kernel thread budget (default: physical cores)",
+    ),
+    (
+        "FOCR_MAX_NEW_TOKENS",
+        "cap generated tokens (an explicit --max-length outranks it)",
+    ),
+    (
+        "FOCR_STAGE_BUDGET_FORWARD_MS",
+        "forward stage budget in ms (default 600000; 0 or `unlimited` disables the timeout)",
+    ),
+    (
+        "FOCR_TIMING",
+        "emit nested stage-timing rows on stderr (disables the resident daemon and progress bar)",
+    ),
+    (
+        "FOCR_NO_PROGRESS",
+        "disable the interactive stderr progress bar",
+    ),
+    (
+        "FOCR_MMAP",
+        "opt trusted immutable artifacts into read-only mmap",
+    ),
+    (
+        "FOCR_FORCE_ARCH",
+        "force a SIMD tier (sdot/smmla/scalar/avx2/avxvnni/avx512vnni)",
+    ),
+    ("FOCR_RUN_STORE", "override the run-history database path"),
+    (
+        "FOCR_NO_RESIDENT",
+        "1/true disables the resident warm-model daemon (flag analog: --no-resident)",
+    ),
+    (
+        "FOCR_RESIDENT_IDLE_SECS",
+        "resident daemon idle unload period (default 600)",
+    ),
+    (
+        "FOCR_RESIDENT_DIR",
+        "override the resident daemon state-file directory",
+    ),
+    (
+        "FOCR_RESIDENT_LOG",
+        "append resident daemon diagnostics to this file",
+    ),
+];
+
 /// A machine-readable, self-describing schema for the robot event stream.
 pub fn robot_schema() -> Value {
+    let environment: Vec<Value> = ENVIRONMENT_VARIABLES
+        .iter()
+        .map(|(name, summary)| json!({ "name": name, "summary": summary }))
+        .collect();
     json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
         "events": EVENT_KINDS,
         "exit_codes": EXIT_CODE_TABLE,
         "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
-        "status": "skeleton — run_start/run_complete (carries `markdown`)/run_error are wired; the streaming stage/page event payloads are finalized + contract-tested in Phase 5 (plan §7.3)"
+        "environment_variables": environment,
+        // How an agent orients in one round-trip each (the franken_whisper
+        // `agent_discovery` pattern): additive keys, schema stays v1.
+        "agent_discovery": {
+            "triage": "focr robot triage",
+            "health": "focr robot health",
+            "backends": "focr robot backends",
+            "selftest": "focr robot selftest",
+            "models": "focr models --json",
+            "doctor": "focr doctor --json",
+        },
+        "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
+        "status": "live — run_start/run_complete (carries `markdown`)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested; `run_error` carries `recovery`"
     })
 }
 
@@ -77,6 +156,9 @@ pub fn run_error_event(err: &FocrError) -> Value {
         "error_kind": err.kind(),
         "code": err.exit_code(),
         "message": err.to_string(),
+        // One actionable next step, machine-consumable without parsing prose
+        // (additive field; schema stays v1).
+        "recovery": err.remediation(),
     })
 }
 

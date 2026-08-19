@@ -44,7 +44,14 @@ const DEFAULT_NGRAM_WINDOW: i64 = 128;
 /// exit codes documented in [`crate::error`].
 pub fn cli_main() -> ExitCode {
     if is_exact_long_version_request(std::env::args_os()) {
-        print!("{}", long_version_report());
+        let report = long_version_report();
+        let mut lines = report.lines();
+        if let Some(version_line) = lines.next() {
+            println!("{version_line}");
+        }
+        for license_line in lines {
+            eprintln!("{license_line}");
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -82,7 +89,11 @@ pub fn cli_main() -> ExitCode {
 #[command(
     name = "focr",
     version,
-    about = "Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model"
+    about = "Pure-Rust, CPU-hyper-optimized runner for the Baidu Unlimited-OCR model",
+    after_help = "Agent orientation: `focr robot triage` (one JSON object: quick reference, live \
+                  health, next commands, exit codes)\nMachine contract: `focr robot schema` | \
+                  Kernel proof on this CPU: `focr robot selftest`\nModel zoo + pull status: \
+                  `focr models --json` | Self-check/repair: `focr doctor`"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -105,6 +116,11 @@ where
 /// read from the default model's [`crate::model_arch::ModelArch`] descriptor (the
 /// source of truth as the model zoo grows); today that is byte-identical to
 /// [`FOCR_MODEL_LICENSE_NOTICE`].
+///
+/// Emission contract (GH #13): only the first line (`focr <semver>`) goes to
+/// stdout so `focr --version | <parse>` stays machine-safe; the license lines
+/// go to stderr, which keeps the attribution visible on a terminal without
+/// polluting pipelines.
 #[must_use]
 pub fn long_version_report() -> String {
     format!(
@@ -145,6 +161,18 @@ pub enum Command {
     Sync(SyncArgs),
     /// Idempotent self-check / repair.
     Doctor(DoctorArgs),
+    /// INTERNAL: the resident warm-model daemon (spawned automatically by
+    /// `focr ocr`; not for direct use). Holds the loaded model in memory and
+    /// exits after the idle period (default 10 minutes).
+    #[command(hide = true)]
+    ResidentDaemon(ResidentDaemonArgs),
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct ResidentDaemonArgs {
+    /// The resolved model artifact path this daemon serves (its identity key).
+    #[arg(long)]
+    pub model_root: PathBuf,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -322,6 +350,13 @@ pub struct OcrRequestArgs {
     /// Without this flag each page is parsed independently.
     #[arg(long)]
     pub multi_page: bool,
+    /// Disable the resident warm-model daemon for this run (env analog:
+    /// FOCR_NO_RESIDENT=1). By default, eligible single-image runs are served
+    /// by a per-model background process that keeps the loaded weights in RAM
+    /// and exits after 10 idle minutes (FOCR_RESIDENT_IDLE_SECS), so
+    /// back-to-back invocations skip the multi-gigabyte artifact load.
+    #[arg(long)]
+    pub no_resident: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -340,6 +375,7 @@ pub struct OcrRequest {
     pub pages: Option<String>,
     pub split_spreads: bool,
     pub multi_page: bool,
+    pub no_resident: bool,
 }
 
 impl OcrArgs {
@@ -419,6 +455,7 @@ impl OcrRequestArgs {
             pages: self.pages.clone(),
             split_spreads: self.split_spreads,
             multi_page: self.multi_page,
+            no_resident: self.no_resident,
         })
     }
 
@@ -879,6 +916,7 @@ pub fn run(cli: Cli) -> FocrResult<()> {
         Command::Runs(args) => run_runs(&args),
         Command::Sync(args) => run_sync(&args),
         Command::Doctor(args) => run_doctor(&args),
+        Command::ResidentDaemon(args) => crate::resident::run_daemon(&args.model_root),
     }
 }
 
@@ -1390,17 +1428,22 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode, show_progress)?),
             Vec::new(),
         ),
-        (None, false) => (
-            Recognition::Single(recognize_with_autodownload(
-                &request,
-                robot_mode,
-                |model| match model {
+        (None, false) => {
+            // The resident warm-model path (GH #9): serve eligible
+            // single-image runs from a per-model background daemon that keeps
+            // the weights loaded across invocations. `Ok(None)` — daemon
+            // unavailable, ineligible, or any transport-shaped failure —
+            // falls through to the classic in-process load; the observable
+            // output contract is identical either way.
+            let doc = match resident_recognition(&args, &request)? {
+                Some(doc) => doc,
+                None => recognize_with_autodownload(&request, robot_mode, |model| match model {
                     Some(m) => engine.recognize_with_layout_model(m, &request.image),
                     None => engine.recognize_with_layout(&request.image),
-                },
-            )?),
-            Vec::new(),
-        ),
+                })?,
+            };
+            (Recognition::Single(doc), Vec::new())
+        }
     };
 
     // Staff-level metadata from a TrOMR music forward (bd-av64.2): consumed
@@ -1532,6 +1575,43 @@ fn music_meta_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Value 
         .collect();
     entries.sort_by_key(|(index, _)| *index);
     serde_json::Value::Array(entries.into_iter().map(|(_, v)| v).collect())
+}
+
+/// Try to serve an eligible single-image recognition from the resident
+/// warm-model daemon (GH #9). `Ok(None)` = run inline (never an error).
+///
+/// Eligibility: single non-PDF image, no figure extraction (both enforced by
+/// the caller's match arm), any task except `music` (TrOMR staff/warning
+/// metadata is read off the client engine after recognition and would be lost
+/// daemon-side), resident not disabled, and no `FOCR_TIMING` trace (its
+/// stderr rows would print invisibly in the daemon). The model spec is
+/// resolved client-side first, so an unresolvable model keeps the inline
+/// path's download-offer / exit-3 contract byte-for-byte.
+fn resident_recognition(
+    args: &OcrArgs,
+    request: &OcrRequest,
+) -> FocrResult<Option<native_engine::RecognizedDocument>> {
+    if !crate::resident::enabled(request.no_resident)
+        || args.request.task == OcrTask::Music
+        || std::env::var_os("FOCR_TIMING").is_some()
+    {
+        return Ok(None);
+    }
+    let spec = request
+        .model
+        .clone()
+        .unwrap_or_else(crate::OcrEngine::model_path);
+    let Ok(model) = native_engine::OcrModel::resolve_model(&spec) else {
+        return Ok(None);
+    };
+    crate::resident::try_recognize(&crate::resident::ResidentRequest {
+        image: &request.image,
+        model,
+        decode: decode_overrides_from(request),
+        preprocess: preprocess_overrides_from(request),
+        format: request.format,
+        question: request.question.as_deref(),
+    })
 }
 
 /// Run one recognition, transparently offering the first-run model download once
@@ -3167,6 +3247,7 @@ mod tests {
                     pages: None,
                     split_spreads: false,
                     multi_page: false,
+                    no_resident: false,
                 },
                 json: false,
                 output: None,
@@ -3199,6 +3280,7 @@ mod tests {
                         pages: None,
                         split_spreads: false,
                         multi_page: false,
+                        no_resident: false,
                     },
                 }),
             },
@@ -3225,6 +3307,7 @@ mod tests {
                 pages: None,
                 split_spreads: false,
                 multi_page: false,
+                no_resident: false,
             },
             json: false,
             output: None,
@@ -3744,6 +3827,7 @@ mod tests {
                 pages: None,
                 split_spreads: false,
                 multi_page: false,
+                no_resident: false,
             },
             json: false,
             output: None,
