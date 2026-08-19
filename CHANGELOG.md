@@ -4,6 +4,16 @@ All notable changes to `franken_ocr` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+Scope window: project inception on 2026-06-24 through HEAD on 2026-08-19.
+
+## Version Timeline
+
+| Version | Kind | Date | Summary |
+|---------|------|------|---------|
+| Unreleased | commits on `main` | 2026-07-12 → 2026-08-19 | wasm/int4 browser path, iOS ABI, resident daemon, janitor docs-reorg |
+| [`models-unlimited-wasm-v1`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/models-unlimited-wasm-v1) | Release (artifact, not SemVer) | 2026-08-11 | Unlimited-OCR wasm-int4 browser artifact |
+| [`v0.7.2`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.7.2) | Release | 2026-07-12 | Latest software tag before HEAD |
+
 **Scope note.** Work began on 2026-06-24 as a planning and scaffolding effort and
 reached a working, end-to-end engine for the first tagged release on 2026-06-29.
 The pre-release kickoff (master plan, crate skeleton, agent conventions, oracle
@@ -26,6 +36,25 @@ immutable `v0.7.0` Unlimited-OCR model artifact is unchanged and remains
 the embedded-manifest pin.
 
 111 commits on [`main`](https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.2...main) after [`v0.7.2`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.7.2) (2026-07-12 → 2026-08-19). No later `v*` software tag exists. One additional GitHub Release in this window is a **model-artifact** tag, not a SemVer bump: [`models-unlimited-wasm-v1`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/models-unlimited-wasm-v1) (2026-08-11, "Unlimited-OCR wasm-int4 browser artifact (v2, calibration-aware)").
+
+### Delivered capability
+
+- Browser wasm/int4 path with a hash-pinned `models-unlimited-wasm-v1` artifact release.
+- iOS staticlib C ABI + Xcodegen app, plus a Hugging Face-first weight mirror.
+- Resident warm-model daemon that preserves the `focr ocr` contract.
+- Janitor: `COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md` now lives under `docs/planning/`.
+
+### Closed workstreams
+
+- GitHub issues #9 (resident daemon), #10 (forward-stage budget), #12 (installer `/releases/latest` confusion).
+- Tracker: [`.beads/issues.jsonl`](https://github.com/Dicklesworthstone/franken_ocr/blob/main/.beads/issues.jsonl).
+
+### Representative commits
+
+- [`add3cb1`](https://github.com/Dicklesworthstone/franken_ocr/commit/add3cb154) / [`0e8c058`](https://github.com/Dicklesworthstone/franken_ocr/commit/0e8c05813) — wasm/int4 browser path.
+- [`ef8b379`](https://github.com/Dicklesworthstone/franken_ocr/commit/ef8b3794d) — iOS C ABI + Xcodegen app.
+- [`b07019e`](https://github.com/Dicklesworthstone/franken_ocr/commit/b07019e02) — resident warm-model daemon (GH #9).
+- [`bcacc89`](https://github.com/Dicklesworthstone/franken_ocr/commit/bcacc89db7f39d354b50a79cc8c19b9c10d6b6fb) — move the comprehensive plan into `docs/planning/`.
 
 ### Added
 
