@@ -14,8 +14,13 @@ sections as they land.
 
 ## [Unreleased]
 
+111 commits on [`main`](https://github.com/Dicklesworthstone/franken_ocr/compare/v0.7.2...main) after [`v0.7.2`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.7.2) (2026-07-12 → 2026-08-19, HEAD [`bcacc89`](https://github.com/Dicklesworthstone/franken_ocr/commit/bcacc89db7f39d354b50a79cc8c19b9c10d6b6fb)). No later `v*` software tag exists. One additional GitHub Release in this window is a **model-artifact** tag, not a SemVer bump: [`models-unlimited-wasm-v1`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/models-unlimited-wasm-v1) (2026-08-11, "Unlimited-OCR wasm-int4 browser artifact (v2, calibration-aware)").
+
 ### Added
 
+- **Browser wasm path + calibration-aware int4.** Native feature split and `focr-wasm` boundary, dual serial/threaded wasm lanes, streaming SHA-256 loader, optional rayon pool, and a wasm32 simd128 int8/int4 kernel island (measured 2.69× on the real browser page) ([`add3cb1`](https://github.com/Dicklesworthstone/franken_ocr/commit/add3cb154), [`0e8c058`](https://github.com/Dicklesworthstone/franken_ocr/commit/0e8c05813)). Scanned-PDF-on-wasm, playground progress UI, multi-arch playground (PDF pages, GOT format, SmolVLM2 Q). The `models-unlimited-wasm-v1` GitHub Release is the hash-pinned browser artifact ([`094c604`](https://github.com/Dicklesworthstone/franken_ocr/commit/094c604c0)).
+- **iOS staticlib C ABI + Xcodegen app** ([`ef8b379`](https://github.com/Dicklesworthstone/franken_ocr/commit/ef8b3794d)). Multi-page PDF walk with document-level progress, HTML export / pasteboard / keep-awake, Hugging Face-first weight fetch with digest-on-arrival, App Store privacy policy. Streamed SAM (GOT-OCR2 / OneChart) and SigLIP (SmolVLM2) towers cut residency; uniform-g32 int4 was measured and rejected ([`43c72d6`](https://github.com/Dicklesworthstone/franken_ocr/commit/43c72d68f)).
+- **Hugging Face weight mirror.** Digest-gated publisher and manifest that tries Hugging Face first and GitHub second, so playground/iOS bandwidth is no longer served only from GitHub Releases ([`e4c9cb9`](https://github.com/Dicklesworthstone/franken_ocr/commit/e4c9cb9cd)).
 - **Resident warm-model daemon (GH #9).** Eligible single-image `focr ocr` runs
   are now served by a per-model background process that keeps the loaded
   weights in RAM between invocations, so back-to-back runs skip the
@@ -28,7 +33,8 @@ sections as they land.
   `FOCR_*` variable except a short transport/telemetry exempt list) on
   every request; any transport-shaped problem falls back to the classic
   in-process load, so the observable contract of `focr ocr` is unchanged.
-  Opt out with `--no-resident` or `FOCR_NO_RESIDENT=1`.
+  Opt out with `--no-resident` or `FOCR_NO_RESIDENT=1`
+  ([`b07019e`](https://github.com/Dicklesworthstone/franken_ocr/commit/b07019e02)).
 - `FOCR_STAGE_BUDGET_FORWARD_MS=0` (or `unlimited`) now disables the forward
   stage timeout entirely instead of being silently ignored (GH #10).
 - Robot `run_error` events carry a machine-consumable `recovery` field (one
@@ -48,6 +54,14 @@ sections as they land.
 - `focr --version` prints only `focr <semver>` to stdout; the source/model
   license attribution lines now go to stderr, so version parsing in pipelines
   and idempotent updaters works with the conventional idiom (GH #13).
+- Resident daemon: clamp `FOCR_RESIDENT_*_SECS` so `Instant + Duration` cannot
+  panic; complete the schema env roster.
+
+### Janitor docs-reorg wave (2026-08-19)
+
+- [`540e531`](https://github.com/Dicklesworthstone/franken_ocr/commit/540e531a7190633a1ddbd9eb871d5a2798513a9a) — untrack skill-loop scratch.
+- [`71761bd`](https://github.com/Dicklesworthstone/franken_ocr/commit/71761bdfd630b0a646b76e3c81650e6d564375e5) — untrack beads recovery snapshots already gitignored.
+- [`bcacc89`](https://github.com/Dicklesworthstone/franken_ocr/commit/bcacc89db7f39d354b50a79cc8c19b9c10d6b6fb) — move [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](https://github.com/Dicklesworthstone/franken_ocr/blob/main/docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md) into `docs/planning/`.
 
 ## [0.7.2] - 2026-07-12
 
@@ -319,7 +333,7 @@ bit-identical 30% speedup of the shared SAM vision tower.
   model grounds but does not transcribe to text (the `![](images/…)` placeholders)
   as real image files in a subfolder — default `<output-stem>_figures/`, or set
   `--figures-dir DIR` — and rewrites the Markdown to reference them
-  (`![figure N](report_figures/page1_figure_1.jpg)`); the JSON gains a `figures`
+  (`![figure N](<output-stem>_figures/page1_figure_1.jpg)`); the JSON gains a `figures`
   array of `{label, page, bbox, path}`. Each figure's format is chosen by content:
   JPG q85 for photographic regions, lossless PNG for line-art / charts /
   screenshots. PDFs name figures per page. The crop comes from a fresh EXIF-aligned
