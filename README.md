@@ -946,7 +946,7 @@ The model weights are a separate matter. The Baidu Unlimited-OCR weights, and an
 
 ## See also
 
-- [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](./COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md), the master plan: architecture census, quantization format, the kernel-optimization catalog, the alien-artifact math families, the verification gauntlet, and the phased roadmap.
+- [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](./docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md), the master plan: architecture census, quantization format, the kernel-optimization catalog, the alien-artifact math families, the verification gauntlet, and the phased roadmap.
 - [`AGENTS.md`](./AGENTS.md), conventions for human and agent contributors, including the engineering doctrine.
 - [`CHANGELOG.md`](./CHANGELOG.md), the project history.
 - [`docs/PERF_LEDGER.md`](./docs/PERF_LEDGER.md), the honest measured perf-ratio log.

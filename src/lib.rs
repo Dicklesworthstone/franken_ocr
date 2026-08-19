@@ -11,7 +11,7 @@
 //! built surface a clean [`FocrError::NotImplemented`] rather than fabricating
 //! output (doctrine #1).
 //!
-//! [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`]: ../COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md
+//! [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`]: ../docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md
 #![cfg_attr(target_arch = "aarch64", allow(stable_features))]
 #![cfg_attr(
     target_arch = "aarch64",
