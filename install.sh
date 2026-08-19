@@ -414,19 +414,27 @@ resolve_version() {
   fi
 
   info "Resolving the latest release..."
-  local api="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
+  # Enumerate releases instead of trusting /releases/latest: this repo also
+  # publishes model-weight releases (models-*), and whichever release was
+  # published most recently wins the "latest" slot regardless of tag shape.
+  # Selecting the newest tag that looks like a binary version keeps the
+  # installer working even when a weights release is the most recent one.
+  local api="https://api.github.com/repos/${OWNER}/${REPO}/releases?per_page=100"
   local tag=""
 
+  # The releases API returns newest-first; take the first semver-shaped tag.
   tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
     -H "Accept: application/vnd.github.v3+json" \
     --connect-timeout 10 --max-time 30 "$api" 2>/dev/null \
-    | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' | head -1) || tag=""
+    | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
+    | head -1) || tag=""
 
   if [ -n "$tag" ]; then
     VERSION="$tag"
-    info "Latest release: $VERSION"
+    info "Latest binary release: $VERSION"
   else
-    err "Could not resolve the latest release from the GitHub API."
+    err "Could not resolve the latest binary release from the GitHub API."
     err "Re-run with --version vX.Y.Z to pin a known release."
     exit 1
   fi

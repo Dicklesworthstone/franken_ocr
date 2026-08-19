@@ -296,7 +296,12 @@ function Resolve-Version {
     }
 
     Info 'Resolving the latest release...'
-    $api = "https://api.github.com/repos/$($script:Owner)/$($script:Repo)/releases/latest"
+    # Enumerate releases instead of trusting /releases/latest: this repo also
+    # publishes model-weight releases (models-*), and whichever release was
+    # published most recently wins the "latest" slot regardless of tag shape.
+    # Selecting the newest semver-shaped tag keeps the installer working even
+    # when a weights release is the most recent one.
+    $api = "https://api.github.com/repos/$($script:Owner)/$($script:Repo)/releases?per_page=100"
     try {
         $headers = @{
             'Accept'     = 'application/vnd.github+json'
@@ -304,21 +309,29 @@ function Resolve-Version {
         }
         # Copy to a local before splatting (splatting takes an unscoped name).
         $wa = $script:WebArgs
-        $rel = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec 30 @wa
+        $rels = Invoke-RestMethod -Uri $api -Headers $headers -TimeoutSec 30 @wa
         $tag = $null
-        if ($rel) {
-            $prop = $rel.PSObject.Properties['tag_name']
-            if ($prop -and $prop.Value) { $tag = [string]$prop.Value }
+        if ($rels) {
+            # The releases API returns newest-first; take the first binary tag.
+            foreach ($rel in @($rels)) {
+                $prop = $rel.PSObject.Properties['tag_name']
+                if (-not ($prop -and $prop.Value)) { continue }
+                $candidate = [string]$prop.Value
+                if ($candidate -cmatch '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$') {
+                    $tag = $candidate
+                    break
+                }
+            }
         }
         if (-not [string]::IsNullOrEmpty($tag)) {
-            Info "Latest release: $tag"
+            Info "Latest binary release: $tag"
             return $tag
         }
     } catch {
-        throw "Could not resolve the latest release from the GitHub API. Re-run with -Version vX.Y.Z to pin a known release. ($($_.Exception.Message))"
+        throw "Could not resolve the latest binary release from the GitHub API. Re-run with -Version vX.Y.Z to pin a known release. ($($_.Exception.Message))"
     }
 
-    throw 'The GitHub latest-release API returned no tag. Re-run with -Version vX.Y.Z to pin a known release.'
+    throw 'The GitHub releases API returned no binary release tag. Re-run with -Version vX.Y.Z to pin a known release.'
 }
 
 # Release tags are v-prefixed; accept a bare semver from -Version too.
