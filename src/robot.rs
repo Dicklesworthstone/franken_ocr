@@ -86,6 +86,14 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
         "FOCR_RESIDENT_LOG",
         "append resident daemon diagnostics to this file",
     ),
+    (
+        "FOCR_RESIDENT_SPAWN_WAIT_SECS",
+        "how long a client waits for a freshly spawned daemon to accept (default 30)",
+    ),
+    (
+        "FOCR_RESIDENT_CLIENT_TIMEOUT_SECS",
+        "client-side reply timeout for a resident request (default 600)",
+    ),
 ];
 
 /// A machine-readable, self-describing schema for the robot event stream.

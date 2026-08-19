@@ -74,6 +74,12 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 const PROTOCOL: u64 = 1;
 
+/// Upper clamp for user-supplied second counts (one year). `Instant + Duration`
+/// PANICS on overflow, so an absurd `FOCR_RESIDENT_*_SECS` value must not reach
+/// deadline arithmetic — in the daemon's case that panic would fire at startup
+/// and turn every later client run into a full spawn-wait stall.
+const MAX_CONFIG_SECS: u64 = 31_536_000;
+
 /// `FOCR_*` variables EXEMPT from the inference-environment fingerprint.
 ///
 /// The fingerprint is a prefix scan over every `FOCR_*` variable rather than a
@@ -112,14 +118,18 @@ fn client_read_timeout() -> Duration {
         // Zero is rejected rather than honored: `set_read_timeout(Some(ZERO))`
         // is an error in std, so a literal 0 would fail every connect.
         .filter(|&seconds| seconds > 0)
-        .map_or(DEFAULT_CLIENT_READ_TIMEOUT, Duration::from_secs)
+        .map_or(DEFAULT_CLIENT_READ_TIMEOUT, |seconds| {
+            Duration::from_secs(seconds.min(MAX_CONFIG_SECS))
+        })
 }
 
 fn spawn_wait() -> Duration {
     std::env::var("FOCR_RESIDENT_SPAWN_WAIT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
-        .map_or(DEFAULT_SPAWN_WAIT, Duration::from_secs)
+        .map_or(DEFAULT_SPAWN_WAIT, |seconds| {
+            Duration::from_secs(seconds.min(MAX_CONFIG_SECS))
+        })
 }
 
 fn idle_period() -> Duration {
@@ -127,7 +137,9 @@ fn idle_period() -> Duration {
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|&seconds| seconds > 0)
-        .map_or(DEFAULT_IDLE, Duration::from_secs)
+        .map_or(DEFAULT_IDLE, |seconds| {
+            Duration::from_secs(seconds.min(MAX_CONFIG_SECS))
+        })
 }
 
 /// Whether the resident path is enabled at all: on by default, disabled by the
