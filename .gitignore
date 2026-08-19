@@ -186,3 +186,8 @@ ios/.*-done.png
 
 # Local iPad document-walk Simulator captures
 ios/.ipad-doc*.png
+
+# Skill-loop / repo-janitor scratch
+.skill-loop-progress.md
+.skill-loop-progress-*.md
+

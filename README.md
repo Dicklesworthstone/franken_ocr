@@ -367,7 +367,7 @@ each entry carries the 1-based staff number, page-space bbox, `recognized` or
 transcribe to text. With `--extract-figures`, those regions are cropped out of the
 source image and saved into a subfolder (default `<output-stem>_figures/`, or set
 `--figures-dir DIR`), then referenced from the output: the Markdown gets a real
-`![figure N](report_figures/page1_figure_1.jpg)` in place of each figure, and the
+`![figure N](<output-stem>_figures/page1_figure_1.jpg)` in place of each figure, and the
 JSON gains a `figures` array of `{label, page, bbox, path}`. Each figure's format is
 chosen by content: JPG (quality 85) for photographic regions, lossless PNG for
 line-art / charts / screenshots. Requires `-o` (or `--figures-dir` for a stdout run).
@@ -946,7 +946,7 @@ The model weights are a separate matter. The Baidu Unlimited-OCR weights, and an
 
 ## See also
 
-- [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](./COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md), the master plan: architecture census, quantization format, the kernel-optimization catalog, the alien-artifact math families, the verification gauntlet, and the phased roadmap.
+- [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](./docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md), the master plan: architecture census, quantization format, the kernel-optimization catalog, the alien-artifact math families, the verification gauntlet, and the phased roadmap.
 - [`AGENTS.md`](./AGENTS.md), conventions for human and agent contributors, including the engineering doctrine.
 - [`CHANGELOG.md`](./CHANGELOG.md), the project history.
 - [`docs/PERF_LEDGER.md`](./docs/PERF_LEDGER.md), the honest measured perf-ratio log.

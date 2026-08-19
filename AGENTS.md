@@ -50,7 +50,7 @@ It is built on:
 - `../asupersync` — structured-concurrency runtime, for **orchestration / cancellation / IO only** (not for intra-op math parallelism).
 - `/dp/frankensqlite` (`fsqlite`) — durable local run state + telemetry (NEVER `rusqlite`).
 
-**The single source of truth for what we are building and why is [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md).** Read it before writing any kernel.
+**The single source of truth for what we are building and why is [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md).** Read it before writing any kernel.
 
 ### What this model is (one paragraph)
 
@@ -73,7 +73,7 @@ Input: **document images** (PNG/JPG/…) **and PDFs**. Scanned / image-XObject P
 ## Porting Workflow (Spec-First)
 
 Implementation follows spec documents, not ad-hoc copying. Read in this order:
-1. [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md) — the master plan (architecture, kernel strategy, phased roadmap, verification methodology).
+1. [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](docs/planning/COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md) — the master plan (architecture, kernel strategy, phased roadmap, verification methodology).
 2. The **Open Research Questions register (§13 of the plan)** — every `[OPEN]`/`OQ-N` item that MUST be resolved by reading the actual model source before the dependent kernel ships.
 3. The **reference source** in the HF repo: `modeling_unlimitedocr.py`, `modeling_deepseekv2.py` (`SlidingWindowLlamaAttention`!), `deepencoder.py`, `configuration_deepseek_v2.py`, `conversation.py`.
 
