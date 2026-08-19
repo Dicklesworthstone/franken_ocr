@@ -14,7 +14,39 @@ sections as they land.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- **Resident warm-model daemon (GH #9).** Eligible single-image `focr ocr` runs
+  are now served by a per-model background process that keeps the loaded
+  weights in RAM between invocations, so back-to-back runs skip the
+  multi-gigabyte artifact load. Loopback-TCP with a 0600 token state file
+  (identical behavior on Linux/macOS/Windows), spawned on demand from the same
+  binary, strictly serial service, idle auto-exit after 10 minutes
+  (`FOCR_RESIDENT_IDLE_SECS`). The daemon re-verifies binary version, model
+  identity, artifact mtime/length, load-resolved decode/preprocess options
+  (rehydrating on change), and a curated inference-environment fingerprint on
+  every request; any transport-shaped problem falls back to the classic
+  in-process load, so the observable contract of `focr ocr` is unchanged.
+  Opt out with `--no-resident` or `FOCR_NO_RESIDENT=1`.
+- `FOCR_STAGE_BUDGET_FORWARD_MS=0` (or `unlimited`) now disables the forward
+  stage timeout entirely instead of being silently ignored (GH #10).
+- Robot `run_error` events carry a machine-consumable `recovery` field (one
+  actionable next step per error category), and `focr robot schema` now
+  self-describes the steering environment variables, an `agent_discovery`
+  command map, and the stdout stream contract; the stale "skeleton" status
+  string is corrected.
+- Root `focr --help` gains an agent-orientation footer pointing at
+  `focr robot triage` / `schema` / `selftest` / `focr models --json`.
+
+### Fixed
+
+- `install.sh` and `install.ps1` no longer trust `GET /releases/latest`, which
+  broke every fresh install once the `models-unlimited-wasm-v1` weights release
+  became the repository's most recent release: both installers now enumerate
+  `/releases` and select the newest semver `v*` tag (GH #12).
+- `focr --version` prints only `focr <semver>` to stdout; the source/model
+  license attribution lines now go to stderr, so version parsing in pipelines
+  and idempotent updaters works with the conventional idiom (GH #13).
 
 ## [0.7.2] - 2026-07-12
 

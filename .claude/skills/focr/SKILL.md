@@ -59,15 +59,28 @@ focr robot health | jq .
 `pull` downloads the int8 `.focrq` model plus tokenizer into the local cache,
 verifies hashes, and is the only normal networked inference-prep step.
 
-### OCR one image
+### OCR one image or PDF
 
 ```bash
 focr ocr invoice.png --json
-focr ocr invoice.png --model ~/.cache/franken_ocr/models/model.focrq
+focr ocr invoice.png --model ~/.cache/franken_ocr/models/unlimited-ocr.v0.7.0.int8.focrq
+focr ocr scan.pdf --pages 3,5-9 -o excerpt.md
 ```
 
 Plain human mode writes markdown/text. `--json` writes machine-readable JSON.
 Use `--robot` when the caller consumes NDJSON lifecycle events.
+
+PDF support covers **scanned** PDFs only (pages that are image XObjects,
+rasterized natively in pure Rust). A born-digital vector/text PDF — the common
+case for a PDF on disk — fails with exit 4 and an error naming the fix:
+rasterize out of band (`pdftoppm -png -r 200 doc.pdf page`) and OCR the images.
+`JPXDecode` (JPEG 2000) and `JBIG2Decode` pages get the same treatment.
+
+Repeated single-image runs are served by the resident warm-model daemon (post
+`v0.7.2` source): the first run spawns a per-model background process holding
+the weights in RAM; later runs within 10 idle minutes skip the artifact load.
+Output is contract-identical; opt out with `--no-resident` or
+`FOCR_NO_RESIDENT=1`, tune with `FOCR_RESIDENT_IDLE_SECS`.
 
 ### OCR a batch
 

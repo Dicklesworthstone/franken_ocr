@@ -49,9 +49,9 @@ ctrlc = { version = "3.4", optional = true }
 num_cpus = "1.16"
 # FrankenTorch compute kernels for the in-process native OCR engine: int8 dynamic
 # linear (SDOT/VNNI), GEMM/sgemm, conv2d (im2col), sdpa, rms_norm, layer_norm.
-ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu" }
+ft-kernel-cpu = { path = "../frankentorch/crates/ft-kernel-cpu", package = "frankentorch-kernel-cpu" }
 # TensorMeta / DType / Device / Float16 — the meta types the kernel entrypoints take.
-ft-core = { path = "../frankentorch/crates/ft-core" }
+ft-core = { path = "../frankentorch/crates/ft-core", package = "frankentorch-core" }
 # Direct dep on `half` (the same crate ft-core re-exports as `Float16`) for its
 # SIMD bulk f16->f32 dequant; `std` enables the runtime aarch64 fp16 / x86 f16c
 # vector paths. Pinned to ft-core's major version.
@@ -226,6 +226,6 @@ strip = true
 # SigLIP forward took ~87s at opt0 vs ~2s at opt3). debug_assertions stay ON
 # (the dev profile flag, independent of opt-level), and opt-level changes no
 # IEEE semantics — no numerics drift vs release.
-[profile.dev.package.ft-kernel-cpu]
+[profile.dev.package.frankentorch-kernel-cpu]
 opt-level = 3
 debug-assertions = false
