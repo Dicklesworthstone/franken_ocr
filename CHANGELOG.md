@@ -24,7 +24,8 @@ sections as they land.
   binary, strictly serial service, idle auto-exit after 10 minutes
   (`FOCR_RESIDENT_IDLE_SECS`). The daemon re-verifies binary version, model
   identity, artifact mtime/length, load-resolved decode/preprocess options
-  (rehydrating on change), and a curated inference-environment fingerprint on
+  (rehydrating on change), and an inference-environment fingerprint (every
+  `FOCR_*` variable except a short transport/telemetry exempt list) on
   every request; any transport-shaped problem falls back to the classic
   in-process load, so the observable contract of `focr ocr` is unchanged.
   Opt out with `--no-resident` or `FOCR_NO_RESIDENT=1`.

@@ -74,36 +74,35 @@ const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 const PROTOCOL: u64 = 1;
 
-/// The curated set of environment variables that steer inference output or
-/// resolution. The daemon inherits the environment of the client that spawned
-/// it; a later client with a DIFFERENT inference environment must not be
-/// served from that process, so both sides fingerprint this list and the
-/// daemon refuses on mismatch (the client then runs inline, which honors its
-/// own environment). Keep this list in sync with the README env table's
-/// inference-affecting rows.
-const ENV_FINGERPRINT_KEYS: &[&str] = &[
-    "FOCR_DECODE_INT8",
-    "FOCR_INT8_ATTN",
-    "FOCR_INT8_LMHEAD",
-    "FOCR_DECODE_STATELESS",
-    "FOCR_QKV_FUSED",
-    "FOCR_RESAMPLE",
-    "FOCR_MAX_NEW_TOKENS",
-    "FOCR_NO_REPEAT_NGRAM",
-    "FOCR_GOT_NO_REPEAT_NGRAM",
-    "FOCR_GOT_FORMAT",
-    "FOCR_SMOLVLM2_QUESTION",
-    "FOCR_TROMR_SAMPLE",
-    "FOCR_TROMR_SEED",
-    "FOCR_TROMR_SPLIT",
-    "FOCR_FORCE_ARCH",
-    "FOCR_INT8_AUTOVEC",
-    "FOCR_THREADS",
-    "FOCR_MMAP",
-    "FOCR_UNLIMITED_VISION_CACHE",
-    "FOCR_MODEL_DIR",
-    "FOCR_QUANT",
-    "FOCR_SPEC_DECODE",
+/// `FOCR_*` variables EXEMPT from the inference-environment fingerprint.
+///
+/// The fingerprint is a prefix scan over every `FOCR_*` variable rather than a
+/// curated allow-list: the daemon inherits the environment of the client that
+/// spawned it, and a later client with a DIFFERENT inference environment must
+/// not be served from that process, so any variable this list does not exempt
+/// participates in the match and a mismatch refuses the request (the client
+/// then runs inline, which honors its own environment). The scan direction is
+/// deliberate — a NEW inference-steering variable is fingerprinted by default;
+/// forgetting to exempt a harmless one costs only an unnecessary inline
+/// fallback, while the inverse (a curated include-list missing a real steering
+/// variable) would serve a warm answer computed under the wrong environment.
+///
+/// Exempt: the resident transport's own knobs (they select HOW the run is
+/// served, not what it computes) and client-process-only surfaces (progress
+/// rendering, run telemetry, pull-time manifest override).
+const ENV_FINGERPRINT_EXEMPT: &[&str] = &[
+    "FOCR_NO_RESIDENT",
+    "FOCR_RESIDENT_IDLE_SECS",
+    "FOCR_RESIDENT_DIR",
+    "FOCR_RESIDENT_LOG",
+    "FOCR_RESIDENT_SPAWN_WAIT_SECS",
+    "FOCR_RESIDENT_CLIENT_TIMEOUT_SECS",
+    "FOCR_NO_PROGRESS",
+    "FOCR_RUN_STORE",
+    "FOCR_MANIFEST_URL",
+    // FOCR_TIMING additionally disables the resident client entirely (its
+    // stderr trace would print invisibly in the daemon).
+    "FOCR_TIMING",
 ];
 
 fn client_read_timeout() -> Duration {
@@ -254,13 +253,16 @@ fn artifact_stamp(root: &Path) -> (u64, u64) {
 }
 
 fn env_fingerprint() -> Value {
-    let mut map = serde_json::Map::new();
-    for key in ENV_FINGERPRINT_KEYS {
-        if let Ok(value) = std::env::var(key) {
-            map.insert((*key).to_owned(), Value::String(value));
+    // BTreeMap for a deterministic key order (std::env::vars() order is
+    // unspecified); Value equality is content-based either way, but the wire
+    // bytes staying stable keeps diffs in FOCR_RESIDENT_LOG readable.
+    let mut map = std::collections::BTreeMap::new();
+    for (key, value) in std::env::vars() {
+        if key.starts_with("FOCR_") && !ENV_FINGERPRINT_EXEMPT.contains(&key.as_str()) {
+            map.insert(key, Value::String(value));
         }
     }
-    Value::Object(map)
+    Value::Object(map.into_iter().collect())
 }
 
 // ------------------------------------------------------------------------ client
@@ -314,7 +316,9 @@ fn options_value(request: &ResidentRequest<'_>) -> Value {
 /// inline path would have produced.
 ///
 /// # Errors
-/// Only recognition errors reported by the daemon (`kind: "ocr"`); every
+/// Recognition errors reported by the daemon (`kind: "ocr"`), plus
+/// [`FocrError::Cancelled`] when cooperative shutdown fires while waiting for
+/// the reply (matching the inline decode loop's Ctrl+C contract); every
 /// transport-shaped failure is `Ok(None)`.
 pub fn try_recognize(request: &ResidentRequest<'_>) -> FocrResult<Option<RecognizedDocument>> {
     match connect(&request.model) {
@@ -338,6 +342,11 @@ enum ConnectFailure {
 }
 
 fn connect(root: &Path) -> Option<TcpStream> {
+    // No resolvable state directory (no cache root, no FOCR_RESIDENT_DIR):
+    // a spawned daemon would fail its state write immediately, and the poll
+    // below would then burn the full spawn wait (30 s) on EVERY run. Bail to
+    // the inline path up front instead.
+    state_path(root)?;
     let mut last = ConnectFailure::NoState;
     for attempt in 0..3 {
         if attempt > 0 {
@@ -393,8 +402,13 @@ fn connect_once(root: &Path) -> Result<TcpStream, ConnectFailure> {
             ConnectFailure::Other
         }
     })?;
+    // A SHORT per-syscall timeout, looped in `roundtrip` up to the overall
+    // client timeout: the reply wait spans a minutes-long forward, and a
+    // single long blocking read would make the client deaf to Ctrl+C (the
+    // inline path polls the cooperative-shutdown flag every decode step; the
+    // resident wait must match that responsiveness).
     stream
-        .set_read_timeout(Some(client_read_timeout()))
+        .set_read_timeout(Some(Duration::from_millis(500)))
         .map_err(|_| ConnectFailure::Other)?;
     stream.set_nodelay(true).ok();
     Ok(stream)
@@ -456,9 +470,18 @@ fn roundtrip(
 
     // Bounded single-line reply read: the reply is one JSON line; the cap
     // refuses a corrupt daemon before it sizes an allocation in this process.
+    // The socket's per-syscall timeout is short (see `connect_once`), so this
+    // loop can poll cooperative cancellation between reads — Ctrl+C aborts
+    // the wait with the same Cancelled/exit-6 contract as the inline decode
+    // loop — while the overall deadline still bounds a wedged daemon.
+    let overall_deadline = Instant::now() + client_read_timeout();
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 65536];
     let newline = loop {
+        crate::cancel_checkpoint()?;
+        if Instant::now() >= overall_deadline {
+            return Ok(None);
+        }
         match stream.read(&mut chunk) {
             Ok(0) => return Ok(None),
             Ok(count) => {
@@ -470,6 +493,13 @@ fn roundtrip(
                     return Ok(None);
                 }
             }
+            // A per-syscall timeout is the expected idle tick while the
+            // daemon's forward runs; anything else is transport-shaped.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(_) => return Ok(None),
         }
     };
@@ -590,6 +620,16 @@ pub fn run_daemon(model_root: &Path) -> FocrResult<()> {
     loop {
         match listener.accept() {
             Ok((stream, _peer)) => {
+                // Un-poison the cooperative-shutdown flag before serving. On
+                // Unix the daemon shares its spawner's process group, so a
+                // Ctrl+C during a resident-served run delivers SIGINT here
+                // too: the in-flight forward correctly aborts Cancelled, but
+                // the process-global flag would otherwise stay set and make
+                // every LATER request fail Cancelled instantly — a poisoned
+                // daemon squatting on gigabytes. The abort-the-current-run
+                // semantics are preserved (the flag is only cleared between
+                // requests); a second Ctrl+C still hard-exits.
+                crate::reset_shutdown();
                 // Serve strictly serially; a second client queues in the OS
                 // backlog. Panic-isolated: this process exists to hold a
                 // hydrated multi-gigabyte model across many calls, so one
@@ -855,13 +895,17 @@ fn handle_connection(
                 });
             }
             Err(error) => {
-                let reply = json!({
-                    "ok": false,
-                    "kind": "ocr",
-                    "exit_code": error.exit_code(),
-                    "message": error.to_string(),
-                });
-                let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                // Engine START failure (runtime build, pool install) is a
+                // property of this daemon process, not of the request or the
+                // model — refuse transport-shaped so the client falls back to
+                // its own inline engine rather than surfacing a fatal error.
+                // Model-load and recognition failures surface later, inside
+                // `recognize_with_layout_model`, as real `kind:"ocr"` errors.
+                refuse(
+                    &mut stream,
+                    "engine",
+                    &format!("resident engine start failed: {error}"),
+                );
                 return;
             }
         }
@@ -881,9 +925,6 @@ fn handle_connection(
         .recognize_with_layout_model(model_root, &image)
     {
         Ok(document) => {
-            // Model bytes are now resident: pin the artifact identity that was
-            // actually loaded (first success wins; later requests re-check
-            // against the filesystem above).
             let layout: Vec<Value> = document
                 .layout
                 .iter()
