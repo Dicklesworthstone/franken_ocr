@@ -230,6 +230,14 @@ irm https://raw.githubusercontent.com/Dicklesworthstone/franken_ocr/main/install
 
 This selects `focr-x86_64-pc-windows-msvc.exe` on AMD64 or `focr-aarch64-pc-windows-msvc.exe` on ARM64, verifies it by SHA256, and puts `focr` on your PATH. Both installers stage and execute the verified binary before an atomic replacement while holding a destination-scoped process lock, so a failed or concurrent update does not clobber a working install. Both Windows architectures are part of the v0.8.0 release matrix.
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install dicklesworthstone/tap/focr
+```
+
+The formula installs the same SHA256-pinned release binary for your platform.
+
 ### Manual binary download
 
 Release binaries are raw executables, not tar.gz archives. Each one is a single portable file that dispatches the ISA tier at runtime, so there is one binary per architecture (no per-CPU-feature variant). Linux assets are GNU binaries linked for **glibc 2.17 or newer**; the dist producer independently replays `readelf` against the exact staged bytes and refuses a higher required symbol version.
@@ -265,7 +273,16 @@ On Linux, swap the asset name and use `sha256sum -c "$asset.sha256"`.
 
 `franken_ocr` requires the nightly Rust toolchain pinned in [`rust-toolchain.toml`](./rust-toolchain.toml). `cargo build --locked --release` builds both the `focr` and `franken_ocr` binaries from one shared entrypoint.
 
-The catch: `franken_ocr` path-depends on sibling repositories that are not published on crates.io (`../asupersync`, `../frankentorch`, and `../frankensqlite`). A fresh-clone `cargo build --locked` or a `cargo install --git` will fail to resolve those dependencies. There is no working `cargo install` from crates.io. Prebuilt binaries are the supported path; build from source only if you have those sibling repositories laid out as the workspace expects.
+As of `v0.8.0` the crate and its dependency closure (`frankentorch-core`,
+`frankentorch-kernel-cpu`, the `fsqlite` family, `asupersync`) are published on
+crates.io, so `franken_ocr` can be used as a library dependency. Two caveats:
+the crate requires the pinned **nightly** toolchain on aarch64 (stdarch feature
+gates in `lib.rs`), so `cargo install franken_ocr` fails on a stable default
+toolchain there, and the registry build is not the byte-exact release binary.
+**Prebuilt binaries remain the supported install path.** A source checkout
+build still expects the sibling repositories (`../asupersync`,
+`../frankentorch`, `../frankensqlite`) laid out beside it (the workspace
+path-deps win over the registry).
 
 ```bash
 cargo build --locked --release
