@@ -18,6 +18,8 @@ include = [
     "README.md",
     "LICENSE",
     "rust-toolchain.toml",
+    # The release-bound embedded pull manifest (src/dist.rs include_str!).
+    "models/manifest-v2.json",
 ]
 
 # Two binaries from one ENTRYPOINT (the shared `franken_ocr::cli_main` in the
