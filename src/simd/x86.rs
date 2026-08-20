@@ -156,6 +156,9 @@ pub(crate) fn igemm_s8s8_with_route(
         super::dispatch::IsaTier::Sdot | super::dispatch::IsaTier::Smmla => {
             unreachable!("ARM ISA tier cannot be selected by an x86-64 build")
         }
+        super::dispatch::IsaTier::WasmSimd128 => {
+            unreachable!("wasm ISA tier cannot be selected by an x86-64 build")
+        }
     }
 }
 
@@ -232,6 +235,9 @@ pub(crate) fn igemm_u8s8_with_route(
         }
         super::dispatch::IsaTier::Sdot | super::dispatch::IsaTier::Smmla => {
             unreachable!("ARM ISA tier cannot be selected by an x86-64 build")
+        }
+        super::dispatch::IsaTier::WasmSimd128 => {
+            unreachable!("wasm ISA tier cannot be selected by an x86-64 build")
         }
     }
 }
