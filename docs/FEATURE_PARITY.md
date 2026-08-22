@@ -269,7 +269,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | locked atomic temp+fsync+rename, byte-identical re-export, one-way contract documented; migration + exit-7 refusal tested (bd-223.4) |
 | `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | present | SURF | bd-wp8.4 | LIVE: detect-then-fix, single-chokepoint mutation (backup-first, hash-logged), undo byte-identical, dry-run zero-blast, capabilities/robot-docs/robot-triage; 8/8 fixture roundtrips (`tests/doctor_fixtures.rs`) |
 | `focr resident-daemon` (hidden; the warm-model resident process, GH #9) | §7.2 | SHOULD | partial | SURF | bd-fuh2 | v0.8.0: loopback-TCP daemon w/ 0600 token state file, idle exit, version/artifact/env re-verification, inline fallback; unit protocol tests green (`src/resident.rs`); model-gated warm-run e2e still owed (bd-fuh2) — an untested speedup claim never rounds up |
-| Exit codes 0..7 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests |
+| Exit codes 0..8 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests (8 = `low_yield`, GH #15) |
 | Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | present | SURF | bd-223.7 | OnceLock; FOCR_THREADS physical-core budget (bd-223.2) |
 | Model resolution (no network at runtime) + header sniff | §7.5 | MUST | present | SURF | bd-223.7 | default auto-resolves pulled int8 (bd-3u6x); dotfile-safe shard globs |
 | `--version` carries Baidu MIT attribution | §11 | MUST | present | SURF | bd-223.14 | license compliance |

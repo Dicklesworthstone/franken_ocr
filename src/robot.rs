@@ -152,6 +152,26 @@ pub fn run_complete_event(markdown: &str) -> Value {
     })
 }
 
+/// [`run_complete_event`] with the low-yield assessment attached when one was
+/// flagged (GH #15): `low_yield: true` plus `yield_chars` and
+/// `input_megapixels`, so a machine consumer can detect a page-sized input
+/// that "succeeded" with almost no text. The fields are ADDITIVE on the
+/// already-advertised `run_complete` kind and absent entirely on healthy
+/// runs, so existing consumers and goldens are unaffected and
+/// [`ROBOT_SCHEMA_VERSION`] is unchanged.
+pub fn run_complete_event_assessed(
+    markdown: &str,
+    low_yield: Option<&crate::tall::LowYield>,
+) -> Value {
+    let mut event = run_complete_event(markdown);
+    if let Some(assessment) = low_yield {
+        event["low_yield"] = json!(true);
+        event["yield_chars"] = json!(assessment.yield_chars);
+        event["input_megapixels"] = json!(assessment.input_megapixels);
+    }
+    event
+}
+
 /// Build the robot-mode `run_error` event from the canonical [`FocrError`].
 ///
 /// This is the only place that shapes a `run_error` payload. The numeric `code`

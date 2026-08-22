@@ -412,6 +412,23 @@ whole document must fit the 32K context (roughly 290 pages); over-budget
 requests fail with an actionable error instead of truncating. It does not
 compose with `--split-spreads` or `--extract-figures` (per-page semantics).
 
+**Tall captures (full-page screenshots).** A full-page browser capture (e.g. the
+Awesome Screenshot extension) is one extremely tall image — 1:4 to 1:10 aspect.
+A single model pass over such an image squashes glyphs below legibility and used
+to come back near-empty with exit 0. Two things now happen instead. First,
+single images with height ≥ 3× width are automatically OCR'd as smart-cut
+horizontal strips (each cut lands on the blankest row near the boundary so text
+lines are not severed) and the per-strip results are merged, with layout boxes
+mapped back to source-image coordinates — no flags needed; `FOCR_TIMING=1` logs
+the strip plan. Second, a large input that still yields almost no text is
+flagged: robot mode adds `low_yield: true` (plus `yield_chars` and
+`input_megapixels`) to `run_complete`, human mode prints a stderr warning, and
+`--fail-on-low-yield` turns it into exit 8 (`low_yield`) before any output is
+written. A capture that is low-yield even after strip routing usually has
+glyphs below ~12px — re-capture at higher resolution; no OCR engine recovers
+7px text. Manual alternative for exotic layouts: cut the page yourself and run
+`focr ocr-batch strip1.png strip2.png …`.
+
 **Tasks (`--task`).** Convenience routing over the model zoo (`focr models`). `--task ocr`
 (the default) is plain document OCR, unchanged. `--task formula`, `tables`, `chart`,
 `molecular`, and `geometry` are served by GOT-OCR2's `OCR with format:` mode, so each

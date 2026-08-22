@@ -2429,6 +2429,7 @@ fn surface_error_exit_codes_are_stable() {
         (FocrError::Timeout("x".into()), 5),
         (FocrError::Cancelled, 6),
         (FocrError::FormatMismatch("x".into()), 7),
+        (FocrError::LowYield("x".into()), 8),
         (FocrError::NotImplemented("x".into()), 1),
     ];
     let mut all = true;

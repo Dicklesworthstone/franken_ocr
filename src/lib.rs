@@ -42,6 +42,7 @@ pub mod robot;
 pub mod simd;
 #[cfg(feature = "native")]
 pub mod storage;
+pub mod tall;
 pub mod tokenizer;
 
 #[cfg(feature = "native")]

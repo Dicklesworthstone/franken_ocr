@@ -357,6 +357,13 @@ pub struct OcrRequestArgs {
     /// back-to-back invocations skip the multi-gigabyte artifact load.
     #[arg(long)]
     pub no_resident: bool,
+    /// Fail (exit 8, `low_yield`) when a large input produces almost no
+    /// recognized text, instead of the default warning. A page-sized capture
+    /// yielding a handful of characters is the silent-failure signature of
+    /// tall or low-DPI screenshots (GH #15); robot consumers can instead
+    /// watch for `low_yield: true` on `run_complete`.
+    #[arg(long)]
+    pub fail_on_low_yield: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1429,20 +1436,36 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             Vec::new(),
         ),
         (None, false) => {
-            // The resident warm-model path (GH #9): serve eligible
-            // single-image runs from a per-model background daemon that keeps
-            // the weights loaded across invocations. `Ok(None)` — daemon
-            // unavailable, ineligible, or any transport-shaped failure —
-            // falls through to the classic in-process load; the observable
-            // output contract is identical either way.
-            let doc = match resident_recognition(&args, &request)? {
-                Some(doc) => doc,
-                None => recognize_with_autodownload(&request, robot_mode, |model| match model {
-                    Some(m) => engine.recognize_with_layout_model(m, &request.image),
-                    None => engine.recognize_with_layout(&request.image),
-                })?,
-            };
-            (Recognition::Single(doc), Vec::new())
+            // Tall-capture routing (GH #15): a single pass over an
+            // extreme-aspect image squashes glyphs below legibility and
+            // returns near-empty markdown with exit 0. Route such images
+            // through smart-cut horizontal strips instead (document-OCR task
+            // only — specialty outputs are not line-concatenable).
+            let tall_dims = (args.request.task == OcrTask::Ocr)
+                .then(|| image::image_dimensions(&request.image).ok())
+                .flatten()
+                .filter(|&(w, h)| crate::tall::is_tall(w, h));
+            if let Some((width, height)) = tall_dims {
+                let doc = recognize_tall_capture(&engine, &request, robot_mode, width, height)?;
+                (Recognition::Single(doc), Vec::new())
+            } else {
+                // The resident warm-model path (GH #9): serve eligible
+                // single-image runs from a per-model background daemon that keeps
+                // the weights loaded across invocations. `Ok(None)` — daemon
+                // unavailable, ineligible, or any transport-shaped failure —
+                // falls through to the classic in-process load; the observable
+                // output contract is identical either way.
+                let doc = match resident_recognition(&args, &request)? {
+                    Some(doc) => doc,
+                    None => {
+                        recognize_with_autodownload(&request, robot_mode, |model| match model {
+                            Some(m) => engine.recognize_with_layout_model(m, &request.image),
+                            None => engine.recognize_with_layout(&request.image),
+                        })?
+                    }
+                };
+                (Recognition::Single(doc), Vec::new())
+            }
         }
     };
 
@@ -1481,6 +1504,40 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     }
 
     let markdown = recognition.markdown();
+
+    // Low-yield guard (GH #15): a page-sized single image whose "successful"
+    // run produced almost no text is the silent-failure signature of tall or
+    // low-DPI captures. Flag it on `run_complete` (robot) / stderr (human),
+    // and with --fail-on-low-yield fail BEFORE any output is written so a
+    // gating pipeline never records the run as good. Judged only for the
+    // plain document-OCR task — a VQA answer is legitimately short.
+    let low_yield = if is_pdf || args.request.task != OcrTask::Ocr {
+        None
+    } else {
+        image::image_dimensions(&request.image)
+            .ok()
+            .and_then(|(w, h)| crate::tall::low_yield_assessment(markdown, w, h))
+    };
+    if let Some(assessment) = &low_yield {
+        if args.request.fail_on_low_yield {
+            return Err(FocrError::LowYield(format!(
+                "{:.2} MP input produced only {} character(s) of text (< {} chars/MP)",
+                assessment.input_megapixels,
+                assessment.yield_chars,
+                crate::tall::LOW_YIELD_CHARS_PER_MEGAPIXEL
+            )));
+        }
+        if !robot_mode {
+            eprintln!(
+                "[focr] warning: low yield — {:.2} MP input produced only {} character(s) of \
+                 recognized text. If this is a full-page capture, re-capture at higher \
+                 resolution: very tall images are tiled automatically, but glyphs below \
+                 ~12px are unrecoverable by any OCR engine.",
+                assessment.input_megapixels, assessment.yield_chars
+            );
+        }
+    }
+
     // `--json` forces JSON; a `.json` output path selects it implicitly. (When no
     // `-o` is given, `output_is_json(None)` is false, so stdout behavior is exactly
     // the legacy `args.json` choice.)
@@ -1497,7 +1554,10 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         // The terminal success event carries the recognized markdown so a machine
         // consumer actually receives the OCR result on the NDJSON stream (the
         // human / `--json` modes print it below instead).
-        emit(&robot::run_complete_event(markdown));
+        emit(&robot::run_complete_event_assessed(
+            markdown,
+            low_yield.as_ref(),
+        ));
     } else if let Some(path) = args.output.as_deref() {
         // Result already went to the file; don't also echo it to stdout. Confirm
         // on stderr so stdout stays empty/clean for any wrapping pipeline.
@@ -1649,6 +1709,46 @@ where
         }
         Err(e) => Err(e),
     }
+}
+
+/// Tall-capture strip recognition (GH #15): cut an extreme-aspect image into
+/// smart-cut horizontal strips (see [`crate::tall`] for the geometry), OCR
+/// each strip, and merge the documents (markdown in reading order, layout
+/// boxes translated back into source-image pixel space). Model resolution —
+/// including the first-run download offer — behaves exactly like the
+/// one-pass path because the strip loop runs inside
+/// [`recognize_with_autodownload`].
+fn recognize_tall_capture(
+    engine: &OcrEngine,
+    request: &OcrRequest,
+    robot_mode: bool,
+    width: u32,
+    height: u32,
+) -> FocrResult<native_engine::RecognizedDocument> {
+    let img = image::open(&request.image).map_err(|e| {
+        FocrError::InputDecode(format!("failed to decode {}: {e}", request.image.display()))
+    })?;
+    let profile = crate::tall::ink_profile(&img);
+    let plan = crate::tall::plan_strips(width, height, &profile);
+    crate::native_engine::timing_log(&format!(
+        "tall capture {}x{} (aspect {:.2}): OCR as {} strips",
+        width,
+        height,
+        f64::from(height) / f64::from(width),
+        plan.len()
+    ));
+    let strips = crate::tall::cut_strips(&img, &plan);
+    recognize_with_autodownload(request, robot_mode, |model| {
+        let mut parts = Vec::with_capacity(strips.len());
+        for (strip, bounds) in strips.iter().zip(&plan) {
+            let doc = match model {
+                Some(m) => engine.recognize_dynamic_with_layout_model(m, strip.clone())?,
+                None => engine.recognize_dynamic_with_layout(strip.clone())?,
+            };
+            parts.push((doc, bounds.top));
+        }
+        Ok(crate::tall::merge_documents(parts))
+    })
 }
 
 /// Parse a `--pages` spec ("3", "3-7", "1,5-9,218"; 1-based, inclusive
@@ -3177,6 +3277,7 @@ mod tests {
             (FocrError::Timeout("stage".into()), 5),
             (FocrError::Cancelled, 6),
             (FocrError::FormatMismatch("bad header".into()), 7),
+            (FocrError::LowYield("sparse".into()), 8),
             (FocrError::NotImplemented("phase gap".into()), 1),
             (FocrError::Other(anyhow::anyhow!("misc")), 1),
         ];
@@ -3248,6 +3349,7 @@ mod tests {
                     split_spreads: false,
                     multi_page: false,
                     no_resident: false,
+                    fail_on_low_yield: false,
                 },
                 json: false,
                 output: None,
@@ -3281,6 +3383,7 @@ mod tests {
                         split_spreads: false,
                         multi_page: false,
                         no_resident: false,
+                        fail_on_low_yield: false,
                     },
                 }),
             },
@@ -3308,6 +3411,7 @@ mod tests {
                 split_spreads: false,
                 multi_page: false,
                 no_resident: false,
+                fail_on_low_yield: false,
             },
             json: false,
             output: None,
@@ -3828,6 +3932,7 @@ mod tests {
                 split_spreads: false,
                 multi_page: false,
                 no_resident: false,
+                fail_on_low_yield: false,
             },
             json: false,
             output: None,

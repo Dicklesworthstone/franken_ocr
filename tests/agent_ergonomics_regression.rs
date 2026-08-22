@@ -73,7 +73,7 @@ fn robot_triage_is_a_one_round_trip_mega_command() {
             .as_array()
             .is_some_and(|r| !r.is_empty())
         && !v["commands"].is_null()
-        && v["exit_codes"].as_array().is_some_and(|c| c.len() == 8);
+        && v["exit_codes"].as_array().is_some_and(|c| c.len() == 9);
     // State-aware: the hermetic environment has no model. Triage must lead with
     // the compatible default pull while retaining the explicit local/raw path.
     let recommendations = v["recommendations"]
@@ -111,7 +111,7 @@ fn robot_schema_is_self_describing() {
     let ok = out.status.code() == Some(0)
         && v["schema_version"].as_i64() == Some(1)
         && v["events"].as_array().is_some_and(|e| !e.is_empty())
-        && v["exit_codes"].as_array().is_some_and(|c| c.len() == 8);
+        && v["exit_codes"].as_array().is_some_and(|c| c.len() == 9);
     emit("self_describing_contract", ok, "");
     assert!(ok, "robot schema not self-describing");
 }

@@ -27,6 +27,7 @@ pub const EXIT_INPUT_DECODE: i32 = 4;
 pub const EXIT_TIMEOUT: i32 = 5;
 pub const EXIT_CANCELLED: i32 = 6;
 pub const EXIT_FORMAT_MISMATCH: i32 = 7;
+pub const EXIT_LOW_YIELD: i32 = 8;
 
 /// The frozen exit-code table (plan §7.4).
 ///
@@ -74,6 +75,12 @@ pub const EXIT_CODE_TABLE: &[ExitCodeSpec] = &[
         name: "format_mismatch",
         meaning: "format or version mismatch",
     },
+    ExitCodeSpec {
+        code: EXIT_LOW_YIELD,
+        name: "low_yield",
+        meaning: "run completed but a large input yielded almost no text and \
+                  --fail-on-low-yield was set",
+    },
 ];
 
 /// Top-level error. Each variant maps to a stable exit code via
@@ -104,6 +111,11 @@ pub enum FocrError {
     #[error("format/version mismatch: {0}")]
     FormatMismatch(String),
 
+    /// A large input produced almost no recognized text and the run was
+    /// asked to treat that as fatal (`--fail-on-low-yield`, GH #15).
+    #[error("low yield: {0}")]
+    LowYield(String),
+
     /// A surface that is planned but not yet implemented in this phase.
     #[error("not yet implemented: {0}")]
     NotImplemented(String),
@@ -125,6 +137,7 @@ impl FocrError {
             FocrError::Timeout(_) => EXIT_TIMEOUT,
             FocrError::Cancelled => EXIT_CANCELLED,
             FocrError::FormatMismatch(_) => EXIT_FORMAT_MISMATCH,
+            FocrError::LowYield(_) => EXIT_LOW_YIELD,
             FocrError::NotImplemented(_) | FocrError::Other(_) => EXIT_GENERIC,
         }
     }
@@ -160,6 +173,11 @@ impl FocrError {
                 "the artifact/manifest does not match this binary's contract; re-run `focr pull` \
                  for a compatible artifact and do not rename artifacts to bypass verification"
             }
+            FocrError::LowYield(_) => {
+                "the input is likely a low-DPI or extreme-aspect capture: re-capture at higher \
+                 resolution (glyphs below ~12px are unrecoverable by any OCR engine), or drop \
+                 --fail-on-low-yield to accept the sparse result"
+            }
             FocrError::NotImplemented(_) => {
                 "this surface is planned but not implemented; `focr models` shows ready vs \
                  planned models and `focr robot triage` lists working commands"
@@ -181,6 +199,7 @@ impl FocrError {
             FocrError::Timeout(_) => "timeout",
             FocrError::Cancelled => "cancelled",
             FocrError::FormatMismatch(_) => "format_mismatch",
+            FocrError::LowYield(_) => "low_yield",
             FocrError::NotImplemented(_) => "not_implemented",
             FocrError::Other(_) => "generic",
         }
@@ -209,6 +228,7 @@ mod tests {
             FocrError::FormatMismatch("x".into()).exit_code(),
             EXIT_FORMAT_MISMATCH
         );
+        assert_eq!(FocrError::LowYield("x".into()).exit_code(), EXIT_LOW_YIELD);
         assert_eq!(
             FocrError::NotImplemented("x".into()).exit_code(),
             EXIT_GENERIC
@@ -233,6 +253,7 @@ mod tests {
                 EXIT_TIMEOUT,
                 EXIT_CANCELLED,
                 EXIT_FORMAT_MISMATCH,
+                EXIT_LOW_YIELD,
             ])
         );
         assert_eq!(codes.len(), EXIT_CODE_TABLE.len());
@@ -247,6 +268,7 @@ mod tests {
             (FocrError::Timeout("x".into()), "timeout"),
             (FocrError::Cancelled, "cancelled"),
             (FocrError::FormatMismatch("x".into()), "format_mismatch"),
+            (FocrError::LowYield("x".into()), "low_yield"),
             (FocrError::NotImplemented("x".into()), "not_implemented"),
             (FocrError::Other(anyhow::anyhow!("x")), "generic"),
         ];

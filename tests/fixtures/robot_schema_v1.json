@@ -126,6 +126,11 @@
       "code": 7,
       "meaning": "format or version mismatch",
       "name": "format_mismatch"
+    },
+    {
+      "code": 8,
+      "meaning": "run completed but a large input yielded almost no text and --fail-on-low-yield was set",
+      "name": "low_yield"
     }
   ],
   "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
