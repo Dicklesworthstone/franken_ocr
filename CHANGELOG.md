@@ -4,13 +4,14 @@ All notable changes to `franken_ocr` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Scope window: project inception on 2026-06-24 through HEAD on 2026-08-19.
+Scope window: project inception on 2026-06-24 through HEAD on 2026-08-22.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
-| Unreleased | commits on `main` | 2026-07-12 → 2026-08-19 | wasm/int4 browser path, iOS ABI, resident daemon, janitor docs-reorg |
+| [`v0.9.0`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.9.0) | Release | 2026-08-22 | Tall-capture strip routing + low-yield guard (GH #15) |
+| [`v0.8.0`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.8.0) | Release | 2026-08-19 | Resident daemon, installer repair, machine-parseable `--version` |
 | [`models-unlimited-wasm-v1`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/models-unlimited-wasm-v1) | Release (artifact, not SemVer) | 2026-08-11 | Unlimited-OCR wasm-int4 browser artifact |
 | [`v0.7.2`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.7.2) | Release | 2026-07-12 | Latest software tag before HEAD |
 
@@ -25,6 +26,46 @@ sections as they land.
 ## [Unreleased]
 
 No changes yet.
+
+## [0.9.0] - 2026-08-22
+
+Tall full-page capture support (GH #15): browser-extension "full page"
+screenshots with extreme aspect ratios no longer come back near-empty with
+exit 0.
+
+### Added
+
+- **Tall-capture strip routing (GH #15).** Single images at least 3× taller
+  than wide are automatically OCRed as smart-cut horizontal strips: cut lines
+  are chosen at minimum-ink rows so text lines are not severed, each strip runs
+  through the standard pipeline, and layout boxes are retranslated into
+  whole-image coordinates. ([`6b30d36`](https://github.com/Dicklesworthstone/franken_ocr/commit/6b30d36))
+- **Low-yield guard.** Runs on images ≥ 0.5 MP that produce fewer than
+  50 characters per megapixel now mark the result as `low_yield` on the
+  `run_complete` robot event and warn on stderr. Opt-in `--fail-on-low-yield`
+  converts that condition into new stable exit code 8 so automation can stop
+  treating silent near-empty output as success. Robot schema stays v1
+  (additive fields); the frozen schema fixture, surface matrix, and parity
+  pins were updated in lockstep.
+
+### Changed
+
+- Path-dep pins refreshed: asupersync 0.4.9, fsqlite 0.3.8
+  ([`59599bf`](https://github.com/Dicklesworthstone/franken_ocr/commit/59599bf)).
+- README documents the tall-capture behavior and the low-yield contract.
+
+### Fixed
+
+- crates.io package now ships `models/manifest-v2.json`, repairing
+  `cargo install` builds of the embedded pull manifest
+  ([`44150fa`](https://github.com/Dicklesworthstone/franken_ocr/commit/44150fa)).
+
+### Known gaps
+
+- The tall-capture path is verified by 18 unit tests on synthetic tall images
+  (including the exact 494×2000 incident shape from GH #15); a model-level
+  end-to-end run on real full-page captures was not part of the release gate
+  because model weights are not present on the build hosts' gate machines.
 
 ## [0.8.0] - 2026-08-19
 

@@ -59,9 +59,9 @@ env:
   RUST_TOOLCHAIN: nightly-2026-07-09
   # The sibling path dependencies are part of the release input. Keep these
   # immutable revisions aligned with the package versions in Cargo.lock.
-  FRANKENTORCH_REV: 062cf3671c194f6ab184da98f0559ebc76cff7c7
-  FRANKENSQLITE_REV: cd9990bb16291d8c7c247b75b47faae8d7701adb
-  ASUPERSYNC_REV: 53aa5c72f855352148c3a88e6961f7f09adb535c
+  FRANKENTORCH_REV: 9627f39cea7462b8f6d55bed5009c271ec6c736b
+  FRANKENSQLITE_REV: 339410c42a14cb91c7b0cf861d55d1a45a05a79c
+  ASUPERSYNC_REV: 76c9363726b9730f10210b995250f08b44fbc62e
 
 jobs:
   dist:

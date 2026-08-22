@@ -1,6 +1,6 @@
 [package]
 name = "franken_ocr"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2024"
 # MIT with the OpenAI/Anthropic rider is not an SPDX expression; ship the file
 # (the frankensqlite precedent for the same rider text).
