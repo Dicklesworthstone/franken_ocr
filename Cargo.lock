@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "franken_ocr"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "anyhow",
  "asupersync 0.3.10",
