@@ -60,7 +60,7 @@ env:
   # The sibling path dependencies are part of the release input. Keep these
   # immutable revisions aligned with the package versions in Cargo.lock.
   FRANKENTORCH_REV: 9627f39cea7462b8f6d55bed5009c271ec6c736b
-  FRANKENSQLITE_REV: 339410c42a14cb91c7b0cf861d55d1a45a05a79c
+  FRANKENSQLITE_REV: bda321183f4cc257e23c14d008f5d67b769e7093
   ASUPERSYNC_REV: 76c9363726b9730f10210b995250f08b44fbc62e
 
 jobs:
