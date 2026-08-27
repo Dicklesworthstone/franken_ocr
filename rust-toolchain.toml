@@ -1,5 +1,5 @@
 [toolchain]
 # Pin the exact nightly exercised by the cross-platform release matrix. Advance
 # this deliberately with the CI `RUST_TOOLCHAIN` value after all targets pass.
-channel = "nightly-2026-07-09"
+channel = "nightly-2026-08-25"
 components = ["clippy", "rustfmt"]

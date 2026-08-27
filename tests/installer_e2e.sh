@@ -499,12 +499,12 @@ EOF
     fi
   done
 
-  if ! grep -Fqx 'channel = "nightly-2026-07-09"' "$TOOLCHAIN_TOML"; then
-    bad "rust-toolchain.toml is not pinned to nightly-2026-07-09"
+  if ! grep -Fqx 'channel = "nightly-2026-08-25"' "$TOOLCHAIN_TOML"; then
+    bad "rust-toolchain.toml is not pinned to nightly-2026-08-25"
     matrix_contract_ok=0
   fi
   for workflow in "$CI_YML" "$DIST_YML"; do
-    if ! grep -Fq 'RUST_TOOLCHAIN: nightly-2026-07-09' "$workflow"; then
+    if ! grep -Fq 'RUST_TOOLCHAIN: nightly-2026-08-25' "$workflow"; then
       bad "$(basename "$workflow") does not install the pinned repo toolchain"
       matrix_contract_ok=0
     fi

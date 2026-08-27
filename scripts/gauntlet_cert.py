@@ -11288,7 +11288,7 @@ def self_test() -> int:
     )
 
     legacy_tag_inputs = {
-        "RUST_TOOLCHAIN": "nightly-2026-07-09",
+        "RUST_TOOLCHAIN": "nightly-2026-08-25",
         "FRANKENTORCH_REV": "f00c3ce79737ffd0e7c7e2f2e81540907ce26562",
         "FRANKENSQLITE_REV": "14c5781680833c248ed18d84914312e233d145df",
         "ASUPERSYNC_REV": "e7e96829632d89815248a0809499332ab0beabcb",
@@ -11297,7 +11297,7 @@ def self_test() -> int:
         f"  {name}: {value}\n" for name, value in legacy_tag_inputs.items()
     )
     parsed_legacy_inputs = _parse_tag_owned_dist_release_inputs(
-        legacy_tag_workflow, "nightly-2026-07-09"
+        legacy_tag_workflow, "nightly-2026-08-25"
     )
     check(
         "dist_release_inputs_parse_exact_legacy_tag",
@@ -11332,7 +11332,7 @@ def self_test() -> int:
             legacy_tag_workflow.replace(
                 f"  ASUPERSYNC_REV: {legacy_tag_inputs['ASUPERSYNC_REV']}\n", ""
             ),
-            "nightly-2026-07-09",
+            "nightly-2026-08-25",
         ),
     )
     check(
@@ -11340,7 +11340,7 @@ def self_test() -> int:
         release_input_parse_rejected(
             legacy_tag_workflow
             + f"  ASUPERSYNC_REV: {legacy_tag_inputs['ASUPERSYNC_REV']}\n",
-            "nightly-2026-07-09",
+            "nightly-2026-08-25",
         ),
     )
     check(
@@ -11349,7 +11349,7 @@ def self_test() -> int:
             legacy_tag_workflow.replace(
                 legacy_tag_inputs["ASUPERSYNC_REV"], "not-a-revision"
             ),
-            "nightly-2026-07-09",
+            "nightly-2026-08-25",
         ),
     )
     check(

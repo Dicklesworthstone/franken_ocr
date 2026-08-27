@@ -44,7 +44,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: nightly-2026-07-09
+  RUST_TOOLCHAIN: nightly-2026-08-25
   # Path dependencies are build inputs. Keep these immutable revisions aligned
   # with the package versions recorded in Cargo.lock; update them deliberately
   # and together, never by floating each job on sibling `main`.

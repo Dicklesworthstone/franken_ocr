@@ -56,7 +56,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_TOOLCHAIN: nightly-2026-07-09
+  RUST_TOOLCHAIN: nightly-2026-08-25
   # The sibling path dependencies are part of the release input. Keep these
   # immutable revisions aligned with the package versions in Cargo.lock.
   FRANKENTORCH_REV: 9627f39cea7462b8f6d55bed5009c271ec6c736b
