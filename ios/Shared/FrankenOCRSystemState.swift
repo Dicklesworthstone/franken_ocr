@@ -55,8 +55,8 @@ struct FrankenOCRWidgetSnapshot: Codable, Hashable {
 
     static let placeholder = FrankenOCRWidgetSnapshot(
         readiness: .ready,
-        headline: "Vision table ready",
-        detail: "Private OCR on this device",
+        headline: "Open the Vision Table",
+        detail: "Recognize text privately on this device",
         updatedAt: .now
     )
 }

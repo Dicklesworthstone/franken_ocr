@@ -10,9 +10,9 @@
 # release build of the whole engine, which is not something anyone wants on
 # every Cmd-R. The xcframework is a build artifact and is gitignored.
 #
-# Two cargo targets, no lipo. `lipo` cannot hold two arm64 slices in one file,
-# and device and simulator are both arm64 — which is precisely the problem the
-# xcframework format exists to solve.
+# Device and simulator remain separate XCFramework slices because `lipo` cannot
+# hold their two arm64 libraries in one file. Catalyst, by contrast, is one
+# platform slice and combines its arm64 and x86_64 libraries with `lipo`.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -42,7 +42,8 @@ done
 HEADERS="$(mktemp -d /tmp/focr-ios-headers.XXXXXX)"
 cp "$CRATE/include/focr_ios.h" "$CRATE/include/module.modulemap" "$HEADERS/"
 
-CATALYST_LIB=$(mktemp /tmp/libfocr_ios-maccatalyst.XXXXXX)
+CATALYST_ROOT=$(mktemp -d /tmp/focr-ios-maccatalyst.XXXXXX)
+CATALYST_LIB="$CATALYST_ROOT/libfocr_ios.a"
 lipo -create \
   "$TARGET_DIR/aarch64-apple-ios-macabi/$PROFILE/$LIB" \
   "$TARGET_DIR/x86_64-apple-ios-macabi/$PROFILE/$LIB" \

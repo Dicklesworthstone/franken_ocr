@@ -1,4 +1,5 @@
 import ActivityKit
+import Foundation
 import SwiftUI
 import WidgetKit
 
@@ -69,8 +70,7 @@ struct FrankenOCRLiveActivity: Widget {
                     Image(systemName: icon(context.state.status)).font(.title2.bold()).foregroundStyle(visionGold)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text(timerInterval: context.attributes.startedAt...Date.distantFuture, countsDown: false)
-                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    OCRElapsedView(context: context)
                 }
                 DynamicIslandExpandedRegion(.center) {
                     Text(context.state.stage).font(.headline).lineLimit(1)
@@ -118,10 +118,32 @@ private struct OCRLockView: View {
                 OCRUnitRail(state: context.state)
             }
             Spacer(minLength: 4)
+            OCRElapsedView(context: context)
+        }
+        .padding(15)
+    }
+}
+
+private struct OCRElapsedView: View {
+    let context: ActivityViewContext<FrankenOCRRunActivityAttributes>
+
+    @ViewBuilder
+    var body: some View {
+        if context.state.status == .complete
+            || context.state.status == .cancelled
+            || context.state.status == .failed
+        {
+            Text(Self.clock(context.state.elapsedSeconds))
+                .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+        } else {
             Text(timerInterval: context.attributes.startedAt...Date.distantFuture, countsDown: false)
                 .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
         }
-        .padding(15)
+    }
+
+    private static func clock(_ seconds: Int) -> String {
+        let value = max(0, seconds)
+        return String(format: "%d:%02d", value / 60, value % 60)
     }
 }
 

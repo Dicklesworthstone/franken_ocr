@@ -54,101 +54,126 @@ struct OcrReactorView: View {
     }
 
     var body: some View {
+        reactorCard
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("OCR processing reactor")
+            .accessibilityValue("\(headline). \(explanation)")
+    }
+
+    private var reactorCard: some View {
+        reactorTimeline
+            .padding(17)
+            .background { reactorBackground }
+            .overlay { reactorBorder }
+            .shadow(color: Lab.accent.opacity(0.18), radius: 28, y: 14)
+    }
+
+    private var reactorTimeline: some View {
         TimelineView(
             .animation(
                 minimumInterval: animationConstrained ? 1.0 / 12.0 : 1.0 / 24.0,
                 paused: reduceMotion
             )
         ) { timeline in
-            VStack(alignment: .leading, spacing: 15) {
-                HStack(alignment: .top, spacing: 12) {
-                    ZStack {
-                        Circle().fill(Lab.accent.opacity(0.12))
-                        Circle().strokeBorder(Lab.accent.opacity(0.52), lineWidth: 1)
-                        Image(systemName: symbol)
-                            .font(.system(size: 18, weight: .bold))
-                            .foregroundStyle(Lab.accent)
-                            .symbolEffect(.pulse, isActive: !reduceMotion)
-                    }
-                    .frame(width: 44, height: 44)
-
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(headline.uppercased())
-                            .font(.system(size: 13, weight: .heavy, design: .monospaced))
-                            .tracking(1.4)
-                            .foregroundStyle(Lab.textPrimary)
-                        Text(explanation)
-                            .font(.system(size: 12))
-                            .foregroundStyle(Lab.textDim)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 8)
-                    Text(Self.clock(elapsed))
-                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(Lab.textFaint)
-                        .monospacedDigit()
-                }
-
-                reactorCanvas(time: timeline.date.timeIntervalSinceReferenceDate)
-                    .frame(height: 226)
-                    .accessibilityHidden(true)
-
-                LabProgressBar(fraction: fraction)
-                HStack(spacing: 8) {
-                    metric(
-                        "PAGE",
-                        pageCount > 0
-                            ? "\(currentPage ?? min(pageCount, completedPages + 1))/\(pageCount)"
-                            : "1/1"
-                    )
-                    metric("UNITS", unitValue)
-                    metric("TEXT", emittedCharacters > 0 ? emittedCharacters.formatted() : "—")
-                    metric("PROGRESS", "\(Int(fraction * 100))%\(isEstimated ? "≈" : "")")
-                }
-
-                if isEstimated {
-                    Label(
-                        "Decode completion is an estimate; token count is exact and EOS is unknowable in advance.",
-                        systemImage: "waveform.path.ecg"
-                    )
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(Lab.textFaint)
-                }
-
-                Button(role: .cancel, action: cancel) {
-                    Label("Cancel recognition", systemImage: "stop.fill")
-                }
-                .buttonStyle(GhostButtonStyle(tint: Lab.red))
-            }
+            reactorContent(at: timeline.date)
         }
-        .padding(17)
-        .background {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(reduceTransparency ? Lab.backgroundDeep : Lab.inset.opacity(0.92))
-                .overlay {
-                    LinearGradient(
-                        colors: [Lab.accent.opacity(0.1), .clear, Lab.violet.opacity(0.07)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                }
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .strokeBorder(
-                    LinearGradient(
-                        colors: [Lab.accent.opacity(0.55), Lab.line, Lab.violet.opacity(0.2)],
-                        startPoint: .topLeading,
-                        endPoint: .bottomTrailing
-                    ),
-                    lineWidth: 1
+    }
+
+    private var reactorBackground: some View {
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .fill(reduceTransparency ? Lab.backgroundDeep : Lab.inset.opacity(0.92))
+            .overlay {
+                LinearGradient(
+                    colors: [Lab.accent.opacity(0.1), .clear, Lab.violet.opacity(0.07)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
                 )
+                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
+            }
+    }
+
+    private var reactorBorder: some View {
+        RoundedRectangle(cornerRadius: 22, style: .continuous)
+            .strokeBorder(
+                LinearGradient(
+                    colors: [Lab.accent.opacity(0.55), Lab.line, Lab.violet.opacity(0.2)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                ),
+                lineWidth: 1
+            )
+    }
+
+    @ViewBuilder
+    private func reactorContent(at date: Date) -> some View {
+        VStack(alignment: .leading, spacing: 15) {
+            reactorHeader
+
+            reactorCanvas(time: date.timeIntervalSinceReferenceDate)
+                .frame(height: 226)
+                .accessibilityHidden(true)
+
+            LabProgressBar(fraction: fraction)
+            metricRow
+
+            if isEstimated {
+                Label(
+                    "Decode completion is an estimate; token count is exact and EOS is unknowable in advance.",
+                    systemImage: "waveform.path.ecg"
+                )
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(Lab.textFaint)
+            }
+
+            Button(role: .cancel, action: cancel) {
+                Label("Cancel recognition", systemImage: "stop.fill")
+            }
+            .buttonStyle(GhostButtonStyle(tint: Lab.red))
         }
-        .shadow(color: Lab.accent.opacity(0.18), radius: 28, y: 14)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("OCR processing reactor")
-        .accessibilityValue("\(headline). \(explanation)")
+    }
+
+    private var reactorHeader: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                Circle().fill(Lab.accent.opacity(0.12))
+                Circle().strokeBorder(Lab.accent.opacity(0.52), lineWidth: 1)
+                Image(systemName: symbol)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundStyle(Lab.accent)
+                    .symbolEffect(.pulse, isActive: !reduceMotion)
+            }
+            .frame(width: 44, height: 44)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(headline.uppercased())
+                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                    .tracking(1.4)
+                    .foregroundStyle(Lab.textPrimary)
+                Text(explanation)
+                    .font(.system(size: 12))
+                    .foregroundStyle(Lab.textDim)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            Text(Self.clock(elapsed))
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Lab.textFaint)
+                .monospacedDigit()
+        }
+    }
+
+    private var metricRow: some View {
+        HStack(spacing: 8) {
+            metric(
+                "PAGE",
+                pageCount > 0
+                    ? "\(currentPage ?? min(pageCount, completedPages + 1))/\(pageCount)"
+                    : "1/1"
+            )
+            metric("UNITS", unitValue)
+            metric("TEXT", emittedCharacters > 0 ? emittedCharacters.formatted() : "—")
+            metric("PROGRESS", "\(Int(fraction * 100))%\(isEstimated ? "≈" : "")")
+        }
     }
 
     private var animationConstrained: Bool {

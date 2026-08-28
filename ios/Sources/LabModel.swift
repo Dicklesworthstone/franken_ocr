@@ -236,7 +236,13 @@ final class LabModel {
         let skipped = pageOutcomes.filter { if case .skipped = $0.state { true } else { false } }.count
         var parts: [String] = []
         if let index = currentPageIndex {
-            parts.append("Page \(pageOutcomes[index].id) of \(total)")
+            let sourcePage = pageOutcomes[index].id
+            if total == pdfPageCount, sourcePage == index + 1 {
+                parts.append("Page \(sourcePage) of \(total)")
+            } else {
+                parts.append("Source page \(sourcePage) of \(pdfPageCount)")
+                parts.append("\(index + 1) of \(total) selected")
+            }
         } else {
             parts.append("\(total) page\(total == 1 ? "" : "s")")
         }
@@ -373,6 +379,11 @@ final class LabModel {
         var errorDescription: String? { message }
     }
 
+    private struct RunInputError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
     /// Resolve `pageSelection` into 1-based page numbers in source order with
     /// duplicates removed. Empty selection means the whole document.
     ///
@@ -463,8 +474,11 @@ final class LabModel {
         // A minutes-long run must not be interrupted by the screen sleeping,
         // which suspends the app. A whole document is much longer still.
         UIApplication.shared.isIdleTimerDisabled = true
+        let wallClockStarted = Date()
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.elapsed += 0.5 }
+            Task { @MainActor in
+                self?.elapsed = Date().timeIntervalSince(wallClockStarted)
+            }
         }
 
         recognizeTask = Task { [weak self] in
@@ -514,7 +528,9 @@ final class LabModel {
 
     /// The plain single-image path.
     private func recognizeSingleImage(generation runGeneration: Int) async throws {
-        guard let imageData else { return }
+        guard let imageData else {
+            throw RunInputError(message: "The selected image is no longer available. Choose it again and retry.")
+        }
         let started = Date()
         let result = try await engine.recognize(imageData: imageData) { [weak self] update in
             Task { @MainActor [weak self] in
@@ -559,7 +575,9 @@ final class LabModel {
     /// continues, matching the CLI: one JPEG-2000 page in a 300-page scan must
     /// not throw away the other 299.
     private func recognizeDocument(generation runGeneration: Int) async throws {
-        guard let pdf else { return }
+        guard let pdf else {
+            throw RunInputError(message: "The selected document is no longer available. Choose it again and retry.")
+        }
         let started = Date()
 
         for (index, outcome) in pageOutcomes.enumerated() {
@@ -622,6 +640,20 @@ final class LabModel {
         lastRunSeconds = seconds
         let done = completedPageCount
         let skipped = pageOutcomes.filter { if case .skipped = $0.state { true } else { false } }.count
+        if done == 0 {
+            statusKind = .err
+            status = String(
+                format: "No pages could be recognized in %.0fs · %d skipped. Review the page errors and try another model or source file.",
+                seconds, skipped
+            )
+            runActivity.finish(
+                status: .failed,
+                headline: "No pages recognized",
+                detail: "Open FrankenOCR to review \(skipped) page error\(skipped == 1 ? "" : "s")"
+            )
+            return
+        }
+
         statusKind = skipped == 0 ? .ok : .warn
         status = String(
             format: "%d of %d pages in %.0fs%@, entirely on this device.",
@@ -636,7 +668,10 @@ final class LabModel {
     }
 
     private func publishActivity(_ update: ProgressUpdate) {
-        let page = currentPageIndex.map { pageOutcomes[$0].id } ?? (isDocumentRun ? 1 : 0)
+        // Activity progress is the position within this run, not the source PDF
+        // page number. A selection such as 5-9 must read 1/5 through 5/5 rather
+        // than producing impossible labels such as "Page 6 of 5".
+        let page = currentPageIndex.map { $0 + 1 } ?? (isDocumentRun ? 1 : 0)
         runActivity.update(
             progress: update,
             page: page,
