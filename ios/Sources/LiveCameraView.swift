@@ -327,8 +327,18 @@ private struct FlyingTextStrip: Identifiable {
     let duration: TimeInterval
 }
 
+private struct CaptureTrayTopPreference: PreferenceKey {
+    static let defaultValue: CGFloat? = nil
+
+    static func reduce(value: inout CGFloat?, nextValue: () -> CGFloat?) {
+        guard let next = nextValue() else { return }
+        value = value.map { min($0, next) } ?? next
+    }
+}
+
 private struct TextWarpLayer: View {
     let strips: [FlyingTextStrip]
+    let landingY: CGFloat?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -343,6 +353,11 @@ private struct TextWarpLayer: View {
                     }
                 }
             }
+            // Canvas has no intrinsic size. Without this expansion SwiftUI can
+            // legally collapse the animation layer to zero even though the
+            // camera and overlay fill the screen.
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .ignoresSafeArea()
             .allowsHitTesting(false)
         }
     }
@@ -354,36 +369,74 @@ private struct TextWarpLayer: View {
         size: CGSize
     ) {
         let start = CGPoint(x: strip.origin.x * size.width, y: strip.origin.y * size.height)
-        let end = CGPoint(x: strip.destinationX * size.width, y: size.height * 0.75)
+        let trayEdge = landingY ?? size.height * 0.75
+        let end = CGPoint(
+            x: strip.destinationX * size.width,
+            y: min(size.height - 24, max(size.height * 0.48, trayEdge + 18))
+        )
         let control = CGPoint(
             x: (start.x + end.x) * 0.5 + strip.curve * size.width,
             y: min(start.y, end.y) - 62
         )
-        let resolved = context.resolve(
-            Text(String(strip.text.prefix(34)))
-                .font(.system(size: 13, weight: .black, design: .monospaced))
-                .foregroundStyle(Lab.accent)
-        )
 
-        // A short coherent trail makes the line appear to bend into the tray.
-        // Every trail sample repeats the same recognized line; there is no
-        // decorative or randomly generated character stream.
-        for trailIndex in stride(from: 3, through: 0, by: -1) {
-            let t = max(0, progress - CGFloat(trailIndex) * 0.035)
-            let eased = t * t * (3 - 2 * t)
-            let oneMinus = 1 - eased
-            let point = CGPoint(
-                x: oneMinus * oneMinus * start.x
-                    + 2 * oneMinus * eased * control.x
-                    + eased * eased * end.x,
-                y: oneMinus * oneMinus * start.y
-                    + 2 * oneMinus * eased * control.y
-                    + eased * eased * end.y
+        // Draw the actual recognized glyphs along the curve. Each character's
+        // position and rotation follow the Bézier tangent, so the line visibly
+        // bends into the tray instead of translating as one rigid label.
+        let glyphs = Array(strip.text.prefix(34))
+        guard !glyphs.isEmpty else { return }
+        let eased = progress * progress * (3 - 2 * progress)
+        let curveSpan = min(0.24, CGFloat(glyphs.count) * 0.010)
+        let fade = min(1, max(0, (1 - progress) / 0.18))
+
+        for (index, glyph) in glyphs.enumerated() {
+            let fraction = glyphs.count == 1
+                ? 1
+                : CGFloat(index) / CGFloat(glyphs.count - 1)
+            let t = min(1, max(0, eased - (1 - fraction) * curveSpan))
+            let point = bezierPoint(t, start: start, control: control, end: end)
+            let tangent = bezierTangent(t, start: start, control: control, end: end)
+            let angle = atan2(tangent.y, tangent.x)
+            let resolved = context.resolve(
+                Text(String(glyph))
+                    .font(.system(size: 13, weight: .black, design: .monospaced))
+                    .foregroundStyle(Lab.accent)
             )
             var copy = context
-            copy.opacity = Double((1 - progress) * (trailIndex == 0 ? 0.95 : 0.12))
-            copy.draw(resolved, at: point, anchor: .center)
+            copy.opacity = Double(fade * (0.72 + 0.28 * fraction))
+            copy.translateBy(x: point.x, y: point.y)
+            copy.rotate(by: .radians(Double(angle)))
+            copy.scaleBy(x: 1 - 0.28 * progress, y: 1 - 0.18 * progress)
+            copy.draw(resolved, at: .zero, anchor: .center)
         }
+    }
+
+    private func bezierPoint(
+        _ t: CGFloat,
+        start: CGPoint,
+        control: CGPoint,
+        end: CGPoint
+    ) -> CGPoint {
+        let oneMinus = 1 - t
+        return CGPoint(
+            x: oneMinus * oneMinus * start.x
+                + 2 * oneMinus * t * control.x
+                + t * t * end.x,
+            y: oneMinus * oneMinus * start.y
+                + 2 * oneMinus * t * control.y
+                + t * t * end.y
+        )
+    }
+
+    private func bezierTangent(
+        _ t: CGFloat,
+        start: CGPoint,
+        control: CGPoint,
+        end: CGPoint
+    ) -> CGPoint {
+        CGPoint(
+            x: 2 * (1 - t) * (control.x - start.x) + 2 * t * (end.x - control.x),
+            y: 2 * (1 - t) * (control.y - start.y) + 2 * t * (end.y - control.y)
+        )
     }
 }
 
@@ -432,6 +485,7 @@ struct LiveCameraView: View {
     @StateObject private var camera = LiveCameraController()
     @State private var accumulator = LiveTextAccumulator()
     @State private var strips: [FlyingTextStrip] = []
+    @State private var captureTrayTop: CGFloat?
     @State private var copied = false
     @State private var isFinishing = false
 
@@ -450,7 +504,7 @@ struct LiveCameraView: View {
             .ignoresSafeArea()
 
             ScannerReticle()
-            TextWarpLayer(strips: strips)
+            TextWarpLayer(strips: strips, landingY: captureTrayTop)
 
             VStack(spacing: 0) {
                 topBar
@@ -464,6 +518,7 @@ struct LiveCameraView: View {
 
             if let error = camera.errorMessage { errorOverlay(error) }
         }
+        .coordinateSpace(name: "liveCameraSurface")
         .preferredColorScheme(.dark)
         .tint(Lab.accent)
         .onDisappear { camera.stop() }
@@ -471,6 +526,7 @@ struct LiveCameraView: View {
             guard let batch = camera.latestBatch else { return }
             ingest(batch)
         }
+        .onPreferenceChange(CaptureTrayTopPreference.self) { captureTrayTop = $0 }
     }
 
     private var topBar: some View {
@@ -586,6 +642,14 @@ struct LiveCameraView: View {
             RoundedRectangle(cornerRadius: 18)
                 .strokeBorder(Lab.accent.opacity(0.34), lineWidth: 1)
         )
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: CaptureTrayTopPreference.self,
+                    value: geometry.frame(in: .named("liveCameraSurface")).minY
+                )
+            }
+        }
     }
 
     private func errorOverlay(_ message: String) -> some View {
