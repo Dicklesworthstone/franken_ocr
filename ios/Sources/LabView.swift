@@ -38,7 +38,17 @@ private extension View {
 /// beside step 03, because a transcription is worth reading next to the page it
 /// came from and the tablet finally has the width for it.
 struct LabView: View {
+    private enum Destination: String, CaseIterable, Identifiable {
+        case capture = "Capture"
+        case live = "Live"
+        case result = "Result"
+        case models = "Models"
+
+        var id: Self { self }
+    }
+
     @State private var model = LabModel()
+    @State private var destination: Destination = .capture
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.horizontalSizeClass) private var sizeClass
 
@@ -69,9 +79,8 @@ struct LabView: View {
                             transcriptionCard.frame(maxWidth: .infinity)
                         }
                     } else {
-                        specimenCard
-                        pageCard
-                        transcriptionCard
+                        destinationPicker
+                        compactWorkspace
                     }
                     footer
                 }
@@ -116,6 +125,8 @@ struct LabView: View {
         .sensoryFeedback(.error, trigger: model.statusKind) { _, kind in kind == .err }
         .task {
             Engine.warmKernelPool()
+            consumeRequestedAction()
+            consumeStagedDocument()
             await loadDebugFixtureIfRequested()
         }
         .onReceive(NotificationCenter.default.publisher(
@@ -125,6 +136,17 @@ struct LabView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .background { model.releaseEngineIfIdle() }
+            if phase == .active {
+                consumeRequestedAction()
+                consumeStagedDocument()
+            }
+        }
+        .onChange(of: model.isRecognizing) { oldValue, newValue in
+            if oldValue, !newValue,
+               model.recognition != nil || model.completedPageCount > 0
+            {
+                withAnimation(.snappy) { destination = .result }
+            }
         }
         .onChange(of: photoItem) { _, item in load(photoItem: item) }
         .fileImporter(
@@ -136,6 +158,16 @@ struct LabView: View {
         .fullScreenCover(isPresented: $showLiveCamera) {
             LiveCameraView(model: model)
         }
+        .onOpenURL { url in
+            guard url.scheme?.lowercased() == "frankenocr" else { return }
+            if url.host?.lowercased() == "cancel" {
+                model.cancel()
+            } else if url.host?.lowercased() == "live-camera" {
+                showLiveCamera = true
+            } else if url.host?.lowercased() == "recognize" {
+                consumeStagedDocument()
+            }
+        }
         .confirmationDialog(
             "Download \(model.spec.totalBytes.humanBytes)?",
             isPresented: $model.showConsent,
@@ -146,6 +178,107 @@ struct LabView: View {
         } message: {
             Text(consentMessage)
         }
+        .userActivity("com.frankenocr.workspace") { activity in
+            activity.title = "FrankenOCR \(destination.rawValue)"
+            activity.isEligibleForHandoff = true
+            activity.userInfo = ["route": destination.rawValue]
+        }
+        .onContinueUserActivity("com.frankenocr.workspace") { activity in
+            guard let rawValue = activity.userInfo?["route"] as? String,
+                  let restored = Destination(rawValue: rawValue)
+            else { return }
+            destination = restored
+        }
+        .dropDestination(for: URL.self) { urls, _ in
+            guard let url = urls.first else { return false }
+            load(fileResult: .success([url]))
+            return true
+        }
+        .focusedSceneValue(
+            \.ocrCommands,
+            OCRCommandActions(
+                importFile: { showFileImporter = true },
+                recognize: {
+                    focusedTextEntry = nil
+                    model.recognize()
+                },
+                liveCamera: { showLiveCamera = true },
+                stop: { model.cancel() },
+                canRecognize: model.canRecognize,
+                canStop: model.isRecognizing
+            )
+        )
+    }
+
+    private var destinationPicker: some View {
+        Picker("Workspace", selection: $destination) {
+            ForEach(Destination.allCases) { destination in
+                Text(destination.rawValue).tag(destination)
+            }
+        }
+        .pickerStyle(.segmented)
+        .accessibilityLabel("FrankenOCR workspace")
+    }
+
+    @ViewBuilder
+    private var compactWorkspace: some View {
+        switch destination {
+        case .capture:
+            if model.store.phase != .ready { specimenCard }
+            pageCard
+        case .live:
+            liveCameraLaunchCard
+        case .result:
+            transcriptionCard
+        case .models:
+            specimenCard
+        }
+    }
+
+    private var liveCameraLaunchCard: some View {
+        LabPanel {
+            VStack(alignment: .leading, spacing: 14) {
+                LabLabel(text: "Live camera")
+                HStack(alignment: .top, spacing: 14) {
+                    Image(systemName: "viewfinder.circle.fill")
+                        .font(.system(size: 34, weight: .bold))
+                        .foregroundStyle(Lab.amber)
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("See real words bend into the capture tray")
+                            .font(.headline)
+                            .foregroundStyle(Lab.textPrimary)
+                        Text(
+                            "Live Camera uses Apple's fast on-device Vision recognizer, not the Baidu-derived FrankenOCR model. It trades some accuracy for realtime responsiveness; still images and PDFs keep the full model."
+                        )
+                        .font(.subheadline)
+                        .foregroundStyle(Lab.textDim)
+                    }
+                }
+                Button {
+                    showLiveCamera = true
+                } label: {
+                    Label("Open Live Camera", systemImage: "camera.viewfinder")
+                }
+                .buttonStyle(PrimaryButtonStyle())
+            }
+        }
+    }
+
+    private func consumeRequestedAction() {
+        switch FrankenOCRSharedStore.consumeRequestedAction() {
+        case .liveCamera:
+            destination = .live
+            showLiveCamera = true
+        case .recognize:
+            destination = .capture
+        case .none:
+            break
+        }
+    }
+
+    private func consumeStagedDocument() {
+        guard let staged = FrankenOCRSharedStore.consumeStagedDocumentURL() else { return }
+        load(fileResult: .success([staged]))
     }
 
     private var consentMessage: String {
@@ -163,19 +296,8 @@ struct LabView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 11)
-                    .fill(LinearGradient(
-                        colors: [Color(hex: 0x04351F), Lab.accent],
-                        startPoint: .topLeading, endPoint: .bottomTrailing
-                    ))
-                Text("O")
-                    .font(.system(size: 21, weight: .black, design: .monospaced))
-                    .foregroundStyle(Lab.onAccent)
-            }
-            .frame(width: 40, height: 40)
-            .overlay(alignment: .topLeading) { Bolt(size: 11).offset(x: -4, y: -4) }
-            .overlay(alignment: .bottomTrailing) { Bolt(size: 11).offset(x: 4, y: 4) }
+            MonsterStatusMark(mood: monsterMood, instrument: .vision, accent: Lab.amber)
+                .frame(width: 52, height: 52)
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("franken_ocr")
@@ -200,6 +322,14 @@ struct LabView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("FrankenOCR, reads locally")
+    }
+
+    private var monsterMood: MonsterMood {
+        if model.statusKind == .err { return .error }
+        if model.isRecognizing { return .working }
+        if model.isLoadingModel { return .waking }
+        if model.recognition != nil || model.completedPageCount > 0 { return .success }
+        return .idle
     }
 
     // ── 01 The specimen ────────────────────────────────────────────────────
@@ -533,33 +663,19 @@ struct LabView: View {
     @ViewBuilder
     private var runControls: some View {
         if model.isRecognizing {
-            VStack(alignment: .leading, spacing: 10) {
-                LabProgressBar(
-                    fraction: model.isDocumentRun
-                        ? model.documentProgressFraction
-                        : model.progressFraction
-                )
-                if model.isDocumentRun {
-                    // The document line first: on a 40-page run this is the
-                    // number that matters, and the page's own stage sits under it.
-                    Text(model.documentDetail)
-                        .font(.system(size: 12, weight: .semibold, design: .monospaced))
-                        .foregroundStyle(Lab.accent)
-                }
-                HStack {
-                    Text(model.progressDetail.isEmpty
-                         ? (model.isLoadingModel ? "Waking the model…" : "Starting…")
-                         : model.progressDetail)
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(Lab.textDim)
-                    Spacer()
-                    Text(String(format: "%.0fs", model.elapsed))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(Lab.textFaint)
-                }
-                Button("Cancel") { model.cancel() }
-                    .buttonStyle(GhostButtonStyle(tint: Lab.red))
-            }
+            OcrReactorView(
+                progress: model.progress,
+                fraction: model.isDocumentRun
+                    ? model.documentProgressFraction
+                    : model.progressFraction,
+                isEstimated: model.progressIsEstimated,
+                elapsed: model.elapsed,
+                currentPage: model.currentPageIndex.map { $0 + 1 },
+                pageCount: model.pageOutcomes.count,
+                completedPages: model.pageOutcomes.filter(\.isTerminal).count,
+                emittedCharacters: model.pageOutcomes.reduce(0) { $0 + $1.text.count },
+                cancel: model.cancel
+            )
         } else {
             Button("Recognize") { model.recognize() }
                 .buttonStyle(PrimaryButtonStyle())

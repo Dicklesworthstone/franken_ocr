@@ -40,7 +40,10 @@ targets:
         CODE_SIGN_ENTITLEMENTS: FrankenOCR.entitlements
         # The xcframework sits next to the project.
         FRAMEWORK_SEARCH_PATHS: ["$(inherited)", "."]
-        SUPPORTS_MACCATALYST: false
+        SUPPORTS_MACCATALYST: true
+        SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
+        DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER: false
+        MACCATALYST_USE_NATIVE_DESIGN: true
       configs:
         Release:
           SWIFT_COMPILATION_MODE: wholemodule
@@ -48,9 +51,76 @@ targets:
           ENABLE_NS_ASSERTIONS: false
     sources:
       - path: Sources
+      - path: Shared
       - path: Assets.xcassets
     dependencies:
       # Static library: there is nothing to embed, and embedding it would both
       # bloat the bundle and confuse dyld.
       - framework: FocrCore.xcframework
         embed: false
+      - target: FrankenOCRWidgets
+        embed: true
+        platformFilter: iOS
+      - target: FrankenOCRShare
+        embed: true
+        platformFilter: iOS
+  FrankenOCRWidgets:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenocr.FrankenOCR.Widgets
+        PRODUCT_NAME: FrankenOCR Widgets
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+        SUPPORTS_MACCATALYST: false
+    sources:
+      - path: Widget
+      - path: Shared
+      - path: Sources/PrivacyInfo.xcprivacy
+    entitlements:
+      path: FrankenOCRWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.frankenocr.FrankenOCR
+    info:
+      path: Widget/Info.plist
+      properties:
+        CFBundleDisplayName: FrankenOCR Widgets
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+
+  FrankenOCRShare:
+    type: app-extension
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenocr.FrankenOCR.Share
+        PRODUCT_NAME: Recognize with FrankenOCR
+        APPLICATION_EXTENSION_API_ONLY: true
+        SKIP_INSTALL: true
+        SUPPORTS_MACCATALYST: false
+    sources:
+      - path: Share
+      - path: Shared
+      - path: Sources/PrivacyInfo.xcprivacy
+    entitlements:
+      path: FrankenOCRShare.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.com.frankenocr.FrankenOCR
+    info:
+      path: Share/Info.plist
+      properties:
+        CFBundleDisplayName: Recognize with FrankenOCR
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.share-services
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
+          NSExtensionAttributes:
+            NSExtensionActivationRule:
+              NSExtensionActivationSupportsFileWithMaxCount: 1
+              NSExtensionActivationSupportsImageWithMaxCount: 1

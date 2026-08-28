@@ -107,6 +107,7 @@ final class LabModel {
 
     private var timer: Timer?
     private var recognizeTask: Task<Void, Never>?
+    private let runActivity = OCRActivityController.shared
     /// Guards against a stale run publishing over a newer one.
     private var generation = 0
 
@@ -457,6 +458,7 @@ final class LabModel {
             pages = []
         }
         pageOutcomes = pages.map { PageOutcome(id: $0) }
+        runActivity.begin()
 
         // A minutes-long run must not be interrupted by the screen sleeping,
         // which suspends the app. A whole document is much longer still.
@@ -492,10 +494,20 @@ final class LabModel {
                 self.status = self.pageOutcomes.isEmpty
                     ? "Cancelled."
                     : "Cancelled after \(self.completedPageCount) of \(self.pageOutcomes.count) pages."
+                self.runActivity.finish(
+                    status: .cancelled,
+                    headline: "Recognition stopped",
+                    detail: self.status
+                )
             } catch {
                 guard runGeneration == self.generation else { return }
                 self.statusKind = .err
                 self.status = error.localizedDescription
+                self.runActivity.finish(
+                    status: .failed,
+                    headline: "Vision reactor interrupted",
+                    detail: "Open FrankenOCR to retry"
+                )
             }
         }
     }
@@ -508,6 +520,7 @@ final class LabModel {
             Task { @MainActor [weak self] in
                 guard let self, runGeneration == self.generation else { return }
                 self.progress = update
+                self.publishActivity(update)
             }
         }
         guard runGeneration == generation else { return }
@@ -528,6 +541,11 @@ final class LabModel {
                 seconds, result.output.count, route
             )
         }
+        runActivity.finish(
+            status: .complete,
+            headline: "Text assembled",
+            detail: "\(result.output.count) characters ready to read and export"
+        )
     }
 
     /// Walk every selected page of the document.
@@ -573,6 +591,7 @@ final class LabModel {
                     Task { @MainActor [weak self] in
                         guard let self, runGeneration == self.generation else { return }
                         self.progress = update
+                        self.publishActivity(update)
                     }
                 }
                 guard runGeneration == generation else { return }
@@ -608,6 +627,22 @@ final class LabModel {
             format: "%d of %d pages in %.0fs%@, entirely on this device.",
             done, pageOutcomes.count, seconds,
             skipped == 0 ? "" : " · \(skipped) skipped"
+        )
+        runActivity.finish(
+            status: .complete,
+            headline: "Document assembled",
+            detail: "\(done) pages ready to read and export"
+        )
+    }
+
+    private func publishActivity(_ update: ProgressUpdate) {
+        let page = currentPageIndex.map { pageOutcomes[$0].id } ?? (isDocumentRun ? 1 : 0)
+        runActivity.update(
+            progress: update,
+            page: page,
+            pageCount: pageOutcomes.count,
+            elapsed: elapsed,
+            totalIsEstimated: update.total == 0 || update.stage == .decode
         )
     }
 

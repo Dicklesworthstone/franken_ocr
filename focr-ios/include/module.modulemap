@@ -1,0 +1,4 @@
+module FocrCore {
+    header "focr_ios.h"
+    export *
+}
