@@ -1,264 +1,248 @@
 import AVFoundation
-import CoreImage
 import Foundation
-import ImageIO
 import SwiftUI
 import UIKit
-import Vision
+import VisionKit
 
-/// One low-latency OCR pass over the latest camera frame.
+/// One update from Apple's native Live Text camera scanner.
 ///
-/// The video output discards late frames and the controller runs at most one
-/// Vision request at a time. There is deliberately no frame queue: when the
-/// recognizer is busy, newer frames replace older ones instead of building a
-/// seconds-long backlog behind the viewfinder.
+/// Boxes use normalized UIKit coordinates: the origin is at the top-left of
+/// the live camera surface. `animatedLineIDs` contains only newly recognized or
+/// materially changed lines, so a stationary paragraph does not continuously
+/// replay the same animation.
 private struct LiveCameraBatch: Identifiable {
     struct Line: Identifiable {
-        let id = UUID()
+        let id: UUID
         let text: String
         let confidence: Float
-        /// Vision coordinates: normalized, with the origin at bottom-left.
         let box: CGRect
     }
 
     let id = UUID()
     let lines: [Line]
-    let snapshot: Data?
-    let latency: TimeInterval
+    let animatedLineIDs: Set<UUID>
 }
 
-/// Owns the capture session and the fast on-device text request.
+/// Main-actor bridge around VisionKit's dedicated live-scanning controller.
 ///
-/// Capture/session state is confined to `captureQueue`; published UI state is
-/// always delivered on the main queue. This keeps camera work and Vision off
-/// SwiftUI's render thread without introducing another inference queue.
+/// DataScannerViewController is the system Live Text camera surface. It owns
+/// camera scheduling, high-frame-rate item tracking, and Apple's on-device text
+/// recognizer. FrankenOCR deliberately asks for `.accurate` rather than `.fast`:
+/// DataScanner's tracking keeps the surface live without accumulating a queue.
+@MainActor
 private final class LiveCameraController: NSObject, ObservableObject,
-                                          AVCaptureVideoDataOutputSampleBufferDelegate {
-    let session = AVCaptureSession()
-
+                                          DataScannerViewControllerDelegate {
     @Published private(set) var latestBatch: LiveCameraBatch?
     @Published private(set) var isRunning = false
     @Published private(set) var torchOn = false
     @Published private(set) var errorMessage: String?
 
-    private let captureQueue = DispatchQueue(
-        label: "com.frankenocr.live-camera",
-        qos: .userInitiated
-    )
-    private let output = AVCaptureVideoDataOutput()
-    private let context = CIContext(options: [.cacheIntermediates: false])
-    private var camera: AVCaptureDevice?
-    private var configured = false
-    private var lastScan = ContinuousClock.now
-    private let minimumScanInterval = Duration.milliseconds(430)
+    fileprivate weak var scanner: DataScannerViewController?
+    private var previousTranscripts: [UUID: String] = [:]
+
+    func attach(_ scanner: DataScannerViewController) {
+        self.scanner = scanner
+        scanner.delegate = self
+    }
 
     func start() {
-        switch AVCaptureDevice.authorizationStatus(for: .video) {
-        case .authorized:
-            configureAndStart()
-        case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { [weak self] allowed in
-                if allowed {
-                    self?.configureAndStart()
-                } else {
-                    self?.publishError("Camera access is off. Enable it in Settings to use Live Camera.")
-                }
-            }
-        case .denied, .restricted:
-            publishError("Camera access is off. Enable it in Settings to use Live Camera.")
-        @unknown default:
-            publishError("The camera is unavailable on this device.")
+        guard DataScannerViewController.isSupported else {
+            errorMessage = "Apple Live Text camera scanning is not supported on this device."
+            return
+        }
+        guard DataScannerViewController.isAvailable else {
+            errorMessage = "Live Camera is unavailable. Check Camera access in Settings and try again."
+            return
+        }
+        do {
+            try scanner?.startScanning()
+            errorMessage = nil
+            isRunning = true
+        } catch {
+            errorMessage = "Live Camera could not start: \(error.localizedDescription)"
+            isRunning = false
         }
     }
 
     func stop() {
-        captureQueue.async { [weak self] in
-            guard let self else { return }
-            if self.session.isRunning { self.session.stopRunning() }
-            DispatchQueue.main.async { self.isRunning = false }
-        }
+        scanner?.stopScanning()
+        isRunning = false
+        turnTorchOff()
     }
 
     func toggleTorch() {
-        captureQueue.async { [weak self] in
-            guard let self, let camera = self.camera, camera.hasTorch else { return }
-            do {
-                try camera.lockForConfiguration()
-                let turnOn = camera.torchMode != .on
-                camera.torchMode = turnOn ? .on : .off
-                camera.unlockForConfiguration()
-                DispatchQueue.main.async { self.torchOn = turnOn }
-            } catch {
-                self.publishError("The flashlight could not be changed.")
-            }
-        }
-    }
-
-    private func configureAndStart() {
-        captureQueue.async { [weak self] in
-            guard let self else { return }
-            if !self.configured {
-                guard self.configure() else { return }
-                self.configured = true
-            }
-            guard !self.session.isRunning else { return }
-            self.session.startRunning()
-            DispatchQueue.main.async {
-                self.errorMessage = nil
-                self.isRunning = true
-            }
-        }
-    }
-
-    private func configure() -> Bool {
-        session.beginConfiguration()
-        defer { session.commitConfiguration() }
-        session.sessionPreset = .high
-
-        guard let device = AVCaptureDevice.default(
+        guard let camera = AVCaptureDevice.default(
             .builtInWideAngleCamera,
             for: .video,
             position: .back
-        ) else {
-            publishError("This device does not have an available rear camera.")
-            return false
-        }
-
+        ), camera.hasTorch else { return }
         do {
-            let input = try AVCaptureDeviceInput(device: device)
-            guard session.canAddInput(input) else {
-                publishError("The rear camera could not be attached to the capture session.")
-                return false
-            }
-            session.addInput(input)
-            camera = device
+            try camera.lockForConfiguration()
+            let turnOn = camera.torchMode != .on
+            camera.torchMode = turnOn ? .on : .off
+            camera.unlockForConfiguration()
+            torchOn = turnOn
         } catch {
-            publishError("The rear camera could not be opened: \(error.localizedDescription)")
-            return false
-        }
-
-        output.alwaysDiscardsLateVideoFrames = true
-        output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
-        ]
-        output.setSampleBufferDelegate(self, queue: captureQueue)
-        guard session.canAddOutput(output) else {
-            publishError("The live camera output could not be created.")
-            return false
-        }
-        session.addOutput(output)
-        return true
-    }
-
-    private func publishError(_ message: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.errorMessage = message
-            self?.isRunning = false
+            errorMessage = "The flashlight could not be changed."
         }
     }
 
-    func captureOutput(
-        _: AVCaptureOutput,
-        didOutput sampleBuffer: CMSampleBuffer,
-        from _: AVCaptureConnection
+    func capturePhotoJPEG() async -> Data? {
+        guard let scanner else { return nil }
+        do {
+            let image = try await scanner.capturePhoto()
+            return image.jpegData(compressionQuality: 0.86)
+        } catch {
+            // Captured text is still useful if a final camera snapshot races
+            // with dismissal or camera interruption.
+            return nil
+        }
+    }
+
+    func dataScanner(
+        _ dataScanner: DataScannerViewController,
+        didAdd addedItems: [RecognizedItem],
+        allItems: [RecognizedItem]
     ) {
-        let now = ContinuousClock.now
-        guard now - lastScan >= minimumScanInterval,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)
-        else { return }
-        lastScan = now
+        publish(allItems, changedItems: addedItems, scanner: dataScanner)
+    }
 
-        let started = ContinuousClock.now
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
-        request.usesLanguageCorrection = true
-        request.minimumTextHeight = 0.012
+    func dataScanner(
+        _ dataScanner: DataScannerViewController,
+        didUpdate updatedItems: [RecognizedItem],
+        allItems: [RecognizedItem]
+    ) {
+        publish(allItems, changedItems: updatedItems, scanner: dataScanner)
+    }
 
-        do {
-            // The iPhone's back-camera sensor buffer is landscape-left while
-            // the app's primary live surface is portrait.
-            let handler = VNImageRequestHandler(
-                cvPixelBuffer: pixelBuffer,
-                orientation: .right,
-                options: [:]
+    func dataScanner(
+        _ dataScanner: DataScannerViewController,
+        didRemove _: [RecognizedItem],
+        allItems: [RecognizedItem]
+    ) {
+        publish(allItems, changedItems: [], scanner: dataScanner)
+    }
+
+    func dataScanner(
+        _: DataScannerViewController,
+        becameUnavailableWithError error: DataScannerViewController.ScanningUnavailable
+    ) {
+        switch error {
+        case .cameraRestricted:
+            errorMessage = "Camera access is restricted. Enable it in Settings to use Live Camera."
+        case .unsupported:
+            errorMessage = "Apple Live Text camera scanning is not supported on this device."
+        @unknown default:
+            errorMessage = "Apple Live Text camera scanning became unavailable."
+        }
+        isRunning = false
+    }
+
+    private func publish(
+        _ items: [RecognizedItem],
+        changedItems: [RecognizedItem],
+        scanner: DataScannerViewController
+    ) {
+        let surface = scanner.view.bounds.size
+        guard surface.width > 0, surface.height > 0 else { return }
+
+        let changedIDs = Set(changedItems.map(\.id))
+        var lines: [LiveCameraBatch.Line] = []
+        var animatedIDs: Set<UUID> = []
+        var currentTranscripts: [UUID: String] = [:]
+
+        for item in items {
+            guard case let .text(recognized) = item,
+                  let candidate = recognized.observation.topCandidates(1).first
+            else { continue }
+
+            let text = recognized.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+            // The native scanner may briefly surface low-confidence fragments
+            // as focus settles. The live tray favors precision over recall;
+            // users can use the full Baidu model for difficult text.
+            guard text.count >= 2, candidate.confidence >= 0.52 else { continue }
+
+            let bounds = recognized.bounds
+            let points = [bounds.topLeft, bounds.topRight, bounds.bottomRight, bounds.bottomLeft]
+            let minX = points.map(\.x).min() ?? 0
+            let maxX = points.map(\.x).max() ?? minX
+            let minY = points.map(\.y).min() ?? 0
+            let maxY = points.map(\.y).max() ?? minY
+            let box = CGRect(
+                x: min(max(minX / surface.width, 0), 1),
+                y: min(max(minY / surface.height, 0), 1),
+                width: min(max((maxX - minX) / surface.width, 0), 1),
+                height: min(max((maxY - minY) / surface.height, 0), 1)
             )
-            try handler.perform([request])
-            let lines = (request.results ?? [])
-                .compactMap { observation -> LiveCameraBatch.Line? in
-                    guard let candidate = observation.topCandidates(1).first,
-                          !candidate.string.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    else { return nil }
-                    return LiveCameraBatch.Line(
-                        text: candidate.string,
-                        confidence: candidate.confidence,
-                        box: observation.boundingBox
-                    )
-                }
-                .sorted {
-                    if abs($0.box.midY - $1.box.midY) > 0.025 {
-                        return $0.box.midY > $1.box.midY
-                    }
-                    return $0.box.minX < $1.box.minX
-                }
 
-            let snapshot = makeSnapshot(pixelBuffer)
-            let latency = started.duration(to: .now).timeInterval
-            let batch = LiveCameraBatch(lines: lines, snapshot: snapshot, latency: latency)
-            DispatchQueue.main.async { [weak self] in self?.latestBatch = batch }
+            currentTranscripts[recognized.id] = text
+            lines.append(LiveCameraBatch.Line(
+                id: recognized.id,
+                text: text,
+                confidence: candidate.confidence,
+                box: box
+            ))
+
+            if changedIDs.contains(recognized.id), previousTranscripts[recognized.id] != text {
+                animatedIDs.insert(recognized.id)
+            }
+        }
+
+        lines.sort {
+            if abs($0.box.midY - $1.box.midY) > 0.025 {
+                return $0.box.midY < $1.box.midY
+            }
+            return $0.box.minX < $1.box.minX
+        }
+        previousTranscripts = currentTranscripts
+        latestBatch = LiveCameraBatch(lines: lines, animatedLineIDs: animatedIDs)
+    }
+
+    private func turnTorchOff() {
+        guard torchOn,
+              let camera = AVCaptureDevice.default(
+                .builtInWideAngleCamera,
+                for: .video,
+                position: .back
+              ), camera.hasTorch
+        else { return }
+        do {
+            try camera.lockForConfiguration()
+            camera.torchMode = .off
+            camera.unlockForConfiguration()
         } catch {
-            publishError("Live text recognition failed: \(error.localizedDescription)")
+            // Dismissal must not fail because the camera was already released.
         }
+        torchOn = false
     }
+}
 
-    /// A compact upright frame for handing the final live capture back to the
-    /// ordinary page UI. The OCR request itself reads the pixel buffer directly.
-    private func makeSnapshot(_ pixelBuffer: CVPixelBuffer) -> Data? {
-        let upright = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
-        let longest = max(upright.extent.width, upright.extent.height)
-        let scale = min(1, 1_600 / max(longest, 1))
-        let image = upright.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        return context.jpegRepresentation(
-            of: image,
-            colorSpace: CGColorSpaceCreateDeviceRGB(),
-            options: [
-                kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.84
-            ]
+private struct NativeLiveTextScanner: UIViewControllerRepresentable {
+    @ObservedObject var controller: LiveCameraController
+
+    func makeUIViewController(context _: Context) -> DataScannerViewController {
+        let scanner = DataScannerViewController(
+            recognizedDataTypes: [.text()],
+            qualityLevel: .accurate,
+            recognizesMultipleItems: true,
+            isHighFrameRateTrackingEnabled: true,
+            isPinchToZoomEnabled: true,
+            isGuidanceEnabled: true,
+            isHighlightingEnabled: true
         )
-    }
-}
-
-private extension Duration {
-    var timeInterval: TimeInterval {
-        let parts = components
-        return Double(parts.seconds) + Double(parts.attoseconds) / 1e18
-    }
-}
-
-private struct CameraPreview: UIViewRepresentable {
-    let session: AVCaptureSession
-
-    func makeUIView(context _: Context) -> PreviewSurface {
-        let view = PreviewSurface()
-        view.previewLayer.session = session
-        view.previewLayer.videoGravity = .resizeAspectFill
-        return view
+        controller.attach(scanner)
+        Task { @MainActor in controller.start() }
+        return scanner
     }
 
-    func updateUIView(_ view: PreviewSurface, context _: Context) {
-        view.previewLayer.session = session
-    }
+    func updateUIViewController(_: DataScannerViewController, context _: Context) {}
 
-    final class PreviewSurface: UIView {
-        override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
-        var previewLayer: AVCaptureVideoPreviewLayer {
-            layer as! AVCaptureVideoPreviewLayer
-        }
+    static func dismantleUIViewController(
+        _ scanner: DataScannerViewController,
+        coordinator _: Void
+    ) {
+        scanner.stopScanning()
     }
-}
-
-private struct LiveGlyphSeed {
-    let character: Character
-    let origin: CGPoint
 }
 
 private struct LiveTextAccumulator {
@@ -269,30 +253,27 @@ private struct LiveTextAccumulator {
     }
 
     private var lines: [CapturedLine] = []
-
     var text: String { lines.map(\.text).joined(separator: "\n") }
 
     mutating func clear() { lines.removeAll(keepingCapacity: true) }
 
-    /// Merge a batch without duplicating the same sign or paragraph on every
-    /// 430 ms pass. Longer/higher-confidence readings replace near-duplicates;
-    /// genuinely new lines append in the order the camera encountered them.
-    mutating func ingest(_ batch: LiveCameraBatch) -> [LiveGlyphSeed] {
-        var seeds: [LiveGlyphSeed] = []
-        for incoming in batch.lines where incoming.confidence >= 0.22 {
-            let text = incoming.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            let normalized = Self.normalize(text)
+    /// Accumulate useful lines without copying the same stationary paragraph on
+    /// every tracking update. Only lines accepted into the tray are animated.
+    mutating func ingest(_ batch: LiveCameraBatch) -> [LiveCameraBatch.Line] {
+        var accepted: [LiveCameraBatch.Line] = []
+        for incoming in batch.lines {
+            let normalized = Self.normalize(incoming.text)
             guard normalized.count >= 2 else { continue }
 
             let match = lines.indices
                 .map { ($0, Self.similarity(normalized, lines[$0].normalized)) }
                 .max { $0.1 < $1.1 }
 
-            if let match, match.1 >= 0.76 {
-                if text.count > lines[match.0].text.count
+            if let match, match.1 >= 0.78 {
+                if incoming.text.count > lines[match.0].text.count
                     || incoming.confidence > lines[match.0].confidence + 0.08 {
                     lines[match.0] = CapturedLine(
-                        text: text,
+                        text: incoming.text,
                         confidence: incoming.confidence,
                         normalized: normalized
                     )
@@ -301,17 +282,15 @@ private struct LiveTextAccumulator {
             }
 
             lines.append(CapturedLine(
-                text: text,
+                text: incoming.text,
                 confidence: incoming.confidence,
                 normalized: normalized
             ))
-            seeds.append(contentsOf: Self.glyphSeeds(text: text, box: incoming.box))
+            if batch.animatedLineIDs.contains(incoming.id) { accepted.append(incoming) }
         }
 
-        // A live camera can be left open indefinitely. Keep the newest useful
-        // lines instead of allowing view state to grow without a bound.
-        if lines.count > 180 { lines.removeFirst(lines.count - 180) }
-        return Array(seeds.prefix(72))
+        if lines.count > 160 { lines.removeFirst(lines.count - 160) }
+        return Array(accepted.prefix(12))
     }
 
     private static func normalize(_ text: String) -> String {
@@ -333,26 +312,14 @@ private struct LiveTextAccumulator {
         guard !left.isEmpty || !right.isEmpty else { return 0 }
         return Double(left.intersection(right).count) / Double(left.union(right).count)
     }
-
-    private static func glyphSeeds(text: String, box: CGRect) -> [LiveGlyphSeed] {
-        let visible = text.filter { !$0.isWhitespace }.prefix(24)
-        let count = max(visible.count, 1)
-        return visible.enumerated().map { index, character in
-            let fraction = (Double(index) + 0.5) / Double(count)
-            return LiveGlyphSeed(
-                character: character,
-                origin: CGPoint(
-                    x: box.minX + box.width * fraction,
-                    y: 1 - box.midY
-                )
-            )
-        }
-    }
 }
 
-private struct FlyingGlyph: Identifiable {
+/// A whole recognized line travels as one strip. The characters are never
+/// invented, shuffled, or scattered into arbitrary lanes: the displayed text
+/// is exactly the native scanner transcript and begins at its real screen box.
+private struct FlyingTextStrip: Identifiable {
     let id = UUID()
-    let character: Character
+    let text: String
     let origin: CGPoint
     let destinationX: CGFloat
     let curve: CGFloat
@@ -360,8 +327,8 @@ private struct FlyingGlyph: Identifiable {
     let duration: TimeInterval
 }
 
-private struct GlyphWarpLayer: View {
-    let glyphs: [FlyingGlyph]
+private struct TextWarpLayer: View {
+    let strips: [FlyingTextStrip]
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -369,78 +336,83 @@ private struct GlyphWarpLayer: View {
             TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
                 Canvas { context, size in
                     let now = timeline.date.timeIntervalSinceReferenceDate
-                    for glyph in glyphs {
-                        let raw = (now - glyph.born) / glyph.duration
-                        guard raw >= 0, raw <= 1 else { continue }
-                        let t = CGFloat(raw)
-                        let eased = t * t * (3 - 2 * t)
-                        let start = CGPoint(
-                            x: glyph.origin.x * size.width,
-                            y: glyph.origin.y * size.height * 0.70
-                        )
-                        let end = CGPoint(
-                            x: glyph.destinationX * size.width,
-                            y: size.height * 0.79
-                        )
-                        let x = start.x + (end.x - start.x) * eased
-                            + sin(t * .pi) * glyph.curve * size.width
-                        let y = start.y + (end.y - start.y) * eased
-                            - sin(t * .pi) * 42
-                        let opacity = Double(sin(t * .pi))
-                        context.opacity = max(0, opacity)
-                        context.draw(
-                            Text(String(glyph.character))
-                                .font(.system(size: 16, weight: .black, design: .monospaced))
-                                .foregroundStyle(Lab.accent),
-                            at: CGPoint(x: x, y: y)
-                        )
+                    for strip in strips {
+                        let progress = (now - strip.born) / strip.duration
+                        guard progress >= 0, progress <= 1 else { continue }
+                        drawStrip(strip, progress: CGFloat(progress), context: &context, size: size)
                     }
                 }
             }
             .allowsHitTesting(false)
         }
     }
+
+    private func drawStrip(
+        _ strip: FlyingTextStrip,
+        progress: CGFloat,
+        context: inout GraphicsContext,
+        size: CGSize
+    ) {
+        let start = CGPoint(x: strip.origin.x * size.width, y: strip.origin.y * size.height)
+        let end = CGPoint(x: strip.destinationX * size.width, y: size.height * 0.75)
+        let control = CGPoint(
+            x: (start.x + end.x) * 0.5 + strip.curve * size.width,
+            y: min(start.y, end.y) - 62
+        )
+        let resolved = context.resolve(
+            Text(String(strip.text.prefix(34)))
+                .font(.system(size: 13, weight: .black, design: .monospaced))
+                .foregroundStyle(Lab.accent)
+        )
+
+        // A short coherent trail makes the line appear to bend into the tray.
+        // Every trail sample repeats the same recognized line; there is no
+        // decorative or randomly generated character stream.
+        for trailIndex in stride(from: 3, through: 0, by: -1) {
+            let t = max(0, progress - CGFloat(trailIndex) * 0.035)
+            let eased = t * t * (3 - 2 * t)
+            let oneMinus = 1 - eased
+            let point = CGPoint(
+                x: oneMinus * oneMinus * start.x
+                    + 2 * oneMinus * eased * control.x
+                    + eased * eased * end.x,
+                y: oneMinus * oneMinus * start.y
+                    + 2 * oneMinus * eased * control.y
+                    + eased * eased * end.y
+            )
+            var copy = context
+            copy.opacity = Double((1 - progress) * (trailIndex == 0 ? 0.95 : 0.12))
+            copy.draw(resolved, at: point, anchor: .center)
+        }
+    }
 }
 
-private struct ScannerOverlay: View {
+private struct ScannerReticle: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         GeometryReader { geometry in
             let rect = CGRect(
-                x: geometry.size.width * 0.08,
-                y: geometry.size.height * 0.17,
-                width: geometry.size.width * 0.84,
-                height: geometry.size.height * 0.42
+                x: geometry.size.width * 0.07,
+                y: geometry.size.height * 0.16,
+                width: geometry.size.width * 0.86,
+                height: geometry.size.height * 0.43
             )
             TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: reduceMotion)) { timeline in
                 let phase = timeline.date.timeIntervalSinceReferenceDate
-                    .truncatingRemainder(dividingBy: 2.4) / 2.4
-                let y = rect.minY + rect.height * CGFloat(phase)
+                    .truncatingRemainder(dividingBy: 2.8) / 2.8
                 Canvas { context, _ in
-                    var corners = Path()
-                    let arm: CGFloat = 28
-                    corners.move(to: CGPoint(x: rect.minX, y: rect.minY + arm))
-                    corners.addLine(to: rect.origin)
-                    corners.addLine(to: CGPoint(x: rect.minX + arm, y: rect.minY))
-                    corners.move(to: CGPoint(x: rect.maxX - arm, y: rect.minY))
-                    corners.addLine(to: CGPoint(x: rect.maxX, y: rect.minY))
-                    corners.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + arm))
-                    corners.move(to: CGPoint(x: rect.minX, y: rect.maxY - arm))
-                    corners.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
-                    corners.addLine(to: CGPoint(x: rect.minX + arm, y: rect.maxY))
-                    corners.move(to: CGPoint(x: rect.maxX - arm, y: rect.maxY))
-                    corners.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
-                    corners.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY - arm))
-                    context.stroke(corners, with: .color(Lab.accent.opacity(0.9)), lineWidth: 2)
-
+                    let border = Path(roundedRect: rect, cornerRadius: 18)
+                    context.stroke(border, with: .color(Lab.accent.opacity(0.34)), lineWidth: 1)
+                    guard !reduceMotion else { return }
+                    let y = rect.minY + rect.height * CGFloat(phase)
                     var beam = Path()
-                    beam.move(to: CGPoint(x: rect.minX + 8, y: y))
-                    beam.addLine(to: CGPoint(x: rect.maxX - 8, y: y))
+                    beam.move(to: CGPoint(x: rect.minX + 10, y: y))
+                    beam.addLine(to: CGPoint(x: rect.maxX - 10, y: y))
                     context.stroke(
                         beam,
                         with: .linearGradient(
-                            Gradient(colors: [.clear, Lab.accent, .clear]),
+                            Gradient(colors: [.clear, Lab.accent.opacity(0.9), .clear]),
                             startPoint: CGPoint(x: rect.minX, y: y),
                             endPoint: CGPoint(x: rect.maxX, y: y)
                         ),
@@ -459,43 +431,41 @@ struct LiveCameraView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @StateObject private var camera = LiveCameraController()
     @State private var accumulator = LiveTextAccumulator()
-    @State private var glyphs: [FlyingGlyph] = []
-    @State private var lastSnapshot: Data?
+    @State private var strips: [FlyingTextStrip] = []
     @State private var copied = false
+    @State private var isFinishing = false
 
     private var capturedText: String { accumulator.text }
 
     var body: some View {
         ZStack {
-            CameraPreview(session: camera.session)
+            NativeLiveTextScanner(controller: camera)
                 .ignoresSafeArea()
 
             LinearGradient(
-                colors: [.black.opacity(0.58), .clear, .black.opacity(0.82)],
+                colors: [.black.opacity(0.55), .clear, .black.opacity(0.84)],
                 startPoint: .top,
                 endPoint: .bottom
             )
             .ignoresSafeArea()
 
-            ScannerOverlay()
-            GlyphWarpLayer(glyphs: glyphs)
+            ScannerReticle()
+            TextWarpLayer(strips: strips)
 
             VStack(spacing: 0) {
                 topBar
                 Spacer()
+                accuracyNotice
                 capturePanel
             }
             .padding(.horizontal, 16)
             .padding(.top, 8)
             .padding(.bottom, 10)
 
-            if let error = camera.errorMessage {
-                errorOverlay(error)
-            }
+            if let error = camera.errorMessage { errorOverlay(error) }
         }
         .preferredColorScheme(.dark)
         .tint(Lab.accent)
-        .onAppear { camera.start() }
         .onDisappear { camera.stop() }
         .onChange(of: camera.latestBatch?.id) { _, _ in
             guard let batch = camera.latestBatch else { return }
@@ -521,7 +491,7 @@ struct LiveCameraView: View {
                     Circle()
                         .fill(camera.isRunning ? Lab.accent : Lab.amber)
                         .frame(width: 6, height: 6)
-                    Text(camera.isRunning ? "ON-DEVICE TEXT STREAM" : "STARTING CAMERA")
+                    Text(camera.isRunning ? "APPLE LIVE TEXT · ON DEVICE" : "STARTING CAMERA")
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.68))
                 }
@@ -538,6 +508,25 @@ struct LiveCameraView: View {
         .foregroundStyle(.white)
     }
 
+    private var accuracyNotice: some View {
+        HStack(alignment: .top, spacing: 9) {
+            Image(systemName: "bolt.fill")
+                .foregroundStyle(Lab.amber)
+                .padding(.top, 1)
+            Text("FAST LIVE MODE: This uses Apple's on-device Live Text recognizer—not the Baidu/FrankenOCR model. It is optimized for real-time video and can be less accurate. For maximum accuracy, use Camera to take a still photo.")
+                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.82))
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(.black.opacity(0.70), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Lab.amber.opacity(0.48), lineWidth: 1)
+        )
+        .padding(.bottom, 8)
+    }
+
     private var capturePanel: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
@@ -546,12 +535,9 @@ struct LiveCameraView: View {
                         .font(.system(size: 11, weight: .black, design: .monospaced))
                         .kerning(1.5)
                         .foregroundStyle(Lab.accent)
-                    if let batch = camera.latestBatch {
-                        Text(String(format: "live pass %.0f ms · %d characters",
-                                    batch.latency * 1_000, capturedText.count))
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundStyle(.white.opacity(0.52))
-                    }
+                    Text("\(camera.latestBatch?.lines.count ?? 0) live lines · \(capturedText.count) captured characters")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.52))
                 }
                 Spacer()
                 Button(copied ? "Copied" : "Copy") {
@@ -567,7 +553,7 @@ struct LiveCameraView: View {
 
                 Button("Clear") {
                     accumulator.clear()
-                    glyphs.removeAll(keepingCapacity: true)
+                    strips.removeAll(keepingCapacity: true)
                 }
                 .disabled(capturedText.isEmpty)
                 .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -575,29 +561,24 @@ struct LiveCameraView: View {
 
             ScrollView {
                 Text(capturedText.isEmpty
-                     ? "Point the camera at text. Recognized letters will stream into this tray."
+                     ? "Point the camera at text. Actual recognized lines will bend into this tray."
                      : capturedText)
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(capturedText.isEmpty ? .white.opacity(0.42) : .white.opacity(0.92))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(minHeight: 72, maxHeight: 152)
+            .frame(minHeight: 72, maxHeight: 142)
 
-            Button {
-                model.adoptLiveCameraCapture(text: capturedText, snapshot: lastSnapshot)
-                dismiss()
-            } label: {
-                Label("Use captured text", systemImage: "arrow.down.doc.fill")
-                    .frame(maxWidth: .infinity)
+            Button { finishCapture() } label: {
+                Label(
+                    isFinishing ? "Capturing frame…" : "Use captured text",
+                    systemImage: "arrow.down.doc.fill"
+                )
+                .frame(maxWidth: .infinity)
             }
             .buttonStyle(PrimaryButtonStyle())
-            .disabled(capturedText.isEmpty)
-
-            Text("Live Camera uses Apple's private, on-device Vision recognizer for immediate feedback. The still Camera button runs the full FrankenOCR model for deeper document parsing. Nothing is uploaded.")
-                .font(.system(size: 9))
-                .foregroundStyle(.white.opacity(0.42))
-                .fixedSize(horizontal: false, vertical: true)
+            .disabled(capturedText.isEmpty || isFinishing)
         }
         .padding(14)
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
@@ -631,22 +612,30 @@ struct LiveCameraView: View {
     }
 
     private func ingest(_ batch: LiveCameraBatch) {
-        lastSnapshot = batch.snapshot ?? lastSnapshot
-        let seeds = accumulator.ingest(batch)
-        guard !reduceMotion, !seeds.isEmpty else { return }
+        let accepted = accumulator.ingest(batch)
+        guard !reduceMotion, !accepted.isEmpty else { return }
         let now = Date.timeIntervalSinceReferenceDate
-        glyphs.removeAll { now - $0.born > $0.duration }
-        glyphs.append(contentsOf: seeds.enumerated().map { index, seed in
-            let lane = CGFloat(index % 9) / 8
-            return FlyingGlyph(
-                character: seed.character,
-                origin: seed.origin,
-                destinationX: 0.18 + lane * 0.64,
-                curve: CGFloat((index % 5) - 2) * 0.026,
-                born: now + Double(index % 7) * 0.026,
-                duration: 1.05 + Double(index % 6) * 0.07
+        strips.removeAll { now - $0.born > $0.duration }
+        strips.append(contentsOf: accepted.enumerated().map { index, line in
+            FlyingTextStrip(
+                text: line.text,
+                origin: CGPoint(x: line.box.midX, y: line.box.midY),
+                destinationX: 0.30 + CGFloat(index % 5) * 0.10,
+                curve: CGFloat((index % 3) - 1) * 0.09,
+                born: now + Double(index) * 0.055,
+                duration: 1.0 + Double(index % 4) * 0.08
             )
         })
-        if glyphs.count > 220 { glyphs.removeFirst(glyphs.count - 220) }
+        if strips.count > 48 { strips.removeFirst(strips.count - 48) }
+    }
+
+    private func finishCapture() {
+        let text = capturedText
+        isFinishing = true
+        Task { @MainActor in
+            let snapshot = await camera.capturePhotoJPEG()
+            model.adoptLiveCameraCapture(text: text, snapshot: snapshot)
+            dismiss()
+        }
     }
 }

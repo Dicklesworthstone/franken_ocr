@@ -366,19 +366,30 @@ struct LabView: View {
                 LabLabel(text: "02 · The page")
 
                 if let preview = model.previewImage {
-                    ZStack {
-                        Image(uiImage: preview)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                        if model.showLayoutBoxes, let recognition = model.recognition {
-                            LayoutOverlay(
-                                spans: recognition.layout,
-                                imageSize: preview.size,
-                                music: recognition.music
-                            )
+                    GeometryReader { geometry in
+                        ZStack {
+                            Image(uiImage: preview)
+                                .resizable()
+                                .scaledToFit()
+                                .frame(
+                                    width: geometry.size.width,
+                                    height: geometry.size.height
+                                )
+                            if model.showLayoutBoxes, let recognition = model.recognition {
+                                LayoutOverlay(
+                                    spans: recognition.layout,
+                                    imageSize: preview.size,
+                                    music: recognition.music
+                                )
+                            }
                         }
                     }
-                    .frame(maxHeight: 340)
+                    // `maxHeight` alone does not clip an oversized SwiftUI
+                    // child. Tall screenshots were therefore painting through
+                    // the controls and transcription below this card. Give the
+                    // preview a concrete viewport and clip every overlay to it.
+                    .frame(height: 340)
+                    .clipShape(RoundedRectangle(cornerRadius: Lab.radius))
                     .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
                     .overlay(RoundedRectangle(cornerRadius: Lab.radius)
                         .strokeBorder(Lab.line, lineWidth: 1))
@@ -593,21 +604,31 @@ struct LabView: View {
 
                     // On a document run this is every recognized page joined
                     // with page markers, not just the page last finished.
-                    Group {
-                        if model.viewSource || model.spec.producesMusicXML {
-                            ScrollView(.horizontal, showsIndicators: false) {
-                                Text(model.displayText)
-                                    .font(.system(size: 12, design: .monospaced))
-                                    .foregroundStyle(Lab.textMid)
-                                    .textSelection(.enabled)
-                                    .padding(12)
-                            }
-                            .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
-                        } else {
-                            MarkdownView(markdown: model.displayText)
+                    if model.viewSource || model.spec.producesMusicXML {
+                        ScrollView([.horizontal, .vertical], showsIndicators: true) {
+                            Text(model.displayText)
+                                .font(.system(size: 12, design: .monospaced))
+                                .foregroundStyle(Lab.textMid)
+                                .textSelection(.enabled)
+                                .padding(12)
+                                .frame(maxWidth: .infinity, alignment: .leading)
                         }
+                        .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
+                        .frame(maxHeight: 420)
+                        .clipped()
+                    } else {
+                        // Rendered Markdown can be taller than the result card.
+                        // A frame constraint does not itself prevent drawing
+                        // outside that frame, so make the result its own scroll
+                        // viewport rather than letting it overlap adjacent UI.
+                        ScrollView(.vertical, showsIndicators: true) {
+                            MarkdownView(markdown: model.displayText)
+                                .padding(.vertical, 2)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .frame(maxHeight: 420)
+                        .clipped()
                     }
-                    .frame(maxHeight: 420)
 
                     exportControls
                 } else {

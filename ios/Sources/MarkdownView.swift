@@ -12,10 +12,29 @@ import SwiftUI
 struct MarkdownView: View {
     let markdown: String
 
+    private var presentation: (blocks: [MarkdownBlock], omittedFigures: Int) {
+        let parsed = MarkdownBlock.parse(markdown)
+        let visible = parsed.filter { block in
+            guard case .figure(let caption) = block else { return true }
+            return !caption.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return (visible, parsed.count - visible.count)
+    }
+
     var body: some View {
+        let content = presentation
         VStack(alignment: .leading, spacing: 14) {
-            ForEach(Array(MarkdownBlock.parse(markdown).enumerated()), id: \.offset) { _, block in
+            ForEach(Array(content.blocks.enumerated()), id: \.offset) { _, block in
                 view(for: block)
+            }
+            if content.omittedFigures > 0 {
+                Label(
+                    "\(content.omittedFigures) non-text figure region\(content.omittedFigures == 1 ? "" : "s") omitted from this reading view",
+                    systemImage: "photo.stack"
+                )
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(Lab.textFaint)
+                .padding(.top, 4)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
