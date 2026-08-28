@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 @main
 struct FrankenOCRApp: App {
@@ -9,15 +10,41 @@ struct FrankenOCRApp: App {
                 // surface is authored against #060b09 and there is no light
                 // palette to fall back to.
                 .preferredColorScheme(.dark)
+                .background(CatalystWindowFreedom())
 #if targetEnvironment(macCatalyst)
-                .frame(minWidth: 820, minHeight: 640)
+                .frame(minWidth: 480, minHeight: 420)
 #endif
         }
 #if targetEnvironment(macCatalyst)
         .defaultSize(width: 1180, height: 820)
-        .windowResizability(.automatic)
+        .windowResizability(.contentMinSize)
 #endif
         .commands { OCRCommands() }
+    }
+}
+
+private struct CatalystWindowFreedom: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) { controller.configure() }
+
+    final class Controller: UIViewController {
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            configure()
+        }
+
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            configure()
+        }
+
+        func configure() {
+#if targetEnvironment(macCatalyst)
+            guard let restrictions = view.window?.windowScene?.sizeRestrictions else { return }
+            restrictions.minimumSize = CGSize(width: 480, height: 420)
+            restrictions.maximumSize = CGSize(width: 10_000, height: 10_000)
+#endif
+        }
     }
 }
 

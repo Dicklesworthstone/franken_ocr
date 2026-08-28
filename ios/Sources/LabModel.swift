@@ -2,6 +2,166 @@ import Foundation
 import SwiftUI
 import UIKit
 
+/// Adaptive recognition forecast keyed by model and stored in this device's app
+/// sandbox. Broad model-class lookup values seed a first run; actual megapixel and
+/// page throughput steadily replaces them. It intentionally publishes nothing until
+/// the engine has completed a measurable piece of its first stage.
+private struct OCRAdaptiveETA {
+    private static let version = "v1"
+
+    private var modelID = "unlimited-ocr"
+    private var beganWarm = true
+    private var pageCount = 1
+    private var inputMegapixels = 1.0
+    private var predictedFinishElapsed: TimeInterval?
+    private var hasMeasuredWork = false
+    private var completedPageSeconds: [Double] = []
+    private var completedMegapixels = 0.0
+
+    mutating func reset(modelID: String, pageCount: Int, inputMegapixels: Double) {
+        self.modelID = modelID
+        self.pageCount = max(1, pageCount)
+        self.inputMegapixels = max(0.1, inputMegapixels)
+        beganWarm = true
+        predictedFinishElapsed = nil
+        hasMeasuredWork = false
+        completedPageSeconds.removeAll(keepingCapacity: true)
+        completedMegapixels = 0
+    }
+
+    mutating func setBeganWarm(_ warm: Bool) {
+        beganWarm = warm
+    }
+
+    mutating func observe(
+        progress: ProgressUpdate?,
+        overallFraction: Double,
+        elapsed: TimeInterval
+    ) {
+        guard let progress,
+              progress.current > 0,
+              overallFraction >= 0.02,
+              elapsed > 0
+        else { return }
+
+        hasMeasuredWork = true
+        let fraction = min(0.985, max(0.02, overallFraction))
+        let observedTotal = elapsed / fraction
+        let priorTotal = coldPriorTotal
+
+        // Once a document has completed a page, its own page cadence is a better
+        // predictor than either a global lookup or an early token callback.
+        let completedProjection: Double?
+        if !completedPageSeconds.isEmpty {
+            let average = completedPageSeconds.reduce(0, +) / Double(completedPageSeconds.count)
+            completedProjection = elapsed
+                + average * Double(max(0, pageCount - completedPageSeconds.count))
+        } else {
+            completedProjection = nil
+        }
+
+        let observedWeight = min(0.90, 0.32 + fraction * 0.58)
+        var candidate = priorTotal * (1 - observedWeight) + observedTotal * observedWeight
+        if let completedProjection {
+            candidate = candidate * 0.35 + completedProjection * 0.65
+        }
+        candidate = max(elapsed + 0.75, candidate)
+
+        if let old = predictedFinishElapsed {
+            let smoothed = old * 0.70 + candidate * 0.30
+            predictedFinishElapsed = min(smoothed, old + 4.0)
+        } else {
+            predictedFinishElapsed = candidate
+        }
+    }
+
+    mutating func recordCompletedPage(seconds: Double, megapixels: Double) {
+        guard seconds.isFinite, seconds > 0 else { return }
+        completedPageSeconds.append(seconds)
+        let mp = max(0.1, megapixels)
+        completedMegapixels += mp
+        Self.update(key: secondsPerPageKey, sample: seconds)
+        Self.update(key: secondsPerMegapixelKey, sample: seconds / mp)
+    }
+
+    func remainingSeconds(at elapsed: TimeInterval) -> Int? {
+        guard hasMeasuredWork, let predictedFinishElapsed else { return nil }
+        return max(1, Int(ceil(predictedFinishElapsed - elapsed)))
+    }
+
+    mutating func finish(totalElapsed: TimeInterval) {
+        guard totalElapsed.isFinite, totalElapsed > 0 else { return }
+        if pageCount == 1 {
+            Self.update(key: secondsPerPageKey, sample: totalElapsed)
+            Self.update(
+                key: secondsPerMegapixelKey,
+                sample: totalElapsed / inputMegapixels
+            )
+        } else if !completedPageSeconds.isEmpty {
+            Self.update(
+                key: secondsPerPageKey,
+                sample: totalElapsed / Double(completedPageSeconds.count)
+            )
+            if completedMegapixels > 0 {
+                Self.update(
+                    key: secondsPerMegapixelKey,
+                    sample: totalElapsed / completedMegapixels
+                )
+            }
+        }
+        predictedFinishElapsed = totalElapsed
+    }
+
+    private var coldPriorTotal: Double {
+        let loadTail = beganWarm ? 0.0 : 3.0
+        if pageCount > 1 {
+            return loadTail + learnedSecondsPerPage * Double(pageCount)
+        }
+        return loadTail + learnedSecondsPerMegapixel * inputMegapixels
+    }
+
+    private var secondsPerPageKey: String {
+        "ocr.eta.\(Self.version).\(modelID).secondsPerPage.\(beganWarm ? "warm" : "cold")"
+    }
+
+    private var secondsPerMegapixelKey: String {
+        "ocr.eta.\(Self.version).\(modelID).secondsPerMegapixel.\(beganWarm ? "warm" : "cold")"
+    }
+
+    private var learnedSecondsPerPage: Double {
+        let learned = UserDefaults.standard.double(forKey: secondsPerPageKey)
+        if learned > 0 { return learned }
+        switch modelID {
+        case "unlimited-ocr": return 42
+        case "got-ocr2": return 30
+        case "tromr": return 24
+        case "onechart": return 20
+        case "smolvlm2": return 14
+        default: return 32
+        }
+    }
+
+    private var learnedSecondsPerMegapixel: Double {
+        let learned = UserDefaults.standard.double(forKey: secondsPerMegapixelKey)
+        if learned > 0 { return learned }
+        switch modelID {
+        case "unlimited-ocr": return 13
+        case "got-ocr2": return 9
+        case "tromr": return 8
+        case "onechart": return 7
+        case "smolvlm2": return 4.5
+        default: return 10
+        }
+    }
+
+    private static func update(key: String, sample: Double) {
+        guard sample.isFinite, sample > 0 else { return }
+        let defaults = UserDefaults.standard
+        let old = defaults.double(forKey: key)
+        defaults.set(old > 0 ? old * 0.72 + sample * 0.28 : sample, forKey: key)
+    }
+}
+
 /// What happened to one page of a document.
 ///
 /// A page that cannot be rasterized (JPEG 2000, JBIG2, a born-digital vector
@@ -89,6 +249,7 @@ final class LabModel {
     var isRecognizing = false
     var isLoadingModel = false
     var elapsed: TimeInterval = 0
+    var estimatedRemainingSeconds: Int?
     var progress: ProgressUpdate?
     var recognition: Recognition?
     var lastRunSeconds: Double?
@@ -106,10 +267,12 @@ final class LabModel {
     var currentPageIndex: Int?
 
     private var timer: Timer?
+    private var runStartedAt: Date?
     private var recognizeTask: Task<Void, Never>?
     private let runActivity = OCRActivityController.shared
     /// Guards against a stale run publishing over a newer one.
     private var generation = 0
+    private var eta = OCRAdaptiveETA()
 
     init() {
         if let saved = UserDefaults.standard.string(forKey: "selectedModel"),
@@ -439,6 +602,7 @@ final class LabModel {
         recognition = nil
         progress = nil
         elapsed = 0
+        estimatedRemainingSeconds = nil
         // Cleared up front: it is only assigned on successful completion, so
         // a cancelled or mid-flight run would otherwise show — and export —
         // the PREVIOUS run's timing as if it belonged to this result.
@@ -469,15 +633,23 @@ final class LabModel {
             pages = []
         }
         pageOutcomes = pages.map { PageOutcome(id: $0) }
+        eta.reset(
+            modelID: spec.id,
+            pageCount: max(1, pages.count),
+            inputMegapixels: pixelMegapixels(previewImage)
+        )
         runActivity.begin()
 
         // A minutes-long run must not be interrupted by the screen sleeping,
         // which suspends the app. A whole document is much longer still.
         UIApplication.shared.isIdleTimerDisabled = true
         let wallClockStarted = Date()
+        runStartedAt = wallClockStarted
         timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.elapsed = Date().timeIntervalSince(wallClockStarted)
+                guard let self else { return }
+                self.elapsed = Date().timeIntervalSince(wallClockStarted)
+                self.refreshETA()
             }
         }
 
@@ -490,8 +662,12 @@ final class LabModel {
                 self.isRecognizing = false
                 self.recognizeTask = nil
                 self.progress = nil
+                self.estimatedRemainingSeconds = nil
+                self.runStartedAt = nil
             }
             do {
+                let beganWarm = await self.engine.isLoaded
+                self.eta.setBeganWarm(beganWarm)
                 try await self.ensureEngineLoaded()
                 // Per-RUN options. These are process-global setters that apply
                 // to the next recognition, so applying them only at engine load
@@ -536,11 +712,16 @@ final class LabModel {
             Task { @MainActor [weak self] in
                 guard let self, runGeneration == self.generation else { return }
                 self.progress = update
+                self.refreshETA()
                 self.publishActivity(update)
             }
         }
         guard runGeneration == generation else { return }
-        let seconds = Date().timeIntervalSince(started)
+        let engineSeconds = Date().timeIntervalSince(started)
+        let seconds = currentRunElapsed(fallback: engineSeconds)
+        elapsed = seconds
+        eta.finish(totalElapsed: seconds)
+        estimatedRemainingSeconds = nil
         lastRunSeconds = seconds
         recognition = result
         if let warning = result.lowYield {
@@ -602,6 +783,7 @@ final class LabModel {
             // Show the page currently being read.
             previewPage = page
             previewImage = UIImage(data: png)
+            let pageMegapixels = pixelMegapixels(previewImage)
 
             let pageStarted = Date()
             do {
@@ -609,15 +791,18 @@ final class LabModel {
                     Task { @MainActor [weak self] in
                         guard let self, runGeneration == self.generation else { return }
                         self.progress = update
+                        self.refreshETA()
                         self.publishActivity(update)
                     }
                 }
                 guard runGeneration == generation else { return }
+                let pageSeconds = Date().timeIntervalSince(pageStarted)
                 pageOutcomes[index].text = result.output
                 pageOutcomes[index].state = .done(
                     characters: result.output.count,
-                    seconds: Date().timeIntervalSince(pageStarted)
+                    seconds: pageSeconds
                 )
+                eta.recordCompletedPage(seconds: pageSeconds, megapixels: pageMegapixels)
                 // Keep the most recent page's layout for the box overlay.
                 recognition = result
             } catch let error as EngineError where error.isFatalToDocument {
@@ -636,7 +821,11 @@ final class LabModel {
 
         guard runGeneration == generation else { return }
         currentPageIndex = nil
-        let seconds = Date().timeIntervalSince(started)
+        let engineSeconds = Date().timeIntervalSince(started)
+        let seconds = currentRunElapsed(fallback: engineSeconds)
+        elapsed = seconds
+        eta.finish(totalElapsed: seconds)
+        estimatedRemainingSeconds = nil
         lastRunSeconds = seconds
         let done = completedPageCount
         let skipped = pageOutcomes.filter { if case .skipped = $0.state { true } else { false } }.count
@@ -678,6 +867,28 @@ final class LabModel {
             pageCount: pageOutcomes.count,
             elapsed: elapsed,
             totalIsEstimated: update.total == 0 || update.stage == .decode
+        )
+    }
+
+    private func refreshETA() {
+        let fraction = isDocumentRun ? documentProgressFraction : progressFraction
+        eta.observe(progress: progress, overallFraction: fraction, elapsed: elapsed)
+        estimatedRemainingSeconds = eta.remainingSeconds(at: elapsed)
+    }
+
+    private func currentRunElapsed(fallback: TimeInterval) -> TimeInterval {
+        runStartedAt.map { Date().timeIntervalSince($0) } ?? fallback
+    }
+
+    private func pixelMegapixels(_ image: UIImage?) -> Double {
+        guard let image else { return 1 }
+        if let cgImage = image.cgImage {
+            return max(0.1, Double(cgImage.width * cgImage.height) / 1_000_000)
+        }
+        return max(
+            0.1,
+            Double(image.size.width * image.scale * image.size.height * image.scale)
+                / 1_000_000
         )
     }
 

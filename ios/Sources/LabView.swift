@@ -94,7 +94,7 @@ struct LabView: View {
                     }
                     .padding(.horizontal, 16)
                     .padding(.vertical, 14)
-                    .frame(maxWidth: 1440, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .frame(maxWidth: .infinity)
                 } else if usesWideWorkspace, geometry.size.width >= 700 {
                     VStack(spacing: 14) {
@@ -124,7 +124,7 @@ struct LabView: View {
                     }
                     .padding(.horizontal, geometry.size.width >= 1000 ? 24 : 16)
                     .padding(.vertical, 14)
-                    .frame(maxWidth: 1320, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .frame(maxWidth: .infinity)
                 } else {
                     ScrollView {
@@ -792,6 +792,7 @@ struct LabView: View {
                     : model.progressFraction,
                 isEstimated: model.progressIsEstimated,
                 elapsed: model.elapsed,
+                estimatedRemainingSeconds: model.estimatedRemainingSeconds,
                 currentPage: model.currentPageIndex.map { $0 + 1 },
                 pageCount: model.pageOutcomes.count,
                 completedPages: model.pageOutcomes.filter(\.isTerminal).count,

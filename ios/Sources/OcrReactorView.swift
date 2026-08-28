@@ -7,6 +7,7 @@ struct OcrReactorView: View {
     let fraction: Double
     let isEstimated: Bool
     let elapsed: TimeInterval
+    let estimatedRemainingSeconds: Int?
     let currentPage: Int?
     let pageCount: Int
     let completedPages: Int
@@ -155,10 +156,20 @@ struct OcrReactorView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
-            Text(Self.clock(elapsed))
-                .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
-                .foregroundStyle(Lab.textFaint)
-                .monospacedDigit()
+            VStack(alignment: .trailing, spacing: 3) {
+                Text(Self.clock(elapsed))
+                    .foregroundStyle(Lab.textFaint)
+                if let estimatedRemainingSeconds {
+                    Text("≈ \(estimatedRemainingSeconds)s left")
+                        .foregroundStyle(Lab.accent)
+                        .contentTransition(.numericText())
+                        .accessibilityLabel(
+                            "About \(estimatedRemainingSeconds) seconds remaining"
+                        )
+                }
+            }
+            .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
+            .monospacedDigit()
         }
     }
 
