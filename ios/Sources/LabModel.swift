@@ -490,11 +490,20 @@ final class LabModel {
         let seconds = Date().timeIntervalSince(started)
         lastRunSeconds = seconds
         recognition = result
-        statusKind = .ok
-        status = String(
-            format: "Done in %.1fs · %d characters, entirely on this device.",
-            seconds, result.output.count
-        )
+        if let warning = result.lowYield {
+            statusKind = .warn
+            status = String(
+                format: "Low-yield result: %.2f MP produced only %d text characters. Try a sharper or higher-resolution capture.",
+                warning.megapixels, warning.characters
+            )
+        } else {
+            statusKind = .ok
+            let route = result.tallStripCount.map { " · \($0) smart strips" } ?? ""
+            status = String(
+                format: "Done in %.1fs · %d characters%@, entirely on this device.",
+                seconds, result.output.count, route
+            )
+        }
     }
 
     /// Walk every selected page of the document.

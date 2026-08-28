@@ -63,6 +63,17 @@ struct Recognition: Sendable {
     let output: String
     let layout: [LayoutSpan]
     let music: MusicMeta?
+    /// Present when the default document model routed an extreme-aspect image
+    /// through the CLI's same smart-cut horizontal-strip path.
+    let tallStripCount: Int?
+    /// A successful but suspiciously sparse page result. This is surfaced as
+    /// an actionable warning instead of quietly presenting a false success.
+    let lowYield: LowYield?
+
+    struct LowYield: Sendable {
+        let characters: Int
+        let megapixels: Double
+    }
 
     struct LayoutSpan: Sendable, Identifiable {
         let id = UUID()
@@ -401,6 +412,15 @@ private extension Recognition {
                 label: span["label"] as? String ?? "",
                 boxes: (span["boxes"] as? [[Int]]) ?? []
             )
+        }
+        tallStripCount = root["tall_strip_count"] as? Int
+        if let warning = root["low_yield"] as? [String: Any] {
+            lowYield = LowYield(
+                characters: warning["yield_chars"] as? Int ?? 0,
+                megapixels: warning["input_megapixels"] as? Double ?? 0
+            )
+        } else {
+            lowYield = nil
         }
         if let m = root["music"] as? [String: Any] {
             music = MusicMeta(

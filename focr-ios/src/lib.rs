@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use franken_ocr::error::{FocrError, FocrResult};
-use franken_ocr::native_engine::OcrModel;
+use franken_ocr::native_engine::{OcrModel, RecognizedDocument};
 
 // ── Error slot ─────────────────────────────────────────────────────────────
 
@@ -372,12 +372,55 @@ pub unsafe extern "C" fn focr_engine_license(engine: *const FocrEngine) -> *cons
 
 // ── Recognition ────────────────────────────────────────────────────────────
 
-/// Build the same JSON envelope `focr-wasm`'s `recognize_json` returns, so the
-/// app and the playground consume ONE result shape.
+fn should_route_tall(model_id: &str, width: u32, height: u32) -> bool {
+    model_id == "unlimited-ocr" && franken_ocr::tall::is_tall(width, height)
+}
+
+/// The CLI's tall-capture router applies only to ordinary document OCR. The
+/// iOS picker exposes specialty models as distinct product modes, so only the
+/// default Unlimited-OCR model is eligible here; a tall photo-description,
+/// chart, structured-GOT, or music input is not safely line-concatenable.
+fn recognize_document(
+    engine: &FocrEngine,
+    image: image::DynamicImage,
+) -> FocrResult<(RecognizedDocument, Option<usize>)> {
+    let (width, height) = (image.width(), image.height());
+    let route_tall = should_route_tall(engine.model.arch().id(), width, height);
+    if !route_tall {
+        return engine
+            .model
+            .recognize_dynamic_with_layout(image)
+            .map(|doc| (doc, None));
+    }
+
+    let profile = franken_ocr::tall::ink_profile(&image);
+    let plan = franken_ocr::tall::plan_strips(width, height, &profile);
+    let strips = franken_ocr::tall::cut_strips(&image, &plan);
+    let mut parts = Vec::with_capacity(strips.len());
+    for (strip, bounds) in strips.into_iter().zip(&plan) {
+        let doc = engine.model.recognize_dynamic_with_layout(strip)?;
+        parts.push((doc, bounds.top));
+    }
+    let strip_count = plan.len();
+    Ok((franken_ocr::tall::merge_documents(parts), Some(strip_count)))
+}
+
+/// Build the same JSON envelope `focr-wasm`'s `recognize_json` returns, with
+/// additive iOS metadata for the CLI's tall-capture and low-yield behavior.
 fn recognize_envelope(engine: &FocrEngine, image_bytes: &[u8]) -> FocrResult<String> {
     let img = image::load_from_memory(image_bytes)
         .map_err(|e| FocrError::InputDecode(format!("could not decode image: {e}")))?;
-    let doc = engine.model.recognize_dynamic_with_layout(img)?;
+    let (width, height) = (img.width(), img.height());
+    let (doc, tall_strip_count) = recognize_document(engine, img)?;
+    let low_yield = (engine.model.arch().id() == "unlimited-ocr")
+        .then(|| franken_ocr::tall::low_yield_assessment(&doc.markdown, width, height))
+        .flatten()
+        .map(|assessment| {
+            serde_json::json!({
+                "yield_chars": assessment.yield_chars,
+                "input_megapixels": assessment.input_megapixels,
+            })
+        });
     let layout: Vec<serde_json::Value> = doc
         .layout
         .iter()
@@ -419,6 +462,8 @@ fn recognize_envelope(engine: &FocrEngine, image_bytes: &[u8]) -> FocrResult<Str
         "output": doc.markdown,
         "layout": layout,
         "music": music,
+        "tall_strip_count": tall_strip_count,
+        "low_yield": low_yield,
     })
     .to_string())
 }
@@ -874,6 +919,15 @@ mod tests {
         assert!(parsed.get("detected_tier").is_some());
         assert!(parsed.get("dense_route").is_some());
         assert!(parsed.get("threads").is_some());
+    }
+
+    #[test]
+    fn tall_router_is_limited_to_the_default_document_model() {
+        assert!(should_route_tall("unlimited-ocr", 500, 1_500));
+        assert!(!should_route_tall("unlimited-ocr", 500, 1_499));
+        assert!(!should_route_tall("smol-vlm", 500, 2_000));
+        assert!(!should_route_tall("got-ocr", 500, 2_000));
+        assert!(!should_route_tall("tromr", 500, 2_000));
     }
 
     #[test]

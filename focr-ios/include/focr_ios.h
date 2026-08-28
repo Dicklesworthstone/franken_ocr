@@ -99,10 +99,16 @@ const char *focr_engine_license(const FocrEngine *engine);
 //   {"model_id": "...",
 //    "output": "<markdown, or MusicXML for TrOMR>",
 //    "layout": [{"label": "...", "boxes": [[x1,y1,x2,y2], ...]}],
-//    "music": {"staves":[...], "skips":[...], "warnings":[...]} | null}
+//    "music": {"staves":[...], "skips":[...], "warnings":[...]} | null,
+//    "tall_strip_count": 4 | null,
+//    "low_yield": {"yield_chars":14, "input_megapixels":0.988} | null}
 //
-// `layout` mirrors `focr ocr --json`. This is a long blocking call — minutes for
-// a document page. Do not call it on the main thread.
+// `layout` mirrors `focr ocr --json`. The default Unlimited-OCR model routes
+// images at least 3x taller than wide through the CLI's same smart-cut strip
+// path; specialty models remain one-pass. `low_yield` is an honest warning
+// that a page-sized input produced almost no text, not a recognition failure.
+// This is a long blocking call — minutes for a document page. Do not call it
+// on the main thread.
 int32_t focr_recognize_json(FocrEngine *engine, const uint8_t *image_bytes,
                             size_t image_len, char **out_json);
 

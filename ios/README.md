@@ -35,6 +35,11 @@ xcodebuild -exportArchive \
 The export configuration keeps the checked-in marketing version and build
 number authoritative instead of letting App Store Connect renumber the binary.
 
+Version 1.1 also carries the v0.9 tall-capture behavior into the native app:
+extreme scrolling screenshots use the same smart-cut strip router as the CLI,
+and suspiciously sparse page output is shown as a low-yield warning instead of
+quietly looking successful.
+
 `FocrCore.xcframework/` and `FrankenOCR.xcodeproj/` are generated and
 gitignored. `project.yml`, `build-rust.sh`, `Sources/`, the entitlements, and
 the privacy manifest are the source.
