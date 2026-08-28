@@ -4,6 +4,8 @@ import SwiftUI
 import UIKit
 import VisionKit
 
+#if !targetEnvironment(macCatalyst)
+
 /// One update from Apple's native Live Text camera scanner.
 ///
 /// Boxes use normalized UIKit coordinates: the origin is at the top-left of
@@ -703,3 +705,66 @@ struct LiveCameraView: View {
         }
     }
 }
+
+#else
+
+/// VisionKit's realtime DataScanner is deliberately unavailable in Mac
+/// Catalyst. Keep the universal app honest and useful: imported images and PDFs
+/// still use the full FrankenOCR engine, while this route explains where the
+/// realtime Apple scanner is supported instead of presenting a dead camera.
+struct LiveCameraView: View {
+    let model: LabModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        ZStack {
+            LabBackground()
+            VStack(alignment: .leading, spacing: 24) {
+                HStack {
+                    LabLabel(text: "Live camera")
+                    Spacer()
+                    Button { dismiss() } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .bold))
+                            .frame(width: 38, height: 38)
+                    }
+                    .buttonStyle(GhostButtonStyle())
+                    .accessibilityLabel("Close")
+                }
+
+                Spacer()
+
+                LabPanel {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Image(systemName: "macbook.and.iphone")
+                            .font(.system(size: 38, weight: .bold))
+                            .foregroundStyle(Lab.amber)
+                        Text("Live Camera continues on iPhone and iPad")
+                            .font(.title2.bold())
+                            .foregroundStyle(Lab.textPrimary)
+                        Text(
+                            "Apple's realtime Live Text camera is not available to Mac Catalyst apps. "
+                                + "On this Mac, drop or choose an image or PDF in the Vision Table to "
+                                + "run the full, more accurate FrankenOCR model entirely on-device."
+                        )
+                        .font(.body)
+                        .foregroundStyle(Lab.textDim)
+                        .fixedSize(horizontal: false, vertical: true)
+                        Button { dismiss() } label: {
+                            Label("Return to the Vision Table", systemImage: "doc.viewfinder")
+                        }
+                        .buttonStyle(PrimaryButtonStyle())
+                    }
+                }
+
+                Spacer()
+            }
+            .padding(24)
+            .frame(maxWidth: 720)
+        }
+        .preferredColorScheme(.dark)
+        .tint(Lab.accent)
+    }
+}
+
+#endif

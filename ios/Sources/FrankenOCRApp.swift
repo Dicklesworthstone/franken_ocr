@@ -9,7 +9,14 @@ struct FrankenOCRApp: App {
                 // surface is authored against #060b09 and there is no light
                 // palette to fall back to.
                 .preferredColorScheme(.dark)
+#if targetEnvironment(macCatalyst)
+                .frame(minWidth: 720, minHeight: 600)
+#endif
         }
+#if targetEnvironment(macCatalyst)
+        .defaultSize(width: 1180, height: 820)
+        .windowResizability(.contentMinSize)
+#endif
         .commands { OCRCommands() }
     }
 }
@@ -48,8 +55,10 @@ private struct OCRCommands: Commands {
                 .keyboardShortcut(.return, modifiers: [.command])
                 .disabled(actions?.canRecognize != true)
 
+#if !targetEnvironment(macCatalyst)
             Button("Open Live Camera") { actions?.liveCamera() }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
+#endif
 
             Divider()
 

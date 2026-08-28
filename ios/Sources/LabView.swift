@@ -50,7 +50,6 @@ struct LabView: View {
     @State private var model = LabModel()
     @State private var destination: Destination = .capture
     @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.horizontalSizeClass) private var sizeClass
 
     @State private var photoItem: PhotosPickerItem?
     @State private var showFileImporter = false
@@ -61,35 +60,35 @@ struct LabView: View {
     @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
     @FocusState private var focusedTextEntry: LabTextEntry?
 
-    private var isWide: Bool { sizeClass == .regular }
-
     var body: some View {
         ZStack {
             LabBackground()
-            ScrollView {
-                VStack(spacing: 26) {
-                    header
-                    if isWide {
-                        HStack(alignment: .top, spacing: 20) {
-                            VStack(spacing: 20) {
-                                specimenCard
-                                pageCard
+            GeometryReader { geometry in
+                ScrollView {
+                    VStack(spacing: 26) {
+                        header
+                        if geometry.size.width >= 900 {
+                            HStack(alignment: .top, spacing: 20) {
+                                VStack(spacing: 20) {
+                                    specimenCard
+                                    pageCard
+                                }
+                                .frame(maxWidth: .infinity)
+                                transcriptionCard.frame(maxWidth: .infinity)
                             }
-                            .frame(maxWidth: .infinity)
-                            transcriptionCard.frame(maxWidth: .infinity)
+                        } else {
+                            destinationPicker
+                            compactWorkspace
                         }
-                    } else {
-                        destinationPicker
-                        compactWorkspace
+                        footer
                     }
-                    footer
+                    .padding(.horizontal, geometry.size.width >= 900 ? 28 : 18)
+                    .padding(.vertical, 26)
+                    .frame(maxWidth: 1180)
+                    .frame(maxWidth: .infinity)
                 }
-                .padding(.horizontal, isWide ? 28 : 18)
-                .padding(.vertical, 26)
-                .frame(maxWidth: 1180)
-                .frame(maxWidth: .infinity)
+                .scrollDismissesKeyboard(.interactively)
             }
-            .scrollDismissesKeyboard(.interactively)
         }
         .coordinateSpace(name: "lab-text-entry-space")
         .onPreferenceChange(LabTextEntryFramePreferenceKey.self) { frames in
@@ -240,28 +239,74 @@ struct LabView: View {
             VStack(alignment: .leading, spacing: 14) {
                 LabLabel(text: "Live camera")
                 HStack(alignment: .top, spacing: 14) {
-                    Image(systemName: "viewfinder.circle.fill")
+                    Image(systemName: liveCameraPlatformSymbol)
                         .font(.system(size: 34, weight: .bold))
                         .foregroundStyle(Lab.amber)
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("See real words bend into the capture tray")
+                        Text(liveCameraPlatformTitle)
                             .font(.headline)
                             .foregroundStyle(Lab.textPrimary)
-                        Text(
-                            "Live Camera uses Apple's fast on-device Vision recognizer, not the Baidu-derived FrankenOCR model. It trades some accuracy for realtime responsiveness; still images and PDFs keep the full model."
-                        )
+                        Text(liveCameraPlatformDetail)
                         .font(.subheadline)
                         .foregroundStyle(Lab.textDim)
                     }
                 }
                 Button {
+#if targetEnvironment(macCatalyst)
+                    destination = .capture
+                    showFileImporter = true
+#else
                     showLiveCamera = true
+#endif
                 } label: {
-                    Label("Open Live Camera", systemImage: "camera.viewfinder")
+                    Label(liveCameraPlatformAction, systemImage: liveCameraPlatformActionSymbol)
                 }
                 .buttonStyle(PrimaryButtonStyle())
             }
         }
+    }
+
+    private var liveCameraPlatformTitle: String {
+#if targetEnvironment(macCatalyst)
+        "Live Camera continues on iPhone and iPad"
+#else
+        "See real words bend into the capture tray"
+#endif
+    }
+
+    private var liveCameraPlatformDetail: String {
+#if targetEnvironment(macCatalyst)
+        "Apple's realtime Live Text scanner is unavailable to Mac Catalyst apps. "
+            + "Choose an image or PDF here to use the full FrankenOCR model on this Mac."
+#else
+        "Live Camera uses Apple's fast on-device Vision recognizer, not the Baidu-derived "
+            + "FrankenOCR model. It trades some accuracy for realtime responsiveness; still "
+            + "images and PDFs keep the full model."
+#endif
+    }
+
+    private var liveCameraPlatformSymbol: String {
+#if targetEnvironment(macCatalyst)
+        "macbook.and.iphone"
+#else
+        "viewfinder.circle.fill"
+#endif
+    }
+
+    private var liveCameraPlatformAction: String {
+#if targetEnvironment(macCatalyst)
+        "Choose an image or PDF"
+#else
+        "Open Live Camera"
+#endif
+    }
+
+    private var liveCameraPlatformActionSymbol: String {
+#if targetEnvironment(macCatalyst)
+        "doc.badge.plus"
+#else
+        "camera.viewfinder"
+#endif
     }
 
     private func consumeRequestedAction() {
@@ -616,6 +661,9 @@ struct LabView: View {
 
     private var inputButtons: some View {
         VStack(spacing: 10) {
+#if targetEnvironment(macCatalyst)
+            HStack(spacing: 10) { photoButton; filesButton }
+#else
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 10) { photoButton; filesButton; cameraButton }
                 VStack(spacing: 10) {
@@ -629,6 +677,7 @@ struct LabView: View {
             }
             .buttonStyle(GhostButtonStyle(tint: Lab.accent))
             .disabled(model.isRecognizing)
+#endif
         }
     }
 
