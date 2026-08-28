@@ -121,7 +121,7 @@ struct OcrReactorView: View {
                     "Decode completion is an estimate; token count is exact and EOS is unknowable in advance.",
                     systemImage: "waveform.path.ecg"
                 )
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: Lab.typeSize(10), design: .monospaced))
                 .foregroundStyle(Lab.textFaint)
             }
 
@@ -138,7 +138,7 @@ struct OcrReactorView: View {
                 Circle().fill(Lab.accent.opacity(0.12))
                 Circle().strokeBorder(Lab.accent.opacity(0.52), lineWidth: 1)
                 Image(systemName: symbol)
-                    .font(.system(size: 18, weight: .bold))
+                    .font(.system(size: Lab.typeSize(18), weight: .bold))
                     .foregroundStyle(Lab.accent)
                     .symbolEffect(.pulse, isActive: !reduceMotion)
             }
@@ -146,17 +146,17 @@ struct OcrReactorView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(headline.uppercased())
-                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(13), weight: .heavy, design: .monospaced))
                     .tracking(1.4)
                     .foregroundStyle(Lab.textPrimary)
                 Text(explanation)
-                    .font(.system(size: 12))
+                    .font(.system(size: Lab.typeSize(12)))
                     .foregroundStyle(Lab.textDim)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 8)
             Text(Self.clock(elapsed))
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
                 .foregroundStyle(Lab.textFaint)
                 .monospacedDigit()
         }
@@ -207,11 +207,11 @@ struct OcrReactorView: View {
     private func metric(_ label: String, _ value: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(label)
-                .font(.system(size: 8, weight: .bold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(8), weight: .bold, design: .monospaced))
                 .tracking(1)
                 .foregroundStyle(Lab.textFaint)
             Text(value)
-                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(11), weight: .semibold, design: .monospaced))
                 .foregroundStyle(Lab.textMid)
                 .monospacedDigit()
                 .lineLimit(1)
@@ -316,7 +316,7 @@ struct OcrReactorView: View {
 
     private func instrumentLabel(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 8, weight: .bold, design: .monospaced))
+            .font(.system(size: Lab.typeSize(8), weight: .bold, design: .monospaced))
             .tracking(1.1)
             .foregroundStyle(Lab.textFaint)
     }

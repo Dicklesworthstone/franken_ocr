@@ -32,7 +32,7 @@ struct MarkdownView: View {
                     "\(content.omittedFigures) non-text figure region\(content.omittedFigures == 1 ? "" : "s") omitted from this reading view",
                     systemImage: "photo.stack"
                 )
-                .font(.system(size: 11, design: .monospaced))
+                .font(.system(size: Lab.typeSize(11), design: .monospaced))
                 .foregroundStyle(Lab.textFaint)
                 .padding(.top, 4)
             }
@@ -52,7 +52,7 @@ struct MarkdownView: View {
 
         case .paragraph(let text):
             Text(inline(text))
-                .font(.system(size: 15))
+                .font(.system(size: Lab.typeSize(15)))
                 .lineSpacing(4)
                 .foregroundStyle(Lab.textMid)
                 .textSelection(.enabled)
@@ -63,7 +63,7 @@ struct MarkdownView: View {
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("•").foregroundStyle(Lab.accent)
                         Text(inline(item))
-                            .font(.system(size: 15))
+                            .font(.system(size: Lab.typeSize(15)))
                             .foregroundStyle(Lab.textMid)
                     }
                 }
@@ -74,10 +74,10 @@ struct MarkdownView: View {
                 ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Text("\(index + 1).")
-                            .font(.system(size: 14, design: .monospaced))
+                            .font(.system(size: Lab.typeSize(14), design: .monospaced))
                             .foregroundStyle(Lab.accent)
                         Text(inline(item))
-                            .font(.system(size: 15))
+                            .font(.system(size: Lab.typeSize(15)))
                             .foregroundStyle(Lab.textMid)
                     }
                 }
@@ -86,7 +86,7 @@ struct MarkdownView: View {
         case .code(let text):
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(text)
-                    .font(.system(size: 12.5, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12.5), design: .monospaced))
                     .foregroundStyle(Lab.textMid)
                     .padding(12)
             }
@@ -109,7 +109,7 @@ struct MarkdownView: View {
                 Image(systemName: "photo")
                 Text(caption.isEmpty ? "figure (not extracted)" : caption)
             }
-            .font(.system(size: 13).italic())
+            .font(.system(size: Lab.typeSize(13)).italic())
             .foregroundStyle(Lab.textFaint)
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -149,7 +149,7 @@ private struct MarkdownTable: View {
             HStack(spacing: 0) {
                 ForEach(Array(header.enumerated()), id: \.offset) { _, cell in
                     Text(cell)
-                        .font(.system(size: 11, weight: .heavy, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(11), weight: .heavy, design: .monospaced))
                         .kerning(1.2)
                         .textCase(.uppercase)
                         .foregroundStyle(Lab.accent)
@@ -164,7 +164,7 @@ private struct MarkdownTable: View {
                 HStack(spacing: 0) {
                     ForEach(Array(row.enumerated()), id: \.offset) { _, cell in
                         Text(cell)
-                            .font(.system(size: 13))
+                            .font(.system(size: Lab.typeSize(13)))
                             .foregroundStyle(Lab.textMid)
                             .frame(minWidth: 90, alignment: .leading)
                             .padding(.vertical, 9).padding(.horizontal, 11)

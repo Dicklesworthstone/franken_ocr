@@ -10,12 +10,12 @@ struct FrankenOCRApp: App {
                 // palette to fall back to.
                 .preferredColorScheme(.dark)
 #if targetEnvironment(macCatalyst)
-                .frame(minWidth: 720, minHeight: 600)
+                .frame(minWidth: 820, minHeight: 640)
 #endif
         }
 #if targetEnvironment(macCatalyst)
         .defaultSize(width: 1180, height: 820)
-        .windowResizability(.contentMinSize)
+        .windowResizability(.automatic)
 #endif
         .commands { OCRCommands() }
     }

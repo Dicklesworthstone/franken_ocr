@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// The franken-ocr.com design system, ported.
 ///
@@ -45,6 +46,30 @@ enum Lab {
 
     static let radius: CGFloat = 12
     static let radiusLarge: CGFloat = 18
+
+    static func typeSize(_ base: CGFloat) -> CGFloat {
+#if targetEnvironment(macCatalyst)
+        base * 1.38
+#else
+        UIFontMetrics(forTextStyle: .body).scaledValue(for: base)
+#endif
+    }
+}
+
+private struct CatalystReadableType: ViewModifier {
+    func body(content: Content) -> some View {
+#if targetEnvironment(macCatalyst)
+        content.dynamicTypeSize(.xLarge)
+#else
+        content
+#endif
+    }
+}
+
+extension View {
+    func catalystReadableType() -> some View {
+        modifier(CatalystReadableType())
+    }
 }
 
 extension Color {
@@ -93,7 +118,7 @@ struct LabLabel: View {
     let text: String
     var body: some View {
         Text(text.uppercased())
-            .font(.system(size: 11, weight: .heavy, design: .monospaced))
+            .font(.system(size: Lab.typeSize(11), weight: .heavy, design: .monospaced))
             .kerning(2.4)
             .foregroundStyle(Lab.accentInk)
     }
@@ -104,7 +129,7 @@ struct LabLabel: View {
 /// most recognizable piece of the FrankenSuite identity — the same mark appears
 /// on frankentts and franken-markdown.
 struct Bolt: View {
-    var size: CGFloat = 13
+    var size: CGFloat = 11
     var body: some View {
         ZStack {
             Circle()
@@ -117,15 +142,14 @@ struct Bolt: View {
                     )
                 )
                 .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 1))
-            // The crossed slot, drawn as two rotated bars.
-            Group {
-                Capsule().frame(width: size * 0.62, height: 1.6).rotationEffect(.degrees(45))
-                Capsule().frame(width: size * 0.62, height: 1.6).rotationEffect(.degrees(-45))
-            }
-            .foregroundStyle(Color(hex: 0x1E293B))
+            Capsule()
+                .frame(width: size * 0.56, height: 1.2)
+                .rotationEffect(.degrees(-28))
+                .foregroundStyle(Color.black.opacity(0.68))
         }
         .frame(width: size, height: size)
-        .shadow(color: Lab.accent.opacity(0.22), radius: 5)
+        .shadow(color: Color.black.opacity(0.55), radius: 2, y: 1)
+        .accessibilityHidden(true)
     }
 }
 
@@ -155,7 +179,7 @@ struct PrimaryButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 12, weight: .heavy, design: .monospaced))
+            .font(.system(size: Lab.typeSize(12), weight: .heavy, design: .monospaced))
             .kerning(1.2)
             .textCase(.uppercase)
             .foregroundStyle(Lab.onAccent)
@@ -184,9 +208,15 @@ struct GhostButtonStyle: ButtonStyle {
 
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .font(.system(size: 12, weight: .heavy, design: .monospaced))
+            .font(.system(size: Lab.typeSize(12), weight: .heavy, design: .monospaced))
             .kerning(1.2)
             .textCase(.uppercase)
+            // Keep controls causal and scannable at accessibility sizes. Giving
+            // the label an honest single-line intrinsic width also lets the
+            // surrounding ViewThatFits choose its two-row layout instead of
+            // accepting an ugly mid-word wrap such as "PHOTO" / "S".
+            .lineLimit(1)
+            .minimumScaleFactor(0.72)
             .foregroundStyle(tint)
             .padding(.vertical, 13)
             .padding(.horizontal, 18)
@@ -213,7 +243,7 @@ struct KeyValueLine: View {
                 .textSelection(.enabled)
             Spacer(minLength: 0)
         }
-        .font(.system(size: 12, design: .monospaced))
+        .font(.system(size: Lab.typeSize(12), design: .monospaced))
     }
 }
 
@@ -239,7 +269,7 @@ struct StatusLine: View {
         HStack(alignment: .top, spacing: 10) {
             Rectangle().frame(width: 2).foregroundStyle(kind.color)
             Text(text)
-                .font(.system(size: 12, design: .monospaced))
+                .font(.system(size: Lab.typeSize(12), design: .monospaced))
                 .foregroundStyle(kind == .neutral ? Lab.textDim : kind.color)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)

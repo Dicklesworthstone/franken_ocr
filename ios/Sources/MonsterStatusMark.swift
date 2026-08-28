@@ -90,7 +90,7 @@ struct MonsterStatusMark: View {
                     .fill(Color.black.opacity(0.86))
                     .overlay {
                         Image(systemName: instrument.symbol)
-                            .font(.system(size: 9, weight: .black))
+                            .font(.system(size: Lab.typeSize(9), weight: .black))
                             .foregroundStyle(accent)
                     }
                     .frame(width: 22, height: 22)

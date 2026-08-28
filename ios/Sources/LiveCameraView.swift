@@ -159,10 +159,13 @@ private final class LiveCameraController: NSObject, ObservableObject,
             else { continue }
 
             let text = recognized.transcript.trimmingCharacters(in: .whitespacesAndNewlines)
-            // The native scanner may briefly surface low-confidence fragments
-            // as focus settles. The live tray favors precision over recall;
-            // users can use the full Baidu model for difficult text.
-            guard text.count >= 2, candidate.confidence >= 0.52 else { continue }
+            // DataScanner's own stabilized transcript is the source of truth
+            // for Live Camera. Its highlight can be valid while Vision's
+            // candidate confidence remains below a fixed threshold, so a hard
+            // confidence gate made visible words silently disappear before
+            // they ever reached the tray. Deduplication below absorbs the
+            // focus-settling repeats without dropping Apple's accepted text.
+            guard text.count >= 2 else { continue }
 
             let bounds = recognized.bounds
             let points = [bounds.topLeft, bounds.topRight, bounds.bottomRight, bounds.bottomLeft]
@@ -279,6 +282,7 @@ private struct LiveTextAccumulator {
                         confidence: incoming.confidence,
                         normalized: normalized
                     )
+                    accepted.append(incoming)
                 }
                 continue
             }
@@ -288,7 +292,10 @@ private struct LiveTextAccumulator {
                 confidence: incoming.confidence,
                 normalized: normalized
             ))
-            if batch.animatedLineIDs.contains(incoming.id) { accepted.append(incoming) }
+            // Animation follows actual tray admission. Depending on focus and
+            // tracking timing, VisionKit can introduce a valid line in an
+            // all-items callback without retaining its ID in changedItems.
+            accepted.append(incoming)
         }
 
         if lines.count > 160 { lines.removeFirst(lines.count - 160) }
@@ -400,7 +407,7 @@ private struct TextWarpLayer: View {
             let angle = atan2(tangent.y, tangent.x)
             let resolved = context.resolve(
                 Text(String(glyph))
-                    .font(.system(size: 13, weight: .black, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(13), weight: .black, design: .monospaced))
                     .foregroundStyle(Lab.accent)
             )
             var copy = context
@@ -535,7 +542,7 @@ struct LiveCameraView: View {
         HStack(spacing: 12) {
             Button { dismiss() } label: {
                 Image(systemName: "xmark")
-                    .font(.system(size: 15, weight: .bold))
+                    .font(.system(size: Lab.typeSize(15), weight: .bold))
                     .frame(width: 42, height: 42)
                     .background(.black.opacity(0.50), in: Circle())
             }
@@ -543,21 +550,21 @@ struct LiveCameraView: View {
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("LIVE CAMERA")
-                    .font(.system(size: 15, weight: .black, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(15), weight: .black, design: .monospaced))
                     .foregroundStyle(.white)
                 HStack(spacing: 6) {
                     Circle()
                         .fill(camera.isRunning ? Lab.accent : Lab.amber)
                         .frame(width: 6, height: 6)
                     Text(camera.isRunning ? "APPLE LIVE TEXT · ON DEVICE" : "STARTING CAMERA")
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(9), weight: .bold, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.68))
                 }
             }
             Spacer()
             Button { camera.toggleTorch() } label: {
                 Image(systemName: camera.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: Lab.typeSize(16), weight: .semibold))
                     .frame(width: 42, height: 42)
                     .background(.black.opacity(0.50), in: Circle())
             }
@@ -572,7 +579,7 @@ struct LiveCameraView: View {
                 .foregroundStyle(Lab.amber)
                 .padding(.top, 1)
             Text("FAST LIVE MODE: This uses Apple's on-device Live Text recognizer—not the Baidu/FrankenOCR model. It is optimized for real-time video and can be less accurate. For maximum accuracy, use Camera to take a still photo.")
-                .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(9), weight: .semibold, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.82))
                 .fixedSize(horizontal: false, vertical: true)
         }
@@ -590,11 +597,11 @@ struct LiveCameraView: View {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("CAPTURED TEXT")
-                        .font(.system(size: 11, weight: .black, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(11), weight: .black, design: .monospaced))
                         .kerning(1.5)
                         .foregroundStyle(Lab.accent)
                     Text("\(camera.latestBatch?.lines.count ?? 0) live lines · \(capturedText.count) captured characters")
-                        .font(.system(size: 9, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(9), design: .monospaced))
                         .foregroundStyle(.white.opacity(0.52))
                 }
                 Spacer()
@@ -607,21 +614,21 @@ struct LiveCameraView: View {
                     }
                 }
                 .disabled(capturedText.isEmpty)
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(11), weight: .bold, design: .monospaced))
 
                 Button("Clear") {
                     accumulator.clear()
                     strips.removeAll(keepingCapacity: true)
                 }
                 .disabled(capturedText.isEmpty)
-                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .font(.system(size: Lab.typeSize(11), weight: .bold, design: .monospaced))
             }
 
             ScrollView {
                 Text(capturedText.isEmpty
                      ? "Point the camera at text. Actual recognized lines will bend into this tray."
                      : capturedText)
-                    .font(.system(size: 13, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(13), design: .monospaced))
                     .foregroundStyle(capturedText.isEmpty ? .white.opacity(0.42) : .white.opacity(0.92))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -657,10 +664,10 @@ struct LiveCameraView: View {
     private func errorOverlay(_ message: String) -> some View {
         VStack(spacing: 14) {
             Image(systemName: "camera.fill")
-                .font(.system(size: 28))
+                .font(.system(size: Lab.typeSize(28)))
                 .foregroundStyle(Lab.amber)
             Text(message)
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: Lab.typeSize(13), weight: .semibold))
                 .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
             Button("Open Settings") {
@@ -678,7 +685,12 @@ struct LiveCameraView: View {
     }
 
     private func ingest(_ batch: LiveCameraBatch) {
-        let accepted = accumulator.ingest(batch)
+        // Assign a new value back to @State. Mutating a nested value in place
+        // is not a reliable invalidation boundary for every SwiftUI release,
+        // and the old path could recognize text while leaving this tray stale.
+        var nextAccumulator = accumulator
+        let accepted = nextAccumulator.ingest(batch)
+        accumulator = nextAccumulator
         guard !reduceMotion, !accepted.isEmpty else { return }
         let now = Date.timeIntervalSinceReferenceDate
         strips.removeAll { now - $0.born > $0.duration }
@@ -725,7 +737,7 @@ struct LiveCameraView: View {
                     Spacer()
                     Button { dismiss() } label: {
                         Image(systemName: "xmark")
-                            .font(.system(size: 14, weight: .bold))
+                            .font(.system(size: Lab.typeSize(14), weight: .bold))
                             .frame(width: 38, height: 38)
                     }
                     .buttonStyle(GhostButtonStyle())
@@ -737,7 +749,7 @@ struct LiveCameraView: View {
                 LabPanel {
                     VStack(alignment: .leading, spacing: 16) {
                         Image(systemName: "macbook.and.iphone")
-                            .font(.system(size: 38, weight: .bold))
+                            .font(.system(size: Lab.typeSize(38), weight: .bold))
                             .foregroundStyle(Lab.amber)
                         Text("Live Camera continues on iPhone and iPad")
                             .font(.title2.bold())

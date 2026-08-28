@@ -64,32 +64,86 @@ struct LabView: View {
         ZStack {
             LabBackground()
             GeometryReader { geometry in
-                ScrollView {
-                    VStack(spacing: 26) {
+                if usesThreeColumnDesktop(width: geometry.size.width) {
+                    VStack(spacing: 14) {
                         header
-                        if geometry.size.width >= 900 {
-                            HStack(alignment: .top, spacing: 20) {
-                                VStack(spacing: 20) {
+                        HStack(alignment: .top, spacing: 14) {
+                            ScrollView(.vertical) {
+                                specimenCard.padding(.vertical, 4)
+                            }
+                            .scrollIndicators(.hidden)
+                            .defaultScrollAnchor(.top)
+                            .frame(maxWidth: .infinity)
+
+                            ScrollView(.vertical) {
+                                pageCard.padding(.vertical, 4)
+                            }
+                            .scrollIndicators(.hidden)
+                            .defaultScrollAnchor(.top)
+                            .frame(maxWidth: .infinity)
+
+                            ScrollView(.vertical) {
+                                transcriptionCard.padding(.vertical, 4)
+                            }
+                            .scrollIndicators(.hidden)
+                            .defaultScrollAnchor(.top)
+                            .frame(maxWidth: .infinity)
+                        }
+                        .frame(maxHeight: .infinity)
+                        footer
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: 1440, maxHeight: .infinity)
+                    .frame(maxWidth: .infinity)
+                } else if usesWideWorkspace, geometry.size.width >= 700 {
+                    VStack(spacing: 14) {
+                        header
+                        HStack(alignment: .top, spacing: 16) {
+                            ScrollView(.vertical) {
+                                VStack(spacing: 16) {
                                     specimenCard
                                     pageCard
                                 }
-                                .frame(maxWidth: .infinity)
-                                transcriptionCard.frame(maxWidth: .infinity)
+                                .padding(.vertical, 4)
                             }
-                        } else {
-                            destinationPicker
-                            compactWorkspace
+                            .scrollIndicators(.hidden)
+                            .defaultScrollAnchor(.top)
+                            .frame(maxWidth: .infinity)
+
+                            ScrollView(.vertical) {
+                                transcriptionCard
+                                    .padding(.vertical, 4)
+                            }
+                            .scrollIndicators(.hidden)
+                            .defaultScrollAnchor(.top)
+                            .frame(maxWidth: .infinity)
                         }
+                        .frame(maxHeight: .infinity)
                         footer
                     }
-                    .padding(.horizontal, geometry.size.width >= 900 ? 28 : 18)
-                    .padding(.vertical, 26)
-                    .frame(maxWidth: 1180)
+                    .padding(.horizontal, geometry.size.width >= 1000 ? 24 : 16)
+                    .padding(.vertical, 14)
+                    .frame(maxWidth: 1320, maxHeight: .infinity)
                     .frame(maxWidth: .infinity)
+                } else {
+                    ScrollView {
+                        VStack(spacing: 22) {
+                            header
+                            destinationPicker
+                            compactWorkspace
+                            footer
+                        }
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 22)
+                        .frame(maxWidth: 760)
+                        .frame(maxWidth: .infinity)
+                    }
+                    .scrollDismissesKeyboard(.interactively)
                 }
-                .scrollDismissesKeyboard(.interactively)
             }
         }
+        .catalystReadableType()
         .coordinateSpace(name: "lab-text-entry-space")
         .onPreferenceChange(LabTextEntryFramePreferenceKey.self) { frames in
             textEntryFrames = frames
@@ -112,7 +166,7 @@ struct LabView: View {
                 Button("Done") {
                     focusedTextEntry = nil
                 }
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: Lab.typeSize(13), weight: .semibold))
             }
         }
         // Only the verifying → ready transition is a download finishing.
@@ -209,6 +263,22 @@ struct LabView: View {
         )
     }
 
+    private var usesWideWorkspace: Bool {
+#if targetEnvironment(macCatalyst)
+        true
+#else
+        UIDevice.current.userInterfaceIdiom == .pad
+#endif
+    }
+
+    private func usesThreeColumnDesktop(width: CGFloat) -> Bool {
+#if targetEnvironment(macCatalyst)
+        width >= 860
+#else
+        false
+#endif
+    }
+
     private var destinationPicker: some View {
         Picker("Workspace", selection: $destination) {
             ForEach(Destination.allCases) { destination in
@@ -240,7 +310,7 @@ struct LabView: View {
                 LabLabel(text: "Live camera")
                 HStack(alignment: .top, spacing: 14) {
                     Image(systemName: liveCameraPlatformSymbol)
-                        .font(.system(size: 34, weight: .bold))
+                        .font(.system(size: Lab.typeSize(34), weight: .bold))
                         .foregroundStyle(Lab.amber)
                     VStack(alignment: .leading, spacing: 5) {
                         Text(liveCameraPlatformTitle)
@@ -346,10 +416,10 @@ struct LabView: View {
 
             VStack(alignment: .leading, spacing: 1) {
                 Text("franken_ocr")
-                    .font(.system(size: 16, weight: .heavy, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(16), weight: .heavy, design: .monospaced))
                     .foregroundStyle(Lab.textPrimary)
                 Text("READS_LOCALLY")
-                    .font(.system(size: 8, weight: .heavy, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(8), weight: .heavy, design: .monospaced))
                     .kerning(2.2)
                     .foregroundStyle(Lab.accentInk)
             }
@@ -358,7 +428,7 @@ struct LabView: View {
                 model.runSelftest()
             } label: {
                 Image(systemName: "checkmark.seal")
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: Lab.typeSize(16), weight: .semibold))
             }
             .buttonStyle(.plain)
             .foregroundStyle(Lab.accent)
@@ -404,10 +474,13 @@ struct LabView: View {
                 } label: {
                     HStack(spacing: 6) {
                         Text("\(model.spec.label) · \(model.spec.totalBytes.humanBytes)")
-                            .font(.system(size: 17, weight: .semibold))
+                            .font(.system(size: Lab.typeSize(17), weight: .semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.76)
+                            .allowsTightening(true)
                             .foregroundStyle(Lab.accent)
                         Image(systemName: "chevron.up.chevron.down")
-                            .font(.system(size: 11, weight: .bold))
+                            .font(.system(size: Lab.typeSize(11), weight: .bold))
                             .foregroundStyle(Lab.accent.opacity(0.75))
                         Spacer(minLength: 0)
                     }
@@ -418,7 +491,7 @@ struct LabView: View {
                 .accessibilityLabel("Model: \(model.spec.label)")
 
                 Text(model.spec.blurb)
-                    .font(.system(size: 13))
+                    .font(.system(size: Lab.typeSize(13)))
                     .foregroundStyle(Lab.textDim)
 
                 if let info = model.info {
@@ -432,11 +505,11 @@ struct LabView: View {
 
                 if model.spec.id == "got-ocr2" {
                     Toggle("Structured output", isOn: $model.gotFormat)
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: Lab.typeSize(13), weight: .semibold))
                         .foregroundStyle(Lab.textMid)
                         .tint(Lab.accent)
                     Text("GOT's `OCR with format:` mode: LaTeX formulas, HTML tables, molecular SMILES, geometry. Off, it reads plain text, which the default model already does faster.")
-                        .font(.system(size: 11))
+                        .font(.system(size: Lab.typeSize(11)))
                         .foregroundStyle(Lab.textFaint)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -447,11 +520,11 @@ struct LabView: View {
                     // the model. Empty restores the model-card caption prompt,
                     // which is why it is optional rather than validated.
                     Text("Question")
-                        .font(.system(size: 13, weight: .semibold))
+                        .font(.system(size: Lab.typeSize(13), weight: .semibold))
                         .foregroundStyle(Lab.textMid)
                     TextField("Can you describe this image?", text: $model.question, axis: .vertical)
                         .focused($focusedTextEntry, equals: .smolQuestion)
-                        .font(.system(size: 13))
+                        .font(.system(size: Lab.typeSize(13)))
                         .foregroundStyle(Lab.textPrimary)
                         .textFieldStyle(.plain)
                         .lineLimit(1 ... 3)
@@ -461,7 +534,7 @@ struct LabView: View {
                         .background(Lab.inset, in: RoundedRectangle(cornerRadius: 8))
                         .reportLabTextEntryFrame(.smolQuestion)
                     Text("Ask anything about the photo. Left blank, it writes a plain description.")
-                        .font(.system(size: 11))
+                        .font(.system(size: Lab.typeSize(11)))
                         .foregroundStyle(Lab.textFaint)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -479,7 +552,7 @@ struct LabView: View {
 
                 if let license = model.licenseNotice ?? Optional(model.spec.license) {
                     Text(license)
-                        .font(.system(size: 10, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(10), design: .monospaced))
                         .foregroundStyle(Lab.textFaint)
                 }
             }
@@ -493,7 +566,7 @@ struct LabView: View {
             VStack(alignment: .leading, spacing: 8) {
                 LabProgressBar(fraction: Double(done) / Double(max(total, 1)))
                 Text("\(asset) · \(done.humanBytes) / \(total.humanBytes) · \(eta)")
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(11), design: .monospaced))
                     .foregroundStyle(Lab.textDim)
                 Button("Cancel") { model.store.cancel() }
                     .buttonStyle(GhostButtonStyle(tint: Lab.red))
@@ -503,14 +576,14 @@ struct LabView: View {
             HStack(spacing: 10) {
                 ProgressView().tint(Lab.accent)
                 Text("Verifying \(asset)…")
-                    .font(.system(size: 12, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12), design: .monospaced))
                     .foregroundStyle(Lab.textDim)
             }
 
         case .ready:
             HStack(spacing: 10) {
                 Label("Installed", systemImage: "checkmark.circle.fill")
-                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                    .font(.system(size: Lab.typeSize(12), weight: .semibold, design: .monospaced))
                     .foregroundStyle(Lab.accent)
                 Spacer()
                 Button("Remove") { model.clearModel() }
@@ -578,7 +651,7 @@ struct LabView: View {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 10) {
                             Text("Preview")
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(.system(size: Lab.typeSize(12), design: .monospaced))
                                 .foregroundStyle(Lab.textDim)
                             Stepper(
                                 value: $model.previewPage, in: 1...model.pdfPageCount,
@@ -587,7 +660,7 @@ struct LabView: View {
                                 }
                             ) {
                                 Text("\(model.previewPage) of \(model.pdfPageCount)")
-                                    .font(.system(size: 12, design: .monospaced))
+                                    .font(.system(size: Lab.typeSize(12), design: .monospaced))
                                     .foregroundStyle(Lab.textMid)
                             }
                             .disabled(model.isRecognizing)
@@ -595,11 +668,11 @@ struct LabView: View {
 
                         HStack(spacing: 8) {
                             Text("Pages")
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(.system(size: Lab.typeSize(12), design: .monospaced))
                                 .foregroundStyle(Lab.textDim)
                             TextField("all", text: $model.pageSelection)
                                 .focused($focusedTextEntry, equals: .pageSelection)
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(.system(size: Lab.typeSize(12), design: .monospaced))
                                 .foregroundStyle(Lab.textMid)
                                 .textFieldStyle(.plain)
                                 .autocorrectionDisabled()
@@ -613,7 +686,7 @@ struct LabView: View {
                         }
 
                         Text("Recognize reads the whole document. Leave Pages empty for all \(model.pdfPageCount), or give a range like 3,5-9. Pages using JPEG 2000 or JBIG2 are skipped with a named reason rather than returning a wrong result.")
-                            .font(.system(size: 11))
+                            .font(.system(size: Lab.typeSize(11)))
                             .foregroundStyle(Lab.textFaint)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -622,7 +695,7 @@ struct LabView: View {
                 runControls
 
                 Text("Nothing here is uploaded. The image is read into memory and recognized on this device's own cores.")
-                    .font(.system(size: 11))
+                    .font(.system(size: Lab.typeSize(11)))
                     .foregroundStyle(Lab.textFaint)
                     // Inside a constrained column this truncates to one line
                     // unless it is told it may grow vertically.
@@ -634,13 +707,13 @@ struct LabView: View {
     private var dropZone: some View {
         VStack(spacing: 8) {
             Image(systemName: "doc.viewfinder")
-                .font(.system(size: 28))
+                .font(.system(size: Lab.typeSize(28)))
                 .foregroundStyle(Lab.accent.opacity(0.8))
             Text("Choose a page")
-                .font(.system(size: 14, weight: .semibold))
+                .font(.system(size: Lab.typeSize(14), weight: .semibold))
                 .foregroundStyle(Lab.textMid)
             Text("PNG, JPEG, or a scanned PDF")
-                .font(.system(size: 12))
+                .font(.system(size: Lab.typeSize(12)))
                 .foregroundStyle(Lab.textFaint)
         }
         .frame(maxWidth: .infinity)
@@ -760,7 +833,7 @@ struct LabView: View {
 
                     if !recognition.layout.isEmpty {
                         Toggle("Show layout boxes", isOn: $model.showLayoutBoxes)
-                            .font(.system(size: 12, design: .monospaced))
+                            .font(.system(size: Lab.typeSize(12), design: .monospaced))
                             .foregroundStyle(Lab.textDim)
                             .tint(Lab.accent)
                     }
@@ -772,7 +845,7 @@ struct LabView: View {
                     if model.viewSource || model.spec.producesMusicXML {
                         ScrollView([.horizontal, .vertical], showsIndicators: true) {
                             Text(model.displayText)
-                                .font(.system(size: 12, design: .monospaced))
+                                .font(.system(size: Lab.typeSize(12), design: .monospaced))
                                 .foregroundStyle(Lab.textMid)
                                 .textSelection(.enabled)
                                 .padding(12)
@@ -798,7 +871,7 @@ struct LabView: View {
                     exportControls
                 } else {
                     Text("Output appears here: Markdown for a document page, MusicXML for a staff. These are the same bytes the CLI writes.")
-                        .font(.system(size: 13))
+                        .font(.system(size: Lab.typeSize(13)))
                         .foregroundStyle(Lab.textFaint)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.vertical, 26)
@@ -886,11 +959,11 @@ struct LabView: View {
             ForEach(model.pageOutcomes) { outcome in
                 HStack(alignment: .top, spacing: 10) {
                     Text(String(format: "%3d", outcome.id))
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
                         .foregroundStyle(Lab.textFaint)
                     icon(for: outcome.state)
                     Text(label(for: outcome.state))
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
                         .foregroundStyle(color(for: outcome.state))
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 0)
@@ -910,15 +983,15 @@ struct LabView: View {
         switch state {
         case .queued:
             Image(systemName: "circle.dotted")
-                .font(.system(size: 11)).foregroundStyle(Lab.textFaint)
+                .font(.system(size: Lab.typeSize(11))).foregroundStyle(Lab.textFaint)
         case .running:
             ProgressView().controlSize(.mini).tint(Lab.accent)
         case .done:
             Image(systemName: "checkmark.circle.fill")
-                .font(.system(size: 11)).foregroundStyle(Lab.accent)
+                .font(.system(size: Lab.typeSize(11))).foregroundStyle(Lab.accent)
         case .skipped:
             Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 11)).foregroundStyle(Lab.red)
+                .font(.system(size: Lab.typeSize(11))).foregroundStyle(Lab.red)
         }
     }
 
@@ -968,7 +1041,7 @@ struct LabView: View {
                     )
                 }
                 Text("Sanity warnings are annotate-only observations the engine makes about its own transcription. Honest signal, not silent cleanup.")
-                    .font(.system(size: 11))
+                    .font(.system(size: Lab.typeSize(11)))
                     .foregroundStyle(Lab.textFaint)
             }
         }
@@ -981,10 +1054,10 @@ struct LabView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
                     Text("This re-runs the dispatched int8 GEMM against a bit-identical scalar oracle on THIS device, including the worst-case K=6848 accumulation row. It is the proof that the kernels are correct on hardware the binary was never built on.")
-                        .font(.system(size: 13))
+                        .font(.system(size: Lab.typeSize(13)))
                         .foregroundStyle(Lab.textDim)
                     Text(model.selftestJSON ?? "…")
-                        .font(.system(size: 11, design: .monospaced))
+                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
                         .foregroundStyle(Lab.textMid)
                         .textSelection(.enabled)
                 }
@@ -1002,19 +1075,19 @@ struct LabView: View {
     private var footer: some View {
         VStack(spacing: 8) {
             Text("Recognized locally. Nothing is uploaded, and there is no analytics of any kind.")
-                .font(.system(size: 11))
+                .font(.system(size: Lab.typeSize(11)))
                 .foregroundStyle(Lab.textFaint)
                 .multilineTextAlignment(.center)
             // A string LITERAL, so `Text` parses the Markdown link — the same
             // free tappable-link trick frankentts's footer uses.
             Text("© 2026 Jeffrey Emanuel · [franken-ocr.com](https://franken-ocr.com)")
-                .font(.system(size: 10, design: .monospaced))
+                .font(.system(size: Lab.typeSize(10), design: .monospaced))
                 .foregroundStyle(Lab.textFaint.opacity(0.7))
                 .tint(Lab.accent.opacity(0.8))
             Text(
                 "If you like this free app, please show your appreciation by trying out my paid skills site at [JeffreysSkills.md](https://jeffreys-skills.md)."
             )
-            .font(.system(size: 10, design: .monospaced))
+            .font(.system(size: Lab.typeSize(10), design: .monospaced))
             .foregroundStyle(Lab.textFaint.opacity(0.72))
             .tint(Lab.accent.opacity(0.8))
             .multilineTextAlignment(.center)
