@@ -40,6 +40,14 @@ extreme scrolling screenshots use the same smart-cut strip router as the CLI,
 and suspiciously sparse page output is shown as a low-yield warning instead of
 quietly looking successful.
 
+The input rail also has two deliberately distinct camera paths. **Camera** takes
+one still and sends it through the selected FrankenOCR model. **Live Camera**
+uses Apple's private, on-device Vision text recognizer at interactive cadence,
+drops late video frames instead of queueing them, deduplicates repeated lines,
+and animates newly seen glyphs into a bounded capture tray. The live surface
+labels that implementation in-app; both paths remain offline and upload
+nothing.
+
 `FocrCore.xcframework/` and `FrankenOCR.xcodeproj/` are generated and
 gitignored. `project.yml`, `build-rust.sh`, `Sources/`, the entitlements, and
 the privacy manifest are the source.

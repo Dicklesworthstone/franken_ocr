@@ -51,7 +51,7 @@
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>Save a recognized page image or transcription to your photo library. Nothing is uploaded.</string>
 	<key>NSCameraUsageDescription</key>
-	<string>Photograph a document to recognize it. The photo is read into memory and processed entirely on this device; nothing is uploaded.</string>
+	<string>Photograph a document or recognize text from the live camera. Images stay in memory and are processed entirely on this device; nothing is uploaded.</string>
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

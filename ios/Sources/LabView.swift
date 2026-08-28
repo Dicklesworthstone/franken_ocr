@@ -45,6 +45,7 @@ struct LabView: View {
     @State private var photoItem: PhotosPickerItem?
     @State private var showFileImporter = false
     @State private var showCamera = false
+    @State private var showLiveCamera = false
     @State private var copied = false
     @State private var copyResetTask: Task<Void, Never>?
     @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
@@ -132,6 +133,9 @@ struct LabView: View {
             allowsMultipleSelection: false
         ) { result in load(fileResult: result) }
         .sheet(isPresented: $model.showSelftest) { selftestSheet }
+        .fullScreenCover(isPresented: $showLiveCamera) {
+            LiveCameraView(model: model)
+        }
         .confirmationDialog(
             "Download \(model.spec.totalBytes.humanBytes)?",
             isPresented: $model.showConsent,
@@ -470,9 +474,20 @@ struct LabView: View {
     }
 
     private var inputButtons: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: 10) { photoButton; filesButton; cameraButton }
-            VStack(spacing: 10) { photoButton; HStack(spacing: 10) { filesButton; cameraButton } }
+        VStack(spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { photoButton; filesButton; cameraButton }
+                VStack(spacing: 10) {
+                    photoButton
+                    HStack(spacing: 10) { filesButton; cameraButton }
+                }
+            }
+            Button { showLiveCamera = true } label: {
+                Label("Live Camera", systemImage: "viewfinder.circle.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(GhostButtonStyle(tint: Lab.accent))
+            .disabled(model.isRecognizing)
         }
     }
 

@@ -284,6 +284,30 @@ final class LabModel {
         }
     }
 
+    /// Bring a Live Camera capture back into the ordinary page/transcription
+    /// workspace. Live mode can accumulate lines across several viewpoints, so
+    /// its text intentionally carries no layout boxes tied to the final frame.
+    func adoptLiveCameraCapture(text: String, snapshot: Data?) {
+        let output = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !output.isEmpty else { return }
+        pdf = nil
+        pageOutcomes = []
+        imageData = snapshot
+        previewImage = snapshot.flatMap(UIImage.init(data:))
+        imageName = "live-camera.jpg"
+        recognition = Recognition(
+            modelID: "apple-vision-live",
+            output: output,
+            layout: [],
+            music: nil,
+            tallStripCount: nil,
+            lowYield: nil
+        )
+        lastRunSeconds = nil
+        statusKind = .ok
+        status = "Captured \(output.count) characters live, entirely on this device."
+    }
+
     private func acceptImage(_ data: Data, name: String) {
         guard let image = UIImage(data: data) else {
             status = "That file is not a PNG or JPEG this app can read."
