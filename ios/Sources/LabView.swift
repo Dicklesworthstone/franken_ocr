@@ -181,6 +181,7 @@ struct LabView: View {
             consumeRequestedAction()
             consumeStagedDocument()
             await loadDebugFixtureIfRequested()
+            await IOSProfileRunner.runIfRequested()
         }
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.didReceiveMemoryWarningNotification)
