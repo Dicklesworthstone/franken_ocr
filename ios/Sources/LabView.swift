@@ -415,9 +415,11 @@ struct LabView: View {
                 .frame(width: 52, height: 52)
 
             VStack(alignment: .leading, spacing: 1) {
-                Text("franken_ocr")
-                    .font(.system(size: Lab.typeSize(16), weight: .heavy, design: .monospaced))
-                    .foregroundStyle(Lab.textPrimary)
+                FrankenWordmark(
+                    productInitial: "OCR",
+                    productRemainder: "",
+                    fullName: "FrankenOCR"
+                )
                 Text("READS_LOCALLY")
                     .font(.system(size: Lab.typeSize(8), weight: .heavy, design: .monospaced))
                     .kerning(2.2)

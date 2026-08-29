@@ -56,6 +56,39 @@ enum Lab {
     }
 }
 
+/// The suite wordmark restores the name's natural F/OCR hierarchy without
+/// giving up its uppercase laboratory typography.
+struct FrankenWordmark: View {
+    let productInitial: String
+    let productRemainder: String
+    let fullName: String
+    var size: CGFloat = 20
+    var accent: Color = Lab.amber
+
+    var body: some View {
+        (
+            Text("F")
+                .font(.system(size: Lab.typeSize(size), weight: .black, design: .monospaced))
+                .foregroundColor(accent)
+            + Text("RANKEN")
+                .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
+                .foregroundColor(Lab.textPrimary.opacity(0.88))
+            + Text(productInitial)
+                .font(.system(size: Lab.typeSize(size), weight: .black, design: .monospaced))
+                .foregroundColor(accent)
+            + Text(productRemainder)
+                .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
+                .foregroundColor(Lab.textPrimary.opacity(0.88))
+        )
+        .kerning(0.8)
+        .lineLimit(1)
+        .minimumScaleFactor(0.72)
+        .allowsTightening(true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(fullName)
+    }
+}
+
 private struct CatalystReadableType: ViewModifier {
     func body(content: Content) -> some View {
 #if targetEnvironment(macCatalyst)
