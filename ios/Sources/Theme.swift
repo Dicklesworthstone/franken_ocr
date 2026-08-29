@@ -69,7 +69,7 @@ struct FrankenWordmark: View {
         (
             Text("F")
                 .font(.system(size: Lab.typeSize(size), weight: .black, design: .monospaced))
-                .foregroundColor(accent)
+                .foregroundColor(Lab.textPrimary.opacity(0.88))
             + Text("RANKEN")
                 .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
                 .foregroundColor(Lab.textPrimary.opacity(0.88))
@@ -78,7 +78,7 @@ struct FrankenWordmark: View {
                 .foregroundColor(accent)
             + Text(productRemainder)
                 .font(.system(size: Lab.typeSize(size * 0.66), weight: .black, design: .monospaced))
-                .foregroundColor(Lab.textPrimary.opacity(0.88))
+                .foregroundColor(accent)
         )
         .kerning(0.8)
         .lineLimit(1)
