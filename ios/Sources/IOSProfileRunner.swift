@@ -79,6 +79,13 @@ enum IOSProfileRunner {
                 "dense_route": info?.dense_route ?? "unknown",
                 "threads": info?.threads ?? 0,
             ],
+            "performance_switches": [
+                "threads": environment["FOCR_THREADS"] ?? "unset",
+                "int8_autovec": environment["FOCR_INT8_AUTOVEC"] ?? "unset",
+                "force_arch": environment["FOCR_FORCE_ARCH"] ?? "unset",
+                "mmap": environment["FOCR_MMAP"] ?? "unset",
+                "timing": environment["FOCR_TIMING"] ?? "unset",
+            ],
             "app_version": bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
             "app_build": bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown",
             "receipt_path": receiptURL.path,
