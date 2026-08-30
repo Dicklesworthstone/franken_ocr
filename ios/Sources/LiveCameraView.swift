@@ -236,7 +236,10 @@ private struct NativeLiveTextScanner: UIViewControllerRepresentable {
             isHighlightingEnabled: true
         )
         controller.attach(scanner)
-        Task { @MainActor in controller.start() }
+        // Construction already runs on the main actor. Starting synchronously
+        // prevents a queued start from racing dismissal and resurrecting the
+        // camera after dismantle has stopped it.
+        controller.start()
         return scanner
     }
 
@@ -496,6 +499,7 @@ struct LiveCameraView: View {
     @State private var strips: [FlyingTextStrip] = []
     @State private var captureTrayTop: CGFloat?
     @State private var copied = false
+    @State private var copyResetTask: Task<Void, Never>?
     @State private var isFinishing = false
 
     private var capturedText: String { accumulator.text }
@@ -530,7 +534,10 @@ struct LiveCameraView: View {
         .coordinateSpace(name: "liveCameraSurface")
         .preferredColorScheme(.dark)
         .tint(Lab.accent)
-        .onDisappear { camera.stop() }
+        .onDisappear {
+            copyResetTask?.cancel()
+            camera.stop()
+        }
         .onChange(of: camera.latestBatch?.id) { _, _ in
             guard let batch = camera.latestBatch else { return }
             ingest(batch)
@@ -608,8 +615,10 @@ struct LiveCameraView: View {
                 Button(copied ? "Copied" : "Copy") {
                     UIPasteboard.general.string = capturedText
                     copied = true
-                    Task {
+                    copyResetTask?.cancel()
+                    copyResetTask = Task {
                         try? await Task.sleep(for: .seconds(1.2))
+                        guard !Task.isCancelled else { return }
                         copied = false
                     }
                 }

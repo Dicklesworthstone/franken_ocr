@@ -72,12 +72,15 @@ private struct OCRCommands: Commands {
     @FocusedValue(\.ocrCommands) private var actions
 
     var body: some Commands {
-        CommandMenu("Recognition") {
+        // Replace Catalyst's built-in Open command instead of adding a second
+        // Command-O key equivalent. Duplicate shortcuts produce undefined menu
+        // dispatch and were reported by UIKit during the real test launch.
+        CommandGroup(replacing: .newItem) {
             Button("Open Image or PDF…") { actions?.importFile() }
                 .keyboardShortcut("o", modifiers: [.command])
+        }
 
-            Divider()
-
+        CommandMenu("Recognition") {
             Button("Recognize") { actions?.recognize() }
                 .keyboardShortcut(.return, modifiers: [.command])
                 .disabled(actions?.canRecognize != true)

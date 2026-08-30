@@ -301,7 +301,10 @@ final class ModelStore {
     private(set) var installedBytes: Int = 0
 
     private var task: Task<Void, Never>?
+    private var isClearing = false
     private static let chunkBytes = 32 * 1024 * 1024
+
+    var isBusy: Bool { task != nil || isClearing }
 
     /// Root for all model data. Application Support, excluded from backup: these
     /// are multi-gigabyte files that can always be re-downloaded, and putting
@@ -361,9 +364,10 @@ final class ModelStore {
     // ── Download ───────────────────────────────────────────────────────────
 
     func download(_ spec: ModelSpec) {
-        guard task == nil else { return }
+        guard task == nil, !isClearing else { return }
         task = Task { [weak self] in
             guard let self else { return }
+            defer { self.task = nil }
             do {
                 try await self.run(spec)
                 self.phase = .ready
@@ -373,23 +377,36 @@ final class ModelStore {
             } catch {
                 self.phase = .failed(error.localizedDescription)
             }
-            self.task = nil
         }
     }
 
     func cancel() {
+        // Retain the single-flight handle until the writer has genuinely
+        // unwound. Clearing it here allowed Retry to append to the same files
+        // while a cancelled multi-gigabyte verifier was still running.
         task?.cancel()
-        task = nil
-        phase = .idle
     }
 
-    func clear(_ spec: ModelSpec) {
-        cancel()
-        if let dir = try? Self.directory(for: spec) {
-            try? FileManager.default.removeItem(at: dir)
+    func clear(_ spec: ModelSpec) async {
+        guard !isClearing else { return }
+        isClearing = true
+        defer { isClearing = false }
+
+        if let activeTask = task {
+            activeTask.cancel()
+            await activeTask.value
         }
-        installedBytes = 0
-        phase = .idle
+        do {
+            let dir = try Self.directory(for: spec)
+            if FileManager.default.fileExists(atPath: dir.path) {
+                try FileManager.default.removeItem(at: dir)
+            }
+            installedBytes = 0
+            phase = .idle
+        } catch {
+            _ = isInstalled(spec)
+            phase = .failed("Could not clear the downloaded model: \(error.localizedDescription)")
+        }
     }
 
     private func run(_ spec: ModelSpec) async throws {
@@ -451,6 +468,9 @@ final class ModelStore {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                // URLSession commonly reports cancellation as URLError.cancelled.
+                // Do not turn the user's Cancel into a fallback-host retry.
+                try Task.checkCancellation()
                 lastError = error
             }
         }
@@ -578,6 +598,7 @@ final class ModelStore {
         } else {
             digest = try await Self.hashFile(at: destination)
         }
+        try Task.checkCancellation()
         guard digest == expectedDigest else {
             try? FileManager.default.removeItem(at: destination)
             throw ModelStoreError.digestMismatch(label, expected: expectedDigest, got: digest)
@@ -589,15 +610,24 @@ final class ModelStore {
     /// `Task.detached` matters here: `ModelStore` is `@MainActor`, and hashing
     /// 3 GB on the main actor would freeze the UI for the whole verification.
     private static func hashFile(at url: URL) async throws -> String {
-        try await Task.detached(priority: .utility) {
+        let digestTask = Task.detached(priority: .utility) {
             let handle = try FileHandle(forReadingFrom: url)
             defer { try? handle.close() }
             var hasher = SHA256()
             while let block = try handle.read(upToCount: 8 * 1024 * 1024), !block.isEmpty {
+                try Task.checkCancellation()
                 hasher.update(data: block)
             }
             return hasher.finalize().hexString
-        }.value
+        }
+        // Detached work does not inherit cancellation from the download task.
+        // Bridge it explicitly so Clear waits for a short, bounded unwind rather
+        // than a stale three-gigabyte read.
+        return try await withTaskCancellationHandler {
+            try await digestTask.value
+        } onCancel: {
+            digestTask.cancel()
+        }
     }
 
     private static func eta(done: Int, total: Int, since: Date) -> String {

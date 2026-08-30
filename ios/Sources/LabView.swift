@@ -177,7 +177,13 @@ struct LabView: View {
         }
         .sensoryFeedback(.error, trigger: model.statusKind) { _, kind in kind == .err }
         .task {
-            Engine.warmKernelPool()
+            // Hosted unit tests do not need the native worker pool. Starting
+            // app-lifetime Rust workers here makes a one-millisecond fence test
+            // take minutes under Thread Sanitizer while it waits on irrelevant
+            // host teardown.
+            if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+                Engine.warmKernelPool()
+            }
             consumeRequestedAction()
             consumeStagedDocument()
             await loadDebugFixtureIfRequested()
@@ -464,7 +470,7 @@ struct LabView: View {
                 Menu {
                     ForEach(ModelCatalog.all) { spec in
                         Button {
-                            model.spec = spec
+                            model.selectModel(spec)
                         } label: {
                             if spec.id == model.spec.id {
                                 Label("\(spec.label) · \(spec.totalBytes.humanBytes)",
@@ -491,6 +497,7 @@ struct LabView: View {
                     .frame(minHeight: 44)
                     .contentShape(Rectangle())
                 }
+                .disabled(model.isRecognizing || model.isClearingModel || model.store.isBusy)
                 .accessibilityLabel("Model: \(model.spec.label)")
 
                 Text(model.spec.blurb)
@@ -762,6 +769,7 @@ struct LabView: View {
             Label("Photos", systemImage: "photo.on.rectangle")
         }
         .buttonStyle(GhostButtonStyle())
+        .disabled(model.isRecognizing)
     }
 
     private var filesButton: some View {
@@ -769,6 +777,7 @@ struct LabView: View {
             Label("Files", systemImage: "folder")
         }
         .buttonStyle(GhostButtonStyle())
+        .disabled(model.isRecognizing)
     }
 
     private var cameraButton: some View {
@@ -776,6 +785,7 @@ struct LabView: View {
             Label("Camera", systemImage: "camera")
         }
         .buttonStyle(GhostButtonStyle())
+        .disabled(model.isRecognizing)
         .fullScreenCover(isPresented: $showCamera) {
             CameraPicker { data in
                 if let data { Task { await model.accept(data: data, name: "photo.jpg") } }

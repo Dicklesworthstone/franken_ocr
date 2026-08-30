@@ -92,7 +92,7 @@ enum IOSProfileRunner {
         ])
 
         let loadStarted = ContinuousClock.now
-        try await engine.load(artifact: artifactURL)
+        try await engine.load(artifact: artifactURL, lifecycleToken: 1)
         let loadMS = milliseconds(since: loadStarted)
         if spec.decodeGuard > 0 { await engine.setNoRepeatNgram(spec.decodeGuard) }
         try receipt.append([

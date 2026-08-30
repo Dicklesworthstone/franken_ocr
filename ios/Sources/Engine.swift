@@ -142,6 +142,18 @@ struct EngineError: LocalizedError {
     }
 }
 
+/// Orders actor lifecycle messages by user intent rather than by the unspecified
+/// arrival order of unstructured Swift tasks.
+struct EngineLifecycleFence {
+    private(set) var latestToken: UInt64 = 0
+
+    mutating func accept(_ token: UInt64) -> Bool {
+        guard token >= latestToken else { return false }
+        latestToken = token
+        return true
+    }
+}
+
 /// Build/device facts the engine reports about itself.
 struct EngineInfo: Sendable, Decodable {
     let crate_version: String
@@ -164,6 +176,8 @@ struct EngineInfo: Sendable, Decodable {
 /// through a `@Sendable` continuation rather than touching actor state.
 actor Engine {
     private var handle: OpaquePointer?
+    private var loadedArtifact: URL?
+    private var lifecycleFence = EngineLifecycleFence()
 
     /// Set while a recognition is in flight so the progress trampoline can find
     /// somewhere to deliver. A class box, because the C callback receives an
@@ -205,18 +219,32 @@ actor Engine {
     /// Cheap on iOS: the artifact is memory-mapped, so this validates the
     /// container and returns, and the gigabytes page in lazily during the
     /// first forward instead of being read up front.
-    func load(artifact url: URL) throws {
-        guard handle == nil else { return }
+    func load(artifact url: URL, lifecycleToken: UInt64) throws {
+        guard lifecycleFence.accept(lifecycleToken) else {
+            throw EngineError(kind: .cancelled, message: "engine lifecycle operation was superseded")
+        }
+        let artifact = url.standardizedFileURL
+        if handle != nil, loadedArtifact == artifact { return }
+        // A model switch can reach the actor before its older unload task. Do
+        // not mistake a non-nil handle for the requested model.
+        if let handle { focr_engine_close(handle) }
+        handle = nil
+        loadedArtifact = nil
         let opened = url.path.withCString { focr_engine_open($0) }
         guard let opened else { throw EngineError.fromNative(code: 3) }
         handle = opened
+        loadedArtifact = artifact
     }
 
     /// Drop the model and its caches. The next recognition reloads lazily.
-    func unload() {
+    func unload(lifecycleToken: UInt64) {
+        // A delayed memory-pressure or model-switch unload must not tear down
+        // a newer load that reached the actor first.
+        guard lifecycleFence.accept(lifecycleToken) else { return }
         guard let handle else { return }
         focr_engine_close(handle)
         self.handle = nil
+        loadedArtifact = nil
     }
 
     var modelID: String? {
@@ -300,6 +328,10 @@ actor Engine {
 /// close the handle exactly once.
 final class PdfDocument: @unchecked Sendable {
     private let handle: OpaquePointer
+    /// The native PDF handle is immutable but not documented as concurrently
+    /// callable. Preview rendering and a document OCR walk can overlap, so all
+    /// FFI access to this one handle is serialized here.
+    private let renderLock = NSLock()
     let pageCount: Int
 
     /// Parse off the main actor.
@@ -334,6 +366,8 @@ final class PdfDocument: @unchecked Sendable {
     /// skipped — "JPXDecode: no pure-Rust decoder" is a materially different
     /// outcome from a corrupt file, and a document walk should say which.
     func renderPage(_ page: Int) throws -> Data {
+        renderLock.lock()
+        defer { renderLock.unlock() }
         var ptr: UnsafeMutablePointer<UInt8>?
         var len = 0
         let code = focr_pdf_render_page(handle, UInt32(page), &ptr, &len)

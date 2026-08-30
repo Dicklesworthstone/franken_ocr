@@ -200,12 +200,13 @@ final class LabModel {
     let engine = Engine()
     let store = ModelStore()
 
-    var spec: ModelSpec = ModelCatalog.all[0] {
+    private(set) var spec: ModelSpec = ModelCatalog.all[0] {
         didSet {
             guard spec.id != oldValue.id else { return }
             // A different model means a different engine. Drop the old one
             // before anything touches the new artifact.
-            Task { await engine.unload() }
+            let lifecycleToken = nextEngineLifecycleToken()
+            Task { await engine.unload(lifecycleToken: lifecycleToken) }
             store.refreshInstalledState(spec)
             recognition = nil
             statusKind = .neutral
@@ -248,6 +249,7 @@ final class LabModel {
     // ── Run state ──────────────────────────────────────────────────────────
     var isRecognizing = false
     var isLoadingModel = false
+    var isClearingModel = false
     var elapsed: TimeInterval = 0
     var estimatedRemainingSeconds: Int?
     var progress: ProgressUpdate?
@@ -272,6 +274,9 @@ final class LabModel {
     private let runActivity = OCRActivityController.shared
     /// Guards against a stale run publishing over a newer one.
     private var generation = 0
+    private var engineLifecycleToken: UInt64 = 0
+    private var inputGeneration = 0
+    private var previewGeneration = 0
     private var eta = OCRAdaptiveETA()
 
     init() {
@@ -295,7 +300,8 @@ final class LabModel {
     var isInstalled: Bool { store.phase == .ready }
 
     var canRecognize: Bool {
-        guard isInstalled, !isRecognizing, spec.isSupportedOnThisDevice else { return false }
+        guard isInstalled, !isRecognizing, !isClearingModel,
+              spec.isSupportedOnThisDevice else { return false }
         // A document is runnable even if its FIRST page failed to preview — the
         // other pages may be perfectly readable. Deliberately does NOT resolve
         // the page selection: this is read on every SwiftUI body evaluation, and
@@ -418,25 +424,47 @@ final class LabModel {
 
     func requestDownload() { showConsent = true }
 
+    func selectModel(_ candidate: ModelSpec) {
+        guard !isRecognizing, !isClearingModel, !store.isBusy else {
+            status = "Finish or cancel the current model operation before switching models."
+            statusKind = .warn
+            return
+        }
+        spec = candidate
+    }
+
     func confirmDownload() {
         showConsent = false
         store.download(spec)
     }
 
     func clearModel() {
-        Task { await engine.unload() }
-        store.clear(spec)
-        recognition = nil
-        status = "Model removed. \(spec.weights.bytes.humanBytes) freed."
-        statusKind = .neutral
+        guard !isRecognizing, !isClearingModel else { return }
+        isClearingModel = true
+        let clearingSpec = spec
+        let lifecycleToken = nextEngineLifecycleToken()
+        Task {
+            await engine.unload(lifecycleToken: lifecycleToken)
+            await store.clear(clearingSpec)
+            if case .failed(let message) = store.phase {
+                status = message
+                statusKind = .err
+            } else {
+                recognition = nil
+                status = "Model removed. \(clearingSpec.weights.bytes.humanBytes) freed."
+                statusKind = .neutral
+            }
+            isClearingModel = false
+        }
     }
 
     /// Drop the engine under memory pressure or on backgrounding. A no-op mid
     /// recognition — tearing the model out from under a running forward would
     /// turn a slow page into a crash.
     func releaseEngineIfIdle() {
-        guard !isRecognizing else { return }
-        Task { await engine.unload() }
+        guard !isRecognizing, !isClearingModel else { return }
+        let lifecycleToken = nextEngineLifecycleToken()
+        Task { await engine.unload(lifecycleToken: lifecycleToken) }
     }
 
     // ── Input ──────────────────────────────────────────────────────────────
@@ -447,9 +475,17 @@ final class LabModel {
     /// need a completion signal: returning before `pdf` is set would leave a
     /// fast "pick then Recognize" tap doing nothing at all.
     func accept(data: Data, name: String) async {
+        guard !isRecognizing else {
+            status = "Stop the current recognition before choosing another input."
+            statusKind = .warn
+            return
+        }
+        inputGeneration &+= 1
+        let importGeneration = inputGeneration
         if data.starts(with: Array("%PDF".utf8)) {
-            await acceptPDF(data, name: name)
+            await acceptPDF(data, name: name, generation: importGeneration)
         } else {
+            guard importGeneration == inputGeneration else { return }
             acceptImage(data, name: name)
         }
     }
@@ -460,6 +496,8 @@ final class LabModel {
     func adoptLiveCameraCapture(text: String, snapshot: Data?) {
         let output = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !output.isEmpty else { return }
+        inputGeneration &+= 1
+        previewGeneration &+= 1
         pdf = nil
         pageOutcomes = []
         imageData = snapshot
@@ -494,17 +532,19 @@ final class LabModel {
         statusKind = .neutral
     }
 
-    private func acceptPDF(_ data: Data, name: String) async {
+    private func acceptPDF(_ data: Data, name: String, generation: Int) async {
         // Parsing and rasterizing are off the main actor: this type is
         // main-actor isolated, and a scanned book is enough object graph that
         // doing either inline visibly freezes the UI.
         status = "Opening \(name)…"
         statusKind = .neutral
         guard let document = await PdfDocument.open(data: data) else {
+            guard generation == inputGeneration else { return }
             status = "That PDF could not be parsed."
             statusKind = .err
             return
         }
+        guard generation == inputGeneration, !isRecognizing else { return }
         pdf = document
         previewPage = 1
         pageSelection = ""
@@ -512,27 +552,46 @@ final class LabModel {
         recognition = nil
         pageOutcomes = []
         let pages = document.pageCount
-        await loadPreviewPage()
-        status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). "
-            + "Recognize reads the whole document."
-        statusKind = .neutral
+        let previewLoaded = await loadPreviewPage()
+        guard generation == inputGeneration else { return }
+        if previewLoaded {
+            status = "\(name) · \(pages) page\(pages == 1 ? "" : "s"). "
+                + "Recognize reads the whole document."
+            statusKind = .neutral
+        }
     }
 
     /// Render the page the user is looking at. Purely a preview — it does not
     /// constrain what `recognize()` covers.
-    func loadPreviewPage() async {
-        guard let pdf else { return }
+    @discardableResult
+    func loadPreviewPage() async -> Bool {
+        guard let pdf else { return false }
+        previewGeneration &+= 1
+        let requestGeneration = previewGeneration
+        let requestedPage = previewPage
         do {
-            let png = try await pdf.page(previewPage)
+            let png = try await pdf.page(requestedPage)
+            guard requestGeneration == previewGeneration,
+                  self.pdf === pdf,
+                  previewPage == requestedPage,
+                  !isRecognizing
+            else { return false }
             imageData = png
             previewImage = UIImage(data: png)
+            return true
         } catch {
+            guard requestGeneration == previewGeneration,
+                  self.pdf === pdf,
+                  previewPage == requestedPage,
+                  !isRecognizing
+            else { return false }
             // The engine names exactly what was unsupported (JPEG 2000, JBIG2,
             // a born-digital vector page) rather than returning a wrong result.
             imageData = nil
             previewImage = nil
             status = error.localizedDescription
             statusKind = .warn
+            return false
         }
     }
 
@@ -596,8 +655,10 @@ final class LabModel {
 
     func recognize() {
         guard canRecognize else { return }
+        previewGeneration &+= 1
         generation += 1
         let runGeneration = generation
+        let lifecycleToken = nextEngineLifecycleToken()
         isRecognizing = true
         recognition = nil
         progress = nil
@@ -668,7 +729,7 @@ final class LabModel {
             do {
                 let beganWarm = await self.engine.isLoaded
                 self.eta.setBeganWarm(beganWarm)
-                try await self.ensureEngineLoaded()
+                try await self.ensureEngineLoaded(lifecycleToken: lifecycleToken)
                 // Per-RUN options. These are process-global setters that apply
                 // to the next recognition, so applying them only at engine load
                 // would silently ignore a toggle flipped afterwards.
@@ -930,13 +991,12 @@ final class LabModel {
     /// How many pages actually produced output in this run.
     private var producedPageCount: Int { completedPageCount }
 
-    private func ensureEngineLoaded() async throws {
-        if await engine.isLoaded { return }
-        isLoadingModel = true
+    private func ensureEngineLoaded(lifecycleToken: UInt64) async throws {
+        isLoadingModel = await !engine.isLoaded
         defer { isLoadingModel = false }
-        status = "Waking the model…"
+        if isLoadingModel { status = "Waking the model…" }
         let url = try ModelStore.artifactURL(for: spec)
-        try await engine.load(artifact: url)
+        try await engine.load(artifact: url, lifecycleToken: lifecycleToken)
         if spec.decodeGuard > 0 {
             await engine.setNoRepeatNgram(spec.decodeGuard)
         }
@@ -962,6 +1022,11 @@ final class LabModel {
         engine.requestCancel()
         status = "Stopping at the next checkpoint…"
         statusKind = .warn
+    }
+
+    private func nextEngineLifecycleToken() -> UInt64 {
+        engineLifecycleToken &+= 1
+        return engineLifecycleToken
     }
 
     // ── Diagnostics ────────────────────────────────────────────────────────

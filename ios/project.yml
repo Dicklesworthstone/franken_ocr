@@ -124,3 +124,15 @@ targets:
             NSExtensionActivationRule:
               NSExtensionActivationSupportsFileWithMaxCount: 1
               NSExtensionActivationSupportsImageWithMaxCount: 1
+
+  FrankenOCRTests:
+    type: bundle.unit-test
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenocr.FrankenOCRTests
+        GENERATE_INFOPLIST_FILE: true
+    sources:
+      - path: Tests
+    dependencies:
+      - target: FrankenOCR
