@@ -13,7 +13,7 @@
 
 ## Read First
 
-In `/Users/jemanuel/projects/franken_ocr`, read:
+In the `franken_ocr` checkout, normally `~/projects/franken_ocr`, read:
 
 1. `AGENTS.md`
 2. `README.md`
