@@ -1047,15 +1047,17 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         REENTRANT_PROGRESS_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
-        // SAFETY: the callback has no context and clears itself before returning.
-        unsafe {
-            focr_set_progress_callback(Some(clear_progress_from_callback), std::ptr::null_mut())
-        };
-        franken_ocr::native_engine::progress::emit("decode", 1, 1);
-        franken_ocr::native_engine::progress::emit("decode", 1, 1);
+        for _ in 0..10 {
+            // SAFETY: the callback has no context and clears itself before returning.
+            unsafe {
+                focr_set_progress_callback(Some(clear_progress_from_callback), std::ptr::null_mut())
+            };
+            franken_ocr::native_engine::progress::emit("decode", 1, 1);
+            franken_ocr::native_engine::progress::emit("decode", 1, 1);
+        }
         assert_eq!(
             REENTRANT_PROGRESS_COUNT.load(std::sync::atomic::Ordering::Relaxed),
-            1
+            10
         );
     }
 

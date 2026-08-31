@@ -265,31 +265,35 @@ mod tests {
     fn a_reentrant_sink_cannot_deadlock_the_forward() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let count = Arc::new(StdMutex::new(0usize));
-        let sink_count = Arc::clone(&count);
-        set_progress_sink(Some(Arc::new(move |_| {
-            *sink_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-            // A sink that emits again re-enters the seam; the thread-local
-            // callback guard drops that nested observation without retaining
-            // the registry mutex across caller code.
-            emit("decode", 0, 0);
-        })));
-        emit("decode", 1, 8);
+        for _ in 0..10 {
+            let sink_count = Arc::clone(&count);
+            set_progress_sink(Some(Arc::new(move |_| {
+                *sink_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                // A sink that emits again re-enters the seam; the thread-local
+                // callback guard drops that nested observation without retaining
+                // the registry mutex across caller code.
+                emit("decode", 0, 0);
+            })));
+            emit("decode", 1, 8);
+        }
         set_progress_sink(None);
-        assert_eq!(*count.lock().unwrap_or_else(|e| e.into_inner()), 1);
+        assert_eq!(*count.lock().unwrap_or_else(|e| e.into_inner()), 10);
     }
 
     #[test]
     fn a_sink_can_clear_itself_without_deadlocking() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let count = Arc::new(StdMutex::new(0usize));
-        let sink_count = Arc::clone(&count);
-        set_progress_sink(Some(Arc::new(move |_| {
-            *sink_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-            set_progress_sink(None);
-        })));
-        emit("decode", 1, 8);
-        emit("decode", 2, 8);
-        assert_eq!(*count.lock().unwrap_or_else(|e| e.into_inner()), 1);
+        for _ in 0..10 {
+            let sink_count = Arc::clone(&count);
+            set_progress_sink(Some(Arc::new(move |_| {
+                *sink_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+                set_progress_sink(None);
+            })));
+            emit("decode", 1, 8);
+            emit("decode", 2, 8);
+        }
+        assert_eq!(*count.lock().unwrap_or_else(|e| e.into_inner()), 10);
         assert!(!enabled());
     }
 }
