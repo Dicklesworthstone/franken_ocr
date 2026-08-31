@@ -166,7 +166,7 @@ pub fn set_progress_callback(f: Option<js_sys::Function>) {
         franken_ocr::native_engine::progress::set_progress_sink(None);
         return;
     }
-    franken_ocr::native_engine::progress::set_progress_sink(Some(Box::new(|event| {
+    franken_ocr::native_engine::progress::set_progress_sink(Some(std::sync::Arc::new(|event| {
         PROGRESS_CALLBACK.with(|slot| {
             // `try_borrow`: a callback that re-enters this seam is dropped, not
             // a panic (and a wasm panic is an opaque `unreachable`).

@@ -579,13 +579,19 @@ pub unsafe extern "C" fn focr_set_progress_callback(
             franken_ocr::native_engine::progress::set_progress_sink(None);
             return;
         }
-        franken_ocr::native_engine::progress::set_progress_sink(Some(Box::new(|event| {
+        franken_ocr::native_engine::progress::set_progress_sink(Some(Arc::new(|event| {
             // `try_lock`, not `lock`: a progress hook must never be able to
             // block — or deadlock — the forward it is reporting on.
-            let Ok(slot) = progress_slot().try_lock() else {
-                return;
+            // SAFETY: copy the immutable function/context pair, then release
+            // the registry mutex before entering caller code. The callback may
+            // legally clear or replace itself through this same API.
+            let target = {
+                let Ok(slot) = progress_slot().try_lock() else {
+                    return;
+                };
+                *slot
             };
-            let Some(target) = *slot else { return };
+            let Some(target) = target else { return };
             // `event.stage` is a `&'static str` from a fixed set, but it is not
             // NUL-terminated, so it needs one allocation to cross as a C string.
             // The hooks sit on outer sequential loops (per vision block, per
@@ -833,6 +839,21 @@ pub unsafe extern "C" fn focr_bytes_free(ptr: *mut u8, len: usize) {
 mod tests {
     use super::*;
 
+    static PROGRESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+    static REENTRANT_PROGRESS_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    extern "C" fn clear_progress_from_callback(
+        _ctx: *mut c_void,
+        _stage: *const c_char,
+        _current: u64,
+        _total: u64,
+    ) {
+        REENTRANT_PROGRESS_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: clearing uses no context and is explicitly supported by the C ABI.
+        unsafe { focr_set_progress_callback(None, std::ptr::null_mut()) };
+    }
+
     #[test]
     fn error_slot_starts_empty_and_records() {
         // A fresh thread so the assertion is about the initial state, not about
@@ -928,6 +949,27 @@ mod tests {
         assert!(!should_route_tall("smol-vlm", 500, 2_000));
         assert!(!should_route_tall("got-ocr", 500, 2_000));
         assert!(!should_route_tall("tromr", 500, 2_000));
+    }
+
+    #[test]
+    fn progress_callback_can_clear_itself_without_deadlocking() {
+        let _guard = PROGRESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        REENTRANT_PROGRESS_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: the callback has no context and clears itself before returning.
+        unsafe {
+            focr_set_progress_callback(
+                Some(clear_progress_from_callback),
+                std::ptr::null_mut(),
+            )
+        };
+        franken_ocr::native_engine::progress::emit("decode", 1, 1);
+        franken_ocr::native_engine::progress::emit("decode", 1, 1);
+        assert_eq!(
+            REENTRANT_PROGRESS_COUNT.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

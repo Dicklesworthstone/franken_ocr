@@ -41,8 +41,34 @@
 //! | `decode`       | tokens emitted / the decode cap (`max_length`)        |
 //! | `postprocess`  | `0/0` — decode finished, assembling the document      |
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+thread_local! {
+    /// External progress code may itself touch an instrumented path. Suppress
+    /// nested observations on that same thread without holding the sink mutex.
+    static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct CallbackGuard;
+
+impl CallbackGuard {
+    fn enter() -> Option<Self> {
+        IN_CALLBACK.with(|active| {
+            if active.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for CallbackGuard {
+    fn drop(&mut self) {
+        IN_CALLBACK.with(|active| active.set(false));
+    }
+}
 
 /// One progress observation. `total == 0` marks an indeterminate stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,7 +85,7 @@ pub struct ProgressEvent {
 /// The installed observer. `Send + Sync` is required so the sink can live in a
 /// `static`; see the threading note above for why it is nevertheless only ever
 /// invoked on the thread that entered the forward.
-pub type ProgressSink = Box<dyn Fn(ProgressEvent) + Send + Sync>;
+pub type ProgressSink = Arc<dyn Fn(ProgressEvent) + Send + Sync>;
 
 /// The fast-path flag. Read (relaxed) at the top of every hook; when it is
 /// `false` nothing else in this module is touched.
@@ -106,10 +132,18 @@ pub fn emit(stage: &'static str, current: u64, total: u64) {
 #[cold]
 #[inline(never)]
 fn emit_cold(event: ProgressEvent) {
+    let Some(_callback_guard) = CallbackGuard::enter() else {
+        return;
+    };
     // `try_lock`, never `lock`: an event is worth less than any risk of
-    // stalling (or deadlocking a re-entrant callback inside) a forward.
-    let Ok(slot) = SINK.try_lock() else { return };
-    if let Some(sink) = slot.as_ref() {
+    // stalling a forward. Clone the Arc and release the registry mutex before
+    // invoking external code: a callback is allowed to replace or clear itself,
+    // which would otherwise recurse into `set_progress_sink` and self-deadlock.
+    let sink = {
+        let Ok(slot) = SINK.try_lock() else { return };
+        slot.as_ref().map(Arc::clone)
+    };
+    if let Some(sink) = sink {
         sink(event);
     }
 }
@@ -149,7 +183,7 @@ pub fn vision_step() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex as StdMutex};
+    use std::sync::Mutex as StdMutex;
 
     /// Serializes the tests in this module: the sink is process-global.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -170,7 +204,7 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let seen: Arc<StdMutex<Vec<ProgressEvent>>> = Arc::new(StdMutex::new(Vec::new()));
         let sink_seen = Arc::clone(&seen);
-        set_progress_sink(Some(Box::new(move |ev| {
+        set_progress_sink(Some(Arc::new(move |ev| {
             sink_seen.lock().unwrap_or_else(|e| e.into_inner()).push(ev);
         })));
         assert!(enabled());
@@ -232,14 +266,30 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let count = Arc::new(StdMutex::new(0usize));
         let sink_count = Arc::clone(&count);
-        set_progress_sink(Some(Box::new(move |_| {
+        set_progress_sink(Some(Arc::new(move |_| {
             *sink_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
-            // A sink that emits again re-enters the seam; `try_lock` drops the
-            // nested event instead of deadlocking.
+            // A sink that emits again re-enters the seam; the thread-local
+            // callback guard drops that nested observation without retaining
+            // the registry mutex across caller code.
             emit("decode", 0, 0);
         })));
         emit("decode", 1, 8);
         set_progress_sink(None);
         assert_eq!(*count.lock().unwrap_or_else(|e| e.into_inner()), 1);
+    }
+
+    #[test]
+    fn a_sink_can_clear_itself_without_deadlocking() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let count = Arc::new(StdMutex::new(0usize));
+        let sink_count = Arc::clone(&count);
+        set_progress_sink(Some(Arc::new(move |_| {
+            *sink_count.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            set_progress_sink(None);
+        })));
+        emit("decode", 1, 8);
+        emit("decode", 2, 8);
+        assert_eq!(*count.lock().unwrap_or_else(|e| e.into_inner()), 1);
+        assert!(!enabled());
     }
 }
