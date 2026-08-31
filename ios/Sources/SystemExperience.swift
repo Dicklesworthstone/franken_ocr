@@ -152,7 +152,7 @@ struct OpenOCRIntent: AppIntent {
 struct OpenLiveCameraIntent: AppIntent {
     static let title: LocalizedStringResource = "Open Live Camera"
     static let description = IntentDescription(
-        "Open FrankenOCR's fast Apple Vision camera. Camera capture begins only after you open the view."
+        "Open FrankenOCR's fast on-device Vision camera. Camera capture begins only after you open the view."
     )
     static let openAppWhenRun = true
     @MainActor func perform() async throws -> some IntentResult {
