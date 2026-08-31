@@ -41,8 +41,8 @@
 //! | `decode`       | tokens emitted / the decode cap (`max_length`)        |
 //! | `postprocess`  | `0/0` — decode finished, assembling the document      |
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 thread_local! {
     /// External progress code may itself touch an instrumented path. Suppress

@@ -123,7 +123,9 @@ typedef void (*FocrProgressFn)(void *ctx, const char *stage, uint64_t current,
 
 // Install (fn != NULL) or clear (fn == NULL) the progress callback. `ctx` is
 // passed back unchanged. The caller guarantees `ctx` outlives the callback,
-// i.e. clear it before releasing whatever `ctx` points at.
+// i.e. clear it before releasing whatever `ctx` points at. Clearing or replacing
+// from another thread waits for any active callback to return; a callback may
+// also clear itself reentrantly.
 void focr_set_progress_callback(FocrProgressFn fn, void *ctx);
 
 // Cooperative cancellation. A running forward observes the request at its next

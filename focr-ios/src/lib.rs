@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use franken_ocr::error::{FocrError, FocrResult};
 use franken_ocr::native_engine::{OcrModel, RecognizedDocument};
@@ -549,9 +549,81 @@ unsafe impl Sync for ProgressTarget {}
 pub type FocrProgressFn =
     extern "C" fn(ctx: *mut c_void, stage: *const c_char, current: u64, total: u64);
 
-fn progress_slot() -> &'static Mutex<Option<ProgressTarget>> {
-    static SLOT: OnceLock<Mutex<Option<ProgressTarget>>> = OnceLock::new();
-    SLOT.get_or_init(|| Mutex::new(None))
+struct ProgressRegistryState {
+    target: Option<ProgressTarget>,
+    in_flight: usize,
+}
+
+struct ProgressRegistry {
+    state: Mutex<ProgressRegistryState>,
+    quiesced: Condvar,
+    /// Only one external callback may run at a time. This makes reentrant
+    /// self-clear compatible with quiescence: two simultaneous callbacks can
+    /// never each wait for the other to retire.
+    invocation_gate: Mutex<()>,
+}
+
+fn progress_registry() -> &'static ProgressRegistry {
+    static REGISTRY: OnceLock<ProgressRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| ProgressRegistry {
+        state: Mutex::new(ProgressRegistryState {
+            target: None,
+            in_flight: 0,
+        }),
+        quiesced: Condvar::new(),
+        invocation_gate: Mutex::new(()),
+    })
+}
+
+thread_local! {
+    /// Distinguishes a callback clearing itself from an unrelated thread that
+    /// must wait for all borrowed callback contexts to quiesce before returning.
+    static IN_PROGRESS_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct ProgressInvocation {
+    target: ProgressTarget,
+    _gate: std::sync::MutexGuard<'static, ()>,
+}
+
+impl ProgressInvocation {
+    fn begin() -> Option<Self> {
+        let registry = progress_registry();
+        let gate = registry
+            .invocation_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target = state.target?;
+        state.in_flight = state
+            .in_flight
+            .checked_add(1)
+            .expect("progress callback in-flight count overflow");
+        IN_PROGRESS_CALLBACK.with(|active| active.set(true));
+        Some(Self {
+            target,
+            _gate: gate,
+        })
+    }
+}
+
+impl Drop for ProgressInvocation {
+    fn drop(&mut self) {
+        IN_PROGRESS_CALLBACK.with(|active| active.set(false));
+        let registry = progress_registry();
+        let mut state = registry
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert!(state.in_flight > 0);
+        state.in_flight -= 1;
+        if state.in_flight == 0 {
+            registry.quiesced.notify_all();
+        }
+    }
 }
 
 /// See `focr_ios.h`.
@@ -570,37 +642,55 @@ pub unsafe extern "C" fn focr_set_progress_callback(
 ) {
     guarded((), || {
         let target = func.map(|func| ProgressTarget { func, ctx });
-        if let Ok(mut slot) = progress_slot().lock() {
-            *slot = target;
+        let called_from_callback = IN_PROGRESS_CALLBACK.with(std::cell::Cell::get);
+        let registry = progress_registry();
+        {
+            let mut state = registry
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Stop new invocations before waiting for existing ones. A caller on
+            // another thread may release its old `ctx` as soon as this function
+            // returns, so replacement has to be a quiescing operation.
+            state.target = None;
+            while !called_from_callback && state.in_flight != 0 {
+                state = registry
+                    .quiesced
+                    .wait(state)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            state.target = target;
+            // Keep the registry state and the engine fast-path arm/disarm in one
+            // linearized critical section. Otherwise concurrent install/clear
+            // calls can publish their two halves in opposite orders and leave a
+            // live target permanently disarmed (or an empty target armed).
+            if target.is_none() {
+                franken_ocr::native_engine::progress::set_progress_sink(None);
+            } else {
+                franken_ocr::native_engine::progress::set_progress_sink(Some(Arc::new(|event| {
+                    // SAFETY: acquire an in-flight lease, release the registry mutex,
+                    // then invoke caller code. Clearing from another thread waits for
+                    // this lease; clearing reentrantly marks the target absent and lets
+                    // the current invocation retire naturally on return.
+                    let Some(invocation) = ProgressInvocation::begin() else {
+                        return;
+                    };
+                    // `event.stage` is a `&'static str` from a fixed set, but it is not
+                    // NUL-terminated, so it needs one allocation to cross as a C string.
+                    // The hooks sit on outer sequential loops (per vision block, per
+                    // token), never inside a rayon body, so this is not a hot path.
+                    let Ok(stage) = CString::new(event.stage) else {
+                        return;
+                    };
+                    (invocation.target.func)(
+                        invocation.target.ctx,
+                        stage.as_ptr(),
+                        event.current,
+                        event.total,
+                    );
+                })));
+            }
         }
-        if target.is_none() {
-            // Disarm the engine's relaxed-atomic fast path so an un-observed run
-            // pays nothing at all.
-            franken_ocr::native_engine::progress::set_progress_sink(None);
-            return;
-        }
-        franken_ocr::native_engine::progress::set_progress_sink(Some(Arc::new(|event| {
-            // `try_lock`, not `lock`: a progress hook must never be able to
-            // block — or deadlock — the forward it is reporting on.
-            // SAFETY: copy the immutable function/context pair, then release
-            // the registry mutex before entering caller code. The callback may
-            // legally clear or replace itself through this same API.
-            let target = {
-                let Ok(slot) = progress_slot().try_lock() else {
-                    return;
-                };
-                *slot
-            };
-            let Some(target) = target else { return };
-            // `event.stage` is a `&'static str` from a fixed set, but it is not
-            // NUL-terminated, so it needs one allocation to cross as a C string.
-            // The hooks sit on outer sequential loops (per vision block, per
-            // token), never inside a rayon body, so this is not a hot path.
-            let Ok(stage) = CString::new(event.stage) else {
-                return;
-            };
-            (target.func)(target.ctx, stage.as_ptr(), event.current, event.total);
-        })));
     });
 }
 
@@ -959,10 +1049,7 @@ mod tests {
         REENTRANT_PROGRESS_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: the callback has no context and clears itself before returning.
         unsafe {
-            focr_set_progress_callback(
-                Some(clear_progress_from_callback),
-                std::ptr::null_mut(),
-            )
+            focr_set_progress_callback(Some(clear_progress_from_callback), std::ptr::null_mut())
         };
         franken_ocr::native_engine::progress::emit("decode", 1, 1);
         franken_ocr::native_engine::progress::emit("decode", 1, 1);
