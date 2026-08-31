@@ -1282,7 +1282,7 @@ dependencies = [
 name = "fsqlite"
 version = "0.3.13"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-ext-fts5",
@@ -1324,7 +1324,7 @@ dependencies = [
 name = "fsqlite-core"
 version = "0.3.13"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "foldhash",
  "fsqlite-ast",
@@ -1431,7 +1431,7 @@ dependencies = [
 name = "fsqlite-mvcc"
 version = "0.3.13"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "crc32c",
  "crossbeam-epoch",
@@ -1466,7 +1466,7 @@ name = "fsqlite-pager"
 version = "0.3.13"
 dependencies = [
  "argon2",
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "bumpalo",
  "chacha20poly1305",
@@ -1517,7 +1517,7 @@ dependencies = [
 name = "fsqlite-types"
 version = "0.3.13"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "bitflags",
  "blake3",
  "fsqlite-error",
@@ -1535,7 +1535,7 @@ dependencies = [
 name = "fsqlite-vdbe"
 version = "0.3.13"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "crossbeam-deque",
  "fsqlite-ast",
  "fsqlite-btree",
@@ -1557,7 +1557,7 @@ name = "fsqlite-vfs"
 version = "0.3.13"
 dependencies = [
  "advisory-lock",
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "fsqlite-error",
  "fsqlite-observability",
  "fsqlite-types",
@@ -1573,7 +1573,7 @@ dependencies = [
 name = "fsqlite-wal"
 version = "0.3.13"
 dependencies = [
- "asupersync 0.4.9",
+ "asupersync 0.4.10",
  "blake3",
  "crc32c",
  "fsqlite-error",
