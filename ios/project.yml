@@ -38,6 +38,7 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         INFOPLIST_FILE: Sources/Info.plist
         CODE_SIGN_ENTITLEMENTS: FrankenOCR.entitlements
+        "CODE_SIGN_ENTITLEMENTS[sdk=macosx*]": FrankenOCR-Mac.entitlements
         # The xcframework sits next to the project.
         FRAMEWORK_SEARCH_PATHS: ["$(inherited)", "."]
         SUPPORTS_MACCATALYST: true
