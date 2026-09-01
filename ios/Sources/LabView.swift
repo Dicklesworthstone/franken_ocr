@@ -60,6 +60,18 @@ struct LabView: View {
     @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
     @FocusState private var focusedTextEntry: LabTextEntry?
 
+    init() {
+#if DEBUG
+        if let requested = ProcessInfo.processInfo.environment["FOCR_INITIAL_DESTINATION"],
+           let destination = Destination.allCases.first(where: {
+               $0.rawValue.caseInsensitiveCompare(requested) == .orderedSame
+           })
+        {
+            _destination = State(initialValue: destination)
+        }
+#endif
+    }
+
     var body: some View {
         ZStack {
             LabBackground()
