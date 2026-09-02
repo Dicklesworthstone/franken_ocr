@@ -532,7 +532,6 @@ struct LiveCameraView: View {
             if let error = camera.errorMessage { errorOverlay(error) }
         }
         .coordinateSpace(name: "liveCameraSurface")
-        .preferredColorScheme(.dark)
         .tint(Lab.accent)
         .onDisappear {
             copyResetTask?.cancel()
@@ -783,7 +782,6 @@ struct LiveCameraView: View {
             .padding(24)
             .frame(maxWidth: 720)
         }
-        .preferredColorScheme(.dark)
         .tint(Lab.accent)
     }
 }

@@ -38,6 +38,7 @@ private extension View {
 /// beside step 03, because a transcription is worth reading next to the page it
 /// came from and the tablet finally has the width for it.
 struct LabView: View {
+    @AppStorage(LabAppearance.storageKey) private var appearance = LabAppearance.dark.rawValue
     private enum Destination: String, CaseIterable, Identifiable {
         case capture = "Capture"
         case live = "Live"
@@ -170,7 +171,7 @@ struct LabView: View {
                     if !tappedAField { focusedTextEntry = nil }
                 }
         )
-        .preferredColorScheme(.dark)
+        .preferredColorScheme((LabAppearance(rawValue: appearance) ?? .dark).colorScheme)
         .tint(Lab.accent)
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
@@ -445,6 +446,7 @@ struct LabView: View {
                     .foregroundStyle(Lab.accentInk)
             }
             Spacer()
+            LabAppearanceButton(selection: $appearance)
             Button {
                 model.runSelftest()
             } label: {
@@ -456,8 +458,7 @@ struct LabView: View {
             .frame(width: 44, height: 44)
             .accessibilityLabel("Verify the int8 kernels on this device")
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("FrankenOCR, reads locally")
+        .accessibilityElement(children: .contain)
     }
 
     private var monsterMood: MonsterMood {
@@ -1093,7 +1094,6 @@ struct LabView: View {
             .navigationTitle("Kernel selftest")
             .navigationBarTitleDisplayMode(.inline)
         }
-        .preferredColorScheme(.dark)
     }
 
     // ── Footer ─────────────────────────────────────────────────────────────

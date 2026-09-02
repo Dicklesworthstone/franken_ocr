@@ -1,48 +1,63 @@
 import SwiftUI
 import UIKit
 
-/// The franken-ocr.com design system, ported.
-///
-/// The site is dark-only by construction — every surface is authored against
-/// `#060b09` and there is no light palette to map onto. Rather than invent one,
-/// the app forces dark too, which also keeps the one visual identity across
-/// web and phone.
+/// The franken-ocr.com design system, extended with a warm laboratory-paper
+/// light palette for native surfaces while preserving the site's semantics.
 ///
 /// Colors carry FIXED semantics here exactly as they do on the site and in
 /// `viz.js`: emerald is "ours / active / exact", amber is "warning /
 /// threshold", red is "failed / skipped / refused", slate is "the reference we
 /// are measured against", violet is "structure / shape / metadata". A color
 /// used off-meaning is a bug, not a style choice.
+enum LabAppearance: String {
+    static let storageKey = "frankenocr.appearance"
+    case dark
+    case light
+    var colorScheme: ColorScheme { self == .dark ? .dark : .light }
+}
+
 enum Lab {
     // Surfaces
-    static let background = Color(hex: 0x060B09)
-    static let backgroundDeep = Color(hex: 0x030706)
-    static let panel = Color.white.opacity(0.022)
-    static let panelStrong = Color(hex: 0x030706).opacity(0.72)
-    static let inset = Color(hex: 0x020605).opacity(0.66)
+    static let background = adaptive(dark: 0x060B09, light: 0xF1F7F2)
+    static let backgroundDeep = adaptive(dark: 0x030706, light: 0xE3EFE6)
+    static let panel = adaptive(dark: 0xFFFFFF, light: 0xFFFFFF, darkAlpha: 0.022, lightAlpha: 0.94)
+    static let panelStrong = adaptive(dark: 0x030706, light: 0xF9FCF9, darkAlpha: 0.72, lightAlpha: 0.98)
+    static let inset = adaptive(dark: 0x020605, light: 0xDFECE2, darkAlpha: 0.66, lightAlpha: 0.92)
 
     // Text
-    static let textPrimary = Color(hex: 0xE8EEF2)
-    static let textMid = Color(hex: 0xCBD5E1)
-    static let textDim = Color(hex: 0x94A3B8)
+    static let textPrimary = adaptive(dark: 0xE8EEF2, light: 0x12231A)
+    static let textMid = adaptive(dark: 0xCBD5E1, light: 0x263B30)
+    static let textDim = adaptive(dark: 0x94A3B8, light: 0x40584B)
     /// The site picked this over `#64748b` deliberately: 5.18:1 on the page
     /// background, where the darker slate measured 4.16:1 and failed AA.
-    static let textFaint = Color(hex: 0x748496)
+    static let textFaint = adaptive(dark: 0x748496, light: 0x53695D)
 
     // Semantics
-    static let accent = Color(hex: 0x34D399)
-    static let accentDeep = Color(hex: 0x059669)
+    static let accent = adaptive(dark: 0x34D399, light: 0x067A50)
+    static let accentDeep = adaptive(dark: 0x059669, light: 0x05633F)
     /// Eyebrows, section labels, table headers — a step deeper than `accent`.
-    static let accentInk = Color(hex: 0x10B981)
+    static let accentInk = adaptive(dark: 0x10B981, light: 0x066E48)
     /// Text drawn ON an accent fill.
     static let onAccent = Color(hex: 0x04140D)
-    static let amber = Color(hex: 0xFBBF24)
-    static let red = Color(hex: 0xF87171)
-    static let reference = Color(hex: 0x7E8E9F)
-    static let violet = Color(hex: 0xA78BFA)
+    static let amber = adaptive(dark: 0xFBBF24, light: 0x9A5A00)
+    static let red = adaptive(dark: 0xF87171, light: 0xB4232C)
+    static let reference = adaptive(dark: 0x7E8E9F, light: 0x4A6172)
+    static let violet = adaptive(dark: 0xA78BFA, light: 0x6540A8)
 
-    static let line = Color.white.opacity(0.07)
-    static let lineStrong = Color(hex: 0x34D399).opacity(0.26)
+    static let line = adaptive(dark: 0xFFFFFF, light: 0x16452D, darkAlpha: 0.07, lightAlpha: 0.15)
+    static let lineStrong = adaptive(dark: 0x34D399, light: 0x067A50, darkAlpha: 0.26, lightAlpha: 0.30)
+
+    private static func adaptive(
+        dark: UInt32,
+        light: UInt32,
+        darkAlpha: CGFloat = 1,
+        lightAlpha: CGFloat = 1
+    ) -> Color {
+        Color(uiColor: UIColor { traits in
+            UIColor(hex: traits.userInterfaceStyle == .dark ? dark : light)
+                .withAlphaComponent(traits.userInterfaceStyle == .dark ? darkAlpha : lightAlpha)
+        })
+    }
 
     static let radius: CGFloat = 12
     static let radiusLarge: CGFloat = 18
@@ -53,6 +68,29 @@ enum Lab {
 #else
         UIFontMetrics(forTextStyle: .body).scaledValue(for: base)
 #endif
+    }
+}
+
+struct LabAppearanceButton: View {
+    @Binding var selection: String
+    private var appearance: LabAppearance { LabAppearance(rawValue: selection) ?? .dark }
+
+    var body: some View {
+        Button {
+            selection = appearance == .dark ? LabAppearance.light.rawValue : LabAppearance.dark.rawValue
+        } label: {
+            Image(systemName: appearance == .dark ? "sun.max.fill" : "moon.stars.fill")
+                .font(.system(size: Lab.typeSize(15), weight: .bold))
+                .frame(width: 44, height: 44)
+                .background(Lab.panelStrong, in: Circle())
+                .overlay(Circle().stroke(Lab.line))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(appearance == .dark ? Lab.amber : Lab.accentDeep)
+        .accessibilityIdentifier("appearance-toggle")
+        .accessibilityLabel(appearance == .dark ? "Switch to light mode" : "Switch to dark mode")
+        .accessibilityValue(appearance == .dark ? "Dark mode" : "Light mode")
+        .accessibilityHint("Remembers this choice for future launches")
     }
 }
 
@@ -117,6 +155,17 @@ extension Color {
     }
 }
 
+private extension UIColor {
+    convenience init(hex: UInt32) {
+        self.init(
+            red: CGFloat((hex >> 16) & 0xFF) / 255,
+            green: CGFloat((hex >> 8) & 0xFF) / 255,
+            blue: CGFloat(hex & 0xFF) / 255,
+            alpha: 1
+        )
+    }
+}
+
 /// The page's fixed background wash: three radial gradients that never scroll,
 /// matching `body::before` on the site.
 struct LabBackground: View {
@@ -127,11 +176,11 @@ struct LabBackground: View {
                 let w = geo.size.width
                 let h = geo.size.height
                 ZStack {
-                    wash(Color(hex: 0x10B981).opacity(0.13), at: .init(x: 0.12, y: -0.06),
+                    wash(Lab.accentInk.opacity(0.13), at: .init(x: 0.12, y: -0.06),
                          size: CGSize(width: w * 1.5, height: h * 0.8))
-                    wash(Color(hex: 0x044225).opacity(0.34), at: .init(x: 0.96, y: 0.22),
+                    wash(Lab.accentDeep.opacity(0.20), at: .init(x: 0.96, y: 0.22),
                          size: CGSize(width: w * 1.2, height: h * 0.9))
-                    wash(Color(hex: 0xFBBF24).opacity(0.05), at: .init(x: 0.40, y: 1.08),
+                    wash(Lab.amber.opacity(0.05), at: .init(x: 0.40, y: 1.08),
                          size: CGSize(width: w, height: h * 0.7))
                 }
             }
