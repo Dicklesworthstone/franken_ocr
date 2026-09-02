@@ -12,7 +12,7 @@ import VisionKit
 /// the live camera surface. `animatedLineIDs` contains only newly recognized or
 /// materially changed lines, so a stationary paragraph does not continuously
 /// replay the same animation.
-private struct LiveCameraBatch: Identifiable {
+struct LiveCameraBatch: Identifiable {
     struct Line: Identifiable {
         let id: UUID
         let text: String
@@ -253,8 +253,9 @@ private struct NativeLiveTextScanner: UIViewControllerRepresentable {
     }
 }
 
-private struct LiveTextAccumulator {
-    private struct CapturedLine {
+struct LiveTextAccumulator {
+private struct CapturedLine {
+        var sourceID: UUID
         var text: String
         var confidence: Float
         var normalized: String
@@ -273,6 +274,28 @@ private struct LiveTextAccumulator {
             let normalized = Self.normalize(incoming.text)
             guard normalized.count >= 2 else { continue }
 
+            // VisionKit keeps a stable ID while one tracked text observation
+            // settles. Preserve that identity so a partial transcript is
+            // replaced by its corrected form instead of being appended as a
+            // second line merely because their word-overlap score is low.
+            if let exactIndex = lines.firstIndex(where: { $0.sourceID == incoming.id }) {
+                let existing = lines[exactIndex]
+                guard existing.normalized != normalized else {
+                    if incoming.confidence > existing.confidence {
+                        lines[exactIndex].confidence = incoming.confidence
+                    }
+                    continue
+                }
+                lines[exactIndex] = CapturedLine(
+                    sourceID: incoming.id,
+                    text: incoming.text,
+                    confidence: incoming.confidence,
+                    normalized: normalized
+                )
+                accepted.append(incoming)
+                continue
+            }
+
             let match = lines.indices
                 .map { ($0, Self.similarity(normalized, lines[$0].normalized)) }
                 .max { $0.1 < $1.1 }
@@ -281,6 +304,7 @@ private struct LiveTextAccumulator {
                 if incoming.text.count > lines[match.0].text.count
                     || incoming.confidence > lines[match.0].confidence + 0.08 {
                     lines[match.0] = CapturedLine(
+                        sourceID: incoming.id,
                         text: incoming.text,
                         confidence: incoming.confidence,
                         normalized: normalized
@@ -291,6 +315,7 @@ private struct LiveTextAccumulator {
             }
 
             lines.append(CapturedLine(
+                sourceID: incoming.id,
                 text: incoming.text,
                 confidence: incoming.confidence,
                 normalized: normalized
