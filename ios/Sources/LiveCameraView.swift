@@ -36,6 +36,7 @@ private final class LiveCameraController: NSObject, ObservableObject,
                                           DataScannerViewControllerDelegate {
     @Published private(set) var latestBatch: LiveCameraBatch?
     @Published private(set) var isRunning = false
+    @Published private(set) var isPaused = false
     @Published private(set) var torchOn = false
     @Published private(set) var errorMessage: String?
 
@@ -60,15 +61,29 @@ private final class LiveCameraController: NSObject, ObservableObject,
             try scanner?.startScanning()
             errorMessage = nil
             isRunning = true
+            isPaused = false
         } catch {
             errorMessage = "Live Camera could not start: \(error.localizedDescription)"
             isRunning = false
+            isPaused = false
+        }
+    }
+
+    func togglePause() {
+        if isRunning {
+            scanner?.stopScanning()
+            isRunning = false
+            isPaused = true
+            turnTorchOff()
+        } else if isPaused {
+            start()
         }
     }
 
     func stop() {
         scanner?.stopScanning()
         isRunning = false
+        isPaused = false
         turnTorchOff()
     }
 
@@ -138,6 +153,7 @@ private final class LiveCameraController: NSObject, ObservableObject,
             errorMessage = "Apple Live Text camera scanning became unavailable."
         }
         isRunning = false
+        isPaused = false
     }
 
     private func publish(
@@ -145,6 +161,7 @@ private final class LiveCameraController: NSObject, ObservableObject,
         changedItems: [RecognizedItem],
         scanner: DataScannerViewController
     ) {
+        guard isRunning else { return }
         let surface = scanner.view.bounds.size
         guard surface.width > 0, surface.height > 0 else { return }
 
@@ -587,12 +604,23 @@ struct LiveCameraView: View {
                     Circle()
                         .fill(camera.isRunning ? Lab.accent : Lab.amber)
                         .frame(width: 6, height: 6)
-                    Text(camera.isRunning ? "APPLE LIVE TEXT · ON DEVICE" : "STARTING CAMERA")
+                    Text(camera.isRunning
+                         ? "APPLE LIVE TEXT · ON DEVICE"
+                         : (camera.isPaused ? "PAUSED · CAPTURED TEXT HELD" : "STARTING CAMERA"))
                         .font(.system(size: Lab.typeSize(9), weight: .bold, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.68))
                 }
             }
             Spacer()
+            Button { camera.togglePause() } label: {
+                Image(systemName: camera.isPaused ? "play.fill" : "pause.fill")
+                    .font(.system(size: Lab.typeSize(15), weight: .semibold))
+                    .frame(width: 42, height: 42)
+                    .background(.black.opacity(0.50), in: Circle())
+            }
+            .disabled(!camera.isRunning && !camera.isPaused)
+            .accessibilityLabel(camera.isPaused ? "Resume Live Camera" : "Pause Live Camera")
+            .accessibilityHint("Keeps the text already captured in the tray")
             Button { camera.toggleTorch() } label: {
                 Image(systemName: camera.torchOn ? "flashlight.on.fill" : "flashlight.off.fill")
                     .font(.system(size: Lab.typeSize(16), weight: .semibold))
@@ -636,6 +664,12 @@ struct LiveCameraView: View {
                         .foregroundStyle(.white.opacity(0.52))
                 }
                 Spacer()
+                ShareLink(item: capturedText) {
+                    Image(systemName: "square.and.arrow.up")
+                        .frame(width: 34, height: 34)
+                }
+                .disabled(capturedText.isEmpty)
+                .accessibilityLabel("Share captured text")
                 Button(copied ? "Copied" : "Copy") {
                     UIPasteboard.general.string = capturedText
                     copied = true

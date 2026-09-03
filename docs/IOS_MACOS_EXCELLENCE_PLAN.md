@@ -51,7 +51,7 @@ per-result deletion, and Clear All.
 - [ ] Stabilize recognized observations across adjacent frames.
 - [ ] Warp actual recognized words from true bounding boxes into the tray.
 - [ ] Commit words at warp completion and suppress duplicates.
-- [ ] Add pause, clear, copy, share, done, and Reduce Motion behavior to Live Camera.
+- [x] Add pause, clear, copy, share, done, and Reduce Motion behavior to Live Camera.
 - [ ] Preserve camera frame rate by bounding recognition and animation work.
 - [x] Add selectable result actions and private local history with retention, deletion, and privacy redaction.
 - [ ] Preserve outside-tap keyboard dismissal without breaking native selection.
