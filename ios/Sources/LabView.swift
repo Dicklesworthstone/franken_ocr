@@ -44,6 +44,7 @@ struct LabView: View {
         case live = "Live"
         case result = "Result"
         case models = "Models"
+        case library = "Library"
 
         var id: Self { self }
     }
@@ -56,6 +57,7 @@ struct LabView: View {
     @State private var showFileImporter = false
     @State private var showCamera = false
     @State private var showLiveCamera = false
+    @State private var showHistory = false
     @State private var copied = false
     @State private var copyResetTask: Task<Void, Never>?
     @State private var textEntryFrames: [LabTextEntry: CGRect] = [:]
@@ -228,6 +230,9 @@ struct LabView: View {
             allowsMultipleSelection: false
         ) { result in load(fileResult: result) }
         .sheet(isPresented: $model.showSelftest) { selftestSheet }
+        .sheet(isPresented: $showHistory) {
+            RecognitionHistorySheet(history: model.history)
+        }
         .fullScreenCover(isPresented: $showLiveCamera) {
             LiveCameraView(model: model)
         }
@@ -321,6 +326,8 @@ struct LabView: View {
             transcriptionCard
         case .models:
             specimenCard
+        case .library:
+            RecognitionHistoryLibrary(history: model.history)
         }
     }
 
@@ -446,6 +453,32 @@ struct LabView: View {
                     .foregroundStyle(Lab.accentInk)
             }
             Spacer()
+            Button { showHistory = true } label: {
+                ZStack(alignment: .topTrailing) {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .font(.system(size: Lab.typeSize(15), weight: .bold))
+                        .frame(width: 30, height: 30)
+                    if !model.history.entries.isEmpty {
+                        Text("\(model.history.entries.count)")
+                            .font(.system(size: Lab.typeSize(8), weight: .black, design: .rounded))
+                            .foregroundStyle(Lab.onAccent)
+                            .frame(minWidth: 16, minHeight: 16)
+                            .background(Lab.accent, in: Circle())
+                            .offset(x: 5, y: -4)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(Lab.violet)
+            .frame(width: 44, height: 44)
+            .accessibilityIdentifier("recognition-history-button")
+            .accessibilityLabel("Recent results")
+            .accessibilityValue(
+                model.history.entries.isEmpty
+                    ? "No saved results"
+                    : "\(model.history.entries.count) saved result\(model.history.entries.count == 1 ? "" : "s")"
+            )
+            .accessibilityHint("Opens private results saved for up to fourteen days")
             LabAppearanceButton(selection: $appearance)
             Button {
                 model.runSelftest()

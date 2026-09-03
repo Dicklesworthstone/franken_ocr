@@ -199,6 +199,7 @@ final class LabModel {
     // ── Engine + model ─────────────────────────────────────────────────────
     let engine = Engine()
     let store = ModelStore()
+    let history: RecognitionHistoryStore
 
     private(set) var spec: ModelSpec = ModelCatalog.all[0] {
         didSet {
@@ -279,7 +280,8 @@ final class LabModel {
     private var previewGeneration = 0
     private var eta = OCRAdaptiveETA()
 
-    init() {
+    init(history: RecognitionHistoryStore = RecognitionHistoryStore()) {
+        self.history = history
         if let saved = UserDefaults.standard.string(forKey: "selectedModel"),
            let found = ModelCatalog.spec(id: saved) {
             spec = found
@@ -799,6 +801,7 @@ final class LabModel {
                 seconds, result.output.count, route
             )
         }
+        saveCurrentResultToHistory()
         runActivity.finish(
             status: .complete,
             headline: "Text assembled",
@@ -910,6 +913,7 @@ final class LabModel {
             done, pageOutcomes.count, seconds,
             skipped == 0 ? "" : " · \(skipped) skipped"
         )
+        saveCurrentResultToHistory()
         runActivity.finish(
             status: .complete,
             headline: "Document assembled",
@@ -1077,6 +1081,22 @@ final class LabModel {
 
     private var exportStem: String {
         (imageName as NSString?)?.deletingPathExtension ?? "page"
+    }
+
+    private func saveCurrentResultToHistory() {
+        let text = displayText
+        guard !text.isEmpty else { return }
+        let ext = (exportFilename as NSString).pathExtension
+        _ = try? history.record(
+            RecognitionHistoryResult(
+                text: text,
+                sourceName: exportStem,
+                modelName: spec.shortName,
+                pageCount: max(1, completedPageCount),
+                seconds: lastRunSeconds,
+                fileExtension: ext
+            )
+        )
     }
 
     /// OneChart's output is a structured-data dict, not Markdown; the

@@ -29,6 +29,11 @@ YAML, plist, privacy-manifest, and diff hygiene checks are green. Regeneration,
 extension compilation, universal framework completion, Mac launch, and device
 acceptance remain open.
 
+Current parity tranche (2026-09-02): the previously promised private result
+Library is now wired to successful still and document runs, with bounded local
+retention, backup exclusion, privacy-minimal metadata, preview/share/copy,
+per-result deletion, and Clear All.
+
 - [ ] Inventory real RecognitionStage, page, decode-unit, geometry, timing, and terminal events.
 - [ ] Define a stable run-state model and mark estimates explicitly.
 - [ ] Build shared semantic theme, panels, controls, telemetry, machine disclosure, and adaptive workspace primitives.
@@ -48,7 +53,7 @@ acceptance remain open.
 - [ ] Commit words at warp completion and suppress duplicates.
 - [ ] Add pause, clear, copy, share, done, and Reduce Motion behavior to Live Camera.
 - [ ] Preserve camera frame rate by bounding recognition and animation work.
-- [ ] Add selectable result actions and private local history with retention, deletion, and privacy redaction.
+- [x] Add selectable result actions and private local history with retention, deletion, and privacy redaction.
 - [ ] Preserve outside-tap keyboard dismissal without breaking native selection.
 - [ ] Add responsive iPad sidebar/document/inspector layout.
 - [ ] Add Mac Catalyst support and Catalyst-compatible Rust library slice.
