@@ -45,6 +45,12 @@ final class FrankenOCRAppearanceUITests: XCTestCase {
         XCTAssertTrue(batchButton.waitForExistence(timeout: 12))
         XCTAssertTrue(batchButton.isHittable)
         XCTAssertTrue(app.staticTexts["Choose pages or images"].exists)
+        let figureToggle = app.switches["extract-figures-toggle"]
+        if !figureToggle.waitForExistence(timeout: 2) {
+            app.swipeUp()
+        }
+        XCTAssertTrue(figureToggle.waitForExistence(timeout: 5))
+        XCTAssertTrue(figureToggle.isHittable)
         keepScreenshot(of: app, named: "Files and batch import")
     }
 

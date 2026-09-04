@@ -112,6 +112,34 @@ const char *focr_engine_license(const FocrEngine *engine);
 int32_t focr_recognize_json(FocrEngine *engine, const uint8_t *image_bytes,
                             size_t image_len, char **out_json);
 
+// A figure-bearing result keeps metadata and lossless PNG crops under one
+// opaque owner. This avoids base64-expanding potentially large images inside
+// JSON. Every borrowed pointer below remains valid only until result_free.
+typedef struct FocrFigureResult FocrFigureResult;
+
+// Run the same recognition route as focr_recognize_json, including smart-strip
+// tall captures, while asking the core to crop every grounded image span from
+// the exact EXIF-aligned source pixels. On success, writes a caller-owned result
+// to *out_result. Long and blocking; serialize access to the engine.
+int32_t focr_recognize_with_figures(FocrEngine *engine,
+                                    const uint8_t *image_bytes,
+                                    size_t image_len,
+                                    FocrFigureResult **out_result);
+
+// Recognition JSON plus a `figures` metadata array. Borrowed from result.
+const char *focr_figure_result_json(const FocrFigureResult *result);
+
+// Number of extracted figure PNGs in the result.
+size_t focr_figure_result_count(const FocrFigureResult *result);
+
+// Borrow one PNG by zero-based index and write its exact byte length. The
+// returned bytes are borrowed from result; copy before result_free.
+const uint8_t *focr_figure_result_png(const FocrFigureResult *result,
+                                      size_t index, size_t *out_len);
+
+// Release the JSON and every PNG. Safe with NULL; exactly once otherwise.
+void focr_figure_result_free(FocrFigureResult *result);
+
 // ── Progress and cancellation ──────────────────────────────────────────────
 
 // Progress callback. `stage` is one of "preprocess", "vision", "prefill",

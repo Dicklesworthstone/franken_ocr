@@ -11,6 +11,9 @@ import SwiftUI
 /// in the browser playground, and in the exported HTML.
 struct MarkdownView: View {
     let markdown: String
+    /// When true, image references are backed by the exact source crops shown
+    /// immediately below this reading view rather than being merely omitted.
+    var hasExtractedFigures = false
 
     private var presentation: (blocks: [MarkdownBlock], omittedFigures: Int) {
         let parsed = MarkdownBlock.parse(markdown)
@@ -29,7 +32,9 @@ struct MarkdownView: View {
             }
             if content.omittedFigures > 0 {
                 Label(
-                    "\(content.omittedFigures) non-text figure region\(content.omittedFigures == 1 ? "" : "s") omitted from this reading view",
+                    hasExtractedFigures
+                        ? "\(content.omittedFigures) non-text figure region\(content.omittedFigures == 1 ? "" : "s") available in Extracted figures below"
+                        : "\(content.omittedFigures) non-text figure region\(content.omittedFigures == 1 ? "" : "s") omitted from this reading view",
                     systemImage: "photo.stack"
                 )
                 .font(.system(size: Lab.typeSize(11), design: .monospaced))
@@ -107,7 +112,11 @@ struct MarkdownView: View {
         case .figure(let caption):
             HStack(spacing: 8) {
                 Image(systemName: "photo")
-                Text(caption.isEmpty ? "figure (not extracted)" : caption)
+                Text(
+                    caption.isEmpty
+                        ? (hasExtractedFigures ? "figure — extracted crop below" : "figure (not extracted)")
+                        : caption
+                )
             }
             .font(.system(size: Lab.typeSize(13)).italic())
             .foregroundStyle(Lab.textFaint)

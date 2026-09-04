@@ -90,6 +90,34 @@ final class ConcurrencyTests: XCTestCase {
         }
     }
 
+    func testHtmlExportEmbedsExtractedFigureBytesWithoutANetworkDependency() throws {
+        let png = try onePixelPNG()
+        let html = HtmlExport.document(
+            provenance: .init(
+                title: "figure-test",
+                modelName: "Unlimited-OCR",
+                characters: 4,
+                seconds: 1,
+                pageSummary: nil
+            ),
+            sections: [
+                .pageWithFigures(
+                    number: nil,
+                    markdown: "text\n\n![](images/0.jpg)",
+                    figures: [
+                        .init(title: "Figure 1", bbox: [1, 2, 3, 4], pngData: png)
+                    ]
+                )
+            ]
+        )
+
+        XCTAssertTrue(html.contains("data:image/png;base64,\(png.base64EncodedString())"))
+        XCTAssertTrue(html.contains("source pixels [1, 2, 3, 4]"))
+        XCTAssertTrue(html.contains("see extracted crop below"))
+        XCTAssertFalse(html.contains("not extracted"))
+        XCTAssertFalse(html.contains("src=\"http"))
+    }
+
     #if !targetEnvironment(macCatalyst)
     func testLiveTextAccumulatorAcceptsARealLineWithoutAChangedItemID() {
         let lineID = UUID()

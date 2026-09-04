@@ -28,7 +28,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use franken_ocr::error::{FocrError, FocrResult};
-use franken_ocr::native_engine::{OcrModel, RecognizedDocument};
+use franken_ocr::native_engine::{ExtractedFigure, OcrModel, RecognizedDocument};
 
 // ── Error slot ─────────────────────────────────────────────────────────────
 
@@ -423,13 +423,74 @@ fn recognize_document(
     Ok((franken_ocr::tall::merge_documents(parts), Some(strip_count)))
 }
 
-/// Build the same JSON envelope `focr-wasm`'s `recognize_json` returns, with
-/// additive iOS metadata for the CLI's tall-capture and low-yield behavior.
-fn recognize_envelope(engine: &FocrEngine, image_bytes: &[u8]) -> FocrResult<String> {
-    let img = image::load_from_memory(image_bytes)
-        .map_err(|e| FocrError::InputDecode(format!("could not decode image: {e}")))?;
-    let (width, height) = (img.width(), img.height());
-    let (doc, tall_strip_count) = recognize_document(engine, img)?;
+/// Figure-preserving twin of [`recognize_document`]. Tall screenshots keep the
+/// same smart-strip route as ordinary Apple recognition; figure indices are
+/// renumbered across strips and their boxes are translated back into full-image
+/// coordinates so the caller never receives a crop from a different inference
+/// path than the text beside it.
+fn recognize_document_with_figures(
+    engine: &FocrEngine,
+    image: image::DynamicImage,
+) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>, Option<usize>)> {
+    let (width, height) = (image.width(), image.height());
+    if !should_route_tall(engine.model.arch().id(), width, height) {
+        let (document, figures) = engine.model.recognize_dynamic_with_figures(image)?;
+        return Ok((document, figures, None));
+    }
+
+    let profile = franken_ocr::tall::ink_profile(&image);
+    let plan = franken_ocr::tall::plan_strips(width, height, &profile);
+    let strips = franken_ocr::tall::cut_strips(&image, &plan);
+    let mut parts = Vec::with_capacity(strips.len());
+    let mut all_figures = Vec::new();
+    let mut figure_index_base = 0usize;
+    for (strip, bounds) in strips.into_iter().zip(&plan) {
+        let (mut document, figures) = engine.model.recognize_dynamic_with_figures(strip)?;
+        // `crop_figures` intentionally skips empty boxes while preserving their
+        // span indexes. Count all image spans, not only returned crops, so later
+        // strips cannot reuse a reference that an empty box left behind. Work
+        // backwards because every replacement raises the numeric index: this
+        // prevents a newly written `images/10.jpg` token from being rewritten
+        // again when the loop reaches local index 10.
+        let image_span_count = document
+            .layout
+            .iter()
+            .filter(|span| span.label.trim() == "image")
+            .count();
+        for local_index in (0..image_span_count).rev() {
+            let local_ref = format!("![](images/{local_index}.jpg)");
+            let global_ref = format!("![](images/{}.jpg)", figure_index_base + local_index);
+            document.markdown = document.markdown.replace(&local_ref, &global_ref);
+        }
+        for mut figure in figures {
+            let global_index = figure_index_base + figure.index;
+            let global_ref = format!("![](images/{global_index}.jpg)");
+            figure.index = global_index;
+            figure.markdown_ref = global_ref;
+            let y_offset = i64::from(bounds.top);
+            figure.bbox[1] = figure.bbox[1].saturating_add(y_offset);
+            figure.bbox[3] = figure.bbox[3].saturating_add(y_offset);
+            all_figures.push(figure);
+        }
+        figure_index_base += image_span_count;
+        parts.push((document, bounds.top));
+    }
+    let strip_count = plan.len();
+    Ok((
+        franken_ocr::tall::merge_documents(parts),
+        all_figures,
+        Some(strip_count),
+    ))
+}
+
+fn recognition_envelope_json(
+    engine: &FocrEngine,
+    doc: &RecognizedDocument,
+    width: u32,
+    height: u32,
+    tall_strip_count: Option<usize>,
+    figures: Vec<serde_json::Value>,
+) -> String {
     let low_yield = (engine.model.arch().id() == "unlimited-ocr")
         .then(|| franken_ocr::tall::low_yield_assessment(&doc.markdown, width, height))
         .flatten()
@@ -466,24 +527,180 @@ fn recognize_envelope(engine: &FocrEngine, image_bytes: &[u8]) -> FocrResult<Str
             "warnings": meta
                 .warnings
                 .iter()
-                .map(|w| serde_json::json!({
-                    "kind": w.kind,
-                    "part": w.part,
-                    "measure": w.measure,
-                    "detail": w.detail,
+                .map(|warning| serde_json::json!({
+                    "kind": warning.kind,
+                    "part": warning.part,
+                    "measure": warning.measure,
+                    "detail": warning.detail,
                 }))
                 .collect::<Vec<_>>(),
         })
     });
-    Ok(serde_json::json!({
+    serde_json::json!({
         "model_id": engine.model.arch().id(),
         "output": doc.markdown,
         "layout": layout,
         "music": music,
         "tall_strip_count": tall_strip_count,
         "low_yield": low_yield,
+        "figures": figures,
     })
-    .to_string())
+    .to_string()
+}
+
+/// Build the same JSON envelope `focr-wasm`'s `recognize_json` returns, with
+/// additive iOS metadata for the CLI's tall-capture and low-yield behavior.
+fn recognize_envelope(engine: &FocrEngine, image_bytes: &[u8]) -> FocrResult<String> {
+    let img = image::load_from_memory(image_bytes)
+        .map_err(|e| FocrError::InputDecode(format!("could not decode image: {e}")))?;
+    let (width, height) = (img.width(), img.height());
+    let (doc, tall_strip_count) = recognize_document(engine, img)?;
+    Ok(recognition_envelope_json(
+        engine,
+        &doc,
+        width,
+        height,
+        tall_strip_count,
+        Vec::new(),
+    ))
+}
+
+/// Opaque owner for one figure-bearing recognition. Metadata is stored as one
+/// JSON string; lossless PNG crops stay as separate byte buffers to avoid the
+/// 33% base64 expansion and duplicate JSON parse allocation on a phone.
+pub struct FocrFigureResult {
+    json: CString,
+    pngs: Vec<Box<[u8]>>,
+}
+
+fn recognize_figure_result(
+    engine: &FocrEngine,
+    image_bytes: &[u8],
+) -> FocrResult<FocrFigureResult> {
+    let image = image::load_from_memory(image_bytes)
+        .map_err(|error| FocrError::InputDecode(format!("could not decode image: {error}")))?;
+    let (width, height) = (image.width(), image.height());
+    let (document, figures, tall_strip_count) = recognize_document_with_figures(engine, image)?;
+    let mut metadata = Vec::with_capacity(figures.len());
+    let mut pngs = Vec::with_capacity(figures.len());
+    for figure in figures {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        figure
+            .image
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|error| {
+                FocrError::Other(
+                    std::io::Error::other(format!(
+                        "could not encode extracted figure {} as PNG: {error}",
+                        figure.index + 1
+                    ))
+                    .into(),
+                )
+            })?;
+        metadata.push(serde_json::json!({
+            "index": figure.index,
+            "label": figure.label,
+            "bbox": figure.bbox,
+            "markdown_ref": figure.markdown_ref,
+        }));
+        pngs.push(cursor.into_inner().into_boxed_slice());
+    }
+    let json =
+        recognition_envelope_json(engine, &document, width, height, tall_strip_count, metadata);
+    let json = CString::new(json).map_err(|_| {
+        FocrError::Other(
+            std::io::Error::other("figure result JSON contained an interior NUL").into(),
+        )
+    })?;
+    Ok(FocrFigureResult { json, pngs })
+}
+
+/// See `focr_ios.h`.
+///
+/// # Safety
+/// Same engine/image-buffer contract as [`focr_recognize_json`]. `out_result`
+/// must be NULL or a writable result slot. On success the caller owns the
+/// result and releases it exactly once with [`focr_figure_result_free`].
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_recognize_with_figures(
+    engine: *mut FocrEngine,
+    image_bytes: *const u8,
+    image_len: usize,
+    out_result: *mut *mut FocrFigureResult,
+) -> i32 {
+    guarded(EXIT_GENERIC, || {
+        clear_error();
+        let Some(engine) = (unsafe { engine_ref(engine) }) else {
+            set_error("focr_recognize_with_figures: engine was NULL");
+            return EXIT_USAGE;
+        };
+        let Some(bytes) = (unsafe { ptr_island::opt_bytes(image_bytes, image_len) }) else {
+            set_error("focr_recognize_with_figures: image_bytes was NULL");
+            return EXIT_USAGE;
+        };
+        if bytes.is_empty() {
+            set_error("focr_recognize_with_figures: image_bytes was empty");
+            return EXIT_INPUT_DECODE;
+        }
+        let result = match recognize_figure_result(engine, bytes) {
+            Ok(result) => Box::into_raw(Box::new(result)),
+            Err(error) => return fail("focr_recognize_with_figures", &error),
+        };
+        if !unsafe { ptr_island::write_out(out_result, result) } {
+            drop(unsafe { Box::from_raw(result) });
+            set_error("focr_recognize_with_figures: out_result was NULL");
+            return EXIT_USAGE;
+        }
+        0
+    })
+}
+
+/// See `focr_ios.h`.
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_figure_result_json(result: *const FocrFigureResult) -> *const c_char {
+    if result.is_null() {
+        return c"".as_ptr();
+    }
+    unsafe { &*result }.json.as_ptr()
+}
+
+/// See `focr_ios.h`.
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_figure_result_count(result: *const FocrFigureResult) -> usize {
+    if result.is_null() {
+        return 0;
+    }
+    unsafe { &*result }.pngs.len()
+}
+
+/// See `focr_ios.h`.
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_figure_result_png(
+    result: *const FocrFigureResult,
+    index: usize,
+    out_len: *mut usize,
+) -> *const u8 {
+    if result.is_null() || out_len.is_null() {
+        return std::ptr::null();
+    }
+    let Some(png) = (unsafe { &*result }).pngs.get(index) else {
+        return std::ptr::null();
+    };
+    unsafe { out_len.write(png.len()) };
+    png.as_ptr()
+}
+
+/// See `focr_ios.h`.
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_figure_result_free(result: *mut FocrFigureResult) {
+    if !result.is_null() {
+        drop(unsafe { Box::from_raw(result) });
+    }
 }
 
 /// See `focr_ios.h`.
@@ -1165,8 +1382,21 @@ mod tests {
                 ),
                 EXIT_USAGE
             );
+            assert_eq!(
+                focr_recognize_with_figures(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut()
+                ),
+                EXIT_USAGE
+            );
+            assert_eq!(focr_figure_result_count(std::ptr::null()), 0);
+            assert!(CStr::from_ptr(focr_figure_result_json(std::ptr::null())).is_empty());
+            assert!(focr_figure_result_png(std::ptr::null(), 0, std::ptr::null_mut()).is_null());
             // Closing NULL is explicitly a no-op.
             focr_engine_close(std::ptr::null_mut());
+            focr_figure_result_free(std::ptr::null_mut());
             focr_string_free(std::ptr::null_mut());
             focr_bytes_free(std::ptr::null_mut(), 0);
         }
@@ -1236,6 +1466,35 @@ mod tests {
         );
         assert!(split_cross_page_output(output, 2).is_err());
         assert!(split_cross_page_output("no marker", 1).is_err());
+    }
+
+    #[test]
+    fn figure_result_accessors_borrow_exact_png_bytes_until_free() {
+        let json = CString::new(r#"{"figures":[{"index":0}]}"#).expect("json");
+        let result = Box::into_raw(Box::new(FocrFigureResult {
+            json,
+            pngs: vec![vec![0x89, 0x50, 0x4e, 0x47].into_boxed_slice()],
+        }));
+        let mut len = 0usize;
+        // SAFETY: `result` is a live handle created immediately above; every
+        // borrowed pointer is consumed before the one matching free below.
+        unsafe {
+            assert_eq!(focr_figure_result_count(result), 1);
+            assert_eq!(
+                CStr::from_ptr(focr_figure_result_json(result))
+                    .to_str()
+                    .expect("utf8"),
+                r#"{"figures":[{"index":0}]}"#
+            );
+            let png = focr_figure_result_png(result, 0, &raw mut len);
+            assert_eq!(len, 4);
+            assert_eq!(
+                std::slice::from_raw_parts(png, len),
+                [0x89, 0x50, 0x4e, 0x47]
+            );
+            assert!(focr_figure_result_png(result, 1, &raw mut len).is_null());
+            focr_figure_result_free(result);
+        }
     }
 
     #[test]

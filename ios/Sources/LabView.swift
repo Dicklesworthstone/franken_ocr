@@ -785,6 +785,10 @@ struct LabView: View {
                     }
                 }
 
+                if !model.spec.producesMusicXML {
+                    figureExtractionControl
+                }
+
                 runControls
 
                 Text("Nothing here is uploaded. The image is read into memory and recognized on this device's own cores.")
@@ -885,6 +889,30 @@ struct LabView: View {
         }
     }
 
+    private var figureExtractionControl: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Toggle("Extract grounded figures", isOn: $model.extractFigures)
+                .font(.system(size: Lab.typeSize(13), weight: .semibold))
+                .foregroundStyle(Lab.textMid)
+                .tint(Lab.accent)
+                .disabled(model.isRecognizing || !model.figureExtractionAvailableForRun)
+                .accessibilityIdentifier("extract-figures-toggle")
+                .accessibilityHint(
+                    "Returns exact source-pixel image regions identified by the OCR model"
+                )
+            Text(
+                model.figureExtractionAvailableForRun
+                    ? "Uses the core's exact EXIF-aligned crops. Off by default to limit phone memory; "
+                        + "keeps at most \(LabModel.maxExtractedFigures) figures or 32 MB per run."
+                    : "Shared cross-page context does not expose page-relative figure crops. "
+                        + "Use independent pages to extract figures."
+            )
+            .font(.system(size: Lab.typeSize(11)))
+            .foregroundStyle(Lab.textFaint)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     @ViewBuilder
     private var runControls: some View {
         if model.isRecognizing {
@@ -964,12 +992,19 @@ struct LabView: View {
                         // outside that frame, so make the result its own scroll
                         // viewport rather than letting it overlap adjacent UI.
                         ScrollView(.vertical, showsIndicators: true) {
-                            MarkdownView(markdown: model.displayText)
+                            MarkdownView(
+                                markdown: model.displayText,
+                                hasExtractedFigures: !model.extractedFigures.isEmpty
+                            )
                                 .padding(.vertical, 2)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         }
                         .frame(maxHeight: 420)
                         .clipped()
+                    }
+
+                    if !model.extractedFigures.isEmpty {
+                        figureGallery
                     }
 
                     exportControls
@@ -999,6 +1034,57 @@ struct LabView: View {
             HStack(spacing: 10) { exportButtons(text: text, html: html) }
             VStack(spacing: 10) { exportButtons(text: text, html: html) }
         }
+    }
+
+    private var figureGallery: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                LabLabel(text: "Extracted figures")
+                Spacer()
+                Text("\(model.extractedFigures.count)")
+                    .font(.system(size: Lab.typeSize(11), weight: .bold, design: .monospaced))
+                    .foregroundStyle(Lab.accent)
+            }
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 10)], spacing: 10) {
+                ForEach(model.extractedFigures) { figure in
+                    figureCard(figure)
+                }
+            }
+        }
+    }
+
+    private func figureCard(_ figure: PresentedFigure) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let image = UIImage(data: figure.pngData) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: 220)
+                    .background(Lab.backgroundDeep)
+                    .clipShape(RoundedRectangle(cornerRadius: 9))
+                    .accessibilityLabel(
+                        "Extracted figure \(figure.index + 1) from \(figure.sourceLabel)"
+                    )
+            }
+            Text("\(figure.sourceLabel) · Figure \(figure.index + 1)")
+                .font(.system(size: Lab.typeSize(11), weight: .semibold, design: .monospaced))
+                .foregroundStyle(Lab.textMid)
+                .fixedSize(horizontal: false, vertical: true)
+            Text("source pixels [\(figure.bbox.map(String.init).joined(separator: ", "))]")
+                .font(.system(size: Lab.typeSize(10), design: .monospaced))
+                .foregroundStyle(Lab.textFaint)
+            ShareLink(
+                item: FigureImageFile(data: figure.pngData, filename: figure.exportFilename),
+                preview: SharePreview(figure.exportFilename)
+            ) {
+                Label("Export PNG", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(GhostButtonStyle())
+        }
+        .padding(10)
+        .background(Lab.inset, in: RoundedRectangle(cornerRadius: Lab.radius))
+        .overlay(RoundedRectangle(cornerRadius: Lab.radius).strokeBorder(Lab.line, lineWidth: 1))
     }
 
     @ViewBuilder
@@ -1408,6 +1494,19 @@ struct HtmlDocumentFile: Transferable {
             let url = try TranscriptionFile.uniqueExportURL(filename: file.filename)
             let html = HtmlExport.document(provenance: file.provenance, sections: file.sections)
             try html.write(to: url, atomically: true, encoding: .utf8)
+            return SentTransferredFile(url)
+        }
+    }
+}
+
+struct FigureImageFile: Transferable {
+    let data: Data
+    let filename: String
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .png) { file in
+            let url = try TranscriptionFile.uniqueExportURL(filename: file.filename)
+            try file.data.write(to: url, options: .atomic)
             return SentTransferredFile(url)
         }
     }

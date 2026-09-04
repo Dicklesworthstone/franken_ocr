@@ -58,6 +58,19 @@ uses its worker pool for one forward pass, while concurrent images would multipl
 peak phone memory. This Apple workflow does not claim to expose the core CLI's
 optional continuous tensor-batch spine.
 
+For document models, **Extract grounded figures** opts into the core's real
+`recognize_dynamic_with_figures` path. Its crops come from the same decoded,
+EXIF-aligned source pixels and grounded boxes as the surrounding recognition;
+they are not screenshots of layout overlays. The app previews each crop, shows
+its source page/image and pixel box, offers each lossless PNG through the share
+sheet, and embeds the crops into the styled HTML export so that file remains
+self-contained and offline. Retention is bounded to 32 figures or 32 MiB per
+run, and the switch defaults off to avoid raising phone memory pressure. Shared
+cross-page decoding does not expose page-relative figure boxes, so that mode
+explains why extraction is unavailable instead of fabricating coordinates.
+Raw Markdown preserves the core's image-reference tokens; use the HTML export
+when one portable file must include both recognition and image bytes.
+
 Finished recognition is also available from the clock button and the compact
 workspace's **Library** destination. The Library keeps only the exported text
 and minimal provenance in Application Support; it never copies the source image,
@@ -143,6 +156,7 @@ unreadable page or shared 32K-context overflow.
   streamed residency mode keys off the Unlimited-OCR recipe. Extending it to
   their towers is what earns them a place in the picker; shipping them first
   would put a model on the phone that gets the app killed.
-- Figure extraction and the optional continuous tensor-batch spine. The Apple
-  app does provide the bounded load-once sequential image-batch workflow above.
+- The optional continuous tensor-batch spine. The Apple app provides the
+  bounded load-once sequential image-batch workflow above, but does not claim
+  the core scheduler's simultaneous multi-sequence decode.
 - Final App Store listing metadata, review notes, and device screenshots.

@@ -21,10 +21,17 @@ enum HtmlExport {
         let pageSummary: String?
     }
 
+    struct Figure: Sendable {
+        let title: String
+        let bbox: [Int]
+        let pngData: Data
+    }
+
     /// One stretch of the document: a recognized page, or the honest record
     /// of one that was not.
     enum Section: Sendable {
         case page(number: Int?, markdown: String)
+        case pageWithFigures(number: Int?, markdown: String, figures: [Figure])
         case skipped(number: Int, reason: String)
     }
 
@@ -40,6 +47,12 @@ enum HtmlExport {
                     body.append(#"<div class="page-marker"><span>Page \#(number)</span></div>"#)
                 }
                 body.append(renderMarkdown(markdown))
+            case .pageWithFigures(let number, let markdown, let figures):
+                if multiPage, let number {
+                    body.append(#"<div class="page-marker"><span>Page \#(number)</span></div>"#)
+                }
+                body.append(renderMarkdown(markdown, hasExtractedFigures: true))
+                body.append(renderFigures(figures))
             case .skipped(let number, let reason):
                 body.append(
                     #"<div class="page-marker skip"><span>Page \#(number) · skipped — \#(escape(reason))</span></div>"#
@@ -86,6 +99,21 @@ enum HtmlExport {
         return formatter.string(from: Date())
     }
 
+    private static func renderFigures(_ figures: [Figure]) -> String {
+        guard !figures.isEmpty else { return "" }
+        let cards = figures.map { figure in
+            let source = figure.pngData.base64EncodedString()
+            let box = figure.bbox.map(String.init).joined(separator: ", ")
+            return """
+            <figure class="extracted-figure">
+              <img src="data:image/png;base64,\(source)" alt="\(escape(figure.title))">
+              <figcaption>\(escape(figure.title)) · source pixels [\(box)]</figcaption>
+            </figure>
+            """
+        }
+        return #"<section class="figure-gallery"><h2>Extracted figures</h2>\#(cards.joined())</section>"#
+    }
+
     // ── Markdown → HTML ────────────────────────────────────────────────────
 
     /// Markdown rendered through the same `MarkdownBlock` parser the on-screen
@@ -93,43 +121,59 @@ enum HtmlExport {
     /// them) split out first and passed through the allowlist — exactly the
     /// split the site's `renderMarkdown` does, so a table is never mangled by
     /// the paragraph pass and the Markdown is never trusted as HTML.
-    static func renderMarkdown(_ source: String) -> String {
+    static func renderMarkdown(_ source: String, hasExtractedFigures: Bool = false) -> String {
         var parts: [String] = []
         var cursor = source.startIndex
         let tableRe = /<table\b.*?<\/table\s*>/.ignoresCase().dotMatchesNewlines()
         for match in source.matches(of: tableRe) {
-            parts.append(renderBlocks(String(source[cursor..<match.range.lowerBound])))
+            parts.append(renderBlocks(
+                String(source[cursor..<match.range.lowerBound]),
+                hasExtractedFigures: hasExtractedFigures
+            ))
             parts.append(#"<div class="tbl">\#(sanitizeEmbeddedTable(String(match.0)))</div>"#)
             cursor = match.range.upperBound
         }
-        parts.append(renderBlocks(String(source[cursor...])))
+        parts.append(renderBlocks(
+            String(source[cursor...]),
+            hasExtractedFigures: hasExtractedFigures
+        ))
         return parts.filter { !$0.isEmpty }.joined(separator: "\n")
     }
 
-    private static func renderBlocks(_ markdown: String) -> String {
+    private static func renderBlocks(_ markdown: String, hasExtractedFigures: Bool) -> String {
         guard !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
         return MarkdownBlock.parse(markdown).map { block in
             switch block {
             case .heading(let level, let text):
-                return "<h\(level)>\(renderInline(text))</h\(level)>"
+                return "<h\(level)>\(renderInline(text, hasExtractedFigures: hasExtractedFigures))</h\(level)>"
             case .paragraph(let text):
-                return "<p>\(renderInline(text))</p>"
+                return "<p>\(renderInline(text, hasExtractedFigures: hasExtractedFigures))</p>"
             case .bullet(let items):
-                return "<ul>" + items.map { "<li>\(renderInline($0))</li>" }.joined() + "</ul>"
+                return "<ul>" + items.map {
+                    "<li>\(renderInline($0, hasExtractedFigures: hasExtractedFigures))</li>"
+                }.joined() + "</ul>"
             case .ordered(let items):
-                return "<ol>" + items.map { "<li>\(renderInline($0))</li>" }.joined() + "</ol>"
+                return "<ol>" + items.map {
+                    "<li>\(renderInline($0, hasExtractedFigures: hasExtractedFigures))</li>"
+                }.joined() + "</ol>"
             case .code(let text):
                 return "<pre>\(escape(text))</pre>"
             case .table(let header, let rows):
-                let head = header.map { "<th>\(renderInline($0))</th>" }.joined()
+                let head = header.map {
+                    "<th>\(renderInline($0, hasExtractedFigures: hasExtractedFigures))</th>"
+                }.joined()
                 let body = rows.map { row in
-                    "<tr>" + row.map { "<td>\(renderInline($0))</td>" }.joined() + "</tr>"
+                    "<tr>" + row.map {
+                        "<td>\(renderInline($0, hasExtractedFigures: hasExtractedFigures))</td>"
+                    }.joined() + "</tr>"
                 }.joined()
                 return #"<div class="tbl"><table><thead><tr>\#(head)</tr></thead><tbody>\#(body)</tbody></table></div>"#
             case .rule:
                 return "<hr>"
             case .figure(let caption):
-                let label = caption.isEmpty ? "figure (not extracted)" : escape(caption)
+                let label = caption.isEmpty
+                    ? (hasExtractedFigures ? "figure — see extracted crop below" : "figure (not extracted)")
+                    : escape(caption)
                 return #"<p><span class="figure">\#(label)</span></p>"#
             }
         }
@@ -140,11 +184,13 @@ enum HtmlExport {
     /// target is http(s) — an improvement over the browser export, which drops
     /// them — and image references become the same honest placeholder the
     /// on-screen renderer draws.
-    private static func renderInline(_ text: String) -> String {
+    private static func renderInline(_ text: String, hasExtractedFigures: Bool) -> String {
         var t = escape(text)
         t = t.replacing(
             /!\[[^\]]*\]\([^)]*\)/,
-            with: #"<span class="figure">figure (not extracted)</span>"#
+            with: hasExtractedFigures
+                ? #"<span class="figure">figure — see extracted crop below</span>"#
+                : #"<span class="figure">figure (not extracted)</span>"#
         )
         t = t.replacing(/\[([^\]]*)\]\(([^)\s]*)\)/) { match in
             let label = String(match.1)
@@ -248,6 +294,10 @@ enum HtmlExport {
     th, td { border: 1px solid rgba(255,255,255,0.11); padding: 0.5rem 0.65rem; text-align: left; vertical-align: top; }
     th { color: #34d399; font-weight: 700; background: rgba(16,185,129,0.05); }
     .figure { display: inline-block; border: 1px dashed rgba(255,255,255,0.16); border-radius: 8px; padding: 0.7rem 1rem; color: #748496; font-size: 0.82rem; font-style: italic; }
+    .figure-gallery { display: grid; gap: 1rem; margin: 1.6rem 0; }
+    .extracted-figure { margin: 0; padding: 0.8rem; border: 1px solid rgba(52,211,153,0.24); border-radius: 12px; background: rgba(2,6,5,0.5); }
+    .extracted-figure img { display: block; width: 100%; height: auto; max-height: 38rem; object-fit: contain; border-radius: 8px; background: #030706; }
+    .extracted-figure figcaption { margin-top: 0.6rem; color: #94a3b8; font: 600 0.72rem/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .page-marker { display: flex; align-items: center; gap: 0.75rem; margin: 2rem 0 1.2rem; }
     .page-marker::before, .page-marker::after { content: ""; flex: 1; border-top: 1px solid rgba(255,255,255,0.09); }
     .page-marker span {
@@ -274,6 +324,9 @@ enum HtmlExport {
       .page-marker span { border-color: #a7cbb9; }
       .page-marker.skip span { color: #b91c1c; border-color: #fca5a5; }
       .figure { border-color: #cfdad3; }
+      .extracted-figure { border-color: #a7cbb9; background: #f5faf7; break-inside: avoid; }
+      .extracted-figure img { background: #fff; }
+      .extracted-figure figcaption { color: #40584b; }
     }
     """
 }

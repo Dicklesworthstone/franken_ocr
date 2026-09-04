@@ -247,6 +247,29 @@ struct PageOutcome: Identifiable {
     }
 }
 
+/// One core-cropped figure with the source unit it came from.
+struct PresentedFigure: Identifiable, Sendable {
+    let id = UUID()
+    let sourceNumber: Int?
+    let sourceName: String?
+    let index: Int
+    let label: String
+    let bbox: [Int]
+    let markdownRef: String
+    let pngData: Data
+
+    var sourceLabel: String {
+        if let sourceNumber, let sourceName { return "Image \(sourceNumber) · \(sourceName)" }
+        if let sourceNumber { return "Page \(sourceNumber)" }
+        return sourceName ?? "Single image"
+    }
+
+    var exportFilename: String {
+        let source = sourceNumber ?? 1
+        return "source-\(source)-figure-\(index + 1).png"
+    }
+}
+
 /// The one place app state lives.
 ///
 /// Everything UI-facing is main-actor and `@Observable`; the single thread
@@ -257,6 +280,8 @@ struct PageOutcome: Identifiable {
 final class LabModel {
     static let maxCrossPagePages = Engine.maxCrossPagePages
     static let maxBatchImages = ImageBatchPlan.maximumImages
+    static let maxExtractedFigures = 32
+    static let maxExtractedFigureBytes = 32 * 1_024 * 1_024
     // ── Engine + model ─────────────────────────────────────────────────────
     let engine = Engine()
     let store = ModelStore()
@@ -271,6 +296,7 @@ final class LabModel {
             Task { await engine.unload(lifecycleToken: lifecycleToken) }
             store.refreshInstalledState(spec)
             recognition = nil
+            resetExtractedFigures()
             statusKind = .neutral
             status = defaultStatus
             UserDefaults.standard.set(spec.id, forKey: "selectedModel")
@@ -318,6 +344,12 @@ final class LabModel {
     /// does, only slower. On for that lane by default.
     var gotFormat: Bool = true
 
+    /// Core-owned, source-pixel figure crops. Off by default because asking the
+    /// engine to retain the decoded source increases peak memory.
+    var extractFigures: Bool {
+        didSet { UserDefaults.standard.set(extractFigures, forKey: "extractFigures") }
+    }
+
     // ── Run state ──────────────────────────────────────────────────────────
     var isRecognizing = false
     var isLoadingModel = false
@@ -327,6 +359,9 @@ final class LabModel {
     var progress: ProgressUpdate?
     var recognition: Recognition?
     var lastRunSeconds: Double?
+    private(set) var extractedFigures: [PresentedFigure] = []
+    private(set) var figureExtractionWasLimited = false
+    private var extractedFigureBytes = 0
 
     var status: String = ""
     var statusKind: StatusLine.Kind = .neutral
@@ -355,6 +390,7 @@ final class LabModel {
     init(history: RecognitionHistoryStore = RecognitionHistoryStore()) {
         self.history = history
         crossPageContext = UserDefaults.standard.bool(forKey: "crossPageContext")
+        extractFigures = UserDefaults.standard.bool(forKey: "extractFigures")
         if let saved = UserDefaults.standard.string(forKey: "selectedModel"),
            let found = ModelCatalog.spec(id: saved) {
             spec = found
@@ -373,6 +409,11 @@ final class LabModel {
     // ── Derived UI state ───────────────────────────────────────────────────
 
     var isInstalled: Bool { store.phase == .ready }
+
+    var figureExtractionAvailableForRun: Bool {
+        !spec.producesMusicXML
+            && !(pdf != nil && crossPageContext && spec.id == "unlimited-ocr")
+    }
 
     var canRecognize: Bool {
         guard isInstalled, !isRecognizing, !isClearingModel,
@@ -527,6 +568,7 @@ final class LabModel {
                 statusKind = .err
             } else {
                 recognition = nil
+                resetExtractedFigures()
                 status = "Model removed. \(clearingSpec.weights.bytes.humanBytes) freed."
                 statusKind = .neutral
             }
@@ -598,6 +640,7 @@ final class LabModel {
         previewImage = UIImage(data: batch[0].data)
         imageName = "\(batch.count)-image-batch"
         recognition = nil
+        resetExtractedFigures()
         status = "\(batch.count) images ready · one model load · processed in selection order."
         statusKind = .neutral
     }
@@ -616,13 +659,15 @@ final class LabModel {
         imageData = snapshot
         previewImage = snapshot.flatMap(UIImage.init(data:))
         imageName = "live-camera.jpg"
+        resetExtractedFigures()
         recognition = Recognition(
             modelID: "apple-vision-live",
             output: output,
             layout: [],
             music: nil,
             tallStripCount: nil,
-            lowYield: nil
+            lowYield: nil,
+            figures: []
         )
         lastRunSeconds = nil
         statusKind = .ok
@@ -642,6 +687,7 @@ final class LabModel {
         previewImage = image
         imageName = name
         recognition = nil
+        resetExtractedFigures()
         status = "\(name) · \(Int(image.size.width))×\(Int(image.size.height))"
         statusKind = .neutral
     }
@@ -665,6 +711,7 @@ final class LabModel {
         pageSelection = ""
         imageName = name
         recognition = nil
+        resetExtractedFigures()
         pageOutcomes = []
         let pages = document.pageCount
         let previewLoaded = await loadPreviewPage()
@@ -768,6 +815,55 @@ final class LabModel {
 
     // ── Recognition ────────────────────────────────────────────────────────
 
+    private var shouldRequestFigureExtraction: Bool {
+        extractFigures && figureExtractionAvailableForRun && !figureExtractionWasLimited
+    }
+
+    private var figureStatusSuffix: String {
+        guard extractFigures, figureExtractionAvailableForRun else { return "" }
+        if figureExtractionWasLimited {
+            return " · \(extractedFigures.count) figures kept (device limit reached)"
+        }
+        return extractedFigures.isEmpty
+            ? " · no figures found"
+            : " · \(extractedFigures.count) figure\(extractedFigures.count == 1 ? "" : "s") extracted"
+    }
+
+    private func resetExtractedFigures() {
+        extractedFigures = []
+        extractedFigureBytes = 0
+        figureExtractionWasLimited = false
+    }
+
+    private func retainFigures(
+        from result: Recognition,
+        sourceNumber: Int?,
+        sourceName: String?
+    ) {
+        for figure in result.figures {
+            let (nextBytes, overflow) = extractedFigureBytes.addingReportingOverflow(
+                figure.pngData.count
+            )
+            guard extractedFigures.count < Self.maxExtractedFigures,
+                  !overflow,
+                  nextBytes <= Self.maxExtractedFigureBytes
+            else {
+                figureExtractionWasLimited = true
+                break
+            }
+            extractedFigures.append(PresentedFigure(
+                sourceNumber: sourceNumber,
+                sourceName: sourceName,
+                index: figure.index,
+                label: figure.label,
+                bbox: figure.bbox,
+                markdownRef: figure.markdownRef,
+                pngData: figure.pngData
+            ))
+            extractedFigureBytes = nextBytes
+        }
+    }
+
     func recognize() {
         guard canRecognize else { return }
         previewGeneration &+= 1
@@ -776,6 +872,7 @@ final class LabModel {
         let lifecycleToken = nextEngineLifecycleToken()
         isRecognizing = true
         recognition = nil
+        resetExtractedFigures()
         progress = nil
         elapsed = 0
         estimatedRemainingSeconds = nil
@@ -911,7 +1008,10 @@ final class LabModel {
             throw RunInputError(message: "The selected image is no longer available. Choose it again and retry.")
         }
         let started = Date()
-        let result = try await engine.recognize(imageData: imageData) { [weak self] update in
+        let result = try await engine.recognize(
+            imageData: imageData,
+            extractFigures: shouldRequestFigureExtraction
+        ) { [weak self] update in
             Task { @MainActor [weak self] in
                 guard let self, runGeneration == self.generation else { return }
                 self.progress = update
@@ -926,19 +1026,20 @@ final class LabModel {
         eta.finish(totalElapsed: seconds)
         estimatedRemainingSeconds = nil
         lastRunSeconds = seconds
-        recognition = result
+        retainFigures(from: result, sourceNumber: nil, sourceName: imageName)
+        recognition = result.withoutFigurePayloads()
         if let warning = result.lowYield {
             statusKind = .warn
             status = String(
                 format: "Low-yield result: %.2f MP produced only %d text characters. Try a sharper or higher-resolution capture.",
                 warning.megapixels, warning.characters
-            )
+            ) + figureStatusSuffix
         } else {
             statusKind = .ok
             let route = result.tallStripCount.map { " · \($0) smart strips" } ?? ""
             status = String(
-                format: "Done in %.1fs · %d characters%@, entirely on this device.",
-                seconds, result.output.count, route
+                format: "Done in %.1fs · %d characters%@%@, entirely on this device.",
+                seconds, result.output.count, route, figureStatusSuffix
             )
         }
         saveCurrentResultToHistory()
@@ -973,7 +1074,10 @@ final class LabModel {
             let imageStarted = Date()
 
             do {
-                let result = try await engine.recognize(imageData: item.data) { [weak self] update in
+                let result = try await engine.recognize(
+                    imageData: item.data,
+                    extractFigures: shouldRequestFigureExtraction
+                ) { [weak self] update in
                     Task { @MainActor [weak self] in
                         guard let self, runGeneration == self.generation else { return }
                         self.progress = update
@@ -989,7 +1093,12 @@ final class LabModel {
                     seconds: imageSeconds
                 )
                 eta.recordCompletedPage(seconds: imageSeconds, megapixels: megapixels)
-                recognition = result
+                retainFigures(
+                    from: result,
+                    sourceNumber: index + 1,
+                    sourceName: item.name
+                )
+                recognition = result.withoutFigurePayloads()
             } catch let error as EngineError where error.isFatalToDocument {
                 throw error
             } catch {
@@ -1027,9 +1136,10 @@ final class LabModel {
 
         statusKind = skipped == 0 ? .ok : .warn
         status = String(
-            format: "%d of %d images in %.0fs%@, entirely on this device.",
+            format: "%d of %d images in %.0fs%@%@, entirely on this device.",
             done, pageOutcomes.count, seconds,
-            skipped == 0 ? "" : " · \(skipped) skipped"
+            skipped == 0 ? "" : " · \(skipped) skipped",
+            figureStatusSuffix
         )
         saveCurrentResultToHistory()
         runActivity.finish(
@@ -1081,7 +1191,10 @@ final class LabModel {
 
             let pageStarted = Date()
             do {
-                let result = try await engine.recognize(imageData: png) { [weak self] update in
+                let result = try await engine.recognize(
+                    imageData: png,
+                    extractFigures: shouldRequestFigureExtraction
+                ) { [weak self] update in
                     Task { @MainActor [weak self] in
                         guard let self, runGeneration == self.generation else { return }
                         self.progress = update
@@ -1098,7 +1211,8 @@ final class LabModel {
                 )
                 eta.recordCompletedPage(seconds: pageSeconds, megapixels: pageMegapixels)
                 // Keep the most recent page's layout for the box overlay.
-                recognition = result
+                retainFigures(from: result, sourceNumber: page, sourceName: nil)
+                recognition = result.withoutFigurePayloads()
             } catch let error as EngineError where error.isFatalToDocument {
                 // Mirrors `pdf::is_fatal_to_document`. A missing model or a
                 // format mismatch is the DOCUMENT's problem: skipping 300 pages
@@ -1139,9 +1253,10 @@ final class LabModel {
 
         statusKind = skipped == 0 ? .ok : .warn
         status = String(
-            format: "%d of %d pages in %.0fs%@, entirely on this device.",
+            format: "%d of %d pages in %.0fs%@%@, entirely on this device.",
             done, pageOutcomes.count, seconds,
-            skipped == 0 ? "" : " · \(skipped) skipped"
+            skipped == 0 ? "" : " · \(skipped) skipped",
+            figureStatusSuffix
         )
         saveCurrentResultToHistory()
         runActivity.finish(
@@ -1206,7 +1321,8 @@ final class LabModel {
             layout: [],
             music: nil,
             tallStripCount: nil,
-            lowYield: nil
+            lowYield: nil,
+            figures: []
         )
         statusKind = .ok
         status = String(
@@ -1433,8 +1549,25 @@ final class LabModel {
                     let sourceHeader = outcome.sourceName.map {
                         "## Image \(outcome.id) · \($0)\n\n"
                     } ?? ""
-                    sections.append(.page(number: outcome.id,
-                                          markdown: sourceHeader + htmlPageMarkdown(outcome.text)))
+                    let figures = extractedFigures
+                        .filter { $0.sourceNumber == outcome.id }
+                        .map {
+                            HtmlExport.Figure(
+                                title: "\($0.sourceLabel) · Figure \($0.index + 1)",
+                                bbox: $0.bbox,
+                                pngData: $0.pngData
+                            )
+                        }
+                    let markdown = sourceHeader + htmlPageMarkdown(outcome.text)
+                    if figures.isEmpty {
+                        sections.append(.page(number: outcome.id, markdown: markdown))
+                    } else {
+                        sections.append(.pageWithFigures(
+                            number: outcome.id,
+                            markdown: markdown,
+                            figures: figures
+                        ))
+                    }
                 case .skipped(let reason):
                     let sourceReason = outcome.sourceName.map { "\($0): \(reason)" } ?? reason
                     sections.append(.skipped(number: outcome.id, reason: sourceReason))
@@ -1450,8 +1583,23 @@ final class LabModel {
                 ? "\(completedPageCount) \(units) recognized · \(skips) skipped"
                 : "\(completedPageCount) \(units)"
         } else {
-            sections.append(.page(number: nil,
-                                  markdown: htmlPageMarkdown(recognition?.output ?? "")))
+            let figures = extractedFigures.map {
+                HtmlExport.Figure(
+                    title: "Figure \($0.index + 1)",
+                    bbox: $0.bbox,
+                    pngData: $0.pngData
+                )
+            }
+            let markdown = htmlPageMarkdown(recognition?.output ?? "")
+            if figures.isEmpty {
+                sections.append(.page(number: nil, markdown: markdown))
+            } else {
+                sections.append(.pageWithFigures(
+                    number: nil,
+                    markdown: markdown,
+                    figures: figures
+                ))
+            }
         }
         let provenance = HtmlExport.Provenance(
             title: exportStem,

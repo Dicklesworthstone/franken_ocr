@@ -69,6 +69,8 @@ struct Recognition: Sendable {
     /// A successful but suspiciously sparse page result. This is surfaced as
     /// an actionable warning instead of quietly presenting a false success.
     let lowYield: LowYield?
+    /// Lossless source-pixel crops returned by the core's figure path.
+    let figures: [Figure]
 
     struct LowYield: Sendable {
         let characters: Int
@@ -80,6 +82,16 @@ struct Recognition: Sendable {
         let label: String
         /// `[x1, y1, x2, y2]` in source-image pixels.
         let boxes: [[Int]]
+    }
+
+    struct Figure: Sendable, Identifiable {
+        let id = UUID()
+        /// Page-local, zero-based index matching `markdownRef`.
+        let index: Int
+        let label: String
+        let bbox: [Int]
+        let markdownRef: String
+        let pngData: Data
     }
 
     struct MusicMeta: Sendable {
@@ -94,6 +106,18 @@ struct Recognition: Sendable {
         struct Warning: Sendable, Identifiable {
             let id = UUID(); let kind: String; let part: String; let measure: Int; let detail: String
         }
+    }
+
+    func withoutFigurePayloads() -> Recognition {
+        Recognition(
+            modelID: modelID,
+            output: output,
+            layout: layout,
+            music: music,
+            tallStripCount: tallStripCount,
+            lowYield: lowYield,
+            figures: []
+        )
     }
 }
 
@@ -291,6 +315,7 @@ actor Engine {
     /// `@Sendable` and should hop to wherever it needs to be.
     func recognize(
         imageData: Data,
+        extractFigures: Bool = false,
         onProgress: (@Sendable (ProgressUpdate) -> Void)? = nil
     ) throws -> Recognition {
         guard let handle else {
@@ -305,6 +330,36 @@ actor Engine {
             Engine.observer.clear()
         }
 
+        if extractFigures {
+            var resultHandle: OpaquePointer?
+            let code = imageData.withUnsafeBytes { raw -> Int32 in
+                let base = raw.bindMemory(to: UInt8.self).baseAddress
+                return focr_recognize_with_figures(handle, base, raw.count, &resultHandle)
+            }
+            guard code == 0 else { throw EngineError.fromNative(code: code) }
+            guard let resultHandle else {
+                throw EngineError(kind: .generic, message: "the engine returned no figure result")
+            }
+            defer { focr_figure_result_free(resultHandle) }
+            guard let jsonPointer = focr_figure_result_json(resultHandle) else {
+                throw EngineError(kind: .generic, message: "the engine returned no figure metadata")
+            }
+            let count = Int(focr_figure_result_count(resultHandle))
+            var pngs: [Data] = []
+            pngs.reserveCapacity(count)
+            for index in 0..<count {
+                var length = 0
+                guard let pointer = focr_figure_result_png(resultHandle, index, &length), length > 0 else {
+                    throw EngineError(
+                        kind: .generic,
+                        message: "the engine omitted extracted figure \(index + 1)"
+                    )
+                }
+                pngs.append(Data(bytes: pointer, count: length))
+            }
+            return try Recognition(json: String(cString: jsonPointer), figurePNGs: pngs)
+        }
+
         var out: UnsafeMutablePointer<CChar>?
         let code = imageData.withUnsafeBytes { raw -> Int32 in
             let base = raw.bindMemory(to: UInt8.self).baseAddress
@@ -315,7 +370,7 @@ actor Engine {
         guard let out else {
             throw EngineError(kind: .generic, message: "the engine returned no result")
         }
-        return try Recognition(json: String(cString: out))
+        return try Recognition(json: String(cString: out), figurePNGs: [])
     }
 
     /// Recognize ordered PDF pages in one shared-context pass. The Rust
@@ -503,7 +558,7 @@ private func progressTrampoline(
 // ── Envelope decoding ──────────────────────────────────────────────────────
 
 private extension Recognition {
-    init(json: String) throws {
+    init(json: String, figurePNGs: [Data]) throws {
         guard let data = json.data(using: .utf8),
               let root = try JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
@@ -518,6 +573,29 @@ private extension Recognition {
             )
         }
         tallStripCount = root["tall_strip_count"] as? Int
+        let figureMetadata = root["figures"] as? [[String: Any]] ?? []
+        guard figureMetadata.count == figurePNGs.count else {
+            throw EngineError(
+                kind: .generic,
+                message: "the engine returned mismatched figure metadata and image counts"
+            )
+        }
+        figures = try zip(figureMetadata, figurePNGs).map { metadata, pngData in
+            guard let index = metadata["index"] as? Int,
+                  let label = metadata["label"] as? String,
+                  let bbox = metadata["bbox"] as? [Int], bbox.count == 4,
+                  let markdownRef = metadata["markdown_ref"] as? String
+            else {
+                throw EngineError(kind: .generic, message: "an extracted figure row was malformed")
+            }
+            return Figure(
+                index: index,
+                label: label,
+                bbox: bbox,
+                markdownRef: markdownRef,
+                pngData: pngData
+            )
+        }
         if let warning = root["low_yield"] as? [String: Any] {
             lowYield = LowYield(
                 characters: warning["yield_chars"] as? Int ?? 0,
