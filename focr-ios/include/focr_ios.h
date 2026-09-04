@@ -161,6 +161,26 @@ uint32_t focr_pdf_page_count(const FocrPdf *pdf);
 int32_t focr_pdf_render_page(const FocrPdf *pdf, uint32_t page,
                              uint8_t **out_png, size_t *out_len);
 
+// Recognize two to 32 ordered, unique source pages in ONE cross-page
+// Unlimited-OCR pass, so a later page can use context from earlier pages. This
+// is not the independent per-page workflow: one unsupported raster, a 32K
+// context overflow, cancellation, or another engine failure refuses the whole
+// pass. `source_pages` are 1-based and must be strictly increasing.
+//
+// On success, writes a JSON envelope to *out_json (caller frees with
+// focr_string_free):
+//
+//   {"model_id":"unlimited-ocr",
+//    "output":"<PAGE>...",
+//    "pages":[{"source_page":1,"output":"..."}, ...]}
+//
+// This is a long blocking call. The engine and PDF handles are both borrowed
+// for its entire duration and callers must serialize access to each.
+#define FOCR_APPLE_CROSS_PAGE_MAX_PAGES 32u
+int32_t focr_recognize_pdf_cross_page_json(
+    FocrEngine *engine, const FocrPdf *pdf, const uint32_t *source_pages,
+    size_t page_count, char **out_json);
+
 // ── Decode options ─────────────────────────────────────────────────────────
 //
 // The library reads these from environment variables on desktop. An app has no

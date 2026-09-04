@@ -97,6 +97,21 @@ struct Recognition: Sendable {
     }
 }
 
+/// One terminal result from the core's real `infer_multi` path. Unlike the
+/// independent document walk, every page belongs to the same decode and later
+/// pages may use earlier-page context. Layout is intentionally absent: the core
+/// does not currently expose trustworthy page-relative boxes for this path.
+struct CrossPageRecognition: Sendable {
+    struct Page: Sendable, Equatable {
+        let sourcePage: Int
+        let output: String
+    }
+
+    let modelID: String
+    let output: String
+    let pages: [Page]
+}
+
 /// An error that crossed the C boundary, carrying the engine's own exit code so
 /// the UI can distinguish "you need to download the model" from "that PDF uses
 /// a codec we refuse to guess at" without matching on strings.
@@ -175,6 +190,7 @@ struct EngineInfo: Sendable, Decodable {
 /// from whichever thread is inside the forward, so it hops to the main actor
 /// through a `@Sendable` continuation rather than touching actor state.
 actor Engine {
+    static let maxCrossPagePages = Int(FOCR_APPLE_CROSS_PAGE_MAX_PAGES)
     private var handle: OpaquePointer?
     private var loadedArtifact: URL?
     private var lifecycleFence = EngineLifecycleFence()
@@ -302,6 +318,51 @@ actor Engine {
         return try Recognition(json: String(cString: out))
     }
 
+    /// Recognize ordered PDF pages in one shared-context pass. The Rust
+    /// boundary owns rasterization and calls the same `infer_multi` path as the
+    /// CLI; Swift neither concatenates independent results nor reproduces model
+    /// semantics.
+    func recognizeCrossPage(
+        pdf: PdfDocument,
+        sourcePages: [Int],
+        onProgress: (@Sendable (ProgressUpdate) -> Void)? = nil
+    ) throws -> CrossPageRecognition {
+        guard let handle else {
+            throw EngineError(kind: .modelNotFound, message: "no model is loaded")
+        }
+        let nativePages = try sourcePages.map { page -> UInt32 in
+            guard let value = UInt32(exactly: page) else {
+                throw EngineError(kind: .usage, message: "source page \(page) is not representable")
+            }
+            return value
+        }
+        focr_reset_cancel()
+        if let onProgress { Engine.observer.install(onProgress) }
+        defer { Engine.observer.clear() }
+
+        var out: UnsafeMutablePointer<CChar>?
+        let code = pdf.withHandle { pdfHandle in
+            nativePages.withUnsafeBufferPointer { pages in
+                focr_recognize_pdf_cross_page_json(
+                    handle,
+                    pdfHandle,
+                    pages.baseAddress,
+                    pages.count,
+                    &out
+                )
+            }
+        }
+        defer { if let out { focr_string_free(out) } }
+        guard code == 0 else { throw EngineError.fromNative(code: code) }
+        guard let out else {
+            throw EngineError(kind: .generic, message: "the engine returned no cross-page result")
+        }
+        return try CrossPageRecognition(
+            json: String(cString: out),
+            expectedSourcePages: sourcePages
+        )
+    }
+
     /// Ask the in-flight recognition to stop. It observes the request at its
     /// next checkpoint and throws `.cancelled`.
     nonisolated func requestCancel() { focr_request_cancel() }
@@ -377,6 +438,15 @@ final class PdfDocument: @unchecked Sendable {
         let copied = Data(bytes: ptr, count: len)
         focr_bytes_free(ptr, len)
         return copied
+    }
+
+    /// Borrow the native document under the same lock used by preview renders.
+    /// A cross-page pass retains the parse and rasterizes several pages, so the
+    /// lock must cover the complete native call rather than only its setup.
+    fileprivate func withHandle<T>(_ body: (OpaquePointer) -> T) -> T {
+        renderLock.lock()
+        defer { renderLock.unlock() }
+        return body(handle)
     }
 
     deinit { focr_pdf_close(handle) }
@@ -477,5 +547,35 @@ private extension Recognition {
         } else {
             music = nil
         }
+    }
+}
+
+extension CrossPageRecognition {
+    init(json: String, expectedSourcePages: [Int]) throws {
+        guard let data = json.data(using: .utf8),
+              let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let modelID = root["model_id"] as? String,
+              let output = root["output"] as? String,
+              let rows = root["pages"] as? [[String: Any]]
+        else {
+            throw EngineError(kind: .generic, message: "the engine returned malformed cross-page JSON")
+        }
+        let decoded = try rows.map { row -> Page in
+            guard let sourcePage = row["source_page"] as? Int,
+                  let output = row["output"] as? String
+            else {
+                throw EngineError(kind: .generic, message: "a cross-page result row was malformed")
+            }
+            return Page(sourcePage: sourcePage, output: output)
+        }
+        guard decoded.map(\.sourcePage) == expectedSourcePages else {
+            throw EngineError(
+                kind: .generic,
+                message: "the engine returned cross-page results for different source pages"
+            )
+        }
+        self.modelID = modelID
+        self.output = output
+        pages = decoded
     }
 }

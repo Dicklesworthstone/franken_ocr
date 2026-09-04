@@ -171,7 +171,9 @@ struct PageOutcome: Identifiable {
     enum State {
         case queued
         case running
-        case done(characters: Int, seconds: Double)
+        /// `seconds` is nil for one shared-context pass: the engine measures the
+        /// document atomically and cannot honestly attribute wall time to pages.
+        case done(characters: Int, seconds: Double?)
         case skipped(reason: String)
     }
 
@@ -196,6 +198,7 @@ struct PageOutcome: Identifiable {
 @MainActor
 @Observable
 final class LabModel {
+    static let maxCrossPagePages = Engine.maxCrossPagePages
     // ── Engine + model ─────────────────────────────────────────────────────
     let engine = Engine()
     let store = ModelStore()
@@ -234,6 +237,13 @@ final class LabModel {
     var previewPage: Int = 1
     /// CLI-style page selection (`3,5-9`). Empty means every page.
     var pageSelection: String = ""
+
+    /// The core's real `infer_multi` mode. Off by default because its failure
+    /// unit and resolution trade-off differ from independent page recovery;
+    /// the user's explicit choice is remembered across launches.
+    var crossPageContext: Bool {
+        didSet { UserDefaults.standard.set(crossPageContext, forKey: "crossPageContext") }
+    }
 
     /// One row per page in the current run.
     var pageOutcomes: [PageOutcome] = []
@@ -279,9 +289,11 @@ final class LabModel {
     private var inputGeneration = 0
     private var previewGeneration = 0
     private var eta = OCRAdaptiveETA()
+    private(set) var isCrossPageRun = false
 
     init(history: RecognitionHistoryStore = RecognitionHistoryStore()) {
         self.history = history
+        crossPageContext = UserDefaults.standard.bool(forKey: "crossPageContext")
         if let saved = UserDefaults.standard.string(forKey: "selectedModel"),
            let found = ModelCatalog.spec(id: saved) {
             spec = found
@@ -350,6 +362,7 @@ final class LabModel {
     /// into the current page we are. Without the second term a 40-page run would
     /// sit frozen for minutes at a time, which reads as a hang.
     var documentProgressFraction: Double {
+        if isCrossPageRun { return progressFraction }
         let total = pageOutcomes.count
         guard total > 0 else { return progressFraction }
         let finished = pageOutcomes.filter(\.isTerminal).count
@@ -695,6 +708,13 @@ final class LabModel {
         } else {
             pages = []
         }
+        if crossPageContext, spec.id == "unlimited-ocr", pages.count > Self.maxCrossPagePages {
+            isRecognizing = false
+            statusKind = .warn
+            status = "Cross-page context is bounded to \(Self.maxCrossPagePages) pages on Apple devices. Select a shorter range or turn it off."
+            return
+        }
+        isCrossPageRun = crossPageContext && spec.id == "unlimited-ocr" && pages.count > 1
         pageOutcomes = pages.map { PageOutcome(id: $0) }
         eta.reset(
             modelID: spec.id,
@@ -727,6 +747,7 @@ final class LabModel {
                 self.progress = nil
                 self.estimatedRemainingSeconds = nil
                 self.runStartedAt = nil
+                self.isCrossPageRun = false
             }
             do {
                 let beganWarm = await self.engine.isLoaded
@@ -737,7 +758,11 @@ final class LabModel {
                 // would silently ignore a toggle flipped afterwards.
                 await self.applyPerRunOptions()
                 if self.pdf != nil {
-                    try await self.recognizeDocument(generation: runGeneration)
+                    if self.isCrossPageRun {
+                        try await self.recognizeDocumentCrossPage(generation: runGeneration)
+                    } else {
+                        try await self.recognizeDocument(generation: runGeneration)
+                    }
                 } else {
                     try await self.recognizeSingleImage(generation: runGeneration)
                 }
@@ -918,6 +943,76 @@ final class LabModel {
             status: .complete,
             headline: "Document assembled",
             detail: "\(done) pages ready to read and export"
+        )
+    }
+
+    /// Run the selected pages through the core's single cross-page decode. This
+    /// path deliberately has an all-or-nothing failure boundary, matching the
+    /// CLI: if one page cannot be rasterized or the shared 32K context is too
+    /// large, no independent-page output is substituted behind the toggle.
+    private func recognizeDocumentCrossPage(generation runGeneration: Int) async throws {
+        guard let pdf else {
+            throw RunInputError(message: "The selected document is no longer available. Choose it again and retry.")
+        }
+        let sourcePages = pageOutcomes.map(\.id)
+        guard sourcePages.count > 1 else {
+            throw RunInputError(message: "Cross-page context needs at least two selected pages.")
+        }
+        let started = Date()
+        for index in pageOutcomes.indices { pageOutcomes[index].state = .running }
+        currentPageIndex = nil
+        status = "Reading \(sourcePages.count) pages together in one shared context…"
+
+        let result: CrossPageRecognition
+        do {
+            result = try await engine.recognizeCrossPage(
+                pdf: pdf,
+                sourcePages: sourcePages
+            ) { [weak self] update in
+                Task { @MainActor [weak self] in
+                    guard let self, runGeneration == self.generation else { return }
+                    self.progress = update
+                    self.refreshETA()
+                    self.publishActivity(update)
+                }
+            }
+        } catch {
+            let reason = "shared-context pass failed: \(error.localizedDescription)"
+            for index in pageOutcomes.indices {
+                pageOutcomes[index].state = .skipped(reason: reason)
+            }
+            throw error
+        }
+        guard runGeneration == generation else { return }
+        let engineSeconds = Date().timeIntervalSince(started)
+        let seconds = currentRunElapsed(fallback: engineSeconds)
+        elapsed = seconds
+        eta.finish(totalElapsed: seconds)
+        estimatedRemainingSeconds = nil
+        lastRunSeconds = seconds
+
+        for (index, page) in result.pages.enumerated() {
+            pageOutcomes[index].text = page.output
+            pageOutcomes[index].state = .done(characters: page.output.count, seconds: nil)
+        }
+        recognition = Recognition(
+            modelID: result.modelID,
+            output: result.output,
+            layout: [],
+            music: nil,
+            tallStripCount: nil,
+            lowYield: nil
+        )
+        statusKind = .ok
+        status = String(
+            format: "%d pages read together in %.0fs, entirely on this device.",
+            result.pages.count, seconds
+        )
+        saveCurrentResultToHistory()
+        runActivity.finish(
+            status: .complete,
+            headline: "Cross-page document assembled",
+            detail: "\(result.pages.count) context-linked pages ready to read and export"
         )
     }
 

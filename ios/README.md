@@ -129,7 +129,10 @@ on A-series hardware. Same rule the ledgers use.
   streamed residency mode keys off the Unlimited-OCR recipe. Extending it to
   their towers is what earns them a place in the picker; shipping them first
   would put a model on the phone that gets the app killed.
-- Cross-page parsing (`--multi-page`), where page N can reference pages 1..N-1.
-  The app reads every page of a document, but each page independently.
+- Cross-page parsing is available for two to 32 selected Unlimited-OCR pages.
+  It uses the core's real single-pass `infer_multi` path, where a later page can
+  reference earlier-page context. Independent pages remain the default because
+  they can skip an unreadable raster; cross-page mode honestly refuses the whole
+  pass on an unreadable page or shared 32K-context overflow.
 - Figure extraction and batch mode.
 - Final App Store listing metadata, review notes, and device screenshots.

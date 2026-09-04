@@ -11,6 +11,29 @@ final class ConcurrencyTests: XCTestCase {
         XCTAssertEqual(fence.latestToken, 42)
     }
 
+    func testCrossPageEnvelopePreservesRequestedSourcePageIdentity() throws {
+        let json = #"{"model_id":"unlimited-ocr","output":"<PAGE>one<PAGE>five","pages":[{"source_page":1,"output":"one"},{"source_page":5,"output":"five"}]}"#
+
+        let result = try CrossPageRecognition(json: json, expectedSourcePages: [1, 5])
+
+        XCTAssertEqual(result.modelID, "unlimited-ocr")
+        XCTAssertEqual(
+            result.pages,
+            [
+                .init(sourcePage: 1, output: "one"),
+                .init(sourcePage: 5, output: "five")
+            ]
+        )
+    }
+
+    func testCrossPageEnvelopeRefusesMissingOrReorderedPages() {
+        let json = #"{"model_id":"unlimited-ocr","output":"<PAGE>five<PAGE>one","pages":[{"source_page":5,"output":"five"},{"source_page":1,"output":"one"}]}"#
+
+        XCTAssertThrowsError(
+            try CrossPageRecognition(json: json, expectedSourcePages: [1, 5])
+        )
+    }
+
     #if !targetEnvironment(macCatalyst)
     func testLiveTextAccumulatorAcceptsARealLineWithoutAChangedItemID() {
         let lineID = UUID()

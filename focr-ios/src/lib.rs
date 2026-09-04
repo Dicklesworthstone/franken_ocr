@@ -133,6 +133,24 @@ mod ptr_island {
         Some(unsafe { std::slice::from_raw_parts(ptr, len) })
     }
 
+    /// Borrow a caller-supplied array of 1-based PDF page numbers.
+    ///
+    /// # Safety
+    /// `ptr` must be NULL, or point to `len` initialized `u32` values that stay
+    /// alive and unmodified for the duration of the call. A zero `len` yields
+    /// an empty slice without dereferencing `ptr`.
+    pub(super) unsafe fn opt_u32s<'a>(ptr: *const u32, len: usize) -> Option<&'a [u32]> {
+        if ptr.is_null() {
+            return None;
+        }
+        if len == 0 {
+            return Some(&[]);
+        }
+        // SAFETY: non-null and len > 0 by the checks above; the caller's
+        // contract guarantees `len` initialized u32 values valid for the call.
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
     /// Write `value` through a caller-supplied out-parameter, if it is non-NULL.
     ///
     /// # Safety
@@ -844,6 +862,146 @@ fn render_pdf_page_png(pages: &franken_ocr::pdf::PdfPages, page: u32) -> FocrRes
     Ok(png)
 }
 
+/// Cross-page recognition has a deliberately tighter app limit than the
+/// engine's 32K token ceiling. The boundary temporarily owns every rendered
+/// page before the core squashes them to Base-640; bounding that collection is
+/// what keeps an unusually high-resolution scan from turning an otherwise valid
+/// context into iOS memory pressure. Longer books remain available in explicit
+/// page ranges, or through the independent per-page workflow.
+const MAX_APPLE_CROSS_PAGE_PAGES: usize = 32;
+
+fn validate_cross_page_selection(selected: &[u32], page_count: usize) -> FocrResult<()> {
+    if selected.len() < 2 {
+        return Err(FocrError::Usage(
+            "cross-page recognition needs at least two selected pages".to_string(),
+        ));
+    }
+    if selected.len() > MAX_APPLE_CROSS_PAGE_PAGES {
+        return Err(FocrError::Usage(format!(
+            "cross-page recognition is bounded to {MAX_APPLE_CROSS_PAGE_PAGES} pages on Apple \
+             devices; select a shorter range or turn off shared context"
+        )));
+    }
+
+    let mut previous = 0;
+    for &page in selected {
+        let page_index = usize::try_from(page).unwrap_or(usize::MAX);
+        if page == 0 || page_index > page_count {
+            return Err(FocrError::Usage(format!(
+                "cross-page source page {page} is out of range; this document has \
+                 {page_count} page(s)"
+            )));
+        }
+        if page <= previous {
+            return Err(FocrError::Usage(
+                "cross-page source pages must be unique and strictly increasing".to_string(),
+            ));
+        }
+        previous = page;
+    }
+    Ok(())
+}
+
+fn split_cross_page_output(output: &str, expected: usize) -> FocrResult<Vec<String>> {
+    let pages: Vec<String> = output
+        .split(franken_ocr::native_engine::postprocess::PAGE_MARKER)
+        .skip(1)
+        .map(str::trim)
+        .map(ToOwned::to_owned)
+        .collect();
+    if pages.len() != expected {
+        return Err(FocrError::Other(
+            std::io::Error::other(format!(
+                "cross-page result contained {} page bodies for {expected} selected pages",
+                pages.len()
+            ))
+            .into(),
+        ));
+    }
+    Ok(pages)
+}
+
+fn recognize_pdf_cross_page_envelope(
+    engine: &FocrEngine,
+    pdf: &FocrPdf,
+    selected: &[u32],
+) -> FocrResult<String> {
+    validate_cross_page_selection(selected, pdf.pages.len())?;
+    let mut images = Vec::with_capacity(selected.len());
+    for &page in selected {
+        images.push(pdf.pages.render(page as usize - 1)?);
+    }
+
+    let output = engine.model.recognize_multi_page_dynamic(images)?;
+    let page_bodies = split_cross_page_output(&output, selected.len())?;
+    let pages = selected
+        .iter()
+        .zip(page_bodies)
+        .map(|(&source_page, output)| {
+            serde_json::json!({"source_page": source_page, "output": output})
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "model_id": engine.model.arch().id(),
+        "output": output,
+        "pages": pages,
+    })
+    .to_string())
+}
+
+/// See `focr_ios.h`.
+///
+/// # Safety
+/// `engine` and `pdf` must be NULL or live handles from this library, and all
+/// access to each handle must be serialized. `source_pages` must be NULL or
+/// point to `page_count` initialized values valid for the call. `out_json` must
+/// be NULL or a writable `char *` slot; on success it receives a caller-owned
+/// string released with [`focr_string_free`].
+#[unsafe(no_mangle)]
+#[allow(unsafe_code)]
+pub unsafe extern "C" fn focr_recognize_pdf_cross_page_json(
+    engine: *mut FocrEngine,
+    pdf: *const FocrPdf,
+    source_pages: *const u32,
+    page_count: usize,
+    out_json: *mut *mut c_char,
+) -> i32 {
+    guarded(EXIT_GENERIC, || {
+        clear_error();
+        // SAFETY: documented as NULL or a live engine handle.
+        let Some(engine) = (unsafe { engine_ref(engine) }) else {
+            set_error("focr_recognize_pdf_cross_page_json: engine was NULL");
+            return EXIT_USAGE;
+        };
+        if pdf.is_null() {
+            set_error("focr_recognize_pdf_cross_page_json: pdf was NULL");
+            return EXIT_USAGE;
+        }
+        // SAFETY: non-null by the check above and documented as a live handle.
+        let pdf = unsafe { &*pdf };
+        // SAFETY: documented as NULL or `page_count` initialized values.
+        let Some(selected) = (unsafe { ptr_island::opt_u32s(source_pages, page_count) }) else {
+            set_error("focr_recognize_pdf_cross_page_json: source_pages was NULL");
+            return EXIT_USAGE;
+        };
+        let json = match recognize_pdf_cross_page_envelope(engine, pdf, selected) {
+            Ok(json) => json,
+            Err(err) => return fail("focr_recognize_pdf_cross_page_json", &err),
+        };
+        let ptr = into_owned_c_string(json);
+        if ptr.is_null() {
+            return EXIT_GENERIC;
+        }
+        // SAFETY: the caller's out-parameter.
+        if !unsafe { ptr_island::write_out(out_json, ptr) } {
+            drop(unsafe { CString::from_raw(ptr) });
+            set_error("focr_recognize_pdf_cross_page_json: out_json was NULL");
+            return EXIT_USAGE;
+        }
+        0
+    })
+}
+
 // ── Decode options ─────────────────────────────────────────────────────────
 
 /// See `focr_ios.h`.
@@ -997,6 +1155,16 @@ mod tests {
                 ),
                 EXIT_USAGE
             );
+            assert_eq!(
+                focr_recognize_pdf_cross_page_json(
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut()
+                ),
+                EXIT_USAGE
+            );
             // Closing NULL is explicitly a no-op.
             focr_engine_close(std::ptr::null_mut());
             focr_string_free(std::ptr::null_mut());
@@ -1039,6 +1207,35 @@ mod tests {
         assert!(!should_route_tall("smol-vlm", 500, 2_000));
         assert!(!should_route_tall("got-ocr", 500, 2_000));
         assert!(!should_route_tall("tromr", 500, 2_000));
+    }
+
+    #[test]
+    fn cross_page_selection_is_bounded_ordered_and_in_range() {
+        assert!(validate_cross_page_selection(&[1, 3, 7], 7).is_ok());
+        assert!(validate_cross_page_selection(&[1], 7).is_err());
+        assert!(validate_cross_page_selection(&[0, 1], 7).is_err());
+        assert!(validate_cross_page_selection(&[1, 8], 7).is_err());
+        assert!(validate_cross_page_selection(&[2, 2], 7).is_err());
+        assert!(validate_cross_page_selection(&[3, 2], 7).is_err());
+        assert!(
+            validate_cross_page_selection(
+                &(1..=u32::try_from(MAX_APPLE_CROSS_PAGE_PAGES + 1).expect("small bound"))
+                    .collect::<Vec<_>>(),
+                MAX_APPLE_CROSS_PAGE_PAGES + 1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn cross_page_output_keeps_empty_pages_and_refuses_count_drift() {
+        let output = "discarded preface<PAGE> first <PAGE>   <PAGE>third\n";
+        assert_eq!(
+            split_cross_page_output(output, 3).expect("three page bodies"),
+            ["first", "", "third"]
+        );
+        assert!(split_cross_page_output(output, 2).is_err());
+        assert!(split_cross_page_output("no marker", 1).is_err());
     }
 
     #[test]

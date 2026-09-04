@@ -741,7 +741,26 @@ struct LabView: View {
                                 .disabled(model.isRecognizing)
                         }
 
-                        Text("Recognize reads the whole document. Leave Pages empty for all \(model.pdfPageCount), or give a range like 3,5-9. Pages using JPEG 2000 or JBIG2 are skipped with a named reason rather than returning a wrong result.")
+                        if model.spec.id == "unlimited-ocr" {
+                            Toggle("Cross-page context", isOn: $model.crossPageContext)
+                                .font(.system(size: Lab.typeSize(13), weight: .semibold))
+                                .foregroundStyle(Lab.textMid)
+                                .tint(Lab.accent)
+                                .disabled(model.isRecognizing)
+                                .accessibilityHint(
+                                    "Reads selected pages in one shared context so later pages can use earlier pages"
+                                )
+                            Text(
+                                model.crossPageContext
+                                    ? "One shared-context pass for 2–\(LabModel.maxCrossPagePages) selected pages. Later pages can use earlier context; one unreadable page or a 32K context overflow stops the pass."
+                                    : "Independent pages recover around unreadable pages. Turn this on when headings, tables, or references continue across pages."
+                            )
+                            .font(.system(size: Lab.typeSize(11)))
+                            .foregroundStyle(model.crossPageContext ? Lab.textDim : Lab.textFaint)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        Text("Leave Pages empty for all \(model.pdfPageCount), or give a range like 3,5-9. In independent mode, pages using JPEG 2000 or JBIG2 are skipped with a named reason rather than returning a wrong result.")
                             .font(.system(size: Lab.typeSize(11)))
                             .foregroundStyle(Lab.textFaint)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1060,7 +1079,11 @@ struct LabView: View {
         case .queued: "queued"
         case .running: "reading…"
         case .done(let characters, let seconds):
-            String(format: "%d characters · %.1fs", characters, seconds)
+            if let seconds {
+                String(format: "%d characters · %.1fs", characters, seconds)
+            } else {
+                "\(characters) characters · shared context"
+            }
         case .skipped(let reason): "skipped: \(reason)"
         }
     }
