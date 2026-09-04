@@ -137,3 +137,15 @@ targets:
       - path: Tests
     dependencies:
       - target: FrankenOCR
+
+  FrankenOCRUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.frankenocr.FrankenOCRUITests
+        GENERATE_INFOPLIST_FILE: true
+    sources:
+      - path: UITests
+    dependencies:
+      - target: FrankenOCR

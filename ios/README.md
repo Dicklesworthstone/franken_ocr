@@ -50,6 +50,14 @@ possible but can be less accurate than the full Baidu model. The live surface
 labels that implementation and tradeoff in-app; both paths remain offline and
 upload nothing.
 
+**Files / Batch** accepts one PDF or two to 32 PNG/JPEG images. An image batch is
+validated atomically, preserves picker order and filenames, loads the selected
+model once, then recognizes each image sequentially with per-image progress and
+failure recovery. Sequential here is intentional: the native engine already
+uses its worker pool for one forward pass, while concurrent images would multiply
+peak phone memory. This Apple workflow does not claim to expose the core CLI's
+optional continuous tensor-batch spine.
+
 Finished recognition is also available from the clock button and the compact
 workspace's **Library** destination. The Library keeps only the exported text
 and minimal provenance in Application Support; it never copies the source image,
@@ -135,5 +143,6 @@ unreadable page or shared 32K-context overflow.
   streamed residency mode keys off the Unlimited-OCR recipe. Extending it to
   their towers is what earns them a place in the picker; shipping them first
   would put a model on the phone that gets the app killed.
-- Figure extraction and batch mode.
+- Figure extraction and the optional continuous tensor-batch spine. The Apple
+  app does provide the bounded load-once sequential image-batch workflow above.
 - Final App Store listing metadata, review notes, and device screenshots.

@@ -162,7 +162,53 @@ private struct OCRAdaptiveETA {
     }
 }
 
-/// What happened to one page of a document.
+/// One validated image in a bounded batch import.
+struct ImageBatchItem: Sendable {
+    let data: Data
+    let name: String
+}
+
+/// Validates a complete image batch before the model replaces the current input.
+///
+/// Validation is intentionally atomic: a bad fourth file must not leave the UI
+/// holding the first three files from a half-imported batch.
+enum ImageBatchPlan {
+    static let maximumImages = 32
+
+    struct ValidationError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
+    static func make(files: [(data: Data, name: String)]) throws -> [ImageBatchItem] {
+        guard files.count >= 2 else {
+            throw ValidationError(message: "Choose at least two PNG or JPEG files for a batch.")
+        }
+        guard files.count <= maximumImages else {
+            throw ValidationError(
+                message: "Image batches are bounded to \(maximumImages) files on Apple devices."
+            )
+        }
+
+        return try files.enumerated().map { index, file in
+            let suppliedName = file.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = suppliedName.isEmpty ? "image-\(index + 1)" : suppliedName
+            guard !file.data.starts(with: Array("%PDF".utf8)) else {
+                throw ValidationError(
+                    message: "\(name) is a PDF. Choose one PDF by itself, or batch PNG/JPEG images."
+                )
+            }
+            let isPNG = file.data.starts(with: [0x89, 0x50, 0x4E, 0x47])
+            let isJPEG = file.data.starts(with: [0xFF, 0xD8, 0xFF])
+            guard (isPNG || isJPEG), UIImage(data: file.data) != nil else {
+                throw ValidationError(message: "\(name) is not a PNG or JPEG this app can read.")
+            }
+            return ImageBatchItem(data: file.data, name: name)
+        }
+    }
+}
+
+/// What happened to one page of a document or image in a batch.
 ///
 /// A page that cannot be rasterized (JPEG 2000, JBIG2, a born-digital vector
 /// page) must not take the whole document down with it — the CLI skips it with a
@@ -179,8 +225,19 @@ struct PageOutcome: Identifiable {
 
     /// 1-based source page number, which is also the identity a person sees.
     let id: Int
+    /// Present for an image batch; nil for a PDF page.
+    let sourceName: String?
     var state: State = .queued
     var text: String = ""
+
+    init(id: Int, sourceName: String? = nil) {
+        self.id = id
+        self.sourceName = sourceName
+    }
+
+    var sourceLabel: String {
+        sourceName.map { "Image \(id) · \($0)" } ?? "Page \(id)"
+    }
 
     var isTerminal: Bool {
         switch state {
@@ -199,6 +256,7 @@ struct PageOutcome: Identifiable {
 @Observable
 final class LabModel {
     static let maxCrossPagePages = Engine.maxCrossPagePages
+    static let maxBatchImages = ImageBatchPlan.maximumImages
     // ── Engine + model ─────────────────────────────────────────────────────
     let engine = Engine()
     let store = ModelStore()
@@ -227,6 +285,9 @@ final class LabModel {
     var imageData: Data?
     var previewImage: UIImage?
     var imageName: String?
+    private var imageBatch: [ImageBatchItem] = []
+    var imageBatchCount: Int { imageBatch.count }
+    var isImageBatch: Bool { imageBatch.count > 1 }
 
     /// Loaded PDF, if the input was a document. Parsed once and reused for
     /// every page render.
@@ -321,7 +382,7 @@ final class LabModel {
         // the page selection: this is read on every SwiftUI body evaluation, and
         // an invalid spec is reported when Recognize is pressed, not by silently
         // disabling the button with no explanation.
-        return imageData != nil || pdf != nil
+        return imageData != nil || pdf != nil || isImageBatch
     }
 
     /// A monotonic, honest progress fraction.
@@ -505,6 +566,42 @@ final class LabModel {
         }
     }
 
+    /// Take two to 32 picked images as one load-once run.
+    ///
+    /// This uses the same already-loaded `Engine` actor for every image. It is
+    /// not presented as the core's optional continuous tensor batch spine: the
+    /// Apple workflow is sequential so peak memory stays bounded on a phone and
+    /// one malformed result does not discard its successful neighbors.
+    func acceptBatch(files: [(data: Data, name: String)]) {
+        guard !isRecognizing else {
+            status = "Stop the current recognition before choosing another input."
+            statusKind = .warn
+            return
+        }
+
+        let batch: [ImageBatchItem]
+        do {
+            batch = try ImageBatchPlan.make(files: files)
+        } catch {
+            status = error.localizedDescription
+            statusKind = .warn
+            return
+        }
+
+        inputGeneration &+= 1
+        previewGeneration &+= 1
+        pdf = nil
+        pageSelection = ""
+        pageOutcomes = []
+        imageBatch = batch
+        imageData = batch[0].data
+        previewImage = UIImage(data: batch[0].data)
+        imageName = "\(batch.count)-image-batch"
+        recognition = nil
+        status = "\(batch.count) images ready · one model load · processed in selection order."
+        statusKind = .neutral
+    }
+
     /// Bring a Live Camera capture back into the ordinary page/transcription
     /// workspace. Live mode can accumulate lines across several viewpoints, so
     /// its text intentionally carries no layout boxes tied to the final frame.
@@ -514,6 +611,7 @@ final class LabModel {
         inputGeneration &+= 1
         previewGeneration &+= 1
         pdf = nil
+        imageBatch = []
         pageOutcomes = []
         imageData = snapshot
         previewImage = snapshot.flatMap(UIImage.init(data:))
@@ -538,6 +636,7 @@ final class LabModel {
             return
         }
         pdf = nil
+        imageBatch = []
         pageOutcomes = []
         imageData = data
         previewImage = image
@@ -560,6 +659,7 @@ final class LabModel {
             return
         }
         guard generation == inputGeneration, !isRecognizing else { return }
+        imageBatch = []
         pdf = document
         previewPage = 1
         pageSelection = ""
@@ -705,19 +805,29 @@ final class LabModel {
                 status = "That page selection matched no pages."
                 return
             }
+        } else if isImageBatch {
+            pages = Array(1...imageBatch.count)
         } else {
             pages = []
         }
         isCrossPageRun = false
-        pageOutcomes = pages.map { PageOutcome(id: $0) }
-        if crossPageContext, spec.id == "unlimited-ocr", pages.count > Self.maxCrossPagePages {
+        pageOutcomes = pages.map { page in
+            PageOutcome(id: page, sourceName: isImageBatch ? imageBatch[page - 1].name : nil)
+        }
+        if pdf != nil,
+           crossPageContext,
+           spec.id == "unlimited-ocr",
+           pages.count > Self.maxCrossPagePages {
             isRecognizing = false
             statusKind = .warn
             status = "Cross-page context is bounded to \(Self.maxCrossPagePages) pages on Apple devices. "
                 + "Select a shorter range or turn it off."
             return
         }
-        isCrossPageRun = crossPageContext && spec.id == "unlimited-ocr" && pages.count > 1
+        isCrossPageRun = pdf != nil
+            && crossPageContext
+            && spec.id == "unlimited-ocr"
+            && pages.count > 1
         eta.reset(
             modelID: spec.id,
             pageCount: max(1, pages.count),
@@ -765,15 +875,18 @@ final class LabModel {
                     } else {
                         try await self.recognizeDocument(generation: runGeneration)
                     }
+                } else if self.isImageBatch {
+                    try await self.recognizeImageBatch(generation: runGeneration)
                 } else {
                     try await self.recognizeSingleImage(generation: runGeneration)
                 }
             } catch let error as EngineError where error.isCancellation {
                 guard runGeneration == self.generation else { return }
                 self.statusKind = .warn
+                let units = self.isImageBatch ? "images" : "pages"
                 self.status = self.pageOutcomes.isEmpty
                     ? "Cancelled."
-                    : "Cancelled after \(self.completedPageCount) of \(self.pageOutcomes.count) pages."
+                    : "Cancelled after \(self.completedPageCount) of \(self.pageOutcomes.count) \(units)."
                 self.runActivity.finish(
                     status: .cancelled,
                     headline: "Recognition stopped",
@@ -833,6 +946,96 @@ final class LabModel {
             status: .complete,
             headline: "Text assembled",
             detail: "\(result.output.count) characters ready to read and export"
+        )
+    }
+
+    /// Walk a selected image batch through one already-loaded model.
+    ///
+    /// The engine serializes forward passes and each pass uses all of its worker
+    /// threads, so concurrent images would only multiply phone memory pressure.
+    /// A per-image failure is recorded and the remaining images still run.
+    private func recognizeImageBatch(generation runGeneration: Int) async throws {
+        guard imageBatch.count == pageOutcomes.count, !imageBatch.isEmpty else {
+            throw RunInputError(message: "The selected image batch is no longer available. Choose it again.")
+        }
+        let started = Date()
+
+        for (index, item) in imageBatch.enumerated() {
+            guard runGeneration == generation else { return }
+            try Task.checkCancellation()
+
+            pageOutcomes[index].state = .running
+            currentPageIndex = index
+            imageData = item.data
+            previewImage = UIImage(data: item.data)
+            status = "Image \(index + 1) of \(imageBatch.count) · \(item.name)"
+            let megapixels = pixelMegapixels(previewImage)
+            let imageStarted = Date()
+
+            do {
+                let result = try await engine.recognize(imageData: item.data) { [weak self] update in
+                    Task { @MainActor [weak self] in
+                        guard let self, runGeneration == self.generation else { return }
+                        self.progress = update
+                        self.refreshETA()
+                        self.publishActivity(update)
+                    }
+                }
+                guard runGeneration == generation else { return }
+                let imageSeconds = Date().timeIntervalSince(imageStarted)
+                pageOutcomes[index].text = result.output
+                pageOutcomes[index].state = .done(
+                    characters: result.output.count,
+                    seconds: imageSeconds
+                )
+                eta.recordCompletedPage(seconds: imageSeconds, megapixels: megapixels)
+                recognition = result
+            } catch let error as EngineError where error.isFatalToDocument {
+                throw error
+            } catch {
+                pageOutcomes[index].state = .skipped(reason: error.localizedDescription)
+            }
+            progress = nil
+        }
+
+        guard runGeneration == generation else { return }
+        currentPageIndex = nil
+        let engineSeconds = Date().timeIntervalSince(started)
+        let seconds = currentRunElapsed(fallback: engineSeconds)
+        elapsed = seconds
+        eta.finish(totalElapsed: seconds)
+        estimatedRemainingSeconds = nil
+        lastRunSeconds = seconds
+        let done = completedPageCount
+        let skipped = pageOutcomes.filter {
+            if case .skipped = $0.state { true } else { false }
+        }.count
+        if done == 0 {
+            statusKind = .err
+            status = String(
+                format: "No images could be recognized in %.0fs · %d skipped. "
+                    + "Review the image errors and try another model or source file.",
+                seconds, skipped
+            )
+            runActivity.finish(
+                status: .failed,
+                headline: "No images recognized",
+                detail: "Open FrankenOCR to review \(skipped) image error\(skipped == 1 ? "" : "s")"
+            )
+            return
+        }
+
+        statusKind = skipped == 0 ? .ok : .warn
+        status = String(
+            format: "%d of %d images in %.0fs%@, entirely on this device.",
+            done, pageOutcomes.count, seconds,
+            skipped == 0 ? "" : " · \(skipped) skipped"
+        )
+        saveCurrentResultToHistory()
+        runActivity.finish(
+            status: .complete,
+            headline: "Image batch assembled",
+            detail: "\(done) images ready to read and export"
         )
     }
 
@@ -1058,8 +1261,7 @@ final class LabModel {
         pageOutcomes.filter { if case .done = $0.state { true } else { false } }.count
     }
 
-    /// The whole document's combined text, with page markers — the same shape
-    /// the CLI writes for a multi-page run.
+    /// The whole document or image batch, with explicit source markers.
     ///
     /// Markdown pages concatenate into one valid document. MusicXML pages do
     /// NOT: each page is a complete XML document with its own declaration and
@@ -1074,11 +1276,23 @@ final class LabModel {
         return pageOutcomes.compactMap { outcome -> String? in
             switch outcome.state {
             case .done:
-                let header = music
-                    ? "===== page \(outcome.id) ====="
-                    : "<!-- page \(outcome.id) -->"
+                let header: String
+                if let sourceName = outcome.sourceName {
+                    header = music
+                        ? "===== image \(outcome.id): \(sourceName) ====="
+                        : "## Image \(outcome.id) · \(sourceName)"
+                } else {
+                    header = music
+                        ? "===== page \(outcome.id) ====="
+                        : "<!-- page \(outcome.id) -->"
+                }
                 return "\(header)\n\n\(outcome.text)"
             case .skipped(let reason):
+                if let sourceName = outcome.sourceName {
+                    return music
+                        ? "===== image \(outcome.id): \(sourceName) skipped: \(reason) ====="
+                        : "## Image \(outcome.id) · \(sourceName) · skipped: \(reason)"
+                }
                 return music
                     ? "===== page \(outcome.id) skipped: \(reason) ====="
                     : "<!-- page \(outcome.id) skipped: \(reason) -->"
@@ -1155,7 +1369,10 @@ final class LabModel {
     /// can open would be worse than an honest extension.
     var exportFilename: String {
         guard spec.producesMusicXML else { return "\(exportStem).md" }
-        return producedPageCount > 1 ? "\(exportStem)-pages.txt" : "\(exportStem).musicxml"
+        if producedPageCount > 1 {
+            return "\(exportStem)-\(isImageBatch ? "images" : "pages").txt"
+        }
+        return "\(exportStem).musicxml"
     }
 
     /// The text an export or the source view should show.
@@ -1213,10 +1430,14 @@ final class LabModel {
             for outcome in pageOutcomes {
                 switch outcome.state {
                 case .done:
+                    let sourceHeader = outcome.sourceName.map {
+                        "## Image \(outcome.id) · \($0)\n\n"
+                    } ?? ""
                     sections.append(.page(number: outcome.id,
-                                          markdown: htmlPageMarkdown(outcome.text)))
+                                          markdown: sourceHeader + htmlPageMarkdown(outcome.text)))
                 case .skipped(let reason):
-                    sections.append(.skipped(number: outcome.id, reason: reason))
+                    let sourceReason = outcome.sourceName.map { "\($0): \(reason)" } ?? reason
+                    sections.append(.skipped(number: outcome.id, reason: sourceReason))
                 case .queued, .running:
                     break
                 }
@@ -1224,9 +1445,10 @@ final class LabModel {
             let skips = pageOutcomes.filter {
                 if case .skipped = $0.state { true } else { false }
             }.count
+            let units = isImageBatch ? "images" : "pages"
             pageSummary = skips > 0
-                ? "\(completedPageCount) pages recognized · \(skips) skipped"
-                : "\(completedPageCount) pages"
+                ? "\(completedPageCount) \(units) recognized · \(skips) skipped"
+                : "\(completedPageCount) \(units)"
         } else {
             sections.append(.page(number: nil,
                                   markdown: htmlPageMarkdown(recognition?.output ?? "")))

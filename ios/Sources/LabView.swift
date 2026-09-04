@@ -2,6 +2,16 @@ import PhotosUI
 import SwiftUI
 import UniformTypeIdentifiers
 
+private struct ImportedFile: Sendable {
+    let data: Data
+    let name: String
+}
+
+private enum ImportedFilesResult: Sendable {
+    case success([ImportedFile])
+    case failure(String)
+}
+
 private enum LabTextEntry: Hashable {
     case smolQuestion
     case pageSelection
@@ -32,7 +42,7 @@ private extension View {
 }
 
 /// The whole app: one laboratory screen mirroring the site's playground —
-/// 01 The specimen, 02 The page, 03 The transcription.
+/// 01 The specimen, 02 The source, 03 The transcription.
 ///
 /// On a phone the three steps stack. On an iPad in landscape, steps 01+02 sit
 /// beside step 03, because a transcription is worth reading next to the page it
@@ -55,6 +65,7 @@ struct LabView: View {
 
     @State private var photoItem: PhotosPickerItem?
     @State private var showFileImporter = false
+    @State private var inputRequestGeneration = 0
     @State private var showCamera = false
     @State private var showLiveCamera = false
     @State private var showHistory = false
@@ -227,7 +238,7 @@ struct LabView: View {
         .fileImporter(
             isPresented: $showFileImporter,
             allowedContentTypes: [.png, .jpeg, .pdf],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in load(fileResult: result) }
         .sheet(isPresented: $model.showSelftest) { selftestSheet }
         .sheet(isPresented: $showHistory) {
@@ -268,8 +279,8 @@ struct LabView: View {
             destination = restored
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            load(fileResult: .success([url]))
+            guard !urls.isEmpty else { return false }
+            load(fileResult: .success(urls))
             return true
         }
         .focusedSceneValue(
@@ -662,12 +673,12 @@ struct LabView: View {
         }
     }
 
-    // ── 02 The page ────────────────────────────────────────────────────────
+    // ── 02 The source ──────────────────────────────────────────────────────
 
     private var pageCard: some View {
         LabPanel {
             VStack(alignment: .leading, spacing: 14) {
-                LabLabel(text: "02 · The page")
+                LabLabel(text: "02 · The source")
 
                 if let preview = model.previewImage {
                     GeometryReader { geometry in
@@ -791,10 +802,10 @@ struct LabView: View {
             Image(systemName: "doc.viewfinder")
                 .font(.system(size: Lab.typeSize(28)))
                 .foregroundStyle(Lab.accent.opacity(0.8))
-            Text("Choose a page")
+            Text("Choose pages or images")
                 .font(.system(size: Lab.typeSize(14), weight: .semibold))
                 .foregroundStyle(Lab.textMid)
-            Text("PNG, JPEG, or a scanned PDF")
+            Text("One PDF, or up to \(LabModel.maxBatchImages) PNG/JPEG images")
                 .font(.system(size: Lab.typeSize(12)))
                 .foregroundStyle(Lab.textFaint)
         }
@@ -809,6 +820,7 @@ struct LabView: View {
         // iPad: dropping a file onto the zone is the natural gesture.
         .dropDestination(for: Data.self) { items, _ in
             guard let data = items.first else { return false }
+            inputRequestGeneration &+= 1
             Task { await model.accept(data: data, name: "dropped") }
             return true
         }
@@ -846,10 +858,13 @@ struct LabView: View {
 
     private var filesButton: some View {
         Button { showFileImporter = true } label: {
-            Label("Files", systemImage: "folder")
+            Label("Files / Batch", systemImage: "folder")
         }
         .buttonStyle(GhostButtonStyle())
         .disabled(model.isRecognizing)
+        .accessibilityHint(
+            "Choose one PDF or up to \(LabModel.maxBatchImages) PNG and JPEG images"
+        )
     }
 
     private var cameraButton: some View {
@@ -860,7 +875,10 @@ struct LabView: View {
         .disabled(model.isRecognizing)
         .fullScreenCover(isPresented: $showCamera) {
             CameraPicker { data in
-                if let data { Task { await model.accept(data: data, name: "photo.jpg") } }
+                if let data {
+                    inputRequestGeneration &+= 1
+                    Task { await model.accept(data: data, name: "photo.jpg") }
+                }
                 showCamera = false
             }
             .ignoresSafeArea()
@@ -1043,20 +1061,29 @@ struct LabView: View {
     private var pageLedgerRows: some View {
         VStack(alignment: .leading, spacing: 0) {
             ForEach(model.pageOutcomes) { outcome in
-                HStack(alignment: .top, spacing: 10) {
-                    Text(String(format: "%3d", outcome.id))
-                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
-                        .foregroundStyle(Lab.textFaint)
-                    icon(for: outcome.state)
-                    Text(label(for: outcome.state))
-                        .font(.system(size: Lab.typeSize(11), design: .monospaced))
-                        .foregroundStyle(color(for: outcome.state))
-                        .fixedSize(horizontal: false, vertical: true)
-                    Spacer(minLength: 0)
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(alignment: .top, spacing: 10) {
+                        Text(String(format: "%3d", outcome.id))
+                            .font(.system(size: Lab.typeSize(11), design: .monospaced))
+                            .foregroundStyle(Lab.textFaint)
+                        icon(for: outcome.state)
+                        Text(label(for: outcome.state))
+                            .font(.system(size: Lab.typeSize(11), design: .monospaced))
+                            .foregroundStyle(color(for: outcome.state))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 0)
+                    }
+                    if let sourceName = outcome.sourceName {
+                        Text(sourceName)
+                            .font(.system(size: Lab.typeSize(10), design: .monospaced))
+                            .foregroundStyle(Lab.textFaint)
+                            .lineLimit(2)
+                            .padding(.leading, 52)
+                    }
                 }
                 .padding(.vertical, 4)
                 .accessibilityElement(children: .combine)
-                .accessibilityLabel("Page \(outcome.id), \(label(for: outcome.state))")
+                .accessibilityLabel("\(outcome.sourceLabel), \(label(for: outcome.state))")
             }
         }
         .padding(.vertical, 4)
@@ -1208,12 +1235,16 @@ struct LabView: View {
 
     private func load(photoItem: PhotosPickerItem?) {
         guard let photoItem else { return }
+        inputRequestGeneration &+= 1
+        let requestGeneration = inputRequestGeneration
         Task {
             // A failure here surfaces exactly as a file-importer failure does;
             // silently doing nothing after a picker tap reads as a dead button.
             if let data = try? await photoItem.loadTransferable(type: Data.self) {
+                guard requestGeneration == inputRequestGeneration else { return }
                 await model.accept(data: data, name: "photo")
             } else {
+                guard requestGeneration == inputRequestGeneration else { return }
                 model.status = "Could not read that photo."
                 model.statusKind = .err
             }
@@ -1224,19 +1255,50 @@ struct LabView: View {
     }
 
     private func load(fileResult: Result<[URL], Error>) {
+        inputRequestGeneration &+= 1
+        let requestGeneration = inputRequestGeneration
         switch fileResult {
         case .success(let urls):
-            guard let url = urls.first else { return }
-            // The security scope must be released only after the bytes are
-            // read, which happens here — `accept` works on the copy.
-            let scoped = url.startAccessingSecurityScopedResource()
-            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
-            guard let data = try? Data(contentsOf: url) else {
-                model.status = "Could not read that file."
-                model.statusKind = .err
+            guard !urls.isEmpty else { return }
+            guard urls.count <= LabModel.maxBatchImages else {
+                model.status = "Choose no more than \(LabModel.maxBatchImages) images at once."
+                model.statusKind = .warn
                 return
             }
-            Task { await model.accept(data: data, name: url.lastPathComponent) }
+
+            Task {
+                let importResult = await Task.detached(priority: .userInitiated) {
+                    var files: [ImportedFile] = []
+                    files.reserveCapacity(urls.count)
+                    for url in urls {
+                        // Release each security scope immediately after copying
+                        // its bytes; the model retains no sandbox-external URL.
+                        let scoped = url.startAccessingSecurityScopedResource()
+                        let data = try? Data(contentsOf: url)
+                        if scoped { url.stopAccessingSecurityScopedResource() }
+                        guard let data else {
+                            return ImportedFilesResult.failure(
+                                "Could not read \(url.lastPathComponent)."
+                            )
+                        }
+                        files.append(ImportedFile(data: data, name: url.lastPathComponent))
+                    }
+                    return ImportedFilesResult.success(files)
+                }.value
+                guard requestGeneration == inputRequestGeneration else { return }
+
+                switch importResult {
+                case .success(let files):
+                    if files.count == 1, let file = files.first {
+                        await model.accept(data: file.data, name: file.name)
+                    } else {
+                        model.acceptBatch(files: files.map { (data: $0.data, name: $0.name) })
+                    }
+                case .failure(let message):
+                    model.status = message
+                    model.statusKind = .err
+                }
+            }
         case .failure(let error):
             model.status = error.localizedDescription
             model.statusKind = .err

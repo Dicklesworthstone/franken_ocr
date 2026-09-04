@@ -2,6 +2,12 @@ import XCTest
 @testable import FrankenOCR
 
 final class ConcurrencyTests: XCTestCase {
+    private func onePixelPNG() throws -> Data {
+        try XCTUnwrap(Data(base64Encoded:
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        ))
+    }
+
     func testLifecycleFenceRejectsAnUnloadThatArrivesAfterANewerLoad() {
         var fence = EngineLifecycleFence()
 
@@ -50,6 +56,38 @@ final class ConcurrencyTests: XCTestCase {
         XCTAssertThrowsError(
             try CrossPageRecognition(json: json, expectedSourcePages: [1, 5])
         )
+    }
+
+    func testImageBatchPlanPreservesSelectionOrderAndNames() throws {
+        let png = try onePixelPNG()
+        let plan = try ImageBatchPlan.make(files: [
+            (data: png, name: "quarter-front.png"),
+            (data: png, name: "quarter-back.png")
+        ])
+
+        XCTAssertEqual(plan.map(\.name), ["quarter-front.png", "quarter-back.png"])
+        XCTAssertEqual(plan.map(\.data), [png, png])
+    }
+
+    func testImageBatchPlanRefusesMixedPDFWithoutReturningAPartialBatch() throws {
+        let png = try onePixelPNG()
+        XCTAssertThrowsError(try ImageBatchPlan.make(files: [
+            (data: png, name: "page.png"),
+            (data: Data("%PDF-1.7".utf8), name: "book.pdf")
+        ])) { error in
+            XCTAssertTrue(error.localizedDescription.contains("book.pdf is a PDF"))
+        }
+    }
+
+    func testImageBatchPlanEnforcesTheAppleDeviceBound() throws {
+        let png = try onePixelPNG()
+        let files = (0...ImageBatchPlan.maximumImages).map {
+            (data: png, name: "image-\($0).png")
+        }
+
+        XCTAssertThrowsError(try ImageBatchPlan.make(files: files)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("bounded to 32 files"))
+        }
     }
 
     #if !targetEnvironment(macCatalyst)

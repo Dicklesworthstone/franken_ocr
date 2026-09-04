@@ -31,6 +31,21 @@ final class FrankenOCRAppearanceUITests: XCTestCase {
         let relaunchedToggle = app.buttons["appearance-toggle"]
         XCTAssertTrue(relaunchedToggle.waitForExistence(timeout: 12))
         XCTAssertEqual(relaunchedToggle.label, "Switch to dark mode")
+
+        // Leave the shared simulator in the product's default dark appearance.
+        relaunchedToggle.tap()
+        XCTAssertEqual(relaunchedToggle.label, "Switch to light mode")
+    }
+
+    func testFilePickerMakesImageBatchImportDiscoverable() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let batchButton = app.buttons["Files / Batch"]
+        XCTAssertTrue(batchButton.waitForExistence(timeout: 12))
+        XCTAssertTrue(batchButton.isHittable)
+        XCTAssertTrue(app.staticTexts["Choose pages or images"].exists)
+        keepScreenshot(of: app, named: "Files and batch import")
     }
 
     private func keepScreenshot(of app: XCUIApplication, named name: String) {

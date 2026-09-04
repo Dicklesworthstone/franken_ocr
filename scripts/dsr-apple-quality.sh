@@ -22,3 +22,24 @@ xcodebuild -project FrankenOCR.xcodeproj -scheme FrankenOCR \
   -destination 'platform=macOS,variant=Mac Catalyst' \
   -derivedDataPath "$build_root/derived-data" \
   CODE_SIGNING_ALLOWED=NO test -only-testing:FrankenOCRTests
+
+simulator_id="${FOCR_IOS_SIMULATOR_ID:-}"
+if [[ -z "$simulator_id" ]]; then
+  simulator_id="$({ xcrun simctl list devices available || true; } | awk -F '[()]' '
+    /iPhone/ && /\(Booted\)$/ { print $2; found = 1; exit }
+    /iPhone/ && fallback == "" { fallback = $2 }
+    END { if (!found) print fallback }
+  ')"
+fi
+if [[ -z "$simulator_id" ]]; then
+  echo "No available iPhone Simulator for FrankenOCR UI tests" >&2
+  exit 1
+fi
+
+# The gate may boot a currently shut-down device. Re-prove the audio fence
+# immediately before that simulator action and preserve every existing window.
+/Users/jemanuel/.local/bin/ensure-simulator-audio-safe prepare
+xcodebuild -project FrankenOCR.xcodeproj -scheme FrankenOCR \
+  -destination "platform=iOS Simulator,id=$simulator_id" \
+  -derivedDataPath "$build_root/derived-data" \
+  CODE_SIGNING_ALLOWED=NO test -only-testing:FrankenOCRUITests
