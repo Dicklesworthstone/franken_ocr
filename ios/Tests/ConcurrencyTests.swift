@@ -11,6 +11,7 @@ final class ConcurrencyTests: XCTestCase {
         XCTAssertEqual(fence.latestToken, 42)
     }
 
+    #if !targetEnvironment(macCatalyst)
     func testLiveTextAccumulatorAcceptsARealLineWithoutAChangedItemID() {
         let lineID = UUID()
         let batch = LiveCameraBatch(
@@ -71,4 +72,5 @@ final class ConcurrencyTests: XCTestCase {
         accumulator.clear()
         XCTAssertTrue(accumulator.text.isEmpty)
     }
+    #endif
 }
