@@ -752,15 +752,22 @@ struct LabView: View {
                                 )
                             Text(
                                 model.crossPageContext
-                                    ? "One shared-context pass for 2–\(LabModel.maxCrossPagePages) selected pages. Later pages can use earlier context; one unreadable page or a 32K context overflow stops the pass."
-                                    : "Independent pages recover around unreadable pages. Turn this on when headings, tables, or references continue across pages."
+                                    ? "One shared-context pass for 2–\(LabModel.maxCrossPagePages) selected pages. "
+                                        + "Later pages can use earlier context; one unreadable page or a 32K "
+                                        + "context overflow stops the pass."
+                                    : "Independent pages recover around unreadable pages. Turn this on when "
+                                        + "headings, tables, or references continue across pages."
                             )
                             .font(.system(size: Lab.typeSize(11)))
                             .foregroundStyle(model.crossPageContext ? Lab.textDim : Lab.textFaint)
                             .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        Text("Leave Pages empty for all \(model.pdfPageCount), or give a range like 3,5-9. In independent mode, pages using JPEG 2000 or JBIG2 are skipped with a named reason rather than returning a wrong result.")
+                        Text(
+                            "Leave Pages empty for all \(model.pdfPageCount), or give a range like 3,5-9. "
+                                + "In independent mode, pages using JPEG 2000 or JBIG2 are skipped with a "
+                                + "named reason rather than returning a wrong result."
+                        )
                             .font(.system(size: Lab.typeSize(11)))
                             .foregroundStyle(Lab.textFaint)
                             .fixedSize(horizontal: false, vertical: true)

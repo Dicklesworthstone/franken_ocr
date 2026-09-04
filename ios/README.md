@@ -122,6 +122,12 @@ No speed figure is claimed here. The app measures each run on the device it is
 running on and shows that number; nothing else is asserted until it is measured
 on A-series hardware. Same rule the ledgers use.
 
+For two to 32 selected Unlimited-OCR pages, the app can opt into the core's real
+single-pass `infer_multi` path, where a later page can reference earlier-page
+context. Independent pages remain the default because they can skip an
+unreadable raster; cross-page mode honestly refuses the whole pass on an
+unreadable page or shared 32K-context overflow.
+
 ## Not in this version
 
 - GOT-OCR2, SmolVLM2, and OneChart. Each hydrates its vision tower to f32 whole
@@ -129,10 +135,5 @@ on A-series hardware. Same rule the ledgers use.
   streamed residency mode keys off the Unlimited-OCR recipe. Extending it to
   their towers is what earns them a place in the picker; shipping them first
   would put a model on the phone that gets the app killed.
-- Cross-page parsing is available for two to 32 selected Unlimited-OCR pages.
-  It uses the core's real single-pass `infer_multi` path, where a later page can
-  reference earlier-page context. Independent pages remain the default because
-  they can skip an unreadable raster; cross-page mode honestly refuses the whole
-  pass on an unreadable page or shared 32K-context overflow.
 - Figure extraction and batch mode.
 - Final App Store listing metadata, review notes, and device screenshots.

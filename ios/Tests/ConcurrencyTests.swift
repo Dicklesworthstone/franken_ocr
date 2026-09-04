@@ -12,7 +12,16 @@ final class ConcurrencyTests: XCTestCase {
     }
 
     func testCrossPageEnvelopePreservesRequestedSourcePageIdentity() throws {
-        let json = #"{"model_id":"unlimited-ocr","output":"<PAGE>one<PAGE>five","pages":[{"source_page":1,"output":"one"},{"source_page":5,"output":"five"}]}"#
+        let json = #"""
+        {
+          "model_id": "unlimited-ocr",
+          "output": "<PAGE>one<PAGE>five",
+          "pages": [
+            {"source_page": 1, "output": "one"},
+            {"source_page": 5, "output": "five"}
+          ]
+        }
+        """#
 
         let result = try CrossPageRecognition(json: json, expectedSourcePages: [1, 5])
 
@@ -27,7 +36,16 @@ final class ConcurrencyTests: XCTestCase {
     }
 
     func testCrossPageEnvelopeRefusesMissingOrReorderedPages() {
-        let json = #"{"model_id":"unlimited-ocr","output":"<PAGE>five<PAGE>one","pages":[{"source_page":5,"output":"five"},{"source_page":1,"output":"one"}]}"#
+        let json = #"""
+        {
+          "model_id": "unlimited-ocr",
+          "output": "<PAGE>five<PAGE>one",
+          "pages": [
+            {"source_page": 5, "output": "five"},
+            {"source_page": 1, "output": "one"}
+          ]
+        }
+        """#
 
         XCTAssertThrowsError(
             try CrossPageRecognition(json: json, expectedSourcePages: [1, 5])

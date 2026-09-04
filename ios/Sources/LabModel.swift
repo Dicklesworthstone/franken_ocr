@@ -708,14 +708,16 @@ final class LabModel {
         } else {
             pages = []
         }
+        isCrossPageRun = false
+        pageOutcomes = pages.map { PageOutcome(id: $0) }
         if crossPageContext, spec.id == "unlimited-ocr", pages.count > Self.maxCrossPagePages {
             isRecognizing = false
             statusKind = .warn
-            status = "Cross-page context is bounded to \(Self.maxCrossPagePages) pages on Apple devices. Select a shorter range or turn it off."
+            status = "Cross-page context is bounded to \(Self.maxCrossPagePages) pages on Apple devices. "
+                + "Select a shorter range or turn it off."
             return
         }
         isCrossPageRun = crossPageContext && spec.id == "unlimited-ocr" && pages.count > 1
-        pageOutcomes = pages.map { PageOutcome(id: $0) }
         eta.reset(
             modelID: spec.id,
             pageCount: max(1, pages.count),
