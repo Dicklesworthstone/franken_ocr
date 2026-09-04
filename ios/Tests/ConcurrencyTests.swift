@@ -112,6 +112,28 @@ final class ConcurrencyTests: XCTestCase {
         ))
     }
 
+    func testCancelledShareMatchesOnlyItsOwnPublishedSelection() throws {
+        let first = FrankenOCRSharedStore.StagedDocument(
+            storedName: "first.png",
+            displayName: "Front.png"
+        )
+        let second = FrankenOCRSharedStore.StagedDocument(
+            storedName: "second.png",
+            displayName: "Back.png"
+        )
+        let encoded = try JSONEncoder().encode([first, second])
+
+        XCTAssertTrue(FrankenOCRSharedStore.publishedSelection(
+            encoded,
+            matches: [first, second]
+        ))
+        XCTAssertFalse(FrankenOCRSharedStore.publishedSelection(
+            encoded,
+            matches: [second, first]
+        ))
+        XCTAssertFalse(FrankenOCRSharedStore.publishedSelection(nil, matches: [first, second]))
+    }
+
     func testHtmlExportEmbedsExtractedFigureBytesWithoutANetworkDependency() throws {
         let png = try onePixelPNG()
         let html = HtmlExport.document(

@@ -10,6 +10,8 @@ final class ShareViewController: UIViewController {
 
     private let statusLabel = UILabel()
     private let openButton = UIButton(type: .system)
+    private var publishedDocuments: [FrankenOCRSharedStore.StagedDocument] = []
+    private var isCancelled = false
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -61,7 +63,7 @@ final class ShareViewController: UIViewController {
             stack.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             stack.centerYAnchor.constraint(equalTo: view.centerYAnchor),
             statusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 360),
-            openButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48),
+            openButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 48)
         ])
     }
 
@@ -103,9 +105,14 @@ final class ShareViewController: UIViewController {
         at index: Int,
         staged: [FrankenOCRSharedStore.StagedDocument]
     ) {
+        guard !isCancelled else {
+            FrankenOCRSharedStore.discardStagedDocuments(staged)
+            return
+        }
         guard index < selections.count else {
             do {
                 try FrankenOCRSharedStore.publishStagedDocuments(staged)
+                publishedDocuments = staged
                 Task { @MainActor [weak self] in
                     let noun = staged.count == 1 ? "specimen" : "images"
                     self?.statusLabel.text = "\(staged.count) \(noun) secured locally in selection order."
@@ -137,7 +144,7 @@ final class ShareViewController: UIViewController {
                     preferredExtension: selection.type.preferredFilenameExtension,
                     displayName: visibleName
                 )
-                guard let self else {
+                guard let self, !self.isCancelled else {
                     FrankenOCRSharedStore.discardStagedDocuments(staged + [record])
                     return
                 }
@@ -158,12 +165,25 @@ final class ShareViewController: UIViewController {
 
     @objc private func openVisionTable() {
         guard let url = URL(string: "frankenocr://recognize") else { return }
-        extensionContext?.open(url) { [weak self] _ in
-            self?.extensionContext?.completeRequest(returningItems: nil)
+        openButton.isEnabled = false
+        extensionContext?.open(url) { [weak self] opened in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if opened {
+                    self.publishedDocuments = []
+                    self.extensionContext?.completeRequest(returningItems: nil)
+                } else {
+                    self.showFailure("FrankenOCR could not open. You can retry or cancel safely.")
+                    self.openButton.isEnabled = true
+                }
+            }
         }
     }
 
     @objc private func cancelShare() {
+        isCancelled = true
+        FrankenOCRSharedStore.discardPublishedStagedDocuments(publishedDocuments)
+        publishedDocuments = []
         extensionContext?.cancelRequest(withError: CocoaError(.userCancelled))
     }
 }

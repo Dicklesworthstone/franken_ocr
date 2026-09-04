@@ -177,6 +177,25 @@ enum FrankenOCRSharedStore {
         }
     }
 
+    /// Cancel a Share-extension handoff without erasing a newer selection that
+    /// another extension instance may already have published. The UUID-backed
+    /// private files still belong to this selection and are always disposable.
+    static func discardPublishedStagedDocuments(_ documents: [StagedDocument]) {
+        if let defaults = UserDefaults(suiteName: suiteName),
+           publishedSelection(defaults.data(forKey: stagedDocumentsKey), matches: documents) {
+            defaults.removeObject(forKey: stagedDocumentsKey)
+            defaults.removeObject(forKey: stagedDocumentKey)
+        }
+        discardStagedDocuments(documents)
+    }
+
+    static func publishedSelection(_ data: Data?, matches documents: [StagedDocument]) -> Bool {
+        guard let data,
+              let published = try? JSONDecoder().decode([StagedDocument].self, from: data)
+        else { return false }
+        return published == documents
+    }
+
     static func consumeStagedDocuments() -> [ConsumedDocument] {
         guard let defaults = UserDefaults(suiteName: suiteName),
               let directory = try? incomingDirectory()
