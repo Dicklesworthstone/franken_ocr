@@ -1,0 +1,350 @@
+{
+  "schema": "franken_ocr.tromr_lineage.v1",
+  "contract_id": "netease-polyphonic-tromr-d1aa83a3-franken-ocr-lineage-v1",
+  "provider": {
+    "package_name": "franken_ocr",
+    "package_version": "0.7.2",
+    "upstream_release_tag": "v0.7.2",
+    "upstream_base_commit": "c5a0e368b1be33187a17cd9aa716653ce6230590",
+    "local_contract_revision": "franken-ocr-mtdt-lineage-v24",
+    "source_inventory_canonicalization": "path UTF-8, NUL, lowercase SHA-256, LF; rows sorted by path",
+    "source_inventory_sha256": "f2ae64ae6aad067f4885aa036d8587f1956222cfb8eee00405e5d1751bcad4ce",
+    "full_tree_binding": "consumer_recursive_source_inventory"
+  },
+  "upstream": {
+    "repository_url": "https://github.com/NetEase/Polyphonic-TrOMR",
+    "default_branch": "master",
+    "commit": "d1aa83a34fb4a05f33ceb4f917917b88600a9bc6",
+    "tree": "9cbeec06f6337ec51b9f40010b35d731b27c1231",
+    "reachable_commit_count": 17,
+    "history_audit_path": "src/native_engine/tromr_upstream_history_audit.json",
+    "history_audit_bytes": 7197,
+    "history_audit_sha256": "02a211cb7d29a884ee7b369624df29f2e1fef9823ea3987920cd936a34c44efd",
+    "tag_count": 0,
+    "release_count": 0,
+    "license_spdx": "Apache-2.0",
+    "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "paper": {
+    "evidence_class": "official_paper",
+    "title": "TrOMR: Transformer-based Polyphonic Optical Music Recognition",
+    "arxiv_id": "2308.09370",
+    "version": "v1",
+    "url": "https://arxiv.org/abs/2308.09370v1",
+    "pdf_url": "https://arxiv.org/pdf/2308.09370v1",
+    "pdf_bytes": 1627131,
+    "pdf_sha256": "ee79554cda98fab1ea7928d8208f25c043450bff01e9147b449629a58aa94aca",
+    "source_url": "https://export.arxiv.org/e-print/2308.09370v1",
+    "source_bytes": 8040787,
+    "source_sha256": "52565a986c0c854d24b7c3a71c8b034c1a80f7c0ccf7aca725e58bc533344924",
+    "tex_path": "Template.tex",
+    "tex_sha256": "acc301212e717e3b6422462b6def2cab11fa51c7ee51494386802347085bbe31"
+  },
+  "source_files": [
+    {
+      "role": "readme",
+      "path": "README.md",
+      "sha256": "0944e5e45ee007ec0654c657a075a2bbe313d9ae8cdc96947e68ae81a03d5317",
+      "git_blob": "e8e6e4926131234c611c8d84311e357e41be9c62"
+    },
+    {
+      "role": "license",
+      "path": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "git_blob": "261eeb9e9f8b2b4b0d119366dda99c6fd7d35c64"
+    },
+    {
+      "role": "requirements",
+      "path": "requirements.txt",
+      "sha256": "a294f5ba6107fd2576d6799234049497b7548637b6765361fcdaa41f3194fcb5",
+      "git_blob": "1b1f2c2660ee56c72469d35b3ed7ae1a82d468ae"
+    },
+    {
+      "role": "runtime_config",
+      "path": "tromr/workspace/config.yaml",
+      "sha256": "192d52bb26b47fd0274001e8ccfe902b867245fd585de7b2d24cf7081fc64f43",
+      "git_blob": "29000d0671e3ecbd9f6d6687b4fce2beb4af3643"
+    },
+    {
+      "role": "inference_entrypoint",
+      "path": "tromr/inference.py",
+      "sha256": "caf4d6a6927f666907c55684ae88757b026557fa7f06f7ef8fb17e7513b3faef",
+      "git_blob": "97b864471841b82a683b9838317f7b162e866a5c"
+    },
+    {
+      "role": "model_config_source",
+      "path": "tromr/configs.py",
+      "sha256": "d538adf3fabb7cd83b28600029d93b848e9e1120e64136981a20b1257a231f6f",
+      "git_blob": "d494697995f4e77ca725197904314a23c54f534f"
+    },
+    {
+      "role": "encoder_source",
+      "path": "tromr/model/encoder.py",
+      "sha256": "5981784ac35e661ced9b7f88a632f4ba187cb7d5fcbf0f212988ed7d256e521d",
+      "git_blob": "47bb128fc6fab361ff84ced56a7c4465d28c7df8"
+    },
+    {
+      "role": "decoder_source",
+      "path": "tromr/model/decoder.py",
+      "sha256": "64a4ba8a18f77287f91363acba1efb45e9d8e96cbc8f19120e4f86b822ca8191",
+      "git_blob": "83c550a47352ccc119ef6bdbb0c09af0940cbcdb"
+    },
+    {
+      "role": "architecture_source",
+      "path": "tromr/model/tromr_arch.py",
+      "sha256": "cfa6458a198835ac2c46f0e695471686d1e4fc167b483f988016b99f9b648f0b",
+      "git_blob": "288b5fbc35881b5c5d70708d168afe3e3d8d9ddc"
+    },
+    {
+      "role": "semantic_projection_source",
+      "path": "tromr/staff2score.py",
+      "sha256": "d20e1a468c69cb5701b93a72afa4bdb8292a7fb3a8b901c2dc61472425b10a2a",
+      "git_blob": "7ebbf5e773d958ae65d7b2a93aa086166e6a3506"
+    }
+  ],
+  "checkpoint": {
+    "role": "raw_checkpoint",
+    "filename": "tromr/workspace/checkpoints/img2score_epoch47.pth",
+    "bytes": 86254711,
+    "sha256": "02925259ef59f5578a8c9e954ac363bb15538ea38ce73090b861c1519179f910",
+    "git_blob": "c379f5bd58c32803c245d6ced60dc67a75547f70",
+    "source_sha256": null,
+    "recipe": null,
+    "tensor_count": 261,
+    "parameter_count": 21534232,
+    "value_bytes": 86136928,
+    "tensor_value_inventory_sha256": "0e080bdf0309b1cb4c3322abd789dc0d879d3f6ca58dd8a17aac7f35b246c1c1",
+    "evidence_class": "official_source",
+    "retained_in_provider_tree": false
+  },
+  "tokenizers": [
+    {
+      "role": "rhythm_tokenizer",
+      "filename": "tokenizer_rhythm.json",
+      "bytes": 10743,
+      "sha256": "603bfef760e8424f7808acba423532b4beb2d88dbf085f81add6a8e543a34035",
+      "git_blob": "225e58f81257f96bfc810144b674fe88bf0cd8d5",
+      "source_sha256": null,
+      "recipe": "wordlevel-260",
+      "tensor_count": null,
+      "evidence_class": "official_source",
+      "retained_in_provider_tree": true
+    },
+    {
+      "role": "pitch_tokenizer",
+      "filename": "tokenizer_pitch.json",
+      "bytes": 2682,
+      "sha256": "2382e8b20c1473290e200789604656b3a06bdf4b55a0818a0f7d175e8cb64ade",
+      "git_blob": "04cb1759f38ff413170154c24e7ed1c5a1b41d17",
+      "source_sha256": null,
+      "recipe": "wordlevel-71",
+      "tensor_count": null,
+      "evidence_class": "official_source",
+      "retained_in_provider_tree": true
+    },
+    {
+      "role": "lift_tokenizer",
+      "filename": "tokenizer_lift.json",
+      "bytes": 979,
+      "sha256": "b61ba09cecd5bc343e6a038a2e26718b54cd3c08e8f9b72013ecf80c3cac86b2",
+      "git_blob": "54f42206653f91add2df0a7945bdf4eec38e3ce5",
+      "source_sha256": null,
+      "recipe": "wordlevel-7",
+      "tensor_count": null,
+      "evidence_class": "official_source",
+      "retained_in_provider_tree": true
+    },
+    {
+      "role": "note_tokenizer",
+      "filename": "tokenizer_note.json",
+      "bytes": 830,
+      "sha256": "504d886d11e3c1fe92893abd46edfc68dfbe7a8eb83e6b51646532dad8a485e1",
+      "git_blob": "9887789db32ec8862695f6804409d4094edcb91f",
+      "source_sha256": null,
+      "recipe": "wordlevel-2",
+      "tensor_count": null,
+      "evidence_class": "official_source",
+      "retained_in_provider_tree": true
+    }
+  ],
+  "provider_sources": [
+    {
+      "role": "package_manifest",
+      "path": "Cargo.toml",
+      "sha256": "fc2c4ce84303c4e988b42bfb8c2735806034d68cafa9039aacaf75facde7085f"
+    },
+    {
+      "role": "checkpoint_export",
+      "path": "scripts/gen_tromr_safetensors.py",
+      "sha256": "3eeaf6a67ba7068d303ee2be711f645444a0d7b75a18e466ccb90386fedb83c8"
+    },
+    {
+      "role": "conversion_gate",
+      "path": "scripts/tromr_convert_e2e.sh",
+      "sha256": "c09a92cdde113fcd6605dfe6e4f04f25d948b2aec3ea920617d022ccf4fb65b6"
+    },
+    {
+      "role": "upstream_history_audit",
+      "path": "src/native_engine/tromr_upstream_history_audit.json",
+      "sha256": "02a211cb7d29a884ee7b369624df29f2e1fef9823ea3987920cd936a34c44efd"
+    },
+    {
+      "role": "checkpoint_export_receipt",
+      "path": "src/native_engine/tromr_export_receipt.json",
+      "sha256": "ce1c2e199107b2b8532cf4a12e9e8b195462a53860b7a09e0254efdc7638389c"
+    },
+    {
+      "role": "container_converter",
+      "path": "src/quant/convert.rs",
+      "sha256": "9ae5628fdc326ed428aaa6cd0da561df9566b85e3cab3c7c4ca5980d0f284d93"
+    },
+    {
+      "role": "architecture_census",
+      "path": "docs/zoo/tromr-spec.md",
+      "sha256": "827cabf4ba1ae05d37e144178263bebbaac07f03c27f416e000fb96da1fc9020"
+    },
+    {
+      "role": "distribution_manifest",
+      "path": "models/manifest-v2.json",
+      "sha256": "3f07b8e1ac26a1d12d7e4b218da2fe49a695cd476084a20f08d76fa3672309c2"
+    }
+  ],
+  "conversion_artifacts": [
+    {
+      "role": "folded_safetensors",
+      "filename": "model.safetensors",
+      "bytes": null,
+      "sha256": "41c88802fbf24c43d7515d94b5552a850b4cfd85f1a3d605e9eb4f841fe141eb",
+      "git_blob": null,
+      "source_sha256": "02925259ef59f5578a8c9e954ac363bb15538ea38ce73090b861c1519179f910",
+      "recipe": "timm-0.6.5-ws-fold-eps-1e-6-drop-note-mask-v1",
+      "tensor_count": 260,
+      "parameter_count": 21533972,
+      "value_bytes": 86135888,
+      "tensor_value_inventory_sha256": "59af5214d0f73eceaba23dc5e7c60941673a4f642b4577c5e1b4183e49cda200",
+      "evidence_class": "provider_derivation",
+      "retained_in_provider_tree": false
+    }
+  ],
+  "runtime_artifacts": [
+    {
+      "role": "f32_focrq",
+      "filename": "tromr.focrq",
+      "bytes": 86168002,
+      "sha256": "a9d41485a98534ad0a1f7c1ec624f0a92f3f092c7dc30ac5af636b50dc465edc",
+      "git_blob": null,
+      "source_sha256": "41c88802fbf24c43d7515d94b5552a850b4cfd85f1a3d605e9eb4f841fe141eb",
+      "recipe": "tromr-f32-v1",
+      "tensor_count": 260,
+      "parameter_count": 21533972,
+      "value_bytes": 86135888,
+      "tensor_value_inventory_sha256": "59af5214d0f73eceaba23dc5e7c60941673a4f642b4577c5e1b4183e49cda200",
+      "evidence_class": "provider_derivation",
+      "retained_in_provider_tree": false
+    },
+    {
+      "role": "int8_focrq",
+      "filename": "tromr.int8.focrq",
+      "bytes": 61107485,
+      "sha256": "cced11c0f05656dd54cc615a15939c472dc8f916f04ae154ea4a0364839f845a",
+      "git_blob": null,
+      "source_sha256": "41c88802fbf24c43d7515d94b5552a850b4cfd85f1a3d605e9eb4f841fe141eb",
+      "recipe": "tromr-decoder-int8-v1",
+      "tensor_count": 260,
+      "evidence_class": "provider_derivation",
+      "retained_in_provider_tree": false
+    }
+  ],
+  "conversion_steps": [
+    {
+      "step_id": "raw-checkpoint-to-folded-safetensors-v1",
+      "from_role": "raw_checkpoint",
+      "to_role": "folded_safetensors",
+      "evidence_class": "provider_derivation",
+      "implementation_path": "scripts/gen_tromr_safetensors.py",
+      "input_tensor_count": 261,
+      "output_tensor_count": 260,
+      "operation": "drop decoder.note_mask and fold 40 ResNetV2 weight-standardized convolutions with timm 0.6.5 arithmetic"
+    },
+    {
+      "step_id": "folded-safetensors-to-f32-focrq-v1",
+      "from_role": "folded_safetensors",
+      "to_role": "f32_focrq",
+      "evidence_class": "provider_derivation",
+      "implementation_path": "src/quant/convert.rs",
+      "input_tensor_count": 260,
+      "output_tensor_count": 260,
+      "operation": "deterministic FOCRQ container conversion under tromr-f32-v1"
+    },
+    {
+      "step_id": "folded-safetensors-to-int8-focrq-v1",
+      "from_role": "folded_safetensors",
+      "to_role": "int8_focrq",
+      "evidence_class": "provider_derivation",
+      "implementation_path": "src/quant/convert.rs",
+      "input_tensor_count": 260,
+      "output_tensor_count": 260,
+      "operation": "deterministic per-channel int8 conversion under tromr-decoder-int8-v1"
+    }
+  ],
+  "conversion_replay": {
+    "receipt_path": "src/native_engine/tromr_export_receipt.json",
+    "receipt_bytes": 221762,
+    "receipt_sha256": "ce1c2e199107b2b8532cf4a12e9e8b195462a53860b7a09e0254efdc7638389c",
+    "identical_regeneration_count": 2,
+    "regenerated_safetensors_bytes": 86166472,
+    "regenerated_safetensors_sha256": "6101efe24503a4246443ced5e777f3fc0c8a2156078587a3880057773f9b46b9",
+    "accepted_safetensors_sha256": "41c88802fbf24c43d7515d94b5552a850b4cfd85f1a3d605e9eb4f841fe141eb",
+    "byte_exact": false,
+    "names_shapes_dtypes_equal": true,
+    "exact_value_tensor_count": 220,
+    "tolerance_value_tensor_count": 40,
+    "max_abs": "0.00000095367431640625",
+    "max_abs_contract": "0.000001",
+    "outcome": "value_tolerance",
+    "honest_gap": "The original accepted safetensors bytes and export environment were not retained. The accepted f32 FOCRQ header binds their SHA-256; two new pinned-environment exports are byte-identical to each other and all 260 accepted FOCRQ tensors match exactly or within the declared WS-only tolerance."
+  },
+  "training_availability": {
+    "published_training_code": false,
+    "negative_evidence": {
+      "readme_path": "README.md",
+      "readme_sha256": "0944e5e45ee007ec0654c657a075a2bbe313d9ae8cdc96947e68ae81a03d5317",
+      "line": 5,
+      "statement": "The training code will be open source later.",
+      "reachable_commit_count": 17,
+      "history_audit_sha256": "02a211cb7d29a884ee7b369624df29f2e1fef9823ea3987920cd936a34c44efd",
+      "audit_method": "enumerate every reachable official commit tree; inspect complete path inventories and source for trainer, data-loader, dataset-generation, tokenizer-generation, optimizer, scheduler, split, checkpoint-selection, and evaluation entrypoints"
+    },
+    "fields": [
+      {"name":"published_training_entrypoint","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:readme-line-5","official:all-17-commit-trees"]},
+      {"name":"dataset_generation_code","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"exact_corpus_sample_identities","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"split_construction","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"tokenizer_construction_inputs","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"augmentation_sequence","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"preprocessing_training_sequence","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"seed_and_order_policy","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"initialization_and_pretraining","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"per_head_cross_entropy","evidence_class":"official_source","value":"rhythm,pitch,lift,note","evidence_refs":["official:tromr/model/decoder.py"]},
+      {"name":"consistency_loss_gamma","evidence_class":"official_source","value":"10","evidence_refs":["official:tromr/model/decoder.py"]},
+      {"name":"complete_loss_aggregation","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"paper_loss_lambda","evidence_class":"official_paper","value":"0.1","evidence_refs":["official-paper:arxiv-2308.09370v1:section-4.1:tex-line-154"]},
+      {"name":"paper_loss_beta","evidence_class":"official_paper","value":"1.0","evidence_refs":["official-paper:arxiv-2308.09370v1:section-4.1:tex-line-154"]},
+      {"name":"optimizer_family","evidence_class":"official_paper","value":"Adam","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
+      {"name":"initial_learning_rate","evidence_class":"official_paper","value":"0.001","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
+      {"name":"optimizer_betas_epsilon_weight_decay","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"scheduler_and_warmup","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"gradient_clipping_accumulation_amp","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"batch_size","evidence_class":"official_paper","value":"32","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
+      {"name":"input_geometry","evidence_class":"official_paper","value":"128x1280","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-179"]},
+      {"name":"generated_staff_count","evidence_class":"official_paper","value":"about-400000","evidence_refs":["official-paper:arxiv-2308.09370v1:section-2.1:tex-line-96"]},
+      {"name":"cmsd_staff_crop_count","evidence_class":"official_paper","value":"71292","evidence_refs":["official-paper:arxiv-2308.09370v1:section-2.1:tex-line-96"]},
+      {"name":"training_hardware","evidence_class":"official_paper","value":"single NVIDIA A100 40GB","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
+      {"name":"stopping_and_checkpoint_selection","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"musescore_and_generation_tool_versions","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"original_evaluation_entrypoint","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
+      {"name":"resumable_optimizer_scheduler_state","evidence_class":"official_source","value":"absent_from_261_tensor_state_dict","evidence_refs":["official:tromr/workspace/checkpoints/img2score_epoch47.pth"]},
+      {"name":"checkpoint_epoch_label","evidence_class":"official_source","value":"epoch47_filename_only; selection meaning unavailable","evidence_refs":["official:tromr/workspace/checkpoints/img2score_epoch47.pth"]}
+    ]
+  }
+}
