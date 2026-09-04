@@ -78,6 +78,14 @@ PDF, question, or layout coordinates. It is excluded from backup, limited to the
 newest 20 results, expires results after 14 days, and provides share, copy,
 per-result deletion, and Clear All controls.
 
+The system Share extension accepts the same input shape as the in-app picker:
+one PDF by itself, or one to 32 images. It copies each provider-owned temporary
+file into the private App Group before that provider callback ends, publishes
+the ordered batch only after every copy succeeds, preserves the visible source
+names, then opens the ordinary Files / Batch path. The app removes only those
+private staging copies after their bytes are safely in memory. The extension
+never loads model weights and never performs recognition itself.
+
 `FocrCore.xcframework/` and `FrankenOCR.xcodeproj/` are generated and
 gitignored. `project.yml`, `build-rust.sh`, `Sources/`, the entitlements, and
 the privacy manifest are the source.

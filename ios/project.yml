@@ -123,8 +123,8 @@ targets:
           NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ShareViewController"
           NSExtensionAttributes:
             NSExtensionActivationRule:
-              NSExtensionActivationSupportsFileWithMaxCount: 1
-              NSExtensionActivationSupportsImageWithMaxCount: 1
+              NSExtensionActivationSupportsFileWithMaxCount: 32
+              NSExtensionActivationSupportsImageWithMaxCount: 32
 
   FrankenOCRTests:
     type: bundle.unit-test

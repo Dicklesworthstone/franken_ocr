@@ -16,6 +16,27 @@ enum LabAppearance: String {
     var colorScheme: ColorScheme { self == .dark ? .dark : .light }
 }
 
+enum LabTextScale {
+    static let storageKey = "frankenocr.uiTextScale"
+    static let defaultValue = 1.0
+    static let minimum = 0.8
+    static let maximum = 1.5
+    static let increment = 0.1
+
+    static var current: CGFloat {
+        let stored = UserDefaults.standard.object(forKey: storageKey) as? NSNumber
+        return CGFloat(clamped(stored?.doubleValue ?? defaultValue))
+    }
+
+    static func adjusted(_ value: Double, by steps: Int) -> Double {
+        clamped(clamped(value) + Double(steps) * increment)
+    }
+
+    static func clamped(_ value: Double) -> Double {
+        min(max(value, minimum), maximum)
+    }
+}
+
 enum Lab {
     // Surfaces
     static let background = adaptive(dark: 0x060B09, light: 0xF1F7F2)
@@ -63,10 +84,16 @@ enum Lab {
     static let radiusLarge: CGFloat = 18
 
     static func typeSize(_ base: CGFloat) -> CGFloat {
+        contentTypeSize(base * LabTextScale.current)
+    }
+
+    /// Sizing for recognized/source document content. Browser-style UI zoom
+    /// must not silently rewrite the user's preferred reading/output scale.
+    static func contentTypeSize(_ base: CGFloat) -> CGFloat {
 #if targetEnvironment(macCatalyst)
-        base * 1.38
+        return base * 1.38
 #else
-        UIFontMetrics(forTextStyle: .body).scaledValue(for: base)
+        return UIFontMetrics(forTextStyle: .body).scaledValue(for: base)
 #endif
     }
 }

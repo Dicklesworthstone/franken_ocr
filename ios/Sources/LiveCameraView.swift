@@ -695,7 +695,7 @@ struct LiveCameraView: View {
                 Text(capturedText.isEmpty
                      ? "Point the camera at text. Actual recognized lines will bend into this tray."
                      : capturedText)
-                    .font(.system(size: Lab.typeSize(13), design: .monospaced))
+                    .font(.system(size: Lab.contentTypeSize(13), design: .monospaced))
                     .foregroundStyle(capturedText.isEmpty ? .white.opacity(0.42) : .white.opacity(0.92))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -819,14 +819,14 @@ struct LiveCameraView: View {
                             .font(.system(size: Lab.typeSize(38), weight: .bold))
                             .foregroundStyle(Lab.amber)
                         Text("Live Camera continues on iPhone and iPad")
-                            .font(.title2.bold())
+                            .font(.system(size: Lab.typeSize(22), weight: .bold))
                             .foregroundStyle(Lab.textPrimary)
                         Text(
                             "Apple's realtime Live Text camera is not available to Mac Catalyst apps. "
                                 + "On this Mac, drop or choose an image or PDF in the Vision Table to "
                                 + "run the full, more accurate FrankenOCR model entirely on-device."
                         )
-                        .font(.body)
+                        .font(.system(size: Lab.typeSize(17)))
                         .foregroundStyle(Lab.textDim)
                         .fixedSize(horizontal: false, vertical: true)
                         Button { dismiss() } label: {

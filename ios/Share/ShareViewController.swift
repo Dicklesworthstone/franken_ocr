@@ -2,6 +2,12 @@ import UIKit
 import UniformTypeIdentifiers
 
 final class ShareViewController: UIViewController {
+    private struct ProviderSelection {
+        let provider: NSItemProvider
+        let type: UTType
+        let isPDF: Bool
+    }
+
     private let statusLabel = UILabel()
     private let openButton = UIButton(type: .system)
 
@@ -63,30 +69,84 @@ final class ShareViewController: UIViewController {
         let providers = (extensionContext?.inputItems as? [NSExtensionItem])?
             .compactMap(\.attachments).flatMap { $0 } ?? []
         let supported = [UTType.pdf, .png, .jpeg, .image]
-        guard let pair = providers.lazy.compactMap({ provider -> (NSItemProvider, UTType)? in
-            supported.first(where: { provider.hasItemConformingToTypeIdentifier($0.identifier) })
-                .map { (provider, $0) }
-        }).first else {
-            showFailure("Share one image or PDF to recognize it.")
+        let selections = providers.compactMap { provider -> ProviderSelection? in
+            guard let type = supported.first(where: {
+                provider.hasItemConformingToTypeIdentifier($0.identifier)
+            }) else { return nil }
+            return ProviderSelection(provider: provider, type: type, isPDF: type == .pdf)
+        }
+        guard selections.count == providers.count else {
+            showFailure("Every shared item must be a PNG, JPEG, image, or PDF.")
+            return
+        }
+        do {
+            try FrankenOCRSharedStore.validateStagedSelection(
+                itemCount: selections.count,
+                pdfCount: selections.filter(\.isPDF).count
+            )
+        } catch {
+            showFailure(error.localizedDescription)
             return
         }
 
-        pair.0.loadFileRepresentation(forTypeIdentifier: pair.1.identifier) { [weak self] url, _ in
-            guard let url else {
-                Task { @MainActor in self?.showFailure("The shared document could not be opened.") }
-                return
-            }
+        let noun = selections.count == 1
+            ? (selections[0].isPDF ? "PDF" : "image")
+            : "images"
+        statusLabel.text = "Securing \(selections.count == 1 ? "the" : String(selections.count)) \(noun) locally…"
+        stageSelections(selections, at: 0, staged: [])
+    }
+
+    /// Load serially so order is deterministic and each provider-owned
+    /// temporary URL is copied before its completion callback returns.
+    private func stageSelections(
+        _ selections: [ProviderSelection],
+        at index: Int,
+        staged: [FrankenOCRSharedStore.StagedDocument]
+    ) {
+        guard index < selections.count else {
             do {
-                _ = try FrankenOCRSharedStore.stageDocument(
-                    from: url,
-                    preferredExtension: pair.1.preferredFilenameExtension
-                )
-                Task { @MainActor in
-                    self?.statusLabel.text = "Specimen secured locally. Ready for private recognition."
+                try FrankenOCRSharedStore.publishStagedDocuments(staged)
+                Task { @MainActor [weak self] in
+                    let noun = staged.count == 1 ? "specimen" : "images"
+                    self?.statusLabel.text = "\(staged.count) \(noun) secured locally in selection order."
                     self?.openButton.isEnabled = true
                 }
             } catch {
-                Task { @MainActor in self?.showFailure("Could not stage that file: \(error.localizedDescription)") }
+                FrankenOCRSharedStore.discardStagedDocuments(staged)
+                Task { @MainActor [weak self] in
+                    self?.showFailure("Could not publish that selection: \(error.localizedDescription)")
+                }
+            }
+            return
+        }
+
+        let selection = selections[index]
+        selection.provider.loadFileRepresentation(
+            forTypeIdentifier: selection.type.identifier
+        ) { [weak self] url, error in
+            guard let url else {
+                FrankenOCRSharedStore.discardStagedDocuments(staged)
+                let detail = error?.localizedDescription ?? "The shared item could not be opened."
+                Task { @MainActor [weak self] in self?.showFailure(detail) }
+                return
+            }
+            do {
+                let visibleName = selection.provider.suggestedName ?? url.lastPathComponent
+                let record = try FrankenOCRSharedStore.stageDocument(
+                    from: url,
+                    preferredExtension: selection.type.preferredFilenameExtension,
+                    displayName: visibleName
+                )
+                guard let self else {
+                    FrankenOCRSharedStore.discardStagedDocuments(staged + [record])
+                    return
+                }
+                self.stageSelections(selections, at: index + 1, staged: staged + [record])
+            } catch {
+                FrankenOCRSharedStore.discardStagedDocuments(staged)
+                Task { @MainActor [weak self] in
+                    self?.showFailure("Could not stage item \(index + 1): \(error.localizedDescription)")
+                }
             }
         }
     }

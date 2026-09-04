@@ -90,6 +90,28 @@ final class ConcurrencyTests: XCTestCase {
         }
     }
 
+    func testShareSelectionAcceptsOnePDFOrTheFullImageBatchBound() throws {
+        XCTAssertNoThrow(try FrankenOCRSharedStore.validateStagedSelection(
+            itemCount: 1,
+            pdfCount: 1
+        ))
+        XCTAssertNoThrow(try FrankenOCRSharedStore.validateStagedSelection(
+            itemCount: FrankenOCRSharedStore.maximumStagedDocuments,
+            pdfCount: 0
+        ))
+    }
+
+    func testShareSelectionRefusesMixedPDFsAndOversizeBatches() {
+        XCTAssertThrowsError(try FrankenOCRSharedStore.validateStagedSelection(
+            itemCount: 2,
+            pdfCount: 1
+        ))
+        XCTAssertThrowsError(try FrankenOCRSharedStore.validateStagedSelection(
+            itemCount: FrankenOCRSharedStore.maximumStagedDocuments + 1,
+            pdfCount: 0
+        ))
+    }
+
     func testHtmlExportEmbedsExtractedFigureBytesWithoutANetworkDependency() throws {
         let png = try onePixelPNG()
         let html = HtmlExport.document(

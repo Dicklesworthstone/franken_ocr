@@ -7,6 +7,12 @@ private struct ImportedFile: Sendable {
     let name: String
 }
 
+private struct ImportedURL: Sendable {
+    let url: URL
+    let name: String
+    let deleteAfterRead: Bool
+}
+
 private enum ImportedFilesResult: Sendable {
     case success([ImportedFile])
     case failure(String)
@@ -49,6 +55,7 @@ private extension View {
 /// came from and the tablet finally has the width for it.
 struct LabView: View {
     @AppStorage(LabAppearance.storageKey) private var appearance = LabAppearance.dark.rawValue
+    @AppStorage(LabTextScale.storageKey) private var uiTextScale = LabTextScale.defaultValue
     private enum Destination: String, CaseIterable, Identifiable {
         case capture = "Capture"
         case live = "Live"
@@ -87,6 +94,7 @@ struct LabView: View {
     }
 
     var body: some View {
+        let _ = uiTextScale
         ZStack {
             LabBackground()
             GeometryReader { geometry in
@@ -352,10 +360,10 @@ struct LabView: View {
                         .foregroundStyle(Lab.amber)
                     VStack(alignment: .leading, spacing: 5) {
                         Text(liveCameraPlatformTitle)
-                            .font(.headline)
+                            .font(.system(size: Lab.typeSize(17), weight: .semibold))
                             .foregroundStyle(Lab.textPrimary)
                         Text(liveCameraPlatformDetail)
-                        .font(.subheadline)
+                        .font(.system(size: Lab.typeSize(15)))
                         .foregroundStyle(Lab.textDim)
                     }
                 }
@@ -430,8 +438,11 @@ struct LabView: View {
     }
 
     private func consumeStagedDocument() {
-        guard let staged = FrankenOCRSharedStore.consumeStagedDocumentURL() else { return }
-        load(fileResult: .success([staged]))
+        let staged = FrankenOCRSharedStore.consumeStagedDocuments()
+        guard !staged.isEmpty else { return }
+        load(urls: staged.map {
+            ImportedURL(url: $0.url, name: $0.displayName, deleteAfterRead: true)
+        })
     }
 
     private var consentMessage: String {
@@ -977,7 +988,7 @@ struct LabView: View {
                     if model.viewSource || model.spec.producesMusicXML {
                         ScrollView([.horizontal, .vertical], showsIndicators: true) {
                             Text(model.displayText)
-                                .font(.system(size: Lab.typeSize(12), design: .monospaced))
+                                .font(.system(size: Lab.contentTypeSize(12), design: .monospaced))
                                 .foregroundStyle(Lab.textMid)
                                 .textSelection(.enabled)
                                 .padding(12)
@@ -1341,53 +1352,65 @@ struct LabView: View {
     }
 
     private func load(fileResult: Result<[URL], Error>) {
-        inputRequestGeneration &+= 1
-        let requestGeneration = inputRequestGeneration
         switch fileResult {
         case .success(let urls):
-            guard !urls.isEmpty else { return }
-            guard urls.count <= LabModel.maxBatchImages else {
-                model.status = "Choose no more than \(LabModel.maxBatchImages) images at once."
-                model.statusKind = .warn
-                return
-            }
-
-            Task {
-                let importResult = await Task.detached(priority: .userInitiated) {
-                    var files: [ImportedFile] = []
-                    files.reserveCapacity(urls.count)
-                    for url in urls {
-                        // Release each security scope immediately after copying
-                        // its bytes; the model retains no sandbox-external URL.
-                        let scoped = url.startAccessingSecurityScopedResource()
-                        let data = try? Data(contentsOf: url)
-                        if scoped { url.stopAccessingSecurityScopedResource() }
-                        guard let data else {
-                            return ImportedFilesResult.failure(
-                                "Could not read \(url.lastPathComponent)."
-                            )
-                        }
-                        files.append(ImportedFile(data: data, name: url.lastPathComponent))
-                    }
-                    return ImportedFilesResult.success(files)
-                }.value
-                guard requestGeneration == inputRequestGeneration else { return }
-
-                switch importResult {
-                case .success(let files):
-                    if files.count == 1, let file = files.first {
-                        await model.accept(data: file.data, name: file.name)
-                    } else {
-                        model.acceptBatch(files: files.map { (data: $0.data, name: $0.name) })
-                    }
-                case .failure(let message):
-                    model.status = message
-                    model.statusKind = .err
-                }
-            }
+            load(urls: urls.map {
+                ImportedURL(url: $0, name: $0.lastPathComponent, deleteAfterRead: false)
+            })
         case .failure(let error):
             model.status = error.localizedDescription
             model.statusKind = .err
+        }
+    }
+
+    private func load(urls: [ImportedURL]) {
+        inputRequestGeneration &+= 1
+        let requestGeneration = inputRequestGeneration
+        guard !urls.isEmpty else { return }
+        guard urls.count <= LabModel.maxBatchImages else {
+            model.status = "Choose no more than \(LabModel.maxBatchImages) images at once."
+            model.statusKind = .warn
+            return
+        }
+
+        Task {
+            let importResult = await Task.detached(priority: .userInitiated) {
+                var files: [ImportedFile] = []
+                files.reserveCapacity(urls.count)
+                for item in urls {
+                    // Release each security scope immediately after copying
+                    // its bytes; the model retains no sandbox-external URL.
+                    let scoped = item.url.startAccessingSecurityScopedResource()
+                    let data = try? Data(contentsOf: item.url)
+                    if scoped { item.url.stopAccessingSecurityScopedResource() }
+                    guard let data else {
+                        return ImportedFilesResult.failure(
+                            "Could not read \(item.name)."
+                        )
+                    }
+                    // Share-extension files are private staging copies. Once
+                    // their bytes are in this task, remove only that copy so a
+                    // 32-image share cannot silently fill the App Group.
+                    if item.deleteAfterRead {
+                        try? FileManager.default.removeItem(at: item.url)
+                    }
+                    files.append(ImportedFile(data: data, name: item.name))
+                }
+                return ImportedFilesResult.success(files)
+            }.value
+            guard requestGeneration == inputRequestGeneration else { return }
+
+            switch importResult {
+            case .success(let files):
+                if files.count == 1, let file = files.first {
+                    await model.accept(data: file.data, name: file.name)
+                } else {
+                    model.acceptBatch(files: files.map { (data: $0.data, name: $0.name) })
+                }
+            case .failure(let message):
+                model.status = message
+                model.statusKind = .err
+            }
         }
     }
 }

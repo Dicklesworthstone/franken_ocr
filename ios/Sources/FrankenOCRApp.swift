@@ -15,7 +15,10 @@ struct FrankenOCRApp: App {
         .defaultSize(width: 1180, height: 820)
         .windowResizability(.contentMinSize)
 #endif
-        .commands { OCRCommands() }
+        .commands {
+            OCRCommands()
+            OCRTextSizeCommands()
+        }
     }
 }
 
@@ -91,6 +94,34 @@ private struct OCRCommands: Commands {
             Button("Stop Recognition") { actions?.stop() }
                 .keyboardShortcut(.escape, modifiers: [])
                 .disabled(actions?.canStop != true)
+        }
+    }
+}
+
+private struct OCRTextSizeCommands: Commands {
+    @AppStorage(LabTextScale.storageKey) private var textScale = LabTextScale.defaultValue
+
+    var body: some Commands {
+        CommandMenu("Text Size") {
+            Button("Make Text Bigger") {
+                textScale = LabTextScale.adjusted(textScale, by: 1)
+            }
+            .keyboardShortcut("+", modifiers: [.command])
+            .disabled(LabTextScale.clamped(textScale) >= LabTextScale.maximum)
+
+            Button("Make Text Smaller") {
+                textScale = LabTextScale.adjusted(textScale, by: -1)
+            }
+            .keyboardShortcut("-", modifiers: [.command])
+            .disabled(LabTextScale.clamped(textScale) <= LabTextScale.minimum)
+
+            Divider()
+
+            Button("Actual Size") {
+                textScale = LabTextScale.defaultValue
+            }
+            .keyboardShortcut("0", modifiers: [.command])
+            .disabled(abs(textScale - LabTextScale.defaultValue) < 0.001)
         }
     }
 }
