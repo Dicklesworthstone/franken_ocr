@@ -52,9 +52,9 @@ anyhow = "1"
 #
 # asupersync: orchestration/cancellation/IO only — the engine owns exactly one
 # Runtime below the sync public API (plan §3.3). default-features=false keeps the
-# surface minimal. The sibling ../asupersync checkout at 0.3.8 satisfies
-# ">=0.3.5,<0.4".
-asupersync = { version = ">=0.3.5, <0.4", default-features = false, features = [
+# surface minimal. The sibling ../asupersync checkout supplies the same 0.5
+# runtime family used by the storage and tensor dependencies below.
+asupersync = { version = "0.5.0", default-features = false, features = [
     "tls-webpki-roots",
 ], optional = true }
 # Ctrl+C -> cooperative shutdown (bd-223.2): the CLI installs the handler; the
@@ -73,8 +73,8 @@ ft-core = { path = "../frankentorch/crates/ft-core", version = "0.1.0", package 
 # vector paths. Pinned to ft-core's major version.
 half = { version = "2", features = ["std"] }
 # Durable run state + telemetry on frankensqlite — NEVER rusqlite (plan §10).
-fsqlite = { path = "../frankensqlite/crates/fsqlite", version = "0.3.6", optional = true }
-fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types", version = "0.3.6", optional = true }
+fsqlite = { path = "../frankensqlite/crates/fsqlite", version = "0.4.0", optional = true }
+fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types", version = "0.4.0", optional = true }
 # Image decode/resize/normalize/pad/tile — the preprocess front end (plan §6.2).
 # Core needs only png+jpeg; the `native` feature restores the full default
 # decoder set (and its rayon fan-out) so CLI behavior is unchanged. The wasm
@@ -205,13 +205,11 @@ mimalloc = []
 # it rides the same lockfile, patches, and profiles as the library it wraps.
 [workspace]
 members = ["focr-ios", "focr-wasm"]
+exclude = ["fuzz"]
 
-# The current asupersync 0.3.8 build input is not yet on crates.io (the index
-# tops out at 0.3.6); it lives in the sibling `../asupersync` checkout.
-# Patch crates-io to that path so the whole dependency graph —
-# franken_ocr's direct dep AND the fsqlite/frankentorch path-deps that pin
-# `0.3.4` — unifies on the single local 0.3.8 (which satisfies both ^0.3.4 and
-# >=0.3.5,<0.4). One asupersync in the tree; no version skew.
+# Keep the existing sibling-checkout policy for the shared runtime. The direct
+# dependency and fsqlite/frankentorch path dependencies all require 0.5, so this
+# patch resolves one Asupersync type universe across their public boundaries.
 [patch.crates-io]
 asupersync = { path = "../asupersync" }
 
