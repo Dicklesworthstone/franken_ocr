@@ -90,6 +90,29 @@ final class ConcurrencyTests: XCTestCase {
         }
     }
 
+    func testEveryModelMapsToAValidBundledWebPlaygroundSample() throws {
+        let expected = [
+            "unlimited-ocr": "sample-doc",
+            "got-ocr2": "sample-table",
+            "smolvlm2": "sample-photo",
+            "onechart": "sample-doc",
+            "tromr": "sample-staff",
+        ]
+
+        XCTAssertEqual(ModelCatalog.all.count, expected.count)
+        for spec in ModelCatalog.all {
+            XCTAssertEqual(spec.sampleResourceName, expected[spec.id])
+            let url = try XCTUnwrap(Bundle.main.url(
+                forResource: spec.sampleResourceName,
+                withExtension: "png"
+            ), "Missing bundled specimen for \(spec.id)")
+            let data = try Data(contentsOf: url)
+            XCTAssertTrue(data.starts(with: [0x89, 0x50, 0x4E, 0x47]))
+            XCTAssertGreaterThan(data.count, 1_000)
+            XCTAssertLessThan(data.count, 1_000_000)
+        }
+    }
+
     func testShareSelectionAcceptsOnePDFOrTheFullImageBatchBound() throws {
         XCTAssertNoThrow(try FrankenOCRSharedStore.validateStagedSelection(
             itemCount: 1,

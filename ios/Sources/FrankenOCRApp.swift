@@ -71,12 +71,12 @@ private struct OCRCommands: Commands {
     @FocusedValue(\.ocrCommands) private var actions
 
     var body: some Commands {
-        // Replace Catalyst's built-in Open command instead of adding a second
-        // Command-O key equivalent. Duplicate shortcuts produce undefined menu
-        // dispatch and were reported by UIKit during the real test launch.
-        CommandGroup(replacing: .newItem) {
+        // Catalyst retains its own Open command even when SwiftUI replaces the
+        // import/export group. Give the app-specific importer a distinct key
+        // equivalent so UIKit never has to choose between two Command-O items.
+        CommandGroup(replacing: .importExport) {
             Button("Open Image or PDF…") { actions?.importFile() }
-                .keyboardShortcut("o", modifiers: [.command])
+                .keyboardShortcut("o", modifiers: [.command, .shift])
         }
 
         CommandMenu("Recognition") {

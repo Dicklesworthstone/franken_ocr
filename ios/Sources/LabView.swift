@@ -701,6 +701,8 @@ struct LabView: View {
                                     width: geometry.size.width,
                                     height: geometry.size.height
                                 )
+                                .accessibilityIdentifier("source-preview")
+                                .accessibilityLabel("\(model.imageName ?? "Selected source") preview")
                             if model.showLayoutBoxes, let recognition = model.recognition {
                                 LayoutOverlay(
                                     spans: recognition.layout,
@@ -860,6 +862,14 @@ struct LabView: View {
             .buttonStyle(GhostButtonStyle(tint: Lab.accent))
             .disabled(model.isRecognizing)
 #endif
+            Button { model.useModelSample() } label: {
+                Label("Try \(model.spec.shortName) sample", systemImage: "sparkles.rectangle.stack")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(GhostButtonStyle(tint: Lab.amber))
+            .disabled(model.isRecognizing)
+            .accessibilityIdentifier("try-model-sample")
+            .accessibilityHint("Loads the reviewed sample from the original web playground")
         }
     }
 

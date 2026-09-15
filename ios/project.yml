@@ -54,6 +54,16 @@ targets:
       - path: Sources
       - path: Shared
       - path: Assets.xcassets
+      # Reuse the original playground's reviewed, model-specific specimens so
+      # every lane can be understood before someone finds their own input.
+      - path: ../site/assets/sample-doc.png
+        buildPhase: resources
+      - path: ../site/assets/sample-table.png
+        buildPhase: resources
+      - path: ../site/assets/sample-photo.png
+        buildPhase: resources
+      - path: ../site/assets/sample-staff.png
+        buildPhase: resources
     dependencies:
       # Static library: there is nothing to embed, and embedding it would both
       # bloat the bundle and confuse dyld.

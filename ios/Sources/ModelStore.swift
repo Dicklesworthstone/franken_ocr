@@ -59,6 +59,20 @@ struct ModelSpec: Sendable, Identifiable {
 
     var totalBytes: Int { weights.bytes + sidecars.reduce(0) { $0 + $1.bytes } }
 
+    /// Exact reviewed specimen used by the original browser playground.
+    /// OneChart has no dedicated web specimen, so it deliberately falls back
+    /// to the ordinary document page instead of inventing new sample content.
+    var sampleResourceName: String {
+        switch id {
+        case "got-ocr2": "sample-table"
+        case "smolvlm2": "sample-photo"
+        case "tromr": "sample-staff"
+        default: "sample-doc"
+        }
+    }
+
+    var sampleFilename: String { "\(sampleResourceName).png" }
+
     /// Where to fetch this model's files, best host first.
     ///
     /// HuggingFace leads: it serves ranged requests, sits behind a CDN, has no

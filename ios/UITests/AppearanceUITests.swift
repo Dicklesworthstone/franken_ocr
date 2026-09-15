@@ -54,6 +54,28 @@ final class FrankenOCRAppearanceUITests: XCTestCase {
         keepScreenshot(of: app, named: "Files and batch import")
     }
 
+    func testOriginalPlaygroundSampleLoadsWithoutARecognizeRun() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let sample = app.buttons["try-model-sample"]
+        XCTAssertTrue(sample.waitForExistence(timeout: 12))
+        for _ in 0..<3 where !sample.isHittable {
+            app.swipeUp()
+        }
+        XCTAssertTrue(sample.isHittable)
+        sample.tap()
+
+        let preview = app.images["source-preview"]
+        XCTAssertTrue(preview.waitForExistence(timeout: 5))
+        for _ in 0..<3 where !preview.isHittable {
+            app.swipeDown()
+        }
+        XCTAssertTrue(preview.isHittable)
+        XCTAssertFalse(app.buttons["Stop"].exists)
+        keepScreenshot(of: app, named: "Original playground sample")
+    }
+
     private func keepScreenshot(of app: XCUIApplication, named name: String) {
         let attachment = XCTAttachment(screenshot: app.screenshot())
         attachment.name = name

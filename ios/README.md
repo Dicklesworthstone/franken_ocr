@@ -50,6 +50,13 @@ possible but can be less accurate than the full Baidu model. The live surface
 labels that implementation and tradeoff in-app; both paths remain offline and
 upload nothing.
 
+The input rail also restores the browser playground's model-specific **Try
+Sample** path. Unlimited-OCR, GOT-OCR2, SmolVLM2, and TrOMR use the exact tiny
+reviewed PNGs from `site/assets`; OneChart deliberately falls back to the
+document specimen because the original site has no dedicated OneChart sample.
+Samples are bundled, offline, and only prepare an input—they never download a
+model or begin recognition without another explicit tap.
+
 **Files / Batch** accepts one PDF or two to 32 PNG/JPEG images. An image batch is
 validated atomically, preserves picker order and filenames, loads the selected
 model once, then recognizes each image sequentially with per-image progress and
@@ -157,13 +164,13 @@ context. Independent pages remain the default because they can skip an
 unreadable raster; cross-page mode honestly refuses the whole pass on an
 unreadable page or shared 32K-context overflow.
 
-## Not in this version
+## Deliberate Apple differences
 
-- GOT-OCR2, SmolVLM2, and OneChart. Each hydrates its vision tower to f32 whole
-  (measured wasm peaks of 3.4 GB for GOT-OCR2, 2.8 GB for SmolVLM2) because the
-  streamed residency mode keys off the Unlimited-OCR recipe. Extending it to
-  their towers is what earns them a place in the picker; shipping them first
-  would put a model on the phone that gets the app killed.
+- All five ready core models are in the native picker: Unlimited-OCR,
+  GOT-OCR2, SmolVLM2, OneChart, and TrOMR. Each uses its exact model-specific
+  Rust forward path and pinned downloadable assets. The larger lanes remain
+  guarded by measured device-memory floors instead of pretending every model
+  is safe on every phone.
 - The optional continuous tensor-batch spine. The Apple app provides the
   bounded load-once sequential image-batch workflow above, but does not claim
   the core scheduler's simultaneous multi-sequence decode.

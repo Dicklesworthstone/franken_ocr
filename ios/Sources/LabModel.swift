@@ -608,6 +608,27 @@ final class LabModel {
         }
     }
 
+    /// Load the same tiny, local specimen the original web playground offers
+    /// for this model. This never downloads weights or starts recognition.
+    func useModelSample(bundle: Bundle = .main) {
+        guard !isRecognizing else {
+            status = "Stop the current recognition before choosing another input."
+            statusKind = .warn
+            return
+        }
+        guard let url = bundle.url(
+            forResource: spec.sampleResourceName,
+            withExtension: "png"
+        ), let data = try? Data(contentsOf: url) else {
+            status = "The bundled \(spec.shortName) sample is unavailable."
+            statusKind = .err
+            return
+        }
+        inputGeneration &+= 1
+        previewGeneration &+= 1
+        acceptImage(data, name: spec.sampleFilename)
+    }
+
     /// Take two to 32 picked images as one load-once run.
     ///
     /// This uses the same already-loaded `Engine` actor for every image. It is
