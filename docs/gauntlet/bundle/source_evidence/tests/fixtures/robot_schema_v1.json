@@ -1,13 +1,5 @@
 {
-  "events": [
-    "run_start",
-    "stage",
-    "page",
-    "staff",
-    "music_warning",
-    "run_complete",
-    "run_error"
-  ],
+  "events": ["run_start", "stage", "page", "staff", "music_warning", "run_complete", "run_error"],
   "exit_codes": [
     {
       "code": 0,
