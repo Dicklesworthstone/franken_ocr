@@ -10,7 +10,8 @@
 // CSP note: this must be an external module (script-src 'self'), never inline.
 const params = new URLSearchParams(location.search);
 const modelId = params.get("model") ?? "tromr";
-const sample = params.get("sample") ?? (modelId === "tromr" ? "sample-staff.png" : "sample-doc.png");
+const sample =
+  params.get("sample") ?? (modelId === "tromr" ? "sample-staff.png" : "sample-doc.png");
 
 const out = { stages: [], done: false };
 globalThis.__focr = out;

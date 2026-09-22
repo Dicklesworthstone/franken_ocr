@@ -38,4 +38,6 @@ if (failures) {
   console.error(`sha256 conformance: ${failures} failure(s)`);
   process.exit(1);
 }
-console.log(`sha256 conformance: OK (${LENGTHS.length} lengths x ${SPLITS.length} splits + FIPS vector)`);
+console.log(
+  `sha256 conformance: OK (${LENGTHS.length} lengths x ${SPLITS.length} splits + FIPS vector)`,
+);

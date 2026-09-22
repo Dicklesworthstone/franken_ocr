@@ -65,9 +65,7 @@ export async function onRequest({ request, params }) {
 
   // Try each upstream in order. Only the Range header crosses; nothing about the
   // requesting browser is forwarded.
-  const headersOut = request.headers.has("range")
-    ? { range: request.headers.get("range") }
-    : {};
+  const headersOut = request.headers.has("range") ? { range: request.headers.get("range") } : {};
   let resp = null;
   let lastStatus = 502;
   for (const base of release.bases) {

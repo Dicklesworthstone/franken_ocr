@@ -61,12 +61,16 @@ try {
     return { ...o, output: o.output ?? "" };
   });
   console.log(`wall: ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-  console.log(`crossOriginIsolated: ${r.crossOriginIsolated}  hardwareConcurrency: ${r.hardwareConcurrency}`);
+  console.log(
+    `crossOriginIsolated: ${r.crossOriginIsolated}  hardwareConcurrency: ${r.hardwareConcurrency}`,
+  );
   console.log(`init: ${JSON.stringify(r.init)}`);
   console.log(`load: ${JSON.stringify(r.load)}`);
   console.log(`stages: ${r.stages.join(" -> ")}`);
   if (r.error) throw new Error(r.error);
-  console.log(`recognize: ${(r.recognize_ms / 1000).toFixed(1)}s   THREADS=${r.load.threads}  PKG=${r.load.pkg}`);
+  console.log(
+    `recognize: ${(r.recognize_ms / 1000).toFixed(1)}s   THREADS=${r.load.threads}  PKG=${r.load.pkg}`,
+  );
   if (!r.output.trim().length) throw new Error("empty output");
   if (outPath) {
     writeFileSync(outPath, r.output);

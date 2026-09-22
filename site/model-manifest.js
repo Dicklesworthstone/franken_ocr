@@ -19,10 +19,26 @@ export const MODELS = {
       sha256: "cced11c0f05656dd54cc615a15939c472dc8f916f04ae154ea4a0364839f845a",
     },
     sidecars: [
-      { name: "tokenizer_rhythm.json", bytes: 10743, sha256: "603bfef760e8424f7808acba423532b4beb2d88dbf085f81add6a8e543a34035" },
-      { name: "tokenizer_pitch.json", bytes: 2682, sha256: "2382e8b20c1473290e200789604656b3a06bdf4b55a0818a0f7d175e8cb64ade" },
-      { name: "tokenizer_lift.json", bytes: 979, sha256: "b61ba09cecd5bc343e6a038a2e26718b54cd3c08e8f9b72013ecf80c3cac86b2" },
-      { name: "tokenizer_note.json", bytes: 830, sha256: "504d886d11e3c1fe92893abd46edfc68dfbe7a8eb83e6b51646532dad8a485e1" },
+      {
+        name: "tokenizer_rhythm.json",
+        bytes: 10743,
+        sha256: "603bfef760e8424f7808acba423532b4beb2d88dbf085f81add6a8e543a34035",
+      },
+      {
+        name: "tokenizer_pitch.json",
+        bytes: 2682,
+        sha256: "2382e8b20c1473290e200789604656b3a06bdf4b55a0818a0f7d175e8cb64ade",
+      },
+      {
+        name: "tokenizer_lift.json",
+        bytes: 979,
+        sha256: "b61ba09cecd5bc343e6a038a2e26718b54cd3c08e8f9b72013ecf80c3cac86b2",
+      },
+      {
+        name: "tokenizer_note.json",
+        bytes: 830,
+        sha256: "504d886d11e3c1fe92893abd46edfc68dfbe7a8eb83e6b51646532dad8a485e1",
+      },
     ],
   },
   "unlimited-ocr": {
@@ -50,12 +66,24 @@ export const MODELS = {
       // byte-split parts; the loader streams them as ONE logical byte stream
       // and verifies each part AND the whole against these pins.
       parts: [
-        { name: "unlimited-ocr.wasm-int4.focrq.part1", bytes: 1677721600, sha256: "95e8bc996ef08dc9ff179dba522ee45e953823913dbf73ac710d799627a9b2c5" },
-        { name: "unlimited-ocr.wasm-int4.focrq.part2", bytes: 1326266517, sha256: "1b6673345d1223f6ad4443df3f9c0760b4e401549c731c1c0d0c9e392dffda93" },
+        {
+          name: "unlimited-ocr.wasm-int4.focrq.part1",
+          bytes: 1677721600,
+          sha256: "95e8bc996ef08dc9ff179dba522ee45e953823913dbf73ac710d799627a9b2c5",
+        },
+        {
+          name: "unlimited-ocr.wasm-int4.focrq.part2",
+          bytes: 1326266517,
+          sha256: "1b6673345d1223f6ad4443df3f9c0760b4e401549c731c1c0d0c9e392dffda93",
+        },
       ],
     },
     sidecars: [
-      { name: "tokenizer.json", bytes: 9979544, sha256: "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4" },
+      {
+        name: "tokenizer.json",
+        bytes: 9979544,
+        sha256: "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4",
+      },
     ],
   },
   "got-ocr2": {
@@ -80,7 +108,11 @@ export const MODELS = {
       sha256: "4da43d7944d7ad6fcab85f1660ceb1a0f0cf7959d6cef0910974ec43aa0d532f",
     },
     sidecars: [
-      { name: "qwen.tiktoken", bytes: 2561218, sha256: "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186" },
+      {
+        name: "qwen.tiktoken",
+        bytes: 2561218,
+        sha256: "b2b1b8dfb5cc5f024bafc373121c6aba3f66f9a5a0269e243470a1de16a33186",
+      },
     ],
   },
   smolvlm2: {
@@ -113,7 +145,11 @@ export const MODELS = {
       sha256: "4ad2ac89e47c83ad4fa3d7389ae753cbbfd190e8214707422abfaeb6439d06fc",
     },
     sidecars: [
-      { name: "tokenizer.json", bytes: 3548256, sha256: "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a" },
+      {
+        name: "tokenizer.json",
+        bytes: 3548256,
+        sha256: "5ece781dc8d2b2f3e2f289ca0ae50b17cfc27dd27bfe7971bb8241e0b964331a",
+      },
     ],
   },
 };

@@ -10,7 +10,14 @@ export const modelstaging_new: () => number;
 export const modelstaging_plan: (a: number, b: number, c: number, d: number, e: number) => void;
 export const modelstaging_push: (a: number, b: number, c: number, d: number) => void;
 export const modelstaging_segment_count: (a: number) => number;
-export const modelstaging_set_sidecar: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const modelstaging_set_sidecar: (
+  a: number,
+  b: number,
+  c: number,
+  d: number,
+  e: number,
+  f: number,
+) => void;
 export const pdf_info: (a: number, b: number, c: number) => void;
 export const pdf_render_page: (a: number, b: number, c: number, d: number) => void;
 export const set_got_format: (a: number) => void;

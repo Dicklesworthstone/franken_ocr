@@ -41,11 +41,9 @@ try {
   console.log(`crossOriginIsolated: ${coi}`);
 
   // 2. engine init
-  await page.waitForFunction(
-    () => !document.getElementById("load-model").disabled,
-    undefined,
-    { timeout: 60_000 },
-  );
+  await page.waitForFunction(() => !document.getElementById("load-model").disabled, undefined, {
+    timeout: 60_000,
+  });
   console.log(`route: ${await page.textContent("#route")}`);
 
   // 3. model download + hydrate. FOCR_SMOKE_MODEL selects the lane:
@@ -68,18 +66,14 @@ try {
   // 4. sample image + recognize
   step("click sample");
   await page.click("#sample");
-  await page.waitForFunction(
-    () => !document.getElementById("run").disabled,
-    undefined,
-    { timeout: 60_000 },
-  );
+  await page.waitForFunction(() => !document.getElementById("run").disabled, undefined, {
+    timeout: 60_000,
+  });
   step("click run");
   await page.click("#run");
-  await page.waitForFunction(
-    () => !document.getElementById("result-wrap").hidden,
-    undefined,
-    { timeout: 10 * 60_000 },
-  );
+  await page.waitForFunction(() => !document.getElementById("result-wrap").hidden, undefined, {
+    timeout: 10 * 60_000,
+  });
   const output = await page.textContent("#output");
   const meta = await page.textContent("#result-meta");
   console.log(`result-meta: ${meta}`);
@@ -98,7 +92,9 @@ try {
     const pages = browser.contexts().flatMap((c) => c.pages());
     for (const p of pages) {
       console.log(`[at-failure] status: ${await p.textContent("#status").catch(() => "?")}`);
-      console.log(`[at-failure] run.disabled: ${await p.evaluate(() => document.getElementById("run")?.disabled).catch(() => "?")}`);
+      console.log(
+        `[at-failure] run.disabled: ${await p.evaluate(() => document.getElementById("run")?.disabled).catch(() => "?")}`,
+      );
     }
   } catch {}
 } finally {

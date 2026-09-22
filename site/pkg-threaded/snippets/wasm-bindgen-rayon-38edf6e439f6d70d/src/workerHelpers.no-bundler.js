@@ -15,10 +15,10 @@
 // a bundlerless ES module environment (which has a few differences).
 
 function waitForMsgType(target, type) {
-  return new Promise(resolve => {
-    target.addEventListener('message', function onMsg({ data }) {
+  return new Promise((resolve) => {
+    target.addEventListener("message", function onMsg({ data }) {
       if (data == null || data.type !== type) return;
-      target.removeEventListener('message', onMsg);
+      target.removeEventListener("message", onMsg);
       resolve(data);
     });
   });
@@ -27,10 +27,10 @@ function waitForMsgType(target, type) {
 // We need to wait for a specific message because this file is used both
 // as a Worker and as a regular script, so it might receive unrelated
 // messages on the page.
-waitForMsgType(self, 'wasm_bindgen_worker_init').then(async data => {
+waitForMsgType(self, "wasm_bindgen_worker_init").then(async (data) => {
   const pkg = await import(data.mainJS);
   await pkg.default(data.module, data.memory);
-  postMessage({ type: 'wasm_bindgen_worker_ready' });
+  postMessage({ type: "wasm_bindgen_worker_ready" });
   pkg.wbg_rayon_start_worker(data.receiver);
 });
 
@@ -49,11 +49,11 @@ export async function startWorkers(module, memory, builder) {
   }
 
   const workerInit = {
-    type: 'wasm_bindgen_worker_init',
+    type: "wasm_bindgen_worker_init",
     module,
     memory,
     receiver: builder.receiver(),
-    mainJS: builder.mainJS()
+    mainJS: builder.mainJS(),
   };
 
   _workers = await Promise.all(
@@ -62,16 +62,16 @@ export async function startWorkers(module, memory, builder) {
       // The script is fetched as a blob so it works even if this script is
       // hosted remotely (e.g. on a CDN). This avoids a cross-origin
       // security error.
-      let scriptBlob = await fetch(import.meta.url).then(r => r.blob());
-      let url = URL.createObjectURL(scriptBlob);
+      const scriptBlob = await fetch(import.meta.url).then((r) => r.blob());
+      const url = URL.createObjectURL(scriptBlob);
       const worker = new Worker(url, {
-        type: 'module'
+        type: "module",
       });
       worker.postMessage(workerInit);
-      await waitForMsgType(worker, 'wasm_bindgen_worker_ready');
+      await waitForMsgType(worker, "wasm_bindgen_worker_ready");
       URL.revokeObjectURL(url);
       return worker;
-    })
+    }),
   );
   builder.build();
 }

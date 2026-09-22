@@ -8,9 +8,9 @@
 //   FOCR_SCRATCH=$S node site/harness/persistence.mjs
 // Writes $S/corpus/browser/PERSISTENCE.json.
 import { spawn } from "node:child_process";
-import { setTimeout as sleep } from "node:timers/promises";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 
 const require = (await import("node:module")).createRequire(
   "/Users/jemanuel/projects/frankentts/package.json",
@@ -30,17 +30,13 @@ const OUT_DIR = join(S, "corpus", "browser");
 
 const reportPath = join(OUT_DIR, process.env.FOCR_DIFF_REPORT ?? "REPORT.json");
 const coldSeconds = existsSync(reportPath)
-  ? JSON.parse(readFileSync(reportPath, "utf8")).cold_load_seconds ?? null
+  ? (JSON.parse(readFileSync(reportPath, "utf8")).cold_load_seconds ?? null)
   : null;
 
-const server = spawn(
-  "node",
-  [new URL("./serve.mjs", import.meta.url).pathname],
-  {
-    env: { ...process.env, PORT: String(PORT), FOCR_MODEL_DIR: MODEL_DIR },
-    stdio: ["ignore", "inherit", "inherit"],
-  },
-);
+const server = spawn("node", [new URL("./serve.mjs", import.meta.url).pathname], {
+  env: { ...process.env, PORT: String(PORT), FOCR_MODEL_DIR: MODEL_DIR },
+  stdio: ["ignore", "inherit", "inherit"],
+});
 await sleep(800);
 
 const consoleLog = [];
@@ -69,11 +65,9 @@ try {
   });
 
   await page.goto(`http://localhost:${PORT}/`);
-  await page.waitForFunction(
-    () => !document.getElementById("load-model").disabled,
-    undefined,
-    { timeout: 60_000 },
-  );
+  await page.waitForFunction(() => !document.getElementById("load-model").disabled, undefined, {
+    timeout: 60_000,
+  });
   await page.selectOption("#model-select", "unlimited-ocr");
   await page.click("#load-model");
   await page.evaluate(() => {
@@ -101,9 +95,7 @@ try {
   result.speedup =
     coldSeconds != null ? Number((coldSeconds / result.warm_load_seconds).toFixed(2)) : null;
   result.verdict =
-    result.from_cache && result.cache_put_warnings.length === 0
-      ? "PERSISTED"
-      : "NOT_PERSISTED";
+    result.from_cache && result.cache_put_warnings.length === 0 ? "PERSISTED" : "NOT_PERSISTED";
 
   console.log(
     `warm load: ${result.warm_load_seconds.toFixed(1)}s (cold was ${coldSeconds}s) — ` +

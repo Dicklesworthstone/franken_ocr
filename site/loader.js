@@ -114,7 +114,10 @@ async function fetchVerifiedSmall(modelId, spec, onProgress) {
   if ((await sha256HexOneShot(buf)) !== spec.sha256) {
     throw new Error(`${spec.name}: SHA-256 mismatch`);
   }
-  await cache.put(url, new Response(buf, { headers: { "content-type": "application/octet-stream" } }));
+  await cache.put(
+    url,
+    new Response(buf, { headers: { "content-type": "application/octet-stream" } }),
+  );
   onProgress?.(spec.bytes, false);
   return buf;
 }
@@ -156,7 +159,9 @@ class WeightsPump {
       const { done, value } = await reader.read();
       if (done) break;
       if (partReceived + value.length > partSpec.bytes) {
-        throw new Error(`${partSpec.name}: server sent more than the pinned ${partSpec.bytes} bytes`);
+        throw new Error(
+          `${partSpec.name}: server sent more than the pinned ${partSpec.bytes} bytes`,
+        );
       }
       partHash.update(value);
       partReceived += value.length;
@@ -239,7 +244,9 @@ async function streamWeights(modelId, spec, sink, onProgress) {
       // Cache write failed (quota). The verified stream still reached the sink —
       // the model runs; it just won't be cached for next time.
       await cache.delete(url).catch(() => {});
-      console.warn(`cache.put(${name}) failed: ${putResult.cacheError} — model will re-download next visit`);
+      console.warn(
+        `cache.put(${name}) failed: ${putResult.cacheError} — model will re-download next visit`,
+      );
     }
   }
 }

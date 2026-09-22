@@ -52,9 +52,7 @@ function blinkAllowsThreads() {
 async function blobModuleWorkerWorks() {
   let url;
   try {
-    url = URL.createObjectURL(
-      new Blob(["self.postMessage('ok');"], { type: "text/javascript" }),
-    );
+    url = URL.createObjectURL(new Blob(["self.postMessage('ok');"], { type: "text/javascript" }));
     const w = new Worker(url, { type: "module" });
     try {
       await new Promise((resolve, reject) => {
@@ -160,8 +158,7 @@ async function dispatch(data) {
       // The build flags are a claim; the instantiated memory is the receipt.
       // A "threaded" module whose memory is a plain ArrayBuffer would run, and
       // run single-threaded, and never say so.
-      threaded =
-        wantThreads && pkg.wasm_memory().buffer instanceof SharedArrayBuffer;
+      threaded = wantThreads && pkg.wasm_memory().buffer instanceof SharedArrayBuffer;
       if (wantThreads && !threaded) {
         throw new Error("pkg-threaded instantiated with a non-shared memory");
       }

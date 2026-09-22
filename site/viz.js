@@ -256,10 +256,21 @@ function buildPipeline() {
     const y = boxY + boxH + 16;
     svg(
       "path",
-      { d: `M ${x0} ${y} L ${x0} ${y + 6} L ${x1} ${y + 6} L ${x1} ${y}`, fill: "none", stroke: color, "stroke-width": 1, opacity: 0.5 },
+      {
+        d: `M ${x0} ${y} L ${x0} ${y + 6} L ${x1} ${y + 6} L ${x1} ${y}`,
+        fill: "none",
+        stroke: color,
+        "stroke-width": 1,
+        opacity: 0.5,
+      },
       root,
     );
-    text(root, (x0 + x1) / 2, y + 22, label, { size: 10, weight: 800, fill: color, extra: { "letter-spacing": "0.18em" } });
+    text(root, (x0 + x1) / 2, y + 22, label, {
+      size: 10,
+      weight: 800,
+      fill: color,
+      extra: { "letter-spacing": "0.18em" },
+    });
   };
   if (visionEnd > 0) {
     bracket(1, visionEnd, "VISION TOWER · KEPT BF16", "rgba(167,139,250,0.85)");
@@ -270,7 +281,11 @@ function buildPipeline() {
 
   // A travelling pulse that traces the whole chain: the one thing static
   // markup cannot say is "this is one forward pass, left to right".
-  const pulse = svg("circle", { r: 5, cy: boxY + boxH / 2, cx: padX, fill: C.accent, opacity: 0 }, root);
+  const pulse = svg(
+    "circle",
+    { r: 5, cy: boxY + boxH / 2, cx: padX, fill: C.accent, opacity: 0 },
+    root,
+  );
   if (!reduced) {
     const x0 = padX + boxW / 2;
     const x1 = W - padX - boxW / 2;
@@ -323,9 +338,16 @@ function buildPipeline() {
       const on = j === index;
       nd.rect.setAttribute(
         "fill",
-        on ? "rgba(52,211,153,0.2)" : nd.stage.kind === "decoder" ? "rgba(16,185,129,0.07)" : C.fillIdle,
+        on
+          ? "rgba(52,211,153,0.2)"
+          : nd.stage.kind === "decoder"
+            ? "rgba(16,185,129,0.07)"
+            : C.fillIdle,
       );
-      nd.rect.setAttribute("stroke", on ? C.accent : nd.stage.kind === "decoder" ? "rgba(52,211,153,0.32)" : C.line);
+      nd.rect.setAttribute(
+        "stroke",
+        on ? C.accent : nd.stage.kind === "decoder" ? "rgba(52,211,153,0.32)" : C.line,
+      );
       nd.rect.setAttribute("stroke-width", on ? 2 : 1.2);
     });
   }
@@ -343,8 +365,14 @@ function buildPipeline() {
   stepper.tabIndex = 0;
   stepper.setAttribute("aria-label", "Pipeline stage details; use the left and right arrow keys");
   stepper.addEventListener("keydown", (e) => {
-    if (e.key === "ArrowLeft") { e.preventDefault(); show(index - 1, true); }
-    if (e.key === "ArrowRight") { e.preventDefault(); show(index + 1, true); }
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      show(index - 1, true);
+    }
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      show(index + 1, true);
+    }
   });
 
   // Replace the static list with the stepper (the list's content lives on
@@ -363,23 +391,29 @@ function buildPipeline() {
       if (timer !== null) clearInterval(timer);
       timer = null;
     };
-    new IntersectionObserver((entries) => {
-      for (const e of entries) {
-        if (e.isIntersecting && auto && timer === null) {
-          timer = setInterval(() => {
-            if (!auto) return stop();
-            if (index === stages.length - 1) {
-              auto = false;
-              return stop();
-            }
-            show(index + 1);
-          }, 4200);
-        } else if (!e.isIntersecting) {
-          stop();
+    new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          if (e.isIntersecting && auto && timer === null) {
+            timer = setInterval(() => {
+              if (!auto) return stop();
+              if (index === stages.length - 1) {
+                auto = false;
+                return stop();
+              }
+              show(index + 1);
+            }, 4200);
+          } else if (!e.isIntersecting) {
+            stop();
+          }
         }
-      }
-    }, { rootMargin: "0px" }).observe(stepper);
-    stepper.addEventListener("pointerdown", () => { auto = false; stop(); });
+      },
+      { rootMargin: "0px" },
+    ).observe(stepper);
+    stepper.addEventListener("pointerdown", () => {
+      auto = false;
+      stop();
+    });
   }
 }
 
@@ -406,12 +440,46 @@ function buildMoe() {
   moeRoot.appendChild(root);
 
   // Router column
-  text(root, 88, 34, "ONE TOKEN", { size: 10.5, weight: 800, fill: C.faint, extra: { "letter-spacing": "0.18em" } });
-  const tokenBox = svg("rect", { x: 24, y: 48, width: 128, height: 40, rx: 9, fill: "rgba(167,139,250,0.1)", stroke: "rgba(167,139,250,0.4)" }, root);
+  text(root, 88, 34, "ONE TOKEN", {
+    size: 10.5,
+    weight: 800,
+    fill: C.faint,
+    extra: { "letter-spacing": "0.18em" },
+  });
+  const tokenBox = svg(
+    "rect",
+    {
+      x: 24,
+      y: 48,
+      width: 128,
+      height: 40,
+      rx: 9,
+      fill: "rgba(167,139,250,0.1)",
+      stroke: "rgba(167,139,250,0.4)",
+    },
+    root,
+  );
   text(root, 88, 73, "hidden 1280", { size: 12, weight: 700, fill: "#c4b5fd", mono: true });
 
-  svg("rect", { x: 24, y: 116, width: 128, height: 52, rx: 9, fill: "rgba(251,191,36,0.07)", stroke: "rgba(251,191,36,0.42)" }, root);
-  text(root, 88, 136, "ROUTER", { size: 11, weight: 800, fill: C.amber, extra: { "letter-spacing": "0.16em" } });
+  svg(
+    "rect",
+    {
+      x: 24,
+      y: 116,
+      width: 128,
+      height: 52,
+      rx: 9,
+      fill: "rgba(251,191,36,0.07)",
+      stroke: "rgba(251,191,36,0.42)",
+    },
+    root,
+  );
+  text(root, 88, 136, "ROUTER", {
+    size: 11,
+    weight: 800,
+    fill: C.amber,
+    extra: { "letter-spacing": "0.16em" },
+  });
   text(root, 88, 154, "f32 · never quantized", { size: 10.5, fill: C.dim, mono: true });
   text(root, 88, 192, "softmax → top-6 greedy", { size: 11, fill: C.dim });
   text(root, 88, 208, "no renormalization", { size: 11, fill: C.faint });
@@ -454,21 +522,47 @@ function buildMoe() {
 
   // Shared experts: always on
   const sx = gx + gridW + 44;
-  text(root, sx + 54, gy - 14, "ALWAYS ON", { size: 10, weight: 800, fill: C.amber, extra: { "letter-spacing": "0.14em" } });
+  text(root, sx + 54, gy - 14, "ALWAYS ON", {
+    size: 10,
+    weight: 800,
+    fill: C.amber,
+    extra: { "letter-spacing": "0.14em" },
+  });
   for (let i = 0; i < 2; i++) {
     svg(
       "rect",
-      { x: sx, y: gy + i * 44, width: 108, height: 34, rx: 8, fill: "rgba(251,191,36,0.12)", stroke: "rgba(251,191,36,0.5)" },
+      {
+        x: sx,
+        y: gy + i * 44,
+        width: 108,
+        height: 34,
+        rx: 8,
+        fill: "rgba(251,191,36,0.12)",
+        stroke: "rgba(251,191,36,0.5)",
+      },
       root,
     );
-    text(root, sx + 54, gy + 22 + i * 44, `shared ${i + 1}`, { size: 11, weight: 700, fill: "#fde68a", mono: true });
+    text(root, sx + 54, gy + 22 + i * 44, `shared ${i + 1}`, {
+      size: 11,
+      weight: 700,
+      fill: "#fde68a",
+      mono: true,
+    });
   }
   text(root, sx + 54, gy + 108, "intermediate", { size: 10.5, fill: C.dim });
   text(root, sx + 54, gy + 123, "1792, fused", { size: 10.5, fill: C.dim, mono: true });
 
   // Read-out line under the grid
-  const readout = text(root, gx + gridW / 2, gy + 8 * (cell + pad) + 22, "", { size: 12.5, weight: 700, fill: C.mid, mono: true });
-  const readout2 = text(root, gx + gridW / 2, gy + 8 * (cell + pad) + 40, "", { size: 11.5, fill: C.dim });
+  const readout = text(root, gx + gridW / 2, gy + 8 * (cell + pad) + 22, "", {
+    size: 12.5,
+    weight: 700,
+    fill: C.mid,
+    mono: true,
+  });
+  const readout2 = text(root, gx + gridW / 2, gy + 8 * (cell + pad) + 40, "", {
+    size: 11.5,
+    fill: C.dim,
+  });
 
   // Measured: routed-expert tensors total 1.716 GB over 11 MoE layers x 64
   // experts; shared experts total 0.054 GB over 11 layers. Per token a layer
@@ -482,7 +576,7 @@ function buildMoe() {
   // Deterministic pseudo-random choice so every visitor sees the same run and
   // the picture is reproducible (an "aha" you can point at, not noise).
   let seed = 20260811;
-  const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
   const pickSix = () => {
     const chosen = new Set();
     while (chosen.size < 6) chosen.add((rnd() * 64) | 0);
@@ -496,8 +590,11 @@ function buildMoe() {
       e.setAttribute("fill", on ? "rgba(52,211,153,0.6)" : C.fillIdle);
       e.setAttribute("stroke", on ? C.accent : C.line);
     });
-    readout.textContent =
-      `token ${tokenNo} · experts ${chosen.slice().sort((a, b) => a - b).map((i) => `#${i}`).join(" ")}`;
+    readout.textContent = `token ${tokenNo} · experts ${chosen
+      .slice()
+      .sort((a, b) => a - b)
+      .map((i) => `#${i}`)
+      .join(" ")}`;
   };
 
   tokenNo = 1;
@@ -562,21 +659,59 @@ function buildBits() {
   const laneW = right - left;
 
   // --- bf16 lane: 16 bits per weight
-  text(root, left - 12, 42, "bf16", { size: 13, weight: 800, fill: C.faint, anchor: "end", mono: true });
+  text(root, left - 12, 42, "bf16", {
+    size: 13,
+    weight: 800,
+    fill: C.faint,
+    anchor: "end",
+    mono: true,
+  });
   text(root, left - 12, 58, "16 bits each", { size: 10.5, fill: C.faint, anchor: "end" });
   const bfCellW = laneW / N;
   for (let i = 0; i < N; i++) {
     const x = left + i * bfCellW;
-    svg("rect", { x: x + 1, y: 26, width: bfCellW - 2, height: 30, rx: 4, fill: "rgba(100,116,139,0.22)", stroke: "rgba(148,163,184,0.35)" }, root);
+    svg(
+      "rect",
+      {
+        x: x + 1,
+        y: 26,
+        width: bfCellW - 2,
+        height: 30,
+        rx: 4,
+        fill: "rgba(100,116,139,0.22)",
+        stroke: "rgba(148,163,184,0.35)",
+      },
+      root,
+    );
     // 16 tick marks = 16 bits, so the width difference is literal, not a metaphor.
     for (let b = 0; b < 16; b++) {
-      svg("rect", { x: x + 2 + b * ((bfCellW - 4) / 16), y: 32, width: Math.max(0.8, (bfCellW - 4) / 16 - 0.7), height: 18, fill: "rgba(203,213,225,0.5)" }, root);
+      svg(
+        "rect",
+        {
+          x: x + 2 + b * ((bfCellW - 4) / 16),
+          y: 32,
+          width: Math.max(0.8, (bfCellW - 4) / 16 - 0.7),
+          height: 18,
+          fill: "rgba(203,213,225,0.5)",
+        },
+        root,
+      );
     }
   }
-  text(root, (left + right) / 2, 76, `${N} weights = ${N * 16} bits = ${N * 2} bytes`, { size: 11.5, fill: C.dim, mono: true });
+  text(root, (left + right) / 2, 76, `${N} weights = ${N * 16} bits = ${N * 2} bytes`, {
+    size: 11.5,
+    fill: C.dim,
+    mono: true,
+  });
 
   // --- int4 lane: 4 bits per weight + one f32 scale for the group
-  text(root, left - 12, 128, "int4", { size: 13, weight: 800, fill: C.accent, anchor: "end", mono: true });
+  text(root, left - 12, 128, "int4", {
+    size: 13,
+    weight: 800,
+    fill: C.accent,
+    anchor: "end",
+    mono: true,
+  });
   text(root, left - 12, 144, "4 bits each", { size: 10.5, fill: C.faint, anchor: "end" });
   // Draw the int4 lane at the SAME bits-per-pixel scale as the bf16 lane above:
   // 4/16 of the width. Anything else would lie about the saving.
@@ -584,17 +719,59 @@ function buildBits() {
   const nibW = q4W / N;
   for (let i = 0; i < N; i++) {
     const x = left + i * nibW;
-    svg("rect", { x: x + 0.6, y: 112, width: nibW - 1.2, height: 30, rx: 2.5, fill: "rgba(16,185,129,0.35)", stroke: "rgba(52,211,153,0.55)", "stroke-width": 0.8 }, root);
+    svg(
+      "rect",
+      {
+        x: x + 0.6,
+        y: 112,
+        width: nibW - 1.2,
+        height: 30,
+        rx: 2.5,
+        fill: "rgba(16,185,129,0.35)",
+        stroke: "rgba(52,211,153,0.55)",
+        "stroke-width": 0.8,
+      },
+      root,
+    );
   }
   // The group scale, drawn to the same scale: 32 bits = two bf16 cells wide.
   const scaleX = left + q4W + 8;
   const scaleW = bfCellW * 2;
-  svg("rect", { x: scaleX, y: 112, width: scaleW, height: 30, rx: 4, fill: "rgba(251,191,36,0.18)", stroke: "rgba(251,191,36,0.55)" }, root);
-  text(root, scaleX + scaleW / 2, 132, "f32 scale", { size: 10.5, weight: 700, fill: "#fde68a", mono: true });
-  svg("path", { d: `M ${left} 150 L ${left} 156 L ${scaleX + scaleW} 156 L ${scaleX + scaleW} 150`, fill: "none", stroke: "rgba(52,211,153,0.5)" }, root);
-  const totalLabel = text(root, (left + scaleX + scaleW) / 2, 172, "", { size: 11.5, fill: C.mid, mono: true, weight: 700 });
+  svg(
+    "rect",
+    {
+      x: scaleX,
+      y: 112,
+      width: scaleW,
+      height: 30,
+      rx: 4,
+      fill: "rgba(251,191,36,0.18)",
+      stroke: "rgba(251,191,36,0.55)",
+    },
+    root,
+  );
+  text(root, scaleX + scaleW / 2, 132, "f32 scale", {
+    size: 10.5,
+    weight: 700,
+    fill: "#fde68a",
+    mono: true,
+  });
+  svg(
+    "path",
+    {
+      d: `M ${left} 150 L ${left} 156 L ${scaleX + scaleW} 156 L ${scaleX + scaleW} 150`,
+      fill: "none",
+      stroke: "rgba(52,211,153,0.5)",
+    },
+    root,
+  );
+  const totalLabel = text(root, (left + scaleX + scaleW) / 2, 172, "", {
+    size: 11.5,
+    fill: C.mid,
+    mono: true,
+    weight: 700,
+  });
   const perLabel = text(root, (left + scaleX + scaleW) / 2, 190, "", { size: 11, fill: C.dim });
-
 
   /* --- controls: group size drives everything, including a measured check --- */
   const GROUPS = [16, 32, 64, 128];
@@ -701,13 +878,14 @@ function tableToBars(table) {
     if (refCol !== null) {
       const rv = Number(cells[refCol].dataset.v ?? cells[refCol].textContent);
       const pair = h("div", { class: "bar-pair" });
-      pair.append(bar(name, rv, `${cells[refCol].textContent.trim()}${unit} <small>ref</small>`, "ref"));
+      pair.append(
+        bar(name, rv, `${cells[refCol].textContent.trim()}${unit} <small>ref</small>`, "ref"),
+      );
       pair.append(
         bar(
           "",
           v,
-          `${cells[valueCol].textContent.trim()}${unit}` +
-            (v <= 0 ? ' <small>exact</small>' : ""),
+          `${cells[valueCol].textContent.trim()}${unit}` + (v <= 0 ? " <small>exact</small>" : ""),
           cls,
         ),
       );
@@ -763,7 +941,11 @@ function buildWalls() {
   railSvg.style.width = "100%";
   railSvg.style.height = "auto";
   rail.appendChild(railSvg);
-  svg("line", { x1: 60, y1: 32, x2: 840, y2: 32, stroke: "rgba(255,255,255,0.12)", "stroke-width": 2 }, railSvg);
+  svg(
+    "line",
+    { x1: 60, y1: 32, x2: 840, y2: 32, stroke: "rgba(255,255,255,0.12)", "stroke-width": 2 },
+    railSvg,
+  );
   // Progress is drawn as a full-length line revealed by stroke-dashoffset:
   // transitioning an SVG geometry attribute (x2) is not reliable everywhere,
   // but dashoffset has been animatable since forever.
@@ -771,7 +953,10 @@ function buildWalls() {
   const railDone = svg(
     "line",
     {
-      x1: 60, y1: 32, x2: 840, y2: 32,
+      x1: 60,
+      y1: 32,
+      x2: 840,
+      y2: 32,
       stroke: C.accent,
       "stroke-width": 2,
       "stroke-dasharray": RAIL_LEN,
@@ -783,7 +968,18 @@ function buildWalls() {
   const marks = walls.map((w, i) => {
     const x = 60 + (i * 780) / (walls.length - 1);
     const g = svg("g", {}, railSvg);
-    const c = svg("circle", { cx: x, cy: 32, r: 11, fill: "#0b1512", stroke: "rgba(255,255,255,0.2)", "stroke-width": 1.5 }, g);
+    const c = svg(
+      "circle",
+      {
+        cx: x,
+        cy: 32,
+        r: 11,
+        fill: "#0b1512",
+        stroke: "rgba(255,255,255,0.2)",
+        "stroke-width": 1.5,
+      },
+      g,
+    );
     const t = text(g, x, 36, String(i + 1), { size: 11, weight: 800, fill: C.faint, mono: true });
     text(g, x, 60, w.rail, { size: 9.5, fill: C.faint, mono: true });
     return { c, t, x };
@@ -797,7 +993,12 @@ function buildWalls() {
   const body = h("div", { class: "step-body", "aria-live": "polite" });
   const dots = h("div", { class: "step-dots", "aria-label": "The five walls" });
   const dotEls = walls.map((w, i) =>
-    h("button", { type: "button", class: "step-dot", "aria-label": `Wall ${i + 1}: ${w.title}`, onclick: () => show(i) }),
+    h("button", {
+      type: "button",
+      class: "step-dot",
+      "aria-label": `Wall ${i + 1}: ${w.title}`,
+      onclick: () => show(i),
+    }),
   );
   dots.append(...dotEls);
   const prev = h("button", { type: "button", class: "btn", text: "← Prev" });
@@ -814,7 +1015,8 @@ function buildWalls() {
     counter.textContent = `${index + 1} / ${walls.length}`;
     title.textContent = w.title;
     stat.textContent = w.stat;
-    body.innerHTML = row("wall", "Wall", w.wall) + row("why", "Why", w.why) + row("fix", "Fix", w.fix);
+    body.innerHTML =
+      row("wall", "Wall", w.wall) + row("why", "Why", w.why) + row("fix", "Fix", w.fix);
     prev.disabled = index === 0;
     next.disabled = index === walls.length - 1;
     dotEls.forEach((d, j) => d.setAttribute("aria-current", j === index ? "true" : "false"));
@@ -836,8 +1038,14 @@ function buildWalls() {
   stepper.tabIndex = 0;
   stepper.setAttribute("aria-label", "The five wasm walls; use the left and right arrow keys");
   stepper.addEventListener("keydown", (e) => {
-    if (e.key === "ArrowLeft") { e.preventDefault(); show(index - 1); }
-    if (e.key === "ArrowRight") { e.preventDefault(); show(index + 1); }
+    if (e.key === "ArrowLeft") {
+      e.preventDefault();
+      show(index - 1);
+    }
+    if (e.key === "ArrowRight") {
+      e.preventDefault();
+      show(index + 1);
+    }
   });
   wallsRoot.appendChild(stepper);
   list.remove();

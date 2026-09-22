@@ -58,10 +58,7 @@ try {
 
   // Open a real multi-page PDF through the file input.
   await page.setInputFiles("#file-input", pdfPath);
-  await page.waitForFunction(
-    () => !document.getElementById("pdf-bar").hidden,
-    { timeout: 30_000 },
-  );
+  await page.waitForFunction(() => !document.getElementById("pdf-bar").hidden, { timeout: 30_000 });
   const pages = Number(await page.locator("#pdf-count").textContent());
   check("PDF opened with a page count", pages > 1, `${pages} pages`);
 
@@ -114,7 +111,11 @@ try {
   } else {
     check("empty range means every page", ranges.all.length === pages, JSON.stringify(ranges.all));
     check("single page", JSON.stringify(ranges.single) === "[2]", JSON.stringify(ranges.single));
-    check("inclusive range", JSON.stringify(ranges.range) === "[1,2]", JSON.stringify(ranges.range));
+    check(
+      "inclusive range",
+      JSON.stringify(ranges.range) === "[1,2]",
+      JSON.stringify(ranges.range),
+    );
     check(
       "unordered input is sorted and deduped",
       JSON.stringify(ranges.unordered) === "[1,3]",

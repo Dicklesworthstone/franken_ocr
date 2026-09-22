@@ -90,8 +90,11 @@ try {
   // Snapshot BEFORE the deliberate negative probe below, which is supposed to
   // log a CSP violation — counting that as a failure would be scoring the test's
   // own control as a bug.
-  check("no CSP/CORS violations during the real fetches", violations.length === 0,
-    violations.join(" | "));
+  check(
+    "no CSP/CORS violations during the real fetches",
+    violations.length === 0,
+    violations.join(" | "),
+  );
 
   // The guarantee the page still makes: nowhere else is reachable.
   const blocked = await page.evaluate(async () => {

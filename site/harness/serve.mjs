@@ -3,9 +3,10 @@
 // file that ships (_headers included, parsed not restated) is the file under
 // test. No mocks — a stubbed fetch/Worker/OPFS harness on the sibling project
 // passed 8/8 while the deployed site hung on every browser.
+
+import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
 import { createServer } from "node:http";
-import { readFileSync, existsSync, statSync, createReadStream } from "node:fs";
-import { join, extname, resolve } from "node:path";
+import { extname, join, resolve } from "node:path";
 
 const SITE = resolve(new URL("..", import.meta.url).pathname);
 const MODEL_DIR = process.env.FOCR_MODEL_DIR ?? "";
@@ -90,4 +91,6 @@ createServer((req, res) => {
     ...headersFor(path),
   });
   res.end(payload);
-}).listen(PORT, () => console.log(`serving ${SITE} on http://localhost:${PORT} (models: ${MODEL_DIR || "UNSET"})`));
+}).listen(PORT, () =>
+  console.log(`serving ${SITE} on http://localhost:${PORT} (models: ${MODEL_DIR || "UNSET"})`),
+);

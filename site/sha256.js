@@ -20,8 +20,8 @@ const K = new Uint32Array([
 export class Sha256 {
   constructor() {
     this.h = new Uint32Array([
-      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-      0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+      0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+      0x5be0cd19,
     ]);
     this.block = new Uint8Array(64);
     this.blockLen = 0;
@@ -93,20 +93,30 @@ export class Sha256 {
     }
     let [a, b, c, d, e, f, g, hh] = h;
     for (let i = 0; i < 64; i += 1) {
-      const S1 = (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) >>> 0;
+      const S1 =
+        (((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7))) >>> 0;
       const ch = ((e & f) ^ (~e & g)) >>> 0;
       const t1 = (hh + S1 + ch + K[i] + w[i]) >>> 0;
-      const S0 = (((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) >>> 0;
+      const S0 =
+        (((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10))) >>> 0;
       const maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0;
       const t2 = (S0 + maj) >>> 0;
-      hh = g; g = f; f = e;
+      hh = g;
+      g = f;
+      f = e;
       e = (d + t1) >>> 0;
-      d = c; c = b; b = a;
+      d = c;
+      c = b;
+      b = a;
       a = (t1 + t2) >>> 0;
     }
-    h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0;
-    h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
-    h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0;
-    h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+    h[0] = (h[0] + a) >>> 0;
+    h[1] = (h[1] + b) >>> 0;
+    h[2] = (h[2] + c) >>> 0;
+    h[3] = (h[3] + d) >>> 0;
+    h[4] = (h[4] + e) >>> 0;
+    h[5] = (h[5] + f) >>> 0;
+    h[6] = (h[6] + g) >>> 0;
+    h[7] = (h[7] + hh) >>> 0;
   }
 }

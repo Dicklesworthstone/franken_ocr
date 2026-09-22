@@ -7,108 +7,108 @@
  * tokenizer sidecars keyed by their canonical zoo filenames.
  */
 export class ModelStaging {
-    free(): void;
-    [Symbol.dispose](): void;
-    /**
-     * Bytes staged so far (for progress display).
-     */
-    filled(): number;
-    /**
-     * Free the staged bytes explicitly (a superseded or failed load should
-     * not wait for the JS GC's FinalizationRegistry).
-     */
-    free(): void;
-    /**
-     * An empty staging area. Call [`Self::reserve`] before the first
-     * [`Self::push`].
-     */
-    constructor();
-    /**
-     * PHASE 1 of staging (bd-syf2): plan the blob's segmentation from a
-     * downloaded PREFIX of the artifact, and reserve every planned segment.
-     *
-     * `header_prefix` is the artifact's leading bytes (4 MiB is ample: the
-     * 3.0 GB Unlimited artifact's header is ~0.5 MB). `total_bytes` is the
-     * artifact's full pinned size. Returns a JSON object:
-     *
-     * * `{"status":"planned","segments":[len,…],"payload_base":N}` — staging is
-     *   armed; start pushing bytes from offset 0.
-     * * `{"status":"need_prefix","need_bytes":N}` — the prefix did not contain
-     *   the whole header; refetch at least `N` leading bytes and call again
-     *   (this converges in at most two probes).
-     *
-     * A small model (TrOMR) plans to exactly one segment and behaves like the
-     * old single-buffer `reserve` did.
-     *
-     * # Errors
-     * A malformed header, an artifact whose layout offers no clean cut, or a
-     * failed reservation (named with its byte count, never an opaque trap).
-     */
-    plan(header_prefix: Uint8Array, total_bytes: number): string;
-    /**
-     * PHASE 2: append one downloaded chunk. The caller streams the artifact
-     * start-to-end and never needs to know where the segment edges are — a
-     * chunk that spans a boundary is split across the two segments here.
-     * Refuses bytes past the planned total: a mismatched manifest must fail
-     * loudly, not grow silently.
-     */
-    push(chunk: Uint8Array): void;
-    /**
-     * The planned segment count (1 for every model that fits one buffer).
-     */
-    segment_count(): number;
-    /**
-     * Attach one tokenizer sidecar by its canonical zoo filename:
-     * `tokenizer.json`, `qwen.tiktoken`, the four TrOMR tables
-     * `tokenizer_{rhythm,pitch,lift,note}.json`, or OneChart's OPT
-     * slow-tokenizer triple `vocab.json` / `merges.txt` /
-     * `added_tokens.json`.
-     */
-    set_sidecar(name: string, bytes: Uint8Array): void;
+  free(): void;
+  [Symbol.dispose](): void;
+  /**
+   * Bytes staged so far (for progress display).
+   */
+  filled(): number;
+  /**
+   * Free the staged bytes explicitly (a superseded or failed load should
+   * not wait for the JS GC's FinalizationRegistry).
+   */
+  free(): void;
+  /**
+   * An empty staging area. Call [`Self::reserve`] before the first
+   * [`Self::push`].
+   */
+  constructor();
+  /**
+   * PHASE 1 of staging (bd-syf2): plan the blob's segmentation from a
+   * downloaded PREFIX of the artifact, and reserve every planned segment.
+   *
+   * `header_prefix` is the artifact's leading bytes (4 MiB is ample: the
+   * 3.0 GB Unlimited artifact's header is ~0.5 MB). `total_bytes` is the
+   * artifact's full pinned size. Returns a JSON object:
+   *
+   * * `{"status":"planned","segments":[len,…],"payload_base":N}` — staging is
+   *   armed; start pushing bytes from offset 0.
+   * * `{"status":"need_prefix","need_bytes":N}` — the prefix did not contain
+   *   the whole header; refetch at least `N` leading bytes and call again
+   *   (this converges in at most two probes).
+   *
+   * A small model (TrOMR) plans to exactly one segment and behaves like the
+   * old single-buffer `reserve` did.
+   *
+   * # Errors
+   * A malformed header, an artifact whose layout offers no clean cut, or a
+   * failed reservation (named with its byte count, never an opaque trap).
+   */
+  plan(header_prefix: Uint8Array, total_bytes: number): string;
+  /**
+   * PHASE 2: append one downloaded chunk. The caller streams the artifact
+   * start-to-end and never needs to know where the segment edges are — a
+   * chunk that spans a boundary is split across the two segments here.
+   * Refuses bytes past the planned total: a mismatched manifest must fail
+   * loudly, not grow silently.
+   */
+  push(chunk: Uint8Array): void;
+  /**
+   * The planned segment count (1 for every model that fits one buffer).
+   */
+  segment_count(): number;
+  /**
+   * Attach one tokenizer sidecar by its canonical zoo filename:
+   * `tokenizer.json`, `qwen.tiktoken`, the four TrOMR tables
+   * `tokenizer_{rhythm,pitch,lift,note}.json`, or OneChart's OPT
+   * slow-tokenizer triple `vocab.json` / `merges.txt` /
+   * `added_tokens.json`.
+   */
+  set_sidecar(name: string, bytes: Uint8Array): void;
 }
 
 /**
  * A loaded model plus the recognize entrypoints the playground calls.
  */
 export class WasmEngine {
-    private constructor();
-    free(): void;
-    [Symbol.dispose](): void;
-    /**
-     * Free the engine (and, if this was the last handle, the weight bytes)
-     * explicitly rather than waiting for the JS GC.
-     */
-    free_engine(): void;
-    /**
-     * Build the engine from a completed staging area (consumes it — the
-     * weight bytes move, they are not copied).
-     *
-     * Fails if the staging is incomplete, the blob does not parse as a
-     * `.focrq`/safetensors container, or the Unlimited-OCR recipe validation
-     * rejects the tensor dtypes.
-     */
-    static from_staging(staging: ModelStaging): WasmEngine;
-    /**
-     * The model-weights license notice that must travel with the artifact.
-     */
-    license_notice(): string;
-    /**
-     * The loaded model's registry id (`unlimited-ocr`, `tromr`, …).
-     */
-    model_id(): string;
-    /**
-     * Recognize one encoded image (PNG/JPEG bytes) and return the model's
-     * primary text output: markdown for the OCR models, MusicXML for TrOMR.
-     */
-    recognize(image_bytes: Uint8Array): string;
-    /**
-     * Recognize one encoded image and return a JSON envelope:
-     * `{"model_id", "output", "layout": [{label, boxes}], "music": {...}?}`.
-     * `layout` mirrors `focr ocr --json`; `music` carries the TrOMR staff
-     * metadata (recognized bboxes, per-staff skips with reasons, annotate-only
-     * warnings) when the run produced any.
-     */
-    recognize_json(image_bytes: Uint8Array): string;
+  private constructor();
+  free(): void;
+  [Symbol.dispose](): void;
+  /**
+   * Free the engine (and, if this was the last handle, the weight bytes)
+   * explicitly rather than waiting for the JS GC.
+   */
+  free_engine(): void;
+  /**
+   * Build the engine from a completed staging area (consumes it — the
+   * weight bytes move, they are not copied).
+   *
+   * Fails if the staging is incomplete, the blob does not parse as a
+   * `.focrq`/safetensors container, or the Unlimited-OCR recipe validation
+   * rejects the tensor dtypes.
+   */
+  static from_staging(staging: ModelStaging): WasmEngine;
+  /**
+   * The model-weights license notice that must travel with the artifact.
+   */
+  license_notice(): string;
+  /**
+   * The loaded model's registry id (`unlimited-ocr`, `tromr`, …).
+   */
+  model_id(): string;
+  /**
+   * Recognize one encoded image (PNG/JPEG bytes) and return the model's
+   * primary text output: markdown for the OCR models, MusicXML for TrOMR.
+   */
+  recognize(image_bytes: Uint8Array): string;
+  /**
+   * Recognize one encoded image and return a JSON envelope:
+   * `{"model_id", "output", "layout": [{label, boxes}], "music": {...}?}`.
+   * `layout` mirrors `focr ocr --json`; `music` carries the TrOMR staff
+   * metadata (recognized bboxes, per-staff skips with reasons, annotate-only
+   * warnings) when the run produced any.
+   */
+  recognize_json(image_bytes: Uint8Array): string;
 }
 
 /**
@@ -254,13 +254,13 @@ export function thread_count(): number;
 export function wasm_memory(): any;
 
 export class wbg_rayon_PoolBuilder {
-    private constructor();
-    free(): void;
-    [Symbol.dispose](): void;
-    build(): void;
-    mainJS(): string;
-    numThreads(): number;
-    receiver(): number;
+  private constructor();
+  free(): void;
+  [Symbol.dispose](): void;
+  build(): void;
+  mainJS(): string;
+  numThreads(): number;
+  receiver(): number;
 }
 
 export function wbg_rayon_start_worker(receiver: number): void;
@@ -268,49 +268,56 @@ export function wbg_rayon_start_worker(receiver: number): void;
 export type InitInput = RequestInfo | URL | Response | BufferSource | WebAssembly.Module;
 
 export interface InitOutput {
-    readonly __wbg_modelstaging_free: (a: number, b: number) => void;
-    readonly __wbg_wasmengine_free: (a: number, b: number) => void;
-    readonly engine_info: (a: number) => void;
-    readonly int8_route: (a: number) => void;
-    readonly modelstaging_filled: (a: number) => number;
-    readonly modelstaging_free: (a: number) => void;
-    readonly modelstaging_new: () => number;
-    readonly modelstaging_plan: (a: number, b: number, c: number, d: number, e: number) => void;
-    readonly modelstaging_push: (a: number, b: number, c: number, d: number) => void;
-    readonly modelstaging_segment_count: (a: number) => number;
-    readonly modelstaging_set_sidecar: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly pdf_info: (a: number, b: number, c: number) => void;
-    readonly pdf_render_page: (a: number, b: number, c: number, d: number) => void;
-    readonly set_got_format: (a: number) => void;
-    readonly set_progress_callback: (a: number) => void;
-    readonly set_smolvlm2_question: (a: number, b: number) => void;
-    readonly wasmengine_free_engine: (a: number) => void;
-    readonly wasmengine_from_staging: (a: number, b: number) => void;
-    readonly wasmengine_license_notice: (a: number, b: number) => void;
-    readonly wasmengine_model_id: (a: number, b: number) => void;
-    readonly wasmengine_recognize: (a: number, b: number, c: number, d: number) => void;
-    readonly wasmengine_recognize_json: (a: number, b: number, c: number, d: number) => void;
-    readonly set_no_repeat_ngram: (a: number) => void;
-    readonly focr_wasm_start: () => void;
-    readonly request_cancel: () => void;
-    readonly reset_cancel: () => void;
-    readonly thread_count: () => number;
-    readonly wasm_memory: () => number;
-    readonly __wbg_wbg_rayon_poolbuilder_free: (a: number, b: number) => void;
-    readonly initThreadPool: (a: number) => number;
-    readonly wbg_rayon_poolbuilder_build: (a: number) => void;
-    readonly wbg_rayon_poolbuilder_mainJS: (a: number) => number;
-    readonly wbg_rayon_poolbuilder_numThreads: (a: number) => number;
-    readonly wbg_rayon_poolbuilder_receiver: (a: number) => number;
-    readonly wbg_rayon_start_worker: (a: number) => void;
-    readonly memory: WebAssembly.Memory;
-    readonly __wbindgen_export: (a: number) => void;
-    readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
-    readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
-    readonly __wbindgen_export3: (a: number, b: number) => number;
-    readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
-    readonly __wbindgen_thread_destroy: (a?: number, b?: number, c?: number) => void;
-    readonly __wbindgen_start: (a: number) => void;
+  readonly __wbg_modelstaging_free: (a: number, b: number) => void;
+  readonly __wbg_wasmengine_free: (a: number, b: number) => void;
+  readonly engine_info: (a: number) => void;
+  readonly int8_route: (a: number) => void;
+  readonly modelstaging_filled: (a: number) => number;
+  readonly modelstaging_free: (a: number) => void;
+  readonly modelstaging_new: () => number;
+  readonly modelstaging_plan: (a: number, b: number, c: number, d: number, e: number) => void;
+  readonly modelstaging_push: (a: number, b: number, c: number, d: number) => void;
+  readonly modelstaging_segment_count: (a: number) => number;
+  readonly modelstaging_set_sidecar: (
+    a: number,
+    b: number,
+    c: number,
+    d: number,
+    e: number,
+    f: number,
+  ) => void;
+  readonly pdf_info: (a: number, b: number, c: number) => void;
+  readonly pdf_render_page: (a: number, b: number, c: number, d: number) => void;
+  readonly set_got_format: (a: number) => void;
+  readonly set_progress_callback: (a: number) => void;
+  readonly set_smolvlm2_question: (a: number, b: number) => void;
+  readonly wasmengine_free_engine: (a: number) => void;
+  readonly wasmengine_from_staging: (a: number, b: number) => void;
+  readonly wasmengine_license_notice: (a: number, b: number) => void;
+  readonly wasmengine_model_id: (a: number, b: number) => void;
+  readonly wasmengine_recognize: (a: number, b: number, c: number, d: number) => void;
+  readonly wasmengine_recognize_json: (a: number, b: number, c: number, d: number) => void;
+  readonly set_no_repeat_ngram: (a: number) => void;
+  readonly focr_wasm_start: () => void;
+  readonly request_cancel: () => void;
+  readonly reset_cancel: () => void;
+  readonly thread_count: () => number;
+  readonly wasm_memory: () => number;
+  readonly __wbg_wbg_rayon_poolbuilder_free: (a: number, b: number) => void;
+  readonly initThreadPool: (a: number) => number;
+  readonly wbg_rayon_poolbuilder_build: (a: number) => void;
+  readonly wbg_rayon_poolbuilder_mainJS: (a: number) => number;
+  readonly wbg_rayon_poolbuilder_numThreads: (a: number) => number;
+  readonly wbg_rayon_poolbuilder_receiver: (a: number) => number;
+  readonly wbg_rayon_start_worker: (a: number) => void;
+  readonly memory: WebAssembly.Memory;
+  readonly __wbindgen_export: (a: number) => void;
+  readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
+  readonly __wbindgen_export2: (a: number, b: number, c: number) => void;
+  readonly __wbindgen_export3: (a: number, b: number) => number;
+  readonly __wbindgen_export4: (a: number, b: number, c: number, d: number) => number;
+  readonly __wbindgen_thread_destroy: (a?: number, b?: number, c?: number) => void;
+  readonly __wbindgen_start: (a: number) => void;
 }
 
 export type SyncInitInput = BufferSource | WebAssembly.Module;
@@ -324,7 +331,12 @@ export type SyncInitInput = BufferSource | WebAssembly.Module;
  *
  * @returns {InitOutput}
  */
-export function initSync(module: { module: SyncInitInput, memory?: WebAssembly.Memory, thread_stack_size?: number } | SyncInitInput, memory?: WebAssembly.Memory): InitOutput;
+export function initSync(
+  module:
+    | { module: SyncInitInput; memory?: WebAssembly.Memory; thread_stack_size?: number }
+    | SyncInitInput,
+  memory?: WebAssembly.Memory,
+): InitOutput;
 
 /**
  * If `module_or_path` is {RequestInfo} or {URL}, makes a request and
@@ -335,4 +347,14 @@ export function initSync(module: { module: SyncInitInput, memory?: WebAssembly.M
  *
  * @returns {Promise<InitOutput>}
  */
-export default function __wbg_init (module_or_path?: { module_or_path: InitInput | Promise<InitInput>, memory?: WebAssembly.Memory, thread_stack_size?: number } | InitInput | Promise<InitInput>, memory?: WebAssembly.Memory): Promise<InitOutput>;
+export default function __wbg_init(
+  module_or_path?:
+    | {
+        module_or_path: InitInput | Promise<InitInput>;
+        memory?: WebAssembly.Memory;
+        thread_stack_size?: number;
+      }
+    | InitInput
+    | Promise<InitInput>,
+  memory?: WebAssembly.Memory,
+): Promise<InitOutput>;

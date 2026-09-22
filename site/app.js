@@ -26,7 +26,9 @@ function call(type, payload = {}, transfer = []) {
     const id = nextId++;
     const timer = setTimeout(() => {
       pending.delete(id);
-      reject(new Error(`${type}: no reply within ${CEILINGS_MS[type] / 1000}s (worker hung or killed)`));
+      reject(
+        new Error(`${type}: no reply within ${CEILINGS_MS[type] / 1000}s (worker hung or killed)`),
+      );
     }, CEILINGS_MS[type] ?? 60_000);
     pending.set(id, { resolve, reject, timer });
     worker.postMessage({ id, type, ...payload }, transfer);
@@ -90,7 +92,7 @@ function onProgress({ loaded, total, fromCache }) {
   let rate = 0;
   if (rateWindow.length > 1) {
     const [t0, b0] = rateWindow[0];
-    rate = ((loaded - b0) / ((now - t0) / 1000)) || 0;
+    rate = (loaded - b0) / ((now - t0) / 1000) || 0;
   }
   const eta = rate > 0 ? Math.ceil((total - loaded) / rate) : null;
   $("progress-text").textContent =
@@ -203,9 +205,7 @@ function paintRecognizeProgress(detail) {
   // a hang. Capped at 99: only the returned result may show a full bar.
   const page = recognizeProgress?.done ?? 0;
   const overall =
-    documentIndex === null || documentTotal === 0
-      ? page
-      : (documentIndex + page) / documentTotal;
+    documentIndex === null || documentTotal === 0 ? page : (documentIndex + page) / documentTotal;
   const pct = Math.min(Math.round(overall * 100), 99);
   $("progress-wrap").hidden = false;
   $("progress-bar").style.width = `${pct}%`;
@@ -365,10 +365,7 @@ async function acceptPdf(file) {
     // Render the first page BEFORE the summary, so the summary is what the
     // reader is left looking at rather than a transient "rendering…" line.
     await loadPdfPage(1);
-    setStatus(
-      `PDF opened: ${info.pages} page(s). Recognize reads the whole document.`,
-      "ok",
-    );
+    setStatus(`PDF opened: ${info.pages} page(s). Recognize reads the whole document.`, "ok");
   } catch (err) {
     currentPdf = null;
     $("pdf-bar").hidden = true;
@@ -512,10 +509,7 @@ function ledgerDocument() {
   return pageLedger
     .filter((r) => r.state === "done" || r.state === "skipped")
     .map((r) => {
-      const label =
-        r.state === "done"
-          ? `page ${r.page}`
-          : `page ${r.page} skipped: ${r.reason}`;
+      const label = r.state === "done" ? `page ${r.page}` : `page ${r.page} skipped: ${r.reason}`;
       const header = music ? `===== ${label} =====` : `<!-- ${label} -->`;
       return r.state === "done" ? `${header}\n\n${r.output}` : header;
     })
@@ -731,7 +725,7 @@ async function runDocument() {
     cancelled
       ? `Cancelled after ${documentDone} of ${pages.length} pages.`
       : `${documentDone} of ${pages.length} pages in ${seconds.toFixed(0)}s` +
-        `${skipped ? ` · ${skipped} skipped` : ""}, entirely on this device.`,
+          `${skipped ? ` · ${skipped} skipped` : ""}, entirely on this device.`,
     skipped || cancelled ? "warn" : "ok",
   );
 }
@@ -845,7 +839,10 @@ const BLOCK_TAGS = new Set(["table", "thead", "tbody", "tfoot", "tr", "td", "th"
 const BLOCK_ATTRS = new Set(["rowspan", "colspan"]);
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  return s.replace(
+    /[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c],
+  );
 }
 
 // Rewrite an embedded HTML span down to the table allowlist. Anything outside
@@ -854,7 +851,10 @@ function escapeHtml(s) {
 function sanitizeEmbedded(html) {
   let s = html.replace(/<!--[\s\S]*?-->/g, "");
   s = s.replace(/<(script|style|iframe|object|embed|noscript|template)\b[\s\S]*?<\/\1\s*>/gi, "");
-  s = s.replace(/<(script|style|iframe|object|embed|noscript|template|link|meta|base)\b[^>]*>/gi, "");
+  s = s.replace(
+    /<(script|style|iframe|object|embed|noscript|template|link|meta|base)\b[^>]*>/gi,
+    "",
+  );
   return s.replace(
     /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g,
     (_m, slash, name, attrs) => {
