@@ -1,8 +1,5 @@
 {
-  "pages": [
-    "page_0009.png",
-    "page_0014.png"
-  ],
+  "pages": ["page_0009.png", "page_0014.png"],
   "prompt": "<image>Multi page parsing.",
   "image_size": 640,
   "no_repeat_ngram_size": 35,

@@ -1,38 +1,11 @@
 {
   "schema_version": 1,
-  "required_common": [
-    "schema_version",
-    "ts",
-    "test",
-    "case",
-    "run_seq",
-    "event",
-    "result"
-  ],
-  "optional_common": [
-    "trace_id"
-  ],
-  "scrubbable_fields": [
-    "ts",
-    "elapsed_us"
-  ],
+  "required_common": ["schema_version", "ts", "test", "case", "run_seq", "event", "result"],
+  "optional_common": ["trace_id"],
+  "scrubbable_fields": ["ts", "elapsed_us"],
   "enums": {
-    "event": [
-      "setup",
-      "stage",
-      "parity",
-      "assert",
-      "skip",
-      "result",
-      "error"
-    ],
-    "result": [
-      "pass",
-      "fail",
-      "xfail",
-      "skip",
-      "skip_no_model"
-    ],
+    "event": ["setup", "stage", "parity", "assert", "skip", "result", "error"],
+    "result": ["pass", "fail", "xfail", "skip", "skip_no_model"],
     "stage": [
       "decode_image",
       "preprocess",
@@ -54,31 +27,9 @@
       "lm_head",
       "kv_cache"
     ],
-    "dtype": [
-      "f32",
-      "bf16",
-      "i8",
-      "i4",
-      "u8"
-    ],
-    "simd_tier": [
-      "smmla",
-      "sdot",
-      "vnni512",
-      "vnni256",
-      "amx",
-      "avx2",
-      "scalar",
-      "none"
-    ],
-    "gate": [
-      "L0",
-      "L1",
-      "L2",
-      "L3",
-      "L4",
-      "L5"
-    ],
+    "dtype": ["f32", "bf16", "i8", "i4", "u8"],
+    "simd_tier": ["smmla", "sdot", "vnni512", "vnni256", "amx", "avx2", "scalar", "none"],
+    "gate": ["L0", "L1", "L2", "L3", "L4", "L5"],
     "metric": [
       "cosine",
       "max_abs_diff",
@@ -90,18 +41,8 @@
     ]
   },
   "required_by_event": {
-    "setup": [
-      "seed"
-    ],
-    "stage": [
-      "stage",
-      "inputs",
-      "shapes",
-      "dtype",
-      "elapsed_us",
-      "simd_tier",
-      "seed"
-    ],
+    "setup": ["seed"],
+    "stage": ["stage", "inputs", "shapes", "dtype", "elapsed_us", "simd_tier", "seed"],
     "parity": [
       "gate",
       "metric",
@@ -112,25 +53,12 @@
       "nondeterminism_envelope",
       "pass"
     ],
-    "assert": [
-      "assertion",
-      "pass"
-    ],
-    "skip": [
-      "reason"
-    ],
-    "result": [
-      "elapsed_us"
-    ],
-    "error": [
-      "diag"
-    ]
+    "assert": ["assertion", "pass"],
+    "skip": ["reason"],
+    "result": ["elapsed_us"],
+    "error": ["diag"]
   },
-  "required_diag_fields": [
-    "error_kind",
-    "focr_exit_code",
-    "message"
-  ],
+  "required_diag_fields": ["error_kind", "focr_exit_code", "message"],
   "native_path_proof": {
     "field": "native_path_ran",
     "fallback_field": "fallback_target",

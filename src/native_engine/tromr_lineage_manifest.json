@@ -316,35 +316,180 @@
       "audit_method": "enumerate every reachable official commit tree; inspect complete path inventories and source for trainer, data-loader, dataset-generation, tokenizer-generation, optimizer, scheduler, split, checkpoint-selection, and evaluation entrypoints"
     },
     "fields": [
-      {"name":"published_training_entrypoint","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:readme-line-5","official:all-17-commit-trees"]},
-      {"name":"dataset_generation_code","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"exact_corpus_sample_identities","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"split_construction","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"tokenizer_construction_inputs","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"augmentation_sequence","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"preprocessing_training_sequence","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"seed_and_order_policy","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"initialization_and_pretraining","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"per_head_cross_entropy","evidence_class":"official_source","value":"rhythm,pitch,lift,note","evidence_refs":["official:tromr/model/decoder.py"]},
-      {"name":"consistency_loss_gamma","evidence_class":"official_source","value":"10","evidence_refs":["official:tromr/model/decoder.py"]},
-      {"name":"complete_loss_aggregation","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"paper_loss_lambda","evidence_class":"official_paper","value":"0.1","evidence_refs":["official-paper:arxiv-2308.09370v1:section-4.1:tex-line-154"]},
-      {"name":"paper_loss_beta","evidence_class":"official_paper","value":"1.0","evidence_refs":["official-paper:arxiv-2308.09370v1:section-4.1:tex-line-154"]},
-      {"name":"optimizer_family","evidence_class":"official_paper","value":"Adam","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
-      {"name":"initial_learning_rate","evidence_class":"official_paper","value":"0.001","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
-      {"name":"optimizer_betas_epsilon_weight_decay","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"scheduler_and_warmup","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"gradient_clipping_accumulation_amp","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"batch_size","evidence_class":"official_paper","value":"32","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
-      {"name":"input_geometry","evidence_class":"official_paper","value":"128x1280","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-179"]},
-      {"name":"generated_staff_count","evidence_class":"official_paper","value":"about-400000","evidence_refs":["official-paper:arxiv-2308.09370v1:section-2.1:tex-line-96"]},
-      {"name":"cmsd_staff_crop_count","evidence_class":"official_paper","value":"71292","evidence_refs":["official-paper:arxiv-2308.09370v1:section-2.1:tex-line-96"]},
-      {"name":"training_hardware","evidence_class":"official_paper","value":"single NVIDIA A100 40GB","evidence_refs":["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]},
-      {"name":"stopping_and_checkpoint_selection","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"musescore_and_generation_tool_versions","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"original_evaluation_entrypoint","evidence_class":"unavailable_upstream","value":null,"evidence_refs":["official:all-17-commit-trees"]},
-      {"name":"resumable_optimizer_scheduler_state","evidence_class":"official_source","value":"absent_from_261_tensor_state_dict","evidence_refs":["official:tromr/workspace/checkpoints/img2score_epoch47.pth"]},
-      {"name":"checkpoint_epoch_label","evidence_class":"official_source","value":"epoch47_filename_only; selection meaning unavailable","evidence_refs":["official:tromr/workspace/checkpoints/img2score_epoch47.pth"]}
+      {
+        "name": "published_training_entrypoint",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:readme-line-5", "official:all-17-commit-trees"]
+      },
+      {
+        "name": "dataset_generation_code",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "exact_corpus_sample_identities",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "split_construction",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "tokenizer_construction_inputs",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "augmentation_sequence",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "preprocessing_training_sequence",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "seed_and_order_policy",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "initialization_and_pretraining",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "per_head_cross_entropy",
+        "evidence_class": "official_source",
+        "value": "rhythm,pitch,lift,note",
+        "evidence_refs": ["official:tromr/model/decoder.py"]
+      },
+      {
+        "name": "consistency_loss_gamma",
+        "evidence_class": "official_source",
+        "value": "10",
+        "evidence_refs": ["official:tromr/model/decoder.py"]
+      },
+      {
+        "name": "complete_loss_aggregation",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "paper_loss_lambda",
+        "evidence_class": "official_paper",
+        "value": "0.1",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-4.1:tex-line-154"]
+      },
+      {
+        "name": "paper_loss_beta",
+        "evidence_class": "official_paper",
+        "value": "1.0",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-4.1:tex-line-154"]
+      },
+      {
+        "name": "optimizer_family",
+        "evidence_class": "official_paper",
+        "value": "Adam",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]
+      },
+      {
+        "name": "initial_learning_rate",
+        "evidence_class": "official_paper",
+        "value": "0.001",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]
+      },
+      {
+        "name": "optimizer_betas_epsilon_weight_decay",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "scheduler_and_warmup",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "gradient_clipping_accumulation_amp",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "batch_size",
+        "evidence_class": "official_paper",
+        "value": "32",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]
+      },
+      {
+        "name": "input_geometry",
+        "evidence_class": "official_paper",
+        "value": "128x1280",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-179"]
+      },
+      {
+        "name": "generated_staff_count",
+        "evidence_class": "official_paper",
+        "value": "about-400000",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-2.1:tex-line-96"]
+      },
+      {
+        "name": "cmsd_staff_crop_count",
+        "evidence_class": "official_paper",
+        "value": "71292",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-2.1:tex-line-96"]
+      },
+      {
+        "name": "training_hardware",
+        "evidence_class": "official_paper",
+        "value": "single NVIDIA A100 40GB",
+        "evidence_refs": ["official-paper:arxiv-2308.09370v1:section-5.1:tex-line-177"]
+      },
+      {
+        "name": "stopping_and_checkpoint_selection",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "musescore_and_generation_tool_versions",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "original_evaluation_entrypoint",
+        "evidence_class": "unavailable_upstream",
+        "value": null,
+        "evidence_refs": ["official:all-17-commit-trees"]
+      },
+      {
+        "name": "resumable_optimizer_scheduler_state",
+        "evidence_class": "official_source",
+        "value": "absent_from_261_tensor_state_dict",
+        "evidence_refs": ["official:tromr/workspace/checkpoints/img2score_epoch47.pth"]
+      },
+      {
+        "name": "checkpoint_epoch_label",
+        "evidence_class": "official_source",
+        "value": "epoch47_filename_only; selection meaning unavailable",
+        "evidence_refs": ["official:tromr/workspace/checkpoints/img2score_epoch47.pth"]
+      }
     ]
   }
 }

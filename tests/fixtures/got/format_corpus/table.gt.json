@@ -1,24 +1,4 @@
 {
-  "headers": [
-    "Item",
-    "Qty",
-    "Price"
-  ],
-  "rows": [
-    [
-      "Widget",
-      "4",
-      "2.50"
-    ],
-    [
-      "Gadget",
-      "17",
-      "3.75"
-    ],
-    [
-      "Sprocket",
-      "42",
-      "1.20"
-    ]
-  ]
+  "headers": ["Item", "Qty", "Price"],
+  "rows": [["Widget", "4", "2.50"], ["Gadget", "17", "3.75"], ["Sprocket", "42", "1.20"]]
 }

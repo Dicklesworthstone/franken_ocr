@@ -1,16 +1,6 @@
 {
   "title": "Widget output",
   "ylabel": "units",
-  "labels": [
-    "A",
-    "B",
-    "C",
-    "D"
-  ],
-  "values": [
-    3,
-    7,
-    5,
-    9
-  ]
+  "labels": ["A", "B", "C", "D"],
+  "values": [3, 7, 5, 9]
 }

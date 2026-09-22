@@ -7,45 +7,30 @@
     "time": "3/4",
     "bars_min": 5,
     "bars_note": "line-end truncated mid-exercise; 5 complete internal measures verified",
-    "bar1_notes": [
-      "E5:quarter",
-      "C5:quarter",
-      "A5:quarter"
-    ],
+    "bar1_notes": ["E5:quarter", "C5:quarter", "A5:quarter"],
     "bar1_note": "spot-verified by eye AND independently reproduced by the model"
   },
   "staves/spohr_no17_sys.png": {
     "kind": "two_staff_system",
     "staff_count": 2,
-    "clefs": [
-      "G2",
-      "G2"
-    ],
+    "clefs": ["G2", "G2"],
     "fifths": 0,
     "time": "3/4"
   },
   "staves/spohr_no21_sys.png": {
     "kind": "two_staff_system",
     "staff_count": 2,
-    "clefs": [
-      "G2",
-      "G2"
-    ],
+    "clefs": ["G2", "G2"],
     "fifths": 0,
     "time": "3/4",
     "content_note": "contains DOUBLE-dotted figures - outside the TrOMR duration vocab; attribute-tier only by design",
-    "xfail": [
-      "time"
-    ],
+    "xfail": ["time"],
     "xfail_note": "model misreads 3/4 on this double-dotted system (verified 3/4 by eye); expected to flip with bd-av64.13 voting / model-quality work \u2014 the gate FAILS LOUD if it starts passing so we promote it"
   },
   "staves/spohr_p116_sys29.png": {
     "kind": "two_staff_system",
     "staff_count": 2,
-    "clefs": [
-      "G2",
-      "G2"
-    ],
+    "clefs": ["G2", "G2"],
     "fifths": -2,
     "time_note": "mid-exercise line (bars 29-31), no time signature printed",
     "content_note": "the WIDE-SYSTEM class (bd-av64.14): virtuosic 16th content, attribute-tier only"
