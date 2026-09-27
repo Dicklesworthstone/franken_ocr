@@ -475,10 +475,18 @@ pub fn finalize(decoded: &str, _image_w: u32, _image_h: u32) -> FocrResult<Strin
 /// Multi-page `infer_multi(...).save_results` assembly
 /// (`modeling_unlimitedocr.py:1267-1295`).
 ///
-/// Strips the trailing EOS, `.strip()`, splits on [`PAGE_MARKER`], DROPS the
-/// leading chunk (`pages = outputs.split('<PAGE>')[1:]` — text before the first
-/// `<PAGE>` is discarded), postprocesses each page with prefix `page_{n}_`, then
-/// rejoins as `"<PAGE>\n" + "\n<PAGE>\n".join(pages)`.
+/// Strips the trailing EOS, `.strip()`, splits on [`PAGE_MARKER`],
+/// postprocesses each page with prefix `page_{n}_`, then rejoins as
+/// `"<PAGE>\n" + "\n<PAGE>\n".join(pages)`.
+///
+/// One deliberate departure from the reference (GH #17): the reference drops
+/// the chunk before the first `<PAGE>` (`outputs.split('<PAGE>')[1:]`), which
+/// is harmless when the model opens with a marker (the chunk is empty) but
+/// silently discards the WHOLE transcription when it does not — the model
+/// often omits the opening marker (a one-page pass commonly emits none at
+/// all), and `focr --multi-page` then printed a bare `<PAGE>` with exit 0. A
+/// non-blank leading chunk is therefore kept as the first page. When the model
+/// does open with a marker the output is byte-identical to the reference.
 ///
 /// `num_pages` is the count of source page images: pages with index `>= num_pages`
 /// are passed through verbatim (only `.strip()`-ed), matching the reference
@@ -488,11 +496,12 @@ pub fn finalize(decoded: &str, _image_w: u32, _image_h: u32) -> FocrResult<Strin
 /// Infallible today; see [`finalize`] for why the `FocrResult` shape is kept.
 pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
     let stripped = strip_eos(decoded);
-    // Python `str.split('<PAGE>')[1:]` — drop the chunk before the first marker.
     let mut chunks = stripped.split(PAGE_MARKER);
-    let _ = chunks.next(); // discard leading chunk (the `[1:]`)
+    // The reference's `[1:]` drops the leading chunk; keep it as page 0 when
+    // the model skipped the opening marker and it carries text (GH #17).
+    let leading = chunks.next().filter(|c| !c.trim().is_empty());
     let mut processed = Vec::new();
-    for (page_idx, page) in chunks.enumerate() {
+    for (page_idx, page) in leading.into_iter().chain(chunks).enumerate() {
         let page = page.trim();
         if page_idx >= num_pages {
             processed.push(page.to_string());
@@ -513,9 +522,10 @@ pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
 ///
 /// Pure string logic — the token→text decode happens in the caller — so the
 /// boundary semantics are unit-tested without a tokenizer. Mirrors
-/// [`finalize_multi`]'s split contract: text before the FIRST marker is
-/// discarded (the reference `split('<PAGE>')[1:]`), and streamed bodies are
-/// `.trim()`-ed raw model text (the polished per-page markdown still comes
+/// [`finalize_multi`]'s split contract: non-blank text before the FIRST
+/// marker is page 1 (the model skipped the opening marker, GH #17), blank
+/// pre-marker text is ignored, and streamed bodies are `.trim()`-ed raw model
+/// text (the polished per-page markdown still comes
 /// from the terminal [`finalize_multi`] assembly).
 #[derive(Debug, Default)]
 pub struct PageStream {
@@ -544,8 +554,16 @@ impl PageStream {
                     let Some(pos) = full_text.find(PAGE_MARKER) else {
                         return;
                     };
+                    // Non-blank text before the first marker is page 1
+                    // (the model skipped the opening marker, GH #17).
+                    let leading = full_text[..pos].trim();
+                    self.current_page = if leading.is_empty() {
+                        1
+                    } else {
+                        on_page(1, leading);
+                        2
+                    };
                     self.body_start = Some(pos + PAGE_MARKER.len());
-                    self.current_page = 1;
                 }
                 Some(start) => {
                     let Some(rel) = full_text[start..].find(PAGE_MARKER) else {
@@ -561,11 +579,17 @@ impl PageStream {
     }
 
     /// End of decode: emit the final in-flight page (marker seen, no
-    /// successor marker). A decode that never emitted a marker emits nothing
-    /// (matching [`finalize_multi`] discarding pre-marker text).
+    /// successor marker). A decode that never emitted a marker emits its whole
+    /// text as page 1 when non-blank (matching [`finalize_multi`], GH #17).
     pub fn finish(self, full_text: &str, mut on_page: impl FnMut(usize, &str)) {
-        if let Some(start) = self.body_start {
-            on_page(self.current_page, full_text[start..].trim());
+        match self.body_start {
+            Some(start) => on_page(self.current_page, full_text[start..].trim()),
+            None => {
+                let body = full_text.trim();
+                if !body.is_empty() {
+                    on_page(1, body);
+                }
+            }
         }
     }
 }
@@ -790,15 +814,14 @@ mod tests {
     fn page_stream_streams_bodies_as_markers_arrive() {
         let mut ps = PageStream::new();
         let mut got: Vec<(usize, String)> = Vec::new();
-        // Incremental growth: nothing before the first marker; page 1 lands
-        // only when marker 2 arrives; idempotent over re-fed prefixes.
-        ps.feed("preamble ", |i, s| got.push((i, s.to_string())));
+        // Incremental growth: blank text before the first marker is ignored;
+        // page 1 lands only when marker 2 arrives; idempotent over re-fed
+        // prefixes.
+        ps.feed(" \n", |i, s| got.push((i, s.to_string())));
         assert!(got.is_empty());
-        ps.feed("preamble <PAGE>\nalpha", |i, s| {
-            got.push((i, s.to_string()))
-        });
+        ps.feed(" \n<PAGE>\nalpha", |i, s| got.push((i, s.to_string())));
         assert!(got.is_empty(), "page 1 is still in flight");
-        let text = "preamble <PAGE>\nalpha\n<PAGE>\nbeta";
+        let text = " \n<PAGE>\nalpha\n<PAGE>\nbeta";
         ps.feed(text, |i, s| got.push((i, s.to_string())));
         assert_eq!(got, vec![(1, "alpha".to_string())]);
         ps.feed(text, |i, s| got.push((i, s.to_string())));
@@ -813,12 +836,42 @@ mod tests {
     }
 
     #[test]
-    fn page_stream_without_markers_streams_nothing() {
-        // Mirrors finalize_multi's split()[1:] — pre-marker text is discarded.
-        let ps = PageStream::new();
-        let mut got = 0usize;
-        ps.finish("no markers at all", |_, _| got += 1);
-        assert_eq!(got, 0);
+    fn page_stream_without_markers_streams_whole_text_as_page_one() {
+        // GH #17: a decode with no marker at all is one page, not nothing.
+        let mut ps = PageStream::new();
+        let mut got: Vec<(usize, String)> = Vec::new();
+        ps.feed("no markers at all", |i, s| got.push((i, s.to_string())));
+        assert!(got.is_empty(), "nothing streams before end of decode");
+        ps.finish(" no markers at all \n", |i, s| got.push((i, s.to_string())));
+        assert_eq!(got, vec![(1, "no markers at all".to_string())]);
+
+        // A blank decode still streams nothing.
+        let mut blank = 0usize;
+        PageStream::new().finish(" \n ", |_, _| blank += 1);
+        assert_eq!(blank, 0);
+    }
+
+    #[test]
+    fn page_stream_text_before_first_marker_is_page_one() {
+        // GH #17: the model skipped the opening marker; the pre-marker text is
+        // page 1 and the marker opens page 2.
+        let mut ps = PageStream::new();
+        let mut got: Vec<(usize, String)> = Vec::new();
+        ps.feed("first page", |i, s| got.push((i, s.to_string())));
+        assert!(got.is_empty());
+        let text = "first page\n<PAGE>\nsecond page";
+        ps.feed(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(got, vec![(1, "first page".to_string())]);
+        ps.feed(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(got.len(), 1, "re-feeding must not re-emit the leading page");
+        ps.finish(text, |i, s| got.push((i, s.to_string())));
+        assert_eq!(
+            got,
+            vec![
+                (1, "first page".to_string()),
+                (2, "second page".to_string())
+            ]
+        );
     }
 
     #[test]
@@ -835,15 +888,40 @@ mod tests {
 
     #[test]
     fn finalize_multi_splits_and_rejoins_pages() {
-        // leading text before first <PAGE> is dropped; two pages rejoined.
-        let raw = format!("preamble<PAGE>page one text<PAGE>page two text{EOS_MARKER}");
+        // Blank text before the first <PAGE> is dropped; two pages rejoined.
+        let raw = format!(" \n<PAGE>page one text<PAGE>page two text{EOS_MARKER}");
         let md = finalize_multi(&raw, 2).unwrap();
-        assert!(md.starts_with("<PAGE>\n"));
-        assert!(md.contains("page one text"));
-        assert!(md.contains("page two text"));
-        assert!(!md.contains("preamble"));
-        // exactly two page markers in the rejoined form
+        assert_eq!(md, "<PAGE>\npage one text\n<PAGE>\npage two text");
+    }
+
+    #[test]
+    fn finalize_multi_keeps_text_when_model_emits_no_marker() {
+        // GH #17: a one-page pass whose decode carries no <PAGE> at all used to
+        // assemble to a bare "<PAGE>\n" — the whole transcription dropped.
+        let raw = format!("INVOICE #10042\nTotal due: 104.49{EOS_MARKER}");
+        let md = finalize_multi(&raw, 1).unwrap();
+        assert_eq!(md, "<PAGE>\nINVOICE #10042\nTotal due: 104.49");
+    }
+
+    #[test]
+    fn finalize_multi_keeps_text_before_first_marker_as_page_zero() {
+        // GH #17: the model skipped the opening marker but separated later
+        // pages; the leading chunk is page 0 (image prefix page_0_), the
+        // marker opens page 1.
+        let raw = format!(
+            "p0 <|ref|>image<|/ref|><|det|>[0,0,10,10]<|/det|><PAGE>p1 <|ref|>image<|/ref|><|det|>[0,0,10,10]<|/det|>{EOS_MARKER}"
+        );
+        let md = finalize_multi(&raw, 2).unwrap();
+        assert!(md.starts_with("<PAGE>\np0"));
+        assert!(md.contains("![](images/page_0_0.jpg)"));
+        assert!(md.contains("![](images/page_1_0.jpg)"));
         assert_eq!(md.matches(PAGE_MARKER).count(), 2);
+    }
+
+    #[test]
+    fn finalize_multi_blank_decode_is_a_bare_marker() {
+        let md = finalize_multi(&format!("  {EOS_MARKER}"), 1).unwrap();
+        assert_eq!(md, "<PAGE>\n");
     }
 
     #[test]

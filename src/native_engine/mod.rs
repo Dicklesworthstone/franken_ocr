@@ -2832,6 +2832,9 @@ impl OcrModel {
             td.elapsed().as_secs_f64()
         ));
         let decoded = self.tokenizer()?.decode(&generated)?;
+        if std::env::var_os("FOCR17_RAW").is_some() {
+            eprintln!("[focr17-raw] {decoded:?}");
+        }
         postprocess::finalize_multi(&decoded, pres.len())
     }
 
