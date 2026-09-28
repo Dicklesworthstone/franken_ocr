@@ -10,6 +10,7 @@ Scope window: project inception on 2026-06-24 through HEAD on 2026-08-22.
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.9.1`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.9.1) | Release | 2026-09-28 | `--multi-page` keeps text the model emits outside `<PAGE>` markers (GH #17) |
 | [`v0.9.0`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.9.0) | Release | 2026-08-22 | Tall-capture strip routing + low-yield guard (GH #15) |
 | [`v0.8.0`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.8.0) | Release | 2026-08-19 | Resident daemon, installer repair, machine-parseable `--version` |
 | [`models-unlimited-wasm-v1`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/models-unlimited-wasm-v1) | Release (artifact, not SemVer) | 2026-08-11 | Unlimited-OCR wasm-int4 browser artifact |
@@ -26,6 +27,52 @@ sections as they land.
 ## [Unreleased]
 
 No changes yet.
+
+## [0.9.1] - 2026-09-28
+
+A patch release for `--multi-page` output (GH #17).
+
+### Fixed
+
+- **`--multi-page` no longer drops text the model emits outside `<PAGE>`
+  markers (GH #17).** Page assembly followed the reference implementation's
+  `split('<PAGE>')[1:]`, which discards everything before the first marker.
+  When the model skipped the opening marker, which is common on single pages,
+  the whole transcription was thrown away and the output file held only
+  `<PAGE>`. Text before the first marker is now kept as the first page, a
+  decode with no markers at all is kept as one page, and the streaming
+  (`PageStream`) path does the same.
+  ([`5707079`](https://github.com/Dicklesworthstone/franken_ocr/commit/5707079),
+  [`1b6a3e4`](https://github.com/Dicklesworthstone/franken_ocr/commit/1b6a3e4))
+- The progress reporter releases its lock before calling the progress sink, so
+  a sink that reports progress itself can no longer deadlock the run.
+  ([`c84df0e`](https://github.com/Dicklesworthstone/franken_ocr/commit/c84df0e))
+
+### Changed
+
+- Built against Asupersync 0.5.0 and FrankenSQLite 0.4.0.
+  ([`fad3731`](https://github.com/Dicklesworthstone/franken_ocr/commit/fad3731))
+
+### Internal
+
+- A formatting sweep after 0.9.0 re-indented JSON files whose exact bytes are
+  pinned by sha256, including the embedded Unlimited-OCR model manifest, which
+  made an unreleased build refuse to load its default model. The pinned bytes
+  are restored, and `tests/pinned_fixture_hashes.rs` now fails when a pinned
+  file changes or goes missing.
+  ([`99af6d1`](https://github.com/Dicklesworthstone/franken_ocr/commit/99af6d1),
+  [`0cfed7b`](https://github.com/Dicklesworthstone/franken_ocr/commit/0cfed7b),
+  [`b4b56cf`](https://github.com/Dicklesworthstone/franken_ocr/commit/b4b56cf),
+  [`5641143`](https://github.com/Dicklesworthstone/franken_ocr/commit/5641143))
+- `scripts/check.sh` runs green again: the installer end-to-end test checks the
+  in-repo release inputs instead of the GitHub workflow files removed when
+  releases moved to dsr, and a PDF fixture added after 0.9.0 is declared in the
+  fixture manifest. Clippy findings on the pinned nightly are fixed.
+  ([`b62a0f3`](https://github.com/Dicklesworthstone/franken_ocr/commit/b62a0f3),
+  [`9d8d14d`](https://github.com/Dicklesworthstone/franken_ocr/commit/9d8d14d),
+  [`90547f6`](https://github.com/Dicklesworthstone/franken_ocr/commit/90547f6))
+- Most other commits since 0.9.0 are iOS app work (`ios/`, `focr-ios`), which
+  is not part of the `focr` binary.
 
 ## [0.9.0] - 2026-08-22
 
