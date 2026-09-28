@@ -2836,9 +2836,8 @@ mod tests {
 
         let whole = sam_weights_from(&weights, prefix)?;
         assert_eq!(whole.blocks.len(), DEPTH);
-        for i in 0..DEPTH {
+        for (i, cached) in whole.blocks.iter().enumerate() {
             let solo = sam_block_from(&weights, prefix, i)?;
-            let cached = &whole.blocks[i];
             assert_eq!(solo.window, cached.window, "block {i} window");
             assert_eq!(solo.norm1.w, cached.norm1.w, "block {i} norm1.w");
             assert_eq!(

@@ -468,8 +468,7 @@ fn argmin_at_lambda(t: &Tensor, lam: f64) -> usize {
     let mut best_idx = 0usize;
     let mut best_cost = t.points[0].distortion + lam * t.points[0].rate_bytes as f64;
     let mut best_rank = option_rank(&t.points[0].option);
-    for idx in 1..t.points.len() {
-        let p = &t.points[idx];
+    for (idx, p) in t.points.iter().enumerate().skip(1) {
         let cost = p.distortion + lam * p.rate_bytes as f64;
         let rank = option_rank(&p.option);
         if cost < best_cost - EPS || ((cost - best_cost).abs() <= EPS && rank < best_rank) {
