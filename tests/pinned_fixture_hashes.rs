@@ -67,7 +67,12 @@ fn gauntlet_certification_bundle_artifact_hashes_match_committed_bytes() {
     for (artifact, expected) in &pins {
         let path = root().join(artifact);
         if !path.is_file() {
-            // Pins on generated outputs (e.g. .gauntlet-output) are not committed.
+            // Pins on generated outputs (e.g. .gauntlet-output) are not
+            // committed, but everything the bundle itself ships must exist:
+            // deleting a pinned bundle file is as much a break as reformatting it.
+            if artifact.starts_with("docs/gauntlet/bundle/") {
+                mismatches.push(format!("{artifact}: pinned {expected}, file is missing"));
+            }
             continue;
         }
         let actual = sha256_hex(&path);
