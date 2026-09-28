@@ -31,11 +31,8 @@ REPO_ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # FOCR_INSTALL_SH lets the test point at an alternate installer copy (used by the
 # test's own regression self-check to prove these gates actually catch the bug).
 INSTALL_SH="${FOCR_INSTALL_SH:-$REPO_ROOT/install.sh}"
-DIST_YML="$REPO_ROOT/.github/workflows/dist.yml"
-CI_YML="$REPO_ROOT/.github/workflows/ci.yml"
 INSTALL_PS1="$REPO_ROOT/install.ps1"
 CHECK_SH="$REPO_ROOT/scripts/check.sh"
-GAUNTLET_CERT="$REPO_ROOT/scripts/gauntlet_cert.py"
 TOOLCHAIN_TOML="$REPO_ROOT/rust-toolchain.toml"
 GITATTRIBUTES="$REPO_ROOT/.gitattributes"
 
@@ -400,8 +397,15 @@ else
   pass "PowerShell installer exposes offline replacement, recovery, and cross-session locking"
 fi
 
+# The GitHub Actions workflows (ci.yml, dist.yml) were removed in 634bfb9:
+# releases are built with dsr on self-hosted machines, and the per-target
+# release contract (exact asset names, glibc floor, sibling revisions) lives in
+# dsr's repos.d/franken_ocr.yaml outside this tree. What stays checkable here is
+# the in-repo half of that contract: the installers serve exactly the release
+# asset names, the toolchain pin, the LF-protected embedded manifests, and the
+# locked cargo commands of the local gate.
 matrix_contract_ok=1
-for required in "$DIST_YML" "$CI_YML" "$INSTALL_PS1" "$CHECK_SH" "$TOOLCHAIN_TOML" "$GITATTRIBUTES"; do
+for required in "$INSTALL_PS1" "$CHECK_SH" "$TOOLCHAIN_TOML" "$GITATTRIBUTES"; do
   if [ ! -f "$required" ]; then
     bad "release contract input is missing: $required"
     matrix_contract_ok=0
@@ -409,76 +413,9 @@ for required in "$DIST_YML" "$CI_YML" "$INSTALL_PS1" "$CHECK_SH" "$TOOLCHAIN_TOM
 done
 
 if [ "$matrix_contract_ok" -eq 1 ]; then
-  expected_assets='focr-aarch64-apple-darwin-neon-sdot-i8mm
-focr-x86_64-apple-darwin
-focr-x86_64-unknown-linux-gnu
-focr-aarch64-unknown-linux-gnu
-focr-x86_64-pc-windows-msvc.exe
-focr-aarch64-pc-windows-msvc.exe'
-  while IFS= read -r asset; do
-    if ! grep -Fq -- "asset: $asset" "$DIST_YML"; then
-      bad "dist matrix does not stage installer asset: $asset"
-      matrix_contract_ok=0
-    fi
-  done <<EOF
-$expected_assets
-EOF
-
-  if ! grep -Fq 'out="${{ matrix.asset }}"' "$DIST_YML" ||
-    ! grep -Fq '$asset = "${{ matrix.asset }}"' "$DIST_YML"; then
-    bad "dist staging does not consume the explicit Unix and Windows asset fields"
-    matrix_contract_ok=0
-  fi
-
-  if ! grep -Fq -- 'rustflags: ""' "$DIST_YML" ||
-    grep -Eq 'asset: focr-x86_64-unknown-linux-gnu$' "$DIST_YML" &&
-      grep -Eq 'rustflags: "-C target-feature=' "$DIST_YML"; then
-    bad "installer-served Linux x86_64 asset is not a portable baseline build"
-    matrix_contract_ok=0
-  fi
-  if ! grep -Fq 'Smoke test focr (no weights)' "$DIST_YML"; then
-    bad "Unix dist artifacts are not executed before staging"
-    matrix_contract_ok=0
-  fi
-  if ! grep -Fq -- "--target '\${{ matrix.target }}.\${{ matrix.glibc_floor }}'" "$DIST_YML" ||
-    ! grep -Fq -- "--dist-glibc-floor '\${{ matrix.glibc_floor }}'" "$DIST_YML"; then
-    bad "Linux dist assets do not target and certify an explicit glibc floor"
-    matrix_contract_ok=0
-  fi
-  if ! grep -Fq 'Test exact staged asset through offline install.ps1' "$DIST_YML" ||
-    ! grep -Fq -- '-OfflineAssetDir $releaseDir' "$DIST_YML"; then
-    bad "Windows dist does not exercise install.ps1 against the exact offline asset"
-    matrix_contract_ok=0
-  fi
-  if grep -Fq '& $asset --version | Select-Object -First 1' "$DIST_YML" ||
-    ! grep -Fq '$versionOutput = @(& $asset --version)' "$DIST_YML" ||
-    ! grep -Fq '$versionExit = $LASTEXITCODE' "$DIST_YML"; then
-    bad "Windows dist truncates the multi-line version probe or loses its exit code"
-    matrix_contract_ok=0
-  fi
   if ! grep -Fxq 'src/native_engine/unlimited_ocr_manifest.json text eol=lf' "$GITATTRIBUTES" ||
-    ! grep -Fxq 'models/manifest-v2.json text eol=lf' "$GITATTRIBUTES" ||
-    ! grep -Fq 'git config --global core.autocrlf false' "$DIST_YML" ||
-    [ "$(grep -Fc '24ff1cfffe71eec6f07bfae8e8eb12b342877bccc43ad6ae4a4a4ceffb76edd3' "$DIST_YML")" -lt 2 ]; then
+    ! grep -Fxq 'models/manifest-v2.json text eol=lf' "$GITATTRIBUTES"; then
     bad "embedded release manifests are not protected from Windows CRLF translation"
-    matrix_contract_ok=0
-  fi
-  if [ "$(grep -Fc -- '--dist-ref-preflight' "$DIST_YML")" -lt 2 ]; then
-    bad "not every dist build job fails closed on ref/version ancestry"
-    matrix_contract_ok=0
-  fi
-  if [ "$(grep -Fc 'ref: ${{ inputs.source_ref || github.ref }}' "$DIST_YML")" -lt 2 ] ||
-    [ "$(grep -Fc 'repair workflow is not current origin/main' "$DIST_YML")" -lt 2 ] ||
-    [ "$(grep -Fc 'git", "cat-file", "blob"' "$DIST_YML")" -lt 2 ] ||
-    [ "$(grep -Fc 'git hash-object $evidenceScript' "$DIST_YML")" -lt 2 ] ||
-    [ "$(grep -Fc 'python $evidenceScript --dist-ref-preflight' "$DIST_YML")" -ne 2 ] ||
-    [ "$(grep -Fc 'authenticated dist ref preflight exited' "$DIST_YML")" -ne 2 ] ||
-    [ "$(grep -Fc 'FOCR_DIST_EVIDENCE_SCRIPT=' "$DIST_YML")" -lt 2 ] ||
-    ! grep -Fq 'source_ref repair release inputs differ from immutable tag' "$GAUNTLET_CERT" ||
-    ! grep -Fq 'immutable-tag repair is unsupported across release-input drift' "$GAUNTLET_CERT" ||
-    ! grep -Fq 'python3 "$FOCR_DIST_EVIDENCE_SCRIPT"' "$DIST_YML" ||
-    ! grep -Fq 'python $env:FOCR_DIST_EVIDENCE_SCRIPT' "$DIST_YML"; then
-    bad "dist immutable-tag repair is not source- and workflow-bound"
     matrix_contract_ok=0
   fi
 
@@ -488,13 +425,13 @@ EOF
     focr-x86_64-unknown-linux-gnu \
     focr-aarch64-unknown-linux-gnu; do
     if ! grep -Fq -- "$asset" "$INSTALL_SH"; then
-      bad "shell installer is missing dist asset: $asset"
+      bad "shell installer is missing release asset: $asset"
       matrix_contract_ok=0
     fi
   done
   for asset in focr-x86_64-pc-windows-msvc.exe focr-aarch64-pc-windows-msvc.exe; do
     if ! grep -Fq -- "$asset" "$INSTALL_PS1"; then
-      bad "PowerShell installer is missing dist asset: $asset"
+      bad "PowerShell installer is missing release asset: $asset"
       matrix_contract_ok=0
     fi
   done
@@ -503,25 +440,6 @@ EOF
     bad "rust-toolchain.toml is not pinned to nightly-2026-08-25"
     matrix_contract_ok=0
   fi
-  for workflow in "$CI_YML" "$DIST_YML"; do
-    if ! grep -Fq 'RUST_TOOLCHAIN: nightly-2026-08-25' "$workflow"; then
-      bad "$(basename "$workflow") does not install the pinned repo toolchain"
-      matrix_contract_ok=0
-    fi
-    if grep -Eq 'uses: [^#]+@(v[0-9]+|nightly)[[:space:]]*$' "$workflow"; then
-      bad "$(basename "$workflow") contains a floating action ref"
-      matrix_contract_ok=0
-    fi
-    if grep -Fq 'git clone --depth 1 https://github.com/Dicklesworthstone/' "$workflow"; then
-      bad "$(basename "$workflow") contains a floating sibling checkout"
-      matrix_contract_ok=0
-    fi
-    unlocked=$(grep -E '^[[:space:]]*run: cargo (build|check|clippy|test)' "$workflow" | grep -Fv -- '--locked' || true)
-    if [ -n "$unlocked" ]; then
-      bad "$(basename "$workflow") contains an unlocked Cargo command: $unlocked"
-      matrix_contract_ok=0
-    fi
-  done
   unlocked=$(grep -E '^run cargo (check|clippy|test)' "$CHECK_SH" | grep -Fv -- '--locked' || true)
   if [ -n "$unlocked" ]; then
     bad "scripts/check.sh contains an unlocked Cargo command: $unlocked"
@@ -529,7 +447,7 @@ EOF
   fi
 
   if [ "$matrix_contract_ok" -eq 1 ]; then
-    pass "release matrix inputs are pinned and installer asset names match"
+    pass "release inputs are pinned and installer asset names match"
   fi
 fi
 
