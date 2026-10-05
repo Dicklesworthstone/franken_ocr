@@ -20,7 +20,7 @@ const LINEAGE_JSON: &str = include_str!("tromr_lineage_manifest.json");
 const HISTORY_AUDIT_JSON: &str = include_str!("tromr_upstream_history_audit.json");
 const EXPORT_RECEIPT_JSON: &str = include_str!("tromr_export_receipt.json");
 const LINEAGE_JSON_SHA256: &str =
-    "6eea7a84b9de1f9f957b2d0159a84c5d64deeb8199d95956b527dae7e24a92d3";
+    "fa5a928ed5d454bbfd99039d2193c2dd75f5ecaa810505d55dadc25d690cd8a9";
 const HISTORY_AUDIT_JSON_SHA256: &str =
     "02a211cb7d29a884ee7b369624df29f2e1fef9823ea3987920cd936a34c44efd";
 const EXPORT_RECEIPT_JSON_SHA256: &str =
@@ -33,7 +33,7 @@ pub const TROMR_LINEAGE_CONTRACT_ID: &str =
     "netease-polyphonic-tromr-d1aa83a3-franken-ocr-lineage-v1";
 /// Canonical JSON identity of [`tromr_lineage_receipt`].
 pub const TROMR_LINEAGE_CANONICAL_SHA256: &str =
-    "1ad70680205890e70396388a320ee828cd120052bd771840ea68e8a4cdc52d72";
+    "3762d2f3e9b539458334f56f424fe7ee1a46297269a1224327e69d7d9dd894e0";
 
 const UPSTREAM_REPOSITORY: &str = "https://github.com/NetEase/Polyphonic-TrOMR";
 const UPSTREAM_COMMIT: &str = "d1aa83a34fb4a05f33ceb4f917917b88600a9bc6";

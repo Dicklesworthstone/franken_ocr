@@ -8,7 +8,7 @@
     "upstream_base_commit": "c5a0e368b1be33187a17cd9aa716653ce6230590",
     "local_contract_revision": "franken-ocr-mtdt-lineage-v24",
     "source_inventory_canonicalization": "path UTF-8, NUL, lowercase SHA-256, LF; rows sorted by path",
-    "source_inventory_sha256": "f2ae64ae6aad067f4885aa036d8587f1956222cfb8eee00405e5d1751bcad4ce",
+    "source_inventory_sha256": "e4c4beaffa13f386caf782d3a8f83e0298a3dd35e8db54f418763f8210b7faba",
     "full_tree_binding": "consumer_recursive_source_inventory"
   },
   "upstream": {
@@ -171,7 +171,7 @@
     {
       "role": "package_manifest",
       "path": "Cargo.toml",
-      "sha256": "fc2c4ce84303c4e988b42bfb8c2735806034d68cafa9039aacaf75facde7085f"
+      "sha256": "87890123a9e8f29ea0fda8810acf85e45b7d3e325266ab4c59c7f423db92ea1b"
     },
     {
       "role": "checkpoint_export",
