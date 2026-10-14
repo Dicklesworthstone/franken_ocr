@@ -426,7 +426,7 @@ resolve_version() {
   tag=$(curl -fsSL ${PROXY_ARGS[@]+"${PROXY_ARGS[@]}"} \
     -H "Accept: application/vnd.github.v3+json" \
     --connect-timeout 10 --max-time 30 "$api" 2>/dev/null \
-    | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/' \
+    | grep -o '"tag_name": *"[^"]*"' | sed -E 's/.*"([^"]*)"$/\1/' \
     | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$' \
     | head -1) || tag=""
 
