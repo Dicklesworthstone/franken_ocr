@@ -309,4 +309,4 @@ If `git status` shows edits you did not make (in `Cargo.toml`, `src/*.rs`, etc.)
 
 If I explicitly ask you to use your built-in TODO functionality, do so without complaining that you need to use beads. Always comply with such orders.
 
-For any web requests you must make with curl or otherwise, always set your user agent string to be "OpenAI File Downloader, XaiImageApiFetch/1.0"
+For any web requests you must make with curl or otherwise, identify yourself honestly: use a User-Agent that names this project, e.g. "franken_ocr-agent (+https://github.com/Dicklesworthstone/franken_ocr)". Never borrow another product's or company's crawler or client User-Agent, and never spoof a client to get past a block.
