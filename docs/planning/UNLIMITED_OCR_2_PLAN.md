@@ -1,80 +1,93 @@
 # Unlimited-OCR-2 in franken_ocr — Upgrade & Support Plan
 
-> **Status:** planning (no code landed). **Created:** 2026-10-28. **Scope owner:** franken_ocr maintainers.
-> **Companion to:** [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md) (the master plan; its doctrine binds this plan).
-> **Work graph:** this plan is mirrored 1:1 into beads under the epic titled
-> "Unlimited-OCR-2: additive model + unlimited-horizon long-document parsing" (label `uocr2`). Once the
-> beads exist they are the executable source of truth; this document is the rationale and the spec.
+> **Status:** planning (no code landed). **Created:** 2026-10-28. **Revision:** 2. Review round 1 is
+> integrated (spec fidelity, codebase grounding, strategy; see §15).
+> **Companion to:** [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md). Its
+> doctrine binds this plan.
+> **Work graph:** this plan is mirrored 1:1 into beads under the epic "Unlimited-OCR-2: additive model
+> + unlimited-horizon long-document parsing" (label `uocr2`). Once the beads exist they are the
+> executable source of truth. This document holds the rationale and the spec.
 
 ---
 
 ## 0. How to read this plan
 
-- §1 is the one-page summary.
-- §2 is the verified ground truth about the new model. Every number in it was checked against the
-  pinned source, config, weight headers or tech report on 2026-10-28.
-- §3 explains why the plan is shaped the way it is, from the user's point of view.
-- §4 lists the load-bearing decisions, each with its rationale.
-- §5 is the **reference-semantics specification**. It is the part an implementer needs, and it is
-  written so nobody has to reopen the Python.
-- §6 is the franken_ocr architecture for the port.
-- §7–§10 cover verification, performance, product surface and default policy.
-- §11 is the phased roadmap with exit gates, §12 is the task graph (mirrored into beads), §13 lists
-  risks, §14 is the open-questions register, and the appendices hold numbers and pins.
+| Section | Contents |
+|---|---|
+| §1 | One-page summary |
+| §2 | Verified ground truth about the new model. Every number was checked against the pinned source, config, weight headers or tech report on 2026-10-28. |
+| §3 | Why the plan is shaped this way, from the user's side |
+| §4 | Load-bearing decisions, each with its rationale |
+| §5 | **Reference-semantics specification**, written so that nobody has to reopen the Python |
+| §6 | franken_ocr architecture for the port, including every code touchpoint the review found |
+| §7–§10 | Verification, performance, product surface, default policy |
+| §11–§14 | Roadmap, task graph (mirrored into beads), risks, open questions |
+| §15 | Review log |
+| Appendices | Numbers, pins, code locations, related beads |
 
 Terminology:
-- **v1:** `baidu/Unlimited-OCR` at HF commit `3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5`, the model
-  franken_ocr runs today.
-- **v2:** `baidu/Unlimited-OCR-2` at HF commit `5632329a32e103d5f1add270681e0f5c1233c6e4`.
-- **R-SWA:** v1's Reference Sliding Window Attention.
-- **SR-SWA:** v2's Sparse Reference Sliding Window Attention. Baidu's code calls it "DASH".
-- **Page Gate / Token Sieve:** the two stages of SR-SWA, named as in the tech report.
-- **Window:** one chunk of the unlimited-horizon (chunked) decoding scheme in §5.10.
-- **HF reference:** the transformers `infer()` path in the v2 repo.
-- **SGLang reference:** the customized SGLang wheel shipped in the v2 repo.
+
+| Term | Meaning |
+|---|---|
+| **v1** | `baidu/Unlimited-OCR` @ HF `3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5`, the model franken_ocr runs today |
+| **v2** | `baidu/Unlimited-OCR-2` @ HF `5632329a32e103d5f1add270681e0f5c1233c6e4` |
+| **R-SWA** | v1's Reference Sliding Window Attention |
+| **SR-SWA** | v2's Sparse Reference Sliding Window Attention ("DASH" in Baidu's code), with two stages, **Page Gate** and **Token Sieve**, named as in the report |
+| **Document mode** | One `<PAGE>`-structured decode over many pages, windowed when long |
+| **Window** | One chunk of the unlimited-horizon decoding scheme (§5.10) |
+| **HF reference** | The transformers `infer()` path in the v2 repo |
+| **SGLang reference** | The customized SGLang wheel shipped in the v2 repo |
 
 ---
 
 ## 1. Executive summary
 
-**What v2 is.** v2 keeps v1's exact backbone: the same vision tower, projector, MoE decoder shapes,
-vocabulary and tokenizer model. The vision tower and projector weights are **byte-identical** to
-v1, because they were frozen during training. Three things changed:
+**What v2 is.** v2 keeps v1's backbone exactly: the same vision tower, projector, MoE decoder
+shapes, vocabulary and tokenizer model. The vision tower and projector weights are **byte-identical**
+to v1 because they were frozen in training. Three things changed:
+
 1. **Attention.** Every decoder layer's attention is now SR-SWA. Each query attends to a 128-token
-   local window plus up to 12 router-selected 32-token blocks, drawn only from **its own page's
-   image tokens**. That keeps per-step attention bounded at about 512 tokens, regardless of
-   document length.
-2. **Positions.** RoPE is now two-axis: an intra-page token position plus a page-parity bit.
-3. **Decode contract.** Prompts and outputs use a `<PAGE>` token (id 128827) for every page,
-   including single pages. A page-count guard makes the output contain exactly one `<PAGE>` per
-   input page.
+   local window plus up to 12 router-selected 32-token blocks. Those blocks come from **its own
+   page's image tokens**, or from all earlier blocks when its page has none yet. Per-step attention
+   stays near 512 tokens, however long the document.
+2. **Positions.** RoPE is two-axis: an intra-page token position plus a page-parity bit.
+3. **Decode contract.** Prompts and outputs carry a `<PAGE>` token (id 128827) for every page, even
+   a single page. A page-count guard makes the output contain exactly one `<PAGE>` per input page.
 
 **What it buys users.**
-- **Single pages:** essentially nothing in accuracy. On OmniDocBench v1.6, v1 scores 93.92 and v2
-  94.02; tables are slightly worse.
-- **Multi-page documents:** a large gain. On MPDocBench (up to 30 pages), v1 scores 61.89 and v2
-  84.59. Cross-page text edit distance drops from 0.605 to 0.100.
-- **Hundred-page documents:** a new capability. v2 scores 77.06 on MarathonDocBench, which v1
-  cannot run at all.
+- **Single pages:** essentially nothing in accuracy. OmniDocBench v1.6 goes from 93.92 to 94.02, and
+  tables are slightly worse.
+- **Multi-page documents:** a large gain. MPDocBench (≤ 30 pages) goes from 61.89 to 84.59, and
+  cross-page text edit distance drops from 0.605 to 0.100.
+- **Long documents:** a new capability. MarathonDocBench (100–300 pages) scores 77.06. v1 cannot run
+  it: in franken_ocr, v1's prompt and output share 32,768 positions, so v1 stops at about 29 dense
+  pages.
 - **Books:** a path to arbitrarily long documents with bounded memory, via chunked "unlimited-horizon"
-  decoding. Baidu ships that only for GPU SGLang serving.
+  decoding.
+  - Baidu ships this only in GPU SGLang serving.
+  - Making it work here also needs a streaming page source, because today's multi-page path holds
+    every page raster in memory.
 
-**The plan in one paragraph.**
-1. Land v2 **additively**, as a new zoo model `unlimited-ocr-2` next to v1.
-2. Harden model identity first, so that no existing v1 artifact can ever be misread as v2.
-3. Port SR-SWA, page2d RoPE and the v2 decode contract by parity-gating against the HF reference.
-4. Certify a conservative int8 artifact using the same recipe policy as v1.
-5. Then build the user-facing differentiator: **long-document parsing on a laptop CPU with bounded
-   memory, page-by-page streaming and crash-safe resume**, implementing Baidu's windowed decoding
-   semantics natively.
+**The plan.**
+1. Land v2 **additively**, as a new zoo model `unlimited-ocr-2`.
+2. First, harden model identity and make dispatch **fail closed**: no v1 artifact can ever be read as
+   v2, and no v2 artifact can ever run through v1 code.
+3. Port SR-SWA, page2d RoPE and the v2 decode contract, gated rung by rung against an **f32 CPU HF
+   oracle**. That is the precedent that gave v1 token-exact parity.
+4. Certify a conservative int8 artifact.
+5. Build the differentiator: **long-document parsing on a laptop CPU**, with:
+   - bounded memory (streamed pages, windowed KV, block retirement);
+   - page-by-page streaming output;
+   - crash-safe, byte-identical resume.
 
-Default model choices change **per mode, only on ground-truth evidence, with the incumbent measured
-in the same invocation**. The expected outcome is that `--multi-page` moves to v2. The single-page
-default moves only if v2 is at least as accurate and no slower on CPU.
+When v2 is the resolved model, a PDF is parsed **as one document by default**. Every per-page cost is
+the same inside a window as alone, so document mode adds cross-page structure and per-page output at
+roughly per-page cost. Per-mode defaults move only on ground-truth evidence, with the incumbent
+measured in the same invocation. The intended end state is one default model for every mode.
 
 **What we are explicitly not doing:**
 - replacing v1 in place;
-- copying SGLang's serving internals (radix cache, prefetch, Triton kernels);
+- copying SGLang serving internals (radix cache, prefetch, Triton kernels);
 - GPU paths;
 - training;
 - iOS/WASM v2 lanes in the first wave.
@@ -88,46 +101,51 @@ default moves only if v2 is at least as accurate and no slower on CPU.
 | Item | Value |
 |---|---|
 | HF repo / commit | `baidu/Unlimited-OCR-2` @ `5632329a32e103d5f1add270681e0f5c1233c6e4` (created 2026-10-26) |
-| Weights | `model-00001-of-00002.safetensors` (4,998,430,312 B, sha256 `4c40b740f209fd7682040d4ebf19409208acde5c401ccd2dde426d0f41542f18`) and `model-00002-of-00002.safetensors` (1,689,875,264 B, sha256 `9490b82fa47f89e5110eb5577f8ab1b6694c12121905dbc086ddb10207a4ba0c`). `model.safetensors.index.json` `total_size` = 6,687,958,536 |
-| Tensors | 2,819 (2,818 BF16 + 1 I64 buffer) |
-| License | MIT. GitHub `baidu/Unlimited-OCR` `LICENSE` reads "MIT License, Copyright (c) 2026 Baidu", and the HF metadata says `license: mit`. **The HF v2 repo itself ships no LICENSE file.** Record that in the provenance doc; the notice we redistribute is the GitHub text. |
-| Reference stack (model card) | Python 3.10, `torch==2.13.0`, `transformers==4.52.1`, `tokenizers==0.21.4`, `huggingface-hub==0.36.0`, CUDA (tested on A800). **This differs from our v1 oracle pins** (torch 2.10.0, transformers 4.57.1). |
+| Weights | `model-00001-of-00002.safetensors` (4,998,430,312 B, sha256 `4c40b740f209fd7682040d4ebf19409208acde5c401ccd2dde426d0f41542f18`) and `model-00002-of-00002.safetensors` (1,689,875,264 B, sha256 `9490b82fa47f89e5110eb5577f8ab1b6694c12121905dbc086ddb10207a4ba0c`). `model.safetensors.index.json` gives `total_size` = 6,687,958,536. |
+| Tensors | 2,819: 2,818 BF16 plus 1 I64 buffer |
+| License | MIT. GitHub `baidu/Unlimited-OCR` `LICENSE` reads "MIT License, Copyright (c) 2026 Baidu", and the HF metadata says `license: mit`. **The HF v2 repo itself ships no LICENSE file.** Record that in provenance; the notice we redistribute is the GitHub text. |
+| Reference stack (model card) | Python 3.10, `torch==2.13.0`, `transformers==4.52.1`, `tokenizers==0.21.4`, `huggingface-hub==0.36.0`, CUDA (tested on A800). **This differs from the v1 oracle pins** (torch 2.10.0, transformers 4.57.1). |
 | Serving reference | `wheel/sglang-0.5.20.dev10+g8d62f5fb9c-py3-none-any.whl` (sha256 `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`) |
 | Tech report | `Unlimited-OCR-2.pdf` (sha256 `1eb5885f…9444`). The arXiv id in the card is v1's `2606.23050`. |
 | Benchmark | `baidu/MarathonDocBench` (dataset, Apache-2.0): 100 documents of 100–300 pages (~18k pages, ~205k layout elements), zh/en, scored with the MPDocBench-Parse toolkit |
 
-Source-file SHA-256 pins (v2 commit) are in Appendix B.
+Source-file SHA-256 pins for the v2 commit are in Appendix B.
 
 ### 2.2 Architecture delta (v1 → v2)
 
 | Component | v1 | v2 | Evidence |
 |---|---|---|---|
-| Decoder dims | 12 layers, hidden 1280, 10 MHA heads, head_dim 128, layer-0 dense (6848), layers 1–11 MoE 64 routed + 2 shared, top-6, moe_intermediate 896, vocab 129280, `use_mla=false` | **Identical** | config diff |
-| Vision tower (SAM-B → conv compressor → CLIP-L/14), projector 2048→1280, `image_newline`, `view_seperator` | — | **Byte-identical weights**: sampled SAM/CLIP/projector/newline/separator tensors compared byte-for-byte. The report §4.2 says the DeepEncoder and aligner were frozen. `deepencoder.py` differs only in comments. | range-read header and data compare |
+| Decoder dims | 12 layers, hidden 1280, 10 MHA heads, head_dim 128, layer-0 dense (6848), layers 1–11 MoE 64 routed + 2 shared experts, top-6, moe_intermediate 896, vocab 129280, `use_mla=false` | **Identical** | config diff |
+| Vision tower (SAM-B → conv compressor → CLIP-L/14), projector 2048→1280, `image_newline`, `view_seperator` | — | **Byte-identical weights.** Sampled tensors were compared byte-for-byte. Report §4.2 says DeepEncoder and aligner were frozen. `deepencoder.py` differs only in comments (the comment-stripped diff is empty). | range-read header and data compare |
 | Decoder weights (attention, experts, router gate, embed_tokens, lm_head) | — | **Retrained.** Sampled 64 KiB slices differ in 22–98% of bf16 elements. | same |
-| New tensors (per layer, ×12) | — | `self_attn.dash_router.{q_proj [128,1280], k_proj [128,1280], q_norm [128], k_norm [128], head_cls [128]}` and `self_attn.indexer.{q_proj [128,1280], k_proj [128,1280], q_norm [128], k_norm [128]}`, all BF16 | header |
-| New buffer | — | `model.vision_model.embeddings.position_ids` I64 [1,257] (a constant arange) | header |
-| Attention | R-SWA: frozen reference prefix plus a ring of 128 generated tokens; every reference token is attended every step | **SR-SWA (DASH)**: block-sparse, ≤ 128 local + 12×32 remote tokens per query, in both prefill and decode | §5.6–5.8 |
-| RoPE | 1-D, theta 1e4, no scaling | Main and router attention: **page2d** = 63 intra-page token pairs (theta 1e4, "resample" spacing) + 1 page-parity pair (page mod 2, theta 256). `rope_theta=5e5` with YaRN ×4 appears in config, but only the 1-D fallback path uses it. | §5.5 |
-| Context | `max_position_embeddings` 32768 | 131072 (positions only index blocks and causality; RoPE uses page-local coordinates) | config |
-| Tokenizer | BPE vocab 128000 + 830 added (max id 128826) | Same BPE model, pre-tokenizer, normalizer and decoder. **+4 added non-special tokens**: `<PAGE>`=128827, `<BLOCK>`=128828, `<FORK>`=128829, `<CHILD>`=128830 (the last three are unused by the inference code). tokenizer.json sha256 `c55c165e…c589`. | tokenizer diff |
-| Prompt | single page: BOS + `<image>`×n + "document parsing."-style task text; multi: BOS + images + "Multi page parsing." | **Always** BOS + (`<PAGE>` + image tokens) per page + "Multi page parsing.", even for one page | §5.1 |
-| Multi-page image size | each page squashed to 640² (111 tokens per page) | each page letterboxed to **1024** (273 tokens per page) | §5.2 |
-| Single-page default view | franken_ocr uses base 1024; HF v1 `infer` defaults to gundam with up to 32 tiles | HF v2 `infer` defaults to **gundam with up to 16 tiles**; base is available | §5.2 |
-| Decode guards | n-gram 35 (128 single / 1024 multi) | n-gram is *off* by default in HF `infer`; Baidu's evaluation uses 35/128/1024. A **page-count guard** is on by default (EOS banned until N `<PAGE>`, 20,000 tokens per page cap). | §5.9 |
+| New tensors (per layer, ×12) | — | `self_attn.dash_router.{q_proj [128,1280], k_proj [128,1280], q_norm [128], k_norm [128], head_cls [128]}` and `self_attn.indexer.{q_proj [128,1280], k_proj [128,1280], q_norm [128], k_norm [128]}`, all BF16 (60 router + 48 indexer tensors) | header |
+| New buffer | — | `model.vision_model.embeddings.position_ids` I64 [1,257], a constant arange | header |
+| Attention | R-SWA: a frozen reference prefix plus a ring of 128 generated tokens; every reference token is attended at every step | **SR-SWA (DASH)**: block-sparse, ≤ 128 local + 12×32 remote tokens per query, in prefill **and** decode | §5.6–5.8 |
+| RoPE | 1-D, theta 1e4, no scaling | Main and router: **page2d**, 63 intra-page token pairs (theta 1e4, "resample" spacing) + 1 page-parity pair (page mod 2, theta 256). Config `rope_theta=5e5` with YaRN ×4 is used only on the 1-D fallback path. | §5.5 |
+| Context | `max_position_embeddings` 32768, shared by prompt and output | 131072. Positions only index blocks and causality; RoPE uses page-local coordinates. | config, `mod.rs:2750-2783` |
+| Tokenizer | BPE vocab 128000 + 830 added (max id 128826) | Same BPE model, pre-tokenizer, normalizer and decoder. **+4 added non-special tokens**: `<PAGE>`=128827, `<BLOCK>`=128828, `<FORK>`=128829, `<CHILD>`=128830 (the last three unused by inference code). tokenizer.json sha256 `c55c165e…c589`. | tokenizer diff |
+| Prompt | single: BOS + `<image>`×n + task text; multi: BOS + images + "Multi page parsing." | **Always** BOS + (`<PAGE>` + image tokens) per page + "Multi page parsing.", even for one page | §5.1 |
+| Multi-page image size | each page squashed to 640² (111 tokens per page) | each page letterboxed to **1024** (273 tokens per page) in HF; SGLang defaults to gundam for every request (§5.11, DISC-U2-6) | §5.2 |
+| Single-page default view | franken_ocr base 1024; HF v1 `infer` gundam ≤ 32 tiles | HF v2 `infer`: **gundam ≤ 16 tiles**; base available | §5.2 |
+| Decode guards | n-gram 35 (128 single / 1024 multi) | n-gram *off* by default in HF `infer`; Baidu's evaluation and SGLang use 35/128/1024. A **page-count guard** is on by default: EOS banned until N `<PAGE>`, 20,000-token per-page cap. | §5.9 |
 
-### 2.3 Benchmarks (from the tech report; not reproduced by us)
+### 2.3 Benchmarks (from the tech report; we have not reproduced them)
 
 | Benchmark | Metric | v1 | v2 | Context |
 |---|---|---|---|---|
 | OmniDocBench v1.6 (single page) | Overall ↑ | 93.92 | 94.02 | TextEdit 0.042→0.038, FormulaCDM 95.79→96.29, TableTEDS 90.16→89.60, ReadOrderEdit 0.129→0.128. Leaders: TeleOCR 96.91, OvisOCR2 96.47. |
 | MPDocBench (≤30 pages) | Overall ↑ | 61.89 | 84.59 | TextEdit 0.167→0.052; T-TextEdit 0.605→0.100 |
-| MarathonDocBench (100–300 pages) | Overall ↑ | n/a (v1 is limited to about 40 pages) | 77.06 | General VLMs score 7.5–33.7 |
-| Per-step decode latency at 100 pages | — | — | 5.6× faster than R-SWA, 7.0× faster than full attention | GPU, gundam, batch 3 |
+| MarathonDocBench (100–300 pages) | Overall ↑ | n/a. The report says v1 is limited to about 40 pages; franken_ocr v1 shares 32,768 positions between prompt and output, so ≈29 pages at ~1,000 output tokens per page. | 77.06 | General VLMs score 7.5–33.7 |
+| Per-step decode latency at 100 pages | — | — | 5.6× faster than R-SWA, 7.0× faster than full attention | GPU, **gundam**, batch 3 |
 | Peak KV at hundred-page scale | — | — | 47.00 GB unwindowed → 1.77 GB windowed | GPU; windowing = §5.10 |
 
-**Takeaway for this plan:** v2's value is **cross-page structure and length**, not single-page
-accuracy. Every default-policy decision in §10 follows from that.
+**Unknown crop mode.** The report does not state the crop mode used for the MPDocBench and
+MarathonDocBench scores. Its latency table uses gundam, and the SGLang processor defaults to gundam
+for every request, multi-page included. Baidu's long-document numbers are therefore plausibly gundam
+multi-page, while HF `infer_multi` uses base (OQ-V2-14).
+
+**Takeaway.** v2's value is **cross-page structure and length**, not single-page accuracy. Every
+default-policy decision in §10 follows from that.
 
 ---
 
@@ -137,37 +155,47 @@ accuracy. Every default-policy decision in §10 follows from that.
 
 | User | Today (v1) | With this plan |
 |---|---|---|
-| **Single-page CLI and agent users** (`focr ocr page.png`) | v1 base mode, certified | **Nothing breaks.** v2 is optional via `--model unlimited-ocr-2`, at roughly equal accuracy and cost. The default changes only if the ground-truth head-to-head (§10) says v2 is at least as good. |
-| **Multi-page PDF users** (5–50 pages, `--multi-page`) | Cross-page pass capped at 32K context (~290 pages at 111 tokens per page); weaker cross-page structure | v2 multi-page brings markedly better cross-page text and tables (MPDocBench +22.7). It also adds **per-page structured output** (JSON layout and figure extraction per page, which `--multi-page` cannot do today), made possible by explicit `<PAGE>` segmentation. |
-| **Book and archive digitizers** (100s–1000s of pages) | Not possible | **New capability:** windowed unlimited-horizon parsing on CPU with bounded memory, streamed page by page, resumable after a crash or Ctrl-C |
-| **Rust embedders** | `recognize_multi_page*` (whole document, blocking) | A document-level API with streaming callbacks, window and resume options; existing calls keep working |
-| **Agents (robot mode)** | `run_complete` and stage events | Additive `page` and `window` events, a model id in `run_complete`, and `robot triage` recommending v2 for long documents. The schema stays versioned and additive. |
-| **Holders of v1 artifacts** | `unlimited-ocr.v0.7.0.int8.focrq` | Keep working forever, bit-identically. No forced downloads; v1 stays pullable. |
+| **Single-page CLI and agent users** (`focr ocr page.png`) | v1 base mode, certified | **Nothing breaks.** v2 is opt-in via `--model unlimited-ocr-2`, at roughly equal accuracy (report, gundam) and roughly equal cost (analytic estimate; U2-F1 measures it). The default changes only if v2 is shown non-inferior on ground truth (§10). |
+| **PDF users** (`focr ocr doc.pdf`, per page today) | Each page is parsed independently by v1 | After v2 passes the multi-page gate, **a PDF is one document by default with v2** (D17). Cross-page structure, the page-count guarantee and per-page JSON/figures cost roughly what per-page parsing costs. `--independent-pages` opts out. |
+| **Multi-page users** (`--multi-page`, 5–50 pages) | One cross-page pass whose prompt (111 tokens per page) and output share 32,768 positions (≈29 dense pages). Weaker cross-page structure. Every raster is held in RAM. `--json` returns `pages: []`. | Markedly better cross-page text and tables (MPDocBench +22.7). A real per-page `pages[]`, layout boxes and figures. No practical length limit and bounded memory. When v1 hits its 32K budget, the error names `focr pull unlimited-ocr-2`. |
+| **Book and archive digitizers** (100s–1000s of pages) | Not possible | **New capability:** windowed parsing on CPU with bounded memory, streamed page by page, resumable after a crash or Ctrl-C. Inputs: scanned PDFs (JPEG/CCITT/Flate pages) or a directory of page images. JBIG2/JPX/vector pages are **skipped with a `page` `skipped` event**, dropped from the prompt and kept in the source-page map, so numbering never shifts. Expect hours per 1,000 pages on CPU (estimate, §8.4). |
+| **Rust embedders** | Five `recognize_multi_page*` variants (whole document, blocking) | One `recognize_document(source, &opts, sink)` with streaming, windowing and resume. The old variants are removed with a minor-version bump and a migration table (AGENTS.md: no compat shims). |
+| **Agents (robot mode)** | `run_complete`, stage events, and a `page` event whose `page` mixes source page and emission index | `page` gains `source_page`, `window`, `tokens`, `finish` and `model_id` (additive). A new `window` event. `run_complete` gains `model_id`, `artifact_sha256`, `pages_out`, `windows`, `extra_markers` and `finish_reason`. `robot triage` recommends v2 for long documents. The schema stays v1 (additive). |
+| **Holders of v1 artifacts** | `unlimited-ocr.v0.7.0.int8.focrq` | Keeps working, byte-identically, throughout this plan (T3 gate). No forced downloads; v1 stays pullable. |
 
 ### 3.2 Principles that follow
 
-1. **Additive, never destructive.** v2 is a new zoo entry. v1 keeps byte-identical behavior,
-   enforced by a gate (§7.6). The work graph treats any v1 output change as a regression.
-2. **Evidence-gated defaults, decided per mode.** Single-page, per-page PDF, cross-page multi-page
-   and batch are separate decisions. Each flip needs ground-truth evidence with v1 live in the same
-   invocation. A self-speedup or self-parity result is not evidence of user value.
-3. **Reference fidelity first.** The HF `infer()` path is the parity oracle for unwindowed
-   decoding. Windowed decoding follows the SGLang reference semantics and is validated by
-   degenerate equivalence, invariants and accuracy (§7.5).
-4. **Ship value incrementally.** Every milestone (§11) ends in something a user can run.
-5. **CPU-honest performance.** v2 is not a single-page speedup on CPU, and the plan says so. The
-   performance mandate is "no single-page regression; bounded long-document cost," measured the way
-   the perf ledger requires.
-6. **Agent ergonomics are part of the product.** New capabilities get robot events, schema
-   entries, surface-matrix rows and `doctor` and `triage` awareness in the same milestone.
+1. **Additive, never destructive.** v2 is a new zoo entry. v1 keeps byte-identical behavior, enforced
+   by a token-id golden gate (§7.6). Any v1 output change is a regression.
+2. **Fail closed.** Every decode path, lever, daemon and converter either supports v2 explicitly or
+   refuses it before weights load. No code path may silently run v2 weights through v1 math, or the
+   reverse (D18).
+3. **Evidence-gated defaults, per mode.** Single page, PDF/document and batch are separate decisions.
+   Each flip needs ground-truth evidence with v1 live in the same invocation. Self-speedups and
+   self-parity are not user-value evidence.
+4. **Reference fidelity first.** The HF `infer()` path, run in **f32 on CPU**, is the parity oracle
+   for unwindowed decoding. Windowed decoding follows the SGLang semantics and is gated against an
+   independently written Python windowed oracle (§7.5).
+5. **Ship value incrementally.** Every milestone (§11) ends in something a user can run. v1 users get
+   early wins: the CJK streaming fix (U2-X1), the streaming page source (U2-D0) and the v1→v2 pull
+   hint.
+6. **CPU-honest performance.** v2 is not a single-page speedup on CPU. The mandate is no single-page
+   regression and bounded long-document cost, measured per the perf ledger rules. Whole-process RSS
+   is a gated number, not just KV.
+7. **Agent ergonomics are part of the product.** New capabilities get robot events, schema entries,
+   surface-matrix rows and `doctor`/`triage` awareness in the same milestone.
 
 ### 3.3 Non-goals (first wave)
 
 - GPU, CUDA, SGLang or vLLM serving.
 - Training or fine-tuning.
 - Reproducing SGLang's radix cache, prefetch or Triton kernels.
-- v2 on iOS, WASM or the website. That is milestone M5; it needs its own int4 calibration.
-- Removing v1. Retirement is a separate, later decision, taken only if v2 dominates in every mode.
+- v2 on iOS, WASM or the website. That is milestone M5, with its own int4 calibration.
+- Removing v1 in this plan.
+
+**Intended end state.** If both gates in §10 pass, v2 becomes the single default for every mode and
+for a bare `focr pull`, so a user needs one artifact and one resident daemon. Existing v1 installs
+are never re-downloaded automatically, and v1 stays pullable.
 
 ---
 
@@ -175,257 +203,497 @@ accuracy. Every default-policy decision in §10 follows from that.
 
 **D1. Add `unlimited-ocr-2` as a separate zoo model rather than replacing v1 in place.**
 *Why:*
-- Single-page accuracy is a wash, so an in-place swap risks regressions (table TEDS is slightly
-  lower) for no gain in the most common mode.
-- The artifact-identity machinery currently treats "absent model_id" as "the default arch." An
-  in-place swap would silently load every existing v1 artifact as v2 (§6.1).
-- Per-mode defaults need both models available at once.
+- Single-page accuracy is a wash, so an in-place swap risks regressions (table TEDS is slightly lower)
+  for no gain in the most common mode.
+- The identity machinery maps "absent model_id" to "the default arch", so an in-place swap would
+  silently load every existing v1 artifact as v2 (§6.1).
+- Per-mode defaults need both models available.
 - The shared code is most of the engine, so keeping v1 is cheap.
 
-**D2. Harden identity before anything else.** An absent `model_id` must permanently mean
-`"unlimited-ocr"` (v1), never `default_arch()`. Every `== default_arch()` check that really means
-"is v1" becomes an explicit capability or identity method on `ModelArch`.
-*Why:* it removes the single most dangerous failure mode (silent misload) independently of v2, and
-it is a prerequisite for ever changing the default.
+**D2. Harden identity before anything else.**
+- An absent `model_id` permanently means `"unlimited-ocr"` (v1), never `default_arch()`.
+- All **48 `default_arch()` call sites in `src/`** (19 in `convert.rs`) are audited. Each one either
+  keeps a genuine "default model" meaning or becomes an explicit capability or identity method on
+  `ModelArch`.
+- Tokenizers are validated per arch: the required token ids must be present (`<PAGE>`=128827 for v2),
+  and the tokenizer.json SHA-256 must match the arch pin.
 
-**D3. Keep the decoder dimension constants compile-time. Add a variant axis for attention, RoPE
-and decode contract, not a runtime shape spec.**
-*Why:* v1 and v2 share every dimension (§2.2). The doctrine prefers fixed shapes in hot loops, and
-the existing type-level shapes (`[_; NUM_EXPERTS_PER_TOK]`, `[f32; HEAD_DIM]`) stay valid. The
-variance is one enum (`UnlimitedVariant::{V1Rswa, V2SrSwa}`) chosen from the arch at load time and
-dispatched once per layer call. There are no trait objects in the inner loops.
+*Why:* this removes the most dangerous failure, a silent misload or a mismatched tokenizer sidecar,
+independently of v2. It is also a prerequisite for ever changing a default.
 
-**D4. Use the HF `infer()` path as the parity oracle for unwindowed decoding.**
+**D3. Keep the decoder dimension constants compile-time. Add a variant axis for attention, RoPE and
+decode contract, not a runtime shape spec.**
+- v1 and v2 share every dimension (§2.2), and the doctrine prefers fixed shapes in hot loops.
+- The variance is one enum, `UnlimitedVariant::{V1Rswa, V2SrSwa}`. It is chosen from the arch at load
+  time and dispatched once per layer call, with no trait objects in inner loops.
+- The existing `ModelArch::decode_contract()` gains the v2 fields; no new method is added for that.
+- `Decoder::DeepSeekV2MoeRswa` gains a sibling, `Decoder::DeepSeekV2MoeSrSwa`.
+
+**D4. The primary parity oracle for unwindowed decoding is the HF `infer()` path, in f32 on CPU.
+bf16 runs form the cross-precision ledger.**
 *Why:*
-- It is deterministic and runnable with pinned packages.
-- It is the "transformers" path Baidu documents.
-- It exposes every intermediate (router scores, selections, biases) we need for rung-by-rung parity.
+- v1's correctness oracle has never run on the dev host under CUDA. v1 reached L4 token-exact 1.0 and
+  L5 CER 0.0 against `gen_reference_fixtures.py --device cpu --cpu-patch --f32` (fixture set
+  `fixtures/native_f32`, `tests/fixtures/PROVENANCE.md`).
+- With f32 on both sides, Token Sieve routing should match exactly even where selection is genuinely
+  selective. Most routing fragility is a bf16-vs-f32 artifact.
+- On CPU the HF reference takes the dense SDPA path (§5.7). That path is semantically identical to the
+  GPU Triton path; only the numerics differ.
 
-SGLang differs in a few places (§5.11). Where they differ, we match HF in unwindowed mode and
-record the difference in `docs/DISCREPANCIES.md`.
+Where HF and SGLang differ (§5.11), unwindowed mode matches HF and the difference is recorded in
+`docs/DISCREPANCIES.md`.
 
-**D5. Use the SGLang reference semantics for windowed (unlimited-horizon) decoding.**
-*Why:* HF `infer()` never splits documents. SGLang is the only implementation, it is what Baidu's
-long-document benchmark numbers came from, and the chunked scheme is what makes books feasible. We
-implement the semantics natively (§5.10). We do **not** replicate a post-processing quirk in its
-non-streaming stitching path that moves a blank first page to the end of its window
-(§5.10.8, DISC). The streaming path in the same wheel does not have it, and replicating it would
-corrupt page alignment for users.
-
-**D6. Port in order: base mode first, then multi-page base, then windowed, then gundam.**
+**D5. Windowed (unlimited-horizon) decoding follows SGLang semantics, gated by a Python windowed
+oracle written from the wheel source.**
 *Why:*
-- In base mode a page's 273 image tokens span at most 10 blocks, and the read budget is K=12. For
-  every query with an own-page candidate set, Token Sieve therefore selects **all** own-page remote
-  blocks. Only the continuous entmax bias varies, so routing cannot flip between implementations.
-  That makes base mode the cheapest place to prove the attention math.
-- Multi-page base is v2's headline accuracy win.
-- Gundam pages carry 900–1,900 image tokens, so routing becomes truly selective. Gundam is also
-  uncertified for v1 today.
+- HF `infer()` never splits documents. SGLang is the only implementation, and Baidu's long-document
+  numbers came from it.
+- The Python windowed oracle (U2-D2a; U2-D2b is the parity gate) runs §5.10 on the HF model's DASH cache. It is written **from the
+  wheel source by a different author than the Rust implementation**, so a misreading of §5.10 is not
+  implemented twice. Where the oracle and §5.10 disagree, §5.10 is fixed.
 
-**D7. Use the conservative int8 recipe policy unchanged.** Quantize exactly the 2,148
-FFN/expert matrices. Keep everything else at source precision: attention q/k/v/o, `lm_head`,
-`embed_tokens`, the MoE router gate, all norms, the vision tower, the projector, **and all new
-router/indexer tensors**. The recipe id is `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1`.
-*Why:* doctrine #2. It is the validated set for this backbone. The router projections are small
-(0.33M MACs per layer per token) and steer a discrete selection, so quantizing them is all risk and
-no gain.
+We do **not** replicate the non-streaming stitching quirk that moves a blank first page to the end of
+its window (§5.10.8, DISC-U2-4). The wheel's streaming path doesn't have it, and it would corrupt page
+alignment.
 
-**D8. Keep the unused `indexer.*` tensors in the artifact; drop only the I64 `position_ids` buffer.**
+**D6. Port in this order: single-page base, then multi-page base, then windowed, then gundam.**
+- **Single-page base is routing-degenerate.** A page's 273 image tokens span ≤ 10 blocks and K=12, so
+  every query selects all remote candidate blocks; only the continuous entmax bias varies. That makes
+  it the cheapest place to prove the attention math.
+- **Multi-page base is NOT degenerate.**
+  - For pages 2..N, the first 128–159 image tokens of each page have no remote own-page block. They
+    fall back to *all* remote blocks (§5.6.4) and route selectively over every earlier page; from
+    page 3 on there are more than 12 candidates and top-K binds.
+  - That is about half of each later page's image tokens, plus the instruction tokens. It is the
+    cross-page channel, and the reason exact routing equality needs the f32 oracle.
+- **Decode in base mode is degenerate:** own-page image blocks number ≤ 10 per page.
+- **Gundam pages carry 483–2,033 image tokens** (Appendix A), so routing is selective everywhere.
+  Gundam is also uncertified for v1 today.
+
+**D7. Keep the conservative int8 recipe policy unchanged, and enforce it by name.**
+- Quantize exactly the 2,148 FFN/expert matrices.
+- Keep everything else at source precision: attention q/k/v/o, `lm_head`, `embed_tokens`, the MoE
+  router gate, all norms, the vision tower, the projector, **and every router/indexer tensor**.
+- Recipe id: `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1`.
+- `recipe.rs::is_decoder_attn_proj` currently matches `.self_attn.` + `q_proj.weight`, which also
+  catches `self_attn.dash_router.q_proj` and `self_attn.indexer.q_proj`. It is narrowed to the exact
+  `self_attn.{q,k,v,o}_proj.weight` names.
+- The v1 WASM int4 recipe is refused for v2.
+
+*Why:* doctrine #2. The router projections are small (0.33M MACs per layer per token) and steer a
+discrete selection, so quantizing them is all risk and no gain.
+
+**D8. Keep the unused `indexer.*` tensors in the artifact. Verify the I64 `position_ids` buffer and
+skip it.**
+- At inference, scoring uses `dash_router.*`. The `indexer` module only supplies page and RoPE helper
+  methods (§5.6.7).
+- Keeping it makes the census exact and costs ≈7.9 MB at bf16. Router plus indexer together are
+  ≈15.7 MB, the v2−v1 `total_size` delta of 15,746,056 B.
+- `position_ids` must equal `arange(257)`. Both the converter **and the raw safetensors loader** verify
+  that and skip it.
+  - Today both parsers reject I64 outright (`weights.rs:197-205`, `mod.rs:1442-1450`), so M1's raw-BF16
+    load needs this.
+  - `.focrq` has no I64 dtype, and the CLIP path already derives positions.
+
+**D9. Start the KV cache as f32. Retirement is block-granular and part of the core v2 cache. bf16 KV
+is a separate lossy lever.**
+- A 32-row block is retired once both conditions hold:
+  1. no non-open query can read it again: it holds no image token, or all its image pages are behind
+     the current query page;
+  2. it lies wholly behind the local window.
+- Retirement is enabled only after the first generated `<PAGE>`.
+- An open-row detector guards it, with a deterministic fallback to no retirement (§5.12).
+- `M = min(16, nblk)` always uses the **logical** (pre-retirement) block count.
+
 *Why:*
-- At inference, scoring uses `dash_router.*`. The `indexer` module supplies only helper logic in
-  the dash stage, so its projections are unused (§5.6.7).
-- Keeping them makes the census exact and costs about 15.7 MB (0.4%).
-- `position_ids` is a constant `arange(257)`. The converter verifies that and drops it, recording
-  the rule in the census. `.focrq` has no I64 tensor dtype, and the CLIP path already derives
-  positions.
+- Without retirement, an unwindowed 20-page run holds about 3 GiB of KV against v1's ~0.3 GiB. That is
+  a memory regression on the very path whose default should flip.
+- Row-level retirement is wrong. Page boundaries are never block-aligned (markers sit at 1+274p, and
+  274 ≡ 18 mod 32), and a selected block is read whole.
 
-**D9. Start the KV cache as f32 and full-length within a window. Earn memory reductions as
-separate, proven levers.**
-*Why:* exactness first. The levers are:
-- retire-on-advance within a window, which is output-exact under the page guard (§5.12, proof
-  obligation);
-- windowing;
-- bf16 KV, which is lossy and kill-switch gated.
+**D10. v2 n-gram defaults are 35, with window 128 for a single page and 1024 for documents.**
+- That is Baidu's evaluation setting and v1's contract. The oracle passes these explicitly, because HF
+  `infer()` defaults to off.
+- The n-gram domain is **generated ids only**, plus the hidden forced tokens in windowed mode.
+  - This is a new domain parameter: the live v1 sampler's history includes prompt ids (`mod.rs` ~3829,
+    ~3932), so it is not a reuse.
+  - `--no-repeat-ngram 0` turns it off.
 
-**D10. n-gram defaults for v2 are 35 with window 128 (single page) or 1024 (multi-page).** That is
-Baidu's evaluation setting and v1's existing contract. The oracle passes these explicitly, because
-HF `infer()` defaults to off.
-*Why:* it matches the published numbers and gives continuity for users. A flag exposes `0` (off).
-
-**D11. Per-page output cap: 20,000 tokens per page by default** (HF and README), configurable with
+**D11. The per-page output cap is 20,000 tokens by default** (HF and README), set with
 `--max-page-tokens`.
+- **v2 document mode has no global generated cap by default.** `--max-length` and
+  `FOCR_MAX_NEW_TOKENS` (default 32,768, a v1 global cap) apply **per page** when set. Otherwise a
+  v1-tuned environment would truncate a book after about 30 pages.
+- `FOCR_STAGE_BUDGET_FORWARD_MS` applies per window, scaled by the pages in the window. An exhausted
+  window checkpoints (D14) and exits 5 (`EXIT_TIMEOUT`), with completed pages written. Cancellation
+  exits 6 (`EXIT_CANCELLED`) the same way.
+- Truncation is never silent. A page that stops on its token cap or on the per-window position limit
+  reports `finish_reason: "length"`. A position-limit stop also exits 5. Until U2-D1b lifts it, an
+  unwindowed v2 document over 60 pages is refused up front with exit 2, because one window cannot
+  hold it.
+- U2-C4 records the per-page generated-token distribution, and the cap default is revisited on that
+  evidence. A runaway page costs minutes of CPU.
 
-**D12. Single-page crop mode for v2 is decided by evidence (milestone M4).** Until then, v2 single
-pages run in **base** mode, which is faster on CPU and has the same vision cost as v1's default.
-Gundam is available via `--crop-mode gundam` (uncertified until G1).
-*Why:* Baidu's default is gundam, but gundam's CPU vision cost is 3–7× base, and v2's single-page
-accuracy edge is negligible either way. The choice deserves measurement, not assumption.
+**D12. v2's single-page crop mode is decided by evidence (U2-G2).**
+- Until then, v2 single pages run in **base** mode, which is faster on CPU and matches v1's default
+  vision cost.
+- Gundam is available via `--crop-mode gundam`, uncertified until U2-G1.
+- Document-mode crop mode is decided the same way (OQ-V2-14). Document mode ships in base; gundam
+  document mode is an evaluated option, not a blocker.
 
-**D13. Windowed decoding defaults to W=10 pages per window (Baidu-validated). Documents with at
-most W pages run unwindowed.** `--page-window N|auto|off`; `auto` derives W from a memory budget.
+*Why:* Baidu's default is gundam, but gundam's CPU vision cost is ≈1.7–6.4× base (estimate from
+§8.1's per-view figures), and v2's single-page edge is negligible either way.
+
+**D13. Windowed decoding defaults to W=10 own pages per window** (Baidu's README; the wheel's env
+default is 1).
+- Documents with N ≤ W pages run unwindowed.
+- `--page-window N|auto|off`, where `auto` derives W from the memory budget.
+
 *Why:* unwindowed is the HF parity mode, and for short documents windowing only adds risk.
 
-**D14. Long runs are resumable and resume is byte-identical.** Completed windows are checkpointed
-to the fsqlite run store, together with the retained tail state that the next window splices
-(§5.10.4).
-*Why:* a 1,000-page run on CPU takes hours. Users must be able to stop and resume without changing
-the result.
+**D14. Long runs are resumable, and resume is byte-identical.**
+- After each window:
+  - completed page bodies are appended to `<out>.partial` (fsynced, renamed on completion);
+  - the retained tail (§5.10.3) is written **atomically** to a checkpoint sidecar file beside the
+    output. That is ≈400–560 rows, ≈47–66 MiB of f32 K/V, ~3 MiB of index keys, plus page state.
+  - Only the latest checkpoint is kept, replaced by atomic rename.
+- The fsqlite run store holds an index row only: run id, checkpoint path, SHA-256.
+- **Resume key:** binary version, artifact SHA-256, input SHA-256, page selection, every decode
+  parameter, and target arch.
+  - On mismatch, byte-identical resume is refused and `--resume=recompute` (window recompute, §5.10.5,
+    not byte-identical) is offered.
+  - Re-running the same command with a matching interrupted run resumes it and prints a note.
 
-**D15. The robot schema changes are additive only:** `page` and `window` events, plus fields on
-`run_complete`.
-*Why:* stable versioned NDJSON contract (AGENTS.md "Agent Ergonomics").
+*Why:*
+- `RunStore` (`src/storage.rs`) is best-effort telemetry: a failed write only prints a note. It is also
+  being refactored under bd-pfui.
+- A 1,000-page CPU run takes hours, so users must be able to stop and resume without changing the
+  result.
 
-**D16. Generalize sharded-safetensors loading for all zoo models**, not as a v2 special case.
-*Why:* v2 is the first default-family checkpoint with two shards, and future zoo models will be
-sharded too.
+**D15. Robot changes are additive.**
+- The existing `page` event (bd-2z0y decoded, bd-fck1 skipped) keeps every field and gains
+  `source_page`, `half`, `window`, `tokens`, `finish`, `elapsed_ms` and `model_id`. This fixes today's
+  mix, where skipped events carry the source page and decoded events the emission index.
+- `window` is the only new event kind.
+
+*Why:* the robot contract is stable, versioned NDJSON (AGENTS.md "Agent Ergonomics").
+
+**D16. Sharded-safetensors loading is generic across the zoo.**
+- **Raw loads** check the index, the per-shard headers and the census on every load, and present one
+  logical tensor directory. That matches v1: raw loads hash nothing today, and `source_sha256` is empty
+  for safetensors.
+- **Full shard SHA-256s** are verified by `focr convert`, which stamps them, and by `doctor`.
+- `.focrq` has a single 32-byte `source_sha256` (preamble[11..43]).
+  - For multi-shard sources it holds **SHA-256 over the concatenation of the shard SHA-256s in index
+    order**.
+  - `provenance_json` lists each shard's name, size and SHA-256.
+
+*Why:* v2 is the first default-family checkpoint with two shards, and future zoo models will shard
+too.
+
+**D17. With v2, a PDF is one document by default** (once the multi-page gate passes, §10).
+- When the resolved model is v2, `focr ocr doc.pdf` runs document mode, windowed when N > W.
+  `--independent-pages` restores per-page parsing.
+- Image lists in `ocr-batch` stay independent unless `--multi-page` is given; a list of images is
+  often unrelated.
+- Document mode composes with `--pages`, `--split-spreads` (each logical half is one `<PAGE>`),
+  `--json` and `--extract-figures`.
+- It keeps a source-page map, so skipped or split pages never shift numbering.
+
+*Why:*
+- Under SR-SWA every per-page cost is the same inside a window as alone: 1024 vision, ~274 prefill
+  tokens, ≤ ~512 attended tokens per step. So document mode costs about N single-page runs (estimate,
+  measured by U2-F1).
+- It adds cross-page structure, the page-count guarantee and per-page output.
+- v1's trade-off was different (640 squash, attention growing with N, 32K shared positions), which is
+  why v1 kept document mode opt-in.
+
+**D18. v2 dispatch is fail-closed.** Each of the following either supports v2 or refuses it with exit
+2 **before weights load**:
+- every decode path: f32 cached (where the certified int8-FFN artifact runs), the `_i8` cached path
+  and its triggers (`FOCR_DECODE_INT8`, `ocr-batch --experimental-full-int8`, `force_int8_decode()`,
+  WASM int4), chunked prefill, stateless oracle, batch spine, spec-verify;
+- every entry point, including `OcrModel::recognize_multi_page*`, which never takes v1's 640-squash
+  loop for v2;
+- every lever: `FOCR_SPEC_DECODE`, `FOCR_BATCH_SPINE`, `FOCR_INT8_KV`, `FOCR_DECODE_INT8`,
+  `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD`, `FOCR_QKV_FUSED`, `FOCR_DECODE_STATELESS`,
+  `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_ATTN_GEMM`, `FOCR_RSWA_PARALLEL_ATTN`, `FOCR_PREFILL_CHUNK`;
+- the resident daemon;
+- the converter recipes.
+
+Routing is an exhaustive `match` on `unlimited_variant()`. No `_ =>` arm may reach the v1 forward.
+
+*Why:*
+- Today `forward` and `forward_dynamic` (`mod.rs:2105`, `:2137`) dispatch on id strings and fall
+  through to the v1 `forward_pre` (`:2394`) for unknown ids. Only `ensure_arch_implemented` guards
+  them.
+- `spec_decode_i8` engages for any run that matches its frozen ban list, and a single-page v2 run would
+  match.
+- v2 weights run through R-SWA code produce confident garbage with exit 0, the worst possible outcome
+  for a user.
+
+**D19. Document mode uses a streaming page source and a whole-process memory budget.**
+- Pages are rasterized and preprocessed per window: W own pages plus 1 lookahead.
+- Vision features are computed and dropped per page.
+- Only page metadata and the source-page map scale with N.
+
+*Why:*
+- `recognize_pdf_multi_page` collects every selected page as a `DynamicImage` and clones the vector
+  (`cli.rs:1821-1862`). At ~25 MB per 300-dpi letter page, a 300-page book holds ~7.5 GB per copy
+  before any KV exists.
+- Streaming also bounds time-to-first-page to one window.
+
+**D20. Pages are split on token id 128827, and each page is decoded by a UTF-8-safe incremental
+decoder.**
+*Why:*
+- The guard guarantees `<PAGE>` is a single token, so splitting on the id is exact and cheaper than
+  re-scanning decoded text.
+- Today's `PageStream` (`mod.rs:2802-2821`) sets `stream_broken = true` permanently after a split
+  multi-byte UTF-8 character, so `page` events stop for the rest of a Chinese document.
+  - This already affects v1; U2-X1 fixes it.
+  - MarathonDocBench is half Chinese.
+
+**D21. Both entmax domains are implemented**, behind `EntmaxDomain::{TopM, AllCandidates}`.
+- HF top-M is the parity default.
+- The long-document default is chosen on ground truth (U2-C5b).
+
+*Why:*
+- Fallback queries are about half of every later page's image tokens in multi-page base, so the
+  HF/SGLang difference is not a corner case.
+- HF entmax combined with SGLang windowing is a combination no Baidu stack ran, and Baidu's
+  long-document numbers are SGLang's.
+- The second domain is one small function.
+
+**D22. Each model gets its own artifact version, and the v2 census is a delta.**
+- `versioned_quant_path` (`mod.rs:1025`) uses the global `UNLIMITED_OCR_ARTIFACT_VERSION` ("0.7.0",
+  `lib.rs:74`) for every model id. It will take a per-model version from the arch instead.
+- The embedded v2 census lists:
+  - only the 109 tensors v2 adds over v1;
+  - the SHA-256 of the resulting 2,819-entry list;
+  - full-tensor SHA-256s of every vision, projector, newline and separator tensor asserted
+    byte-identical to v1. This is the mechanical vision-reuse proof.
+
+*Why:* a second full census would duplicate 2,710 identical entries, and one global version cannot
+name two artifacts.
+
+**D23. Library first: one document API.**
+- `recognize_document(source, &opts, sink)` replaces the five `recognize_multi_page*` variants.
+- The CLI's document mode, streaming (D5) and resume (D4) are built on it.
+- The crate is published, so this lands with a minor-version bump and a CHANGELOG migration table.
+- The iOS crate's `recognize_multi_page_dynamic` migrates in U2-H1.
+
+*Why:* AGENTS.md forbids compatibility wrappers, and the product is library-first.
+
+**D24. Document mode never aborts on one bad page.**
+- A page that cannot be rasterized is skipped. That covers JBIG2, JPX and vector/text content
+  (`pdf.rs:317-322`, bd-0a7). The skipped page gets a `page` `skipped` event, is excluded from the
+  prompt, and keeps its slot in the source-page map.
+- A directory of page images (natural sort) is a first-class document input. It is the realistic
+  route for books rasterized out of band.
+
+**D25. Model resolution is deterministic and visible.**
+- Precedence: `--model` > `FOCR_MODEL_PATH` > the mode default (§10) > v1.
+- If the mode default is not installed, v1 serves the run and prints a one-line pull hint (on stderr,
+  plus a robot note).
+- JSON output and `run_complete` carry `model_id` and `artifact_sha256`, and the run store records
+  both.
+
+*Why:* "v2 when installed" would otherwise make pipeline output depend on cache state invisibly.
 
 ---
 
 ## 5. Reference-semantics specification (v2)
 
-The citations point into the pinned v2 sources: `MU` = `modeling_unlimitedocr.py`,
-`MD` = `modeling_deepseekv2.py` (the DASH overlay), `SB` = `_sparse_base_impl.py`,
-`DA` = `dash_attention.py`, `W/…` = the SGLang wheel. Line numbers refer to commit `5632329a`.
+Citations point into the pinned v2 sources at commit `5632329a`:
+
+| Tag | File |
+|---|---|
+| `MU` | `modeling_unlimitedocr.py` |
+| `MD` | `modeling_deepseekv2.py` (DASH overlay) |
+| `SB` | `_sparse_base_impl.py` |
+| `DA` | `dash_attention.py` |
+| `TR` | `sparse_gather_e2e_triton.py` |
+| `W/…` | SGLang wheel, under `sglang/srt/` |
+
+Claims marked **[W]** were verified against the wheel by the spec-fidelity review.
 
 ### 5.1 Prompt and tokenization
 
-**Layout.**
-- Prompt string: `"<PAGE><image>" * n_pages + instruction`, with the default instruction
-  `"Multi page parsing."`. This holds even when `n_pages == 1` (`MU:1073-1080`).
-- The token sequence is `[BOS=0] ( [<PAGE>=128827] [<image>=128815] × n_img(p) )_{p=1..N}
-  [instruction tokens]` (`MU:531-580`).
+**Prompt string** (`MU:1073-1082`). The default is `"<PAGE><image>" * n_pages + "Multi page
+parsing."`, even for `n_pages == 1`. HF handles three cases:
+
+| Caller prompt | HF behavior |
+|---|---|
+| No `<image>` | Prepends `"<PAGE><image>"*n` |
+| One `<image>` and n > 1 images | Replaces it with `"<PAGE><image>"*n` |
+| Already n `<image>` placeholders | Uses it **as is**, which can lack `<PAGE>` (§5.5 fallback) |
+
+franken_ocr always builds the prompt itself and never accepts caller `<image>` placeholders for v2.
+
+**Token sequence** (`MU:531-580`):
+`[BOS=0] ( [<PAGE>=128827] [<image>=128815] × n_img(p) )_{p=1..N} [instruction tokens]`
+- BOS is prepended manually.
+- Text segments are encoded with `add_special_tokens=False` (`MU:550,570-571`).
 - There is no chat template and there are no role tokens. The SGLang template `unlimited-ocr` has
   empty roles and separators.
-- The trailing EOS appended by the vLLM/SGLang tokenizer is stripped in inference mode
-  (`W/configs/unlimited_ocr.py:503-507`).
+- The trailing EOS that the SGLang/vLLM tokenizer appends is stripped in inference mode
+  (`W/configs/unlimited_ocr.py:502-507`) [W].
 
-**Tokenization.**
-- Text segments are encoded with `add_special_tokens=False`.
-- `<PAGE>` must tokenize to the single id 128827. It is an *added, non-special* token, so the
-  added-token split must recognize it before BPE.
-- Decoding with `skip_special_tokens=False` renders it as the literal text `<PAGE>`.
+**`<PAGE>`.** It must tokenize to the single id 128827. It is an *added, non-special* token.
+- franken_ocr's tokenizer already splits on all added tokens longest-first, regardless of the
+  `special` flag.
+- It decodes non-special added tokens literally, even with `skip_special`.
+- The remaining v2 work is the required-token check and conformance fixtures (U2-A4).
+- The tokenizer.json normalizer is empty.
 
 **Image-token counts.** With nq = ceil((640/16)/4) = 10 and nqb = ceil((1024/16)/4) = 16:
-- **Base (no crop):** `nqb*(nqb+1) + 1 = 273` (`MU:562`).
-- **Gundam with tiles (w_t × h_t, where w_t>1 or h_t>1):** `273 + (nq*w_t + 1) * (nq*h_t)`
-  (`MU:563-566`).
+- base (no crop): `nqb*(nqb+1) + 1 = 273` (`MU:564`);
+- gundam with tiles (w_t × h_t, w_t>1 or h_t>1): `273 + (nq*w_t + 1) * (nq*h_t)` (`MU:565-567`).
 
 **Generation output.**
-- Format: `<PAGE>body_1<PAGE>body_2…<PAGE>body_N` followed by EOS (id 1), which is dropped.
-- Each `<PAGE>` *opens* a page.
-- Body text keeps v1's grounding grammar (`<|ref|>…<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>`,
-  0–999 normalized per page). The post-processor is unchanged apart from page splitting on the
-  `<PAGE>` text.
+- The output is `<PAGE>body_1<PAGE>body_2…<PAGE>body_N`, then EOS (id 1), which is not appended.
+  Each `<PAGE>` *opens* a page.
+- Body text keeps v1's grounding grammar: `<|ref|>…<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>`, with
+  coordinates normalized to 0–999 per page.
+- franken_ocr segments pages on the **token id** (D20), not on decoded text.
 
 ### 5.2 Preprocessing (`MU:531-580`)
 
-**Normalization.** mean = std = 0.5, i.e. `x/127.5 − 1`. Pad color (127,127,127). Each global view
-is `ImageOps.pad(image, (1024,1024))`, an aspect-preserving letterbox using PIL BICUBIC resampling.
+**Normalization.** mean = std = 0.5, so `x/127.5 − 1`. Pad color is (127,127,127). Each global view is
+`ImageOps.pad(image, (1024,1024))`: an aspect-preserving letterbox with PIL BICUBIC and color 127
+(`MU:545,561`).
 
-**Crop policy.** `crop_mode=None` means gundam when exactly one image and base otherwise. `infer_multi`
-forces base (`MU:1117`). franken_ocr's v2 default for single pages is base (D12).
+**Crop mode selection.**
+- In HF, `crop_mode=None` means gundam when there is exactly one image and base otherwise (`MU:541`).
+- `infer_multi` forces base (`MU:1117`).
+- SGLang defaults to gundam for every request (DISC-U2-6).
+- franken_ocr's v2 default is base for single pages and documents alike (D12).
 
-**Base mode.** One global 1024 view per page, **with no 640 pre-resize**. This is a deliberate
-change from v1's multi-page path ("vLLM's training-parity fix", `MU:536-538`).
+**Base mode.** One global 1024 view per page, **with no 640 pre-resize**. This is a deliberate change
+from v1's multi-page path ("vLLM's training-parity fix", `MU:536-538`).
+
+**Resampling kernel.** For v1, multi-page forces PIL-bicubic squash and single-page uses the
+CatmullRom default (DISC-001, `FOCR_RESAMPLE`). For v2, the 1024 letterbox uses the **PIL-bicubic
+exact kernel for both single pages and documents**: that is what the reference computes, and L0 is
+exact. Any faster kernel is a lossy lever with its own CER-gated DISC entry.
 
 **Gundam mode.**
-- If both image sides are ≤ 640, there are no tiles (ratio (1,1)).
-- Otherwise `dynamic_preprocess(min_num=2, max_num=16, image_size=640)` applies. **v1 used
-  max_num=32.**
-- The tiles are 640² crops of the resized image.
+- If both image sides are ≤ 640, there are no tiles: ratio (1,1) (`MU:554`).
+- Otherwise the image goes through `dynamic_preprocess(min_num=2, max_num=16, image_size=640)`
+  (`MU:229,1043`). v1 used max_num=32.
+- Any grid with i·j ∈ [2,16] is allowed (`MU:236`), so 1×16 and 16×1 are possible.
+- Tiles are 640² crops of the resized image.
 
-**Vision-feature order in the embedding scatter** (`MU:731-790`):
-- Tiled pages: `[local features with image_newline per row] ++ [global features with image_newline
-  per row] ++ [view_seperator]`.
-- Untiled pages: `[global with newline] ++ [view_seperator]`.
-- This is identical to v1. Multi-page concatenates per page, in order.
+**Vision-feature scatter order** (`MU:731-790`, identical to v1):
+- tiled: `[local features with image_newline per row] ++ [global features with image_newline per row]
+  ++ [view_seperator]`;
+- untiled: `[global with newline] ++ [view_seperator]`.
+
+Multi-page concatenates per page, in order. franken_ocr's `connector::fuse_no_crop`
+(`connector.rs:403`) already handles interleaved `<PAGE>` tokens.
 
 ### 5.3 Vision tower
 
-Unchanged from v1: same code and byte-identical weights. franken_ocr's existing SAM, CLIP, bridge
-and connector code and its vision parity evidence apply as-is. U2-B8 proves this mechanically.
+Unchanged from v1: same code and byte-identical weights. franken_ocr's SAM, CLIP, bridge and connector
+code, and its vision parity evidence, apply as-is. The delta census (D22) proves the identity
+mechanically with full-tensor SHA-256s.
 
 ### 5.4 Page bookkeeping
 
-These definitions drive both RoPE (§5.5) and the Page Gate (§5.6.4). Let `ids` be the token-id
-sequence, `img = ids==128815` and `mk = ids==128827`. Let `cum[i]` be the inclusive count of `mk`
-up to position i, and `last_img` the index of the last image token. `N = cum[last_img]` is the
-number of prompt pages, and **marker mode** means `N > 0`. v2 prompts are always in marker mode.
-`in_prefill[i] = (i ≤ last_img)`.
+These definitions drive RoPE (§5.5) and the Page Gate (§5.6.4).
+- `ids` is the token-id sequence, `img = ids==128815`, `mk = ids==128827`.
+- `cum[i]` is the inclusive count of `mk` up to position i.
+- `last_img` is the index of the last image token.
+- `N = cum[last_img]` is the number of prompt pages. v2 prompts are always in marker mode (N > 0).
 
-**Image-token page id** (0-based): `img_page[i] = cum[i] − 1` for image tokens and −1 otherwise
-(`SB:2404-2440`).
+**Image-token page id** (0-based; `SB:2433-2435`): `img_page[i] = cum[i] − 1` for image tokens, and −1
+otherwise.
 
-**Query page id** (`SB:2440-2458`, inference sets `_PAGE_SCOPE_PREFILL=True`, `MD:333`):
+**Query page id** (`SB:2439-2456`; inference sets `_PAGE_SCOPE_PREFILL=True`, `MD:333`):
 
 | Token | Query page |
 |---|---|
-| Prefill tokens up to `last_img` (markers and image tokens) | `cum − 1` |
+| Prefill tokens ≤ `last_img` (markers, image tokens) | `cum − 1` |
 | BOS (cum=0) | −1 |
 | Instruction tokens after `last_img` | −1 |
 | Generated tokens | `cum − 1 − N` (−1 if negative) |
 
-So the k-th generated `<PAGE>` and its body map to page k−1, which is the prompt's page k−1.
+So the k-th generated `<PAGE>` and its body map to prompt page k−1.
 
-**Per-block image-page range** (block size 32, `MU:481-528`): for each KV block,
-- `bmax` is the max image page id among its tokens (−1 if none);
-- `bmin` is the min image page id (−1 if none).
+**Per-block image-page range** (block size 32; `MU:481-528`).
+- For each KV block, `bmax` and `bmin` are the max and min image page ids among its tokens, or −1 if
+  it has none.
+- Both are computed once at prefill, from the prompt.
+- HF decode ignores generated ids for these ranges, even if id 128815 were sampled (`MU:514-528`).
 
-These are computed once at prefill, from the prompt. Generated tokens are never image tokens.
+**Decode query page.**
+- Start with `mcum = cum[-1]` (all prompt markers) and `pp = N` (`MU:506,512`).
+- Each **fed** `<PAGE>` increments `mcum`.
+- `qp = mcum − 1 − pp`, or −1 if that is negative.
 
-**Decode query page.** `marker_cum` is incremented when the *fed* token is `<PAGE>`. Then
-`qp = marker_cum − 1 − N`, with −1 if negative.
+For standard prompts `cum[-1] == N`, so the first fed generated `<PAGE>` gives qp = 0.
 
 ### 5.5 page2d RoPE (main attention **and** router)
 
-**Coordinates.** `SB:2511-2557` for prefill, `SB:1451-1489` for the decode state machine.
+Coordinates come from `SB:2511-2568` (prefill) and `SB:1451-1489` (decode state machine).
 
 **Bucket per token.**
-- Prefill tokens up to `last_img`: bucket = `cum` (so 1..N).
-- Generated tokens and the instruction: bucket = `cum − N`, clamped to ≥ 0.
-- BOS and instruction therefore land in bucket 0, the reserved "no page" bucket.
+- Prefill tokens ≤ `last_img`: bucket = `cum`, so 1..N.
+- Generated tokens and instruction tokens: bucket = `cum − N`, clamped ≥ 0 (`SB:2554-2555`).
+- BOS and the instruction therefore land in bucket 0, the reserved "no page" bucket.
 
-**Token position.** `tok_pos` is the 0-based running count of earlier tokens in the same bucket. A
-response page's tokens continue after that page's prompt tokens, so the response `<PAGE>` of page b
-gets `tok_pos = 1 + n_img(b)` (that is, `pf_cnt[b]`).
+**`tok_pos`.** The 0-based running count of earlier tokens in the same bucket.
+- `pf_cnt[b]` counts only bucket b's prefill rows.
+- A response page's tokens continue after that page's prompt tokens, so the response `<PAGE>` of page
+  b gets `tok_pos = pf_cnt[b] = 1 + n_img(b)`.
 
-**Page position.** `page_pos = bucket`, folded to `bucket mod 2` at the angle computation
+**Page position.** `page_pos = bucket`, folded to `bucket mod 2` at angle computation
 (`sparse_rope_page_mod=2`).
 
-**Decode state machine.** Per layer, the state is `(page, tok, pf_cnt[], n_pg)`.
-- It is seeded from the last prefill coordinate: page 0 (instruction bucket), with `tok` = the last
-  bucket-0 count.
-- On each fed token:
+**Decode state machine.** Per sequence, the state is `(page, tok, pf_cnt[], n_pg)`, with
+`n_pg = N+1`.
+- Seed: `page` = the bucket of the last prompt token (0, the instruction bucket), and `tok` = **that
+  token's `tok_pos`** (`SB:1473-1474`).
+- On each fed token (`SB:1484-1489`):
   - if it is `<PAGE>`: `page = min(page+1, n_pg−1)` and `tok = pf_cnt[page]`;
   - otherwise: `tok += 1`.
-- `n_pg = N+1`. Extra markers clamp to the last page.
+- Extra markers clamp to the last page. HF then resets `tok = pf_cnt[N]` (DISC-U2-7).
 
-**Frequencies** (`SB:1984-2068`). dim = 128, half = 64, page_pairs = 1, so n_tok = 63.
+**Frequencies** (`SB:2027-2061`). dim = 128, half = 64, page_pairs = 1, so n_tok = 63.
 - `inv_tok[i] = 10000^(−i/63)` for i in 0..63. This is "resample" mode; note the /63, not 2i/128.
 - `inv_page[0] = 256^0 = 1`.
-- `ang = [tok_pos·inv_tok[0..63], (page_pos mod 2)·1]` (64 angles); `emb = cat(ang, ang)`.
-- Apply with the NeoX `rotate_half` convention: `x·cos + rotate_half(x)·sin`, where
-  `rotate_half([x1,x2]) = [−x2, x1]`.
-- cos and sin are computed in fp32, then cast to the activation dtype (bf16 in the reference).
-- The router uses the **same** 2-axis RoPE and coordinates on its 128-d q/k (`index_dim ==
-  head_dim`, so the 2-D branch is used, `MD:126-143`).
+- `ang = [tok_pos·inv_tok[0..63], (page_pos mod 2)·1]` gives 64 angles, and `emb = cat(ang, ang)`.
+- Rotation is NeoX `rotate_half` via transformers' llama `apply_rotary_pos_emb` (`SB:39-42`):
+  `x·cos + rotate_half(x)·sin`, with `rotate_half([x1,x2]) = [−x2, x1]`. It is not the interleaved
+  local variant at `SB:463`.
+- cos and sin are computed in fp32, then cast to the activation dtype (`SB:2061`).
 
-**Scaling.** The main-attention softmax scale is 1/√128. YaRN `attention_factor=1.0` does not
+**Router RoPE.** The router uses the **same** 2-axis RoPE, with identical parameters and coordinates,
+on its 128-d q/k (`MD:126-143,177-189,510-511`; `SB:1417-1425` vs `SB:2331-2347`).
+
+**Scale.** The main-attention softmax scale is 1/√128 (`DA:937`). YaRN's `attention_factor` does not
 apply on this path.
 
-**Fallback.** If a row has no `<PAGE>` or no image token, both paths fall back to 1-D RoPE (theta
-5e5, YaRN ×4). v2 prompts always carry markers, so franken_ocr **rejects** v2 inputs without image
-or marker structure rather than implementing the fallback (OQ-V2-6).
+**Fallback.** If a row has no `<PAGE>` or no image token, HF falls back to:
+- 1-D YaRN RoPE (theta 5e5, ×4) on main attention (LlamaRotaryEmbedding) and the router
+  (`SB:2337-2340,2542-2552`);
+- page ids `run//273` (`SB:2434`);
+- no guard (`expected_pages=0`, `MU:585,1141`).
+
+This never triggers with the default or `infer_multi` prompts. It does trigger for a caller prompt that
+already has n `<image>` placeholders and no `<PAGE>`. SGLang has no 1-D fallback at all
+[W: `models/unlimited_ocr_v2.py:151-152`]. franken_ocr always builds `<PAGE><image>` prompts (§5.1)
+and **does not implement the fallback**.
 
 ### 5.6 Token Sieve router (per layer, per query)
 
-Constants come from the checkpoint snapshot of `sparse_attention_config`, which inference reads
-(`MD:56-64,296-335`):
+**Constants.** Inference reads the checkpoint snapshot of `sparse_attention_config` (`MD:56-64,
+296-335`):
 
 | Constant | Value |
 |---|---|
 | block_size | 32 |
-| local_blocks | 4, so local_window = 128 tokens |
+| local_blocks | 4 (local_window = 128 tokens) |
 | K (read budget) | `dash_topk_blocks` = 12 |
 | M (entmax window) | 16 (`dash_topm`) |
 | idx_scale | `dash_scale_per_layer[l]/√128` = 128/√128 = 11.3137085 for all 12 layers |
@@ -433,60 +701,74 @@ Constants come from the checkpoint snapshot of `sparse_attention_config`, which 
 | σ | 1.0 |
 | stage0 | `head_cls` |
 
-**Pitfall.** The live config dict is overwritten at construction by `_persist_router_cfg`. Inference
-reads a **snapshot** taken before that. The env var `DASH_STAGE0` would override stage0, and the
-oracle must leave it unset.
+Pitfalls:
+- `_persist_router_cfg` overwrites the live config dict at construction, and inference reads the
+  snapshot taken before that.
+- The env var `DASH_STAGE0` would override stage0 (`MD:312`). The oracle must leave it unset.
 
-**5.6.1 Router projections** (`MD:365-377`). With h = the layer's input hidden state (the
-post-attention-norm input to self_attn):
+**5.6.1 Router projections** (`MD:365-377`). The router input is the same normalized tensor that feeds
+q/k/v. `SB:3692-3697` applies `input_layernorm` before `self_attn`, and `MD:369` maps NaN and ±Inf to
+0:
 ```
-iq = q_norm(q_proj(h))          # [128]
-ik = k_norm(k_proj(h))          # [128]
+h  = nan_to_num(input_layernorm(x))     # same tensor that feeds q_proj/k_proj/v_proj
+iq = q_norm(q_proj(h))                  # [128]
+ik = k_norm(k_proj(h))                  # [128]
 ```
-`q_norm`/`k_norm` are **Gemma-style RMSNorm**:
+`q_norm` and `k_norm` are **Gemma-style RMSNorm** (`DA:844-855`; eps = `rms_norm_eps` = 1e-6):
 ```
 x32 = nan_to_num(x.float())
 y   = x32 * rsqrt(mean(x32²) + 1e-6)
 y   = clamp(y, ±1e4) * (1 + w)
-y   = clamp(y, ±1e4)
+y   = clamp(y, ±1e4).to(activation_dtype)        # rounded back to bf16 in the reference
 ```
-- Apply 2-axis RoPE (§5.5) to iq and ik.
-- Cast to f32, replacing NaN/Inf with 0.
-- Index keys are cached **post-norm, post-RoPE**.
+- Next, 2-axis RoPE (§5.5) is applied to iq and ik **in the activation dtype**, with cos and sin also
+  cast.
+- Only then are they cast to f32, with NaN/Inf → 0 (`MD:375-376`).
+- Index keys are cached **post-norm, post-RoPE, f32** (`MD:440-444,515-517`).
+- In the f32 oracle every cast is a no-op. Against bf16 references these roundings are part of the
+  cross-precision ledger, because routing is discrete.
 
-**5.6.2 Block summaries (stage0 = head_cls)** (`MD:391-408`). For block c, with valid tokens j in c:
+**5.6.2 Block summaries (stage0 = head_cls)** (`MD:391-408`). For block c and its valid tokens j:
 ```
 a_j   = clamp((ik_j · head_cls) / √128, ±1e4)
-w_j   = softmax over valid j of a_j      # max-subtracted; denominator clamped ≥ 1e-6
-k̄_c  = Σ_j w_j · ik_j                    # nan_to_num → 0
+w_j   = exp(a_j − max_valid a) · valid_j ;  w_j /= max(Σ w, 1e-6)
+k̄_c  = nan_to_num(Σ_j w_j · ik_j)
 ```
+A partial tail block is never remote: remote requires `c ≤ q//32 − 4`, so every remote block is full
+and lies before q. Validity only matters for the tail block.
 
-**5.6.3 Remote block scores** (`MD:409-417`):
+**5.6.3 Remote block scores** (`MD:409-417`; `SCORE_NEG` at `DA:741`):
 ```
 s_c = clamp((iq · k̄_c) / √128, ±1e4)   if c ≤ floor(q_pos/32) − 4 and c has a valid token
 s_c = SCORE_NEG (−1e9)                   otherwise   ("not remote")
 ```
-`q_pos` is the **1-D absolute position** of the query within the KV sequence of the current window.
+`q_pos` is the query's **1-D position within the current KV sequence**. In windowed mode that
+position is window-local.
 
 **5.6.4 Page Gate (candidate set).**
-- **Decode** (`MU:481-528`): `allow[c] = (bmin[c] ≥ 0) ∧ (bmin[c] ≤ qp ≤ bmax[c]) ∧ (qp ≥ 0)`. If
-  `qp < 0` or no block is allowed, every block is allowed (open row).
-- **Prefill** (`MD:108-123`, `SB:2629-2649,2706-2737`): `cand[q,c]` is true when block c contains
-  any image token whose `img_page` equals the query page of q (≥ 0). If q has no such block, every
-  block is a candidate for q (per-query fallback).
+- **Decode** (`MU:481-528`): `allow[c] = (bmin[c] ≥ 0) ∧ (bmin[c] ≤ qp ≤ bmax[c]) ∧ (qp ≥ 0)`.
+  - Generated-text blocks (bmin = −1) are never allowed.
+  - If `qp < 0`, or no block is allowed, every block is allowed. This is an **open row**.
+  - The gate applies only because `image_only=True` (`MD:523-526`, config).
+- **Prefill** (`MD:108-123`, `SB:2629-2649,2706-2737`):
+  - `cand[q,c]` is true when block c contains any image token with `img_page == query page of q`
+    (≥ 0).
+  - If q has no such block, every block is a candidate for q (per-query fallback).
 - **Then** (`MD:339-348`):
   ```
   remote = s > SCORE_NEG/2
   cand   = remote ∧ allow_or_cand
-  if not any(cand): cand = remote
+  if not any(cand): cand = remote        # also an open row
   ```
-  If nothing is remote (the query is in the first 4 blocks), the query attends to its local window
-  only.
+  - If nothing is remote (q is in the first 4 blocks), the query attends to its local window only.
+  - In multi-page base prefill, the first 128–159 image tokens of pages 2..N hit `not any(cand)` and
+    route over all earlier blocks (D6).
 
-**5.6.5 Entmax-1.5 over the top-M window (HF semantics)** (`MD:349-362`, `DA:772-813`):
+**5.6.5 Entmax-1.5 over the top-M window (HF semantics; `EntmaxDomain::TopM`)** (`MD:346-362`,
+`DA:772-813`):
 ```
 x_c  = s_c · idx_scale  if cand[c] else −1e4 ; nan/±inf → −1e4
-(xv, xi) = topk(x, M = min(16, nblk))          # descending
+(xv, xi) = topk(x, M = min(16, nblk))          # nblk = LOGICAL block count; descending
 prior = entmax15(xv):
     z = (xv − max(xv)) / 2
     sort z descending; for k = 1..M: mean_k, meansq_k, ss_k = k(meansq_k − mean_k²),
@@ -496,463 +778,746 @@ prior = entmax15(xv):
 is_cand = cand[xi]
 K' = min(12, M) ; take the first K' slots: idx = xi[:K'], p = prior[:K'], valid = is_cand[:K']
 logp = ln(max(p, floor)) ; μ = mean of logp over valid slots (count clamped ≥ 1)
-bias = (logp − μ)/σ  if valid else 0
+bias = (logp − μ)/σ  if valid else 0          # no clamp at inference
 ```
-Selected blocks are `idx` where `valid`, each carrying a scalar `bias`. Zero-prior blocks inside
-the first K' slots are still read, with bias `ln(1e-4) − μ`.
+- The selected blocks are `idx` where `valid`, each carrying scalar `bias`.
+- Zero-prior candidate blocks inside the first K' slots **are still read**, with bias `ln(1e-4) − μ`.
+- Non-candidate slots (x = −1e4) contribute p = 0 and do not move τ*. Computing top-M over candidates
+  only and padding with −1e4 entries up to M is therefore exactly equivalent. Both the F2 lever and D9
+  retirement rely on this.
+- `topk` tie order among equal scores follows torch's descending `topk`. Ties among *candidates* at
+  the K' boundary are a tie-flip class (§7.2).
 
-**5.6.6 SGLang difference.** SGLang runs entmax over **all** candidate blocks, using an exact τ
-bisection, rather than the top-16 window. The two agree whenever the candidate count is ≤ 16. That
-covers every own-page query in base mode (≤ 10 blocks). It does **not** cover fallback queries
-(BOS, instruction, the first image blocks of a page, generated text before the first `<PAGE>`) or
-gundam pages. We implement HF semantics (D4); the difference is recorded as DISC-U2-1.
+**5.6.6 `EntmaxDomain::AllCandidates` (SGLang semantics).** SGLang runs entmax over **all** candidate
+blocks (`W/layers/attention/route_triton.py:12,175-202`) [W]:
+- τ comes from a 24-step bisection over [−1, 0] with fp64 sums;
+- the read set is `cand ∩ {z > thr}`, found with a 40-step count bisection, so a tie at 12th place can
+  read fewer than 12 blocks.
 
-**5.6.7 Unused indexer.** `self_attn.indexer.{q,k}_proj` are not used at inference (the dash path
-scores with `dash_router.*`). The indexer object only hosts page and RoPE helper methods.
+HF and SGLang agree whenever the candidate count is ≤ 16, up to bisection precision and tie handling.
+That covers every own-page query in base mode. They do **not** agree on:
+- fallback queries (BOS, instruction, early image blocks of pages 2..N, generated text before the
+  first `<PAGE>`);
+- gundam pages.
+
+franken_ocr implements `AllCandidates` with an exact τ (sort-based, as in §5.6.5 but over all
+candidates) and records the bisection difference as part of DISC-U2-1.
+
+**5.6.7 Unused indexer.** `self_attn.indexer.{q,k}_proj` are not used at inference; the dash path
+scores with `dash_router.*`. The indexer object only hosts page and RoPE helper methods (`MD:96-143`).
 
 ### 5.7 Block-sparse biased attention
 
-For a query at position q with selected blocks B (each with bias β_b) (`MD:454-481` for decode,
-`DA:1230-1261` for prefill):
+For a query at position q with selected blocks B, each with bias β_b (`MD:454-481` decode;
+`DA:1230-1261` dense prefill; `TR:37-118` Triton prefill):
 ```
-local(j)  = (q − 128 < j ≤ q)
-remote(j) = (j ≤ q) ∧ (block(j) ∈ B) ∧ ¬local(j)          # local wins on overlap
+local(j)  = (q − 128 < j ≤ q)                                # 128 tokens including self
+remote(j) = (j ≤ q) ∧ (block(j) ∈ B) ∧ ¬local(j)             # local wins on overlap
 logit_j   = (q·k_j)/√128 + (remote(j) ? β_block(j) : 0)
 out       = softmax over {j : local(j) ∨ remote(j)} of logit_j, applied to v_j
 ```
-- Per head; 10 heads share the selection, since the router is one head per layer.
-- In the reference, prefill runs SDPA in **bf16**, with the additive mask (including the bias) cast
-  to bf16. Decode runs in fp32.
-- franken_ocr computes in f32 throughout. The parity tolerance is measured, not assumed (OQ-V2-3).
+- Attention is computed per head. The 10 heads share the selection, because the router has one head
+  per layer (`MD:480`).
 - The output goes through `o_proj` as before. There is no attention bias anywhere
   (`attention_bias=false`).
+
+**Reference numerics.** All paths are semantically identical; only the rounding differs.
+- **GPU prefill: the Triton e2e kernel.** The preconditions are `router.use_triton and q.is_cuda and
+  attn_mask is None` (`MD:447-450`); the model forward drops the mask (`SB:~3960`).
+  - The bias is fp32.
+  - q·scale is rounded to bf16 before QK.
+  - P is rounded to bf16 before PV.
+  - The online softmax runs in fp32.
+- **CPU prefill**, or when the Triton import fails, or when positions ≠ arange (`TR:370-381`):
+  `_forward_dense` runs SDPA with an additive mask, bias included, in the activation dtype (bf16, or
+  f32 in the f32 oracle).
+- **Decode on both devices:** `_decode_attend` does fp32 math over activation-dtype q/K/V. The output
+  is cast to the activation dtype before `o_proj` (`MD:530`).
+- **Logits:** `lm_head(h)` in the activation dtype, then `.float()` (`MU:1165-1167`).
+
+franken_ocr computes in f32 throughout. The parity target is the f32 oracle (D4). Against bf16, the
+tolerance is measured (OQ-V2-3).
 
 ### 5.8 Prefill vs decode
 
 - **Prefill** (`q_len > 1`): every prompt token is a query with its own routing (§5.6) and sparse
   attention (§5.7). The router index keys of all prompt tokens are cached.
 - **Decode** (`q_len == 1`):
-  - append the token's K, V and index key;
-  - recompute its block's summary;
-  - route against all blocks (candidates per §5.6.4);
-  - attend per §5.7.
-- **Stateless equivalence.** The reference decode path and a fresh prefill over the full sequence
-  should select identically, because both use causal per-query routing and the same page ids. This
-  is a metamorphic test (§7.4), not an assumption.
-- **Only the last position** goes through `lm_head` after prefill (`MU:1143-1145`).
+  1. append the token's K, V and index key;
+  2. recompute its block's summary;
+  3. route against all blocks, with candidates per §5.6.4;
+  4. attend per §5.7.
+- **Positions:** `arange` in prefill and `S + len − 1` in decode (`MU:1163,1188`).
+- **Stateless equivalence.** Reference decode and a fresh prefill over the full sequence should select
+  identically: both use causal per-query routing and the same page ids. This is a metamorphic test
+  (§7.4), not an assumption. Its precondition is that no generated token equals 128815; a stateless
+  re-prefill would treat such a token as an image token, while decode ignores it.
+- **Only the last position** goes through `lm_head` after prefill (`MU:1165-1167`).
+- **KV:** HF keeps the **full** DynamicCache. Ring and sliding windows are disabled, and nothing is
+  evicted (`MU:1151-1153,1160`; `MD:509,516`).
 
 ### 5.9 Decode loop (`MU:1124-1200`)
 
-1. **Greedy** when temperature is 0. Temperature sampling is out of scope for parity.
-2. **Logit processors, per step:**
-   - **n-gram ban** (when enabled, D10), applied to *generated ids only*. With
-     `prefix = gen[-(n−1):]`, ban `gen[i+n−1]` for every i in `[max(0, len−window), len−n+1)` where
-     `gen[i:i+n−1] == prefix`.
-   - **Page-count guard** (HF semantics), with `expected = #<PAGE> in prompt`, `mc = #<PAGE> in
-     gen`, and `page_len` = tokens since the last generated `<PAGE>`:
+1. **Greedy** when temperature is 0. Argmax over the f32-converted logits takes the **lowest id on
+   ties** (`MU:1167,1176`). With bf16 logits, ties are much likelier than in f32. Temperature sampling
+   is out of scope for parity.
+2. **Logit processors**, per step in HF order (`MU:1168-1172`): n-gram first, then the guard.
+   - **n-gram ban** (when `no_repeat_ngram_size > 0`; D10), over *generated ids only*
+     (`MU:608-623`):
+     - with `prefix = gen[-(n−1):]`, ban `gen[i+n−1]` for each i in `[max(0, len−window), len−n+1)`
+       where `gen[i:i+n−1] == prefix`;
+     - `ngram_window ≤ 0` means **100** (`MU:1092`);
+     - a whitelist set is subtracted from the bans (`MU:620`).
+   - **Page-count guard** (`MU:585-604`). Definitions:
+     - `expected` = the count of `<PAGE>` in the prompt;
+     - `mc` = the count of `<PAGE>` in gen;
+     - `page_len` = tokens since the last generated `<PAGE>`, excluding the marker itself. Before the
+       first generated `<PAGE>`, it counts from the start of generation (`MU:593-595,1142`).
      ```
      if mc > expected: only EOS allowed
      elif 0 < max_page_tokens ≤ page_len: only (<PAGE> if mc < expected else EOS) allowed
      elif mc < expected: EOS banned
      ```
-3. **Stop** at EOS, at `max_new_tokens` (default `max_length − prompt_len`, with `max_length`
-   131072), or when `pos+1 ≥ max_length`.
-4. **Order hazard (OQ-V2-7).** HF applies the n-gram ban **before** the guard. If the ban removed
-   the token the guard then forces, every logit is −inf and HF's argmax emits id 0. SGLang applies
-   the guard first and a forced token short-circuits. **franken_ocr makes forced tokens
-   authoritative** (SGLang order). The oracle comparison asserts this case never occurs on any
-   fixture, and the difference is recorded as DISC-U2-2.
-5. **HF vs SGLang guard difference.** On the last page of an unsplit request, SGLang also bans
-   `<PAGE>` (when not `end_on_marker`); HF does not. With HF semantics, an extra `<PAGE>` is
-   possible and is followed by a forced EOS. Our page splitter drops a trailing empty page body and
-   counts it (`extra_markers`). Unwindowed mode follows HF; windowed mode follows SGLang (§5.10.7).
+     The guard is disabled when the prompt has no `<PAGE>` (`MU:585,1170`). `max_page_tokens ≤ 0`
+     disables only the cap (`MU:600`).
+3. **Stop conditions:**
+   - EOS (not appended);
+   - `max_new_tokens`, default `max(1, max_length − S)` with `max_length` 131072;
+   - `pos+1 ≥ max_length` (`MU:1089,1179-1190`).
+4. **Order hazard** (OQ-V2-7, DISC-U2-2). If the n-gram ban removes the token the guard then forces,
+   every logit is −inf and HF's argmax emits id 0. SGLang applies the guard first, and a forced token
+   skips the n-gram ban (`W/…/custom_logit_processor.py:194-262,325-338`) [W].
+   - **franken_ocr makes forced tokens authoritative** (SGLang order).
+   - The oracle comparison asserts that this case never occurs on any fixture.
+5. **`<PAGE>` on the last page** (DISC-U2-3). On the last page of an unsplit request, SGLang also bans
+   `<PAGE>` when not `end_on_marker`. HF does not.
+   - With HF semantics an extra `<PAGE>` is possible, followed by a forced EOS. Our splitter counts it
+     (`extra_markers`) and drops the empty trailing body.
+   - Unwindowed mode follows HF; windowed mode follows SGLang (§5.10.7).
 
-### 5.10 Windowed ("unlimited-horizon") decoding (SGLang reference semantics)
+### 5.10 Windowed ("unlimited-horizon") decoding (SGLang semantics) [W]
 
-The wheel citations come from the spec extracted on 2026-10-28; the full notes travel with the
-truth pack (U2-A1).
+The source notes ship in the truth pack (U2-A1). Citations are under `W/session/uocr_doc_reuse.py`
+and `W/entrypoints/openai/doc_split.py` unless noted.
 
 **5.10.1 Planning.**
-- The document has N pages and a window size of W own pages; the default is 10 (D13).
-- Windows are contiguous and own their pages: `[0,W), [W,2W), …`.
-- Every window except the last also encodes **one lookahead page**: the next window's first page.
-  It is encoded but never transcribed.
-- If `N ≤ W`, decoding is unwindowed (the plain §5.9 loop).
+- **Window size.** W own pages per window. franken_ocr defaults to 10 (D13); the wheel's env default
+  is 1 (`W/environ.py:1354-1358`).
+  - The wheel keeps W per mode: a base limit for base/large/small/tiny, and a gundam limit otherwise
+    (`doc_split.py:337-343`).
+  - Own pages per window = `min((ctx − 65) // per_page_est, W)`, with `per_page_est` = 274 for base
+    and 1514 for gundam (`doc_split.py:28-35,141-143`). `ctx` is the per-window position limit,
+    131072.
+- **Ownership.** Windows are contiguous and own their pages. Every window except the last also encodes
+  **one lookahead page**, the next window's first page, which is never transcribed.
+- **Short documents.** If `N ≤ W`, decoding is unwindowed. The wheel would still split if `max_tokens`
+  exceeded capacity (`:149-156`), but franken_ocr has no global cap in document mode (D11), so that
+  cannot arise.
 
-**5.10.2 Window 0, and any recomputed window.**
-- Prompt: `[BOS] (<PAGE> img)×(own pages) [<PAGE> img(lookahead)] "Multi page parsing."`, with
-  `page_base = lo`.
-- Guard: `expected = #markers − context_pages(0) − lookahead`, which equals the number of own
-  pages.
-- A window with a lookahead ends when the model emits the `<PAGE>` that would open the lookahead
-  page: `marks > expected` forces EOS. A natural EOS on the last own page is also accepted.
+**5.10.2 Window 0 and any recomputed window.**
+- Prompt: `[BOS] (<PAGE> img)×(own) [<PAGE> img(lookahead)] "Multi page parsing."`, with **page_base =
+  lo**.
+- Guard: `expected = #markers − context_pages(0) − lookahead`, which equals the number of own pages.
+- A window with a lookahead ends when the model emits the `<PAGE>` that would open the lookahead page,
+  because `marks > expected` forces EOS. A natural EOS on the last own page is also accepted.
 
-**5.10.3 Retention at the end of window k** (only if it finished by EOS and is not the last
-window). Keep exactly these KV rows, together with the router index keys and the per-slot page
-state, and free the rest:
-- (a) the `<PAGE>` marker of the last own page;
-- (b) the **image tail** `[E − 128 − (E mod 32), E)`, where E is one past the last own page's last
-  image token (128–159 tokens, block-aligned);
-- (c) the whole lookahead page (marker and image tokens);
-- (d) the **text tail**: up to 128 trailing generated tokens of the last own page's body, never
+**5.10.3 Retention at the end of window k.** This applies only if window k ended by EOS (or a stop
+string) and is not the last window. Keep exactly these KV rows, with their router index keys and
+per-slot page state, and free the rest:
+- **(a)** the `<PAGE>` marker of window k's last own page. This page is the **tail page**, global page
+  lo−1.
+- **(b)** the **image tail** `[E − 128 − (E mod 32), E)`, where E is one past the tail page's last
+  image token. That is 128–159 tokens, block-aligned (`:256-268`).
+- **(c)** the whole lookahead page, marker and image tokens. It is window k+1's first own page, global
+  page lo.
+- **(d)** the **text tail**: up to 128 trailing generated tokens of the tail page's body, never
   including a marker.
 
 **5.10.4 Window k+1 with reuse.**
-- **New KV sequence, in order:**
-  1. copied (a), at position 0;
-  2. copied (b);
-  3. copied (c), which is window k+1's own first page;
-  4. **prefill** of the remaining own pages `lo+1..hi−1` and of window k+1's own lookahead page;
-  5. copied (d), the text tail.
-- **No BOS and no instruction.**
-- `page_base = lo − 1`, because the tail page is local page 0.
-- **Copied K and index keys are not re-rotated.** page2d coordinates are page-local, and
-  `page_pos ≡ global_page+1 (mod 2)` is preserved by the `page_base` parity rule.
-- **Router block summaries are recomputed** for the new block grouping.
-- The per-slot page state is replayed in the new window's frame. The text tail is assigned to
-  page 0's bucket.
+
+*KV layout, in order:*
+1. copied (a) at position 0;
+2. copied (b);
+3. copied (c);
+4. **prefill** of own pages lo+1..hi−1 and of window k+1's own lookahead page;
+5. copied (d).
+
+There is **no BOS and no instruction**. **page_base = lo − 1**, because the tail page is local page 0.
+1-D positions are window-local; row 0 is position 0.
+
+*No re-rotation.* **Copied K and index keys are not re-rotated.** Intra-page `tok_pos` is unchanged by
+construction, and page parity is preserved by this rule
+(`W/layers/attention/unlimited_ocr_v2_backend.py:1001-1031`):
+```
+rope_page_coord = local_bucket + (page_base mod 2)   if local_bucket > 0
+                = 0                                   if local_bucket == 0   (BOS/instruction)
+```
+- A recomputed window numbers its own pages 1..n, with page_base = lo.
+- A reused window numbers the tail page 1, the first own page 2, and so on, with page_base = lo − 1.
+- Either way, `local_bucket + page_base` ≡ global bucket (= global page + 1) mod 2 for every row.
+
+*Recomputed state.* **Router block summaries are recomputed** for the new block grouping. **Page state
+is replayed** in the new frame:
+
+| Row class | Gate page (img_page / query page) | RoPE bucket (before base) | tok_pos |
+|---|---|---|---|
+| (a) tail marker | 0 | 1 | kept (copied) |
+| (b) tail image rows | 0 | 1 | kept (copied) |
+| (c) lookahead marker + images | 1 | 2 | kept (copied) |
+| first newly prefilled marker (page lo+1) | 2 | 3 | 0 |
+| (d) text tail | 0 (response of local page 0) | 1 (carry `mc + CONTEXT_PAGES`, `:409-437,1274`) | kept (copied) |
+| forced `<PAGE>` (opens page lo) | 1 | 2 | `pf_cnt[2] = 1 + n_img(lo)` |
+
+U2-D1a's first deliverable re-derives this table from the wheel and asserts it in unit tests. U2-D2b
+checks it against the U2-D2a Python windowed oracle.
+
+*Starting the decode.*
 - **The sampled prefill token is discarded.** The first decode input is a **forced `<PAGE>`**. The
-  wheel comments that copied KV otherwise re-predicts EOS (18 of 94 MPDocBench follow-ups).
-- The forced tokens (text tail + `<PAGE>`) count as generated for the n-gram domain, but are hidden
-  from output.
-- Guard: `context_pages = 1`, `end_on_marker = true`, and `expected = #markers(prompt) − 1 −
-  lookahead` (own pages).
+  wheel notes that copied KV otherwise re-predicts EOS (18 of 94 MPDocBench follow-ups).
+- If the text-splice allocation fails, only the forced `<PAGE>` is spliced (`:1257-1285`).
+- The forced tokens (text tail + `<PAGE>`) count as generated for the n-gram domain. They are hidden
+  from output and do not consume the token budget.
 
-**5.10.5 Fallback.** If retention is not possible (window ended by length or cancel, a page has
-< ~129 image tokens, page discontinuity, a missing text tail, or memory pressure), window k+1 is
-recomputed exactly like window 0. Its prompt includes BOS and the instruction, and it has no
-cross-window context.
+*Guard.* `context_pages = 1` and `end_on_marker = true`. `expected = #markers(prompt) − 1 − lookahead`,
+i.e. the own pages. The forced `<PAGE>` counts as the first generated mark.
 
-**5.10.6 Positions.** 1-D positions (which only index blocks and causality) are window-local: KV
-row 0 is position 0. There are no absolute document positions, so the 131072 limit applies per
-window.
+*One-page variant.* When window k+1 has exactly one own page and no lookahead (the last window when
+N mod W == 1), segment (c) is copied **except its final image token, which is re-prefilled**
+(`copy_end = la_end − 1`, "straddle", `:284-287`). Presumably this is because an extend step needs at
+least one new token.
 
-**5.10.7 Guard and caps.** The per-page cap counts tokens since the last `<PAGE>`, including the
-forced one. The global token budget is per document; window i gets
-`min(remaining, capacity_i)`, where
-`capacity_i = min(ctx − 64 − per_page·(own+lookahead), own·max_page_tokens + 256)`. Spliced and
-forced tokens do not consume the budget.
+**5.10.5 Fallback.** Window k+1 is recomputed exactly like window 0, with page_base = lo, when:
+- (i) there is no retained entry: window k was not stopped by EOS or a stop string, was aborted, was
+  the last window, or was retracted or evicted (`:836-847,711-795`);
+- (ii) the follow-up was retracted or already has output (`:956`);
+- (iii) `next_page ≠ lo` (`:1049`);
+- (iv) the layout mismatches, or `E − 128 − (E mod 32) ≤ marker index`, i.e. the tail page has fewer
+  than 128 + (E mod 32) image tokens (`:256-268`);
+- (v) there was no output at all, or `len(tail) + 2 ≥ max_new_tokens` (`:1069-1077`);
+- (vi) KV allocation fails (`:1093`);
+- (vii) a multimodal item straddles the copy boundary (`:1095`).
 
-**5.10.8 Stitching.** Split each window's visible text on `<PAGE>`:
+An empty last body is **not** a fallback (`:319-320`). A recomputed window has BOS and the instruction,
+and no cross-window context.
+
+**5.10.6 Positions.** 1-D positions are window-local; they only index blocks and causality. There are
+no absolute document positions, and the 131072 limit applies per window.
+
+**5.10.7 Guard and caps.**
+- The per-page cap counts tokens since the last `<PAGE>`, including the forced one.
+- The wheel's per-window capacity is `min(ctx − 64 − per_page·(own+lookahead), own·max_page_tokens +
+  256)`. The second term uses the effective cap and is omitted when the cap is ≤ 0
+  (`doc_split.py:89-114`). franken_ocr has no global budget by default (D11).
+- In windowed runs SGLang bans `<PAGE>` on the last own page of the **last** window, when not
+  `end_on_marker`.
+- SGLang's guard can lag one step under overlap scheduling, so an extra token can precede the forced
+  EOS (`:811-812`, `_cut_at_extra_marker`). franken_ocr has no overlap scheduling, and SGLang
+  comparisons tolerate the lag (DISC-U2-8).
+
+**5.10.8 Stitching** (`doc_split.py:251-275`).
+- Split each window's visible text on `<PAGE>`. We split on token ids (D20).
+- A recomputed window keeps non-blank text before its first `<PAGE>` as a body:
+  `[head, *tail] if leads_with_body or head.strip()`.
 - A reused window's visible text starts with the body of its first own page.
-- Keep the bodies of own pages only, and concatenate in order.
-- A trailing empty body (the window ended on the lookahead marker) is dropped.
-- **Deviation (D5):** never reorder a blank first page.
+- Ownership is `bodies[ctx:input_pages]`. **All** surplus bodies beyond the own pages are dropped, and
+  pages are concatenated in order.
+- **Deviation (D5):** we do not replicate the non-streaming path's quirk,
+  `while len(bodies) > input_pages and not bodies[0].strip(): bodies = bodies[1:]`. The streaming path
+  (`:260-275`) has no such drop.
 
-**5.10.9 Within-window retirement.** SGLang retires nothing within a window. Our optional
-retirement is §5.12.
+**5.10.9 Within-window retirement.** SGLang retires nothing within a window. franken_ocr's
+block-granular retirement (§5.12) applies inside every window, under the same proof.
 
-### 5.11 Known HF-vs-SGLang divergences and our choices
+It must never free a row that §5.10.3 retains, and unconstrained retirement would:
+- **(b)** The `<PAGE>` that opens the lookahead page moves qp past the tail page, so the image-tail
+  blocks die at the final step.
+- **(a)** When the tail marker at local row 1 + 274·j is ≡ 31 (mod 32), i.e. j ≡ 7 (mod 16), it ends a
+  block holding only page j−1 images. That block dies once qp = j. Example: W = 8, window 0, row 1919.
+- **(d)** Row q − 128 dies whenever it ends a block.
+
+So every window with a successor sets a **pinned set**:
+- the last own page's marker block and image-tail blocks;
+- the lookahead rows;
+- a one-row margin on generated-text blocks.
+
+Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a sets it).
+
+### 5.11 Known divergences and our choices
 
 | ID | Divergence | HF | SGLang | franken_ocr |
 |---|---|---|---|---|
-| DISC-U2-1 | entmax domain | top-16 window | all candidates | HF (D4); measure on gundam and fallback queries |
-| DISC-U2-2 | n-gram vs guard order | n-gram first (can yield id 0) | guard first, forced token authoritative | forced token authoritative; assert never triggered on fixtures |
-| DISC-U2-3 | `<PAGE>` ban on the last page of an unsplit request | no ban | ban when not end_on_marker | HF unwindowed; SGLang inside windowed mode |
-| DISC-U2-4 | windowed stitching blank-page reorder | n/a | non-streaming path reorders | never reorder |
-| DISC-U2-5 | numeric precision | bf16 prefill SDPA (bf16 mask/bias), fp32 decode | bf16 Triton | f32 throughout (measured tolerance) |
+| DISC-U2-1 | entmax domain | top-16 window | all candidates; bisection τ; ties can read fewer than 12 | Both (`EntmaxDomain`, D21); HF is the parity default; the long-document default is chosen on ground truth (U2-C5b) |
+| DISC-U2-2 | n-gram vs guard order | n-gram first (can yield id 0) | guard first; a forced token skips n-gram | Forced token authoritative; assert never triggered on fixtures |
+| DISC-U2-3 | `<PAGE>` ban on the last page | no ban | ban when not end_on_marker | HF when unwindowed, SGLang when windowed |
+| DISC-U2-4 | blank-first-page reorder in stitching | n/a | non-streaming path reorders | Never reorder |
+| DISC-U2-5 | numerics | GPU: Triton (bf16 q·scale and P; fp32 bias and softmax). CPU: SDPA in the activation dtype. Decode: fp32 over bf16. | bf16 Triton | f32 throughout; parity target is the f32 oracle |
+| DISC-U2-6 | crop mode for multi-image requests | base (`infer_multi`) | gundam by default (`W/multimodal/processors/unlimited_ocr.py:23`) | Base by default; gundam document mode evaluated (OQ-V2-14) |
+| DISC-U2-7 | page2d tok after an extra `<PAGE>` | reset to `pf_cnt[N]` (`SB:1486-1488`) | keeps the running count (`W/…/page2d_rope.py:579-591`) | HF; only reachable on a guard-forced EOS step |
+| DISC-U2-8 | guard lag | none | can lag one step under overlap scheduling | None; SGLang comparisons tolerate it |
 
-### 5.12 Retire-on-advance (franken_ocr optimization, output-exact under the guard)
+### 5.12 Block-granular retirement (franken_ocr optimization; exact under the guard)
 
-**Claim.** In decode (unwindowed, or within a window), once the fed token is the `<PAGE>` that
-opens page k, these become unreachable:
-- every KV row belonging to image pages < k;
-- every generated-text row older than the local window.
+**Rule.** In decode, after the first generated `<PAGE>` (qp ≥ 0), block c is **dead** once both of
+these hold:
+1. **No future non-open query can select it.** Either `bmin[c] = −1` (no image token: BOS,
+   instruction-only and generated-text blocks), or `bmax[c] < qp` (all its image pages are behind the
+   current query page, and qp never decreases).
+2. **It lies wholly behind the local window**: block end ≤ q − 127. q only increases.
 
-They are unreachable **unless** the step is an open row (qp < 0 or no allowed block).
+A dead block's K/V rows, index keys and k̄ may be freed. The **logical** block count, and with it
+`M = min(16, nblk)`, is unchanged.
 
-**Why open rows are harmless with the guard on.**
-- qp < 0 happens only before the first generated `<PAGE>`, when nothing has been retired yet.
-- "No allowed block" with qp ≥ 0 happens only when qp ≥ N, i.e. after an extra `<PAGE>`. The guard
-  then forces EOS on the very next step (`mc > expected`). That step's logits are fully overridden,
-  and no later step reads its KV.
+**Why this is exact.**
+- **Non-open rows.** A dead block is never a candidate, so its x is −1e4. That affects neither τ* nor
+  the read set (§5.6.5). A dead block is also never in the local window.
+- **Open rows** read every remote block, but they only occur in three cases:
+  - *qp < 0* (before the first generated `<PAGE>`). Retirement is disabled until then.
+  - *No allowed block with qp ≥ 0.* That only happens when qp ≥ N, i.e. right after an extra `<PAGE>`.
+    The guard (`mc > expected`) then restricts that step's logits to EOS, so its output does not
+    depend on attention, and no later step exists.
+  - *Allowed blocks exist but none is remote,* which falls back to all remote blocks. This is
+    impossible in base and gundam: the current page's image blocks are prompt blocks, and at least 5 of
+    its ≥ 8 full blocks lie ≥ 4 blocks behind any decode query.
 
-**Proof obligation and runtime check.** The proof obligation is tested in U2-D3. A runtime detector
-asserts that no open row ever needs retired rows in a step whose output is not guard-forced. If it
-fires, the run records a ledger event and the deterministic fallback is to re-run that window
-without retirement. With the guard disabled, retirement is disabled too.
+**Why row-level retirement is wrong.** Page boundaries are not block-aligned: base markers sit at
+1+274p, and 274 ≡ 18 mod 32. A selected block is read whole, and k̄ uses all 32 index keys. So a block
+straddling pages p−1 and p (bmin = p−1, bmax = p) stays live while qp = p.
+
+**Proof obligation and runtime check (U2-B4).**
+- A detector asserts that no open row occurs while dead blocks exist, except on a step whose output is
+  fully guard-forced.
+- If it fires, the run records a ledger event and re-runs the current window without retirement. That
+  is the deterministic fallback.
+- Retirement is disabled whenever the guard is disabled.
+
+**Effect.** Unwindowed decode holds only:
+- the prompt blocks of the current and future pages;
+- boundary blocks;
+- the image-bearing last prompt block;
+- the local window.
+
+Generated text older than the local window costs nothing. This is v1's ring, generalized.
 
 ---
 
 ## 6. franken_ocr architecture for v2
 
-### 6.1 Identity and loading (U2-A2, U2-A3, U2-A5)
+### 6.1 Identity, loading and tokenizer (U2-A2, U2-A3, U2-A5, U2-A7)
 
-**Current hazards.**
-- `weights.rs:73-76` and `mod.rs:1221-1224` map an absent `model_id` to `default_arch()`.
-- `focrq.rs:593-603` omits `model_id` when it equals the default.
-- Raw safetensors are tagged as the default (`weights.rs:1238`).
-- `mod.rs:1231,1573,1699,2626,2663,2701,2851`, `cli.rs:2350,2420` and `convert.rs:124` all mean
-  "is v1" when they test `== default_arch()`.
+**Current hazards** (code review, 2026-10-28). These places read "default arch" as "v1":
+- **weights.rs:**
+  - `:73-76` maps an absent `model_id` to `default_arch()`;
+  - `:100` (license notice), `:898` (`Default for Weights`), `:2086`;
+  - `:1238` tags raw safetensors as the default.
+- **focrq.rs `:593-603`:** the writer omits `model_id` for the default.
+- **mod.rs:**
+  - `:1221-1224`, plus `:1231,1573,1699,2626,2663,2701,2851`;
+  - `:1472` `validate_safetensors_header` always runs the v1 census;
+  - `:1025` `versioned_quant_path` uses one global version;
+  - `:2105/2137` `forward`/`forward_dynamic` fall through to v1 for unknown ids;
+  - `:3268-3285` accepts the tokenizer.json sidecar without a hash check.
+- **convert.rs:**
+  - `:124,181`;
+  - `:254` stamps the manifest `quant_recipe` only for the default;
+  - `:292` (F16 guard);
+  - `:392` builds the wasm int4 artifact only for the default;
+  - 19 `default_arch()` sites in all.
+- **unlimited_ocr_census.rs:** `:110,366`.
+- **cli.rs:**
+  - `:130` (`--version` license);
+  - `:686` (`convert --model-id` defaults to `unlimited-ocr`);
+  - `:1686` (auto-download is v1 only);
+  - `:2350,2420`;
+  - `:2676-2680` (models guidance; the ID column is 14 chars, but `unlimited-ocr-2` is 15);
+  - `:2949` (`health` reports one model path);
+  - `:3036` (v1-only pull hint);
+  - `:4108`.
+- **Elsewhere:**
+  - `robot.rs` schema and health (`FOCR_MODEL_LICENSE_NOTICE`);
+  - `doctor.rs:121` (default model only; flat directory scan);
+  - `storage.rs:520` (`model_version_tag`);
+  - `simd/dispatch.rs:636` (per-model rollup ids);
+  - tests `cli_robot_golden.rs:1143,2141,2162`, which assert on `models[0]`.
 
-**Change.**
-- Introduce `model_arch::UNLIMITED_OCR_V1_ID = "unlimited-ocr"` and `fn legacy_absent_model_id() ->
-  &'static str` returning it permanently.
-- The writer always emits `model_id` for non-v1 archs and continues to omit it for v1, which keeps
-  v1 artifacts byte-identical.
-- Raw safetensors identify their arch from the census match: v1 census → v1, v2 census → v2,
-  neither → refuse. This replaces the current "assume default" behavior.
-- Replace identity checks with `ModelArch` capability methods:
-  - `supports_cross_page()` (true for v1 and v2);
-  - `census()` (an `Option<&'static Census>`);
-  - `required_quant_recipe(quant)`;
-  - `decode_contract()`;
-  - `unlimited_variant()` (`Some(V1Rswa | V2SrSwa)`).
-- **Tests:**
-  - a v1 artifact without `model_id` loads as v1 under a test-only registry where the default is
-    v2;
-  - a v2 artifact without `model_id` is impossible to write;
-  - raw safetensors are arch-detected by census.
+**Changes.**
 
-**Sharded sources (U2-A3).**
-- `FOCR_MODEL_PATH` or `--model` pointing at a directory with `model.safetensors.index.json`
-  resolves every shard, verifies each shard's SHA-256 against the arch's pins, and presents one
-  logical tensor directory.
-- `focr convert <dir>` accepts the same input.
-- Byte-owned by default; `FOCR_MMAP=1` maps each shard. Generic for the whole zoo.
+*Identity.*
+- Add `model_arch::UNLIMITED_OCR_V1_ID = "unlimited-ocr"`. An absent `model_id` maps to it,
+  permanently.
+- The writer always emits `model_id` for non-v1 archs and keeps omitting it for v1, so v1 artifacts
+  stay byte-identical.
+- Raw safetensors identify their arch from the census: v1 census → v1, v2 census → v2, neither →
+  refuse. `validate_safetensors_header` branches per arch.
 
-**v2 census (U2-A5).**
-- An embedded manifest `unlimited_ocr_2_manifest.json` (new data file) lists all 2,819 tensor
-  names, shapes and dtypes, with pins:
-  - HF commit `5632329a…`;
-  - both shard SHA-256s and sizes;
-  - the tokenizer.json SHA;
-  - the verified-artifact SHA, filled in at C3.
-- `unlimited_ocr_census.rs` is generalized to hold two `Census` values, v1 and v2. There is no
-  second census module (no file proliferation).
+*Capability methods on `ModelArch`* replace identity checks:
+- `census()`;
+- `required_quant_recipe(quant)`;
+- the existing `decode_contract()`, extended;
+- `unlimited_variant() -> Option<UnlimitedVariant>`;
+- `artifact_version()`;
+- `required_token_ids()`;
+- `tokenizer_sha256()`;
+- `license_notice()`.
+
+*Tokenizer sidecar.* Per-model cache subdirectories hold their own `tokenizer.json`. The loader
+verifies `tokenizer_sha256()` and `required_token_ids()`. Today `validate_pinned_ids`
+(`tokenizer/mod.rs:489-532`) only validates tokens that are present, so a v1 tokenizer would be
+silently accepted for v2.
+
+*Fail-closed dispatch (U2-A7, D18).*
+- `forward` and `forward_dynamic` match exhaustively on decoder family plus variant.
+- Every lever in D18 checks the variant before weights load.
+- bd-3ryl (task-vs-arch guard) is the general version; A7 implements the v2 cases and links it.
+
+*Tests.*
+- A v1 artifact without `model_id` loads as v1 under a **test-only registry whose default is v2**.
+- A v2 artifact without `model_id` is impossible to write.
+- Raw safetensors are arch-detected by census.
+- A v1 tokenizer beside a v2 artifact is refused, with a re-pull remediation.
+- A v2 artifact under every lever reports "supported" or "refused", never "ran v1".
+
+**Sharded sources (U2-A3, D16).**
+- `--model` or `FOCR_MODEL_PATH` pointing at a directory with `model.safetensors.index.json` resolves
+  every shard.
+  - Each shard's header and the census are checked on every load.
+  - Shards are byte-owned by default; `FOCR_MMAP=1` maps each one.
+- `RAW_SAFETENSORS_SHARD_NAME` (`mod.rs:333,857`) becomes a per-arch shard list.
+- `focr convert <dir>` streams shard by shard instead of reading one file fully into memory
+  (~`cli.rs:2335`). It computes full shard hashes and stamps the multi-shard `source_sha256`
+  convention.
+- The I64 `position_ids` is verified and skipped at parse time (D8).
+
+**v2 census (U2-A5, D22).** It is an embedded **delta**, `unlimited_ocr_2_manifest.json` (a new data
+file), containing:
+- the 109 added tensors with names, shapes and dtypes;
+- the SHA-256 of the resulting 2,819-entry list;
+- full-tensor SHA-256s for the byte-identical vision tensors;
+- pins: HF commit `5632329a…`, both shard SHA-256s and sizes, the tokenizer.json SHA-256, and the
+  verified-artifact SHA (filled at C3).
+
+`unlimited_ocr_census.rs` is generalized to hold the v1 census plus the v2 delta. There is no second
+census module.
 
 ### 6.2 Decoder structure (U2-B1…B6)
 
 | Piece | Location | Notes |
 |---|---|---|
-| Dimension constants | `decoder::config`, `moe::config`, `rswa.rs` constants | Unchanged (D3) |
+| Dimension constants | `decoder::config`, `moe::config`, `rswa.rs` | Unchanged (D3) |
 | Variant enum | `UnlimitedVariant` | Chosen once from the arch |
-| Layer forward | Generic over an attention-kind enum: `LayerAttention::Rswa(&mut RingCache)` / `LayerAttention::SrSwa(&mut SrSwaLayerCache, &SrSwaLayerWeights)` | MoE, FFN, norms and `lm_head` code is shared verbatim |
-| New module `src/native_engine/srswa.rs` | Genuinely new functionality (like `rswa.rs`) | Contents below |
-| `RopeTable` | Gains `RopeTable::from_angles` | page2d tables reuse the same apply kernel (`apply_rope`, `decoder.rs:238`) |
-| v2 generate loop | `mod.rs`, next to the v1 path | Prompt builder (§5.1), guard (§5.9), n-gram (reuse `sampler.rs` sliding-window n-gram over generated ids), `<PAGE>`-aware `PageStream`, EOS handling, length limits (131072) |
+| Layer forward | Attention-kind enum: `LayerAttention::Rswa(&mut RingCache)` / `LayerAttention::SrSwa(&mut SrSwaLayerCache, &SrSwaLayerWeights, &PageCoords)` | `layer_forward`'s attention call gains access to the normalized hidden state `h` (the router input) and the page coordinates. MoE, FFN, norms and `lm_head` code is shared verbatim. |
+| New module `src/native_engine/srswa.rs` | Genuinely new functionality, like `rswa.rs` | Contents listed below |
+| `RopeTable` | Gains `RopeTable::from_angles` | page2d tables reuse the apply kernel (`decoder.rs:238`) |
+| Weight caches | `DecoderWeightCache` (`decoder.rs:812`), `DecoderWeightCacheI8` (`:2326`) | Gain the per-layer router weights, widened once from bf16 to f32 |
+| Shared `decoder::prefill_attention` (`:577`) | Also used by `decoder_qwen2.rs:1266,1270` (GOT, SmolVLM2, OneChart) | **Not modified.** v2 prefill attention lives in `srswa.rs`. |
+| v2 generate loop | `mod.rs`, next to the v1 loops | Contents listed below |
 
-Contents of `srswa.rs`:
-- `PageCoords` and the decode state machine (§5.4–5.5);
+`srswa.rs` contains:
+- `PageCoords` and the decode state machine, including `page_base` (§5.4–5.5, §5.10.4);
 - `Page2dRope` tables;
-- `SrSwaLayerWeights` (router `q/k_proj` as pre-transposed f32 or bf16→f32, norm weights,
-  `head_cls`);
-- `SrSwaLayerCache`, described below;
-- router functions (§5.6): `project`, `summaries`, `scores`, `page_gate`, `entmax15_topm`,
-  `select_bias`;
-- the attention kernel (§5.7), with a dense scalar oracle and a gathered fast path;
+- `SrSwaLayerWeights`;
+- `SrSwaLayerCache`: K/V, index keys, `kbar`, `bmin`/`bmax`, page state, and a dead-block set with
+  the logical `nblk`;
+- the router (§5.6): `project`, `summaries`, `scores`, `page_gate`, `entmax15` (`TopM` and
+  `AllCandidates`), `select_bias`;
+- attention (§5.7), with a dense scalar oracle and a gathered fast path;
 - prefill and decode entry points;
-- `retire_through(page)` (§5.12);
+- `retire_dead_blocks` with the open-row detector (§5.12);
 - `splice_from(prev_tail)` (§5.10.4);
 - `serialize_tail` and `deserialize_tail` (D14).
 
-`SrSwaLayerCache` holds, per layer:
-- K and V, contiguous f32 `[cap_tokens × 1280]` with a live length;
-- index keys, f32 `[cap_tokens × 128]`;
-- `kbar` `[cap_blocks × 128]` and validity;
-- `bmin` and `bmax` per block;
-- page state: `marker_cum`, N, `pf_cnt`, page and tok;
-- a retired-row bitmap or range set.
+The v2 generate loop contains:
+- the prompt builder (§5.1);
+- the guard (§5.9);
+- the generated-only n-gram domain (D10);
+- per-page budgets (D11);
+- token-id page segmentation with a UTF-8-safe incremental decoder (D20);
+- EOS handling and length limits.
 
-**v1 non-regression.** All existing v1 fixtures, goldens and selftests must remain byte-identical
-across the refactor (U2-T4 gate). No v1 code path may observe the v2 code.
+It reuses the domain-agnostic per-token sampling primitives from `sampler.rs`.
 
-### 6.3 Memory model
+**Path matrix (D18).**
 
-Per token, with 12 layers:
-- K+V in f32 = 12 × 2 × 1280 × 4 B = **120 KiB**;
-- index keys = 12 × 128 × 4 B = **6 KiB**;
-- block summaries are negligible.
-
-Worked examples, assuming roughly 1,000 output tokens per page. These are analytic estimates;
-U2-F1 measures the real numbers.
-
-| Scenario | Tokens resident | f32 KV |
+| Path / lever | v2 first wave | Later |
 |---|---|---|
-| Single page, base | ~275 prompt + ~1,000 out | ~0.16 GiB |
-| 20 pages unwindowed | 20×274 + 20,000 ≈ 25.5k | ~3.0 GiB; ~0.65 GiB with retirement (prefill image KV dominates) |
-| 100 pages unwindowed | ~127k | ~15 GiB; also hits 131k max_length. **Windowing is required on CPU.** |
-| W=10 window | (11×274 ≈ 3k prompt) + 10k out | ~1.5 GiB; ~0.4 GiB with retirement |
+| f32 cached prefill/decode (`generate_cached` → `prefill_with_cache`, `decode_step_with_cache`) | **Support**. The certified conservative artifact runs here: int8 FFN inside `DecoderWeightCache`, high-precision attention and `lm_head` (`mod.rs:3736-3800`). | — |
+| int8 cached (`generate_cached_i8` → `prefill_with_cache_i8`, `decode_step_with_cache_i8`, `:2826,:2956`), reached only by the experimental full-int8 switch (`FOCR_DECODE_INT8`, `ocr-batch --experimental-full-int8`, `force_int8_decode()`) and the WASM int4 artifact | Refuse | Backlog |
+| `OcrModel::recognize_multi_page*` (`mod.rs:2620/2654/2691`) | Refuse until U2-B6, then route to the v2 document loop. Never v1's 640-squash loop. | U2-E2 replaces them |
+| Stateless oracle (`forward` `:699`, `FOCR_DECODE_STATELESS`) | **Support** (metamorphic test) | — |
+| Chunked prefill (`:1198,:1287,:2842`, `FOCR_PREFILL_CHUNK`) | Refuse | F2 |
+| Batched / spine (`batched_decode_step_i8*` `:3211,:3243`; `recognize_batch_spine` `mod.rs:2983`; `batch_scheduler.rs:43,440,487`) | Refuse | F5 |
+| Spec decode / verify (`spec_decode_i8` ~`mod.rs:4060`; `verify_forward*` `:3495,:3575`) | Refuse | Backlog |
+| `FOCR_INT8_KV`, `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD`, `FOCR_ATTN_GEMM`, `FOCR_QKV_FUSED`, `FOCR_RSWA_PARALLEL_ATTN`, `FOCR_FUSE_NGRAM_LMHEAD` | Refuse | F4 (bf16 KV), then per lever |
+| `RunawayGuard` | Not used for v2 (the page guard plus the per-page cap replace it) | — |
+| Resident daemon (`cli.rs:1650`, `resident.rs`) | Refuse for v2 until its protocol carries the v2 flags | Backlog (bd-fuh2) |
 
-The plan adds a memory-budget estimator (U2-D3), used by `--page-window auto` and reported in
-robot `window` events.
+Parity tests that must gain v2 lanes or explicit v2 skips:
+- `batched_attention_parity`;
+- `batched_forward_parity`;
+- `chunked_prefill_parity`;
+- `parity_ladder` (`:130`);
+- `spec_decode_gate`;
+- `spec_ring_rollback`;
+- `spec_verify_forward_parity`.
+
+**v1 non-regression.** Every v1 token-id golden stays byte-identical (U2-T3 gate), and no v1 code path
+observes v2 code.
+
+### 6.3 Memory model (whole process)
+
+**Peak RSS** = artifact bytes (~4.17 GB owned; less with `FOCR_MMAP=1`) + hydrated vision caches +
+widened decoder weights + rasters and preprocessed tensors of the pages in flight + KV.
+
+**KV per token** (12 layers):
+- K+V f32: 12 × 2 × 1280 × 4 B = **120 KiB**;
+- index keys: 12 × 128 × 4 B = **6 KiB**;
+- block summaries: negligible.
+
+Worked examples assume about 1,000 output tokens per page. They are analytic estimates; U2-F1
+measures the real numbers.
+
+| Scenario | KV rows resident | f32 KV without retirement | f32 KV with block retirement (D9) |
+|---|---|---|---|
+| Single page, base | ~280 prompt + ~1,000 out | ~0.15 GiB | ~0.05 GiB (prompt + local window) |
+| 20 pages unwindowed | 20×274 + 20,000 ≈ 25.5k | ~3.0 GiB | ≤ ~0.65 GiB at start (all future prompt pages), falling as pages pass |
+| W=10 window | 11×274 ≈ 3k prompt + 10k out | ~1.5 GiB | ≤ ~0.35 GiB |
+| v1 multi-page, 20 pages (comparison) | 20×111 + ring 128 | ~0.27 GiB | — |
+
+- **Rasters.** With the streaming page source (D19, U2-D0), only W+1 page rasters are in flight, about
+  25 MB each at 300 dpi letter. Today `--multi-page` holds all of them, twice.
+- **Estimator.** U2-D3 adds a whole-process memory-budget estimator. `--page-window auto` uses it, and
+  robot `window` events report it.
 
 ### 6.4 Concurrency (doctrine #5)
 
 - One live forward at a time.
-- Windows run strictly sequentially.
-- Per-page vision encoding is sequential within a window.
+- Windows run strictly sequentially, and per-page vision encoding is sequential within a window.
+- The page source may rasterize the next window's pages on the same thread between windows, never
+  concurrently with a forward.
 - All parallelism is intra-op via the kernel rayon pool: heads × query chunks in prefill attention,
-  GEMMs and vision.
+  the GEMMs, and vision.
 - No rayon under a held lock, and no nested asupersync runtime.
-- Resume and checkpoint I/O happens between windows, never inside a forward.
-- The `many_pages_without_deadlock` watchdog is extended to windowed v2 (U2-T2).
+- Checkpoint I/O happens between windows, never inside a forward.
+- `tests/many_pages_without_deadlock.rs` has no multi-page scenario today. U2-T2 adds windowed v2
+  document scenarios.
 
 ### 6.5 Quantization and artifact (U2-C3)
 
-**Recipe.** `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1`. Classification is by name prefix
-in `recipe.rs`:
-- int8: exactly the 2,148 FFN/expert matrices (`model.layers.0.mlp.{gate,up,down}_proj`,
-  `model.layers.{1..11}.mlp.experts.{0..63}.{gate,up,down}_proj`,
-  `model.layers.{1..11}.mlp.shared_experts.{gate,up,down}_proj`);
-- high precision (BF16 source): everything else, including `self_attn.dash_router.*`,
-  `self_attn.indexer.*` and `mlp.gate.weight`;
-- the I64 `position_ids` is verified to equal `arange(257)` and is dropped (D8).
+**Recipe.** `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1`, classified by name in `recipe.rs`.
+- **int8:** exactly the 2,148 FFN/expert matrices:
+  - `model.layers.0.mlp.{gate,up,down}_proj`;
+  - `model.layers.{1..11}.mlp.experts.{0..63}.{gate,up,down}_proj`;
+  - `model.layers.{1..11}.mlp.shared_experts.{gate,up,down}_proj`.
+- **High precision** (BF16 source): everything else, including `self_attn.dash_router.*`,
+  `self_attn.indexer.*` and `mlp.gate.weight`.
+- **Matcher.** `is_decoder_attn_proj` (`recipe.rs:195`) is narrowed to the exact
+  `self_attn.{q,k,v,o}_proj.weight` names. A test asserts that under every attention or `lm_head`
+  lever, the v2 int8 set contains 48 attention projections when the lever is on, and **0**
+  router/indexer tensors.
+- **Converter path.** The non-default path (`convert.rs` ~124-178) must use this explicit recipe, not
+  its "every `self_attn` projection" default.
+- The I64 `position_ids` is verified to equal `arange(257)` and skipped (D8).
 
-**Counts and gates.**
-- int8 = 2,148; high-precision tensors = 2,819 − 2,148 − 1 = 670.
-- The loader gate rejects any v2 `.focrq` whose dtypes violate the recipe or whose `source_sha256`
-  values don't match the pinned shard pair.
-- The i32-accumulation proof at K=6848 is unchanged (same dense layer-0 `down_proj`).
+**Counts.** int8 = 2,148. High precision = 2,819 − 2,148 − 1 = 670. The i32-accumulation proof at
+K=6848 is unchanged.
+
+**WASM.** The v1 int4 recipe (`convert.rs:60`,
+`unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1`) and its loader branches (`mod.rs:1710`;
+`artifact_stores_gated_int8` at `:3128`) refuse v2.
+
+**Loader gate.** It rejects any v2 `.focrq` whose dtypes violate the recipe, or whose `source_sha256`
+does not match the multi-shard convention (D16).
 
 **Artifact.**
-- `unlimited-ocr-2.v<ver>.int8.focrq`, about 4.2 GB.
-- Installed under `~/.cache/franken_ocr/models/unlimited-ocr-2/` with **its own** `tokenizer.json`
-  (the v2 hash). The per-model subdirectory prevents a sidecar collision with v1's flat
-  `tokenizer.json`.
-- Split into parts under 2 GiB for GitHub release assets; the HF mirror is per bd-3p8y and
-  bd-aio5.
+- `unlimited-ocr-2.v<ver>.int8.focrq`, about 4.17 GB (estimate: v1's 4,157,448,783 B plus ~16 MB of
+  router/indexer).
+- The per-model version (D22) is resolved by `versioned_quant_path`.
+- It installs under `~/.cache/franken_ocr/models/unlimited-ocr-2/` with its own `tokenizer.json`.
+- It is published as release parts under 2 GiB.
+- The HF mirror is per bd-3p8y/bd-aio5. GitHub release parts are primary.
+
+### 6.6 Document pipeline (U2-D0, U2-E2, U2-E3)
+
+**Page sources.** The PDF and directory page sources sit on `pdf::walk_document`, the consolidation
+bd-3gyt tracks for the CLI. U2-D0 implements the multi-page part and coordinates with bd-3gyt and
+bd-paom.
+- The page source is **lazy**: it yields a page's raster on demand.
+- It records a source-page map entry for every page, including skipped pages, spread halves and
+  `--pages` selections.
+
+```
+PageSource (lazy) ─▶ window planner (§5.10.1) ─▶ per window:
+    rasterize + preprocess own+lookahead pages ─▶ vision per page ─▶ drop rasters
+    ─▶ prefill (or splice + prefill) ─▶ decode with guard ─▶ per-page bodies (token-id split)
+    ─▶ sink(PageResult{source_page, text, layout, figures}) ─▶ checkpoint (D14)
+```
+
+**Driver and sinks.** `recognize_document` (D23) drives the pipeline. The CLI is a sink: markdown,
+JSON `pages[]`, figures, or robot events.
+
+**JSON pages.** `--multi-page --json` today returns `pages: []` (`cli.rs:1912-1915`).
+- With v2 it returns real pages.
+- With v1 it either returns real pages from `<PAGE>` text splitting (v1 emits `<PAGE>` in multi-page
+  output) or refuses explicitly. U2-E3 decides which and records the choice.
 
 ---
 
 ## 7. Verification plan
 
-### 7.1 Oracle (U2-A6, U2-A7)
+### 7.1 Oracle (U2-A6)
 
-**Environment.**
-- A separate pinned venv: python 3.10, torch 2.13.0, transformers 4.52.1, tokenizers 0.21.4,
-  addict, einops, easydict.
-- Model at commit `5632329a`, bf16, on CUDA.
-- `DASH_STAGE0` unset; `TIME_DIAG` and `SPARSE_DIAG_LOG` off.
-- **Never shares a venv with the v1 oracle.**
+**Primary oracle: HF v2 on CPU in f32.**
+- **Environment.** A venv with python 3.10, torch 2.13.0, transformers 4.52.1, tokenizers 0.21.4,
+  addict, einops and easydict, **never shared with the v1 oracle**. Model at commit `5632329a`.
+- **Shims.** Mirror v1's `--device cpu --cpu-patch --f32` shims: `.cuda()` and autocast become no-ops,
+  and the whole pipeline computes in float32.
+- **DASH paths.** Prefill takes `_forward_dense` (SDPA) on CPU, and decode takes `_decode_attend`
+  (§5.7). `DASH_STAGE0` stays unset; `TIME_DIAG` and `SPARSE_DIAG_LOG` stay off.
+- **Step 1 of A6 is feasibility.** If any DASH path is CUDA-only, the oracle script ports its dense
+  fallback (a few dozen lines against §5.6–5.7). The port is verified once against GPU bf16 on S1 if a
+  GPU is available; otherwise, against the unpatched dense path in bf16 on CPU.
 
-**Script.** `scripts/gen_reference_fixtures_uocr2.py`. Per-model oracle scripts are existing
-precedent (`gen_reference_fixtures_got.py`).
+**Secondary oracle (cross-precision ledger):** the same runs in bf16, on CPU and on GPU if available.
+
+**Script.** `scripts/gen_reference_fixtures_uocr2.py`; per-model oracle scripts are existing
+precedent.
 - It drives `model.infer()` / `infer_multi()` with explicit `no_repeat_ngram_size=35`,
-  `ngram_window=128|1024`, `max_page_tokens=20000`, `page_count_guard=True`, and an explicit
+  `ngram_window=128|1024`, `max_page_tokens=20000`, `page_count_guard=True` and an explicit
   `crop_mode`.
+- Dumps are taken through forward hooks:
+  - prompt ids and preprocessed tensors;
+  - per-layer input hidden states;
+  - per layer, for selected query rows **including fallback queries**: router `iq`/`ik` (post-RoPE),
+    `kbar`, block scores, candidate mask, entmax prior, and topi/bias/valid;
+  - per-layer attention output;
+  - final hidden state, last-position logits and generated ids;
+  - per-step dumps for the first 64 decode steps and for steps around every `<PAGE>`.
 
-**Dumps, through forward hooks.**
-- Prompt token ids.
-- Preprocessed tensors.
-- Per-layer input hidden states.
-- Per layer, for selected query rows:
-  - router iq and ik (post-RoPE);
-  - `kbar`;
-  - block scores;
-  - candidate mask;
-  - entmax prior;
-  - topi, bias and valid.
-- Per-layer attention output.
-- Final hidden state, last-position logits and generated ids.
-- **Generation runs on GPU.** Per-step dumps are captured for the first 64 decode steps and for
-  steps around every `<PAGE>`.
-
-**Fixture sets.**
+**Fixture sets:**
 
 | Set | Contents |
 |---|---|
-| S1 | One page, base (`crop_mode=False`): 3 pages from the existing 20-page corpus, including the hard page used for page0590-style EOS checks |
+| S1 | 1 page, base (`crop_mode=False`): 3 pages from the 20-page corpus, including the hard-EOS page |
 | S2 | 3-page document, base multi |
-| S3 | The existing multi-page fixtures (p9_p14, p10, p20) rerun under v2 |
-| S4 | One page, gundam (`crop_mode=True`) |
-| S5 | One 40–60 page document with ground truth (a MarathonDocBench subset, Apache-2.0), unwindowed on GPU, for D2 equivalence and accuracy work |
+| S3 | The existing multi-page fixtures (p9_p14, p10, p20) under v2 |
+| S4 | 1 page, gundam (`crop_mode=True`) |
+| S5 | One 40–60 page document with ground truth (a MarathonDocBench subset, Apache-2.0), unwindowed. CPU f32 if the time is tolerable; otherwise bf16 on GPU, as ledger only. |
 
-**Nondeterminism floor.** Run each fixture twice. Record bitwise token equality and the max
-hidden-state deltas, which set the tolerances (AGENTS testing policy).
-
-**CPU feasibility (OQ-V2-4).** Patch `.cuda()` and run the dense fallback on CPU to see whether CPU
-tokens match GPU. If they do, a CI-friendly CPU oracle and CPU perf baseline exist. If not, the
-oracle stays GPU-only and the CPU baseline uses v1 franken_ocr (incumbent comparison).
+**Nondeterminism floor.** Run each fixture twice, at two thread counts. Record bitwise token equality
+and the max hidden-state deltas. These set the tolerances (AGENTS testing policy).
 
 ### 7.2 Parity ladder rungs for v2 (U2-C1, U2-C2)
 
 | Rung | What | Gate |
 |---|---|---|
-| L0 | Preprocessing tensors; prompt ids (incl. `<PAGE>`=128827); image-token counts | exact (pil-bicubic mode) |
-| L1 | page2d coordinates and cos/sin; Gemma norm; `kbar`; scores; entmax; selection; bias | coordinates exact; floats within measured tol |
-| L2 | Per-layer hidden states; **routing equality** (topi and valid sets exact on S1/S2; bias within tol); attention outputs | cosine ≥ the floor-derived threshold |
-| L3 | Last-position logits | within measured tolerance |
-| L4 | Generated tokens | exact where the reference is deterministic (S1, S2); S3 within CER budget |
+| L0 | Preprocessing tensors; prompt ids (incl. `<PAGE>`=128827); image-token counts | exact (pil-bicubic) |
+| L1 | page2d coordinates and cos/sin; Gemma norm; `kbar`; scores; Page Gate; entmax; selection; bias | coordinates exact; floats within the f32 floor |
+| L2 | Per-layer hidden states; **routing equality** (topi/valid exact vs the f32 oracle on S1–S3, **including fallback queries**); attention outputs | cosine ≥ the floor-derived threshold. Against bf16, mismatches fall in the tie-flip class, which has a ceiling. |
+| L3 | Last-position logits | within the measured f32 tolerance |
+| L4 | Generated tokens | exact vs the f32 oracle on S1–S3 |
 | L5 | Corpus CER (§7.3) | budgets |
 
-**Routing-margin diagnostics.** For every selection mismatch, log the score margin between the
-12th and 13th candidates and the entmax support size. A mismatch with a margin below the measured
-float noise is classified "tie-flip". This is a discrepancy class with a ceiling, not a free pass.
+**Routing-margin diagnostics.** For every selection mismatch, log the score margin between the K'-th
+and (K'+1)-th candidates and the entmax support size. A mismatch below the measured float noise is a
+"tie-flip": a discrepancy class with a ceiling, not a free pass.
 
 ### 7.3 Corpus gates (U2-C4)
 
-**Single page.**
-- The existing 20-page corpus, v2 base mode.
-- The v2 int8 artifact vs the v2 BF16 HF reference: aggregate normalized CER with the same budget
-  as v1 (0.25).
-- Hard pages must emit EOS; the guard makes EOS reachable only after `<PAGE>`.
+**Single page.** The 20-page corpus, v2 base mode, comparing the v2 int8 artifact against the v2 f32
+HF reference.
+- **Gate shape per `docs/conformance/RATCHET.md` §4.2.** Graded metrics enter as thresholded
+  pass/fail, never as raw means.
+  - Each page passes iff its normalized CER is within the per-page budget (v1's documented 0.25 unless
+    a tighter one is justified).
+  - The gate is the per-category Jeffreys/Hoeffding lower bound at alpha 0.05, with n ≥
+    `MIN_CALIBRATION_N`, ratcheted, with a transparency card.
+- Aggregate CER is **reported against v1's measured 0.193 as information only**, so a worse port
+  cannot hide behind a loose mean.
+- Hard pages must emit EOS. Under the guard, EOS is reachable only after `<PAGE>`.
 
-**Multi-page.**
-- S2 and S3 vs the v2 reference: per-document CER and page-count equality.
+**Multi-page.** S2 and S3 against the v2 reference: per-document CER, page-count equality, and the
+per-page generated-token distribution (which feeds D11).
 
-**Ledger.** All numbers go to `docs/DISCREPANCIES.md`, with the artifact SHA.
+Every result is recorded in `docs/DISCREPANCIES.md` with the artifact SHA.
 
-### 7.4 Property and metamorphic tests (U2-T3)
+### 7.4 Property and metamorphic tests (acceptance criteria of their owning beads)
 
-- entmax-1.5: sums to 1; support ≥ 1; monotone in input; shift-invariant; matches the brute-force τ
-  solve.
-- Page coordinates: bijective (bucket, tok) per sequence; the decode state machine equals the
-  prefill builder on teacher-forced sequences.
-- Guard state machine: never emits more than N markers; EOS is impossible before N; the cap forces
-  correctly.
-- **Stateless ≡ cached:** prefill-recompute of a prefix produces the same selections and logits as
-  incremental decode (tolerance-gated).
-- Window planner: partition, lookahead and budget invariants.
-- Splice: copied rows equal their sources; replayed page state equals a fresh computation; `kbar`
-  is recomputed for the new grouping.
-- Stitching: bodies by own page; order preserved; a trailing empty body is dropped; a blank first
-  page is never reordered.
-- Tokenizer: added-token splitting is idempotent; `<PAGE>` round-trips; fuzz over random
-  interleavings of added tokens and text.
+| Property | Bead |
+|---|---|
+| entmax-1.5 (both domains): sums to 1; support ≥ 1; monotone; shift-invariant; matches brute-force τ; top-M with padding ≡ full top-M (§5.6.5) | B2 |
+| Page coordinates: bijective (bucket, tok) per sequence; decode state machine ≡ prefill builder on teacher-forced sequences; page_base parity invariant (§5.10.4) | B1 |
+| Retirement: retired vs unretired runs give exact equality on S1–S3 fixtures; the detector fires on a synthetic extra-marker sequence; the pinned set survives (W=8 window 0, marker row 1919 ≡ 31 mod 32); no retirement on guard-forced steps | B4 (mechanism), D1a (pinned set) |
+| Guard: never more than N markers; no EOS before N; the cap forces correctly; forced tokens are authoritative | B6 |
+| **Stateless ≡ cached** (with the §5.8 precondition) | C2 |
+| Planner partition/lookahead/budget; splice copies equal their sources; replayed page state equals the §5.10.4 table; one-page variant; stitching ownership and no reorder | D1a |
+| Windowed pipeline: one vision encode per page (fallback recomputes counted separately); rasters dropped after their window; 61+-page documents run windowed instead of being refused | D1b |
+| A 61-page unwindowed v2 document is refused with exit 2; a position-limit stop gives `finish_reason: "length"` and exit 5, never silent truncation | B6 |
+| Added-token splitting is idempotent; `<PAGE>` round-trips; fuzz over interleavings | A4 |
+| UTF-8-safe incremental decode across split CJK characters and page boundaries | X1 |
 
-### 7.5 Windowed-mode validation (U2-D2)
+### 7.5 Windowed-mode validation (U2-D2a oracle, U2-D2b gate)
 
-1. **Degenerate equivalence.** With W ≥ N, output is byte-identical to unwindowed.
+1. **Splice parity.** `gen_reference_fixtures_uocr2.py --windowed W` (U2-D2a) implements §5.10 on the HF
+   model's DASH cache. It slices rows (a)–(d), rebuilds window k+1's cache and page state, and forces
+   `<PAGE>`.
+   - It is written from the wheel source by an author other than U2-D1a's implementer. U2-D2a depends
+     only on A1 and A6, so it can be built in parallel with the Rust decoder and cannot copy it.
+   - U2-D2b uses it to gate U2-D1a token-exactly (f32) at W=2 and W=3 on 5–9-page documents, which gives 1–4 splices
+     each. One case must have N mod W == 1, to exercise the one-page variant.
+   - Fallback-recompute windows are also checked equal to an unwindowed run over the same pages plus
+     the lookahead.
+   - If a GPU host is available, it is compared once against the SGLang wheel. That comparison is
+     informational, because of DISC-U2-1/5/8.
 2. **Invariants.**
-   - exactly N page bodies;
+   - exactly N page bodies (minus skipped pages);
    - order preserved;
-   - no lookahead page is ever transcribed;
-   - resume (byte-identical, D14);
-   - memory bounded by the window plan.
-3. **Accuracy.** On S5 and a MarathonDocBench subset:
-   - windowed (W=10) vs unwindowed CER, both against ground truth;
-   - windowed must not be worse than unwindowed beyond a stated tolerance.
-   - Baidu describes its scheme as "approximate; validated by OCR accuracy."
-4. **Optional GPU SGLang runs.** Run the pinned wheel on one or two long documents to compare
-   per-page text with ours. This is informational, because of DISC-U2-1/5.
+   - no lookahead page transcribed;
+   - resume byte-identical (D14);
+   - peak RSS within the window plan.
 
-### 7.6 v1 non-regression gate (U2-T4)
+   W ≥ N is unwindowed by definition, so that case is a smoke test only.
+3. **Accuracy.** On S5 and a MarathonDocBench subset, compare windowed (W=10) and unwindowed CER, both
+   against ground truth. Windowed must not be worse than unwindowed beyond a pre-registered
+   tolerance; Baidu calls the scheme approximate.
 
-Before any shared-code refactor, capture a v1 golden set (model-gated):
-- token ids for the S1/S3-equivalent v1 inputs;
-- `robot selftest` output;
-- existing parity fixtures.
+### 7.6 v1 non-regression gate (U2-T3)
 
-Every U2 bead touching the decoder, loader, tokenizer or sampler must keep these byte-identical.
-The gate runs in `scripts/check.sh` when weights are present (skip-with-success otherwise, per the
-model-gated convention), and the "native path ran" proof applies.
+**Capture.** Before any shared-code refactor, capture a model-gated v1 golden set:
+- generated **token ids** for S1- and S3-equivalent v1 inputs;
+- the existing parity fixtures;
+- multi-page streaming `page` events.
 
-### 7.7 E2E scripts and logging (U2-T1)
+**Gate.**
+- Every U2 bead that touches the decoder, loader, tokenizer, sampler, PDF walk or CLI output must keep
+  these byte-identical.
+- The gate runs in `scripts/check.sh` when weights are present, and skips with SUCCESS otherwise. The
+  "native path ran" proof applies.
 
-**Script.** `scripts/uocr2_e2e.sh`. It is model-gated and emits structured NDJSON logs per
-`docs/TEST_LOGGING.md` (one line per step, with timings, model id, artifact SHA and outcome).
+`robot selftest` is a GEMM-vs-scalar check (`cli.rs:3159`). It stays as a kernel guard but is **not**
+decoder evidence.
 
-**Scenarios.**
-- (a) single page base;
-- (b) 3-page multi;
-- (c) 20-page multi;
-- (d) windowed 35-page document with W=10, built by concatenating corpus pages;
-- (e) resume after injected cancellation at window 2, which must be byte-identical;
+### 7.7 E2E scripts and logging (U2-T1a, U2-T1b)
+
+`scripts/uocr2_e2e.sh` is model-gated and emits NDJSON logs per `docs/TEST_LOGGING.md`. Each step
+writes one line with timings, model id, artifact SHA, peak RSS and outcome.
+
+**T1a (M2):**
+- (a) single page, base;
+- (b) 3-page document;
+- (c) 20-page document;
+- (g) v1 regression check;
+- (h) `--json --extract-figures` per-page outputs in document mode;
+- (i) `focr pull unlimited-ocr-2` against a local manifest;
+- (j) lever refusal matrix;
+- (k) CJK streaming across a split character;
+- (l) v1→v2 pull hint on a v1 32K-budget failure.
+
+**T1b (M3):**
+- (d) 35-page windowed document, W=10, built by concatenating corpus pages;
+- (e) resume after an injected cancellation at window 2, byte-identical;
 - (f) robot schema validation of `page`, `window` and `run_complete`;
-- (g) the v1 regression check;
-- (h) `--multi-page --json --extract-figures` per-page outputs;
-- (i) `focr pull unlimited-ocr-2` against a local manifest.
+- (m) page-failure skip with source-page map continuity;
+- (n) directory input;
+- (o) a ≥ 300-page synthetic run, recording the RSS bound and time-to-first-page.
 
 ---
 
@@ -967,115 +1532,142 @@ model-gated convention), and the "native path ran" proof applies.
 | MoE layers 1–11 (6 routed + 2-expert-equivalent shared) | ≈ 303M |
 | Dense layer 0 | ≈ 26M |
 | lm_head | 165M |
-| Attention scores and AV (v2) | ≤ 12 × 10 × 128 × 2 × 512 ≈ 16M |
+| Attention scores + AV (v2) | ≤ 12 × 10 × 128 × 2 × 512 ≈ 16M |
 | **Total (v2)** | **≈ 0.59G** |
 
-**Comparisons with v1.**
-- **Single page:** v1 attends to ~408 tokens, so its attention is about 12.5M. **Decode cost is
-  roughly equal**; no speedup is expected.
-- **Multi-page decode:** v1 attends to `m = 111·N + 128`. At N=100 that adds about 344M per token
-  (+58%), and at N=290 about 1G. v2 stays flat. v2 wins beyond roughly 50 pages, and only v2 can
-  go past about 290 pages.
-- **Prefill:**
-  - v1 full causal attention ≈ 15,360·S² MACs;
-  - v2 sparse ≈ S·15.7M;
-  - linear prefill work is S × ~430M for both, and v2's S per page is 2.5× larger (274 vs 111
-    tokens).
-- **Vision per page:** SAM-B at 1024 is about 0.45 TMAC, against about 0.15 TMAC at 640, so v2
-  multi-page vision costs about 2.8× v1 multi-page vision.
+**Comparison with v1.**
+- **Single page.** v1 attends to ~408 tokens, about 12.5M MACs of attention, so **decode cost is
+  roughly equal** and no speedup is expected.
+- **Multi-page decode.** v1 attends to `m = 111·N + 128` tokens.
+  - At N=100 that adds ~344M MACs per token (+58%), while v2 stays flat.
+  - On decode MACs alone, v2 pulls ahead near 50 pages. But **v1 cannot reach 50 dense pages**: its
+    prompt and output share 32,768 positions (`mod.rs:2750-2783`), so it stops near 29 pages at ~1,000
+    output tokens per page. Beyond that, only v2 runs.
+- **Prefill.**
+  - Attention: v1 full causal costs ≈ 15,360·S² MACs, v2 sparse ≈ S·15.7M.
+  - Linear prefill work is S × ~430M for both, but v2's S per page is 2.5× larger (274 vs 111).
+- **Vision per page.**
+  - SAM-B at 1024 is ≈0.45 TMAC, against ≈0.15 TMAC at 640. v2 document-mode vision therefore costs
+    ≈2.8× v1 multi-page vision.
+  - It costs the **same** as v1 single-page base, since both run at 1024. PERF_LEDGER G2 rows
+    (2026-07-08, M-class host, 8 threads) put v1 vision-encode at ≈4.2 s per page.
+  - Gundam vision is ≈1.7–6.4× base, depending on the tile count (estimate).
 
 **Honest summary.**
 - Single page: parity.
-- Short multi-page documents: comparable; v2 spends more on vision and prefill and less on
-  attention.
-- Long documents: v2 wins, and it is the only option at book scale.
+- Documents vs per-page parsing: about the same per page, plus cross-page value (D17).
+- Documents vs v1 multi-page: more vision and prefill, less attention, and no length ceiling.
 
-The default-flip gates (§10) treat performance as a **budget, not a selling point**, except at long
-document lengths.
+The default-flip gates (§10) treat performance as a **budget, not a selling point**.
 
-### 8.2 Exact levers (each with bit-identity proof; U2-F2, U2-F3)
+### 8.2 Exact levers (each with a bit-identity proof; U2-F2, U2-F3)
 
-1. **Candidate-only scoring.** Score only allowed blocks plus, for open rows, all remote blocks.
-   This is identical to scoring everything and masking, because non-candidates are set to −1e4
-   before top-M.
-2. **Incremental `kbar`.** Complete blocks are immutable; recompute only the tail block, plus
+1. **Candidate-only scoring** with −1e4 padding to M. This is exactly equivalent per §5.6.5.
+2. **Incremental `kbar`.** Complete blocks are immutable, so only the tail block is recomputed, plus
    copied segments on splice.
-3. **Gathered attention layout.** Contiguous per-block K/V slices with the head-major inner loop
-   left to LLVM autovec (doctrine #3: no hand-rolled wide SIMD over scalar loops).
+3. **Gathered attention layout.** Contiguous per-block K/V slices; the head-major inner loop is left
+   to LLVM autovectorization (doctrine #3).
 4. **Prefill attention parallelism.** Rayon over (head, query-chunk) tiles inside the forward.
 5. **Vision once per page in windowed mode.** Lookahead KV is copied, never re-encoded.
-6. **Retire-on-advance** (§5.12), for memory and cache locality.
+6. **Chunked prefill for v2.** This lifts the D18 refusal.
 
 ### 8.3 Lossy levers (kill-switch gated, CER-measured; U2-F4)
 
 - bf16 KV storage, which halves KV memory.
-- The int8 attention, `lm_head` and int4 expert levers are **out of scope** for v2 until the
-  equivalent v1 gates exist (doctrine #2).
+- int8 attention/`lm_head` and int4 experts are **out of scope** for v2 until the equivalent v1 gates
+  exist (doctrine #2).
 
-### 8.4 Benchmarks
+### 8.4 Benchmarks and wall time
 
-Every row runs v1 and v2 in the **same invocation**, at the same thread count, on the same inputs
-(suite rule: a win needs the incumbent live), with `FOCR_TIMING=1` rows for:
-- `srswa.router`, `srswa.attend`, `srswa.kbar`;
-- `vision.page`, `prefill`, `decode`.
+**Benchmark rules.** Every row runs v1 and v2 **in the same invocation**, at the same thread count, on
+the same inputs. That is the suite rule: a win needs the incumbent live.
+- Rows include `FOCR_TIMING=1` timings for `srswa.router`, `srswa.attend`, `srswa.kbar`,
+  `vision.page`, `prefill`, `decode` and `pagesource`, plus **peak RSS**.
+- Rows go to `docs/PERF_LEDGER.md`, losing rows included.
 
-Results go to `docs/PERF_LEDGER.md`, including losing rows.
+**Book wall time.** Estimate, to be replaced by U2-F1 numbers: 15–60 s per page on M-class hosts,
+which is roughly 4–17 hours per 1,000 pages. The docs say so, and progress output shows a live ETA.
 
 ---
 
 ## 9. Product surface
 
-### 9.1 CLI (U2-E1, U2-D4, U2-D5)
+### 9.1 CLI (U2-E1, U2-D5)
 
-- **Model selection.** `--model unlimited-ocr-2`: `--model` accepts zoo **ids** in addition to
-  paths and filenames, resolving through the per-model cache subdirectory. Ids are accretive across
-  the whole zoo.
-- **Single page:** `focr ocr page.png --model unlimited-ocr-2 [--crop-mode base|gundam]`.
-- **Multi-page:** `focr ocr doc.pdf --multi-page --model unlimited-ocr-2 [--pages …]
-  [--page-window N|auto|off] [--max-page-tokens N] [--resume RUN_ID] [--json] [-o out.md|out.json]
-  [--extract-figures]`.
-- **Batch:** `focr ocr-batch … --multi-page --model unlimited-ocr-2`.
-- **Exit codes.** Existing codes only. Running out of budget is 5, with a partial-output note.
-- **`focr models`.** Lists `unlimited-ocr-2` with status, tasks, recipe, the "best for: multi-page
-  and long documents" guidance, and its pull state.
-- **Help text.** Explains when to choose v1 vs v2.
+**Model selection.** `--model unlimited-ocr-2`.
+- `--model` already resolves bare ids. Candidates are `<id>`, `<id>.focrq`,
+  `<id>.v<ver>.{int8,int4}.focrq` and `<id>.{int8,int4}.focrq`.
+- Search order: `FOCR_MODEL_DIR`, then the cache root, then per-model subdirectories.
+- With D22, the version comes from the arch.
 
-### 9.2 Robot mode (additive)
+**Single page.** `focr ocr page.png --model unlimited-ocr-2 [--crop-mode base|gundam]`.
 
-**`page` event.**
+**Documents.** With v2 resolved, `focr ocr doc.pdf` runs document mode once E5a flips. Until then, add
+`--multi-page`.
 ```
-{event:"page", page:<1-based source page>, index:<1-based in run>, window:<k>, chars,
- tokens, finish:"marker|eos|page_cap", elapsed_ms}
-```
-Emitted as each page body completes (streaming).
-
-**`window` event.**
-```
-{event:"window", index, pages:[lo,hi], lookahead:0|1, reused:bool, prefill_tokens,
- generated_tokens, kv_bytes_peak, elapsed_ms}
+focr ocr doc.pdf --model unlimited-ocr-2 [--pages …] [--split-spreads]
+    [--page-window N|auto|off] [--max-page-tokens N] [--resume[=recompute]]
+    [--independent-pages] [--json] [-o out.md|out.json] [--extract-figures]
+focr ocr ./scanned_book_pages/ --model unlimited-ocr-2         # directory = one document (D24)
 ```
 
-**`run_complete` additions.** `model_id`, `pages_out`, `windows`, `extra_markers`, and
-`finish_reason` (`stop|length|cancelled`).
+**Batch.** `focr ocr-batch … [--multi-page] --model unlimited-ocr-2`.
+
+**Exit codes.** Existing codes only (`src/error.rs`). Cancellation exits 6 (`EXIT_CANCELLED`), also with
+completed pages and a checkpoint written. A budget exhaustion, including v2 hitting the per-window
+position limit, exits 5 (`EXIT_TIMEOUT`), with completed pages and a checkpoint
+written.
+
+**`focr models`.** It lists `unlimited-ocr-2` with status, tasks, recipe, the note "best for:
+documents and long documents", and pull state. The ID column is widened (`cli.rs:2680`).
+
+**Help text.** It explains when to use v1 vs v2 and corrects the v1 limit text: `cli.rs:34,230,349`
+("32K (~290 pages)" becomes "32,768 positions shared by prompt and output") and `lib.rs:705-714`.
+
+**v1 budget errors.** Once the artifact is published (E4), v1 32K-budget errors name
+`focr pull unlimited-ocr-2` as the remediation.
+
+### 9.2 Robot mode (additive; D15)
+
+**`page`** keeps its existing fields and adds new ones:
+```
+{event:"page", status:"decoded"|"skipped", page:<run index, unchanged semantics>, text, chars,
+ source_page:<1-based PDF page / file index>, half:"left"|"right"|null,
+ window:<k>|null, tokens, finish:"marker"|"eos"|"page_cap"|null, elapsed_ms, model_id}
+```
+- It is emitted as each page body completes, using token-id segmentation (D20).
+- `source_page` is added to both statuses.
+
+**`window`** (new):
+```
+{event:"window", index, pages:[lo,hi], lookahead:0|1, reused:bool, fallback_reason|null,
+ prefill_tokens, generated_tokens, kv_bytes_peak, rss_bytes_peak, elapsed_ms, eta_ms}
+```
+
+**`run_complete` additions:** `model_id`, `artifact_sha256`, `pages_out`, `pages_skipped`, `windows`,
+`extra_markers`, `finish_reason` (`stop|length|cancelled|budget`) and `resumed_from`.
 
 **Contract upkeep.**
-- `robot schema` and the frozen schema fixture are updated, coordinating with the open schema-golden
-  bug bd-wp8.2.2.
-- `tests/surface_matrix.rs` and `docs/FEATURE_PARITY.md` get rows for every new flag and event.
-- `robot triage` recommends `--multi-page --model unlimited-ocr-2` for PDFs with more than about 10
-  pages when v2 is installed.
+- `robot schema` and the frozen fixture `tests/fixtures/robot_schema_v1.json` are regenerated with
+  `UPDATE_GOLDENS=1` as a reviewed golden change. The schema stays v1 (additive).
+- `tests/surface_matrix.rs` and `docs/FEATURE_PARITY.md` §13 get a `window` row and a rollup bump. New
+  flags are recorded in the ledger.
+- Coordinate with bd-wp8.2, bd-wp8.3 and bd-znwm.
+- `robot triage` recommends v2 document mode for PDFs over about 10 pages when v2 is installed, and
+  `focr pull unlimited-ocr-2` when it is not.
 
-### 9.3 Structured multi-page output (U2-E3)
+### 9.3 Structured document output (U2-E3)
 
-v2's explicit `<PAGE>` segmentation lets `--multi-page` produce:
-- a per-page `pages[]` array with layout boxes mapped to each source page;
-- figure extraction per page (`page{N}_figure_{M}`).
+v2's token-level `<PAGE>` segmentation gives document mode:
+- a per-page `pages[]` array, with layout boxes (0–999 per page) mapped through each source page's
+  original size;
+- per-page figure extraction (`page{N}_figure_{M}`);
+- the source-page map.
 
-Today `--multi-page` refuses `--extract-figures` because of per-page semantics, and this lifts that
-restriction for v2. Boxes are 0–999 normalized per page in the model output and are mapped with
-that page's original size.
+This lifts the `--multi-page` refusal of `--extract-figures` and `--split-spreads` (`cli.rs:1393`) for
+v2. Coordinate with bd-hfdt-admission-prereqs-dfr1, bd-json-per-span-text-wbbu and bd-v73v.
 
-### 9.4 Library (U2-E2)
+### 9.4 Library (U2-E2, D23)
 
 ```rust
 let engine = OcrEngine::new()?;
@@ -1083,196 +1675,280 @@ let opts = DocumentOptions::builder()
     .model(ModelChoice::Id("unlimited-ocr-2"))
     .page_window(PageWindow::Auto)
     .max_page_tokens(20_000)
-    .resume(None)
+    .resume(ResumePolicy::IfMatching)
     .build();
-let doc = engine.recognize_document(PageSource::pdf("book.pdf", PageSelection::All), &opts,
-    |page: &PageResult| { /* stream */ })?;
+let doc = engine.recognize_document(
+    PageSource::pdf("book.pdf", PageSelection::All),   // or PageSource::dir("pages/")
+    &opts,
+    |page: &PageResult| { /* stream */ },
+)?;
 ```
-- Synchronous and blocking, with the runtime owned internally.
-- The existing `recognize_multi_page*` calls keep their signatures and work with v2 artifacts.
-- Coordinate with bd-paom (`recognize_pdf`) and bd-3gyt (consolidated PDF walks) so there is a
-  single document-walk path.
+- The call is synchronous and blocking; the runtime is owned internally.
+- It replaces the five `recognize_multi_page*` variants, with a minor-version bump and a CHANGELOG
+  migration table.
+- `recognize_pdf` (bd-paom) is its per-page sibling over the same walk.
+- The engine caches one model (`lib.rs` `model_at`), so per-mode defaults resolve the model before
+  engine construction (D25).
 
 ### 9.5 Distribution (U2-E4)
 
-- A manifest-v2 `models["unlimited-ocr-2"]` entry with `license_notice`, `quants.int8 {recipe,
-  focrq{filename,size,sha256,parts[]}}` and `tokenizer` (the v2 `tokenizer.json`).
-- `dist.rs::required_quant_recipe` gains a v2 arm.
-- `focr pull unlimited-ocr-2` installs into the model subdirectory.
-- The install docs size text is updated.
-- The HF mirror follows bd-3p8y / bd-aio5 (non-blocking; GitHub release parts are primary).
+- **Manifest.** A manifest-v2 `models["unlimited-ocr-2"]` entry holds:
+  - `license_notice`;
+  - `version` (D22);
+  - `quants.int8 {recipe, focrq{filename,size,sha256,parts[]}}`;
+  - `tokenizer` (the v2 `tokenizer.json` and its sha256).
+- **Recipe check.** `dist.rs::required_quant_recipe` gains a v2 arm.
+- **Pull.** `focr pull unlimited-ocr-2` installs into the model subdirectory, with artifact and sidecar
+  in one transaction (bd-jprb).
+- **Docs and hints.** The install docs' size text is updated, and so is `with_pull_hint`
+  (`cli.rs:3036`).
+- **HF mirror.** Per bd-3p8y/bd-aio5; non-blocking.
 
 ### 9.6 Health and doctor (U2-E7)
 
-- `robot health` reports installed models, including v2, with artifact SHA and recipe.
-- `doctor` detects a v2 artifact with a v1 tokenizer sidecar (hash mismatch) and offers the
-  reversible fix of re-pulling the sidecar.
-- `robot triage` is v2-aware.
+- **`robot health`** reports every installed model (`cli.rs:2949` reports one), with artifact SHA,
+  recipe and tokenizer SHA.
+- **`doctor`** scans per-model subdirectories (`doctor.rs:121`). It detects a v1 tokenizer beside a v2
+  artifact and offers the reversible fix of re-pulling the sidecar.
+- **`robot triage`** is v2-aware.
 
-### 9.7 Documentation (U2-E6)
+### 9.7 Documentation (U2-E6a at M2, U2-E6b at M4)
 
-- README: the model table; a "Long documents and books" section; v2 limitations (single-page
-  parity, CPU vision cost at 1024 per page, windowed mode is approximate per Baidu, gundam
-  uncertified until G1).
-- AGENTS.md "What this model is": add the v2 paragraph.
-- CHANGELOG.
-- The master plan §13: a cross-reference to the OQ-V2 register.
-- DISCREPANCIES (DISC-U2-*) and PERF_LEDGER rows.
+- **README:**
+  - the model table;
+  - a "Long documents and books" section;
+  - inputs and limitations: JBIG2/JPX/vector pages are skipped, and the directory route is
+    recommended;
+  - book wall-time estimates;
+  - v2 limitations: single-page parity only; windowed mode is approximate (per Baidu); gundam is
+    uncertified until G1; there is no global heading hierarchy across windows (per the report).
+- **AGENTS.md** "What this model is": a v2 paragraph.
+- **CHANGELOG**, including the API migration table.
+- **The master plan's §13**: a cross-reference to OQ-V2.
+- **DISCREPANCIES** (DISC-U2-*) and **PERF_LEDGER** rows.
 
 ---
 
-## 10. Default-policy decision framework (U2-E5)
+## 10. Default-policy decision framework (U2-E5a, U2-E5b)
 
 | Mode | Today | After M2 (artifact certified) | After M4, if gates pass |
 |---|---|---|---|
-| `focr ocr page.png` | v1 base | v1 (v2 opt-in) | v2 only if the single-page gate passes, else v1 |
-| `focr ocr doc.pdf` (per page) | v1 | v1 | follows the single-page decision |
-| `--multi-page` | v1 (≤32K context) | v1 (v2 opt-in) | **v2 when installed** if the multi-page gate passes; v1 otherwise. A one-line stderr/robot note names the model used. |
-| `ocr-batch` | v1 | v1 | follows the single-page decision |
-| `focr pull` (no argument) | v1 artifact | v1 | unchanged; `focr pull unlimited-ocr-2` is explicit (v1 users are never auto-upgraded into a 4 GB download) |
+| `focr ocr page.png` | v1 base | v1 (v2 opt-in) | v2 if the single-page gate passes (E5b), else v1 |
+| `focr ocr doc.pdf` | v1, per page | v1, per page (v2 document mode opt-in) | **v2 document mode** (D17) if the multi-page gate passes (E5a). `--independent-pages` keeps per-page parsing, with the single-page default model. |
+| `--multi-page` | v1 (32,768 positions shared; ~29 dense pages) | v1 (v2 opt-in). v1 budget errors name `focr pull unlimited-ocr-2`. | v2 if the multi-page gate passes |
+| `ocr-batch` | v1 | v1 | Follows the single-page decision; `--multi-page` follows the multi-page decision |
+| `focr pull` (no argument) | v1 artifact | v1 | v1 until **both** gates pass, then v2 (D25 end state). v1 installs are never auto-upgraded into a 4 GB download. |
 
-**Multi-page gate (all required).**
+**Model resolution (D25):** `--model` > `FOCR_MODEL_PATH` > the mode default above > v1. A pull hint
+is printed when the mode default is missing. JSON output and `run_complete` carry `model_id` and
+`artifact_sha256`.
+
+**Multi-page gate (E5a; all required).**
 1. C4 green on the int8 artifact.
-2. The ground-truth head-to-head (U2-C5) on at least 30 multi-page documents (5–60 pages) shows v2
-   ≥ v1 on aggregate normalized text edit distance, with a lower confidence bound above v1 (the
-   conformal-ratchet style of `docs/conformance/RATCHET.md`) and no category regression beyond the
-   stated tolerance.
-3. Windowed-mode validation (§7.5) is green.
-4. CPU wall time per page is within 1.5× of v1 multi-page at ≤ 20 pages. The cost is published
-   either way.
-5. The surface ledger is complete.
+2. A **ground-truth head-to-head** (U2-C5a/C5b) on ≥ 30 documents of 5–60 pages and ≥ 5 documents of
+   100+ pages. v2 document mode must beat v1 multi-page **and** v1 per-page.
+   - **Statistic:** the lower bound of a paired per-document bootstrap of (ED_v1 − ED_v2) is above 0.
+   - **No category regression** beyond the pre-registered tolerance.
+   - **v1 failures count.** A v1 run that errors on the 32K budget or truncates scores edit distance
+     1.0 for every page it did not produce. No document is dropped for failing on one side.
+   - **At least a third of the documents are non-Baidu** (OQ-V2-15), because MarathonDocBench and
+     MPDocBench are Baidu-built.
+3. Windowed-mode validation (§7.5) green.
+4. **Cost bounds.** CPU wall time per completed page is within 1.5× of v1 multi-page at ≤ 20 pages, and
+   within 1.2× of v1 per-page parsing. Peak RSS at 20 pages is ≤ v1 multi-page + 1 GiB. Both numbers
+   are published either way.
+5. The surface ledger is complete, and the robot schema golden is updated.
 
-**Single-page gate (all required).**
-1. v2 (in its chosen crop mode, from G2) ≥ v1 on ground-truth CER over at least 100 pages, with a
-   lower bound above v1.
+**Single-page gate (E5b; all required).**
+1. v2, in its chosen crop mode (G2), is **non-inferior** to v1 on ≥ 300 ground-truth pages.
+   - **Statistic:** the upper bound of a paired bootstrap of (CER_v2 − CER_v1) is below δ.
+   - Table pages pass the same test on TEDS.
+   - δ (proposed: 0.005) is committed before the run.
+   - A superiority bound cannot pass at the reported 93.92 vs 94.02, and it would freeze a two-model
+     default forever.
 2. CPU wall time ≤ 1.1× v1.
 3. Hard-page EOS behavior is no worse.
+4. Peak RSS ≤ v1 + 0.5 GiB.
 
 **Evidence sets.**
-- MarathonDocBench pages and documents (Apache-2.0; it has per-page ground truth).
-- Optionally MPDocBench and OmniDocBench subsets, if their licenses allow local evaluation
+- **MarathonDocBench** documents and pages (Apache-2.0, per-page ground truth).
+- **Non-Baidu documents** with ground truth (OQ-V2-15). Candidates:
+  - public-domain book scans with existing human-proofread transcriptions;
+  - born-digital PDFs rasterized out-of-band for evaluation only, with text-layer ground truth
+    normalized for reading order.
+- **OmniDocBench** (OpenDataLab, not Baidu) for single pages, if its license allows local evaluation
   (OQ-V2-12).
-- Metric: our minimal normalized edit distance, plus the official MPDocBench-Parse toolkit offline
-  for reported numbers.
+- **Metrics:** our minimal normalized edit distance, plus the official MPDocBench-Parse toolkit, run
+  offline, for reported numbers.
+- **Compute budget** (estimate): both models over 35 documents is ≈ 15–40 CPU-hours. C5 runs it once
+  per candidate artifact.
 
 ---
 
 ## 11. Roadmap and milestones
 
-Each milestone ends with something a user can run, and has an exit gate.
+Each milestone ends with something a user can run, and each has an exit gate.
 
-**M0 — Foundation (no user-visible change).**
-- **Work:** A1 truth pack and OQ register; A2 identity hardening; A3 sharded sources; A4 tokenizer;
-  A5 arch and census; A6/A7 oracle; T4 v1 golden capture.
-- **Exit:** v1 byte-identical; the v2 checkpoint loads (census ok) behind
-  `implemented() == false`; oracle fixtures S1–S4 generated, with the nondeterminism floor
-  recorded.
+**M0 — Foundation and early v1 wins.**
+- **Work:**
+  - T3: v1 golden gate;
+  - A1: truth pack;
+  - A2: identity;
+  - A3: sharded sources;
+  - A4: tokenizer;
+  - A5: arch and census;
+  - A6: oracle;
+  - A7: fail-closed dispatch;
+  - **X1:** CJK streaming fix (v1);
+  - **D0:** streaming page source (v1 multi-page memory).
+- **User value:**
+  - v1 Chinese multi-page streaming no longer dies after a split character;
+  - v1 `--multi-page` no longer holds every raster twice;
+  - a v1 tokenizer sidecar can no longer be silently accepted for the wrong arch.
+- **Exit:**
+  - v1 is byte-identical;
+  - the v2 checkpoint loads (census OK) behind `implemented() == false`, and every path refuses it
+    explicitly;
+  - oracle fixtures S1–S4 are generated (f32 CPU), with the floor recorded.
 
 **M1 — Correct native v2 (experimental).**
-- **Work:** B1–B8, C1, C2.
-- **User value:** `focr ocr --model /path/to/Unlimited-OCR-2` (raw BF16, experimental flag) works
-  for single pages (base) and unwindowed multi-page.
-- **Exit:** L0–L4 green on S1–S3; v1 gate green.
+- **Work:** B1–B7, C1, C2.
+- **User value:** `focr ocr --model /path/to/Unlimited-OCR-2/` (raw BF16 shards, experimental) works
+  for single pages (base) and for unwindowed documents.
+- **Exit:** L0–L4 green on S1–S3 against the f32 oracle; retirement exact; v1 gate green.
 
 **M2 — Certified opt-in model.**
-- **Work:** C3, C4, E1, E3, E4, E7, F1, F2, T1 (partial).
-- **User value:** `focr pull unlimited-ocr-2`; `--model unlimited-ocr-2` for single pages and
-  multi-page, with per-page JSON and figures.
-- **Exit:** corpus gates green; artifact published; perf ledger rows published.
+- **Work:** C3, C4, C5a, E1, E3, E4, E6a, E7, F1, T1a.
+- **User value:**
+  - `focr pull unlimited-ocr-2`;
+  - `--model unlimited-ocr-2` for single pages and for documents of ≤ W pages, with per-page JSON and
+    figures;
+  - v1 budget errors point to v2.
+- **Exit:** corpus gates green; artifact published; perf and RSS ledger rows published; C5a evidence
+  recorded.
 
 **M3 — Unlimited-horizon books.**
-- **Work:** D1–D5, E2, T2, T1 (full), F3.
-- **User value:** 1,000-page PDFs on CPU with bounded memory, streaming, resumable; robot `page` and
-  `window` events; the library document API.
-- **Exit:** §7.5 green; watchdog green; e2e (d)/(e) green.
+- **Work:** E2, D1a, D1b, D2a, D2b, D3, D4, D5, C5b, T1b, T2, F2, F3. D2a, the independent oracle,
+  can start as soon as A1 and A6 close.
+- **User value:**
+  - 1,000-page PDFs or page directories on CPU, with bounded memory, streaming, and resume;
+  - robot `page` and `window` events;
+  - `recognize_document`.
+- **Exit:**
+  - §7.5 green;
+  - watchdog green;
+  - T1b green;
+  - a measured ≥ 300-page run on a 16 GB laptop-class host, with peak RSS ≤ 8 GiB at W=10 and the first
+    page emitted after one window, published in PERF_LEDGER.
 
-**M4 — Evidence-gated defaults.**
-- **Work:** C5, G1, G2, E5, E6.
-- **Exit:** the decision table published, with defaults flipped only where the gates pass.
+**M4 — Evidence-gated document default.**
+- **Work:** E5a, E6b.
+- **Exit:** the decision table is published, and document/multi-page defaults flip only if the gate
+  passes.
 
-**M5 — Ecosystem and further perf (backlog).**
-- **Work:** F4 bf16 KV; F5 v2 batch spine; H1 iOS/WASM/site v2 lanes.
+**M4b — Single-page decision (never blocks M4).** G1, G2, E5b.
 
-**Critical path.** A1 → (B1, B2) → B3 → B4 → B5 → B6 → C2 → C3/C4 → E4 → (D1 → D2) → C5 → E5.
-A2, A3, A4, A6, B7 and T4 run in parallel off the start.
+**M5 — Ecosystem and further perf (backlog).** F4 bf16 KV; F5 cross-document batching; H1
+iOS/WASM/site v2 lanes.
+
+**Critical path.** The longest blocking chain in the bead graph has 13 beads:
+```
+A1 → B1 → B2 → B4 → B5 → B6 → C2 → C4 → E4 → T1a → T1b → E5a → E6b
+```
+The windowed-books track joins it at T1b and E5a:
+```
+T3 → A2 → A5 → A7 → B5 ┐
+B4, B6 → D1a ─┬→ D2b (← D2a ← A1, A6) → C5b → E5a
+D0, E2 ───────┴→ D1b → D3, D4 → D5 → T1b
+```
+A3, A4, A6, B7, X1 and D2a run in parallel from the start, or as soon as their deps close.
+G1 → G2 → E5b runs off the critical path. Bead ids are listed in §12.
 
 ---
 
 ## 12. Task graph (mirrored into beads; labels in brackets)
 
-Format: **ID — title** [labels] (deps). Each bead carries the full spec excerpt from §5 that it
-needs, acceptance criteria, tests, logging requirements and rationale.
+Each entry is written **ID — title** [labels] (blocking deps) — `bead id`. This list was regenerated
+from the live `br` graph after bead polish round 1; when they disagree, the beads win. Each bead carries
+milestone labels `uocr2-m0`…`uocr2-m5` (omitted here) and:
+- the full spec excerpt it needs;
+- acceptance criteria;
+- the tests it owns (§7.4);
+- logging requirements;
+- rationale.
 
-**Epic U2.** Unlimited-OCR-2: additive model + unlimited-horizon long-document parsing + evidence-gated defaults [uocr2,epic].
+**Epic U2.** Unlimited-OCR-2: additive model + unlimited-horizon long-document parsing +
+evidence-gated defaults [uocr2,epic].
 
-**A — Foundation and identity**
-- **U2-A1** — Truth pack v2: pin sources, write OQ-V2 answers (SR-SWA, page2d RoPE, decode contract, preprocessing, tokenizer, windowed semantics), register in plan §13 and OQ_INDEX [uocr2,research,conformance] ()
-- **U2-A2** — Model-identity hardening: absent model_id ≡ v1 forever; capability methods replace `== default_arch()` identity checks; census-based raw-safetensors arch detection [uocr2,identity] ()
-- **U2-A3** — Sharded safetensors sources (index.json + N shards) for raw load and `focr convert`, with per-shard SHA pins [uocr2,weights,convert] ()
-- **U2-A4** — Tokenizer v2: added non-special tokens 128827–128830; v2 tokenizer pin; conformance fixtures vs HF [uocr2,tokenizer,conformance] (A1)
-- **U2-A5** — Register `unlimited-ocr-2` ModelArch + embedded 2,819-tensor census + pins + recipe id (implemented=false until B6) [uocr2,identity] (A1,A2,A3)
-- **U2-A6** — v2 reference oracle generator + fixtures S1–S5 + nondeterminism floor [uocr2,conformance,oracle] (A1)
-- **U2-A7** — HF v2 on CPU feasibility (OQ-V2-4) + CPU baseline decision [uocr2,conformance,research] (A6)
+**A — Foundation, identity, safety**
+- **U2-T3** — v1 token-id golden capture and non-regression gate (before any shared refactor) [uocr2,conformance,test] () — `bd-uocr2-epic-cgux.1`
+- **U2-A1** — Truth pack v2: pin sources, wheel and SGLang notes; register OQ-V2 [uocr2,conformance] () — `bd-uocr2-epic-cgux.2`
+- **U2-A2** — Model-identity hardening: absent model_id ≡ v1 forever; capability methods; per-arch tokenizer validation [uocr2,identity] (T3) — `bd-uocr2-epic-cgux.3`
+- **U2-A3** — Sharded safetensors sources (index + N shards): raw load, streaming `focr convert`, I64 verify-and-skip, multi-shard provenance [uocr2,convert,weights] (T3) — `bd-uocr2-epic-cgux.4`
+- **U2-A4** — Tokenizer v2: added tokens 128827–128830, v2 tokenizer pin, conformance vs HF [uocr2,conformance,tokenizer] (T3,A1) — `bd-uocr2-epic-cgux.5`
+- **U2-A5** — Register `unlimited-ocr-2` ModelArch (implemented=false) + delta census + vision byte-identity hashes + per-model artifact version + recipe id [uocr2,identity] (A1,A2,A3,A4) — `bd-uocr2-epic-cgux.6`
+- **U2-A6** — v2 reference oracle: f32 CPU primary (feasibility first), bf16 ledger, dumps, fixtures S1–S5, nondeterminism floor [uocr2,conformance,oracle] (A1) — `bd-uocr2-epic-cgux.7`
+- **U2-A7** — Fail-closed v2 dispatch: every decode path, lever, daemon and recipe supports v2 or refuses it before weights load [uocr2,identity,safety] (A5) — `bd-uocr2-epic-cgux.8`
+- **U2-X1** — Fix PageStream: page events stop permanently after a split multi-byte UTF-8 char (v1 bug); UTF-8-safe incremental decoder [uocr2,bug,streaming] (T3) — `bd-uocr2-epic-cgux.9`
 
 **B — Native SR-SWA decoder**
-- **U2-B1** — page2d coordinates + decode state machine + RoPE tables [uocr2,decoder,rope] (A1)
-- **U2-B2** — Token Sieve router math (proj/Gemma-norm/RoPE/kbar/scores/Page Gate/entmax top-M/top-K/bias) with scalar oracle [uocr2,decoder,attention] (A1,B1)
-- **U2-B3** — Block-sparse biased attention (local ∪ selected) prefill + decode, dense scalar oracle + gathered path [uocr2,decoder,attention,kernel] (B2)
-- **U2-B4** — SR-SWA KV/router caches, block page ranges, incremental kbar, memory accounting [uocr2,decoder,memory] (B1,B2)
-- **U2-B5** — Decoder integration: attention-kind dispatch; v2 prefill/decode; v1 byte-identity preserved [uocr2,decoder] (B3,B4,A5,T4)
-- **U2-B6** — v2 decode contract: prompt, guard, n-gram, lengths, `<PAGE>` stream, postprocess; flip implemented=true (experimental) [uocr2,decoder,sampler] (A4,B5,B7)
-- **U2-B7** — v2 preprocessing: base-1024 letterbox multi-page (273/page), gundam max 16 tiles, small-image rule [uocr2,preprocess] (A1)
-- **U2-B8** — Vision reuse proof: byte-identical vision tensors v1↔v2 + vision rungs under v2 [uocr2,vision,conformance] (A5,A6)
+- **U2-B1** — page2d coordinates, decode state machine, page_base, and RoPE tables [uocr2,decoder,rope] (A1) — `bd-uocr2-epic-cgux.10`
+- **U2-B2** — Token Sieve router math (projections, Gemma norm, RoPE, kbar, scores, Page Gate, both entmax domains, top-K, bias) with a scalar oracle [uocr2,attention,decoder] (B1) — `bd-uocr2-epic-cgux.11`
+- **U2-B3** — Block-sparse biased attention (prefill and decode): dense scalar oracle plus gathered path [uocr2,attention,decoder,kernel] (B2) — `bd-uocr2-epic-cgux.12`
+- **U2-B4** — SR-SWA caches: K/V, index keys, incremental kbar, bmin/bmax, page state, block-granular retirement with open-row detector, memory accounting [uocr2,decoder,memory] (B1,B2) — `bd-uocr2-epic-cgux.13`
+- **U2-B5** — Decoder integration: LayerAttention dispatch; v2 f32 cached (certified-artifact path) + stateless paths; weight caches; v1 byte-identity [uocr2,decoder] (T3,A5,A7,B3,B4) — `bd-uocr2-epic-cgux.14`
+- **U2-B6** — v2 decode contract: prompt, guard, generated-only n-gram, per-page budgets, token-id page split, postprocess; flip implemented=true (experimental) [uocr2,decoder,sampler] (A4,A6,X1,B5,B7) — `bd-uocr2-epic-cgux.15`
+- **U2-B7** — v2 preprocessing: base-1024 letterbox (PIL-bicubic exact), gundam max 16 tiles, small-image rule [uocr2,preprocess] (T3,A1,A6) — `bd-uocr2-epic-cgux.16`
 
 **C — Parity and certification**
-- **U2-C1** — Ladder L0–L2 for v2 incl. routing-equality rung + margin diagnostics [uocr2,conformance,test] (B5,B7,A6)
-- **U2-C2** — Ladder L3–L4 + stateless≡cached metamorphic + cross-page invariants [uocr2,conformance,test] (C1,B6)
-- **U2-C3** — Conservative int8 artifact for v2 (recipe, convert from shards, loader gate) [uocr2,quant,convert] (A5,A3)
-- **U2-C4** — L5 corpus gates for the v2 int8 artifact (single-page corpus, multi-page fixtures, hard pages) + DISC entries [uocr2,conformance,quant] (C2,C3)
-- **U2-C5** — Ground-truth head-to-head v1 vs v2 (single page + multi-page + long docs) → decision table [uocr2,eval] (C4,D2)
+- **U2-C1** — Parity ladder L0–L2 for v2 vs the f32 oracle, incl. routing equality on fallback queries + margin diagnostics [uocr2,conformance,test] (A6,B5,B7) — `bd-uocr2-epic-cgux.17`
+- **U2-C2** — Parity ladder L3–L4 + stateless≡cached metamorphic + cross-page invariants [uocr2,conformance,test] (B6,C1) — `bd-uocr2-epic-cgux.18`
+- **U2-C3** — Conservative int8 artifact for v2 (recipe, matcher narrowing, convert from shards, loader gate, WASM refusal) [uocr2,convert,quant] (A3,A5) — `bd-uocr2-epic-cgux.19`
+- **U2-C4** — L5 corpus gates (ratcheted) for the v2 int8 artifact + DISC entries [uocr2,conformance,quant] (C2,C3) — `bd-uocr2-epic-cgux.20`
+- **U2-C5a** — Ground-truth head-to-head: single page + documents ≤ W pages (v1 vs v2) + ground-truth sourcing incl. non-Baidu [uocr2,eval] (C4) — `bd-uocr2-epic-cgux.21`
+- **U2-C5b** — Ground-truth head-to-head: long documents (windowed v2 vs failure-scored v1) + entmax-domain and doc crop-mode evidence [uocr2,eval,longdoc] (C5a,D3,D2b) — `bd-uocr2-epic-cgux.22`
 
-**D — Unlimited-horizon (books)**
-- **U2-D1** — Windowed decoding: planner, lookahead, retention, splice, forced `<PAGE>`, fallback, stitching [uocr2,decoder,longdoc] (B6,B4)
-- **U2-D2** — Windowed validation: degenerate equivalence, invariants, accuracy vs unwindowed, optional SGLang runs [uocr2,conformance,longdoc] (D1,A6)
-- **U2-D3** — Memory bounding: retire-on-advance (exact under guard + detector), memory estimator, `--page-window auto` [uocr2,memory,longdoc] (D1)
-- **U2-D4** — Durable resume: window checkpoints in fsqlite, `--resume`, byte-identical resume [uocr2,longdoc,storage] (D1)
-- **U2-D5** — Streaming output: per-page emission, robot `page`/`window` events, progress/ETA, `--page-window` and `--max-page-tokens` flags [uocr2,cli,robot,longdoc] (D1,E1)
+**D — Documents and unlimited horizon**
+- **U2-D0** — Streaming page source: lazy per-window rasterization, source-page map, directory input, page-failure skip; multi-page CLI moved onto it [uocr2,longdoc,pdf] (T3) — `bd-uocr2-epic-cgux.23`
+- **U2-D1a** — Windowed decoding core: planner, lookahead, retention, splice (incl. one-page variant), forced `<PAGE>`, fallback, stitching, page_base, worked coordinate table [uocr2,decoder,longdoc] (B4,B6) — `bd-uocr2-epic-cgux.24`
+- **U2-D1b** — Windowed document pipeline: streaming page source per window, raster dropping, once-per-page vision, recognize_document integration, W=10 default [uocr2,decoder,longdoc,pdf] (D0,E2,D1a) — `bd-uocr2-epic-cgux.49`
+- **U2-D2a** — Independent Python windowed oracle, written from the SGLang wheel source (not from the Rust implementation) [uocr2,conformance,longdoc,oracle] (A1,A6) — `bd-uocr2-epic-cgux.50`
+- **U2-D2b** — Windowed validation: splice parity W=2/3 vs the independent Python oracle, invariants, accuracy vs unwindowed [uocr2,conformance,longdoc] (D2a,D1a) — `bd-uocr2-epic-cgux.25`
+- **U2-D3** — Whole-process memory estimator, `--page-window auto`, RSS measurement [uocr2,longdoc,memory] (D1b) — `bd-uocr2-epic-cgux.26`
+- **U2-D4** — Durable resume: sidecar checkpoints, `.partial` output, resume key, byte-identical resume [uocr2,longdoc,storage] (D1b) — `bd-uocr2-epic-cgux.27`
+- **U2-D5** — Streaming UX: extended `page` event, new `window` event, progress/ETA, `--page-window`/`--max-page-tokens`/`--resume` flags [uocr2,cli,longdoc,robot] (D3,D4,E1,D1b) — `bd-uocr2-epic-cgux.28`
 
 **E — Product surface**
-- **U2-E1** — CLI and robot basics for v2: `--model` id aliases, crop-mode semantics, `focr models` row, `run_complete` fields, schema and surface-matrix rows [uocr2,cli,robot] (B6)
-- **U2-E2** — Library document API with streaming, window and resume options [uocr2,library] (D4,D5)
-- **U2-E3** — Multi-page structured output: per-page layout/figures/JSON from `<PAGE>` segmentation [uocr2,cli,postprocess] (B6)
-- **U2-E4** — Distribution: manifest entry, artifact parts, `focr pull unlimited-ocr-2`, install text, HF mirror coordination [uocr2,dist,release] (C4)
-- **U2-E5** — Evidence-gated per-mode default policy and flip [uocr2,policy] (C5,E4,A2,G2)
-- **U2-E6** — Documentation: README/AGENTS/CHANGELOG/plan/DISCREPANCIES/PERF_LEDGER [uocr2,docs] (E4,E5)
-- **U2-E7** — Health, doctor and triage awareness of v2 (sidecar hash checks, recommendations) [uocr2,cli,doctor] (E4)
+- **U2-E1** — CLI/robot basics for v2: id resolution with per-model version, crop-mode semantics, `focr models` row, model_id in outputs, schema/surface rows [uocr2,cli,robot] (B6) — `bd-uocr2-epic-cgux.29`
+- **U2-E2** — Library `recognize_document` replacing `recognize_multi_page*`; streaming sink; window/resume options; CLI built on it [uocr2,library] (B6,D0) — `bd-uocr2-epic-cgux.30`
+- **U2-E3** — Structured document output: per-page `pages[]`, layout, figures, split-spreads from token-level `<PAGE>` segmentation [uocr2,cli,postprocess] (B6,D0) — `bd-uocr2-epic-cgux.31`
+- **U2-E4** — Distribution: manifest entry, artifact parts, `focr pull unlimited-ocr-2`, tokenizer sidecar transaction, v1→v2 pull hints [uocr2,dist,release] (C4,E1) — `bd-uocr2-epic-cgux.32`
+- **U2-E5a** — Document/multi-page default policy (D17, D25) and flip if the gate passes [uocr2,policy] (A2,C5b,D4,D5,E3,E4,F1,T1b,T2) — `bd-uocr2-epic-cgux.33`
+- **U2-E5b** — Single-page default policy and flip if the gate passes [uocr2,policy] (C5a,E4,G2) — `bd-uocr2-epic-cgux.34`
+- **U2-E6a** — Docs for opt-in v2: README, AGENTS, CHANGELOG, DISCREPANCIES, PERF_LEDGER [uocr2,docs] (C5a,E1,E3,E4,F1) — `bd-uocr2-epic-cgux.35`
+- **U2-E6b** — Docs for books and defaults: long-document section, wall-time, limitations, migration table [uocr2,docs] (D4,D5,E5a,T1b) — `bd-uocr2-epic-cgux.36`
+- **U2-E7** — Health/doctor/triage awareness of v2 (multi-model health, sidecar checks, recommendations) [uocr2,cli,doctor] (E4) — `bd-uocr2-epic-cgux.37`
 
 **F — Performance**
-- **U2-F1** — Same-invocation v1 vs v2 baseline + FOCR_TIMING rows + PERF_LEDGER [uocr2,perf] (C2)
-- **U2-F2** — Exact SR-SWA levers: candidate-only scoring, incremental kbar, gathered layout, prefill parallelism [uocr2,perf,kernel] (F1)
-- **U2-F3** — Multi-page vision cost at 1024/page: measure + exact levers; once-per-page vision in windowed mode [uocr2,perf,vision] (F1,D1)
-- **U2-F4** — bf16 KV storage option (lossy, CER kill-switch) [uocr2,perf,memory] (D3,C4)
-- **U2-F5** — v2 continuous-batch spine for ocr-batch (backlog) [uocr2,perf,batch] (C4)
+- **U2-F1** — Same-invocation v1 vs v2 baseline + FOCR_TIMING rows + RSS + PERF_LEDGER [uocr2,perf] (A6,C2,C3) — `bd-uocr2-epic-cgux.38`
+- **U2-F2** — Exact SR-SWA levers: candidate-only scoring, incremental kbar, gathered layout, prefill parallelism, v2 chunked prefill [uocr2,kernel,perf] (F1) — `bd-uocr2-epic-cgux.39`
+- **U2-F3** — Document-mode vision cost at 1024/page: measure + exact levers; once-per-page vision in windows [uocr2,perf,vision] (F1,D1b) — `bd-uocr2-epic-cgux.40`
+- **U2-F4** — bf16 KV storage option (lossy, CER kill-switch) [uocr2,memory,perf] (C4,D3,D4) — `bd-uocr2-epic-cgux.41`
+- **U2-F5** — Cross-document batching of windows, byte-identical per document (backlog) [uocr2,batch,perf] (C4,D1b) — `bd-uocr2-epic-cgux.42`
 
-**G — Gundam single page**
-- **U2-G1** — Gundam v2 parity + certification (non-degenerate routing; int8 flip sensitivity) [uocr2,conformance,preprocess] (C2,C3,B7)
-- **U2-G2** — v2 single-page crop-mode decision (base vs gundam) by ground truth + CPU time [uocr2,eval] (G1,C5)
+**G — Gundam**
+- **U2-G1** — Gundam v2 parity + certification (selective routing; int8 flip sensitivity) [uocr2,conformance,preprocess] (B7,C2,C3,C4) — `bd-uocr2-epic-cgux.43`
+- **U2-G2** — v2 crop-mode decisions: single page (base vs gundam) and whether gundam document mode earns its CPU cost [uocr2,eval] (C5a,G1) — `bd-uocr2-epic-cgux.44`
 
-**T — Testing infrastructure**
-- **U2-T1** — Model-gated e2e script `scripts/uocr2_e2e.sh` with NDJSON logging, scenarios (a)–(i) [uocr2,test,e2e,logging] (E1,E3,D4,D5)
-- **U2-T2** — Concurrency watchdog for windowed v2 (many_pages_without_deadlock) [uocr2,test] (D1)
-- **U2-T3** — Property/metamorphic suite additions [uocr2,test] (B2,B6,D1)
-- **U2-T4** — v1 golden capture + non-regression gate in check.sh (before any shared refactor) [uocr2,test,conformance] ()
+**T — Tests**
+- **U2-T1a** — e2e script `scripts/uocr2_e2e.sh` with NDJSON logging, M2 scenarios [uocr2,e2e,logging,test] (A7,E1,E3,E4) — `bd-uocr2-epic-cgux.45`
+- **U2-T1b** — e2e book scenarios: windowed, resume, robot, skip, directory, ≥300 pages with RSS [uocr2,e2e,longdoc,test] (D3,D4,D5,T1a) — `bd-uocr2-epic-cgux.46`
+- **U2-T2** — Concurrency watchdog scenarios for windowed v2 documents [uocr2,test] (D4,D1b) — `bd-uocr2-epic-cgux.47`
 
 **H — Ecosystem**
-- **U2-H1** — iOS/WASM/site v2 lanes (int4 calibration, artifacts, catalog) (backlog) [uocr2,ios,wasm] (E4)
+- **U2-H1** — iOS/WASM/site v2 lanes (int4 calibration, artifacts, catalog, iOS multi-page API migration) (backlog) [uocr2,ios,wasm] (E2,E4) — `bd-uocr2-epic-cgux.48`
 
-**Related existing beads** (relation edges, not blockers):
-- bd-3jo6 (Model Zoo epic);
-- bd-3p8y and bd-aio5 (HF mirror);
-- bd-wp8.2.2 (robot schema golden);
-- bd-mgd3 (per-page progress telemetry);
-- bd-paom and bd-3gyt (PDF document walk).
+**Related existing beads.** These are relation edges, not blockers; see Appendix D.
 
 ---
 
@@ -1280,18 +1956,30 @@ needs, acceptance criteria, tests, logging requirements and rationale.
 
 | # | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|---|
-| R1 | Discrete routing makes parity fragile (gundam, fallback queries) | M | H | Base mode first, where selection is degenerate; routing-equality rung with margin diagnostics; tie-flip discrepancy class with a ceiling |
-| R2 | Reference stack drift (transformers 4.52.1 vs our 4.57.1) | H | M | Separate pinned venv; provenance checks (`check_oracle_provenance.py` extended) |
-| R3 | HF config quirks: the snapshot `_CKPT_SP`, the `DASH_STAGE0` env, `_PAGE_SCOPE_PREFILL` set only inside `infer` | M | H | Oracle only via `infer()`; the truth pack documents the snapshot values (§5.6) |
-| R4 | CPU vision cost at 1024 per page makes short multi-page slower than v1 | H | M | Honest perf ledger; per-mode gates treat cost as a budget; vision levers (F3) |
-| R5 | Memory for long documents (120 KiB per token in f32) | H | H | Windowing (D1), retirement (D3), bf16 KV (F4), memory estimator, `auto` window size |
-| R6 | Silent misload of v1 artifacts after a default change | M | H | A2 first, with tests that simulate a changed default |
-| R7 | The shared-decoder refactor perturbs v1 | M | H | T4 golden gate before B5; enum dispatch; no shared mutable state |
-| R8 | Windowed mode is approximate (Baidu's words) | M | M | Accuracy validation vs unwindowed and ground truth; W ≥ N degenerate equivalence; W user-tunable |
-| R9 | The windowed-mode reference only exists as a GPU SGLang wheel | H | L | Native semantics from the spec; invariants plus ground truth instead of byte parity; optional SGLang runs |
+| R1 | Discrete routing makes parity fragile (fallback queries, gundam) | M | H | f32 CPU oracle (D4); routing-equality rung that includes fallback queries; margin diagnostics; a tie-flip class with a ceiling |
+| R2 | Reference stack drift (transformers 4.52.1 vs v1's 4.57.1) | H | M | Separate pinned venv; extend `check_oracle_provenance.py` |
+| R3 | HF config quirks: the `_CKPT_SP` snapshot, the `DASH_STAGE0` env var, and `_PAGE_SCOPE_PREFILL` being set only inside `infer` | M | H | Run the oracle only via `infer()`; snapshot values are documented in §5.6 |
+| R4 | CPU vision cost at 1024 per page makes documents slower than v1 multi-page | H | M | Honest ledger; treat cost as a budget; F3 levers; v2 matches v1 per-page parsing, which is also 1024 |
+| R5 | Memory for long documents (120 KiB per token in f32) | H | H | Block retirement (D9), windowing, bf16 KV (F4), the estimator, `auto` W |
+| R6 | Silent misload of v1 artifacts after a default change | M | H | A2 lands first; a test-only registry with v2 as default |
+| R7 | The shared-decoder refactor perturbs v1 | M | H | T3 token-id goldens before B5; enum dispatch; the shared `prefill_attention` stays untouched |
+| R8 | Windowed mode is approximate (Baidu's word) | M | M | Splice parity against a Python oracle; accuracy vs unwindowed and vs ground truth; W tunable |
+| R9 | The windowed reference exists only as a GPU SGLang wheel | H | L | Independent Python windowed oracle on the HF model; an optional SGLang run |
 | R10 | Distribution blocked by the missing HF org (bd-3p8y) | H | L | GitHub release parts are primary |
-| R11 | License ambiguity (no LICENSE in the HF v2 repo) | L | M | Use the GitHub LICENSE text and HF metadata; record both in the truth pack and the artifact notice |
-| R12 | Process ceremony crowding out shipping (suite reward-hacking patterns) | M | M | Every bead closes on cited evidence (tests, fixture diffs, ledger rows); no spec-only "progress" beads beyond A1 |
+| R11 | License ambiguity (no LICENSE file in the HF v2 repo) | L | M | Use the GitHub LICENSE text and the HF metadata; record both in the truth pack and the artifact notice |
+| R12 | Process ceremony crowding out shipping | M | M | Every bead closes on cited evidence; tests live in the beads that own them; no spec-only beads beyond A1 |
+| R13 | No CUDA host (the v1 bf16 oracle never ran here) | H | H | f32 CPU oracle as primary (D4); GPU only for the optional ledger |
+| R14 | Eager rasterization (plus a clone) exhausts RAM on books before KV matters | H | H | Streaming page source (U2-D0); RSS exit gate at M3 |
+| R15 | A v2 artifact silently runs v1 math through an unaudited lever or the unknown-id fallthrough | M | H | D18 fail-closed dispatch, with a per-lever test (U2-A7) |
+| R16 | Baidu built both ground-truth benchmarks, so the head-to-head may favor v2's training distribution | M | M | ≥ 1/3 non-Baidu documents (OQ-V2-15) |
+| R17 | Real book PDFs use JBIG2, JPX or vector content the PDF path refuses (bd-0a7) | H | M | Skip pages and keep the source map; directory input (D24); a follow-up decoder evaluation |
+| R18 | Book runs take hours on CPU (estimate: 4–17 h per 1,000 pages), exposed to sleep and throttling | H | M | Byte-identical resume, partial output, an ETA, honest docs |
+| R19 | A split default means two artifacts and possibly two resident daemons | M | M | Non-inferiority single-page gate; one-default end state (D25) |
+| R20 | Upstream fixes after the pin (the repo was 2 days old when pinned) | M | M | Pin; diff upstream at each milestone until M2; changes re-enter via A1 |
+| R21 | Streaming dies on CJK (the PageStream bug), and MarathonDocBench is half Chinese | H | M | U2-X1 plus token-id splitting (D20) |
+| R22 | The quant matcher int8s the router/indexer projections | M | H | Exact-name matcher; a test asserting 0 router tensors under every lever (D7) |
+| R23 | The global artifact version breaks v2 artifact resolution | H | M | Per-model version (D22) |
+| R24 | bd-pfui changes storage and runtime while D4 lands | M | M | Checkpoints are sidecar files, not RunStore blobs; the run store holds an index row only |
 
 ---
 
@@ -1299,20 +1987,138 @@ needs, acceptance criteria, tests, logging requirements and rationale.
 
 | ID | Question | Status | Resolution / owner |
 |---|---|---|---|
-| OQ-V2-1 | SR-SWA candidate semantics (prefill per-query own-page image blocks; decode `[bmin,bmax]` allow; fallback to all remote) | RESOLVED | §5.6.4 (`MD:108-123,339-348`, `MU:481-528`, `SB:2629-2737`) |
-| OQ-V2-2 | Exact router constants at inference (K=12, M=16, scale 128/√128, floor 1e-4, σ=1, head_cls) | RESOLVED | §5.6 (`MD:296-335`, config snapshot) |
-| OQ-V2-3 | Parity tolerance given reference bf16 prefill SDPA vs our f32 | OPEN | U2-A6 floor + U2-C1 |
-| OQ-V2-4 | Does HF v2 run on CPU (dense fallback) and reproduce GPU tokens? | OPEN | U2-A7 |
-| OQ-V2-5 | Are the `indexer.*` projections used at inference? | RESOLVED (no) | §5.6.7; keep in artifact (D8) |
-| OQ-V2-6 | 1-D RoPE fallback for marker-less inputs | RESOLVED (reject such inputs) | §5.5; v2 prompts always carry markers |
-| OQ-V2-7 | n-gram vs guard order hazard (HF can emit id 0) | RESOLVED (forced wins) | DISC-U2-2; assert on fixtures |
-| OQ-V2-8 | Tokenizer handling of non-special added tokens 128827–128830 | OPEN | U2-A4 conformance |
-| OQ-V2-9 | Windowed-mode accuracy vs unwindowed on long documents | OPEN | U2-D2 |
-| OQ-V2-10 | v2 single-page base vs gundam quality and cost | OPEN | U2-G2 |
-| OQ-V2-11 | Retire-on-advance is output-exact under the guard | OPEN (proof obligation) | U2-D3, §5.12 |
-| OQ-V2-12 | Licenses of ground-truth evaluation sets beyond MarathonDocBench (MPDocBench, OmniDocBench) for local evaluation | OPEN | U2-C5 |
-| OQ-V2-13 | Does the conservative int8 FFN recipe hold v2 CER within budget? | OPEN | U2-C4 |
-| OQ-V2-14 | Activated parameters (report: "A570M" in a figure vs 500M in text) | DEFERRED (docs only) | — |
+| OQ-V2-1 | SR-SWA candidate semantics | RESOLVED | §5.6.4 |
+| OQ-V2-2 | Router constants at inference | RESOLVED | §5.6 |
+| OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | OPEN | U2-A6 floor + U2-C1 |
+| OQ-V2-4 | Does HF v2 run in f32 on CPU (dense SDPA path), and is a ported dense fallback needed? | OPEN | U2-A6 step 1 |
+| OQ-V2-5 | Are the `indexer.*` projections used at inference? | RESOLVED (no) | §5.6.7, D8 |
+| OQ-V2-6 | 1-D RoPE fallback | RESOLVED (franken builds `<PAGE>` prompts; no fallback) | §5.5 |
+| OQ-V2-7 | n-gram vs guard order hazard | RESOLVED (the forced token wins) | DISC-U2-2 |
+| OQ-V2-8 | Tokenizer handling of non-special added tokens | PARTIAL: the splitter already handles them; conformance fixtures and the required-token check are pending | U2-A4, U2-A2 |
+| OQ-V2-9 | Windowed accuracy vs unwindowed | OPEN | U2-D2b |
+| OQ-V2-10 | v2 single-page base vs gundam | OPEN | U2-G2 |
+| OQ-V2-11 | Block-granular retirement is output-exact under the guard | OPEN (proof obligation; argued in §5.12) | U2-B4 |
+| OQ-V2-12 | Licenses of evaluation sets beyond MarathonDocBench (MPDocBench, OmniDocBench) | OPEN | U2-C5a |
+| OQ-V2-13 | Does the conservative int8 recipe hold v2 CER within budget? | OPEN | U2-C4 |
+| OQ-V2-14 | Document-mode crop mode: Baidu's long-document numbers are plausibly gundam (the SGLang default) | OPEN | U2-C5b, U2-G2 |
+| OQ-V2-15 | Non-Baidu ground-truth documents for the head-to-head (sources, licenses, normalization) | OPEN | U2-C5a |
+| OQ-V2-16 | Entmax domain for long documents (TopM vs AllCandidates) | OPEN | U2-C5b |
+
+---
+
+## 15. Review log
+
+**Round 1 (2026-10-28).** Three independent, fresh-context reviews ran as Claude Code subagents:
+- **Spec fidelity**, against the pinned Python and the SGLang wheel.
+- **Codebase grounding**, against the repo and the existing beads.
+- **Strategic**, using the planning-workflow review prompt.
+
+**Spec fidelity: integrated.**
+- **2 WRONG items:**
+  - row-level retire-on-advance, now block-granular (§5.12);
+  - the reference prefill numerics: Triton on GPU, dense on CPU (§5.7).
+- **Router and prompt details:**
+  - router input and dtype path (§5.6.1);
+  - prompt variants and fallback triggers (§5.1, §5.5);
+  - SGLang's gundam default (DISC-U2-6);
+  - SGLang τ bisection (§5.6.6).
+- **Decode-loop details:**
+  - decode-loop details (§5.9);
+  - extra-marker tok (DISC-U2-7);
+  - the decode query-page initial value and the seeding rule;
+  - the stateless-test precondition.
+- **Windowing:**
+  - the one-page splice variant;
+  - text-tail coordinates (§5.10.4);
+  - the exact fallback list (§5.10.5);
+  - stitching ownership (§5.10.8);
+  - window planning and capacity (§5.10.1, §5.10.7);
+  - the guard lag (DISC-U2-8).
+- **Numbers and citations:**
+  - the gundam token range (Appendix A);
+  - sizes in D8;
+  - citation fixes.
+
+I read the page_base parity rule directly from `unlimited_ocr_v2_backend.py:1001-1031` and
+`uocr_doc_reuse.py:109-121`.
+
+**Codebase grounding: integrated.**
+- **Identity and dispatch:**
+  - the full identity-hazard list (§6.1);
+  - the decoder path matrix and lever refusals (§6.2, D18).
+- **Weights, quant and tokenizer:**
+  - the recipe matcher (D7);
+  - I64 parsing (D8);
+  - tokenizer sidecar validation (D2);
+  - the global artifact version (D22);
+  - the single `.focrq` `source_sha256` (D16).
+- **Existing surfaces the plan had wrong:**
+  - the existing `page` event and `decode_contract()`;
+  - the generated-only n-gram domain (D10);
+  - `selftest` is not decoder evidence (§7.6);
+  - the watchdog has no multi-page scenario (§6.4);
+  - `--multi-page --json` returns `pages: []` (§6.6);
+  - RunStore is best-effort (D14).
+- **Related beads:** Appendix D.
+
+**Also noted.** bd-wp8.2.2 (the P0 robot-schema golden bug) appears stale.
+`tests/fixtures/robot_schema_v1.json` already lists `staff` and `music_warning`, and
+`tests/cli_robot_golden.rs:723-724` asserts them. Its owner should re-verify and close it; this plan
+does not depend on it.
+
+**Strategic: accepted P1–P16 and all honesty corrections, with these modifications.**
+- **P6** (windowed oracle): the Python oracle must be written from the wheel source by an author
+  other than the Rust implementer, so a misread §5.10 is not implemented twice.
+- **P7** (non-Baidu evidence): concrete ground-truth sources are named, and sourcing is an explicit
+  open question (OQ-V2-15) rather than an assumed input.
+- **P12** (book inputs): the pure-Rust JBIG2/JPEG 2000 decoder evaluation is left to bd-0a7's owners
+  as a linked follow-up. Candidate crates must be verified for maturity, license and no-FFI before
+  adoption.
+- **P13** (raw loads): confirmed against the code. v1 raw loads already hash nothing
+  (`source_sha256` is empty for safetensors), so v2 follows the same policy.
+
+**Round 2 (2026-10-28): bead polish.** After the plan was converted into 51 beads (epic
+`bd-uocr2-epic-cgux` plus 50 children), an independent read-only reviewer checked every bead against
+the code. It reported 33 findings, all integrated. Load-bearing claims were spot-verified in the
+tree first. The material corrections:
+- **Certified path (§6.2, D18).** The conservative artifact runs `generate_cached` →
+  `prefill_with_cache`/`decode_step_with_cache` with int8 FFN inside `DecoderWeightCache`
+  (`mod.rs:3736-3800`).
+  - The `_i8` cached path serves only the experimental full-int8 switch and WASM int4, so v2 refuses
+    it. U2-B5 is f32 cached plus stateless.
+  - `recognize_multi_page*` gained a refuse row (A7) and is routed to the v2 document loop (B6).
+- **Retirement inside windows (§5.10.9).** Unconstrained block retirement would free retention rows
+  (a), (b) and (d). U2-D1a now sets a pinned set, and retirement is suspended on guard-forced steps.
+  The regression case is W=8 window 0, marker row 1919.
+- **Never truncate silently (D11).**
+  - U2-B6 refuses unwindowed v2 documents over 60 pages with exit 2 until U2-D1b.
+  - A position-limit stop gives `finish_reason: "length"` and exit 5.
+  - Cancellation exits 6.
+  - U2-E4 also surfaces v1's existing silent clamp (`mod.rs:2779-2784`).
+- **Splits.**
+  - U2-D1 → D1a (windowed core: B4, B6) and D1b (pipeline: D1a, D0, E2; W=10 default; lifts the
+    60-page limit).
+  - U2-D2 → D2a (independent Python oracle; deps A1, A6 only, so it runs in parallel and cannot copy
+    the Rust code) and D2b (the parity gate).
+- **Gate shape (§7.3).** Per-page pass/fail with per-category Jeffreys/Hoeffding bounds per
+  RATCHET.md §4.2. Aggregate CER vs 0.193 is informational only.
+- **Ownership fixes.**
+  - X1 names `postprocess::PageStream`.
+  - E1 owns D25 and the mode-default table.
+  - E2 migrates the `focr-ios` call site.
+  - D4 owns stale-checkpoint reporting.
+  - A4 publishes pins only (A5 depends on it).
+  - C1 covers prefill rows only (decode steps are in C2).
+- **Dependency edges.**
+  - Added: E5a ← T1b, T2, E3, F1; E6a ← F1, C5a; E4 ← E1; F1 ← C3; F4 ← D4; G1 ← C4; H1 ← E2;
+    B6 ← A6; B7 ← A6, T3.
+  - D3, D4, D5, F3, F5 and T2 moved from D1 to D1b.
+  - §12 was regenerated from the live graph: 116 blocking edges; `br dep cycles` shows only the two
+    cycles that predate this plan.
+
+**Not yet done.** No GPT Pro or other non-Claude review round has run. The planning workflow
+recommends 4–5 rounds with GPT Pro Extended Reasoning. The exact prompt is in the planning-workflow
+skill ("Carefully review this entire plan…"); paste this file after it.
 
 ---
 
@@ -1321,9 +2127,15 @@ needs, acceptance criteria, tests, logging requirements and rationale.
 | Mode | Image tokens per page | Prompt tokens per page incl. `<PAGE>` |
 |---|---|---|
 | Base 1024 | 273 | 274 |
-| Gundam 2×2 tiles | 273 + (21)·20 = 693 | 694 |
-| Gundam 4×4 tiles (max 16) | 273 + (41)·40 = 1,913 | 1,914 |
+| Gundam 2×1 (minimum tiled) | 273 + (21)·10 = 483 | 484 |
+| Gundam 1×2 | 273 + (11)·20 = 493 | 494 |
+| Gundam 2×2 | 273 + (21)·20 = 693 | 694 |
+| Gundam 4×4 | 273 + (41)·40 = 1,913 | 1,914 |
+| Gundam 1×16 (maximum) | 273 + (11)·160 = 2,033 | 2,034 |
 | v1 multi-page (640 squash) | 111 | 111 (+ separator handling per v1) |
+
+Base markers sit at positions 1 + 274·p (p 0-based), and 274 ≡ 18 (mod 32), so page boundaries are
+never block-aligned (§5.12).
 
 ## Appendix B — v2 source-file SHA-256 (commit 5632329a)
 
@@ -1347,22 +2159,47 @@ model.safetensors.index.json  dc60a31ecb77eb03e166345d18cbe25bc71d2a19cc6fc089d8
 Unlimited-OCR-2.pdf           1eb5885f4ddfa4ec6fbff375092377f30b5d6a5e034ec4936213f125bf2f9444
 ```
 
-## Appendix C — Code locations touched (v1 baseline, for implementers)
+## Appendix C — Code locations touched (current tree, 2026-10-28)
 
-| Area | Current location |
+| Area | Location |
 |---|---|
-| Decoder constants | `src/native_engine/decoder.rs:82-109` (incl. `ROPE_THETA` at :98; RoPE table at :157-238) |
+| Decoder constants and RoPE | `src/native_engine/decoder.rs:82-109` (`ROPE_THETA` :98; RoPE table :157-238) |
+| Decoder paths | `decoder.rs`: `prefill_attention` :577 (shared with `decoder_qwen2.rs:1266,1270`); stateless `forward` :699; `DecoderWeightCache` :812; `chunk_prefill_attention` :1198; `prefill_with_cache` :1272/:1287; `decode_step_with_cache` :1428-1502; `DecoderWeightCacheI8` :2326; `prefill_with_cache_i8` :2826/:2842; `decode_step_with_cache_i8` :2956; `batched_decode_step_i8*` :3211/:3243; `verify_forward*` :3495/:3575 |
 | MoE constants and router | `src/native_engine/moe.rs:53-76,118-120,482-500` |
 | R-SWA cache and attention | `src/native_engine/rswa.rs:46-50,180-219,484-624,997-1007` |
-| Decode step | `src/native_engine/decoder.rs:1428-1502` |
-| Multi-page path | `src/native_engine/mod.rs:2602-2830`, `build_prompt_multi` at :4399-4419; 32K checks at :2750, :2783; `MULTI_PAGE_BASE_SIZE` 640 at :358 |
-| Sampler (n-gram, EOS, max_length) | `src/native_engine/sampler.rs:27-45,514-640` |
-| Postprocess (`<PAGE>`, PageStream) | `src/native_engine/postprocess.rs:38,497-560` |
-| Tokenizer specials | `src/tokenizer/mod.rs:86-119,489-532` |
-| Identity | `src/native_engine/weights.rs:60-110,1238`; `src/quant/focrq.rs:588-606`; `src/native_engine/model_arch.rs:143-257,545-571` |
-| Census | `src/native_engine/unlimited_ocr_census.rs:24-55,328-394`; `src/native_engine/unlimited_ocr_manifest.json` |
-| Convert and recipe | `src/quant/convert.rs:46,60,124`; `src/quant/recipe.rs:122-129,236`; `src/cli.rs:2350,2420` |
-| Distribution | `src/dist.rs:35,93-185,485-520`; `models/manifest-v2.json` |
-| Preprocessing | `src/preprocess/mod.rs:47-75,141-144,251-283,350-416` |
-| Oracle scripts | `scripts/gen_reference_fixtures.py:92-125`; `scripts/oracle_bridge.py`; `scripts/oracle_nondeterminism_floor.py`; `scripts/check_oracle_provenance.py` |
-| Truth pack | `docs/truth-pack/{OQ_INDEX.md,PINNED_SOURCES.md,SOURCE_HASHES.md,oq/*.md}` |
+| Generation loops and levers | `mod.rs`: `forward` :2105; `forward_dynamic` :2137; `ensure_arch_implemented` :2376; `forward_pre` :2394; `generate_cached` :3773; `generate_cached_i8` :3887; `spec_decode_i8` ~:4060; `generate_stateless` :4246; `PagePrefill` :1926; `recognize_batch_spine` :2983; `batch_scheduler.rs:43,440,487` |
+| Multi-page path | `mod.rs:2602-2830` (32K checks :2750-2783; PageStream :2802-2821); `build_prompt_multi` :4399-4419; `MULTI_PAGE_BASE_SIZE` 640 :358; `cli.rs:1821-1862` (`recognize_pdf_multi_page`, eager raster + clone); `cli.rs:1393` (refusals); `cli.rs:1912-1915` (`pages: []`); `lib.rs:282` (`stream_pages`); `lib.rs:705-785` |
+| Sampler | `src/native_engine/sampler.rs:27-45,514-640`; n-gram history includes prompt ids (`mod.rs` ~3829, ~3932) |
+| Postprocess | `src/native_engine/postprocess.rs:38,497-597` (`finalize_multi` keeps a non-blank leading chunk, GH #17) |
+| Tokenizer | `src/tokenizer/mod.rs:86-119,489-532`; sidecar `mod.rs:3268-3285` |
+| Identity | `weights.rs:60-110,174,197-205,898,1238,2086`; `focrq.rs:588-606`; `model_arch.rs:143-257,545-571`; `mod.rs:333,857,1025,1221-1231,1416-1473,1573,1699,2626,2663,2701,2851` |
+| Census | `src/native_engine/unlimited_ocr_census.rs:24-55,110,328-394`; `unlimited_ocr_manifest.json` |
+| Convert and recipe | `src/quant/convert.rs:46,60,124-178,181,254,292,392`; `src/quant/recipe.rs:122-129,195,236,332`; `cli.rs:686,2335,2350,2420` |
+| CLI surfaces | `cli.rs:34,130,230,349,1650,1686,2676-2680,2949,3036,3159,4108`; `robot.rs` (`EVENT_KINDS`, `page_decoded_event`, `page_skipped_event`); `doctor.rs:121`; `storage.rs:520` (RunStore, `FOCR_RUN_STORE`) |
+| Distribution | `src/dist.rs:35,93-185,485-520,~1103-1160`; `models/manifest-v2.json`; `lib.rs:74,89-96` |
+| Preprocessing | `src/preprocess/mod.rs:47-75` (`MAX_NUM` 32 :66), `141-144,251-283,350-416`; `connector.rs:403` (`fuse_no_crop`) |
+| Tests to extend | `tests/many_pages_without_deadlock.rs`; `tests/surface_matrix.rs`; `tests/cli_robot_golden.rs:723-724,768,1143,2141,2162`; `tests/fixtures/robot_schema_v1.json`; `parity_ladder.rs:130`; the spec/batched/chunked parity tests |
+| Oracle scripts | `scripts/gen_reference_fixtures.py:92-125,152-244,325`; `oracle_bridge.py`; `oracle_nondeterminism_floor.py`; `check_oracle_provenance.py`; `tests/fixtures/PROVENANCE.md` |
+| Other targets | `focr-ios/src/lib.rs:394,494,1152`; `ios/Sources/{LabView.swift:453,768, ModelStore.swift:106}`; `site/model-manifest.js:44`; `site/functions/model/[[path]].js:35`; `focr-wasm/src/lib.rs` |
+
+## Appendix D — Related existing beads
+
+| Bead | Status | Relation |
+|---|---|---|
+| bd-3jo6 Model Zoo epic | open | The U2 epic is a zoo addition (related) |
+| bd-3gyt consolidate PDF page walks | open | U2-D0 implements the multi-page part on `pdf::walk_document` |
+| bd-paom `recognize_pdf` | open | U2-E2's per-page sibling over the same walk |
+| bd-pfui asupersync 0.5 storage/RunStore | in progress | U2-D4 avoids conflict by using sidecar checkpoints |
+| bd-2mo.30 hotspot campaign (vision statics cache) | in progress | U2-B5/F3 reuse the vision path; coordinate |
+| bd-2mo.28 int8/int4 KV | open | U2-F4's bf16 KV is the v2 analogue |
+| bd-wp8.2 (freeze robot schema), bd-wp8.3 (streaming transport), bd-znwm (ocr-batch streaming), bd-mgd3 (per-page progress) | open | U2-D5/E1 robot changes go through these |
+| bd-hfdt-admission-prereqs-dfr1, bd-json-per-span-text-wbbu, bd-v73v | open | U2-E3 structured output |
+| bd-0a7 / bd-0a7.4 native PDF and vector rasterization | open | Book inputs (D24); the decoder evaluation lives there |
+| bd-3p8y, bd-aio5, bd-we84, bd-b8cg (HF mirror); bd-jprb (atomic pull) | open | U2-E4 |
+| bd-3ryl task-vs-arch guard | open | U2-A7 is the v2 case |
+| bd-fuh2 resident daemon follow-ups | open | The daemon refuses v2 until its protocol carries the v2 flags |
+| bd-1azu.12 (shared-prefix KV), bd-1azu.34/38/40/41/44 (spec decode/spine), bd-1azu.55/56 (megakernel) | open | Levers that refuse v2 (D18) |
+| bd-5k7a iOS multi-page | in progress | U2-H1 |
+| bd-322.18 40+ page benchmark cells | open | U2-C5b evidence |
+| bd-10sb testing infrastructure epic | open | U2-T1a/T1b/T2/T3 |
+| bd-wp8.2.2 robot schema golden (P0) | open, appears stale | Not a dependency |
