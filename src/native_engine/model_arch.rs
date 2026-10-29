@@ -193,6 +193,25 @@ const UNLIMITED_OCR_V1_TOKENS: &[(u32, &str)] = &[
     (crate::tokenizer::special::ASSISTANT, "<|Assistant|>"),
 ];
 
+/// SHA-256 of the Unlimited-OCR-2 `tokenizer.json` (9,980,278 bytes): v1's file
+/// plus the four non-special added tokens `<PAGE>`, `<BLOCK>`, `<FORK>`,
+/// `<CHILD>` (ids 128827..=128830); every other section is byte-identical
+/// (U2-A4, `docs/truth-pack/oq/tokenizer.md`). U2-A5 wires it into the
+/// `unlimited-ocr-2` arch's `tokenizer_sha256()`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const UNLIMITED_OCR_V2_TOKENIZER_SHA256: &str =
+    "c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589";
+
+/// The added tokens the v2 prompt and page split depend on, as `(id, content)`.
+/// U2-A5 wires it into the `unlimited-ocr-2` arch's `required_token_ids()`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const UNLIMITED_OCR_V2_TOKENS: &[(u32, &str)] = &[
+    (crate::tokenizer::special::BOS, "<｜begin▁of▁sentence｜>"),
+    (crate::tokenizer::special::EOS, "<｜end▁of▁sentence｜>"),
+    (crate::tokenizer::special::IMAGE, "<image>"),
+    (crate::tokenizer::special::PAGE, "<PAGE>"),
+];
+
 /// A model-architecture descriptor — the foundation `ModelArch` of the zoo. A
 /// descriptor is pure metadata (no weights, no runtime); the forward dispatch is
 /// wired through it in later A-tasks. `Send + Sync` so a `&'static dyn ModelArch`

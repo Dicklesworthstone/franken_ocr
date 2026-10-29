@@ -24,6 +24,8 @@ fixture** (`_meta` blocks) — this file is the index, not the authority.
 | `moe_torch_2_10_cpu.json` | [R→C] | Pinned macOS arm64 Torch 2.10 CPU `topk(sorted=False)` and `[N,6,1280]` reduction oracle; file SHA256 `84fa230a314ee2722a256b07504f9b319c470e246cb50729d1f49db78a3d01a2` | `uv run --python 3.12 --with torch==2.10.0 python scripts/gen_moe_torch_2_10_cpu_fixture.py --check tests/fixtures/moe_torch_2_10_cpu.json`; use `--write` only for reviewed regeneration on the pinned host |
 | `tokenizer/corpus.txt` | [C] | Hand-curated conformance corpus (OQ-16) | Hand-edited only |
 | `tokenizer_baidu/expected.json` | [R→C] | `scripts/gen_token_id_fixtures.py` (pinned `LlamaTokenizerFast`, truth-pack commit) | Rerun the script; commit is a reviewed change |
+| `tokenizer/corpus_uocr2.txt` | [C] | Hand-curated Unlimited-OCR-2 cases (U2-A4): `<PAGE>` prompts, the four new added tokens, near misses, page-joined output | Hand-edited only |
+| `tokenizer_baidu/expected_uocr2.json` | [R→C] | `FOCR_BAIDU_MODEL=unlimited-ocr-2 scripts/gen_token_id_fixtures.py` over the pinned v2 `tokenizer.json` (`c55c165e…799c589`), in a minimal venv of Python 3.10.19 + `tokenizers==0.21.4` (the v2 reference stack's pin; transformers is not imported) | Rerun the script in that venv; commit is a reviewed change |
 | `tokenizer_got/` | [R→C] | `scripts/gen_got_token_id_fixtures.py` (pinned Qwen tiktoken) | Same |
 | `tokenizer_onechart/` | [R→C] | Part of `scripts/gen_reference_fixtures_onechart.py` (GPT-2 BPE ids) | Same |
 | `tokenizer_smolvlm2/` | [R→C] | `scripts/gen_smolvlm2_token_id_fixtures.py` | Same |
