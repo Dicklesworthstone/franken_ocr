@@ -33,8 +33,9 @@
 //! any [`BlockKv`], and the per-layer cache that stores K/V and index keys in
 //! 32-row blocks and frees whole blocks no later query can read (plan §5.12).
 
-use super::decoder::{RopeTable, apply_rope, linear_no_bias};
+use super::decoder::{RopeTable, apply_rope, config as decoder_config, linear_no_bias};
 use super::tensor::Mat;
+use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
 use crate::tokenizer::special;
 use rayon::prelude::*;
@@ -486,6 +487,34 @@ impl SrSwaLayerWeights {
             head_cls,
             hidden,
         })
+    }
+
+    /// Layer `layer`'s `self_attn.dash_router.*` from a checkpoint, widened
+    /// to f32 once (U2-B5).
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if a tensor is absent, [`FocrError::Other`]
+    /// on a shape mismatch.
+    pub fn load(weights: &Weights, layer: usize) -> FocrResult<Self> {
+        let p = format!("model.layers.{layer}.self_attn.dash_router");
+        Self::new(
+            decoder_config::HIDDEN_SIZE,
+            weights.mat(&format!("{p}.q_proj.weight"))?.data,
+            weights.mat(&format!("{p}.k_proj.weight"))?.data,
+            weights.vec(&format!("{p}.q_norm.weight"))?,
+            weights.vec(&format!("{p}.k_norm.weight"))?,
+            weights.vec(&format!("{p}.head_cls"))?,
+        )
+    }
+
+    /// Every layer's router weights ([`Self::load`]).
+    ///
+    /// # Errors
+    /// As [`Self::load`].
+    pub fn load_all(weights: &Weights) -> FocrResult<Vec<Self>> {
+        (0..decoder_config::NUM_HIDDEN_LAYERS)
+            .map(|layer| Self::load(weights, layer))
+            .collect()
     }
 }
 
@@ -1347,6 +1376,144 @@ pub fn attend_dense(
         }
     }
     Ok(out)
+}
+
+/// The switch for the dense oracle attention ([`attend_dense`]): bit-identical
+/// to [`attend`] and far slower, for diagnosis.
+pub const DENSE_ENV: &str = "FOCR_SRSWA_DENSE";
+
+/// Whether a [`DENSE_ENV`] value turns the dense attention on (a truthy value;
+/// unset is off).
+#[must_use]
+pub fn dense_enabled_for(value: Option<&str>) -> bool {
+    value.is_some_and(crate::quant::recipe::is_truthy)
+}
+
+/// [`DENSE_ENV`], read once per process.
+#[must_use]
+pub fn dense_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| dense_enabled_for(std::env::var(DENSE_ENV).ok().as_deref()))
+}
+
+/// [`attend`], or [`attend_dense`] when `dense`.
+///
+/// # Errors
+/// As [`attend`].
+pub fn attend_with(
+    q: &Mat,
+    q_pos: &[usize],
+    sel: &[BlockSelection],
+    kv: &(impl BlockKv + Sync),
+    dense: bool,
+) -> FocrResult<Mat> {
+    if dense {
+        attend_dense(q, q_pos, sel, kv)
+    } else {
+        attend(q, q_pos, sel, kv)
+    }
+}
+
+/// One layer's prefill routing (U2-B5): the router's index queries and keys
+/// for the rows of `normed` (the `input_layernorm` output), then each row's
+/// selection from an empty cache ([`prefill_routes`]). Returns the
+/// selections and the index keys, which the cache stores.
+///
+/// # Errors
+/// As [`project`] and [`prefill_routes`].
+pub fn prefill_selections(
+    normed: &Mat,
+    w: &SrSwaLayerWeights,
+    rope: &RopeTable,
+    coords: &PageCoords,
+    p: &RouterParams,
+    domain: EntmaxDomain,
+) -> FocrResult<(Vec<BlockSelection>, Mat)> {
+    let (iq, ik) = project(normed, w, rope)?;
+    let routes = prefill_routes(&iq, &ik, coords, &w.head_cls, p, domain)?;
+    Ok((routes.into_iter().map(BlockSelection::from).collect(), ik))
+}
+
+/// One v2 sequence's attention state between decode steps (U2-B5): each
+/// layer's cache, the page coordinates of the next fed token, and the
+/// routing settings, all fixed at prefill.
+#[derive(Debug, Clone)]
+pub struct SrSwaState {
+    /// Per layer, in order.
+    pub layers: Vec<SrSwaLayerCache>,
+    /// Advanced once per fed token.
+    pub page: DecodePageState,
+    /// The router's parameters.
+    pub params: RouterParams,
+    /// The entmax the router runs.
+    pub domain: EntmaxDomain,
+    /// Whether attention runs [`attend_dense`].
+    pub dense: bool,
+}
+
+impl SrSwaState {
+    /// Empty caches for a sequence whose prompt has `coords`, with the
+    /// parity defaults ([`RouterParams::uocr2`], [`EntmaxDomain::TopM`]) and
+    /// [`dense_enabled`]. Block retirement stays off: it is safe only under
+    /// the page-count guard, which U2-B6 adds.
+    ///
+    /// # Errors
+    /// As [`SrSwaLayerCache::new`].
+    pub fn new(
+        router: &[SrSwaLayerWeights],
+        coords: &PageCoords,
+        page_base: u32,
+    ) -> FocrResult<Self> {
+        Ok(Self {
+            layers: router
+                .iter()
+                .map(|w| SrSwaLayerCache::new(&w.head_cls, false))
+                .collect::<FocrResult<_>>()?,
+            page: DecodePageState::after_prompt(coords, page_base),
+            params: RouterParams::uocr2(),
+            domain: EntmaxDomain::TopM,
+            dense: dense_enabled(),
+        })
+    }
+
+    /// One decode step's attention in `layer`: index the new row, append its
+    /// K, V and index key (a generated row, so no image page), route it from
+    /// the cache, and attend. `normed` is the row's `input_layernorm` output,
+    /// `q`/`k` its RoPE'd projections and `v` its values, each one row; `rope`
+    /// is the row's page2d table and `query_page` its Page Gate page.
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] on a shape mismatch or when the retirement
+    /// detector fires (impossible while retirement is off).
+    // decode attention: the row's tensors plus its coordinates
+    #[allow(clippy::too_many_arguments)]
+    pub fn decode_layer(
+        &mut self,
+        layer: usize,
+        w: &SrSwaLayerWeights,
+        normed: &Mat,
+        q: &Mat,
+        k: &Mat,
+        v: &Mat,
+        rope: &RopeTable,
+        query_page: i32,
+    ) -> FocrResult<Mat> {
+        let (iq, ik) = project(normed, w, rope)?;
+        let cache = &mut self.layers[layer];
+        cache.append(k, v, &ik, &[-1])?;
+        let route = cache
+            .decode_route(iq.row(0), query_page, &self.params, self.domain, false)
+            .map_err(|e| FocrError::Other(anyhow::anyhow!("layer {layer}: {e}")))?;
+        let q_pos = cache.rows() - 1;
+        attend_with(
+            q,
+            &[q_pos],
+            &[BlockSelection::from(route.route)],
+            &*cache,
+            self.dense,
+        )
+    }
 }
 
 // ── Layer cache and block retirement (U2-B4) ────────────────────────────────
@@ -3827,5 +3994,225 @@ mod tests {
         cache.append(&k, &v, &ik, &[-1; 200]).unwrap();
         cache.retire_dead_blocks(0, 199, false).unwrap();
         let _ = cache.keys(0, 0);
+    }
+
+    // ── U2-B5: the decoder-facing layer state ──
+
+    fn bits(xs: &[f32]) -> Vec<u32> {
+        xs.iter().map(|x| x.to_bits()).collect()
+    }
+
+    fn row_range(m: &Mat, r: Range<usize>) -> Mat {
+        Mat::from_vec(
+            r.len(),
+            m.cols,
+            m.data[r.start * m.cols..r.end * m.cols].to_vec(),
+        )
+    }
+
+    /// One layer over a base prompt of one or two pages and generated text
+    /// with one `<PAGE>` marker per prompt page: the prompt prefill plus one
+    /// [`SrSwaState::decode_layer`] per row equals a prefill of every row,
+    /// bit for bit, on the gathered and the dense attention. The one-page
+    /// prompt (283 rows, M = 9) has a smaller router window than the longer
+    /// forward; the rows still agree because no candidate's entmax input is
+    /// near the −1e4 pads (plan §5.8), unlike
+    /// [`prefill_window_is_set_by_the_forward_not_the_row`].
+    #[test]
+    fn state_decode_equals_a_reprefill_of_the_layer_bit_for_bit() {
+        for (pages, seed) in [(&[273][..], 0x5eed_0b05), (&[273, 273][..], 0x5eed_0b06)] {
+            state_decode_equals_a_reprefill(pages, seed);
+        }
+    }
+
+    fn state_decode_equals_a_reprefill(pages: &[usize], seed: u64) {
+        let mut rng = Lcg(seed);
+        let hidden = 64;
+        let w = SrSwaLayerWeights::new(
+            hidden,
+            random_mat(&mut rng, HEAD_DIM, hidden, 0.3).data,
+            random_mat(&mut rng, HEAD_DIM, hidden, 0.3).data,
+            (0..HEAD_DIM).map(|_| uniform(&mut rng, 0.5, 1.5)).collect(),
+            (0..HEAD_DIM).map(|_| uniform(&mut rng, 0.5, 1.5)).collect(),
+            random_head_cls(&mut rng),
+        )
+        .unwrap();
+        let prompt_ids = prompt(pages, 8);
+        let mut generated = vec![TEXT; 30];
+        for _ in pages {
+            generated.push(PG);
+            generated.extend(std::iter::repeat_n(TEXT, 25));
+        }
+        let all: Vec<u32> = prompt_ids.iter().chain(&generated).copied().collect();
+        let (n, s) = (prompt_ids.len(), all.len());
+        assert_eq!(n, 9 + 274 * pages.len(), "{pages:?}");
+        let width = NUM_HEADS * HEAD_DIM;
+        let normed = random_mat(&mut rng, s, hidden, 1.0);
+        let q = random_mat(&mut rng, s, width, 1.0);
+        let (k, v, _) = random_rows(&mut rng, s);
+        let positions: Vec<usize> = (0..s).collect();
+
+        // Every row in one prefill.
+        let coords = PageCoords::build(&all).unwrap();
+        let p = RouterParams::uocr2();
+        let rope = coords.rope_table(0);
+        let (sel, ik) =
+            prefill_selections(&normed, &w, &rope, &coords, &p, EntmaxDomain::TopM).unwrap();
+        let mut whole = SrSwaLayerCache::new(&w.head_cls, false).unwrap();
+        whole.append(&k, &v, &ik, &coords.img_page).unwrap();
+        let want = attend(&q, &positions, &sel, &whole).unwrap();
+        assert_eq!(
+            bits(
+                &attend_with(&q, &positions, &sel, &whole, true)
+                    .unwrap()
+                    .data
+            ),
+            bits(&want.data),
+            "the dense prefill"
+        );
+        // Some generated rows read remote blocks, so routing is exercised.
+        assert!(sel[n..].iter().any(|s| !s.blocks.is_empty()));
+
+        // The prompt prefill, then one decode step per generated row.
+        let pc = PageCoords::build(&prompt_ids).unwrap();
+        let mut state = SrSwaState::new(std::slice::from_ref(&w), &pc, 0).unwrap();
+        assert!(!state.dense, "FOCR_SRSWA_DENSE is unset in tests");
+        let (psel, pik) = prefill_selections(
+            &row_range(&normed, 0..n),
+            &w,
+            &pc.rope_table(0),
+            &pc,
+            &state.params,
+            state.domain,
+        )
+        .unwrap();
+        state.layers[0]
+            .append(
+                &row_range(&k, 0..n),
+                &row_range(&v, 0..n),
+                &pik,
+                &pc.img_page,
+            )
+            .unwrap();
+        let got = attend(
+            &row_range(&q, 0..n),
+            &positions[..n],
+            &psel,
+            &state.layers[0],
+        )
+        .unwrap();
+        assert_eq!(
+            bits(&got.data),
+            bits(&want.data[..n * width]),
+            "prompt rows"
+        );
+        let mut dense = state.clone();
+        dense.dense = true;
+        for (i, &id) in generated.iter().enumerate() {
+            let r = n + i;
+            let coord = state.page.feed(id);
+            assert_eq!(
+                (coord.bucket, coord.tok_pos, coord.query_page),
+                (coords.bucket[r], coords.tok_pos[r], coords.query_page[r]),
+                "row {r} coordinates"
+            );
+            let rope = page2d_rope_table(&[coord.tok_pos], &[coord.rope_page]);
+            let one = |m: &Mat| row_range(m, r..r + 1);
+            let out = state
+                .decode_layer(
+                    0,
+                    &w,
+                    &one(&normed),
+                    &one(&q),
+                    &one(&k),
+                    &one(&v),
+                    &rope,
+                    coord.query_page,
+                )
+                .unwrap();
+            assert_eq!(bits(&out.data), bits(want.row(r)), "row {r} (token {id})");
+            dense.page.feed(id);
+            let out = dense
+                .decode_layer(
+                    0,
+                    &w,
+                    &one(&normed),
+                    &one(&q),
+                    &one(&k),
+                    &one(&v),
+                    &rope,
+                    coord.query_page,
+                )
+                .unwrap();
+            assert_eq!(bits(&out.data), bits(want.row(r)), "dense row {r}");
+        }
+        assert_eq!(state.layers[0].rows(), s);
+    }
+
+    #[test]
+    fn dense_switch_reads_truthy_values_only() {
+        for (value, on) in [
+            (None, false),
+            (Some(""), false),
+            (Some("0"), false),
+            (Some("off"), false),
+            (Some("1"), true),
+            (Some("true"), true),
+            (Some("ON"), true),
+        ] {
+            assert_eq!(dense_enabled_for(value), on, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn router_weights_load_by_layer_and_refuse_a_missing_tensor() {
+        let hidden = decoder_config::HIDDEN_SIZE;
+        let p = "model.layers.3.self_attn.dash_router";
+        let proj: Vec<f32> = (0..HEAD_DIM * hidden).map(|i| (i % 7) as f32).collect();
+        let mut tensors = vec![
+            (
+                format!("{p}.q_proj.weight"),
+                vec![HEAD_DIM, hidden],
+                proj.clone(),
+            ),
+            (
+                format!("{p}.k_proj.weight"),
+                vec![HEAD_DIM, hidden],
+                proj.clone(),
+            ),
+        ];
+        for name in ["q_norm.weight", "k_norm.weight", "head_cls"] {
+            tensors.push((format!("{p}.{name}"), vec![HEAD_DIM], vec![0.5; HEAD_DIM]));
+        }
+        // A raw F32 safetensors blob of exactly these tensors.
+        let (mut entries, mut payload) = (Vec::new(), Vec::new());
+        for (name, shape, data) in &tensors {
+            let beg = payload.len();
+            payload.extend(data.iter().flat_map(|x| x.to_le_bytes()));
+            entries.push(format!(
+                "\"{name}\":{{\"dtype\":\"F32\",\"shape\":{shape:?},\"data_offsets\":[{beg},{}]}}",
+                payload.len()
+            ));
+        }
+        let header = format!("{{{}}}", entries.join(","));
+        let mut blob = (header.len() as u64).to_le_bytes().to_vec();
+        blob.extend_from_slice(header.as_bytes());
+        blob.extend_from_slice(&payload);
+        let weights = Weights::from_bytes(blob).unwrap();
+        let w = SrSwaLayerWeights::load(&weights, 3).unwrap();
+        assert_eq!((w.hidden, w.q_proj.len()), (hidden, HEAD_DIM * hidden));
+        assert_eq!(w.k_proj, proj);
+        assert_eq!(w.head_cls, vec![0.5; HEAD_DIM]);
+        let missing = SrSwaLayerWeights::load(&weights, 4)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            missing.contains("model.layers.4.self_attn.dash_router"),
+            "{missing}"
+        );
+        assert!(
+            SrSwaLayerWeights::load_all(&weights).is_err(),
+            "layer 0 is absent"
+        );
     }
 }

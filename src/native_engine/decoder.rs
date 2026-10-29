@@ -41,6 +41,7 @@ use super::calib;
 use super::moe;
 use super::nn;
 use super::rswa::{self, BatchedRingCache, RingCache};
+use super::srswa;
 use super::tensor::{Mat, QInt4, QInt8, WeightLayout};
 use super::weights::{DType, Weights};
 use crate::error::{FocrError, FocrResult};
@@ -528,9 +529,10 @@ pub fn attn_output_proj(
 /// `h = x + o_proj(attn(rope(qkv(input_ln(x)))))`;
 /// `out = h + mlp(post_attention_ln(h))`.
 ///
-/// `attn_context` is a closure that runs the R-SWA attention kernel over the
-/// rope'd `(q, k, v)` and returns the pre-`o_proj` context `[seq,
-/// num_heads*head_dim]` — injected so this driver is testable against a pure
+/// `attn_context` is a closure that runs the attention kernel over the
+/// `input_layernorm` output and the rope'd `(q, k, v)` (in that order; the
+/// normed rows are the SR-SWA router's input, U2-B5) and returns the
+/// pre-`o_proj` context `[seq, num_heads*head_dim]` — injected so this driver is testable against a pure
 /// reference attention (and so the real ring-cache kernel
 /// [`crate::native_engine::rswa::attention`] plugs in at the call site without
 /// this function owning the per-layer cache). `mlp` is a closure that runs the
@@ -552,13 +554,13 @@ pub fn layer_forward<A, M>(
     mlp: M,
 ) -> FocrResult<Mat>
 where
-    A: FnOnce(&Mat, &Mat, &Mat) -> FocrResult<Mat>,
+    A: FnOnce(&Mat, &Mat, &Mat, &Mat) -> FocrResult<Mat>,
     M: FnOnce(&Mat) -> FocrResult<Mat>,
 {
     // --- attention sub-block ---
     let normed = nn::rms_norm(x, Some(lw.input_ln), eps)?;
     let (q, k, v) = qkv_with_rope(&normed, lw, rope, hidden, qkv_dim)?;
-    let context = attn_context(&q, &k, &v)?;
+    let context = attn_context(&normed, &q, &k, &v)?;
     let attn_out = attn_output_proj(&context, lw.o_proj, hidden, qkv_dim)?;
     let h = add_residual(x, &attn_out)?;
 
@@ -734,7 +736,90 @@ pub fn lm_head(weights: &Weights, hidden: &Mat) -> FocrResult<Mat> {
 /// [`FocrError::FormatMismatch`] on an absent tensor; [`FocrError::Other`] on a
 /// shape mismatch or kernel error (propagated from the sub-steps).
 pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
-    checked_mat_len("decoder::forward inputs_embeds", inputs_embeds)?;
+    check_embeds("decoder::forward", inputs_embeds)?;
+    let seq = inputs_embeds.rows;
+
+    // Absolute position_ids 0..seq ([SPEC-095]: true logical positions); one
+    // RoPE table shared across all 12 layers.
+    let positions: Vec<usize> = (0..seq).collect();
+    let rope = RopeTable::build(&positions, config::HEAD_DIM, config::ROPE_THETA);
+    forward_layers(weights, inputs_embeds, &rope, |_, _, q, k, v| {
+        prefill_attention(q, k, v, config::NUM_ATTENTION_HEADS, config::HEAD_DIM)
+    })
+}
+
+/// [`forward`] for Unlimited-OCR-2 (U2-B5): the same layers, with page2d RoPE
+/// from `coords` and SR-SWA attention routed by each layer's Token Sieve
+/// router, whose weights are read from `weights` per layer like the rest.
+/// `coords` describes the rows of `inputs_embeds` in an unwindowed run (page
+/// base 0). This is the stateless all-f32 path of the f32 oracle rungs
+/// (U2-C1/C2).
+///
+/// # Errors
+/// As [`forward`], or if `coords` does not describe one row per embedding.
+pub fn forward_srswa(
+    weights: &Weights,
+    inputs_embeds: &Mat,
+    coords: &srswa::PageCoords,
+) -> FocrResult<Mat> {
+    check_embeds("decoder::forward_srswa", inputs_embeds)?;
+    check_coords("decoder::forward_srswa", inputs_embeds, coords)?;
+    let rope = coords.rope_table(0);
+    let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
+    let params = srswa::RouterParams::uocr2();
+    let dense = srswa::dense_enabled();
+    forward_layers(weights, inputs_embeds, &rope, |layer, normed, q, k, v| {
+        let w = srswa::SrSwaLayerWeights::load(weights, layer)?;
+        let (sel, _) = srswa::prefill_selections(
+            normed,
+            &w,
+            &rope,
+            coords,
+            &params,
+            srswa::EntmaxDomain::TopM,
+        )?;
+        let kv = srswa::HeadMajorKv::from_rows(k, v)?;
+        srswa::attend_with(q, &positions, &sel, &kv, dense)
+    })
+}
+
+/// `inputs_embeds` is a well-formed `[seq, hidden]` matrix.
+fn check_embeds(context: &str, inputs_embeds: &Mat) -> FocrResult<()> {
+    checked_mat_len(&format!("{context} inputs_embeds"), inputs_embeds)?;
+    if inputs_embeds.cols != config::HIDDEN_SIZE {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: inputs_embeds cols {} != hidden {}",
+            inputs_embeds.cols,
+            config::HIDDEN_SIZE
+        )));
+    }
+    Ok(())
+}
+
+/// `coords` holds one row per row of `inputs_embeds`.
+fn check_coords(context: &str, inputs_embeds: &Mat, coords: &srswa::PageCoords) -> FocrResult<()> {
+    if coords.bucket.len() != inputs_embeds.rows {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: {} page coordinates for {} rows",
+            coords.bucket.len(),
+            inputs_embeds.rows
+        )));
+    }
+    Ok(())
+}
+
+/// The 12 decoder layers of the stateless [`forward`] over `inputs_embeds`
+/// with RoPE table `rope`. `attend(layer, normed, q, k, v)` is the layer's
+/// attention ([`layer_forward`]'s `attn_context`).
+fn forward_layers<A>(
+    weights: &Weights,
+    inputs_embeds: &Mat,
+    rope: &RopeTable,
+    mut attend: A,
+) -> FocrResult<Mat>
+where
+    A: FnMut(usize, &Mat, &Mat, &Mat, &Mat) -> FocrResult<Mat>,
+{
     let hidden = config::HIDDEN_SIZE;
     let qkv_dim = checked_shape_mul(
         "decoder::forward",
@@ -743,19 +828,6 @@ pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
         "num_heads*head_dim",
     )?;
     let eps = config::RMS_NORM_EPS;
-    if inputs_embeds.cols != hidden {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "decoder::forward: inputs_embeds cols {} != hidden {hidden}",
-            inputs_embeds.cols
-        )));
-    }
-    let seq = inputs_embeds.rows;
-
-    // Absolute position_ids 0..seq ([SPEC-095]: true logical positions); one
-    // RoPE table shared across all 12 layers.
-    let positions: Vec<usize> = (0..seq).collect();
-    let rope = RopeTable::build(&positions, config::HEAD_DIM, config::ROPE_THETA);
-
     let mut x = inputs_embeds.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let prefix = format!("model.layers.{layer}");
@@ -784,11 +856,11 @@ pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
         x = layer_forward(
             &x,
             &lw,
-            &rope,
+            rope,
             hidden,
             qkv_dim,
             eps,
-            |q, k, v| prefill_attention(q, k, v, config::NUM_ATTENTION_HEADS, config::HEAD_DIM),
+            |normed, q, k, v| attend(layer, normed, q, k, v),
             |normed| {
                 if layer < config::FIRST_K_DENSE_REPLACE {
                     moe::dense_forward(weights, normed)
@@ -852,6 +924,9 @@ pub struct DecoderWeightCache {
     final_norm: Vec<f32>,
     /// `lm_head.weight`, widened once to row-major f32 `[vocab, hidden]`.
     lm_head: Vec<f32>,
+    /// Unlimited-OCR-2's per-layer Token Sieve router weights, f32 (U2-B5);
+    /// `None` for v1.
+    router: Option<Vec<srswa::SrSwaLayerWeights>>,
 }
 
 /// One decoder layer's mixed-precision weights.
@@ -968,6 +1043,30 @@ impl DecoderWeightCache {
             layers,
             final_norm,
             lm_head,
+            router: None,
+        })
+    }
+
+    /// [`Self::build`] plus Unlimited-OCR-2's router weights, widened to f32
+    /// once like the attention projections (U2-B5).
+    ///
+    /// # Errors
+    /// As [`Self::build`], or if a router tensor is absent or mis-shaped.
+    pub fn build_srswa(weights: &Weights) -> FocrResult<Self> {
+        let mut cache = Self::build(weights)?;
+        cache.router = Some(srswa::SrSwaLayerWeights::load_all(weights)?);
+        Ok(cache)
+    }
+
+    /// The router weights, for a cache built by [`Self::build_srswa`].
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] for a v1 cache.
+    pub fn router(&self) -> FocrResult<&[srswa::SrSwaLayerWeights]> {
+        self.router.as_deref().ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "the decoder weight cache holds no SR-SWA router (built for v1)"
+            ))
         })
     }
 }
@@ -1413,21 +1512,92 @@ pub fn prefill_with_cache_chunked(
     let positions: Vec<usize> = (0..seq).collect();
     let rope = RopeTable::build(&positions, head_dim, config::ROPE_THETA);
 
+    // Intercept (k, v) to seed the ring cache's reference block before the
+    // prefill SDPA.
+    let x = prefill_layers(wc, inputs_embeds, &rope, |layer, _, q, k, v| {
+        let (kh, vh) = token_major_to_head_major(k, v, seq, num_heads, head_dim)?;
+        caches[layer].record_prefill(&kh, &vh, seq)?;
+        prefill_attention(q, k, v, num_heads, head_dim)
+    })?;
+    Ok((x, caches))
+}
+
+/// [`prefill_with_cache`] for Unlimited-OCR-2 (U2-B5): the same cached layers
+/// with page2d RoPE from `coords` and SR-SWA attention. Each layer routes
+/// every prompt row from an empty cache, stores the rows' K, V and index
+/// keys, and attends through that cache. Returns the final hidden `[seq,
+/// hidden]` and the state [`decode_step_with_cache_srswa`] continues from.
+/// `coords` describes the prompt rows of an unwindowed run (page base 0).
+///
+/// # Errors
+/// As [`prefill_with_cache`]; if `wc` holds no router ([`DecoderWeightCache::
+/// build_srswa`]) or `coords` does not describe one row per embedding; or
+/// under `FOCR_PREFILL_CHUNK`, whose chunked schedule is R-SWA only (U2-F2).
+pub fn prefill_with_cache_srswa(
+    wc: &DecoderWeightCache,
+    inputs_embeds: &Mat,
+    coords: &srswa::PageCoords,
+) -> FocrResult<(Mat, srswa::SrSwaState)> {
+    if prefill_chunk_size().is_some() {
+        return Err(FocrError::Usage(format!(
+            "{PREFILL_CHUNK_ENV} is not supported for unlimited-ocr-2: chunked prefill \
+             assumes R-SWA attention (until U2-F2); unset it"
+        )));
+    }
+    check_embeds("decoder::prefill_with_cache_srswa", inputs_embeds)?;
+    check_coords("decoder::prefill_with_cache_srswa", inputs_embeds, coords)?;
+    let router = wc.router()?;
+    let mut state = srswa::SrSwaState::new(router, coords, 0)?;
+    let rope = coords.rope_table(0);
+    let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
+    let x = prefill_layers(wc, inputs_embeds, &rope, |layer, normed, q, k, v| {
+        let (sel, ik) = srswa::prefill_selections(
+            normed,
+            &router[layer],
+            &rope,
+            coords,
+            &state.params,
+            state.domain,
+        )?;
+        let cache = &mut state.layers[layer];
+        cache.append(k, v, &ik, &coords.img_page)?;
+        srswa::attend_with(q, &positions, &sel, &*cache, state.dense)
+    })?;
+    Ok((x, state))
+}
+
+/// The 12 cached decoder layers of a monolithic prefill over `inputs_embeds`
+/// with RoPE table `rope`. `attend(layer, normed, q, k, v)` returns the
+/// layer's pre-`o_proj` context; it also captures whatever its cache keeps.
+fn prefill_layers<A>(
+    wc: &DecoderWeightCache,
+    inputs_embeds: &Mat,
+    rope: &RopeTable,
+    mut attend: A,
+) -> FocrResult<Mat>
+where
+    A: FnMut(usize, &Mat, &Mat, &Mat, &Mat) -> FocrResult<Mat>,
+{
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::prefill_with_cache",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
     let mut x = inputs_embeds.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
         let lw = cached_layer_weights(cl);
 
-        // Attention sub-block — mirrors `layer_forward`, but intercepts (k, v) to
-        // seed the ring cache's reference block before the prefill SDPA.
+        // Attention sub-block — mirrors `layer_forward`.
         let normed = nn::rms_norm(&x, Some(lw.input_ln), eps)?;
         if calib::enabled() {
             calib::record_rows(&quant_calib::attn_in_key(layer), &normed.data, normed.cols);
         }
-        let (q, k, v) = qkv_with_rope(&normed, &lw, &rope, hidden, qkv_dim)?;
-        let (kh, vh) = token_major_to_head_major(&k, &v, seq, num_heads, head_dim)?;
-        caches[layer].record_prefill(&kh, &vh, seq)?;
-        let context = prefill_attention(&q, &k, &v, num_heads, head_dim)?;
+        let (q, k, v) = qkv_with_rope(&normed, &lw, rope, hidden, qkv_dim)?;
+        let context = attend(layer, &normed, &q, &k, &v)?;
         if calib::enabled() {
             calib::record_rows(&quant_calib::o_in_key(layer), &context.data, context.cols);
         }
@@ -1439,7 +1609,7 @@ pub fn prefill_with_cache_chunked(
         let mlp_out = cached_mlp(&cl.mlp, &normed2, calib::enabled().then_some(layer))?;
         x = add_residual(&h, &mlp_out)?;
     }
-    Ok((x, caches))
+    Ok(x)
 }
 
 /// One incremental decode step over the per-layer [`RingCache`]s
@@ -1468,21 +1638,7 @@ pub fn decode_step_with_cache(
     token_embed: &Mat,
     position: usize,
 ) -> FocrResult<Mat> {
-    let hidden = config::HIDDEN_SIZE;
-    let qkv_dim = checked_shape_mul(
-        "decoder::decode_step_with_cache",
-        config::NUM_ATTENTION_HEADS,
-        config::HEAD_DIM,
-        "num_heads*head_dim",
-    )?;
-    let eps = config::RMS_NORM_EPS;
-    if token_embed.rows != 1 || token_embed.cols != hidden {
-        return Err(FocrError::Other(anyhow::anyhow!(
-            "decoder::decode_step_with_cache: token_embed shape [{}, {}] != [1, {hidden}]",
-            token_embed.rows,
-            token_embed.cols
-        )));
-    }
+    check_token_embed("decoder::decode_step_with_cache", token_embed)?;
     if caches.len() != config::NUM_HIDDEN_LAYERS {
         return Err(FocrError::Other(anyhow::anyhow!(
             "decoder::decode_step_with_cache: {} caches != {} layers",
@@ -1494,17 +1650,97 @@ pub fn decode_step_with_cache(
     // RoPE at the single TRUE absolute position (one row, one shared table).
     let rope = RopeTable::build(&[position], config::HEAD_DIM, config::ROPE_THETA);
 
+    // Push K/V into the ring (the query attends to itself as the newest ring
+    // token — OQ-3), then R-SWA decode attention over reference ++ ring. seq ==
+    // 1, so the token-major `[1, qkv_dim]` rows ARE the head-major `[num_heads,
+    // head_dim]` flats the ring kernels expect.
+    decode_layers(wc, token_embed, &rope, |layer, _, q, k, v| {
+        caches[layer].write_decode_step(&k.data, &v.data)?;
+        rswa::decode_attention(&caches[layer], &q.data)
+    })
+}
+
+/// [`decode_step_with_cache`] for Unlimited-OCR-2 (U2-B5): feeds `token_id`
+/// (whose embedding is `token_embed`) through the page state for its page2d
+/// RoPE and query page, then runs each layer's SR-SWA decode attention
+/// ([`srswa::SrSwaState::decode_layer`]) over the caches that
+/// [`prefill_with_cache_srswa`] seeded.
+///
+/// # Errors
+/// As [`decode_step_with_cache`], or if `wc` holds no router or `state` has
+/// the wrong layer count.
+pub fn decode_step_with_cache_srswa(
+    wc: &DecoderWeightCache,
+    state: &mut srswa::SrSwaState,
+    token_id: u32,
+    token_embed: &Mat,
+) -> FocrResult<Mat> {
+    check_token_embed("decoder::decode_step_with_cache_srswa", token_embed)?;
+    let router = wc.router()?;
+    if state.layers.len() != config::NUM_HIDDEN_LAYERS {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::decode_step_with_cache_srswa: {} caches != {} layers",
+            state.layers.len(),
+            config::NUM_HIDDEN_LAYERS
+        )));
+    }
+    let coord = state.page.feed(token_id);
+    let rope = srswa::page2d_rope_table(&[coord.tok_pos], &[coord.rope_page]);
+    decode_layers(wc, token_embed, &rope, |layer, normed, q, k, v| {
+        state.decode_layer(
+            layer,
+            &router[layer],
+            normed,
+            q,
+            k,
+            v,
+            &rope,
+            coord.query_page,
+        )
+    })
+}
+
+/// `token_embed` is one `[1, hidden]` row.
+fn check_token_embed(context: &str, token_embed: &Mat) -> FocrResult<()> {
+    if token_embed.rows != 1 || token_embed.cols != config::HIDDEN_SIZE {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{context}: token_embed shape [{}, {}] != [1, {}]",
+            token_embed.rows,
+            token_embed.cols,
+            config::HIDDEN_SIZE
+        )));
+    }
+    Ok(())
+}
+
+/// The 12 cached decoder layers of one decode step for the row `token_embed`
+/// with RoPE table `rope`. `attend(layer, normed, q, k, v)` stores the row in
+/// the layer's cache and returns its pre-`o_proj` context `[1, qkv_dim]`.
+fn decode_layers<A>(
+    wc: &DecoderWeightCache,
+    token_embed: &Mat,
+    rope: &RopeTable,
+    mut attend: A,
+) -> FocrResult<Mat>
+where
+    A: FnMut(usize, &Mat, &Mat, &Mat, &Mat) -> FocrResult<Mat>,
+{
+    let hidden = config::HIDDEN_SIZE;
+    let qkv_dim = checked_shape_mul(
+        "decoder::decode_step_with_cache",
+        config::NUM_ATTENTION_HEADS,
+        config::HEAD_DIM,
+        "num_heads*head_dim",
+    )?;
+    let eps = config::RMS_NORM_EPS;
     let profiling = prof::enabled();
     let mut x = token_embed.clone();
     for layer in 0..config::NUM_HIDDEN_LAYERS {
         let cl = &wc.layers[layer];
         let t_attn = profiling.then(Instant::now);
 
-        // Attention via the bespoke m=1 GEMV: project q/k/v, RoPE q/k at the true
-        // `position`, push K/V into the ring (the query attends to itself as the
-        // newest ring token — OQ-3), R-SWA decode attention over reference ++
-        // ring, then o_proj. seq == 1, so the token-major `[1, qkv_dim]` rows ARE
-        // the head-major `[num_heads, head_dim]` flats the ring kernels expect.
+        // Attention via the bespoke m=1 GEMV: project q/k/v, RoPE q/k, attend,
+        // then o_proj.
         let normed = nn::rms_norm(&x, Some(&cl.input_ln), eps)?;
         let nrow = normed.row(0);
         if calib::enabled() {
@@ -1512,11 +1748,10 @@ pub fn decode_step_with_cache(
         }
         let mut q = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.q_proj, qkv_dim, hidden));
         let mut k = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.k_proj, qkv_dim, hidden));
-        let v = gemv(nrow, &cl.v_proj, qkv_dim, hidden);
-        apply_rope(&mut q, &rope)?;
-        apply_rope(&mut k, &rope)?;
-        caches[layer].write_decode_step(&k.data, &v)?;
-        let context = rswa::decode_attention(&caches[layer], &q.data)?;
+        let v = Mat::from_vec(1, qkv_dim, gemv(nrow, &cl.v_proj, qkv_dim, hidden));
+        apply_rope(&mut q, rope)?;
+        apply_rope(&mut k, rope)?;
+        let context = attend(layer, &normed, &q, &k, &v)?;
         if calib::enabled() {
             calib::record_row(&quant_calib::o_in_key(layer), &context.data);
         }
@@ -5244,7 +5479,7 @@ mod tests {
             qkv_dim,
             1e-6,
             // attention returns zeros
-            |q, _k, _v| Ok(Mat::zeros(q.rows, q.cols)),
+            |_normed, q, _k, _v| Ok(Mat::zeros(q.rows, q.cols)),
             // mlp returns zeros
             |n| Ok(Mat::zeros(n.rows, n.cols)),
         )?;
@@ -5282,7 +5517,7 @@ mod tests {
             hidden,
             qkv_dim,
             1e-6,
-            |_q, _k, _v| Ok(Mat::from_vec(1, qkv_dim, vec![1.0, 1.0])),
+            |_normed, _q, _k, _v| Ok(Mat::from_vec(1, qkv_dim, vec![1.0, 1.0])),
             |_n| Ok(Mat::from_vec(1, hidden, vec![100.0, 100.0])),
         )?;
         // x + [1,1] + [100,100] = [111, 121]

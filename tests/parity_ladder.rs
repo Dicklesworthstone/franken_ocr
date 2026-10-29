@@ -201,7 +201,8 @@ fn load_subject_weights() -> Result<Weights, String> {
 
 /// Serializes the fixture+model-gated rungs. Each gated rung holds a full
 /// [`Weights`] load (~6.7 GB widened on access) and L4 additionally builds the
-/// f32 [`decoder::DecoderWeightCache`]; the default parallel test harness would
+/// conservative [`decoder::DecoderWeightCache`] (int8 FFN/expert matrices,
+/// f32 attention, router and `lm_head`); the default parallel test harness would
 /// otherwise run several of those at once and blow the memory budget. The lock
 /// is taken AFTER the gate check, so on a fixtureless box (every rung skips)
 /// there is zero contention. Poison is deliberately swallowed: a failed rung
@@ -807,7 +808,7 @@ fn compute_decode_captures(
 ) -> BTreeMap<String, Result<DecodeCapture, String>> {
     let mut out = BTreeMap::new();
     let goldens = loader.list_goldens().unwrap_or_default();
-    // The dominant costs (f32 decoder weight cache + embed table) are built
+    // The dominant costs (the conservative decoder weight cache + embed table) are built
     // ONCE for all goldens; a build failure is recorded per golden so every
     // consumer rung sees the same loud error.
     let shared = (|| -> Result<(decoder::DecoderWeightCache, Mat), String> {

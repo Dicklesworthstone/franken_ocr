@@ -244,6 +244,10 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             Ignored("speculative verify has no caller in any decode path"),
         ),
         lever(
+            "FOCR_SRSWA_DENSE",
+            Supported("the dense SR-SWA attention is bit-identical to the gathered one"),
+        ),
+        lever(
             "FOCR_SRSWA_RETIRE",
             Supported("SR-SWA block retirement frees only blocks no query can select"),
         ),
@@ -631,6 +635,7 @@ mod tests {
         ("FOCR_UNLIMITED_VISION_CACHE", "0", Expect::Silent),
         ("FOCR_MMAP", "1", Expect::Silent),
         ("FOCR_SRSWA_RETIRE", "0", Expect::Silent),
+        ("FOCR_SRSWA_DENSE", "1", Expect::Silent),
         ("FOCR_CALIB_OUT", "/tmp/calib", Expect::Silent),
         ("FOCR_SAM_ATTN_PROBE_RUNS", "3", Expect::Silent),
         ("FOCR_TEST_MAX_POSITIONS", "100", Expect::Silent),

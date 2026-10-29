@@ -2139,9 +2139,11 @@ fn forward_route(arch: &dyn model_arch::ModelArch) -> FocrResult<ForwardRoute> {
         (Decoder::DeepSeekV2MoeRswa, Some(UnlimitedVariant::V1Rswa)) => {
             Some(ForwardRoute::UnlimitedV1)
         }
+        // The SR-SWA decoder exists (U2-B5); the prompt and decode contract
+        // that drive it from an image do not yet.
         (Decoder::DeepSeekV2MoeSrSwa, Some(UnlimitedVariant::V2SrSwa)) => {
             return Err(FocrError::NotImplemented(format!(
-                "{} has no forward in this build (U2-B5); it never runs v1's R-SWA forward",
+                "{} has no forward in this build (U2-B6); it never runs v1's R-SWA forward",
                 arch.id()
             )));
         }
@@ -3801,10 +3803,18 @@ impl OcrModel {
 
     /// Build or fetch the conservative mixed-precision decoder cache. Unlike
     /// the legacy all-f32 cache, this keeps the 2,148 recipe FFN/expert matrices
-    /// in int8 storage, so it is practical to retain across pages.
+    /// in int8 storage, so it is practical to retain across pages. For
+    /// Unlimited-OCR-2 it also holds the f32 router weights (U2-B5).
     fn decoder_cache(&self) -> FocrResult<&decoder::DecoderWeightCache> {
         self.decoder_cache
-            .get_or_try_init(|| decoder::DecoderWeightCache::build(&self.weights))
+            .get_or_try_init(|| match self.arch().unlimited_variant() {
+                Some(model_arch::UnlimitedVariant::V2SrSwa) => {
+                    decoder::DecoderWeightCache::build_srswa(&self.weights)
+                }
+                Some(model_arch::UnlimitedVariant::V1Rswa) | None => {
+                    decoder::DecoderWeightCache::build(&self.weights)
+                }
+            })
     }
 
     /// The lazily-hydrated CLIP tower weights (bd-av64.10), built once per
@@ -4447,11 +4457,13 @@ impl OcrModel {
     /// reference block (the entire prefill) is never evicted; the generated tail
     /// rides a 128-slot ring, so memory and per-step cost are bounded.
     ///
-    /// Both prefill and decode run off a [`decoder::DecoderWeightCache`] built
-    /// once here — the decoder weights are dequantized to f32 a single time
-    /// instead of re-dequantizing ~10 GB of expert weights from the bf16 payload
-    /// every token (the dominant decode cost). No math changes, only the weight
-    /// source, so the output is identical to the `&Weights` path.
+    /// Both prefill and decode run off the conservative
+    /// [`decoder::DecoderWeightCache`], built once per model: the 2,148
+    /// FFN/expert matrices are int8 (quantized at build even from a raw bf16
+    /// source), and attention, the router and `lm_head` stay f32. That int8 FFN
+    /// is a real numeric difference from the all-f32 stateless path
+    /// ([`Self::generate_stateless`]); this is the path the certified
+    /// conservative artifact runs.
     ///
     /// # Errors
     /// As [`Self::generate`].
@@ -6826,7 +6838,7 @@ mod tests {
                 }
                 model_arch::UNLIMITED_OCR_V2_ID => {
                     let single = single.expect_err("v2 has no forward yet").to_string();
-                    assert!(single.contains("U2-B5") && single.contains("never runs v1"));
+                    assert!(single.contains("U2-B6") && single.contains("never runs v1"));
                     let multi = multi.expect_err("v2 has no document loop yet").to_string();
                     assert!(multi.contains("U2-B6") && multi.contains("never runs v1"));
                 }
@@ -6899,7 +6911,7 @@ mod tests {
         let image = || image::DynamicImage::new_rgb8(4, 4);
         let no_forward = |error: FocrError| {
             assert!(matches!(error, FocrError::NotImplemented(_)), "{error:?}");
-            assert!(error.to_string().contains("U2-B5"), "{error}");
+            assert!(error.to_string().contains("U2-B6"), "{error}");
         };
         no_forward(model.forward(missing).expect_err("forward"));
         no_forward(model.forward_dynamic(image()).expect_err("forward_dynamic"));
