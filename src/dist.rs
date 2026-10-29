@@ -1427,6 +1427,22 @@ mod tests {
                 );
                 continue;
             };
+            let published = manifest.model == arch.id() || manifest.models.contains_key(arch.id());
+            if let Some(source) = arch.tokenizer_source() {
+                // Not published yet: its refusals name the pinned upstream file.
+                assert!(
+                    !published,
+                    "`focr pull {}` publishes it; drop its tokenizer_source",
+                    arch.id()
+                );
+                assert!(
+                    source.starts_with("https://huggingface.co/")
+                        && source.ends_with("/tokenizer.json"),
+                    "{}: {source}",
+                    arch.id()
+                );
+                continue;
+            }
             let tokenizer = if manifest.model == arch.id() {
                 &manifest.tokenizer
             } else {

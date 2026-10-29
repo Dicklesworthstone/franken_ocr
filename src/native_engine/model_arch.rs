@@ -39,6 +39,9 @@ pub enum Decoder {
     /// DeepSeek-V2 MoE (64 routed + 2 shared experts, top-6) with R-SWA
     /// (Reference Sliding Window Attention, window 128) — the Baidu decoder.
     DeepSeekV2MoeRswa,
+    /// The same DeepSeek-V2 MoE with SR-SWA (routed sparse page-block
+    /// attention, page2d RoPE) — Unlimited-OCR-2. [planned: U2-B]
+    DeepSeekV2MoeSrSwa,
     /// Qwen2 dense (GOT-OCR2.0). [shared engine A7]
     Qwen2Dense,
     /// SmolLM2 / Llama-style dense (SmolVLM2). [A7]
@@ -145,6 +148,9 @@ impl QuantPolicy {
 /// another model.
 pub const UNLIMITED_OCR_V1_ID: &str = "unlimited-ocr";
 
+/// The id of Baidu Unlimited-OCR-2 (SR-SWA). Its artifacts always declare it.
+pub const UNLIMITED_OCR_V2_ID: &str = "unlimited-ocr-2";
+
 /// Which Unlimited-OCR generation an arch is. Forward routing matches on this
 /// exhaustively, so a new generation cannot fall through to another's kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,6 +167,9 @@ pub enum TensorCensus {
     /// The pinned 2,710-tensor Unlimited-OCR v1 shard
     /// (`unlimited_ocr_census`).
     UnlimitedOcrV1,
+    /// The pinned two-shard Unlimited-OCR-2 checkpoint: v1's census plus the
+    /// embedded 109-tensor delta (`unlimited_ocr_census`, plan D22).
+    UnlimitedOcrV2,
 }
 
 /// Exact recipe for the published GOT-OCR2 int8 artifact.
@@ -196,15 +205,11 @@ const UNLIMITED_OCR_V1_TOKENS: &[(u32, &str)] = &[
 /// SHA-256 of the Unlimited-OCR-2 `tokenizer.json` (9,980,278 bytes): v1's file
 /// plus the four non-special added tokens `<PAGE>`, `<BLOCK>`, `<FORK>`,
 /// `<CHILD>` (ids 128827..=128830); every other section is byte-identical
-/// (U2-A4, `docs/truth-pack/oq/tokenizer.md`). U2-A5 wires it into the
-/// `unlimited-ocr-2` arch's `tokenizer_sha256()`.
-#[cfg_attr(not(test), allow(dead_code))]
+/// (U2-A4, `docs/truth-pack/oq/tokenizer.md`).
 pub(crate) const UNLIMITED_OCR_V2_TOKENIZER_SHA256: &str =
     "c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589";
 
 /// The added tokens the v2 prompt and page split depend on, as `(id, content)`.
-/// U2-A5 wires it into the `unlimited-ocr-2` arch's `required_token_ids()`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const UNLIMITED_OCR_V2_TOKENS: &[(u32, &str)] = &[
     (crate::tokenizer::special::BOS, "<｜begin▁of▁sentence｜>"),
     (crate::tokenizer::special::EOS, "<｜end▁of▁sentence｜>"),
@@ -313,6 +318,12 @@ pub trait ModelArch: Send + Sync {
     fn required_token_ids(&self) -> &'static [(u32, &'static str)] {
         &[]
     }
+    /// Where the pinned `tokenizer.json` comes from when `focr pull` does not
+    /// publish this model yet; `None` once it does. A refused sidecar's
+    /// remediation names this source instead of `focr pull`.
+    fn tokenizer_source(&self) -> Option<&'static str> {
+        None
+    }
 }
 
 impl std::fmt::Debug for dyn ModelArch + '_ {
@@ -384,6 +395,82 @@ impl ModelArch for UnlimitedOcr {
 
 /// The one process-global Unlimited-OCR descriptor instance.
 static UNLIMITED_OCR: UnlimitedOcr = UnlimitedOcr;
+
+/// Baidu Unlimited-OCR-2: v1's vision tower and MoE decoder with SR-SWA
+/// attention and page2d RoPE. Registered so its checkpoints and artifacts are
+/// identified, census-checked and reported; `implemented()` stays false until
+/// its forward lands (U2-B6), and every inference path refuses it (U2-A7).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct UnlimitedOcr2;
+
+impl ModelArch for UnlimitedOcr2 {
+    fn id(&self) -> &'static str {
+        UNLIMITED_OCR_V2_ID
+    }
+    fn display_name(&self) -> &'static str {
+        "Baidu Unlimited-OCR-2"
+    }
+    fn license_notice(&self) -> &'static str {
+        // The GitHub LICENSE text; the HF v2 repo ships no LICENSE file.
+        "Baidu Unlimited-OCR-2 - Copyright (c) 2026 Baidu, MIT License"
+    }
+    fn default_artifact_basename(&self) -> &'static str {
+        "unlimited-ocr-2.focrq"
+    }
+    fn vision_encoder(&self) -> VisionEncoder {
+        VisionEncoder::SamClip
+    }
+    fn decoder(&self) -> Decoder {
+        Decoder::DeepSeekV2MoeSrSwa
+    }
+    fn tokenizer(&self) -> TokenizerKind {
+        TokenizerKind::DeepSeekBpe
+    }
+    fn decode_contract(&self) -> DecodeContract {
+        // The skeleton (plan D10): greedy, EOS 1, n-gram 35 over a 128 window
+        // for a single page. U2-B6 adds the document window, the page guard and
+        // the per-page cap.
+        DecodeContract {
+            temperature: 0.0,
+            eos_token_id: crate::tokenizer::special::EOS,
+            no_repeat_ngram_size: 35,
+            ngram_window: 128,
+        }
+    }
+    fn tasks(&self) -> &'static [Task] {
+        &[Task::Ocr]
+    }
+    fn implemented(&self) -> bool {
+        false
+    }
+    fn required_quant_recipe(&self, quant: &str) -> Option<&'static str> {
+        (quant == "int8").then_some(crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID)
+    }
+    fn unlimited_variant(&self) -> Option<UnlimitedVariant> {
+        Some(UnlimitedVariant::V2SrSwa)
+    }
+    fn tensor_census(&self) -> Option<TensorCensus> {
+        Some(TensorCensus::UnlimitedOcrV2)
+    }
+    fn artifact_version(&self) -> &'static str {
+        "0.1.0"
+    }
+    fn tokenizer_sha256(&self) -> Option<&'static str> {
+        Some(UNLIMITED_OCR_V2_TOKENIZER_SHA256)
+    }
+    fn required_token_ids(&self) -> &'static [(u32, &'static str)] {
+        UNLIMITED_OCR_V2_TOKENS
+    }
+    fn tokenizer_source(&self) -> Option<&'static str> {
+        Some(
+            "https://huggingface.co/baidu/Unlimited-OCR-2/blob/\
+             5632329a32e103d5f1add270681e0f5c1233c6e4/tokenizer.json",
+        )
+    }
+}
+
+/// The one process-global Unlimited-OCR-2 descriptor instance.
+static UNLIMITED_OCR_2: UnlimitedOcr2 = UnlimitedOcr2;
 
 /// A data-driven [`ModelArch`] for a PLANNED zoo model (epic bd-3jo6): described in
 /// the registry — so `focr models` shows the roadmap — but with `implemented()` =
@@ -679,12 +766,13 @@ static PIX2TEX: PlannedArch = PlannedArch {
     quant_recipes: &[],
 };
 
-/// The model registry, in priority order (the default + implemented first, then the
-/// planned zoo models). This is the single place models register. Today exactly one
-/// is IMPLEMENTED (Unlimited-OCR); the rest are planned descriptors (epic bd-3jo6)
-/// shown by `focr models` and upgraded to real impls as their sub-epics land.
+/// The model registry, in priority order (the default first, then its successor
+/// Unlimited-OCR-2, then the zoo). This is the single place models register.
+/// Planned descriptors (`implemented() == false`) are shown by `focr models` and
+/// upgraded as their sub-epics land.
 static REGISTRY: &[&dyn ModelArch] = &[
     &UNLIMITED_OCR,
+    &UNLIMITED_OCR_2,
     &GOT_OCR2,
     &SMOLVLM2,
     &ONECHART,
@@ -787,8 +875,8 @@ mod tests {
             implemented,
             ["got-ocr2", "onechart", "smolvlm2", "tromr", "unlimited-ocr"]
         );
-        // The remaining zoo models are present but NOT yet implemented (descriptors).
-        for id in ["trocr", "pix2tex"] {
+        // The remaining models are present but NOT yet implemented (descriptors).
+        for id in [UNLIMITED_OCR_V2_ID, "trocr", "pix2tex"] {
             let a = arch_by_id(id).unwrap_or_else(|| unreachable!("planned arch {id} registered"));
             assert!(!a.implemented(), "{id} is planned, not implemented");
         }
@@ -873,18 +961,88 @@ mod tests {
             "the v1 tokenizer has no <PAGE> token"
         );
         for arch in registry() {
+            if arch.unlimited_variant().is_some() {
+                continue;
+            }
             assert_eq!(
                 arch.artifact_version(),
                 crate::UNLIMITED_OCR_ARTIFACT_VERSION
             );
-            if arch.id() == UNLIMITED_OCR_V1_ID {
-                continue;
-            }
             assert_eq!(arch.unlimited_variant(), None, "{}", arch.id());
             assert_eq!(arch.tensor_census(), None, "{}", arch.id());
             assert_eq!(arch.tokenizer_sha256(), None, "{}", arch.id());
             assert!(arch.required_token_ids().is_empty(), "{}", arch.id());
+            assert_eq!(arch.tokenizer_source(), None, "{}", arch.id());
         }
+        assert_eq!(v1.artifact_version(), crate::UNLIMITED_OCR_ARTIFACT_VERSION);
+        assert_eq!(v1.tokenizer_source(), None, "focr pull publishes v1");
+    }
+
+    #[test]
+    fn unlimited_ocr_2_is_registered_with_its_capabilities_and_unimplemented() {
+        let v2 = arch_by_id(UNLIMITED_OCR_V2_ID).expect("unlimited-ocr-2 registered");
+        assert!(!v2.implemented(), "no forward until U2-B6");
+        assert_eq!(v2.display_name(), "Baidu Unlimited-OCR-2");
+        assert_eq!(v2.vision_encoder(), VisionEncoder::SamClip);
+        assert_eq!(v2.decoder(), Decoder::DeepSeekV2MoeSrSwa);
+        assert_eq!(v2.tokenizer(), TokenizerKind::DeepSeekBpe);
+        assert_eq!(v2.tasks(), &[Task::Ocr]);
+        assert!(v2.license_notice().contains("Copyright (c) 2026 Baidu"));
+        assert!(v2.license_notice().contains("MIT License"));
+        assert_ne!(
+            v2.license_notice(),
+            FOCR_MODEL_LICENSE_NOTICE,
+            "its own notice"
+        );
+        assert_eq!(v2.unlimited_variant(), Some(UnlimitedVariant::V2SrSwa));
+        assert_eq!(v2.tensor_census(), Some(TensorCensus::UnlimitedOcrV2));
+        assert_eq!(
+            v2.required_quant_recipe("int8"),
+            Some("unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1")
+        );
+        assert_eq!(v2.required_quant_recipe("int4"), None);
+        assert_eq!(v2.artifact_version(), "0.1.0");
+        assert_ne!(v2.artifact_version(), crate::UNLIMITED_OCR_ARTIFACT_VERSION);
+        assert_eq!(
+            v2.tokenizer_sha256(),
+            Some("c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589")
+        );
+        for required in [
+            (0, "<｜begin▁of▁sentence｜>"),
+            (1, "<｜end▁of▁sentence｜>"),
+            (128815, "<image>"),
+            (128827, "<PAGE>"),
+        ] {
+            assert!(v2.required_token_ids().contains(&required), "{required:?}");
+        }
+        let source = v2
+            .tokenizer_source()
+            .expect("v2 is not published by focr pull yet");
+        assert!(source.contains("baidu/Unlimited-OCR-2"), "{source}");
+        assert!(
+            source.contains("5632329a32e103d5f1add270681e0f5c1233c6e4"),
+            "{source}"
+        );
+        let c = v2.decode_contract();
+        assert_eq!(
+            (
+                c.temperature,
+                c.eos_token_id,
+                c.no_repeat_ngram_size,
+                c.ngram_window
+            ),
+            (0.0, 1, 35, 128)
+        );
+        assert_eq!(v2.default_artifact_basename(), "unlimited-ocr-2.focrq");
+        assert_eq!(v2.quant_policy(), QuantPolicy::DOCTRINE);
+        assert!(!v2.tie_word_embeddings());
+        assert!(!v2.lm_head_stored_int8());
+        assert_eq!(v2.vision_tower_prefix(), "model.sam_model");
+        assert_eq!(v2.decoder_layers_prefix(), "model.layers.");
+        assert_eq!(
+            arch_for_declared_id(UNLIMITED_OCR_V2_ID).map(ModelArch::id),
+            Some(UNLIMITED_OCR_V2_ID)
+        );
     }
 
     #[test]

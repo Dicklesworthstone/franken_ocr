@@ -2811,6 +2811,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "models": models,
             "guidance": {
                 "unlimited-ocr": "default runtime; FAST plain-text OCR; `focr pull` installs the conservative exact-recipe int8 artifact",
+                "unlimited-ocr-2": "planned: Baidu's long-document successor (SR-SWA); its raw checkpoint is identified and census-checked, but this build runs no forward for it — use unlimited-ocr",
                 "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text; shorthand: `focr ocr --task formula|tables|chart|molecular|geometry|music` (implies `--format`)"
             },
         }));
@@ -2818,7 +2819,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         // TASKS last: its width varies per model (GOT-OCR2 serves seven), so a
         // fixed-width column would misalign — keep it trailing.
         println!(
-            "{:<14}  {:<8}  {:<12}  {:<22}  TASKS",
+            "{:<16}  {:<8}  {:<12}  {:<22}  TASKS",
             "ID", "STATUS", "PULL", "MODEL"
         );
         for a in archs {
@@ -2845,7 +2846,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 "-".to_owned()
             };
             println!(
-                "{:<14}  {:<8}  {:<12}  {:<22}  {}",
+                "{:<16}  {:<8}  {:<12}  {:<22}  {}",
                 a.id(),
                 status,
                 pull,

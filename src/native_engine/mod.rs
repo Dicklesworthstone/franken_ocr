@@ -1309,12 +1309,18 @@ fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
+/// `<stem>.v<version>.<quant>.focrq`. Each model's artifacts carry its own
+/// release version (plan D22): a stem naming a registered model uses that
+/// model's version, and any other stem the default model's.
 fn versioned_quant_path(direct: &Path, quant: ModelQuantPreference) -> PathBuf {
-    direct.with_extension(format!(
-        "v{}.{}.focrq",
-        crate::UNLIMITED_OCR_ARTIFACT_VERSION,
-        quant.as_str()
-    ))
+    let version = direct
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(model_arch::arch_by_id)
+        .map_or(crate::UNLIMITED_OCR_ARTIFACT_VERSION, |arch| {
+            arch.artifact_version()
+        });
+    direct.with_extension(format!("v{version}.{}.focrq", quant.as_str()))
 }
 
 fn short_model_candidates(
@@ -1949,15 +1955,13 @@ fn validate_model_header_from_reader(
             .as_ref()
             .and_then(|manifest| manifest.quant_recipe.as_deref());
         validate_header_directory(&header.tensors, file_len - payload_base, header.arch_target)?;
-        match arch.tensor_census() {
-            Some(model_arch::TensorCensus::UnlimitedOcrV1) => {
-                unlimited_ocr_census::validate_focrq_header(
-                    &header.tensors,
-                    &header.source_sha256,
-                    declared_recipe,
-                )?;
-            }
-            None => {}
+        if let Some(census) = arch.tensor_census() {
+            unlimited_ocr_census::validate_focrq_header(
+                census,
+                &header.tensors,
+                &header.source_sha256,
+                declared_recipe,
+            )?;
         }
         validate_unlimited_ocr_quant_records(
             true,
@@ -2091,12 +2095,15 @@ fn checked_tokenizer(
     use sha2::Digest as _;
 
     let id = arch.id();
+    let remedy = match arch.tokenizer_source() {
+        Some(source) => format!("fetch the pinned file from {source}"),
+        None => format!("re-install its sidecars with `focr pull {id}`"),
+    };
     if let Some(expected) = arch.tokenizer_sha256() {
         let found = format!("{:x}", sha2::Sha256::digest(bytes));
         if found != expected {
             return Err(FocrError::FormatMismatch(format!(
-                "{origin} has sha256 {found}, but {id} requires {expected}; \
-                 re-install its sidecars with `focr pull {id}`"
+                "{origin} has sha256 {found}, but {id} requires {expected}; {remedy}"
             )));
         }
     }
@@ -2106,7 +2113,7 @@ fn checked_tokenizer(
         if found != Some(content) {
             return Err(FocrError::FormatMismatch(format!(
                 "{origin} maps token id {token_id} to {found:?}, but {id} requires {content:?}; \
-                 re-install its sidecars with `focr pull {id}`"
+                 {remedy}"
             )));
         }
     }
@@ -5439,6 +5446,57 @@ mod tests {
     }
 
     #[test]
+    fn resolve_model_names_each_models_artifacts_by_its_own_version() {
+        let v2 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V2_ID).expect("v2 registered");
+        assert_ne!(v2.artifact_version(), crate::UNLIMITED_OCR_ARTIFACT_VERSION);
+        let dir = temp_model_dir("resolve_per_model_version");
+        let v1_current = dir.join(format!(
+            "unlimited-ocr.v{}.int8.focrq",
+            crate::UNLIMITED_OCR_ARTIFACT_VERSION
+        ));
+        let v2_current = dir.join(format!(
+            "unlimited-ocr-2.v{}.int8.focrq",
+            v2.artifact_version()
+        ));
+        for path in [&v1_current, &v2_current] {
+            std::fs::write(path, weights::FOCRQ_MAGIC).expect("write model");
+        }
+        for (spec, expected) in [
+            ("unlimited-ocr", &v1_current),
+            ("models/unlimited-ocr.focrq", &v1_current),
+            ("unlimited-ocr-2", &v2_current),
+            ("models/unlimited-ocr-2.focrq", &v2_current),
+        ] {
+            let resolved =
+                resolve_model_from_search_dirs(Path::new(spec), std::slice::from_ref(&dir))
+                    .expect("spec resolves");
+            assert_eq!(&resolved, expected, "{spec}");
+        }
+        // v1's release version on a v2 name is no v2 release.
+        let misversioned = temp_model_dir("resolve_per_model_misversioned");
+        std::fs::write(
+            misversioned.join(format!(
+                "unlimited-ocr-2.v{}.int8.focrq",
+                crate::UNLIMITED_OCR_ARTIFACT_VERSION
+            )),
+            weights::FOCRQ_MAGIC,
+        )
+        .expect("write model");
+        let error = resolve_model_from_search_dirs(Path::new("unlimited-ocr-2"), &[misversioned])
+            .expect_err("a misversioned name is not a v2 release");
+        assert!(matches!(error, FocrError::ModelNotFound(_)), "{error}");
+
+        // A per-model subdirectory holding a sharded checkpoint resolves by
+        // the model's short name to its index.
+        let subdir = dir.join("unlimited-ocr-2");
+        std::fs::create_dir_all(&subdir).expect("model subdir");
+        std::fs::write(subdir.join(shards::SHARD_INDEX_NAME), b"{}").expect("write index");
+        let resolved = resolve_model_from_search_dirs(Path::new("unlimited-ocr-2"), &[dir])
+            .expect("the subdirectory resolves");
+        assert_eq!(resolved, subdir.join(shards::SHARD_INDEX_NAME));
+    }
+
+    #[test]
     fn resolve_model_prefers_exact_focrq_over_quant_variant() {
         // When BOTH a generic `unlimited-ocr.focrq` (e.g. from `focr convert`) and a
         // pulled `unlimited-ocr.int8.focrq` are present, the exact name wins.
@@ -6465,31 +6523,35 @@ mod tests {
         }
     }
 
-    /// The v2 vision `position_ids` rule as U2-A5's census will state it,
-    /// supplied by the test until then.
-    static V2_POSITION_IDS_RULE: [shards::Int64Rule; 1] = [shards::Int64Rule {
-        name: "model.vision_model.embeddings.position_ids",
-        shape: &[1, 257],
-        content: shards::Int64Content::Arange,
-    }];
+    /// One NDJSON log line of a model-gated v2 test (`scripts/check_test_logs.py`).
+    fn v2_gated_line(
+        test: &str,
+        started: std::time::Instant,
+        case: &str,
+        event: &str,
+        result: &str,
+        extra: serde_json::Value,
+    ) {
+        let mut object = serde_json::json!({
+            "schema_version": 1, "ts": started.elapsed().as_secs_f64(), "test": test,
+            "case": case, "run_seq": 0, "event": event, "result": result,
+        });
+        if let (Some(object), Some(extra)) = (object.as_object_mut(), extra.as_object()) {
+            object.extend(extra.clone());
+        }
+        println!("{object}");
+    }
 
-    /// Model-gated (U2-A3): `FOCR_UOCR2_SOURCE_DIR` names a directory holding
-    /// the real Unlimited-OCR-2 index and both shards, or header-only stand-ins
-    /// (real headers, sparse payloads). Skips with success when unset. Only
-    /// headers are read; the census and the shard pins are U2-A5's.
+    /// Model-gated (U2-A3, U2-A5): `FOCR_UOCR2_SOURCE_DIR` names a directory
+    /// holding the real Unlimited-OCR-2 index and both shards, or header-only
+    /// stand-ins (real headers, sparse payloads). Skips with success when
+    /// unset. Only headers are read, and they must pass the v2 census.
     #[test]
     fn real_v2_index_and_shard_headers_parse_through_the_resolver() {
         let test = "real_v2_index_and_shard_headers_parse_through_the_resolver";
         let started = std::time::Instant::now();
         let line = |case: &str, event: &str, result: &str, extra: serde_json::Value| {
-            let mut object = serde_json::json!({
-                "schema_version": 1, "ts": started.elapsed().as_secs_f64(), "test": test,
-                "case": case, "run_seq": 0, "event": event, "result": result,
-            });
-            if let (Some(object), Some(extra)) = (object.as_object_mut(), extra.as_object()) {
-                object.extend(extra.clone());
-            }
-            println!("{object}");
+            v2_gated_line(test, started, case, event, result, extra);
         };
         let Some(dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) else {
             line(
@@ -6530,10 +6592,11 @@ mod tests {
             ["model.vision_model.embeddings.position_ids"],
             "exactly one I64 tensor"
         );
-        shards::check_int64_entries(&merged.int64, &V2_POSITION_IDS_RULE, "unlimited-ocr-2")
-            .expect("the I64 tensor is the rule's");
-        shards::check_int64_rules_present(&merged.int64, &V2_POSITION_IDS_RULE, "unlimited-ocr-2")
-            .expect("the rule's tensor is present");
+        let arch = identify_checkpoint(&merged).expect("the headers pass the v2 census");
+        assert_eq!(arch.id(), model_arch::UNLIMITED_OCR_V2_ID);
+        let rules = shards::int64_rules(Some(arch));
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].name, "model.vision_model.embeddings.position_ids");
         line(
             "v2",
             "result",
@@ -6542,6 +6605,121 @@ mod tests {
                 "elapsed_us": started.elapsed().as_micros() as u64,
                 "tensors": merged.len(), "int64": merged.int64.len(),
                 "source_sha256": serde_json::Value::Null,
+            }),
+        );
+    }
+
+    /// Model-gated (U2-A5): `FOCR_UOCR2_SOURCE_DIR` names the real, complete
+    /// Unlimited-OCR-2 checkpoint (index, both shards, `tokenizer.json`).
+    /// Loads it raw through the production open path, re-hashes both shards
+    /// against the pins, and checks every vision tensor against the census's
+    /// identity hashes and, with `FOCR_MODEL_PATH` naming the v1 artifact,
+    /// against v1's bytes. Skips with success when unset.
+    #[test]
+    fn real_v2_checkpoint_loads_raw_and_matches_its_pins() {
+        let test = "real_v2_checkpoint_loads_raw_and_matches_its_pins";
+        let started = std::time::Instant::now();
+        let line = |case: &str, event: &str, result: &str, extra: serde_json::Value| {
+            v2_gated_line(test, started, case, event, result, extra);
+        };
+        let Some(dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) else {
+            line(
+                "v2",
+                "skip",
+                "skip_no_model",
+                serde_json::json!({"reason": "FOCR_UOCR2_SOURCE_DIR unset"}),
+            );
+            return;
+        };
+        let index = OcrModel::resolve_model(&dir).expect("the directory resolves");
+
+        let opened = load_weights_from_resolved_model(&index).expect("the raw v2 load succeeds");
+        assert_eq!(opened.arch.id(), model_arch::UNLIMITED_OCR_V2_ID);
+        assert_eq!(opened.weights.model_id(), model_arch::UNLIMITED_OCR_V2_ID);
+        assert!(!opened.weights.is_focrq());
+        assert_eq!(
+            opened.weights.len(),
+            2_818,
+            "2,819 less the verified I64 tensor"
+        );
+        assert!(
+            !opened
+                .weights
+                .contains("model.vision_model.embeddings.position_ids")
+        );
+        let tokenizer = opened.tokenizer.as_ref().expect("the pinned sidecar loads");
+        assert_eq!(
+            tokenizer.token_to_id("<PAGE>"),
+            Some(crate::tokenizer::special::PAGE)
+        );
+        line(
+            "raw_load",
+            "assert",
+            "pass",
+            serde_json::json!({
+                "assertion": "raw v2 load identifies unlimited-ocr-2 and passes its census",
+                "pass": true, "tensors": opened.weights.len(), "hashed": false,
+            }),
+        );
+
+        let digests = shards::hash_shards(&index).expect("hash both shards");
+        let pinned = unlimited_ocr_census::source_shards(model_arch::TensorCensus::UnlimitedOcrV2);
+        assert_eq!(digests.len(), pinned.len());
+        for (digest, (name, sha256)) in digests.iter().zip(pinned) {
+            let hex: String = digest.sha256.iter().map(|b| format!("{b:02x}")).collect();
+            assert_eq!((digest.name.as_str(), hex.as_str()), (*name, *sha256));
+            line(
+                name,
+                "assert",
+                "pass",
+                serde_json::json!({
+                    "assertion": "shard sha256 equals its pin",
+                    "pass": true, "bytes": digest.size, "hashed": true,
+                }),
+            );
+        }
+        let source: String = shards::source_sha256(&digests)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(source, unlimited_ocr_census::V2_SOURCE_SHA256);
+
+        let v1 = std::env::var_os("FOCR_MODEL_PATH")
+            .map(PathBuf::from)
+            .map(|path| load_weights_from_resolved_model(&path).expect("the v1 artifact loads"));
+        if let Some(v1) = &v1 {
+            assert_eq!(v1.weights.model_id(), model_arch::UNLIMITED_OCR_V1_ID);
+        }
+        let identity = unlimited_ocr_census::v2_vision_identity_sha256();
+        assert_eq!(identity.len(), 476);
+        for (name, expected) in identity {
+            use sha2::Digest as _;
+
+            let view = opened.weights.tensor(name).expect("vision tensor present");
+            let actual = format!("{:x}", sha2::Sha256::digest(view.data));
+            assert_eq!(&actual, expected, "{name}");
+            if let Some(v1) = &v1 {
+                let v1_view = v1.weights.tensor(name).expect("v1 has the vision tensor");
+                assert_eq!(v1_view.dtype, DType::BF16, "{name}");
+                assert!(v1_view.data == view.data, "{name} differs from v1");
+            }
+        }
+        line(
+            "vision_identity",
+            "assert",
+            "pass",
+            serde_json::json!({
+                "assertion": "476 vision tensors match the census hashes",
+                "pass": true, "compared_to_v1": v1.is_some(),
+            }),
+        );
+        line(
+            "v2",
+            "result",
+            "pass",
+            serde_json::json!({
+                "elapsed_us": started.elapsed().as_micros() as u64,
+                "source_sha256": source,
             }),
         );
     }
@@ -7172,6 +7350,17 @@ mod tests {
         };
         assert!(!pins_tokenizer(&unpinned));
         checked_tokenizer(&unpinned, other.as_bytes(), "t.json").expect("nothing pinned");
+
+        // A model `focr pull` does not publish names its pinned source instead.
+        let v2 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V2_ID).expect("v2 registered");
+        let message = checked_tokenizer(v2, bytes, "t.json")
+            .expect_err("not the v2 tokenizer")
+            .to_string();
+        assert!(
+            message.contains("huggingface.co/baidu/Unlimited-OCR-2/blob/"),
+            "{message}"
+        );
+        assert!(!message.contains("focr pull"), "{message}");
     }
 
     #[test]

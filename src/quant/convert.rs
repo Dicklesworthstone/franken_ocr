@@ -44,6 +44,12 @@ use crate::native_engine::weights::{DType, Weights};
 
 /// Frozen identifier stamped into Unlimited-OCR conservative int8 artifacts.
 pub const UNLIMITED_OCR_INT8_RECIPE_ID: &str = "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1";
+/// The conservative int8 recipe id for Unlimited-OCR-2 artifacts (U2-A5). The
+/// recipe contract itself — which tensors it quantizes and how a loader checks
+/// them — lands with the v2 artifact in U2-C3; until then a `.focrq` declaring
+/// it is refused.
+pub const UNLIMITED_OCR_2_INT8_RECIPE_ID: &str =
+    "unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1";
 
 /// Frozen identifier for the explicitly NON-DEFAULT wasm/browser Unlimited-OCR
 /// recipe (bd-4l71): routed + shared expert FFN and the dense layer-0 MLP stored
