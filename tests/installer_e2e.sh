@@ -414,6 +414,7 @@ done
 
 if [ "$matrix_contract_ok" -eq 1 ]; then
   if ! grep -Fxq 'src/native_engine/unlimited_ocr_manifest.json text eol=lf' "$GITATTRIBUTES" ||
+    ! grep -Fxq 'src/native_engine/unlimited_ocr_2_manifest.json text eol=lf' "$GITATTRIBUTES" ||
     ! grep -Fxq 'models/manifest-v2.json text eol=lf' "$GITATTRIBUTES"; then
     bad "embedded release manifests are not protected from Windows CRLF translation"
     matrix_contract_ok=0

@@ -1,3 +1,4 @@
-# These manifests are embedded in release binaries; one has a pinned raw-byte hash.
+# These manifests are embedded in release binaries; the census files have pinned raw-byte hashes.
 src/native_engine/unlimited_ocr_manifest.json text eol=lf
+src/native_engine/unlimited_ocr_2_manifest.json text eol=lf
 models/manifest-v2.json text eol=lf
