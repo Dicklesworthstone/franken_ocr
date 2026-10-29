@@ -235,9 +235,11 @@ Model: `baidu/Unlimited-OCR-2` (pins in `docs/truth-pack/PINNED_SOURCES.md`).
   ones), and `skip_special_tokens=True` keeps them. The reference decodes model
   output with `skip_special_tokens=False` (`modeling_unlimitedocr.py:1201`) and
   splits pages on the `<PAGE>` text.
-- **Required ids** (`model_arch::UNLIMITED_OCR_V2_TOKENS`, wired into the
-  `unlimited-ocr-2` arch by U2-A5): BOS 0, EOS 1, `<image>` 128815, `<PAGE>`
-  128827. The v1 tokenizer has no `<PAGE>`, so a v1 sidecar fails this check.
+- **Required ids** (`model_arch::UNLIMITED_OCR_V2_TOKENS`, the `unlimited-ocr-2`
+  arch's `required_token_ids()` since U2-A5): BOS 0, EOS 1, `<image>` 128815,
+  `<PAGE>` 128827. The v1 tokenizer has no `<PAGE>`, so a v1 sidecar fails this
+  check. The arch also pins the sidecar's SHA-256; a refusal names the pinned
+  Hugging Face file, because `focr pull` does not publish v2 yet.
 
 Conformance evidence (2026-10-29):
 - Golden `tests/fixtures/tokenizer_baidu/expected_uocr2.json`: 227 cases (v1's

@@ -2525,7 +2525,7 @@ evidence-gated defaults [uocr2,epic].
 | OQ-V2-5 | Are the `indexer.*` projections used at inference? | RESOLVED (no) | §5.6.7, D8 |
 | OQ-V2-6 | 1-D RoPE fallback | RESOLVED (franken builds `<PAGE>` prompts; no fallback) | §5.5 |
 | OQ-V2-7 | n-gram vs guard order hazard | RESOLVED (the forced token wins) | DISC-U2-2 |
-| OQ-V2-8 | Tokenizer handling of non-special added tokens | PARTIAL: the splitter already handles them; conformance fixtures and the required-token check are pending | U2-A4 updates it; U2-A5 closes it once the required-token check is wired |
+| OQ-V2-8 | Tokenizer handling of non-special added tokens | RESOLVED: the splitter handles them (U2-A4's 227-case golden and fuzz), and the `unlimited-ocr-2` arch pins the sidecar and its required ids (U2-A5) | Closed by U2-A5 |
 | OQ-V2-9 | Windowed accuracy vs unwindowed | OPEN | U2-D2b |
 | OQ-V2-10 | v2 single-page base vs gundam | OPEN | U2-G2 |
 | OQ-V2-11 | Block-granular retirement is output-exact under the guard | RESOLVED (mechanism, 2026-10-29): retired and unretired synthetic S1–S3-shaped runs agree bit for bit; the detector passes only guard-forced open rows; pinned rows survive; fixture equality is U2-C2's | U2-B4 (`srswa.rs` cache tests) |
