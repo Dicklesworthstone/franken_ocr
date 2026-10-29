@@ -68,6 +68,17 @@ sections as they land.
     `--json` receipt gains `source_shards`. Single-file sources convert to the
     same bytes as before.
   - `--quant int4` refuses a multi-shard source.
+- **Unlimited-OCR-2 tokenizer conformance** (bead U2-A4). The v2 `tokenizer.json`
+  is v1's plus four non-special added tokens (`<PAGE>` 128827, `<BLOCK>`,
+  `<FORK>`, `<CHILD>` 128830).
+  - A 227-case golden from `tokenizers==0.21.4`
+    (`tests/fixtures/tokenizer_baidu/expected_uocr2.json`) holds encode, decode
+    and skip-special decode exact.
+  - Fuzz tests check that the added tokens never split and always round-trip.
+  - `scripts/gen_token_id_fixtures.py` takes `FOCR_BAIDU_MODEL=unlimited-ocr-2`.
+  - The v2 tokenizer SHA-256 and required ids are published for U2-A5 to
+    register.
+  - No runtime change: the tokenizer already split non-special added tokens.
 
 ### Fixed
 
