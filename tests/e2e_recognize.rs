@@ -789,12 +789,35 @@ fn multi_page_streaming_matches_terminal_assembly_when_armed() {
         return;
     };
 
-    let load = |p: &PathBuf| image::open(p).expect("tiny fixture decodes");
     let page_a = write_tiny_png();
     let page_b = write_tiny_png();
-    let engine = OcrEngine::new().expect("OcrEngine::new builds");
+    let (streamed, events, markers) = stream_against_plain(&model_path, &[page_a, page_b]);
+    log_line(
+        test,
+        case,
+        "result",
+        "pass",
+        &format!(
+            "streamed_pages={} markers={} markdown_bytes={} note=\"stream == terminal assembly\"",
+            events.len(),
+            markers,
+            streamed.len(),
+        ),
+    );
+}
 
-    // Streaming pass: collect (page, body) events.
+/// Run `pages` as one streamed and one plain multi-page pass and check the
+/// streaming invariants: the terminal assembly is byte-identical, there is one
+/// `page` event per terminal `<PAGE>` marker, pages arrive in order from 1, and
+/// the streamed bodies are the document's trimmed `<PAGE>` chunks (so they
+/// finalize to the terminal text). Returns the terminal text, the events and
+/// the marker count.
+fn stream_against_plain(
+    model_path: &Path,
+    pages: &[PathBuf],
+) -> (String, Vec<(usize, String)>, usize) {
+    let load = |p: &PathBuf| image::open(p).expect("page fixture decodes");
+    let engine = OcrEngine::new().expect("OcrEngine::new builds");
     let events: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink_events = events.clone();
@@ -806,21 +829,18 @@ fn multi_page_streaming_matches_terminal_assembly_when_armed() {
     });
     let streamed = engine
         .recognize_multi_page_dynamic_streaming_with_model(
-            &model_path,
-            vec![load(&page_a), load(&page_b)],
+            model_path,
+            pages.iter().map(load).collect(),
             sink,
         )
         .expect("streaming multi-page pass");
-
-    // Non-streaming pass over the SAME pages must assemble byte-identically.
     let plain = engine
-        .recognize_multi_page_dynamic_with_model(&model_path, vec![load(&page_a), load(&page_b)])
+        .recognize_multi_page_dynamic_with_model(model_path, pages.iter().map(load).collect())
         .expect("plain multi-page pass");
     assert_eq!(
         streamed, plain,
         "streaming must not change the terminal assembly"
     );
-
     let events = events.lock().expect("events mutex").clone();
     let markers = streamed.matches("<PAGE>").count();
     assert_eq!(
@@ -831,16 +851,64 @@ fn multi_page_streaming_matches_terminal_assembly_when_armed() {
     for (i, (page, _)) in events.iter().enumerate() {
         assert_eq!(*page, i + 1, "pages must stream in order from 1");
     }
+    let bodies: Vec<&str> = events.iter().map(|(_, body)| body.as_str()).collect();
+    let rebuilt = franken_ocr::native_engine::postprocess::finalize_multi(
+        &format!("<PAGE>{}", bodies.join("<PAGE>")),
+        pages.len(),
+    )
+    .expect("finalize the streamed bodies");
+    assert_eq!(
+        rebuilt, streamed,
+        "the streamed bodies must be the terminal text's <PAGE> chunks"
+    );
+    (streamed, events, markers)
+}
+
+/// U2-X1: Chinese text whose rarer characters the v1 tokenizer splits across
+/// byte tokens. Before the fix the first split character stopped every later
+/// `page` event; now the stream keeps up to the terminal marker count.
+#[test]
+fn multi_page_streaming_survives_split_cjk_characters_when_armed() {
+    let test = "multi_page_streaming_survives_split_cjk_characters_when_armed";
+    let case = "cjk_stream_two_pages";
+    let Some(model_path) = armed_present_model() else {
+        log_success(
+            test,
+            case,
+            &format!(
+                "CJK streaming e2e skipped: model not present or {REAL_MODEL_ARM_ENV} unarmed"
+            ),
+        );
+        return;
+    };
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cjk_stream");
+    let pages = vec![fixtures.join("page_1.png"), fixtures.join("page_2.png")];
+    let (streamed, events, markers) = stream_against_plain(&model_path, &pages);
+    // The run must really stream a split character. Before the fix one in any
+    // body lost that page's event (or the final flush), so the event count
+    // checked above would fall short of the markers.
+    let tok_path = model_path.with_file_name("tokenizer.json");
+    let tok = franken_ocr::tokenizer::Tokenizer::from_file(&tok_path)
+        .unwrap_or_else(|e| panic!("tokenizer beside the model ({}): {e}", tok_path.display()));
+    let is_split = |c: char| tok.encode(&c.to_string()).is_ok_and(|ids| ids.len() > 1);
+    let first_split_event = events
+        .iter()
+        .position(|(_, body)| body.chars().any(|c| !c.is_ascii() && is_split(c)))
+        .unwrap_or_else(|| panic!("no split CJK character was streamed: {events:?}"));
+    assert!(markers >= 2, "both pages must stream: {events:?}");
+    let split_chars: String = streamed
+        .chars()
+        .filter(|&c| !c.is_ascii() && is_split(c))
+        .collect();
     log_line(
         test,
         case,
         "result",
         "pass",
         &format!(
-            "streamed_pages={} markers={} markdown_bytes={} note=\"stream == terminal assembly\"",
-            events.len(),
-            markers,
-            streamed.len(),
+            "streamed_pages={} markers={markers} first_split_event={first_split_event} \
+             split_chars={split_chars:?}",
+            events.len()
         ),
     );
 }
@@ -1491,4 +1559,250 @@ fn tiny_png_fixture_is_structurally_valid() {
             png.len()
         ),
     );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// U2-X2: v1 honest reporting (`finish_reason`, `v1_truncated`), model-gated
+// and armed like the other real-forward branches. Inputs are corpus pages
+// (`FOCR_CORPUS_DIR`, default `~/.cache/franken_ocr/corpus/pages`).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The corpus pages, or `None` (skip-with-SUCCESS) when absent.
+fn corpus_pages(names: &[&str]) -> Option<Vec<PathBuf>> {
+    let dir = std::env::var_os("FOCR_CORPUS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".cache/franken_ocr/corpus/pages"))
+        })?;
+    let pages: Vec<PathBuf> = names.iter().map(|n| dir.join(n)).collect();
+    pages.iter().all(|p| p.is_file()).then_some(pages)
+}
+
+/// Run `focr` with extra environment.
+fn run_focr_env(bin: &Path, args: &[&str], envs: &[(&str, String)]) -> CliOut {
+    let mut command = Command::new(bin);
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let out = command
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin.display()));
+    CliOut {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// The armed model, binary and three corpus pages for the X2 cases.
+fn x2_inputs(test: &str) -> Option<(PathBuf, PathBuf, Vec<PathBuf>)> {
+    let Some(model) = armed_present_model() else {
+        log_line(
+            test,
+            "gate",
+            "skip",
+            "skip_no_model",
+            "reason=\"FOCR_E2E_REAL_MODEL unset or no model\"",
+        );
+        log_success(
+            test,
+            "gate",
+            "model-gated: arm with FOCR_E2E_REAL_MODEL=1 and a resolvable model",
+        );
+        return None;
+    };
+    let Some(bin) = focr_bin() else {
+        log_success(test, "gate", "no built focr binary");
+        return None;
+    };
+    let Some(pages) = corpus_pages(&["page_0009.png", "page_0014.png", "page_0019.png"]) else {
+        log_line(
+            test,
+            "gate",
+            "skip",
+            "skip_no_model",
+            "reason=\"corpus pages absent\"",
+        );
+        log_success(
+            test,
+            "gate",
+            "set FOCR_CORPUS_DIR to the 20-page corpus pages dir",
+        );
+        return None;
+    };
+    Some((model, bin, pages))
+}
+
+/// One `ocr-batch --multi-page --json` run over the three pages.
+fn batch_multi_page(
+    bin: &Path,
+    model: &Path,
+    pages: &[PathBuf],
+    envs: &[(&str, String)],
+) -> (CliOut, Option<serde_json::Value>) {
+    let mut args = vec!["ocr-batch", "--multi-page", "--json"];
+    let page_strs: Vec<String> = pages.iter().map(|p| p.display().to_string()).collect();
+    args.extend(page_strs.iter().map(String::as_str));
+    let mut envs = envs.to_vec();
+    envs.push(("FOCR_MODEL_PATH", model.display().to_string()));
+    envs.push(("FOCR_NO_RESIDENT", "1".to_string()));
+    let out = run_focr_env(bin, &args, &envs);
+    let value = out
+        .stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["command"] == "batch.multi_page");
+    (out, value)
+}
+
+fn warning_kinds(value: &serde_json::Value) -> Vec<String> {
+    value["warnings"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|w| w["kind"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The position clamp: a budget just past the 3-page prompt stops the decode
+/// early. Exit 0, `finish_reason: length`, a `v1_truncated` warning with
+/// cause `positions`, and its stderr line.
+#[test]
+fn v1_multi_page_clamp_reports_truncation_when_armed() {
+    const TEST: &str = "v1_multi_page_clamp_reports_truncation_when_armed";
+    let Some((model, bin, pages)) = x2_inputs(TEST) else {
+        return;
+    };
+    // Probe the prompt length: a 1-position budget fails with it in the message.
+    let (probe, _) = batch_multi_page(
+        &bin,
+        &model,
+        &pages,
+        &[("FOCR_TEST_MAX_POSITIONS", "1".into())],
+    );
+    let text = format!("{}{}", probe.stdout, probe.stderr);
+    let prompt_len: usize = text
+        .split("prefix is ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no prompt length in the over-budget error: {text}"));
+    let budget = prompt_len + 48;
+    let (out, value) = batch_multi_page(
+        &bin,
+        &model,
+        &pages,
+        &[("FOCR_TEST_MAX_POSITIONS", budget.to_string())],
+    );
+    let value = value.unwrap_or_else(|| panic!("no batch.multi_page object: {}", out.stdout));
+    assert_eq!(
+        out.code,
+        Some(0),
+        "v1 truncation keeps exit 0: {}",
+        out.stderr
+    );
+    assert_eq!(value["finish_reason"], "length");
+    let warning = &value["warnings"][0];
+    assert_eq!(warning["kind"], "v1_truncated", "{value}");
+    assert_eq!(warning["cause"], "positions");
+    assert_eq!(warning["expected"], 3);
+    let got = warning["got"].as_u64().expect("got");
+    assert!(got < 3, "{value}");
+    assert!(
+        out.stderr
+            .contains(&format!("[focr] warning: stopped after {got} of 3 pages")),
+        "{}",
+        out.stderr
+    );
+    log_line(
+        TEST,
+        "clamp",
+        "result",
+        "pass",
+        &format!(
+            "expected_pages=3 bodies={got} finish_reason=length warning_kinds={:?} exit_code=0 \
+             budget={budget} prompt_len={prompt_len}",
+            warning_kinds(&value)
+        ),
+    );
+}
+
+/// A user token cap below the clamp: the same kind with cause `user_cap`.
+#[test]
+fn v1_multi_page_user_cap_reports_truncation_when_armed() {
+    const TEST: &str = "v1_multi_page_user_cap_reports_truncation_when_armed";
+    let Some((model, bin, pages)) = x2_inputs(TEST) else {
+        return;
+    };
+    let (out, value) = batch_multi_page(
+        &bin,
+        &model,
+        &pages,
+        &[("FOCR_MAX_NEW_TOKENS", "24".into())],
+    );
+    let value = value.unwrap_or_else(|| panic!("no batch.multi_page object: {}", out.stdout));
+    assert_eq!(out.code, Some(0), "{}", out.stderr);
+    assert_eq!(value["finish_reason"], "length");
+    let warning = &value["warnings"][0];
+    assert_eq!(
+        (warning["kind"].as_str(), warning["cause"].as_str()),
+        (Some("v1_truncated"), Some("user_cap"))
+    );
+    assert_eq!(warning["recovery"], "raise `--max-length`");
+    log_line(
+        TEST,
+        "user_cap",
+        "result",
+        "pass",
+        &format!(
+            "expected_pages=3 bodies={} finish_reason=length warning_kinds={:?} exit_code=0",
+            warning["got"],
+            warning_kinds(&value)
+        ),
+    );
+}
+
+/// Single pages report `finish_reason` and never warn: `stop` at EOS,
+/// `length` under `--max-length`.
+#[test]
+fn v1_single_page_reports_finish_reason_when_armed() {
+    const TEST: &str = "v1_single_page_reports_finish_reason_when_armed";
+    let Some((model, bin, pages)) = x2_inputs(TEST) else {
+        return;
+    };
+    let page = pages[0].display().to_string();
+    for (case, extra, want) in [("healthy", None, "stop"), ("capped", Some("8"), "length")] {
+        let mut args = vec!["ocr", "--robot", page.as_str()];
+        if let Some(cap) = extra {
+            args.extend(["--max-length", cap]);
+        }
+        let out = run_focr_env(
+            &bin,
+            &args,
+            &[
+                ("FOCR_MODEL_PATH", model.display().to_string()),
+                ("FOCR_NO_RESIDENT", "1".into()),
+            ],
+        );
+        let complete = out
+            .stdout
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["event"] == "run_complete")
+            .unwrap_or_else(|| panic!("{case}: no run_complete: {}{}", out.stdout, out.stderr));
+        assert_eq!(out.code, Some(0), "{case}");
+        assert_eq!(complete["finish_reason"], want, "{case}");
+        assert!(complete.get("warnings").is_none(), "{case}: {complete}");
+        log_line(
+            TEST,
+            case,
+            "result",
+            "pass",
+            &format!("expected_pages=1 finish_reason={want} warning_kinds=[] exit_code=0"),
+        );
+    }
 }

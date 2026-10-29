@@ -29,6 +29,17 @@ done
 if [ "${1:-}" = "--verify" ]; then
   echo "Verifying against SOURCE_HASHES.md ..."
   HASHES="$(cd "$(dirname "$0")/.." && pwd)/docs/truth-pack/SOURCE_HASHES.md"
-  awk -F'`' '/\| `[0-9a-f]{64}` \|/{print $2"  "$4}' "$HASHES" | (cd "$DIR" && shasum -a 256 -c -)
+  # Only the v1 section (it ends at the v2 heading, whose rows reuse names like
+  # config.json) and only the files fetched above: tokenizer.json and the weight
+  # shard are large sources fetched elsewhere (scripts/fetch_model.sh).
+  LIST="$(awk -F'`' -v files=" $FILES " '/^# Unlimited-OCR-2/{exit}
+    /\| `[0-9a-f]{64}` \|/ && index(files, " "$4" "){print $2"  "$4}' "$HASHES")"
+  want=$(echo $FILES | wc -w | tr -d " ")
+  got=$(printf '%s\n' "$LIST" | grep -c .)
+  if [ "$want" -ne "$got" ]; then
+    echo "SOURCE_HASHES.md pins $got of the $want fetched files" >&2
+    exit 1
+  fi
+  printf '%s\n' "$LIST" | (cd "$DIR" && shasum -a 256 -c -)
   echo "OK: all snapshots match the pinned hashes."
 fi

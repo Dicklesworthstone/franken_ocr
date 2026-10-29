@@ -27,3 +27,40 @@
 | **OQ-18** | RESOLVED | `oq/preprocess-infer.md` | Full per-mode token census: base-1024 placeholder `(16+1)·16+1 = 273` slots; Gundam multi-tile totals; `no_repeat_ngram_size=35` with `ngram_window` **128 single / 1024 multi** (`modeling_unlimitedocr.py` `infer`/`infer_multi`). |
 
 **Disposition:** 14 RESOLVED, 1 PARTIAL (OQ-14, external NVFP4 set), 3 DEFERRED-non-blocking (OQ-10/11/12). **Zero blocking OQs remain** — the Phase-1 kernels are unblocked. The PARTIAL/DEFERRED items carry explicit "needs X" retry conditions and gate only later, optional work (NVFP4 cross-check, int8-vision experiment, benchmark-cell confirmation), not the f32 reference-parity forward.
+
+---
+
+## OQ-V2 — Unlimited-OCR-2 (bead U2-A1)
+
+> The v2 spec is [`UNLIMITED_OCR_2_PLAN.md` §5](../planning/UNLIMITED_OCR_2_PLAN.md#5-reference-semantics-specification-v2)
+> and its OQ register is [§14](../planning/UNLIMITED_OCR_2_PLAN.md#14-open-questions-register-oq-v2);
+> this section indexes that register and does not restate it. Every answer cites the v2
+> pin (HF `5632329…`, hashes in `SOURCE_HASHES.md` "Unlimited-OCR-2"). The windowed-mode
+> semantics behind §5.10 `[W]` are in `oq/uocr2-windowed-sglang.md`. The v1 rows above
+> describe the v1 checkpoint only: v2 replaces R-SWA with SR-SWA, 1-D RoPE with page2d
+> RoPE and adds the `<PAGE>` tokens, so the v1 answers to OQ-1–5, 8, 9, 13, 14, 16 and 18
+> do not carry over and their v2 equivalents live here.
+
+| OQ | Status | Answered in / owning bead | Question |
+|----|--------|---------------------------|----------|
+| **OQ-V2-1** | RESOLVED | plan §5.6.4 | SR-SWA candidate semantics |
+| **OQ-V2-2** | RESOLVED | plan §5.6 | Router constants at inference |
+| **OQ-V2-3** | OPEN | U2-A6 floor (`bd-uocr2-epic-cgux.7`) + U2-C1 (`.17`) | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance |
+| **OQ-V2-4** | OPEN | U2-A6 step 1 (`.7`) | Does HF v2 run in f32 on CPU (dense SDPA path); is a ported dense fallback needed? |
+| **OQ-V2-5** | RESOLVED (no) | plan §5.6.7, D8 | Are the `indexer.*` projections used at inference? |
+| **OQ-V2-6** | RESOLVED | plan §5.5 | 1-D RoPE fallback: franken builds `<PAGE>` prompts, so none |
+| **OQ-V2-7** | RESOLVED | plan §5.9, DISC-U2-2 | n-gram vs guard order hazard: the forced token wins |
+| **OQ-V2-8** | PARTIAL | U2-A4 (`.5`) updates, U2-A5 (`.6`) closes | Non-special added tokens: the splitter handles them; conformance fixtures and the required-token check are pending |
+| **OQ-V2-9** | OPEN | U2-D2b (`.25`) | Windowed accuracy vs unwindowed |
+| **OQ-V2-10** | OPEN | U2-G2 (`.44`) | v2 single-page base vs gundam |
+| **OQ-V2-11** | RESOLVED (mechanism; fixtures at U2-C2) | U2-B4 (`.13`): `src/native_engine/srswa.rs` tests `retired_runs_equal_unretired_runs_bit_for_bit`, `the_detector_passes_guard_forced_steps_and_fires_otherwise`, `pinned_rows_survive_to_the_end_of_a_window` | Block-granular retirement is output-exact under the guard |
+| **OQ-V2-12** | OPEN | U2-C5a (`.21`) | Licenses of evaluation sets beyond MarathonDocBench (MPDocBench, OmniDocBench) |
+| **OQ-V2-13** | OPEN | U2-C4 (`.20`) | Does the conservative int8 recipe hold v2 CER within budget? |
+| **OQ-V2-14** | OPEN | U2-C5b (`.22`), else U2-G2 (`.44`) on C5b's subset | Document-mode crop mode (Baidu's long-document numbers are plausibly gundam) |
+| **OQ-V2-15** | OPEN | U2-C5a (`.21`) | Non-Baidu ground-truth documents for the head-to-head |
+| **OQ-V2-16** | OPEN | U2-C5b (`.22`) | Entmax domain for long documents (TopM vs AllCandidates) |
+
+**Disposition:** 7 RESOLVED, 1 PARTIAL, 8 OPEN, each OPEN item owned by the bead named.
+Kernel gates: OQ-V2-3/4 block parity sign-off (U2-A6, U2-C1). OQ-V2-11 no longer blocks
+block retirement; `FOCR_SRSWA_RETIRE` stays default-on only if U2-C2's fixtures also agree. The rest gate evaluation or defaults (C4, C5a/b, D2b, G2),
+not the f32 reference forward. Bead ids are children of epic `bd-uocr2-epic-cgux`.

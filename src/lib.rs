@@ -362,6 +362,20 @@ impl OcrEngine {
             .and_then(|model| model.take_music_meta())
     }
 
+    /// Take (consume) the [`native_engine::DecodeReport`] of the most recent
+    /// Unlimited-OCR decode on this engine's cached model, if any (U2-X2): its
+    /// `finish_reason` and, for a multi-page run, expected pages vs page
+    /// bodies. The CLI turns it into `finish_reason` and `warnings[]`
+    /// ([`native_engine::decode_warnings`]).
+    #[must_use]
+    pub fn take_last_decode_report(&self) -> Option<native_engine::DecodeReport> {
+        self.model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone))
+            .and_then(|model| model.take_last_decode())
+    }
+
     /// Construct the engine, building the single owned `asupersync` runtime
     /// (plan §3.3: `worker_threads(2)`, `blocking_threads(1, 4)`,
     /// `thread_name_prefix("focr")`). The model is loaded lazily on the first
@@ -708,10 +722,16 @@ impl OcrEngine {
     /// pages); use this when the pages form one document whose later pages
     /// reference earlier content.
     ///
+    /// Prompt and output share v1's 32,768 positions (≈29 dense pages), so a
+    /// longer document's output stops early. That is not an error: take
+    /// [`OcrEngine::take_last_decode_report`] afterwards for the
+    /// `finish_reason` and [`crate::native_engine::decode_warnings`] for the
+    /// `v1_truncated` / `v1_page_merge` warnings.
+    ///
     /// # Errors
     /// As [`crate::native_engine::OcrModel::recognize_multi_page`] — notably
     /// `NotImplemented` for non-Unlimited-OCR artifacts and an actionable
-    /// error when the assembled prefix exceeds the 32K position budget.
+    /// error when the assembled prefix alone exceeds the position budget.
     pub fn recognize_multi_page(&self, images: &[&Path]) -> FocrResult<String> {
         self.recognize_multi_page_with_model(&Self::model_path(), images)
     }

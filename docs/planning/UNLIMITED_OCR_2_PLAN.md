@@ -1,7 +1,7 @@
 # Unlimited-OCR-2 in franken_ocr — Upgrade & Support Plan
 
-> **Status:** planning (no code landed). **Created:** 2026-10-28. **Revision:** 2. Review round 1 is
-> integrated (spec fidelity, codebase grounding, strategy; see §15).
+> **Status:** planning (no code landed). **Created:** 2026-10-28. **Revision:** 3. Review rounds 1–4
+> are integrated (spec fidelity, codebase grounding, strategy, consistency; see §15).
 > **Companion to:** [`COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md`](COMPREHENSIVE_PLAN_FOR_FRANKEN_OCR.md). Its
 > doctrine binds this plan.
 > **Work graph:** this plan is mirrored 1:1 into beads under the epic "Unlimited-OCR-2: additive model
@@ -160,7 +160,7 @@ default-policy decision in §10 follows from that.
 | **Multi-page users** (`--multi-page`, 5–50 pages) | One cross-page pass whose prompt (111 tokens per page) and output share 32,768 positions (≈29 dense pages). Weaker cross-page structure. Every raster is held in RAM. `--json` returns `pages: []`. | Markedly better cross-page text and tables (MPDocBench +22.7). A real per-page `pages[]`, layout boxes and figures. No practical length limit and bounded memory. When v1 hits its 32K budget, the error names `focr pull unlimited-ocr-2`. |
 | **Book and archive digitizers** (100s–1000s of pages) | Not possible | **New capability:** windowed parsing on CPU with bounded memory, streamed page by page, resumable after a crash or Ctrl-C. Inputs: scanned PDFs (JPEG/CCITT/Flate pages) or a directory of page images. JBIG2/JPX/vector pages are **skipped with a `page` `skipped` event**, dropped from the prompt and kept in the source-page map, so numbering never shifts. Expect hours per 1,000 pages on CPU (estimate, §8.4). |
 | **Rust embedders** | Five `recognize_multi_page*` variants (whole document, blocking) | One `recognize_document(source, &opts, sink)` with streaming, windowing and resume. The old variants are removed with a minor-version bump and a migration table (AGENTS.md: no compat shims). |
-| **Agents (robot mode)** | `run_start`, `run_complete`/`run_error`, and a `page` event whose `page` mixes source page and emission index. The schema lists event kinds only, so no field can be validated (`stage` is advertised but has no emitter). | `robot schema` gains field-level `event_fields` (U2-X2, M0). `page` gains `source_page`, `window`, `tokens`, `finish` and `model_id` (additive). A new `window` event. `run_complete` gains `model_id`, `artifact_sha256`, `pages_out`, `windows`, `extra_markers`, `finish_reason` and `warnings[]`; a partial-output `run_error` carries the same partial fields. `robot triage` recommends v2 for long documents. The schema stays v1 (additive). |
+| **Agents (robot mode)** | `run_start`, `run_complete`/`run_error`, and a `page` event whose `page` mixes source page and emission index. The schema lists event kinds only, so no field can be validated (`stage` is advertised but has no emitter). | `robot schema` gains field-level `event_fields` (U2-X2, M0). On v2 runs, `page` gains `source_page`, `window`, `tokens`, `finish` and `model_id` (additive); v1 `page` events are unchanged. A new `window` event. `run_complete` gains `model_id`, `artifact_sha256`, `pages_out`, `windows`, `extra_markers`, `finish_reason` and `warnings[]`; a partial-output `run_error` carries the same partial fields. `robot triage` recommends v2 for long documents. The schema stays v1 (additive). |
 | **Holders of v1 artifacts** | `unlimited-ocr.v0.7.0.int8.focrq` | Keeps working, byte-identically, throughout this plan (T3 gate). No forced downloads; v1 stays pullable. |
 
 ### 3.2 Principles that follow
@@ -252,9 +252,9 @@ oracle written from the wheel source.**
   wheel source by a different author than the Rust implementation**, so a misreading of §5.10 is not
   implemented twice. Where the oracle and §5.10 disagree, §5.10 is fixed.
 
-We do **not** replicate the non-streaming stitching quirk that moves a blank first page to the end of
-its window (§5.10.8, DISC-U2-4). The wheel's streaming path doesn't have it, and it would corrupt page
-alignment.
+We do **not** replicate the non-streaming stitching quirk that drops leading blank bodies while bodies
+are surplus (§5.10.8, DISC-U2-4). The wheel's incremental `stream_owned_text` doesn't have it (its
+streaming handler's end-of-window `select_batch_output` does), and it would corrupt page alignment.
 
 **D6. Port in this order: single-page base, then multi-page base, then windowed, then gundam.**
 - **Single-page base is routing-degenerate.** A page's 273 image tokens span ≤ 10 blocks and K=12, so
@@ -270,7 +270,9 @@ alignment.
 - **Decode in base mode is degenerate:** own-page image blocks number ≤ 10 per page.
 - **Gundam pages carry 273 (small image, both sides ≤ 640) or 483–2,033 image tokens** (Appendix A).
   Routing is selective once more than 12 own-page blocks are remote. 2×1 and 1×2 pages have about 16
-  image blocks, so their early decode rows are not selective. Gundam is also uncertified for v1 today.
+  image blocks: on a single-page document, or a document's last page, the first ~20 decode rows see
+  ≤ 12 remote own-page blocks and are not selective; every earlier page's decode rows are selective.
+  Gundam is also uncertified for v1 today.
 
 **D7. Keep the conservative int8 recipe policy unchanged, and enforce it by name.**
 - Quantize exactly the 2,148 FFN/expert matrices.
@@ -333,6 +335,9 @@ is a separate lossy lever.**
   - An exhausted window checkpoints (D14), writes the completed pages, and exits 5 (`EXIT_TIMEOUT`)
     through a `run_error` carrying `finish_reason: "budget"`.
   - Cancellation exits 6 (`EXIT_CANCELLED`) the same way, with `finish_reason: "cancelled"`.
+  - Producers: U2-B6 builds the partial-output path and produces `length` and `budget`; U2-D1a
+    produces per-window `budget`; U2-E2 produces `cancelled` (cooperative cancellation in the driver);
+    U2-D4 checkpoints the last completed window on each of those stops.
 - **Truncation is never silent.**
   - A page stopped by the **per-page cap** reports `finish: "page_cap"`, and the run continues.
   - A page interrupted by the **position limit** reports `finish: "length"`. The run reports
@@ -343,8 +348,11 @@ is a separate lossy lever.**
     - U2-C4 re-derives it from the measured distribution, as the largest N with
       `64 + 274·N + (N − 1)·p90 + p99 ≤ 131,072`, where p90 and p99 are generated tokens per page. Using
       per-page p99 for every page would be far too strict: page_0590 alone emits ~4,033 tokens.
-    - An explicit unwindowed request (`PageWindow::Off`, or `--page-window off` once U2-D5 lands)
-      bypasses the refusal and relies on the exit-5 position stop. U2-D2b's S5 comparison uses it.
+    - An explicit unwindowed request (`Some(PageWindow::Off)`, or `--page-window off` once U2-D5
+      lands) bypasses the refusal and relies on the exit-5 position stop. The library default
+      (`DocumentOptions.page_window: None`, U2-E2 owns `PageWindow`) keeps the refusal, so default
+      and explicit `Off` stay distinguishable. U2-B6 implements the bypass as an `enforce_page_limit`
+      parameter of its document loop, which U2-D2b's S5 comparison sets directly.
     - Tests use "limit + 1 pages", never a literal.
 - U2-C4 records the per-page generated-token distribution, and the cap default is revisited on that
   evidence. A runaway page costs minutes of CPU.
@@ -397,12 +405,15 @@ default is 1).
   result.
 
 **D15. Robot changes are additive.**
-- The existing `page` event (bd-2z0y decoded, bd-fck1 skipped) keeps every field and gains
-  `source_page`, `half`, `window`, `tokens`, `finish`, `elapsed_ms` and `model_id`. This fixes today's
-  mix, where skipped events carry the source page and decoded events the emission index.
+- The existing `page` event (bd-2z0y decoded, bd-fck1 skipped) keeps every field. **On v2 runs** it
+  gains `source_page`, `half`, `window` and `model_id` (decoded and skipped), plus `tokens`, `finish`
+  and `elapsed_ms` (decoded only). That fixes today's mix, where skipped events carry the source page
+  and decoded events the emission index, for v2. **v1 `page` events are unchanged**: v1 merges pages,
+  so its bodies have no reliable source page.
 - `window` is the only new event kind.
-- U2-X2 (M0) adds field-level `event_fields` to `robot schema`. Every bead that adds a field extends it
-  in the same change, so agents can validate every event.
+- U2-X2 (M0) adds field-level `event_fields` to `robot schema`. Every bead that adds a field or a
+  warning kind extends it in the same change (U2-A7, D0, B6, E1, E3, D4, D5), so agents can validate
+  every event.
 
 *Why:* the robot contract is stable, versioned NDJSON (AGENTS.md "Agent Ergonomics").
 
@@ -413,7 +424,8 @@ default is 1).
 - **Full shard SHA-256s** are verified by `focr convert`, which stamps them, and by `doctor`.
 - `.focrq` has a single 32-byte `source_sha256` (preamble[11..43]).
   - For multi-shard sources it holds **SHA-256 over the concatenation of the shard SHA-256s in index
-    order**.
+    order**. Index order is the distinct shard file names of the index's `weight_map`, sorted
+    ascending (`docs/focrq-format.md`, "Sharded sources").
   - `provenance_json` lists each shard's name, size and SHA-256.
 
 *Why:* v2 is the first default-family checkpoint with two shards, and future zoo models will shard
@@ -436,29 +448,51 @@ too.
 - v1's trade-off was different (640 squash, attention growing with N, 32K shared positions), which is
   why v1 kept document mode opt-in.
 
-**D18. v2 dispatch is fail-closed.** Each of the following either supports v2 or refuses it with exit
-2 **before weights load** (a new pre-load check returning `FocrError::Usage`):
+**D18. v2 dispatch is fail-closed.** Each of the following either supports v2, is **ignored** with an
+`ignored_lever` warning (it cannot reach a v2 path), or is refused with exit 2 **before weights load**
+(a new pre-load check returning `FocrError::Usage`):
 - every decode path: the conservative cached path (`generate_cached` over `DecoderWeightCache`: int8
   FFN, f32 attention/router/`lm_head`; where the certified artifact runs), the `_i8` cached path and
   its triggers (`FOCR_DECODE_INT8`, `ocr-batch --experimental-full-int8`, `force_int8_decode()`, WASM
   int4), chunked prefill, the stateless f32 path, batch spine, spec-verify;
 - every entry point, including `OcrModel::recognize_multi_page*`, which never takes v1's 640-squash
   loop for v2;
-- every lever: `FOCR_SPEC_DECODE`, `FOCR_BATCH_SPINE`, `FOCR_INT8_KV`, `FOCR_DECODE_INT8`,
-  `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD`, `FOCR_QKV_FUSED`, `FOCR_DECODE_STATELESS`,
-  `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_ATTN_GEMM`, `FOCR_RSWA_PARALLEL_ATTN`, `FOCR_PREFILL_CHUNK`;
+- every lever: `FOCR_SPEC_DECODE`, `FOCR_SPEC_VERIFY`, `FOCR_BATCH_SPINE`, `FOCR_INT8_KV`,
+  `FOCR_DECODE_INT8`, `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD`, `FOCR_QKV_FUSED`, `FOCR_DECODE_STATELESS`,
+  `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_FUSE_NORM_QUANT`, `FOCR_LMHEAD_SHARD`, `FOCR_LMHEAD_SHARD_TILES`,
+  `FOCR_ATTN_GEMM`, `FOCR_RSWA_PARALLEL_ATTN`, `FOCR_PREFILL_CHUNK`, `FOCR_RUNAWAY_GUARD`;
 - the resident daemon;
 - the converter recipes.
 
 Routing is an exhaustive `match` on `unlimited_variant()`. No `_ =>` arm may reach the v1 forward.
 
 Levers are classified by **effective state** (U2-A7's `UOCR2_LEVER_POLICY`):
-- kill-switch values, and levers that reach only v1 R-SWA or `_i8` paths (e.g. `FOCR_QKV_FUSED`, which
-  is default ON, `decoder.rs:2222-2231`; `FOCR_ATTN_GEMM`; `FOCR_RSWA_PARALLEL_ATTN`; `FOCR_INT8_KV`),
-  plus `FOCR_RESAMPLE` (v2 hard-wires PIL bicubic), are **ignored** for v2, with
+- value-parsed levers set to their kill-switch value (e.g. `FOCR_QKV_FUSED=0`) are no-ops for v2.
+  **Presence-based** levers (`FOCR_LMHEAD_SHARD`, `FOCR_PREFILL_CHUNK`, `FOCR_FUSE_NORM_QUANT`,
+  `FOCR_SPEC_DECODE`, `FOCR_SPEC_VERIFY`, `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_PROFILE_DECODE`) are armed by
+  any value, including `0` (`lmhead_shard_enabled` is `var_os(..).is_some()`, `decoder.rs:2115`), so
+  they are classified by presence;
+- levers that reach only v1 R-SWA or `_i8` paths are **ignored** for v2, with
   `warnings[{kind:"ignored_lever", env}]`. Refusing them would break v1 users' exported tuning
-  environments and guard nothing;
-- only levers that would change v2 numerics on a reachable v2 path are refused;
+  environments and guard nothing:
+  - `FOCR_QKV_FUSED` (default ON, read only in `DecoderWeightCacheI8::build`, `decoder.rs:2222-2231`);
+  - `FOCR_ATTN_GEMM`, `FOCR_RSWA_PARALLEL_ATTN`, `FOCR_INT8_KV` (read only in `rswa::decode_attention`
+    and `RingCache::new`; ignorable only because U2-B5's SR-SWA arm never calls those);
+  - `FOCR_FUSE_NORM_QUANT` (only `decode_step_with_cache_i8`, `decoder.rs:2990`),
+    `FOCR_FUSE_NGRAM_LMHEAD` (only `generate_cached_i8`, `mod.rs:3939`), `FOCR_SPEC_DECODE` (only
+    `generate_cached_i8`, `mod.rs:3949`), `FOCR_SPEC_VERIFY` (no production reader);
+  - `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD` (read only by `Recipe::from_env()` in
+    `require_experimental_full_int8_recipe`, `mod.rs:480`; convert, census and loader use
+    `validated_default`);
+  - `FOCR_RESAMPLE` (v2 hard-wires PIL bicubic);
+  - `FOCR_RUNAWAY_GUARD`, but only once the v2 arm stops building it: today `RunawayGuard` is built
+    for every path (`mod.rs:3727`) and checked in `generate_cached` (`:3830`) and `generate_stateless`
+    (`:4284`), so U2-B5/B6 must not build or check it on the v2 arm;
+- only levers that would change v2 numerics on a reachable v2 path are refused. `FOCR_LMHEAD_SHARD` and
+  `FOCR_LMHEAD_SHARD_TILES` reach `lm_head_cached` (`decoder.rs:1088-1090`) on the conservative path,
+  so they are **refused until U2-C2**. Levers that select a refused path are refused with it:
+  `FOCR_DECODE_INT8` (the `_i8` path), `FOCR_PREFILL_CHUNK` (chunked prefill, until U2-F2) and
+  `FOCR_BATCH_SPINE` (until U2-F5); `FOCR_DECODE_STATELESS` selects a supported path;
 - U2-C2 re-runs L4 with each "refuse until C2" lever on and flips each pass to supported-exact.
 
 *Why:*
@@ -468,7 +502,7 @@ Levers are classified by **effective state** (U2-A7's `UOCR2_LEVER_POLICY`):
   load and preprocessing.
 - `spec_decode_i8` (`mod.rs:4064`) is reachable only through `generate_cached_i8` (`mod.rs:3887`), i.e.
   the full-int8 or WASM-int4 paths, behind `require_full_int8_authorization()` (`:3895`). The certified
-  path cannot reach it, and v2 refuses it as defense in depth.
+  path cannot reach it, so `FOCR_SPEC_DECODE` is ignored for v2; the `_i8` path itself is refused.
 - v2 weights run through R-SWA code produce confident garbage with exit 0, the worst possible outcome
   for a user.
 
@@ -490,7 +524,7 @@ decoder.**
   re-scanning decoded text.
 - Today the streaming observer in `recognize_multi_page_pres` (`mod.rs:2723`, observer `:2786-2824`)
   sets `stream_broken = true` permanently after a split multi-byte UTF-8 character (`:2802-2811`). That
-  also suppresses the final flush (`:2818`), so `page` events stop for the rest of a Chinese document.
+  also suppresses the final flush (`:2821`), so `page` events stop for the rest of a Chinese document.
   `PageStream` itself (`postprocess.rs:531`) has no error state.
   - This already affects v1; U2-X1 fixes it.
   - MarathonDocBench is half Chinese.
@@ -538,7 +572,8 @@ name two artifacts.
 - v1 multi-page already skips such pages (`cli.rs:1836-1846`, aborting only if none renders, `:1853`).
   The defect is numbering: decoded `page` events are numbered by body ordinal (`postprocess.rs:535-536`,
   `cli.rs:1868-1874`), so after a skip they are misnumbered and can collide with the skipped page's
-  number. The source-page map fixes that.
+  number. The source-page map fixes that for v2 (`source_page`). v1 keeps body-ordinal numbering,
+  because v1 merges pages and its bodies have no reliable source page.
 - A directory of page images (natural sort) is a first-class document input. It is the realistic
   route for books rasterized out of band.
 
@@ -727,14 +762,17 @@ Coordinates come from `SB:2511-2568` (prefill) and `SB:1451-1489` (decode state 
   would clamp the forced `<PAGE>` to bucket M. Instead, with M = the `<PAGE>` count of the rewritten
   prompt and pp = M:
   - **RoPE carry:** the marker count is M + 1, so the response bucket is min(max(mc − pp, 0), pp) = 1.
-    `cnt[]` comes from replaying the rewritten prompt, with copied rows counted in their buckets.
+    `cnt[]` = `replay_coords` over the rewritten prompt only: rows (a), (b), (c) and the newly
+    prefilled pages; the text tail (d) is not counted (wheel `:292`, `:1100,1122-1124`). Only cnt[≥2]
+    is ever used.
   - The forced `<PAGE>` then gets bucket 2 and `tok = cnt[2] = 1 + n_img(lo)` (the §5.10.4 table).
   - The HF seed applies only to window 0, recomputed windows and unwindowed runs.
 
 **Frequencies** (`SB:2027-2061`). dim = 128, half = 64, page_pairs = 1, so n_tok = 63.
 - `inv_tok[i] = 10000^(−i/63)` for i in 0..63. This is "resample" mode; note the /63, not 2i/128.
-  Compute it in the source's operation order, `1.0 / (10000 ** (f32(i) / 63))` in f32 (`SB:2032`), so
-  the table is bit-equal.
+  Compute it in the source's operation order, `1.0 / (10000 ** (f32(i) / 63))` in f32 (`SB:2032`),
+  and assert the 63 values against the oracle's dumped `inv_tok`; pin them as constants if Rust's
+  `powf` differs from torch's `pow`.
 - `inv_page[0] = 256^0 = 1`.
 - `ang = [tok_pos·inv_tok[0..63], (page_pos mod 2)·1]` gives 64 angles, and `emb = cat(ang, ang)`.
 - Rotation is NeoX `rotate_half` via transformers' llama `apply_rotary_pos_emb` (`SB:39-42`):
@@ -864,16 +902,23 @@ bias = (logp − μ)/σ  if valid else 0          # no clamp at inference
 - The selected blocks are `idx` where `valid`, each carrying scalar `bias`.
 - Zero-prior candidate blocks inside the first K' slots **are still read**, with bias `ln(1e-4) − μ`.
 - **`nblk` is per forward, not per query** (`MD:437`, `MD:351-352`, `MD:519`).
-  - In prefill, nblk = ceil(L/32), where L is the KV length of the whole forward. It is identical for
-    every query row, so early prefill rows use M = min(16, ceil(S/32)), not their causal block count.
+  - HF prefill is defined only on an empty cache: nblk = ceil(S/32), where S is the forward's query
+    count (= its KV length; `MD:436-437`), and the router scores only this forward's index keys
+    (`MD:440-445`). nblk is identical for every query row, so early prefill rows use
+    M = min(16, ceil(S/32)), not their causal block count.
+  - For an extend over a non-empty cache (a reused window, §5.10.4), franken_ocr defines
+    nblk = ceil(total KV rows/32) and scores against all cached index keys. U2-D2a's oracle implements
+    the same rule explicitly.
   - In decode, nblk = ceil((pos+1)/32).
   - Chunked prefill (F2) must therefore use the unchunked M = min(16, ceil(S_prompt/32)) for every
-    chunk.
-  - Chunked ≡ unchunked and re-prefill ≡ incremental decode (§5.8) are bitwise only if no row has a
-    max candidate x < −1e4+2. Tests assert that precondition, or log the affected rows.
-- **Padding.** z = (x − max)/2 and τ* ≥ z_max − 1 (`DA:762-788`).
-  - A non-candidate slot (x = −1e4) gets p = 0 **iff** the best candidate's x ≥ −1e4+2. Otherwise pads
-    fall inside the support and move τ*.
+    chunk, with pads counted from the logical nblk. With both, chunked ≡ unchunked selection holds
+    unconditionally.
+  - Re-prefill ≡ incremental decode (§5.8) is bitwise only if, on every row, the max candidate
+    x ≥ −1e4+2 and no candidate has x ≤ −1e4. Tests assert that precondition, or log the affected rows.
+- **Padding.** z = (x − max)/2 and τ* ≥ z_max − 1 (`DA:762-798`).
+  - A pad (x = −1e4) has p = 0 iff z_pad = (−1e4 − m)/2 ≤ τ*, where m is the max candidate x.
+    **m ≥ −1e4+2 is sufficient**, since then z_pad ≤ −1 ≤ τ*. Below that, pads *may* enter the support
+    and move τ*; tests must not assert p_pad > 0 merely because m < −1e4+2.
   - Computing top-M over candidates only and **merging** min(M, nblk − #cand) pads into the full top-M
     order is exact in both cases. Appending pads after the candidates is not.
   - Both the F2 lever and D9 retirement rely on the merged form.
@@ -900,7 +945,8 @@ candidates) and records the bisection difference as part of DISC-U2-1. The read 
   zero-prior candidates (bias ln(1e-4) − μ). Ranking by prior is ambiguous at p = 0;
 - every candidate is read when there are ≤ 12.
 
-AllCandidates ≡ TopM tests must exclude 12th-place ties and rows whose max x < −1e4+2.
+AllCandidates ≡ TopM tests must exclude 12th-place ties, rows whose max candidate x < −1e4+2, and
+rows with any candidate x ≤ −1e4.
 
 **5.6.7 Unused indexer.** `self_attn.indexer.{q,k}_proj` are not used at inference; the dash path
 scores with `dash_router.*`. The indexer object only hosts page and RoPE helper methods (`MD:96-143`).
@@ -953,8 +999,9 @@ tolerance is measured (OQ-V2-3).
   cache). It has two preconditions:
   - no generated token equals 128815. A re-prefill would treat such a token as an image token, while
     decode ignores it;
-  - no row has a max candidate x < −1e4+2. Prefill computes M from the whole forward's nblk and decode
-    from the cache length (§5.6.5), and the two agree only under that condition.
+  - on every row, the max candidate x ≥ −1e4+2 and no candidate has x ≤ −1e4. Prefill computes M from
+    the whole forward's nblk and decode from the cache length (§5.6.5), so the pad counts differ, and
+    the two agree only under that condition.
 - **Only the last position** goes through `lm_head` after prefill (`MU:1165-1167`).
 - **KV:** HF keeps the **full** DynamicCache. Ring and sliding windows are disabled, and nothing is
   evicted (`MU:1151-1153,1160`; `MD:509,516`).
@@ -997,13 +1044,15 @@ tolerance is measured (OQ-V2-3).
    - With HF semantics an extra `<PAGE>` is possible, followed by a forced EOS. Our splitter counts it
      (`extra_markers`) and drops the empty trailing body.
    - Unwindowed mode follows HF; windowed mode follows SGLang (§5.10.7). In SGLang the ban reaches
-     only a last window that was recomputed, because every reused window runs with
-     `end_on_marker = true`.
+     only a last window that was recomputed, because `end_on_marker = (lookahead > 0) || reused`
+     (`CLP:227`): every non-last window has a lookahead, and every reused window sets
+     `_uocr_end_on_marker` (`:1109`).
 
 ### 5.10 Windowed ("unlimited-horizon") decoding (SGLang semantics) [W]
 
-The source notes ship in the truth pack (U2-A1). Citations are under `W/session/uocr_doc_reuse.py`
-and `W/entrypoints/openai/doc_split.py` unless noted.
+The source notes are `docs/truth-pack/oq/uocr2-windowed-sglang.md` (U2-A1; `W/` is the pinned
+dev10 wheel's `sglang/srt/`, and its section 5 reviews the dev13 delta). Citations are under
+`W/session/uocr_doc_reuse.py` and `W/entrypoints/openai/doc_split.py` unless noted.
 
 **5.10.1 Planning.**
 - **Window size.** W own pages per window. franken_ocr defaults to 10 (D13); the wheel's env default
@@ -1012,9 +1061,10 @@ and `W/entrypoints/openai/doc_split.py` unless noted.
     (`doc_split.py:337-343`).
   - Own pages per window = `min((ctx − 65) // per_page_est, W)`, with `per_page_est` = 274 for base
     and 1514 for gundam (`doc_split.py:28-35,141-143`).
-  - In the wheel, `ctx` is the server's `max_req_input_len` (`W/entrypoints/openai/serving_chat.py:378`).
-    That is min((W+la)·2034 + W·max_page_tokens + 1024, 131072) (`W/configs/model_config.py:305-327`),
-    which is 131072 under the README configuration. It does not matter at W = 10, where the `W` term
+  - In the wheel, `ctx` is the server's `max_req_input_len` (`W/entrypoints/openai/serving_chat.py:378`)
+    = min(context_len − 1, KV pool − 1) − 5 (`W/managers/tp_worker.py:544-557`). context_len defaults
+    to min((W+la)·2034 + W·max_page_tokens + 1024, 131072) (`W/configs/model_config.py:305-327`), so
+    under the README configuration ctx ≤ 131,066. It does not matter at W = 10, where the `W` term
     binds.
   - franken_ocr's bound adds the output side, because outputs share the window's 131,072 positions:
     own pages per window = min(prompt-derived bound, W, the U2-B6/C4 pre-windowing page limit, D11).
@@ -1099,9 +1149,13 @@ rule (§5.4, §5.5):
 *Guard.* `context_pages = 1` and `end_on_marker = true`. `expected = #markers(prompt) − 1 − lookahead`,
 i.e. the own pages. The forced `<PAGE>` counts as the first generated mark.
 
-*One-page variant.* When window k+1 has exactly one own page (N mod W == 1, or W == 1), segment (c) is
-copied **except its final image token, which is re-prefilled** (`copy_end = la_end − 1`, "straddle",
-`:284-287`). The source confirms why: the extend step needs at least one token to run.
+*One-page variant.* When window k+1 is the **last** window and has exactly one own page
+(`p_new == 1`, `:260`), segment (c) is copied **except its final image token, which is re-prefilled**
+(`copy_end = la_end − 1`, "straddle", `:284-287`). The source confirms why: the extend step needs at
+least one token to run.
+- `p_new` counts every page of the sent prompt, lookahead included, so a non-last window, even at
+  W == 1, always copies (c) whole.
+- The variant therefore happens when N mod W == 1, or for the last window when W == 1.
 
 **5.10.5 Fallback.** Window k+1 is recomputed exactly like window 0, with page_base = lo, when:
 - (i) there is no retained entry: window k was not stopped by EOS or a stop string, was aborted, was
@@ -1118,7 +1172,8 @@ An empty last body is **not** a fallback (`:319-320`). A recomputed window has B
 and no cross-window context.
 
 **Two of these causes cannot happen with real v2 pages:**
-- (iv) needs n_img < 128 + (E mod 32) ≤ 159, but every v2 page has ≥ 273 image tokens (`MU:564`).
+- (iv)'s **short-tail branch** needs n_img < 128 + (E mod 32) ≤ 159, but every v2 page has ≥ 273
+  image tokens (`MU:564`).
 - (v)'s "no output" cannot happen with the guard on, because EOS is banned while marks < expected
   (`custom_logit_processor.py:256-257`, `MU:603`). So every window emits at least one `<PAGE>`.
 
@@ -1132,6 +1187,11 @@ with:
 - expected = the own pages;
 - end-on-marker;
 - guard-first order.
+
+For a recomputed **last** window (no lookahead), the reference runs with end_on_marker = false, so the
+last-page `<PAGE>` ban applies (§5.10.7), and it is compared through EOS. U2-D2a derives this
+configuration (page_base, expected marker count, end_on_marker, logit-processor order) from the wheel
+source and records it in its notes.
 
 HF `infer_multi` is **not** that reference when lo is odd:
 - the page parity differs (`serving_chat.py:512-515`, `KEY_PAGE_BASE: lo`;
@@ -1147,11 +1207,12 @@ no absolute document positions, and the 131072 limit applies per window.
 - The wheel's per-window capacity is `min(ctx − 64 − per_page·(own+lookahead), own·max_page_tokens +
   256)`. The second term uses the effective cap and is omitted when the cap is ≤ 0
   (`doc_split.py:89-114`). franken_ocr has no global budget by default (D11).
-- **The last-page `<PAGE>` ban (DISC-U2-3) is narrower than it looks.** Every reused window sets
-  `_uocr_end_on_marker = True` (`:1109`), and `end_on_marker` short-circuits the ban
-  (`custom_logit_processor.py:227,258-262`).
-  - A reused last window is therefore **never banned**. On its last own page EOS is allowed, and an
-    extra `<PAGE>` forces EOS and is cut or dropped as surplus.
+- **The last-page `<PAGE>` ban (DISC-U2-3) is narrower than it looks.**
+  `end_on_marker = (lookahead > 0) || reused` (`custom_logit_processor.py:227`), and `end_on_marker`
+  short-circuits the ban (`:258-262`). Every non-last window has a lookahead, and every reused window
+  sets `_uocr_end_on_marker = True` (`:1109`).
+  - Neither is therefore **ever banned**. On a reused last window's last own page EOS is allowed, and
+    an extra `<PAGE>` forces EOS and is cut or dropped as surplus.
   - The ban applies only to a last window that was recomputed (fallback), and to unsplit requests.
   - `_restore_prompt` resets the flag (`:669`).
 - SGLang's guard can lag one step under overlap scheduling, so an extra token can precede the forced
@@ -1177,10 +1238,12 @@ no absolute document positions, and the 131072 limit applies per window.
 - A reused window's visible text starts with the body of its first own page.
 - Ownership is `bodies[ctx:input_pages]`. **All** surplus bodies beyond the own pages are dropped, and
   pages are concatenated in order.
-- **Deviation (D5, DISC-U2-4):** we do not replicate the non-streaming path's drop of leading blank
+- **Deviation (D5, DISC-U2-4):** we do not replicate `select_batch_output`'s drop of leading blank
   bodies while bodies are surplus,
   `while len(bodies) > input_pages and not bodies[0].strip(): bodies = bodies[1:]`
-  (`doc_split.py:253-254`). It shifts alignment. The streaming path (`:260-275`) has no such drop.
+  (`doc_split.py:253-254`). It shifts alignment. The incremental `stream_owned_text` (`:260-275`) has
+  no such drop; the streaming handler's end-of-window `select_batch_output` call
+  (`serving_chat.py:1114-1124`) does, and stops sending text if ownership moves.
 
 **5.10.9 Within-window retirement.** SGLang retires nothing within a window. franken_ocr's
 block-granular retirement (§5.12) applies inside every window, under the same proof.
@@ -1205,8 +1268,8 @@ Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a
 |---|---|---|---|---|
 | DISC-U2-1 | entmax domain | top-16 window | all candidates; bisection τ; ties can read fewer than 12 | Both (`EntmaxDomain`, D21); HF is the parity default; the long-document default is chosen on ground truth (U2-C5b) |
 | DISC-U2-2 | n-gram vs guard order | n-gram first (can yield id 0) | guard first; a forced token skips n-gram | Forced token authoritative; assert never triggered on fixtures |
-| DISC-U2-3 | `<PAGE>` ban on the last page | no ban | ban when not end_on_marker; reused windows always set end_on_marker, so only a recomputed last window (or an unsplit request) is banned | HF when unwindowed, SGLang when windowed |
-| DISC-U2-4 | leading blank bodies dropped while surplus, in stitching | n/a | the non-streaming path drops them (`doc_split.py:253-254`), which shifts alignment | Never drop |
+| DISC-U2-3 | `<PAGE>` ban on the last page | no ban | ban when not end_on_marker; end_on_marker holds whenever the window has a lookahead or is reused, so only a recomputed last window (or an unsplit request) is banned | HF when unwindowed, SGLang when windowed |
+| DISC-U2-4 | leading blank bodies dropped while surplus, in stitching | n/a | `select_batch_output` drops them (`doc_split.py:253-254`; the non-streaming path and the streaming handler's end-of-window call), which shifts alignment | Never drop |
 | DISC-U2-5 | numerics | GPU: Triton (bf16 q·scale and P; fp32 bias and softmax). CPU: SDPA in the activation dtype. Decode: fp32 over bf16. | bf16 Triton | f32 throughout; parity target is the f32 oracle |
 | DISC-U2-6 | crop mode for multi-image requests | base (`infer_multi`) | gundam by default (`W/multimodal/processors/unlimited_ocr.py:23`) | Base by default; gundam document mode evaluated (OQ-V2-14) |
 | DISC-U2-7 | page2d tok after an extra `<PAGE>` | reset to `pf_cnt[N]` (`SB:1486-1488`) | keeps the running count (`W/…/page2d_rope.py:579-591`) | HF; only reachable on a guard-forced EOS step |
@@ -1218,8 +1281,9 @@ would escape the required-field, kill-switch and uniqueness checks.
 - Each DISC-U2-k is therefore filed in `docs/DISCREPANCIES.md` under the next free numeric heading,
   titled `## DISC-NNN: U2-k — <title>`. The checker stays as it is and enforces the fields.
 - The plan and the beads keep "DISC-U2-k" as the cross-reference name.
-- U2-C4 writes or confirms the entries, with measured impact. Other beads supply their numbers and link
-  to them.
+- U2-C4 writes or confirms the entries, with measured impact. U2-C1, C2, B2 and B6 supply numbers
+  before C4 closes. U2-C5b, F4 and G1 run later: they append measured impact to the entry filed by C4,
+  or file a new numeric entry, with `check_ledgers.py` green.
 
 ### 5.12 Block-granular retirement (franken_ocr optimization; exact under the guard)
 
@@ -1298,7 +1362,8 @@ Generated text older than the local window costs nothing. This is v1's ring, gen
   - `:686` (`convert --model-id` defaults to `unlimited-ocr`);
   - `:1686` (auto-download is v1 only);
   - `:2350` (convert's pinned v1 source-SHA check) and `:2420` (the receipt's `quant_recipe`);
-  - `:2676-2680` (models guidance; the ID column is 14 chars, but `unlimited-ocr-2` is 15);
+  - `:2675-2711` (models `guidance` map `:2675`; the ID column is `{:<14}` at `:2684,2711`, but
+    `unlimited-ocr-2` is 15 chars);
   - `:2949` (`health` reports one model path);
   - `:3036` (v1-only pull hint);
   - `:4108`.
@@ -1428,16 +1493,16 @@ It reuses the domain-agnostic per-token sampling primitives from `sampler.rs`.
 
 | Path / lever | v2 first wave | Later |
 |---|---|---|
-| Conservative cached prefill/decode (`generate_cached` → `prefill_with_cache`, `decode_step_with_cache`; int8 FFN, high-precision attention/router/`lm_head`) | **Support**. The certified artifact runs here, and so does a raw BF16 checkpoint: `DecoderWeightCache::build` (`decoder.rs:837`) int8-quantizes the 2,148 FFN/expert matrices even from BF16 (`quant_oc_loaded`, `decoder.rs:1838`). There is **no all-f32 cached path**; the comment at `mod.rs:3765-3770` saying otherwise is stale, and U2-B5 fixes it. v1's own L4 rung builds this cache (`tests/parity_ladder.rs:788`). (`mod.rs:3736-3800`) | — |
+| Conservative cached prefill/decode (`generate_cached` → `prefill_with_cache`, `decode_step_with_cache`; int8 FFN, high-precision attention/router/`lm_head`) | **Support**. The certified artifact runs here, and so does a raw BF16 checkpoint: `DecoderWeightCache::build` (`decoder.rs:837`) int8-quantizes the 2,148 FFN/expert matrices even from BF16 (`quant_ffn_loaded` → `quant_oc_loaded`, `decoder.rs:1928` → `:1838`). There is **no all-f32 cached path**; the comment at `mod.rs:3765-3770` saying otherwise is stale, and U2-B5 fixes it. v1's own L4 rung builds this cache (`tests/parity_ladder.rs:788`). (`mod.rs:3736-3800`) | — |
 | int8 cached (`generate_cached_i8` → `prefill_with_cache_i8`, `decode_step_with_cache_i8`, `decoder.rs:2826,2956`), reached only by the experimental full-int8 switch (`FOCR_DECODE_INT8`, `ocr-batch --experimental-full-int8`, `force_int8_decode()`) and the WASM int4 artifact | Refuse | Backlog |
 | `OcrModel::recognize_multi_page*` (`mod.rs:2620/2654/2691`; arch guards at `:2626/2663/2701` and `ensure_arch_implemented` at `:2634/2671/2709`) | Refuse until U2-B6, then route to the v2 document loop. Never v1's 640-squash loop. | U2-E2 replaces them |
 | Stateless f32 path (`generate_stateless` → `decoder::forward(&Weights)`, `decoder.rs:699`; `mod.rs:4246/4278`; `FOCR_DECODE_STATELESS`) | **Support**. The only all-f32 native path: the f32-oracle rungs (L2 routing, L3, L4) run here (§7.2) | — |
-| Chunked prefill (`decoder.rs:1198` `chunk_prefill_attention`, `:1287` `prefill_with_cache_chunked`, `:2842` `prefill_with_cache_i8_chunked`; `FOCR_PREFILL_CHUNK`) | Refuse when `prefill_chunk_size()` is `Some` | F2 |
+| Chunked prefill (`decoder.rs:1198` `chunk_prefill_attention`, `:1287` `prefill_with_cache_chunked`, `:2842` `prefill_with_cache_i8_chunked`; `FOCR_PREFILL_CHUNK`, presence-based: any value arms it) | Refuse when `prefill_chunk_size()` is `Some` | F2 |
 | Batched / spine (`batched_decode_step_i8*` `decoder.rs:3211,3243`; `recognize_batch_spine` `mod.rs:2984`; `batch_scheduler.rs:43,440,487`) | Refuse | F5 |
-| Spec decode / verify (`spec_decode_i8` `mod.rs:4064`, reachable only via `generate_cached_i8` `:3887`; `verify_forward*` `decoder.rs:3495,3575`) | Refuse (defense in depth; the certified path cannot reach it) | Backlog |
-| `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD`, `FOCR_FUSE_NGRAM_LMHEAD` (reach the v2 path) | Refuse | F4 (bf16 KV), then per lever |
-| `FOCR_INT8_KV`, `FOCR_ATTN_GEMM`, `FOCR_QKV_FUSED` (default ON), `FOCR_RSWA_PARALLEL_ATTN` (reach only R-SWA or `_i8` paths), `FOCR_RESAMPLE` | Ignored, with `warnings[{kind:"ignored_lever"}]` | — |
-| `RunawayGuard` | Not used for v2 (the page guard plus the per-page cap replace it) | — |
+| Spec decode / verify (`spec_decode_i8` `mod.rs:4064`, reachable only via `generate_cached_i8` `:3887`; `verify_forward*` `decoder.rs:3495,3575`, no production caller) | Unreachable from the v2 paths: the `_i8` path is refused, and `FOCR_SPEC_DECODE`/`FOCR_SPEC_VERIFY` are ignored (row below) | Backlog |
+| `FOCR_LMHEAD_SHARD`, `FOCR_LMHEAD_SHARD_TILES` (presence-based, `decoder.rs:2098,2105,2115`; reach `lm_head_cached`, `decoder.rs:1088-1090`, on the conservative path) | Refuse | U2-C2 (L4 with the lever on), then supported-exact |
+| `FOCR_INT8_KV`, `FOCR_ATTN_GEMM`, `FOCR_RSWA_PARALLEL_ATTN` (read only in `rswa::decode_attention`/`RingCache::new`, which the SR-SWA arm never calls); `FOCR_QKV_FUSED` (default ON, `_i8` only); `FOCR_FUSE_NORM_QUANT` (`decoder.rs:2990`, `_i8` only); `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_SPEC_DECODE` (`generate_cached_i8` only, `mod.rs:3939,3949`); `FOCR_SPEC_VERIFY` (no production reader); `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD` (full-int8 recipe only, `mod.rs:480`); `FOCR_RESAMPLE` | Ignored, with `warnings[{kind:"ignored_lever"}]` | — |
+| `RunawayGuard`, `FOCR_RUNAWAY_GUARD` (`sampler.rs:53`) | Ignored, **once U2-B5/B6 stop building it on the v2 arm**: today it is built for every path (`mod.rs:3727`) and checked in `generate_cached` (`:3830`) and `generate_stateless` (`:4284`). The page guard plus the per-page cap replace it | — |
 | Resident daemon (`cli.rs:1650`, `resident.rs`) | Refuse for v2 until its protocol carries the v2 flags | Backlog (bd-fuh2) |
 
 Parity tests that must gain v2 lanes or explicit v2 skips:
@@ -1582,10 +1647,11 @@ JSON `pages[]`, figures, or robot events.
 - **Environment.** A venv with python 3.10, torch 2.13.0, transformers 4.52.1, tokenizers 0.21.4,
   addict, einops and easydict, **never shared with the v1 oracle**. Model at commit `5632329a`.
 - **Shims.** Mirror v1's `--device cpu --cpu-patch --f32` shims (`scripts/gen_reference_fixtures.py`:
-  flags `:225-245`, `_install_cpu_patches` `:292-321`, `_install_f32_patches` `:324-345`). `.cuda()` and
+  flags `:225-245`, `_install_cpu_patches` `:292-321`, `_install_f32_patches` `:324-347`). `.cuda()` and
   autocast become no-ops, and the whole pipeline computes in float32. That includes the image casts:
-  `MU:562,568` call `transform(...).to(torch.bfloat16)`, which v1's existing `Tensor.to` shim rewrites to
-  float32 (`:330-343`). Without it the L0 dumps would be bf16-rounded.
+  `MU:561,566` call `transform(...).to(torch.bfloat16)`, which v1's existing `Tensor.to` wrapper
+  rewrites to float32 (`:338-347`). Without it the L0 dumps would be bf16-rounded. The bf16 zero crop
+  placeholder at `MU:579` is not rewritten and is unused in base mode.
 - **DASH paths.** Prefill takes `_forward_dense` (SDPA) on CPU, and decode takes `_decode_attend`
   (§5.7). `DASH_STAGE0` stays unset; `TIME_DIAG` and `SPARSE_DIAG_LOG` stay off.
 - **Step 1 of A6 is feasibility.** If any DASH path is CUDA-only, the oracle script ports its dense
@@ -1617,7 +1683,7 @@ precedent.
 | S3 | The existing multi-page fixtures (p9_p14, p10, p20) under v2 |
 | S4 | 1 page, gundam (`crop_mode=True`) |
 | S5 | One 40–60 page document with ground truth (a MarathonDocBench subset, Apache-2.0), unwindowed. CPU f32 if the time is tolerable; otherwise bf16 on GPU, as ledger only. |
-| S1-corpus | v2 f32 CPU single-page base references for all 20 corpus pages (U2-C4's gate input), plus **v1 f32** CPU references for the same 20 pages from the existing `native_f32`/`--cpu-patch` generator, so C4's baseline is symmetric. Not an M0 exit item: generate it any time before U2-C4. U2-G1 generates the 20-page gundam set with the same script (`crop_mode=True`). |
+| S1-corpus | v2 f32 CPU single-page base references for all 20 corpus pages (U2-C4's gate input), plus **v1 f32** CPU references for the same 20 pages from the existing `native_f32`/`--cpu-patch` generator, so C4's baseline is symmetric. Not an M0 exit item: U2-C4 produces it with U2-A6's script if absent and records the commands in `tests/fixtures/PROVENANCE.md`. U2-G1 generates the 20-page gundam set with the same script (`crop_mode=True`). |
 
 **Nondeterminism floor.** Run each fixture twice, at two thread counts. Record bitwise token equality
 and the max hidden-state deltas. These set the tolerances (AGENTS testing policy).
@@ -1685,12 +1751,12 @@ U2-E4 before publishing.
 |---|---|
 | entmax-1.5 (both domains): sums to 1; support ≥ 1; monotone; shift-invariant; matches brute-force τ; top-M with merged padding ≡ full top-M, including rows whose max candidate x < −1e4+2 (§5.6.5) | B2 |
 | Page coordinates: bijective (bucket, tok) per sequence and decode state machine ≡ prefill builder on teacher-forced sequences with ≤ N generated markers (DISC-U2-7 tested separately); reused-window seed (§5.5); page_base parity invariant for every row with local_bucket > 0 (§5.10.4) | B1 |
-| Retirement: retired vs unretired runs give exact equality on S1–S3 fixtures; the detector fires on a synthetic extra-marker sequence; the pinned set survives (W=8 window 0, marker row 1919 ≡ 31 mod 32); no retirement on guard-forced steps | B4 (mechanism), D1a (pinned set) |
+| Retirement: retired vs unretired runs give exact equality on S1–S3 fixtures; the detector fires on a synthetic extra-marker sequence; the pinned set survives (W=8 window 0, marker row 1919 ≡ 31 mod 32); no retirement on guard-forced steps | B4 (mechanism, synthetic), C2 (S1–S3 fixtures), D1a (pinned set) |
 | Guard: never more than N markers; no EOS before N; the cap forces correctly; forced tokens are authoritative | B6 |
-| **Re-prefill ≡ incremental** on the conservative cached path (both §5.8 preconditions), retirement on and off; stateless f32 and cached agree on tokens on S1–S3 | C2 |
+| **Re-prefill ≡ incremental** on the conservative cached path (both §5.8 preconditions), retirement on and off (retired ≡ unretired); stateless-vs-cached agreement is L4's gate (§7.2), with its DISC escape | C2 |
 | Planner partition/lookahead/budget (own pages ≤ the page limit); splice copies equal their sources; reused-window seed and replayed page state equal the §5.10.4 table; one-page variant; stitching ownership, leading-text prepend (DISC-U2-9) and no leading-blank drop; fallbacks injected through a test hook | D1a |
 | Windowed pipeline: one vision encode per page (fallback recomputes counted separately); rasters dropped after their window; documents of page limit + 1 pages run windowed instead of being refused | D1b |
-| An unwindowed v2 document of page limit + 1 pages is refused with exit 2 (an explicit `PageWindow::Off` bypasses it); a position-limit stop writes the completed pages and ends in `run_error` with `finish_reason: "length"` and exit 5, never silent truncation | B6 |
+| An unwindowed v2 document of page limit + 1 pages is refused with exit 2 by default (an explicit `Some(PageWindow::Off)` bypasses it); a position-limit stop writes the completed pages and ends in `run_error` with `finish_reason: "length"` and exit 5, never silent truncation | B6 |
 | v1 multi-page reports what happened: `v1_truncated` at the clamp (via `FOCR_TEST_MAX_POSITIONS`), `v1_page_merge` on every recorded fixture (p9_p14 gives 1 body for 2 pages), a synthetic exactly-N string gives no warning; exit 0 and v1 text unchanged; every emitted robot event validates against `event_fields` | X2 |
 | Added-token splitting is idempotent; `<PAGE>` round-trips; fuzz over interleavings | A4 |
 | UTF-8-safe incremental decode across split CJK characters and page boundaries | X1 |
@@ -1702,9 +1768,10 @@ U2-E4 before publishing.
    the new frame, and forces `<PAGE>`.
    - It is **ported function by function** from `W/session/uocr_doc_reuse.py`,
      `W/entrypoints/openai/doc_split.py` and `W/layers/attention/unlimited_ocr_v2_backend.py:1001-1031`,
-     by an author other than U2-D1a's implementer. That author does not read §5.10, U2-D1a or the
-     truth-pack notes until the oracle's self-tests pass, so it is an independent reading, not a
-     restatement of ours.
+     by an author other than U2-D1a's implementer, from the pinned wheel's source files only (U2-A1
+     pins the wheel by SHA-256). That author never reads the U2-A1 truth-pack notes or the SGLang spec
+     comment (they are the first reading), and does not read §5.10 or U2-D1a until the oracle's
+     self-tests pass, so it is an independent reading, not a restatement of ours.
    - U2-D2a depends only on A1 and A6. U2-D1a depends on U2-D2a, so the oracle exists before the Rust
      windowed core is written.
    - U2-D2b uses it to gate U2-D1a token-exactly (f32) at W=2 and W=3 on 5–9-page documents, which
@@ -1713,9 +1780,12 @@ U2-E4 before publishing.
      (DISC-U2-9) to the oracle's ids.
    - Fallback-recompute windows are forced through a test hook (natural fallbacks (iv) and (v) cannot
      happen with real v2 pages, §5.10.5). Up to and including the `<PAGE>` that opens the lookahead page,
-     each must equal an unwindowed run over the same pages + lookahead executed with page_base = lo,
-     expected = own pages, end-on-marker and guard-first order. HF `infer_multi` is not that reference
-     when lo is odd.
+     each must equal an unwindowed run over the same pages + lookahead, configured the way the wheel
+     configures a recomputed window: page_base, the expected marker count, end_on_marker and the
+     logit-processor order are derived from the wheel source and recorded in the oracle's notes. A
+     recomputed **last** window (no lookahead) runs with end_on_marker = false and is compared through
+     EOS. HF `infer_multi` cannot serve as that reference, because its page parity, expected count and
+     processor order follow an unwindowed request.
    - If a GPU host is available, it is compared once against the SGLang wheel. That comparison is
      informational, because of DISC-U2-1/5/8.
 2. **Invariants.**
@@ -1725,9 +1795,13 @@ U2-E4 before publishing.
    - resume byte-identical (D14);
    - peak RSS within the window plan.
 
-   W ≥ N is unwindowed by definition, so that case is a smoke test only.
-3. **Accuracy.** On S5 and a MarathonDocBench subset, compare windowed (W=10) and unwindowed
-   (`PageWindow::Off`, which bypasses the pre-windowing refusal) CER, both against ground truth.
+   W ≥ N is unwindowed by definition, so that case is a smoke test only. In the oracle's degenerate
+   case (W ≥ N), the windowed oracle, run through its own loop (one window, no lookahead; never by
+   delegating to `infer_multi`), equals the unwindowed HF `infer_multi` output token for token.
+3. **Accuracy.** On S5 and a MarathonDocBench subset, compare windowed (W=10) and unwindowed CER, both
+   against ground truth. The unwindowed side runs U2-B6's document loop with
+   `enforce_page_limit = false` (what `Some(PageWindow::Off)` maps onto), which bypasses the
+   pre-windowing refusal.
    Windowed must not be worse than unwindowed beyond a pre-registered tolerance; Baidu calls the scheme
    approximate. U2-D2b records a pass/fail verdict against that tolerance, and U2-E5a reads the verdict.
 
@@ -1749,13 +1823,15 @@ decoder evidence.
 
 ### 7.7 E2E scripts and logging (U2-T1a, U2-T1b)
 
-`scripts/uocr2_e2e.sh` is model-gated and emits NDJSON logs per `docs/TEST_LOGGING.md`. Each step
-writes one line with timings, model id, artifact SHA, peak RSS, outcome, and the native-path proof
-fields `native_path_ran` and `fallback_target`.
+`scripts/uocr2_e2e.sh` emits NDJSON logs per `docs/TEST_LOGGING.md`. Each step writes one line with
+timings, model id, artifact SHA, peak RSS, outcome, and the native-path proof fields `native_path_ran`
+and `fallback_target`. Model gating is per step: a step that needs the v2 artifact skips with SUCCESS
+(exit 0, logged "skipped: weights absent") when it is absent.
 
-**T1a (M2):**
-- (a) single page, base, and (b) 3-page document. Both run only under `FOCR_E2E_LONG=1`, because the
-  U2-T3 v2 lane already decodes the same pages in check.sh;
+**T1a (M2).** (a), (b), (c), (h) and (r) run only under `FOCR_E2E_LONG=1`, because they decode long or
+repeated inputs and the U2-T3 v2 lane already decodes the same pages in check.sh. (j)'s refusal half
+and (p) use synthetic artifacts and always run.
+- (a) single page, base, and (b) 3-page document;
 - (c) 20-page document;
 - (g) v1 regression check;
 - (h) `--json --extract-figures` per-page outputs in document mode;
@@ -1768,19 +1844,23 @@ fields `native_path_ran` and `fallback_target`.
 - (k) CJK streaming across a split character;
 - (l) v1 honest reporting (U2-X2, reaching the clamp through `FOCR_TEST_MAX_POSITIONS`) plus the
   v1→v2 pull hint (U2-E4);
-- (m′) the U2-B6 pre-windowing limit: a document of page limit + 1 pages is refused with exit 2. U2-D1b
-  deletes this step when it lands; T1b's (m″) owns the replacement;
+- (m′) the U2-B6 pre-windowing limit: a document of page limit + 1 pages is refused with exit 2. Added
+  only while U2-D1b is open; U2-D1b deletes it when it lifts the limit, and T1b's (m″) owns the
+  replacement;
 - (p) health, doctor and triage (added by U2-E7);
 - (r) `ocr-batch --model unlimited-ocr-2` over 3 images, and with `--multi-page` over one 3-page
   document. Outputs equal the solo v2 runs.
 
-**T1b (M3):**
+**T1b (M3).** Every T1b step decodes long documents, so each runs only under `FOCR_E2E_LONG=1`;
+`check.sh` runs none by default.
 - (d) 35-page windowed document, W=10, built by concatenating corpus pages;
 - (e) resume after an injected cancellation at window 2, byte-identical;
 - (f) every line from (d), (e) and (m) validates against `robot schema`'s `event_fields` (added by
   U2-X2 and extended since);
 - (m) page-failure skip with source-page map continuity;
-- (m″) a document of page limit + 1 pages runs windowed, exit 0, with every body in order;
+- (m″) a document of N pages, where N is (page limit + 1) rounded up to the next N with N mod 10 == 1,
+  runs windowed at W=10 in ceil(N/10) windows, exit 0, with N bodies in order. The last window has one
+  own page;
 - (n) directory input;
 - (o) a ≥ 300-page synthetic run, recording the RSS bound and time-to-first-page;
 - (q) a 35-page windowed `--json --extract-figures` run: `pages[]` has length 35, and figures are named
@@ -1841,8 +1921,9 @@ own counter test. F1's breakdown measures them; there is no separate pass for th
 4. **Prefill attention parallelism.** Rayon over (head, query-chunk) tiles inside the forward.
 5. **Vision once per page in windowed mode.** Lookahead KV is copied, never re-encoded.
 6. **Chunked prefill for v2.** This lifts the D18 refusal. Every chunk uses the unchunked
-   M = min(16, ceil(S_prompt/32)) (§5.6.5). Bit-identity with unchunked prefill is asserted on rows
-   whose max candidate x ≥ −1e4+2, and the other rows are logged.
+   M = min(16, ceil(S_prompt/32)) and counts pads from the logical nblk (§5.6.5), so routing
+   selections match unchunked prefill unconditionally. Any logit difference is accumulation order in
+   the chunked attention, which U2-F2 must show is zero.
 
 ### 8.3 Lossy levers (kill-switch gated, CER-measured; U2-F4)
 
@@ -1876,7 +1957,8 @@ which is roughly 4–17 hours per 1,000 pages. The docs say so, and progress out
 - `--model` already resolves bare ids. Candidates are `<id>`, `<id>.focrq`,
   `<id>.v<ver>.{int8,int4}.focrq` and `<id>.{int8,int4}.focrq`.
 - Search order: `FOCR_MODEL_DIR` entries, then `<cache>/models`, then sorted `<cache>/models/*/`
-  (`mod.rs:917-943`).
+  (`mod.rs:917-943`). This order already exists (bd-av64.7). U2-E1 adds no tier: it adds the
+  header-arch check, closes the two short-circuits below, and pins the order with tests.
 - **Two short-circuits must not fire for a bare registry id**:
   - each search dir short-circuits if it is itself a raw package, for any spec (`mod.rs:1162-1166`, via
     `:855-864`). So `FOCR_MODEL_DIR` pointing at a v1 raw dir would load v1 for
@@ -1901,6 +1983,8 @@ focr ocr doc.pdf --model unlimited-ocr-2 [--pages …] [--split-spreads]
 focr ocr ./scanned_book_pages/ --model unlimited-ocr-2 [--multi-page]   # directory = one document
                                                     # (D24); --multi-page needed until E5a flips
 ```
+- **Flag owners.** `--page-window` is U2-D5's. `--resume[=recompute]` and `--keep-checkpoint` are
+  U2-D4's (help text and FEATURE_PARITY rows); U2-D5 only cross-references them in help.
 - **Refusals today** (`cli.rs`): non-PDF input with `--multi-page` (`:1386-1392`); `--multi-page` with
   split or figures (`:1393-1399`); and a mode-independent `--split-spreads` + `--extract-figures`
   refusal (`:1401-1408`).
@@ -1926,9 +2010,9 @@ PDF-only today, so image lists go through `ocr-batch --multi-page` (T1a step (r)
   - an over-limit unwindowed document exits 2 (D11).
 
 **`focr models`.** It lists `unlimited-ocr-2` with status, tasks, recipe, the note "best for:
-documents and long documents", and pull state. The ID column is widened (`cli.rs:2680`). Status is
+documents and long documents", and pull state. The ID column (`{:<14}`, `cli.rs:2684`) is widened. Status is
 rendered in two places, JSON (`cli.rs:2593`) and the table (`:2691`), both from
-`ModelArch::maturity()`. The guidance text lives in the `guidance` map (`:2672`).
+`ModelArch::maturity()`. The guidance text lives in the `guidance` map (`:2675`).
 
 **Help text.** It explains when to use v1 vs v2 and corrects the v1 limit text (U2-X2):
 - `cli.rs:230` ("must fit the 32K context") and `cli.rs:349` ("32K (~290 pages)") become "32,768
@@ -1937,27 +2021,28 @@ rendered in two places, JSON (`cli.rs:2593`) and the table (`:2691`), both from
 - `lib.rs:705-714` documents only the prompt-overflow error and omits the output clamp. It gains the
   clamp and the warnings.
 - `README.md:411-412` ("roughly 290 pages; over-budget requests fail … instead of truncating") is false
-  given the clamp at `mod.rs:2779-2782`, and is corrected too.
+  given the clamp (`mod.rs:2778-2785`; the clamp is at `:2783`), and is corrected too.
 
 **v1 budget errors.** Once the artifact is published (E4), the `v1_truncated` and `v1_page_merge`
 warnings and the prompt-too-long error name `focr pull unlimited-ocr-2` as their `recovery`.
 - The warnings get it through U2-X2's shared remediation function.
 - The prompt-too-long error is `FocrError::Other` at `mod.rs:2750-2758` (exit 1), and gets it there.
-- `with_pull_hint` (`cli.rs:3036-3042`) is applied only to `ModelNotFound` today (`cli.rs:1703/1706`).
+- `with_pull_hint` (`cli.rs:3036-3042`) is applied only to `ModelNotFound` today (`cli.rs:1704/1707`).
   It becomes model-aware.
 
 ### 9.2 Robot mode (additive; D15)
 
-**`page`** keeps its existing fields and adds new ones. Today the two statuses differ (`robot.rs:205-232`,
-`cli.rs:1841`):
+**`page`** keeps its existing fields and, on v2 runs, adds new ones. Today the two statuses differ
+(`robot.rs:205-232`, `cli.rs:1841`):
 - decoded: `{status, page (model emission index), chars, text}`;
 - skipped: `{status, page (1-based source PDF page), error_kind, message}`.
 
-Both keep those fields and `page` semantics unchanged. Both gain:
+Both keep those fields and `page` semantics unchanged. **On v2 runs**, both gain:
 ```
 source_page:<1-based PDF page / file index>, half:"left"|"right"|null, window:<k>|null, model_id
 ```
-Decoded events also gain `tokens`, `finish:"marker"|"eos"|"page_cap"|"length"` and `elapsed_ms`.
+Decoded v2 events also gain `tokens`, `finish:"marker"|"eos"|"page_cap"|"length"` and `elapsed_ms`.
+- **v1 `page` events are unchanged**: v1 merges pages, so its bodies have no reliable source page.
 - It is emitted as each page body completes, using token-id segmentation (D20).
 - **Ownership:** U2-E3 (M2) adds every field except `window`, with their volatile-list entries, so
   v2's document mode and streaming ship with them. U2-D5 adds `window`.
@@ -1969,16 +2054,21 @@ Decoded events also gain `tokens`, `finish:"marker"|"eos"|"page_cap"|"length"` a
 ```
 
 **`run_complete` additions:** `model_id`, `artifact_sha256`, `pages_out`, `pages_skipped`, `windows`,
-`extra_markers`, `finish_reason`, `warnings[]` and `resumed_from` (owned by U2-D4).
+`extra_markers` (U2-D5 adds `pages_out`, `pages_skipped`, `windows` and `extra_markers`),
+`finish_reason` and `warnings[]` (U2-X2), and `resumed_from` (owned by U2-D4). The library mirror is
+U2-E2's `DocumentResult`, which gains `warnings: Vec<Warning>` with the same `{kind, message, recovery,
+…}` entries, so library-side kinds reach the CLI and library users.
 
 **Terminal events.** `run_complete` stays the success terminal (`robot.rs:140`), and every nonzero exit
 ends with `run_error`. A nonzero exit never follows `run_complete`.
-- `finish_reason` on `run_complete` (every one) is `stop`, or `length` for v1 truncation only (exit 0,
-  with `v1_truncated`).
+- `finish_reason` on `run_complete` (every one) is `stop`, or `length` for v1 truncation only (exit 0).
+  A multi-page v1 truncation carries `v1_truncated`; a v1 page merge keeps `stop` with `v1_page_merge`;
+  a single-page v1 run stopped by `--max-length` reports `length` with no warning.
 - A **partial-output `run_error`** (exit 5 or 6, after the completed pages are written) carries the
-  additive fields `finish_reason` (`length` for v2's position limit, `budget`, `cancelled`), `pages_out`
-  and `warnings[]`, and from U2-D4, `checkpoint` and `resumed_from`.
-- `ocr_robot_*_stream_matches_exit_code` (`tests/cli_robot_golden.rs:1365-1623`) is updated for the new
+  additive fields `finish_reason`, `pages_out` and `warnings[]`, and from U2-D4, `checkpoint` and
+  `resumed_from`. U2-B6 builds that path and produces `length` (v2's position limit) and `budget`;
+  U2-D1a produces per-window `budget`; U2-E2 produces `cancelled`; U2-D4 checkpoints on each.
+- `ocr_robot_*_stream_matches_exit_code` (`tests/cli_robot_golden.rs:1365-1613`) is updated for the new
   fields, and the schema's `status` string with it.
 
 **`warnings[]`.**
@@ -2008,8 +2098,8 @@ ends with `run_error`. A nonzero exit never follows `run_complete`.
   - `stage` has no emitter today, so it is listed as `{reserved: true}`.
   - A stream contract test validates every emitted line in `tests/cli_robot_golden.rs` against it.
     Today the schema lists only event kinds, so no field can be validated.
-  - Every later bead that adds fields extends `event_fields` in the same change: B6, E1, E3, D1a/D3
-    (`window`), D4, D5 and E7.
+  - Every later bead that adds fields or warning kinds extends `event_fields` in the same change
+    (U2-A7, D0, B6, E1, E3, D4, D5; D5 owns the `window` event).
 - `robot schema` and the frozen fixture `tests/fixtures/robot_schema_v1.json` are regenerated with
   `UPDATE_GOLDENS=1` as a reviewed golden change. The schema stays v1 (additive).
 - **Test-only position limit.** `DecodeParams.max_positions` (`#[doc(hidden)]`) is also settable
@@ -2060,6 +2150,14 @@ let doc = engine.recognize_document(
 )?;
 ```
 - The call is synchronous and blocking; the runtime is owned internally.
+- **Page window.** `DocumentOptions.page_window` is `Option<PageWindow>`, and U2-E2 owns the
+  `PageWindow::{N, Auto, Off}` enum. `None` is the default policy: until U2-D1b lands, unwindowed with
+  U2-B6's page limit enforced; after it, W=10 for N > W. `Some(PageWindow::Off)` is the explicit
+  unwindowed request that bypasses the limit (U2-B6's `enforce_page_limit = false`).
+- **Result.** `DocumentResult { pages_out, pages_skipped, windows, extra_markers, finish_reason,
+  warnings, resumed_from, model_id, artifact_sha256 }`. `warnings: Vec<Warning>` carries U2-X2's
+  `{kind, message, recovery, …}` entries, so library-side kinds (`leading_text`, `v2_length`,
+  `v1_page_merge`, `resume_recompute`, `ignored_files`) reach the CLI and library users.
 - It replaces the five `recognize_multi_page*` wrappers (`lib.rs:703-802`), with a minor-version bump
   and a CHANGELOG migration table (owned by U2-E2).
   - Other callers migrate in the same change: `cli.rs:2221-2222`, `tests/e2e_recognize.rs:684-817` and
@@ -2109,7 +2207,9 @@ let doc = engine.recognize_document(
   reviewed golden change.
 - **`doctor`** scans per-model subdirectories: `detect_model_not_resolvable` (`doctor.rs:121`),
   `detect_stale_focrq_format` (`:142`) and `detect_unreadable_cache_entries` (`:186`). Orphan scanning
-  already recurses (`:273`).
+  already recurses (`:273`). `detect_model_not_resolvable` is not a no-op: it checks only the default
+  model spec and ignores the doctor root, so it too gains the per-model tier (each installed model's
+  resolvability is reported).
   - It detects a v1 tokenizer beside a v2 artifact and reports `tokenizer_mismatch` as
     `RefusedUnsafe { recommended_command: "focr pull unlimited-ocr-2" }`.
   - There is no `.bak` next to the file and no network access inside `doctor --fix`.
@@ -2230,8 +2330,9 @@ Each milestone ends with something a user can run, and each has an exit gate.
 - **User value:** `focr ocr --model /path/to/Unlimited-OCR-2/` (raw BF16 shards, experimental) works
   for single pages (base) and for unwindowed documents.
 - **Exit:**
-  - L0–L4 green on S1–S3 against the f32 oracle, on the stateless f32 path and on the conservative
-    cached path (§7.2);
+  - L0–L4 green on S1–S3 against the f32 oracle on the stateless f32 path;
+  - `generate_cached` L4 token-exact on S1–S3, or any mismatch root-caused to the int8 FFN quant
+    effect and recorded as a DISC (§7.2);
   - retirement exact on the fixtures, or `FOCR_SRSWA_RETIRE` defaulted to 0 with a filed bug. E5a's RSS
     bound then decides whether that matters;
   - v1 gate green.
@@ -2273,7 +2374,8 @@ iOS/WASM/site v2 lanes.
 **Critical path.** The longest blocking chain in the bead graph has 14 beads (recomputed after bead
 polish round 3. The round-3 edges B4 → B3, D1a → D2a, F4 → D2b and G2 → C5b do not lengthen it:
 B3 sits at B2's depth, so A1 → B1 → B3 → B4 → … is an equally long chain; D2a sits at depth 3; and
-F4 and G2 sit on short side branches):
+F4 and G2 sit on short side branches. The round-4b edges A7 → X2 and D0 → X2 do not lengthen it
+either: X2 sits at depth 2, below A7's A5 input, and D0 only feeds D1b, which waits on E2):
 ```
 A1 → B1 → B2 → B4 → B5 → B6 → E3 → E2 → D1b → D4 → D5 → T1b → E5a → E6b
 ```
@@ -2281,7 +2383,7 @@ E3 owns the library `PageResult` that E2 reuses. The certification track runs al
 T1b and E5a:
 ```
 T3 → A2 → A5 → A7 → B5 → C1 → C2 → C4 → E4 → T1a → T1b
-T3 → X2 → B6
+T3 → X2 → B6, A7, D0
 B1 → B3 → B4
 A1, A6 → D2a
 B4, B6, D2a → D1a ─┬→ D2b (← D2a) → C5b → E5a
@@ -2316,7 +2418,7 @@ evidence-gated defaults [uocr2,epic].
 - **U2-A4** — Tokenizer v2: added tokens 128827–128830, v2 tokenizer pin, conformance vs HF [uocr2,conformance,tokenizer] (T3,A1) — `bd-uocr2-epic-cgux.5`
 - **U2-A5** — Register `unlimited-ocr-2` ModelArch (implemented=false) + delta census + vision byte-identity hashes + per-model artifact version + recipe id [uocr2,identity] (A1,A2,A3,A4) — `bd-uocr2-epic-cgux.6`
 - **U2-A6** — v2 reference oracle: f32 CPU primary (feasibility first), bf16 ledger, dumps, fixtures S1–S5, nondeterminism floor [uocr2,conformance,oracle] (A1) — `bd-uocr2-epic-cgux.7`
-- **U2-A7** — Fail-closed v2 dispatch: every decode path, lever, daemon and recipe supports v2 or refuses it before weights load [uocr2,identity,safety] (A5) — `bd-uocr2-epic-cgux.8`
+- **U2-A7** — Fail-closed v2 dispatch: every decode path, lever, daemon and recipe supports v2, is ignored with a warning, or refuses it before weights load [uocr2,identity,safety] (A5,X2) — `bd-uocr2-epic-cgux.8`
 - **U2-X1** — Fix multi-page streaming: page events stop permanently after a split multi-byte UTF-8 char (v1 bug); UTF-8-safe incremental decoder [uocr2,bug,streaming] (T3) — `bd-uocr2-epic-cgux.9`
 - **U2-X2** — v1 multi-page honest reporting: truncation and page-merge warnings, run_complete finish_reason/warnings, robot event_fields, help-text fix [uocr2,bug,cli,robot] (T3) — `bd-uocr2-epic-cgux.51`
 
@@ -2338,14 +2440,14 @@ evidence-gated defaults [uocr2,epic].
 - **U2-C5b** — Ground-truth head-to-head: long documents (windowed v2 vs failure-scored v1) + entmax-domain and doc crop-mode evidence [uocr2,eval,longdoc] (C5a,D3,D2b) — `bd-uocr2-epic-cgux.22`
 
 **D — Documents and unlimited horizon**
-- **U2-D0** — Streaming page source: lazy per-window rasterization, source-page map, directory input, page-failure skip; multi-page CLI moved onto it [uocr2,longdoc,pdf] (T3) — `bd-uocr2-epic-cgux.23`
+- **U2-D0** — Streaming page source: lazy per-window rasterization, source-page map, directory input, page-failure skip; multi-page CLI moved onto it [uocr2,longdoc,pdf] (T3,X2) — `bd-uocr2-epic-cgux.23`
 - **U2-D1a** — Windowed decoding core: planner, lookahead, retention, splice (incl. one-page variant), forced `<PAGE>`, fallback, stitching, page_base, worked coordinate table [uocr2,decoder,longdoc] (B4,B6,D2a) — `bd-uocr2-epic-cgux.24`
 - **U2-D1b** — Windowed document pipeline: streaming page source per window, raster dropping, once-per-page vision, recognize_document integration, W=10 default [uocr2,decoder,longdoc,pdf] (D0,E2,D1a) — `bd-uocr2-epic-cgux.49`
 - **U2-D2a** — Independent Python windowed oracle, written from the SGLang wheel source (not from the Rust implementation) [uocr2,conformance,longdoc,oracle] (A1,A6) — `bd-uocr2-epic-cgux.50`
 - **U2-D2b** — Windowed validation: splice parity W=2/3 vs the independent Python oracle, invariants, accuracy vs unwindowed [uocr2,conformance,longdoc] (D2a,D1a) — `bd-uocr2-epic-cgux.25`
 - **U2-D3** — Whole-process memory estimator, `--page-window auto`, RSS measurement [uocr2,longdoc,memory] (D1b) — `bd-uocr2-epic-cgux.26`
 - **U2-D4** — Durable resume: sidecar checkpoints, `.partial` output, resume key, byte-identical resume [uocr2,longdoc,storage] (D1b) — `bd-uocr2-epic-cgux.27`
-- **U2-D5** — Streaming UX: extended page event, new window event, progress/ETA, --page-window/--resume/--keep-checkpoint flags [uocr2,cli,longdoc,robot] (D3,D4,E1,D1b) — `bd-uocr2-epic-cgux.28`
+- **U2-D5** — Streaming UX: page.window field, new window event, progress/ETA, --page-window flag [uocr2,cli,longdoc,robot] (D3,D4,E1,D1b) — `bd-uocr2-epic-cgux.28`
 
 **E — Product surface**
 - **U2-E1** — CLI/robot basics for v2: id resolution with per-model version, crop-mode semantics, `focr models` row, model_id in outputs, schema/surface rows [uocr2,cli,robot] (B6) — `bd-uocr2-epic-cgux.29`
@@ -2392,14 +2494,14 @@ evidence-gated defaults [uocr2,epic].
 | R5 | Memory for long documents (120 KiB per token in f32) | H | H | Block retirement (D9), windowing, bf16 KV (F4), the estimator, `auto` W |
 | R6 | Silent misload of v1 artifacts after a default change | M | H | A2 lands first; a test-only registry with v2 as default |
 | R7 | The shared-decoder refactor perturbs v1 | M | H | T3 token-id goldens before B5; enum dispatch; the shared `prefill_attention` stays untouched |
-| R8 | Windowed mode is approximate (Baidu's word) | M | M | Splice parity against a Python oracle; accuracy vs unwindowed (`PageWindow::Off`) and vs ground truth, with a pass/fail verdict against a pre-registered tolerance; W tunable |
+| R8 | Windowed mode is approximate (Baidu's word) | M | M | Splice parity against a Python oracle; accuracy vs unwindowed (`Some(PageWindow::Off)`) and vs ground truth, with a pass/fail verdict against a pre-registered tolerance; W tunable |
 | R9 | The windowed reference exists only as a GPU SGLang wheel | H | L | Independent Python windowed oracle on the HF model, ported function by function from the wheel before U2-D1a is written; an optional SGLang run |
 | R10 | Distribution blocked by the missing HF org (bd-3p8y) | H | L | GitHub release parts are primary |
 | R11 | License ambiguity (no LICENSE file in the HF v2 repo) | L | M | Use the GitHub LICENSE text and the HF metadata; record both in the truth pack and the artifact notice |
 | R12 | Process ceremony crowding out shipping | M | M | Every bead closes on cited evidence; tests live in the beads that own them; no spec-only beads beyond A1 |
 | R13 | No CUDA host (the v1 bf16 oracle never ran here) | H | H | f32 CPU oracle as primary (D4); GPU only for the optional ledger |
 | R14 | Eager rasterization (plus a clone) exhausts RAM on books before KV matters | H | H | Streaming page source (U2-D0); RSS exit gate at M3 |
-| R15 | A v2 artifact silently runs v1 math through an unaudited lever or the unknown-id fallthrough | M | H | D18 fail-closed dispatch: a pre-load refusal (exit 2), `UOCR2_LEVER_POLICY` classified by effective state, a census test over every `FOCR_*` variable, and a per-lever test (U2-A7) |
+| R15 | A v2 artifact silently runs v1 math through an unaudited lever or the unknown-id fallthrough | M | H | D18 fail-closed dispatch: a pre-load refusal (exit 2), `UOCR2_LEVER_POLICY` classified by effective state (presence-based levers by presence; `FOCR_RUNAWAY_GUARD` ignored only once the v2 arm stops building it), a census test over every `FOCR_*` variable, and a per-lever test (U2-A7) |
 | R16 | Baidu built both ground-truth benchmarks, so the head-to-head may favor v2's training distribution | M | M | ≥ 1/3 non-Baidu documents (OQ-V2-15) |
 | R17 | Real book PDFs use JBIG2, JPX or vector content the PDF path refuses (bd-0a7) | H | M | Skip pages and keep the source map; directory input (D24); a follow-up decoder evaluation |
 | R18 | Book runs take hours on CPU (estimate: 4–17 h per 1,000 pages), exposed to sleep and throttling | H | M | Byte-identical resume; partial output written before an exit 5/6 (budget checked cooperatively inside the document loop, D11); an ETA; honest docs |
@@ -2426,10 +2528,10 @@ evidence-gated defaults [uocr2,epic].
 | OQ-V2-8 | Tokenizer handling of non-special added tokens | PARTIAL: the splitter already handles them; conformance fixtures and the required-token check are pending | U2-A4 updates it; U2-A5 closes it once the required-token check is wired |
 | OQ-V2-9 | Windowed accuracy vs unwindowed | OPEN | U2-D2b |
 | OQ-V2-10 | v2 single-page base vs gundam | OPEN | U2-G2 |
-| OQ-V2-11 | Block-granular retirement is output-exact under the guard | OPEN (proof obligation; argued in §5.12) | U2-B4 |
+| OQ-V2-11 | Block-granular retirement is output-exact under the guard | RESOLVED (mechanism, 2026-10-29): retired and unretired synthetic S1–S3-shaped runs agree bit for bit; the detector passes only guard-forced open rows; pinned rows survive; fixture equality is U2-C2's | U2-B4 (`srswa.rs` cache tests) |
 | OQ-V2-12 | Licenses of evaluation sets beyond MarathonDocBench (MPDocBench, OmniDocBench) | OPEN | U2-C5a |
 | OQ-V2-13 | Does the conservative int8 recipe hold v2 CER within budget? | OPEN | U2-C4 |
-| OQ-V2-14 | Document-mode crop mode: Baidu's long-document numbers are plausibly gundam (the SGLang default) | OPEN | U2-C5b, U2-G2 |
+| OQ-V2-14 | Document-mode crop mode: Baidu's long-document numbers are plausibly gundam (the SGLang default) | OPEN | U2-C5b resolves it, or defers its gundam cells to U2-G2, which runs them on C5b's long-document subset (same harness and invocation) and resolves it |
 | OQ-V2-15 | Non-Baidu ground-truth documents for the head-to-head (sources, licenses, normalization) | OPEN | U2-C5a |
 | OQ-V2-16 | Entmax domain for long documents (TopM vs AllCandidates) | OPEN | U2-C5b |
 
@@ -2523,7 +2625,7 @@ tree first. The material corrections:
   - U2-B6 refuses unwindowed v2 documents over 60 pages with exit 2 until U2-D1b.
   - A position-limit stop gives `finish_reason: "length"` and exit 5.
   - Cancellation exits 6.
-  - U2-E4 also surfaces v1's existing silent clamp (`mod.rs:2779-2784`).
+  - U2-E4 also surfaces v1's existing silent clamp (`mod.rs:2778-2785`).
 - **Splits.**
   - U2-D1 → D1a (windowed core: B4, B6) and D1b (pipeline: D1a, D0, E2; W=10 default; lifts the
     60-page limit).
@@ -2640,8 +2742,8 @@ What changed:
   - Unreachable levers are ignored with a warning instead of refused.
 - **Gates.**
   - C4's v1 baseline uses v1 **f32** references (U2-A6's S1-corpus row), so both lanes are symmetric.
-  - The page limit re-derivation uses p90 plus one p99 tail, not per-page p99, and `PageWindow::Off`
-    bypasses the refusal.
+  - The page limit re-derivation uses p90 plus one p99 tail, not per-page p99, and
+    `Some(PageWindow::Off)` bypasses the refusal.
   - R20 runs in C2 and E4, not C4.
   - DISC-U2-k entries are filed under numeric `DISC-NNN` headings, so `check_ledgers.py` enforces them.
 - **Ownership and process.**
@@ -2656,13 +2758,51 @@ What changed:
 - **Edges.**
   - B4 depends on B3, whose `BlockKv` view it implements.
   - D1a depends on D2a, so the oracle exists first.
-  - Neither lengthens the 14-bead critical path.
+  - F4 depends on D2b, whose subset it reuses; G2 depends on C5b, whose long-document evidence it
+    reads.
+  - None lengthens the 14-bead critical path. The review of these edits (round 4b) added A7 → X2 and
+    D0 → X2.
 - **Rejected.**
   - The claim that D0, D1b and C5b are blocked by bd-paom, bd-3gyt, bd-0a7, bd-0a7.4 and bd-322.18
     (`br show` lists them as `related`).
   - Moving E2 after D1b: D1b integrates through E2's `recognize_document`.
 - **Deferred to the user.** An earlier `--multi-page` default flip for documents within the page
   limit, on C5a evidence at M2. It would split default behavior by page count.
+
+**Round 4b (2026-10-29): review of round 4's edits.** Three independent, read-only reviewers read the
+round-4 diffs (`round3_beads.diff`, `round3_plan.diff`) for code claims (16 findings), spec fidelity
+(14) and consistency (25), about 55 in all. The load-bearing code facts were re-verified before they
+were applied: `RunawayGuard` built at `mod.rs:3727` and checked at `:3830`/`:4284`;
+`lmhead_shard_enabled` presence-based at `decoder.rs:2115`; `p_new` counting lookahead (wheel `:260`);
+HF prefill nblk from the forward's query count (`MD:436-445`).
+- **Levers (D18, §6.2).** `FOCR_RUNAWAY_GUARD` reaches both v2 paths today, so it is ignored only once
+  U2-B5/B6 stop building it on the v2 arm. Presence-based levers are classified by presence.
+  `FOCR_INT8_ATTN`/`_LMHEAD`, `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_SPEC_DECODE`/`_VERIFY` and
+  `FOCR_FUSE_NORM_QUANT` are ignored (they reach only `_i8` or full-int8 code), and
+  `FOCR_LMHEAD_SHARD`/`_TILES` are refused until U2-C2.
+- **Spec (§5).** The one-page splice applies to the last window only. HF prefill nblk is defined on
+  an empty cache, with franken_ocr's rule for extends over a reused window. The pad condition is
+  sufficient, not iff, and the re-prefill precondition adds "no candidate x ≤ −1e4"; chunked ≡
+  unchunked selection is unconditional. `cnt[]` replays the rewritten prompt only. `inv_tok` is
+  asserted against the oracle's dump. The last-page ban rationale is `end_on_marker = (lookahead > 0)
+  || reused`. `ctx` subtracts the wheel's −1/−5 margins. The streaming handler's end-of-window
+  `select_batch_output` drops leading blanks too. A recomputed last window's reference runs with
+  end_on_marker = false.
+- **Product surface (§3, §4, §9).** `PageWindow`'s default (`None`, limit enforced) is distinct from an
+  explicit `Some(PageWindow::Off)`. v1 `page` events are unchanged; the new fields are v2-only. The
+  stop producers are named (B6 `length`/`budget`, D1a per-window `budget`, E2 `cancelled`, D4
+  checkpoints). D4 owns `--resume`/`--keep-checkpoint`. `DocumentResult` gains `warnings`. The
+  `event_fields` extender list is corrected. The model-resolution tiers already exist (bd-av64.7), and
+  `detect_model_not_resolvable` checks only the default spec.
+- **Gates (§7, §11).** The M1 exit separates the stateless f32 L0–L4 gate from the cached path's L4
+  (token-exact, or a root-caused int8 FFN DISC). Retirement is owned by B4 (synthetic), C2 (fixtures)
+  and D1a (pinned set). D2a reads only the pinned wheel source and runs its own loop for W ≥ N. e2e
+  gating is per step, every T1b step runs under `FOCR_E2E_LONG`, and (m″) is sized from the page limit.
+- **Edges.** A7 → X2 and D0 → X2 (both register warning kinds in X2's `event_fields`). Neither
+  lengthens the critical path.
+- **Citations.** `cli.rs:2684`, `cli.rs:1704/1707`, `mod.rs:2778-2785`, final flush `:2821`,
+  `_install_f32_patches` `:324-347`, `MU:561,566`, `cli_robot_golden.rs:1365-1613`,
+  `quant_ffn_loaded` → `quant_oc_loaded`.
 
 **Not yet done.** No GPT Pro or other non-Claude review round has run. The planning workflow
 recommends 4–5 rounds with GPT Pro Extended Reasoning. The exact prompt is in the planning-workflow
@@ -2712,22 +2852,22 @@ Unlimited-OCR-2.pdf           1eb5885f4ddfa4ec6fbff375092377f30b5d6a5e034ec49362
 | Area | Location |
 |---|---|
 | Decoder constants and RoPE | `src/native_engine/decoder.rs:82-109` (`ROPE_THETA` :98; RoPE table :157-238) |
-| Decoder paths | `decoder.rs`: `prefill_attention` :577 (shared with `decoder_qwen2.rs:1266,1270`); stateless `forward` :699; `DecoderWeightCache` :812 (`build` :837 keeps FFN int8; `quant_oc_loaded` :1838); `chunk_prefill_attention` :1198; `prefill_with_cache` :1272 (delegates to `prefill_with_cache_chunked` :1287; monolithic branch :1374-1400); `decode_step_with_cache` :1428-1502; `DecoderWeightCacheI8` :2326; `prefill_with_cache_i8` :2826/:2842; `decode_step_with_cache_i8` :2956; `batched_decode_step_i8*` :3211/:3243; `verify_forward*` :3495/:3575 |
+| Decoder paths | `decoder.rs`: `prefill_attention` :577 (shared with `decoder_qwen2.rs:1266,1270`); stateless `forward` :699; `DecoderWeightCache` :812 (`build` :837 keeps FFN int8; `quant_ffn_loaded` :1928 → `quant_oc_loaded` :1838); `chunk_prefill_attention` :1198; `prefill_with_cache` :1272 (delegates to `prefill_with_cache_chunked` :1287; monolithic branch :1374-1400); `decode_step_with_cache` :1428-1502; `DecoderWeightCacheI8` :2326; `prefill_with_cache_i8` :2826/:2842; `decode_step_with_cache_i8` :2956; `batched_decode_step_i8*` :3211/:3243; `verify_forward*` :3495/:3575 |
 | MoE constants and router | `src/native_engine/moe.rs:53-76,118-120,482-500` |
 | R-SWA cache and attention | `src/native_engine/rswa.rs:46-50,180-219,484-624,997-1007` |
 | Generation loops and levers | `mod.rs`: `forward` :2105; `forward_dynamic` :2137; `ensure_arch_implemented` :2376; `forward_pre` :2394; `generate_cached` :3773; `generate_cached_i8` :3887; `spec_decode_i8` :4064 (reached only via `generate_cached_i8`); `generate_stateless` :4246; `PagePrefill` :1926; `recognize_batch_spine` :2984; `batch_scheduler.rs:43,440,487` |
-| Multi-page path | `mod.rs:2602-2830` (32K checks :2750-2783; streaming observer in `recognize_multi_page_pres` :2723, `stream_broken` :2802-2811, final flush :2818; `PageStream` is `postprocess.rs:531`); `build_prompt_multi` :4399-4419; `MULTI_PAGE_BASE_SIZE` 640 :358; `cli.rs:1821-1862` (`recognize_pdf_multi_page`, eager raster + clone); `cli.rs:1386-1408` (three refusals); `cli.rs:1911` (`pages: []`); `lib.rs:282` (`stream_pages`); `lib.rs:703-802` (wrappers) |
+| Multi-page path | `mod.rs:2602-2830` (32K checks :2750-2783; streaming observer in `recognize_multi_page_pres` :2723, `stream_broken` :2802-2811, final flush :2821; `PageStream` is `postprocess.rs:531`, doc `:517-529`); `build_prompt_multi` :4399-4419; `MULTI_PAGE_BASE_SIZE` 640 :358; `cli.rs:1821-1862` (`recognize_pdf_multi_page`, eager raster + clone); `cli.rs:1386-1408` (three refusals); `cli.rs:1911` (`pages: []`); `lib.rs:282` (`stream_pages`); `lib.rs:703-802` (wrappers) |
 | Sampler | `src/native_engine/sampler.rs:27-45,514-640`; n-gram history includes prompt ids (`mod.rs` ~3829, ~3932) |
 | Postprocess | `src/native_engine/postprocess.rs:38,497-597` (`finalize_multi` keeps a non-blank leading chunk, GH #17) |
 | Tokenizer | `src/tokenizer/mod.rs:86-119,489-532`; sidecar `mod.rs:3268-3285` |
 | Identity | `weights.rs:60-110,174,197-205,898,1238,2086`; `focrq.rs:588-606`; `model_arch.rs:143-257,545-571`; `mod.rs:333,857,1022,1221-1231,1416-1473,1573,1699,2626,2663,2701,2851` |
 | Census | `src/native_engine/unlimited_ocr_census.rs:24-55,110,328-394`; `unlimited_ocr_manifest.json` |
 | Convert and recipe | `src/quant/convert.rs:46,60,124-178,181,254,292,392`; `src/quant/recipe.rs:122-129,195,236,332`; `cli.rs:686,2332,2350,2420` |
-| CLI surfaces | `cli.rs:34` (constant), `:130,230,349`, `:409-437` (override forwarding), `:818` (`RobotCmd::Triage`), `:1045,1578,1594` (JSON `warnings`), `cli.rs:1650,1686,2676-2680,2949,3036,3159,4108`; `robot.rs` (`EVENT_KINDS`, `page_decoded_event`, `page_skipped_event`); `doctor.rs:121,142,186,246-285`; `storage.rs:31,34,54,68` (`SCHEMA_VERSION`, `FOCR_RUN_STORE`, `model_version_tag`, `RunStore`) |
+| CLI surfaces | `cli.rs:34` (constant), `:130,230,349`, `:409-437` (override forwarding), `:818` (`RobotCmd::Triage`), `:1045,1578,1594` (JSON `warnings`), `cli.rs:1650,1686,2675-2711,2949,3036,3159,4108`; `robot.rs` (`EVENT_KINDS`, `page_decoded_event`, `page_skipped_event`); `doctor.rs:121,142,186,246-285`; `storage.rs:31,34,54,68` (`SCHEMA_VERSION`, `FOCR_RUN_STORE`, `model_version_tag`, `RunStore`) |
 | Distribution | `src/dist.rs:35,93-185,485-520,~1103-1160`; `models/manifest-v2.json`; `lib.rs:74,89-96` |
 | Preprocessing | `src/preprocess/mod.rs:47-75` (`MAX_NUM` 32 :66), `141-144,251-283,350-416`; `connector.rs:403` (`fuse_no_crop`) |
-| Tests to extend | `tests/many_pages_without_deadlock.rs`; `tests/surface_matrix.rs`; `tests/cli_robot_golden.rs:723-724,768,894-931,1143,1365-1623,2141,2162` (health golden at 894-931, exit-code streams at 1365-1623); `tests/fixtures/golden/robot_health.golden`; `tests/fixtures/MANIFEST.toml`; `tests/fixtures/robot_schema_v1.json`; `parity_ladder.rs:130`; the spec/batched/chunked parity tests |
-| Oracle scripts | `scripts/gen_reference_fixtures.py:92-125` (pins and modes), `:225-245` (flags), `:292-321` (`_install_cpu_patches`), `:324-345` (`_install_f32_patches`); `oracle_bridge.py`; `oracle_nondeterminism_floor.py`; `check_oracle_provenance.py` (`PIN_TORCH`/`PIN_TRANSFORMERS` :28-29); `check_ledgers.py:310` (DISC heading regex); `tests/fixtures/PROVENANCE.md` |
+| Tests to extend | `tests/many_pages_without_deadlock.rs`; `tests/surface_matrix.rs`; `tests/cli_robot_golden.rs:723-724,768,894-931,1143,1365-1613,2141,2162` (health golden at 894-931, exit-code streams at 1365-1613); `tests/fixtures/golden/robot_health.golden`; `tests/fixtures/MANIFEST.toml`; `tests/fixtures/robot_schema_v1.json`; `parity_ladder.rs:130`; the spec/batched/chunked parity tests |
+| Oracle scripts | `scripts/gen_reference_fixtures.py:92-125` (pins and modes), `:225-245` (flags), `:292-321` (`_install_cpu_patches`), `:324-347` (`_install_f32_patches`; `Tensor.to` wrapper `:338-347`); `oracle_bridge.py`; `oracle_nondeterminism_floor.py`; `check_oracle_provenance.py` (`PIN_TORCH`/`PIN_TRANSFORMERS` :28-29); `check_ledgers.py:310` (DISC heading regex); `tests/fixtures/PROVENANCE.md` |
 | Other targets | `focr-ios/src/lib.rs:280-284,394,401,494,1152`; `ios/Sources/{LabView.swift:453,768, ModelStore.swift:106}`; `site/model-manifest.js:44`; `site/functions/model/[[path]].js:35`; `focr-wasm/src/lib.rs` |
 
 ## Appendix D — Related existing beads

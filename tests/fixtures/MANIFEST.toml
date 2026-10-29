@@ -26,6 +26,8 @@
 "realscan_music" = { kind = "committed", note = "public-domain Spohr real-scan music corpus; tiered truth plus frozen MusicXML anchor (bd-av64.6)" }
 "ladder_scorecard" = { kind = "regenerated-committed", script = "scripts/ladder_scorecard.sh", note = "the L0-L5 per-commit parity receipt, armed + unarmed shapes (bd-re8.19)" }
 "multi_page" = { kind = "regenerated-committed", script = "scripts/baseline/run_baidu_reference_multi.py", note = "frozen infer_multi oracle raw+meta (2/10/20-page legs; the 20-page fixture is the reference-collapse upper bound — bd-1gv.26/bd-1465, DISC-004)" }
+"uocr2_v1_goldens" = { kind = "regenerated-committed", script = "scripts/token_golden_gate.sh", note = "v1 token-id + markdown + page-event goldens on the pinned conservative int8 artifact (CAPTURE.json); written only by a reviewed UPDATE_GOLDENS=1 FOCR_E2E_LONG=1 run (U2-T3, GOLDEN.md §4a)" }
+"cjk_stream" = { kind = "regenerated-committed", script = "scripts/gen_cjk_stream_fixture.py", note = "two rendered Chinese-text pages whose rarer characters the v1 tokenizer splits across byte tokens; the armed U2-X1 multi-page streaming test (Hiragino Sans GB, macOS)" }
 "lilypond_selectable_text.pdf" = { kind = "committed", note = "real LilyPond-generated PDF with selectable text; exact-text + opaque-music-glyph golden for src/pdf_text.rs (added by eea10a5)" }
 "PROVENANCE.md" = { kind = "committed", note = "this catalogue's prose twin" }
 "MANIFEST.toml" = { kind = "committed", note = "this file" }

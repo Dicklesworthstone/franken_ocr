@@ -683,26 +683,36 @@ impl Tokenizer {
             if skip_special && self.special_ids.contains(&id) {
                 continue;
             }
-            let tok = self.id_to_token.get(&id).ok_or_else(|| {
-                FocrError::FormatMismatch(format!("decode: unknown token id {id}"))
-            })?;
-            if self.added_by_content.contains_key(tok) {
-                // Added token → literal content bytes (NOT byte-level remapped).
-                bytes.extend_from_slice(tok.as_bytes());
-            } else {
-                // Base token → each char is a byte-level symbol; invert the map.
-                for c in tok.chars() {
-                    let b = pretok::char_to_byte(c).ok_or_else(|| {
-                        FocrError::FormatMismatch(format!(
-                            "decode: token id {id} has non-byte-level symbol {c:?}"
-                        ))
-                    })?;
-                    bytes.push(b);
-                }
-            }
+            self.token_bytes(id, &mut bytes)?;
         }
         String::from_utf8(bytes)
             .map_err(|e| FocrError::FormatMismatch(format!("decode: invalid UTF-8: {e}")))
+    }
+
+    /// Append token `id`'s bytes to `out` and return whether it is an added
+    /// token. An added token contributes its literal content (NOT byte-level
+    /// remapped); a base token's chars are byte-level symbols, mapped back.
+    /// On error `out` is left as it was.
+    fn token_bytes(&self, id: u32, out: &mut Vec<u8>) -> FocrResult<bool> {
+        let tok = self
+            .id_to_token
+            .get(&id)
+            .ok_or_else(|| FocrError::FormatMismatch(format!("decode: unknown token id {id}")))?;
+        if self.added_by_content.contains_key(tok) {
+            out.extend_from_slice(tok.as_bytes());
+            return Ok(true);
+        }
+        let start = out.len();
+        for c in tok.chars() {
+            let Some(b) = pretok::char_to_byte(c) else {
+                out.truncate(start);
+                return Err(FocrError::FormatMismatch(format!(
+                    "decode: token id {id} has non-byte-level symbol {c:?}"
+                )));
+            };
+            out.push(b);
+        }
+        Ok(false)
     }
 
     /// The id of an added/special token by its literal content, if present.
@@ -767,6 +777,85 @@ impl Tokenizer {
             PretokScheme::SmolLm2 => special_smollm2::IMAGE,
             PretokScheme::Gpt2 => special_opt::IMG_PAD,
         }
+    }
+}
+
+/// Incremental, UTF-8-safe detokenizing for streaming (U2-X1). Byte-level BPE
+/// can split one character across several tokens, so a prefix of the ids may
+/// end inside a character, which [`Tokenizer::decode`] reports as an error.
+/// This decoder holds an incomplete trailing sequence back until a later token
+/// completes it, so it only ever emits whole characters.
+///
+/// An added token (`<image>`, v2's `<PAGE>`, …) ends a byte segment: the
+/// pending bytes are flushed first, as HF's ByteLevel decoder
+/// (`errors="replace"`) decodes each segment between added tokens on its own.
+/// Invalid bytes become U+FFFD wherever `String::from_utf8_lossy` would put
+/// them. So the text pushed, plus [`StreamDecoder::flush`] at the end, is the
+/// per-segment lossy decode of the ids; when the ids decode as valid UTF-8 it
+/// is exactly [`Tokenizer::decode`].
+#[derive(Debug, Clone, Default)]
+pub struct StreamDecoder {
+    /// Bytes of the current segment not yet emitted: an incomplete trailing
+    /// character, at most 3 bytes between pushes.
+    pending: Vec<u8>,
+}
+
+impl StreamDecoder {
+    /// An empty decoder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Decode token `id` and append the whole characters it completes to
+    /// `out`.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] for an id the tokenizer does not know or a
+    /// base token with a non-byte-level symbol, as [`Tokenizer::decode`]; the
+    /// decoder is then unchanged.
+    pub fn push(&mut self, tok: &Tokenizer, id: u32, out: &mut String) -> FocrResult<()> {
+        let start = self.pending.len();
+        if tok.token_bytes(id, &mut self.pending)? {
+            let literal = self.pending.split_off(start);
+            self.flush(out);
+            out.push_str(&String::from_utf8_lossy(&literal));
+        } else {
+            self.emit_complete(out);
+        }
+        Ok(())
+    }
+
+    /// End of the stream or of a page segment: append what is held back, an
+    /// incomplete character as U+FFFD.
+    pub fn flush(&mut self, out: &mut String) {
+        out.push_str(&String::from_utf8_lossy(&self.pending));
+        self.pending.clear();
+    }
+
+    /// Emit every complete character and every invalid sequence (as U+FFFD),
+    /// keeping only an incomplete trailing sequence a later byte could finish.
+    fn emit_complete(&mut self, out: &mut String) {
+        let mut at = 0;
+        while at < self.pending.len() {
+            match std::str::from_utf8(&self.pending[at..]) {
+                Ok(text) => {
+                    out.push_str(text);
+                    at = self.pending.len();
+                }
+                Err(e) => {
+                    let valid = at + e.valid_up_to();
+                    out.push_str(&String::from_utf8_lossy(&self.pending[at..valid]));
+                    let Some(bad) = e.error_len() else {
+                        at = valid;
+                        break;
+                    };
+                    out.push(char::REPLACEMENT_CHARACTER);
+                    at = valid + bad;
+                }
+            }
+        }
+        self.pending.drain(..at);
     }
 }
 
@@ -1110,6 +1199,230 @@ mod tests {
             mismatches, 0,
             "tok_id_mismatch_count must be 0 (got {mismatches})"
         );
+    }
+
+    // ── StreamDecoder (U2-X1) ───────────────────────────────────────────────
+
+    const PAGE: u32 = 128_827;
+    /// Multi-byte base tokens of [`byte_tokenizer`], by id: whole "中", its
+    /// first two bytes, its last byte + "a" (crossing a character boundary),
+    /// 🦀 as two halves, whole "é".
+    const MULTI: [(u32, &[u8]); 6] = [
+        (2000, "中".as_bytes()),
+        (2001, &[0xE4, 0xB8]),
+        (2002, &[0xAD, b'a']),
+        (2003, &[0xF0, 0x9F]),
+        (2004, &[0xA6, 0x80]),
+        (2005, "é".as_bytes()),
+    ];
+
+    /// The byte-level alphabet symbol of every byte.
+    fn byte_symbols() -> [char; 256] {
+        let mut sym = ['\0'; 256];
+        for c in (0..0x144).filter_map(char::from_u32) {
+            if let Some(b) = pretok::char_to_byte(c) {
+                sym[b as usize] = c;
+            }
+        }
+        sym
+    }
+
+    fn byte_id(b: u8) -> u32 {
+        1000 + u32::from(b)
+    }
+
+    /// A synthetic byte-level tokenizer: every byte as its own token (id 1000 +
+    /// byte), the [`MULTI`] tokens, and the added tokens `<image>` and `<PAGE>`.
+    fn byte_tokenizer() -> Tokenizer {
+        let sym = byte_symbols();
+        let spell = |bytes: &[u8]| bytes.iter().map(|&b| sym[b as usize]).collect::<String>();
+        let mut vocab = serde_json::Map::new();
+        for b in 0..=255u8 {
+            vocab.insert(spell(&[b]), byte_id(b).into());
+        }
+        for (id, bytes) in MULTI {
+            vocab.insert(spell(bytes), id.into());
+        }
+        let json = serde_json::json!({
+            "version": "1.0",
+            "added_tokens": [
+                {"id": 128815, "content": "<image>", "special": true},
+                {"id": PAGE, "content": "<PAGE>", "special": false}
+            ],
+            "normalizer": {"type": "Sequence", "normalizers": []},
+            "model": {"type": "BPE", "vocab": vocab, "merges": []}
+        });
+        Tokenizer::from_json_bytes(json.to_string().as_bytes()).expect("byte tokenizer loads")
+    }
+
+    fn byte_ids(text: &str) -> Vec<u32> {
+        text.bytes().map(byte_id).collect()
+    }
+
+    /// The oracle: each run of base tokens between added tokens decoded with
+    /// `from_utf8_lossy` on its own, added tokens as their literal content.
+    fn lossy_segments(t: &Tokenizer, ids: &[u32]) -> String {
+        let (mut out, mut seg) = (String::new(), Vec::new());
+        for &id in ids {
+            let piece = t.id_to_token(id).expect("known id");
+            if t.added_by_content.contains_key(piece) {
+                out.push_str(&String::from_utf8_lossy(&seg));
+                seg.clear();
+                out.push_str(piece);
+            } else {
+                seg.extend(piece.chars().map(|c| pretok::char_to_byte(c).unwrap()));
+            }
+        }
+        out.push_str(&String::from_utf8_lossy(&seg));
+        out
+    }
+
+    /// Push `ids` one at a time; return what each push emitted and the flush.
+    fn stream(t: &Tokenizer, ids: &[u32]) -> (Vec<String>, String) {
+        let mut d = StreamDecoder::new();
+        let emits = ids
+            .iter()
+            .map(|&id| {
+                let mut out = String::new();
+                d.push(t, id, &mut out).unwrap();
+                out
+            })
+            .collect();
+        let mut tail = String::new();
+        d.flush(&mut tail);
+        (emits, tail)
+    }
+
+    #[test]
+    fn stream_decoder_emits_split_characters_once_complete() {
+        let t = byte_tokenizer();
+        let cases: [(&str, Vec<u32>, &[&str]); 6] = [
+            ("中 as 3 byte tokens", byte_ids("中"), &["", "", "中"]),
+            ("🦀 as 4 byte tokens", byte_ids("🦀"), &["", "", "", "🦀"]),
+            ("🦀 as 2 halves", vec![2003, 2004], &["", "🦀"]),
+            ("a token across a boundary", vec![2001, 2002], &["", "中a"]),
+            (
+                "whole tokens",
+                vec![2000, 2005, byte_id(b'x')],
+                &["中", "é", "x"],
+            ),
+            (
+                "split, then ASCII, then split",
+                [
+                    byte_ids("é")[..1].to_vec(),
+                    vec![byte_id(0xA9), byte_id(b'!')],
+                    byte_ids("中"),
+                ]
+                .concat(),
+                &["", "é", "!", "", "", "中"],
+            ),
+        ];
+        for (what, ids, want) in cases {
+            let (emits, tail) = stream(&t, &ids);
+            assert_eq!(emits, want, "{what}");
+            assert_eq!(tail, "", "{what}");
+            assert_eq!(emits.concat(), t.decode(&ids).unwrap(), "{what}");
+        }
+    }
+
+    #[test]
+    fn stream_decoder_ends_a_segment_at_an_added_token() {
+        let t = byte_tokenizer();
+        // The first byte of 中, then <PAGE>, then text: the partial character
+        // becomes U+FFFD at the end of the first segment and is not carried on.
+        let ids = [byte_id(0xE4), PAGE, byte_id(b'a'), 2000];
+        let (emits, tail) = stream(&t, &ids);
+        assert_eq!(emits, ["", "\u{FFFD}<PAGE>", "a", "中"]);
+        assert_eq!(tail, "");
+        assert_eq!(emits.concat(), lossy_segments(&t, &ids));
+        assert!(t.decode(&ids).is_err(), "the strict decode rejects it");
+        // Invalid bytes inside a segment: U+FFFD where from_utf8_lossy puts it.
+        let ids = [byte_id(0xFF), byte_id(b'a'), byte_id(0xE4), byte_id(b'b')];
+        let (emits, _) = stream(&t, &ids);
+        assert_eq!(emits, ["\u{FFFD}", "a", "", "\u{FFFD}b"]);
+        // A partial character at the end of the stream is flushed as U+FFFD.
+        let (emits, tail) = stream(&t, &[byte_id(b'c'), 2003]);
+        assert_eq!(
+            (emits.concat(), tail.as_str()),
+            ("c".to_string(), "\u{FFFD}")
+        );
+        // An unknown id is an error and leaves the decoder as it was.
+        let mut d = StreamDecoder::new();
+        let mut out = String::new();
+        d.push(&t, byte_id(0xE4), &mut out).unwrap();
+        assert!(d.push(&t, 7, &mut out).is_err());
+        d.push(&t, byte_id(0xB8), &mut out).unwrap();
+        d.push(&t, byte_id(0xAD), &mut out).unwrap();
+        assert_eq!(out, "中");
+    }
+
+    #[test]
+    fn stream_decoder_equals_the_per_segment_lossy_decode() {
+        let t = byte_tokenizer();
+        let mut state = 0x5eed_0a11_u64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        let mut checked_invalid = 0;
+        for _ in 0..3000 {
+            let len = 1 + next(24) as usize;
+            let ids: Vec<u32> = (0..len)
+                .map(|_| match next(10) {
+                    0 => PAGE,
+                    1 => special::IMAGE,
+                    2 | 3 => MULTI[next(MULTI.len() as u64) as usize].0,
+                    // Lead and continuation bytes, often enough to split and
+                    // to break characters.
+                    4 => byte_id(0xC0 + next(0x38) as u8),
+                    5 | 6 => byte_id(0x80 + next(0x40) as u8),
+                    _ => byte_id(b'a' + next(26) as u8),
+                })
+                .collect();
+            let full = lossy_segments(&t, &ids);
+            let (emits, tail) = stream(&t, &ids);
+            assert_eq!(format!("{}{tail}", emits.concat()), full, "{ids:?}");
+            // Nothing emitted early is ever taken back, and every prefix
+            // flushes to its own lossy decode.
+            let mut d = StreamDecoder::new();
+            let mut so_far = String::new();
+            for (i, &id) in ids.iter().enumerate() {
+                d.push(&t, id, &mut so_far).unwrap();
+                assert!(full.starts_with(&so_far), "{ids:?} at {i}");
+                let mut flushed = so_far.clone();
+                d.clone().flush(&mut flushed);
+                assert_eq!(flushed, lossy_segments(&t, &ids[..=i]), "{ids:?} at {i}");
+            }
+            match t.decode(&ids) {
+                Ok(strict) => assert_eq!(strict, full, "{ids:?}"),
+                Err(_) => checked_invalid += 1,
+            }
+        }
+        assert!(
+            checked_invalid > 100,
+            "too few invalid sequences: {checked_invalid}"
+        );
+    }
+
+    /// The real v1 tokenizer splits rarer CJK characters across byte tokens;
+    /// streaming its ids must still reproduce the text, `<PAGE>` text markers
+    /// included, with no error at any prefix.
+    #[test]
+    fn stream_decoder_reassembles_real_cjk_splits() {
+        let Some(t) = load_real() else {
+            return;
+        };
+        let text = "<PAGE>\n第一页：饕餮盛宴\n魑魅魍魉，犇骉鱻羴。\n<PAGE>\n第二页：垚与赑屃 🦀";
+        let ids = t.encode(text).unwrap();
+        let (emits, tail) = stream(&t, &ids);
+        assert_eq!(emits.concat(), text);
+        assert_eq!(tail, "");
+        let split_prefixes = (1..ids.len())
+            .filter(|&n| t.decode(&ids[..n]).is_err())
+            .count();
+        assert!(split_prefixes > 0, "no character was split across tokens");
     }
 
     // ── SmolLM2 scheme (C6, bd-3jo6.3.6) ─────────────────────────────────────

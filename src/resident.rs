@@ -46,7 +46,7 @@ use crate::error::{
     EXIT_CANCELLED, EXIT_FORMAT_MISMATCH, EXIT_INPUT_DECODE, EXIT_MODEL_NOT_FOUND, EXIT_TIMEOUT,
     EXIT_USAGE, FocrError, FocrResult,
 };
-use crate::native_engine::{DecodeOverrides, PreprocessOverrides};
+use crate::native_engine::{DecodeOverrides, FinishReason, PreprocessOverrides};
 use crate::{LayoutSpan, OcrEngine, RecognizedDocument};
 
 /// Default idle unload period. Overridable through `FOCR_RESIDENT_IDLE_SECS`
@@ -279,6 +279,16 @@ fn env_fingerprint() -> Value {
 
 // ------------------------------------------------------------------------ client
 
+/// A daemon's successful reply: the document plus how its decode ended
+/// (U2-X2), so a resident run reports the same `finish_reason` an inline one
+/// would.
+pub struct ResidentReply {
+    /// The recognized document.
+    pub document: RecognizedDocument,
+    /// `None` when the daemon's model recorded no decode report.
+    pub finish_reason: Option<FinishReason>,
+}
+
 /// One recognition request as it crosses the wire: everything the daemon needs
 /// to reproduce the exact recognition the client would have run inline.
 pub struct ResidentRequest<'a> {
@@ -332,7 +342,7 @@ fn options_value(request: &ResidentRequest<'_>) -> Value {
 /// [`FocrError::Cancelled`] when cooperative shutdown fires while waiting for
 /// the reply (matching the inline decode loop's Ctrl+C contract); every
 /// transport-shaped failure is `Ok(None)`.
-pub fn try_recognize(request: &ResidentRequest<'_>) -> FocrResult<Option<RecognizedDocument>> {
+pub fn try_recognize(request: &ResidentRequest<'_>) -> FocrResult<Option<ResidentReply>> {
     match connect(&request.model) {
         Some(stream) => roundtrip(stream, request),
         None => Ok(None),
@@ -457,7 +467,7 @@ fn spawn_daemon(root: &Path) -> Option<()> {
 fn roundtrip(
     mut stream: TcpStream,
     request: &ResidentRequest<'_>,
-) -> FocrResult<Option<RecognizedDocument>> {
+) -> FocrResult<Option<ResidentReply>> {
     let Some(state) = read_state(&request.model) else {
         return Ok(None);
     };
@@ -553,7 +563,16 @@ fn roundtrip(
                     .collect()
             })
             .unwrap_or_default();
-        return Ok(Some(RecognizedDocument { markdown, layout }));
+        // Absent from an older daemon's reply: the run then reports none.
+        let finish_reason = match reply.get("finish_reason").and_then(Value::as_str) {
+            Some("stop") => Some(FinishReason::Stop),
+            Some("length") => Some(FinishReason::Length),
+            _ => None,
+        };
+        return Ok(Some(ResidentReply {
+            document: RecognizedDocument { markdown, layout },
+            finish_reason,
+        }));
     }
     // A recognition error is real and final; anything transport-shaped means
     // fallback.
@@ -942,10 +961,17 @@ fn handle_connection(
                 .iter()
                 .map(|span| json!({ "label": span.label, "boxes": span.boxes }))
                 .collect();
+            // Taken per request: the warm model's report would otherwise
+            // accumulate across requests.
+            let finish_reason = engine
+                .engine
+                .take_last_decode_report()
+                .map(|report| report.run_finish_reason().as_str());
             let reply = json!({
                 "ok": true,
                 "markdown": document.markdown,
                 "layout": layout,
+                "finish_reason": finish_reason,
             });
             let _ = stream.write_all(format!("{reply}\n").as_bytes());
             let _ = stream.flush();

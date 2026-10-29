@@ -13,7 +13,8 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::dist::{self, TROMR_F32_RECIPE, TROMR_INT8_RECIPE};
+use crate::dist;
+use crate::model_arch::{TROMR_F32_RECIPE, TROMR_INT8_RECIPE};
 use crate::error::{FocrError, FocrResult};
 
 const LINEAGE_JSON: &str = include_str!("tromr_lineage_manifest.json");

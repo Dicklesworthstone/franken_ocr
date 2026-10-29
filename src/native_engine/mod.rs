@@ -34,8 +34,10 @@ pub mod postprocess;
 pub mod progress;
 pub mod rswa;
 pub mod sampler;
+pub mod shards;
 pub mod smolvlm2;
 pub(crate) mod spec;
+pub mod srswa;
 pub mod tensor;
 pub mod token_compress;
 pub mod tromr;
@@ -156,6 +158,15 @@ impl<T> FallibleOnce<T> {
         }
     }
 
+    /// A cell that already holds `value` when one was built eagerly.
+    fn prefilled(value: Option<T>) -> Self {
+        let cell = Self::new();
+        if let Some(value) = value {
+            let _ = cell.value.set(value);
+        }
+        cell
+    }
+
     fn get_or_try_init<E, F>(&self, initialize: F) -> Result<&T, E>
     where
         F: FnOnce() -> Result<T, E>,
@@ -258,6 +269,10 @@ pub struct OcrModel {
     /// In-memory sidecar payloads for byte-loaded models; empty (all `None`)
     /// on the filesystem route, where sidecars resolve beside `path`.
     sidecars: SidecarBundle,
+    /// The model these weights are: the id the `.focrq` declares (absent means
+    /// Unlimited-OCR v1), or for a raw shard the census it matched. Resolved
+    /// once at construction; never a fallback to the default model.
+    arch: &'static dyn model_arch::ModelArch,
     /// The loaded weight set. The `.focrq` reader (bd-1es.3) is wired, so every
     /// `Weights`-backed stage entrypoint hydrates its named tensors and runs the
     /// real math.
@@ -314,6 +329,14 @@ pub struct OcrModel {
     /// forward" is well-defined. Taken (consumed) by the CLI after a music
     /// run to emit robot `staff` events and the `--json` staves array.
     music_meta: std::sync::Mutex<Option<MusicPageMeta>>,
+    /// What the most recent decode through the sequential driver
+    /// ([`Self::generate_with_observer`]: every single-page, multi-page and
+    /// streaming Unlimited-OCR forward) did. Same side-channel idiom as
+    /// `music_meta`; taken by the CLI for `finish_reason` and the v1
+    /// multi-page warnings, and by the token-id golden gate
+    /// (`tests/uocr2_goldens.rs`), because one drifted token can survive
+    /// detokenize + postprocess without changing the markdown.
+    last_decode: std::sync::Mutex<Option<DecodeReport>>,
 }
 
 struct UnlimitedVisionStatics {
@@ -330,7 +353,6 @@ struct UnlimitedVisionStatics {
 type ModelCacheEntry = Option<(PathBuf, Weak<OcrModel>)>;
 type ModelCache = Mutex<ModelCacheEntry>;
 
-const RAW_SAFETENSORS_SHARD_NAME: &str = "model-00001-of-000001.safetensors";
 const MODEL_HEADER_VALIDATION_MAX_BYTES: usize = 8 * 1024 * 1024;
 const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
 const MODEL_QUANT_ENV: &str = "FOCR_QUANT";
@@ -359,7 +381,251 @@ const MULTI_PAGE_BASE_SIZE: usize = 640;
 /// `max_position_embeddings` — the hard 32K cap one cross-page pass must fit
 /// in ([SPEC-101]; plan §2.1 "constant-KV long-output decoding of dozens of
 /// pages in one 32K pass").
-const MAX_POSITION_EMBEDDINGS: usize = 32768;
+const MAX_POSITION_EMBEDDINGS: usize = sampler::DEFAULT_MAX_POSITIONS;
+
+/// Test-only position budget (U2-X2): lowers [`DecodeParams::max_positions`]
+/// so CLI and e2e tests reach the multi-page clamp on small documents. Read
+/// once; a value above the arch's context is a usage error
+/// ([`validate_test_max_positions`]).
+const TEST_MAX_POSITIONS_ENV: &str = "FOCR_TEST_MAX_POSITIONS";
+
+/// The parsed [`TEST_MAX_POSITIONS_ENV`]: `Ok(None)` when unset.
+fn test_max_positions() -> &'static Result<Option<usize>, String> {
+    static VALUE: OnceLock<Result<Option<usize>, String>> = OnceLock::new();
+    VALUE.get_or_init(|| {
+        let Some(raw) = std::env::var_os(TEST_MAX_POSITIONS_ENV) else {
+            return Ok(None);
+        };
+        let raw = raw.to_string_lossy();
+        match raw.trim().parse::<usize>() {
+            Ok(n) if (1..=MAX_POSITION_EMBEDDINGS).contains(&n) => Ok(Some(n)),
+            _ => Err(format!(
+                "{TEST_MAX_POSITIONS_ENV}={raw:?} must be an integer in 1..={MAX_POSITION_EMBEDDINGS} \
+                 (the architecture's context); it is a test-only override"
+            )),
+        }
+    })
+}
+
+/// Refuse an out-of-range [`TEST_MAX_POSITIONS_ENV`] before any model work
+/// (exit 2).
+///
+/// # Errors
+/// [`FocrError::Usage`] when the variable is set to anything but an integer in
+/// `1..=32768`.
+pub fn validate_test_max_positions() -> FocrResult<()> {
+    test_max_positions()
+        .as_ref()
+        .map(|_| ())
+        .map_err(|why| FocrError::Usage(why.clone()))
+}
+
+/// How a decode ended (U2-X2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model emitted EOS.
+    Stop,
+    /// A token or position limit stopped it first.
+    Length,
+}
+
+impl FinishReason {
+    /// The robot/`--json` spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+        }
+    }
+}
+
+/// The limit that ended a [`FinishReason::Length`] decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LengthCap {
+    /// The generated-token cap (`--max-length` / `FOCR_MAX_NEW_TOKENS`).
+    MaxLength,
+    /// The shared position budget: a multi-page document's prompt left fewer
+    /// positions than the token cap.
+    Positions,
+}
+
+/// What the most recent decode through [`OcrModel::generate_with_observer`]
+/// did: every single-page, multi-page and streaming Unlimited-OCR forward.
+/// Taken by the CLI for `finish_reason` and the v1 truncation / page-merge
+/// warnings, and by the token-id golden gate (`tests/uocr2_goldens.rs`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeReport {
+    /// The generated token ids, before detokenize and postprocess.
+    pub ids: Vec<u32>,
+    /// EOS or a limit.
+    pub finish_reason: FinishReason,
+    /// The binding limit when `finish_reason` is `Length`.
+    pub cap: Option<LengthCap>,
+    /// Multi-page decodes: the page count asked for and the page bodies the
+    /// output carries ([`postprocess::page_body_count`]).
+    pub pages: Option<PageBodies>,
+    /// The generated-token cap this decode ran under.
+    pub max_length: usize,
+    /// The position budget prompt and output shared.
+    pub max_positions: usize,
+    /// Decodes since the report was last taken (a PDF or tall-capture run
+    /// decodes once per page or strip); the fields above describe the last.
+    pub decodes: usize,
+    /// How many of those decodes stopped at a limit.
+    pub length_stops: usize,
+}
+
+impl DecodeReport {
+    /// The run-level `finish_reason`: `length` when any decode since the last
+    /// take stopped at a limit.
+    #[must_use]
+    pub fn run_finish_reason(&self) -> FinishReason {
+        if self.length_stops > 0 {
+            FinishReason::Length
+        } else {
+            FinishReason::Stop
+        }
+    }
+}
+
+/// Expected pages vs page bodies of a multi-page decode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageBodies {
+    /// Source pages.
+    pub expected: usize,
+    /// Page bodies in the decoded text.
+    pub bodies: usize,
+}
+
+/// The kinds of run warnings and recoveries the engine reports (U2-X2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningKind {
+    /// A v1 multi-page decode stopped at the position budget before its last page.
+    V1TruncatedPositions,
+    /// A v1 multi-page decode stopped at a user token cap before its last page.
+    V1TruncatedUserCap,
+    /// A v1 multi-page decode ended at EOS with fewer page bodies than pages.
+    V1PageMerge,
+    /// A multi-page prompt alone exceeds the position budget (an error, not a
+    /// warning; it shares the recovery text).
+    PromptTooLong,
+}
+
+/// The one actionable next step for each [`WarningKind`]: the single source
+/// U2-E4 extends with `focr pull unlimited-ocr-2` once v2 is published.
+#[must_use]
+pub fn warning_recovery(kind: WarningKind) -> &'static str {
+    match kind {
+        WarningKind::V1TruncatedPositions | WarningKind::PromptTooLong => {
+            "split the document with `--pages`, or parse pages independently (omit `--multi-page`)"
+        }
+        WarningKind::V1TruncatedUserCap => "raise `--max-length`",
+        WarningKind::V1PageMerge => {
+            "parse pages independently (omit `--multi-page`) when page boundaries matter"
+        }
+    }
+}
+
+/// One `warnings[]` entry: `{kind, message, recovery, ...kind-specific
+/// fields}` on `run_complete`, in `--json` and on stderr (U2-X2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunWarning {
+    /// Machine-stable kind (`v1_truncated`, `v1_page_merge`).
+    pub kind: &'static str,
+    /// The human line, also printed to stderr.
+    pub message: String,
+    /// [`warning_recovery`] for this warning.
+    pub recovery: &'static str,
+    /// Kind-specific fields (`expected`, `got`, `cause`).
+    pub fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl RunWarning {
+    /// The JSON object form.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut obj = serde_json::Map::new();
+        obj.insert("kind".into(), self.kind.into());
+        obj.insert("message".into(), self.message.clone().into());
+        obj.insert("recovery".into(), self.recovery.into());
+        obj.extend(self.fields.clone());
+        serde_json::Value::Object(obj)
+    }
+}
+
+/// `32768` → `"32,768"`.
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The warnings a v1 decode earns (U2-X2): only multi-page decodes with fewer
+/// page bodies than pages warn. A length stop is a truncation, named by the
+/// limit that bound it; an EOS stop is a page merge. Single-page decodes
+/// report only their `finish_reason`.
+#[must_use]
+pub fn decode_warnings(report: &DecodeReport) -> Vec<RunWarning> {
+    let Some(PageBodies { expected, bodies }) = report.pages else {
+        return Vec::new();
+    };
+    if bodies >= expected {
+        return Vec::new();
+    }
+    let mut fields = serde_json::Map::new();
+    fields.insert("expected".into(), expected.into());
+    fields.insert("got".into(), bodies.into());
+    let warning = match (report.finish_reason, report.cap) {
+        (FinishReason::Length, Some(LengthCap::MaxLength)) => {
+            fields.insert("cause".into(), "user_cap".into());
+            RunWarning {
+                kind: "v1_truncated",
+                message: format!(
+                    "stopped after {bodies} of {expected} pages: the --max-length cap of {} \
+                     generated tokens was reached",
+                    thousands(report.max_length)
+                ),
+                recovery: warning_recovery(WarningKind::V1TruncatedUserCap),
+                fields,
+            }
+        }
+        (FinishReason::Length, _) => {
+            fields.insert("cause".into(), "positions".into());
+            let dense = if report.max_positions == MAX_POSITION_EMBEDDINGS {
+                " (≈29 dense pages)"
+            } else {
+                ""
+            };
+            RunWarning {
+                kind: "v1_truncated",
+                message: format!(
+                    "stopped after {bodies} of {expected} pages: v1 shares {} positions between \
+                     prompt and output{dense}",
+                    thousands(report.max_positions)
+                ),
+                recovery: warning_recovery(WarningKind::V1TruncatedPositions),
+                fields,
+            }
+        }
+        (FinishReason::Stop, _) => RunWarning {
+            kind: "v1_page_merge",
+            message: format!(
+                "v1 produced {bodies} page bodies for {expected} pages; page boundaries in this \
+                 output are unreliable"
+            ),
+            recovery: warning_recovery(WarningKind::V1PageMerge),
+            fields,
+        },
+    };
+    vec![warning]
+}
 
 /// Streaming sink for completed multi-page bodies (bd-2z0y): called with the
 /// 1-based page index and the trimmed raw body as each `<PAGE>` boundary is
@@ -792,6 +1058,9 @@ fn decode_params_from_env() -> DecodeParams {
     {
         p.max_length = n;
     }
+    if let Ok(Some(n)) = test_max_positions() {
+        p.max_positions = *n;
+    }
     apply_decode_overrides(&mut p, decode_overrides());
     p
 }
@@ -852,15 +1121,36 @@ impl Drop for TrackedCacheGuard {
     }
 }
 
+/// Resolve an existing `path`: a file as-is; a raw safetensors directory to
+/// its shard index ([`shards::SHARD_INDEX_NAME`]), so that `parent()` is the
+/// directory holding the sidecars; or, without an index, to the one shard of a
+/// registered single-shard checkpoint ([`raw_single_shard_names`]).
 fn resolve_existing_model_artifact(path: &Path) -> Option<PathBuf> {
     if path.is_dir() {
-        let shard = path.join(RAW_SAFETENSORS_SHARD_NAME);
-        shard.is_file().then_some(shard)
+        let index = path.join(shards::SHARD_INDEX_NAME);
+        if index.is_file() {
+            return Some(index);
+        }
+        raw_single_shard_names()
+            .map(|name| path.join(name))
+            .find(|shard| shard.is_file())
     } else if path.exists() {
         Some(path.to_path_buf())
     } else {
         None
     }
+}
+
+/// The shard file names of every registered single-shard checkpoint, from
+/// the arch censuses.
+fn raw_single_shard_names() -> impl Iterator<Item = &'static str> {
+    model_arch::registry()
+        .iter()
+        .filter_map(|arch| arch.tensor_census())
+        .filter_map(|census| match unlimited_ocr_census::source_shards(census) {
+            [(name, _)] => Some(*name),
+            _ => None,
+        })
 }
 
 fn is_short_model_spec(path: &Path) -> bool {
@@ -1210,6 +1500,8 @@ struct FocrqHeaderProbe {
     model_id: String,
     #[serde(default)]
     packing_manifest: Option<FocrqPackingManifestProbe>,
+    #[serde(default)]
+    provenance: Option<shards::FocrqProvenance>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1218,17 +1510,13 @@ struct FocrqPackingManifestProbe {
     quant_recipe: Option<String>,
 }
 
-fn compatible_model_id(declared: &str) -> FocrResult<&'static str> {
-    if declared.is_empty() {
-        return Ok(model_arch::default_arch().id());
-    }
-    model_arch::arch_by_id(declared)
-        .map(|arch| arch.id())
+fn compatible_arch(declared: &str) -> FocrResult<&'static dyn model_arch::ModelArch> {
+    model_arch::arch_for_declared_id(declared)
         .ok_or_else(|| FocrError::FormatMismatch(format!("unknown model_id {declared:?}")))
 }
 
 fn validate_header_license(notice: &str, model_id: &str) -> FocrResult<()> {
-    if model_id == model_arch::default_arch().id() {
+    if model_id == model_arch::UNLIMITED_OCR_V1_ID {
         if notice == crate::FOCR_MODEL_LICENSE_NOTICE
             || (notice.contains("Copyright (c) 2026 Baidu") && notice.contains("MIT License"))
         {
@@ -1413,66 +1701,156 @@ fn validate_header_directory(
     Ok(())
 }
 
-fn validate_safetensors_header(header: &[u8], payload_len: usize) -> FocrResult<()> {
-    #[derive(serde::Deserialize)]
-    struct Entry {
-        dtype: String,
-        shape: Vec<usize>,
-        data_offsets: [usize; 2],
-    }
-
-    let raw: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_slice(header).map_err(|error| {
-            FocrError::FormatMismatch(format!("safetensors header JSON invalid: {error}"))
-        })?;
-    let mut directory = std::collections::BTreeMap::new();
-    for (name, value) in raw {
-        if name == "__metadata__" {
-            continue;
-        }
-        let entry: Entry = serde_json::from_value(value).map_err(|error| {
-            FocrError::FormatMismatch(format!("safetensors entry {name:?} invalid: {error}"))
-        })?;
-        let [start, end] = entry.data_offsets;
-        if end < start {
-            return Err(FocrError::FormatMismatch(format!(
-                "safetensors entry {name:?} has reversed offsets"
-            )));
-        }
-        let dtype = match entry.dtype.as_str() {
-            "F32" => DType::F32,
-            "F16" => DType::F16,
-            "BF16" => DType::BF16,
-            other => {
-                return Err(FocrError::FormatMismatch(format!(
-                    "unsupported safetensors dtype {other:?}"
-                )));
-            }
-        };
-        directory.insert(
-            name,
-            weights::TensorRecord {
-                dtype,
-                shape: entry.shape,
-                byte_offset: start,
-                byte_len: end - start,
-                scales_offset: 0,
-                scales_len: 0,
-                group_size: 0,
-                tier: 0,
-            },
-        );
-    }
-    if directory.is_empty() {
+fn validate_safetensors_header(
+    header: &[u8],
+    payload_len: usize,
+) -> FocrResult<&'static dyn model_arch::ModelArch> {
+    let header = shards::parse_safetensors_header(header)?;
+    if header.len() == 0 {
         return Err(FocrError::FormatMismatch(
             "safetensors tensor directory is empty; no native forward can use this artifact".into(),
         ));
     }
-    validate_header_directory(&directory, payload_len, 0)?;
-    unlimited_ocr_census::validate_source_header(&directory)
+    validate_header_directory(&header.records, payload_len, 0)?;
+    shards::validate_int64_records(&header, payload_len)?;
+    identify_checkpoint(&header)
 }
 
-fn validate_model_header_from_reader(mut reader: impl Read, file_len: u64) -> FocrResult<()> {
+/// Identify a whole raw checkpoint by census, and check its I64 tensors
+/// against that census's verify-and-skip rules by name and shape. The full
+/// load verifies their content.
+fn identify_checkpoint(
+    header: &shards::SafetensorsHeader,
+) -> FocrResult<&'static dyn model_arch::ModelArch> {
+    let arch = unlimited_ocr_census::identify_raw(
+        header
+            .records
+            .iter()
+            .map(|(name, record)| (name.as_str(), record)),
+    )?;
+    let rules = shards::int64_rules(Some(arch));
+    shards::check_int64_entries(&header.int64, rules, arch.id())?;
+    shards::check_int64_rules_present(&header.int64, rules, arch.id())?;
+    Ok(arch)
+}
+
+/// Read one safetensors file's bounded header from the start of `reader`
+/// and validate it structurally against the file's payload. Returns the
+/// header, its raw `length prefix + JSON` bytes, and the payload base.
+fn read_validated_safetensors_header(
+    mut reader: impl Read,
+    file_len: u64,
+) -> FocrResult<(shards::SafetensorsHeader, Vec<u8>, usize)> {
+    let mut prefix = [0u8; 8];
+    reader.read_exact(&mut prefix).map_err(|error| {
+        FocrError::FormatMismatch(format!("safetensors header truncated: {error}"))
+    })?;
+    let (header_json, payload_len) = read_safetensors_header_json(reader, prefix, file_len)?;
+    let header = shards::parse_safetensors_header(&header_json)?;
+    validate_header_directory(&header.records, payload_len, 0)?;
+    shards::validate_int64_records(&header, payload_len)?;
+    let payload_base = prefix.len() + header_json.len();
+    let mut raw = prefix.to_vec();
+    raw.extend_from_slice(&header_json);
+    Ok((header, raw, payload_base))
+}
+
+/// Read a safetensors header's JSON from `reader`, whose 8-byte length
+/// `prefix` was already read, bounded at [`MODEL_HEADER_VALIDATION_MAX_BYTES`].
+/// Returns the JSON and the payload length. Never reads payload bytes.
+fn read_safetensors_header_json(
+    mut reader: impl Read,
+    prefix: [u8; 8],
+    file_len: u64,
+) -> FocrResult<(Vec<u8>, usize)> {
+    let file_len = usize::try_from(file_len).map_err(|_| {
+        FocrError::FormatMismatch("model file exceeds this platform's addressable size".into())
+    })?;
+    let header_len_u64 = u64::from_le_bytes(prefix);
+    let header_len = usize::try_from(header_len_u64)
+        .map_err(|_| FocrError::FormatMismatch("safetensors header length exceeds usize".into()))?;
+    if header_len == 0 || header_len > MODEL_HEADER_VALIDATION_MAX_BYTES {
+        return Err(FocrError::FormatMismatch(format!(
+            "safetensors header length {header_len} is outside the bounded validation limit"
+        )));
+    }
+    let payload_base = 8usize
+        .checked_add(header_len)
+        .ok_or_else(|| FocrError::FormatMismatch("safetensors header length overflows".into()))?;
+    if payload_base > file_len {
+        return Err(FocrError::FormatMismatch(
+            "safetensors header overruns the file".into(),
+        ));
+    }
+    let mut header = vec![0u8; header_len];
+    reader.read_exact(&mut header).map_err(|error| {
+        FocrError::FormatMismatch(format!("safetensors header truncated: {error}"))
+    })?;
+    Ok((header, file_len - payload_base))
+}
+
+/// Header probe of a sharded checkpoint: open every shard its index names,
+/// read and validate each bounded header from its descriptor, merge them
+/// against the index, and identify the whole by census. Returns the arch and
+/// the open shards, which the load then reads.
+fn validate_sharded_model(
+    index_path: &Path,
+) -> FocrResult<(&'static dyn model_arch::ModelArch, shards::OpenedShards)> {
+    let opened = shards::open_shards(index_path)?;
+    let merged = read_opened_shard_headers(&opened)?;
+    let arch = identify_checkpoint(&merged)?;
+    Ok((arch, opened))
+}
+
+/// Read, validate and merge the bounded headers of every open shard. Offsets
+/// in the result are logical: shards laid end to end in index order.
+fn read_opened_shard_headers(
+    opened: &shards::OpenedShards,
+) -> FocrResult<shards::SafetensorsHeader> {
+    let mut headers = Vec::with_capacity(opened.shards.len());
+    let mut start = 0u64;
+    for shard in &opened.shards {
+        let (header, _, payload_base) = read_validated_safetensors_header(&shard.file, shard.len)
+            .map_err(|error| shards::in_shard(&shard.name, error))?;
+        headers.push((header, start + payload_base as u64));
+        start = start.saturating_add(shard.len);
+    }
+    shards::merge_shard_headers(&opened.index, headers)
+}
+
+/// The bounded header pass of a `focr convert` source: every shard's header,
+/// validated and (for an indexed source) merged against the index, plus each
+/// shard's raw `length prefix + JSON` bytes, against which the streamed
+/// bytes are checked.
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // sole non-test caller is the CLI convert path
+pub(crate) fn read_source_headers(
+    source: &shards::SourceShards,
+) -> FocrResult<(shards::SafetensorsHeader, Vec<Vec<u8>>)> {
+    let mut headers = Vec::with_capacity(source.files().len());
+    let mut prefixes = Vec::with_capacity(source.files().len());
+    let mut start = 0u64;
+    for (name, path) in source.files() {
+        let (file, file_len) = open_model_file(path)?;
+        let (header, raw, payload_base) = read_validated_safetensors_header(&file, file_len)
+            .map_err(|error| shards::in_shard(name, error))?;
+        headers.push((header, start + payload_base as u64));
+        prefixes.push(raw);
+        start = start.saturating_add(file_len);
+    }
+    let merged = match source.index() {
+        Some(index) => shards::merge_shard_headers(index, headers)?,
+        None => headers
+            .pop()
+            .map(|(header, _)| header)
+            .ok_or_else(|| FocrError::Other(anyhow::anyhow!("a source has one file")))?,
+    };
+    Ok((merged, prefixes))
+}
+
+fn validate_model_header_from_reader(
+    mut reader: impl Read,
+    file_len: u64,
+) -> FocrResult<&'static dyn model_arch::ModelArch> {
     const FOCRQ_PREAMBLE_LEN: usize = 6 + 4 + 1 + 32 + 8;
 
     let file_len = usize::try_from(file_len).map_err(|_| {
@@ -1558,58 +1936,43 @@ fn validate_model_header_from_reader(mut reader: impl Read, file_len: u64) -> Fo
                 header.source_sha256
             )));
         }
+        shards::validate_source_shards(header.provenance.as_ref(), &header.source_sha256)?;
         if header.tensors.is_empty() {
             return Err(FocrError::FormatMismatch(
                 ".focrq tensor directory is empty; no native forward can use this artifact".into(),
             ));
         }
-        let model_id = compatible_model_id(&header.model_id)?;
-        validate_header_license(&header.license_notice, model_id)?;
+        let arch = compatible_arch(&header.model_id)?;
+        validate_header_license(&header.license_notice, arch.id())?;
         let declared_recipe = header
             .packing_manifest
             .as_ref()
             .and_then(|manifest| manifest.quant_recipe.as_deref());
         validate_header_directory(&header.tensors, file_len - payload_base, header.arch_target)?;
-        if model_id == model_arch::default_arch().id() {
-            unlimited_ocr_census::validate_focrq_header(
-                &header.tensors,
-                &header.source_sha256,
-                declared_recipe,
-            )?;
+        match arch.tensor_census() {
+            Some(model_arch::TensorCensus::UnlimitedOcrV1) => {
+                unlimited_ocr_census::validate_focrq_header(
+                    &header.tensors,
+                    &header.source_sha256,
+                    declared_recipe,
+                )?;
+            }
+            None => {}
         }
         validate_unlimited_ocr_quant_records(
             true,
-            model_id,
+            arch.id(),
             declared_recipe,
             header
                 .tensors
                 .iter()
                 .map(|(name, record)| (name.as_str(), record.dtype)),
         )?;
-        return Ok(());
+        return Ok(arch);
     }
 
-    let header_len_u64 = u64::from_le_bytes(prefix);
-    let header_len = usize::try_from(header_len_u64)
-        .map_err(|_| FocrError::FormatMismatch("safetensors header length exceeds usize".into()))?;
-    if header_len == 0 || header_len > MODEL_HEADER_VALIDATION_MAX_BYTES {
-        return Err(FocrError::FormatMismatch(format!(
-            "safetensors header length {header_len} is outside the bounded validation limit"
-        )));
-    }
-    let payload_base = 8usize
-        .checked_add(header_len)
-        .ok_or_else(|| FocrError::FormatMismatch("safetensors header length overflows".into()))?;
-    if payload_base > file_len {
-        return Err(FocrError::FormatMismatch(
-            "safetensors header overruns the file".into(),
-        ));
-    }
-    let mut header = vec![0u8; header_len];
-    reader.read_exact(&mut header).map_err(|error| {
-        FocrError::FormatMismatch(format!("safetensors header truncated: {error}"))
-    })?;
-    validate_safetensors_header(&header, file_len - payload_base)
+    let (header, payload_len) = read_safetensors_header_json(reader, prefix, file_len as u64)?;
+    validate_safetensors_header(&header, payload_len)
 }
 
 fn open_model_file(path: &Path) -> FocrResult<(std::fs::File, u64)> {
@@ -1634,7 +1997,10 @@ fn open_model_file(path: &Path) -> FocrResult<(std::fs::File, u64)> {
     Ok((file, file_len.len()))
 }
 
-fn validate_model_header_file(path: &Path) -> FocrResult<()> {
+fn validate_model_header_file(path: &Path) -> FocrResult<&'static dyn model_arch::ModelArch> {
+    if shards::is_index_path(path) {
+        return validate_sharded_model(path).map(|(arch, _)| arch);
+    }
     let (file, file_len) = open_model_file(path)?;
     validate_model_header_from_reader(&file, file_len)
 }
@@ -1654,21 +2020,121 @@ pub fn native_model_available(path: &Path) -> bool {
     validate_model_header_file(&resolved).is_ok()
 }
 
-fn load_weights_from_resolved_model(resolved: &Path) -> FocrResult<Weights> {
+/// A filesystem model open: the model the header identified, its tokenizer
+/// when the sidecar was verified at open, and the weights.
+struct OpenedModel {
+    arch: &'static dyn model_arch::ModelArch,
+    tokenizer: Option<crate::tokenizer::Tokenizer>,
+    weights: Weights,
+}
+
+impl std::fmt::Debug for OpenedModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenedModel")
+            .field("arch", &self.arch.id())
+            .field("tokenizer", &self.tokenizer.is_some())
+            .field("tensors", &self.weights.len())
+            .finish()
+    }
+}
+
+fn load_weights_from_resolved_model(resolved: &Path) -> FocrResult<OpenedModel> {
     load_weights_from_resolved_model_after_validation(resolved, || {})
 }
 
 fn load_weights_from_resolved_model_after_validation(
     resolved: &Path,
     after_validation: impl FnOnce(),
-) -> FocrResult<Weights> {
-    let (file, file_len) = open_model_file(resolved)?;
-    validate_model_header_from_reader(&file, file_len)?;
-    after_validation();
-    Weights::load_opened(file, resolved).and_then(|weights| {
-        validate_unlimited_ocr_quant_recipe(&weights)?;
-        Ok(weights)
+) -> FocrResult<OpenedModel> {
+    // The tokenizer sidecar is judged before a single weight byte is read.
+    let (arch, tokenizer, weights) = if shards::is_index_path(resolved) {
+        let (arch, opened) = validate_sharded_model(resolved)?;
+        let tokenizer = eager_sidecar_tokenizer(arch, resolved)?;
+        after_validation();
+        (arch, tokenizer, Weights::load_opened_shards(opened)?)
+    } else {
+        let (file, file_len) = open_model_file(resolved)?;
+        let arch = validate_model_header_from_reader(&file, file_len)?;
+        let tokenizer = eager_sidecar_tokenizer(arch, resolved)?;
+        after_validation();
+        (arch, tokenizer, Weights::load_opened(file, resolved)?)
+    };
+    validate_unlimited_ocr_quant_recipe(&weights)?;
+    if weights.model_id() != arch.id() {
+        return Err(FocrError::FormatMismatch(format!(
+            "{}: the loaded weights identify as {:?} but the header probe resolved {:?}",
+            resolved.display(),
+            weights.model_id(),
+            arch.id()
+        )));
+    }
+    Ok(OpenedModel {
+        arch,
+        tokenizer,
+        weights,
     })
+}
+
+/// Whether `arch` pins anything about its `tokenizer.json` sidecar.
+fn pins_tokenizer(arch: &dyn model_arch::ModelArch) -> bool {
+    arch.tokenizer_sha256().is_some() || !arch.required_token_ids().is_empty()
+}
+
+/// Parse `tokenizer.json` bytes for `arch`, refusing a sidecar whose SHA-256
+/// is not the one the arch pins or that maps a required added-token id to
+/// other content. `origin` names the sidecar in the error.
+fn checked_tokenizer(
+    arch: &dyn model_arch::ModelArch,
+    bytes: &[u8],
+    origin: &str,
+) -> FocrResult<crate::tokenizer::Tokenizer> {
+    use sha2::Digest as _;
+
+    let id = arch.id();
+    if let Some(expected) = arch.tokenizer_sha256() {
+        let found = format!("{:x}", sha2::Sha256::digest(bytes));
+        if found != expected {
+            return Err(FocrError::FormatMismatch(format!(
+                "{origin} has sha256 {found}, but {id} requires {expected}; \
+                 re-install its sidecars with `focr pull {id}`"
+            )));
+        }
+    }
+    let tokenizer = crate::tokenizer::Tokenizer::from_json_bytes(bytes)?;
+    for &(token_id, content) in arch.required_token_ids() {
+        let found = tokenizer.id_to_token(token_id);
+        if found != Some(content) {
+            return Err(FocrError::FormatMismatch(format!(
+                "{origin} maps token id {token_id} to {found:?}, but {id} requires {content:?}; \
+                 re-install its sidecars with `focr pull {id}`"
+            )));
+        }
+    }
+    Ok(tokenizer)
+}
+
+/// Verify and parse the `tokenizer.json` beside `model_path` at open time when
+/// `arch` pins it. An absent sidecar is left to the first-use
+/// [`FocrError::ModelNotFound`]; whichever path reads the file verifies it.
+fn eager_sidecar_tokenizer(
+    arch: &dyn model_arch::ModelArch,
+    model_path: &Path,
+) -> FocrResult<Option<crate::tokenizer::Tokenizer>> {
+    if !pins_tokenizer(arch) {
+        return Ok(None);
+    }
+    let path = model_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tokenizer.json");
+    match std::fs::read(&path) {
+        Ok(bytes) => checked_tokenizer(arch, &bytes, &path.display().to_string()).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(FocrError::ModelNotFound(format!(
+            "tokenizer.json at {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 /// Reject Unlimited-OCR containers that violate the fixed default quantization
@@ -1696,8 +2162,17 @@ fn validate_unlimited_ocr_quant_records<'a>(
     declared_recipe: Option<&str>,
     records: impl IntoIterator<Item = (&'a str, DType)>,
 ) -> FocrResult<()> {
-    if !is_focrq || model_id != model_arch::default_arch().id() {
+    if !is_focrq {
         return Ok(());
+    }
+    match model_arch::arch_by_id(model_id).and_then(|arch| arch.unlimited_variant()) {
+        Some(model_arch::UnlimitedVariant::V1Rswa) => {}
+        Some(model_arch::UnlimitedVariant::V2SrSwa) => {
+            return Err(FocrError::FormatMismatch(format!(
+                "{model_id} .focrq: this binary has no quant-recipe contract for SR-SWA artifacts"
+            )));
+        }
+        None => return Ok(()),
     }
 
     // The explicitly-tagged NON-DEFAULT wasm experts-int4 recipe (bd-4l71) is
@@ -1944,7 +2419,9 @@ impl OcrModel {
     /// (`native_model_available`, bd-223.7).
     ///
     /// Returns `path` as-is if it exists as a file; if `path` is a raw
-    /// safetensors directory, returns its canonical shard. Missing relative
+    /// safetensors directory, returns its shard index
+    /// (`model.safetensors.index.json`), or without one the shard of a
+    /// registered single-shard checkpoint. Missing relative
     /// specs are searched under `$FOCR_MODEL_DIR` (split with the platform
     /// path-list separator) and the user cache default; each `$FOCR_MODEL_DIR`
     /// entry may itself be a direct artifact/package or a search root.
@@ -1954,9 +2431,11 @@ impl OcrModel {
         }
         if path.is_dir() {
             return Err(FocrError::ModelNotFound(format!(
-                "no model artifact at {} (expected {RAW_SAFETENSORS_SHARD_NAME} inside \
-                 safetensors directory; resolver lands in Phase 0/1, bd-223.7)",
-                path.display()
+                "no model artifact at {} (expected {} or a single-shard checkpoint ({}) inside \
+                 the safetensors directory)",
+                path.display(),
+                shards::SHARD_INDEX_NAME,
+                raw_single_shard_names().collect::<Vec<_>>().join(", ")
             )));
         }
         if is_searchable_model_spec(path) {
@@ -2002,11 +2481,12 @@ impl OcrModel {
         // Route through `Weights::load`: owned bytes are the safe default.
         // `FOCR_MMAP=1` is an explicit opt-in for trusted immutable artifacts;
         // mmap failures retain the owned-buffer fallback.
-        let weights = load_weights_from_resolved_model(&resolved)?;
+        let opened = load_weights_from_resolved_model(&resolved)?;
         let model = Arc::new(Self {
             path: resolved.clone(),
             sidecars: SidecarBundle::default(),
-            weights,
+            arch: opened.arch,
+            weights: opened.weights,
             decode_params: decode_params_from_env(),
             decoder_cache_i8: FallibleOnce::new(),
             decoder_cache: FallibleOnce::new(),
@@ -2015,10 +2495,11 @@ impl OcrModel {
             got_statics: FallibleOnce::new(),
             onechart_statics: FallibleOnce::new(),
             smol_statics: FallibleOnce::new(),
-            tokenizer: FallibleOnce::new(),
+            tokenizer: FallibleOnce::prefilled(opened.tokenizer),
             got_tokenizer: FallibleOnce::new(),
             tromr_tokenizer: FallibleOnce::new(),
             music_meta: std::sync::Mutex::new(None),
+            last_decode: std::sync::Mutex::new(None),
         });
 
         let mut guard = model_cache_guard()?;
@@ -2034,14 +2515,38 @@ impl OcrModel {
     /// weak cache (byte-loaded models are owned by their caller).
     ///
     /// # Errors
-    /// [`FocrError::FormatMismatch`] if the weights violate the fixed
-    /// Unlimited-OCR quant recipe (other archs have separate storage contracts,
-    /// validated by their own tensor accessors at forward time).
+    /// [`FocrError::FormatMismatch`] if a raw shard matches no registered
+    /// model's census, if the `tokenizer_json` sidecar is not the one the
+    /// model pins (checked first, before the weights' contract), or if the
+    /// weights violate the fixed Unlimited-OCR quant recipe (other archs have
+    /// separate storage contracts, validated by their own tensor accessors at
+    /// forward time).
     pub fn from_weights(weights: Weights, sidecars: SidecarBundle) -> FocrResult<Arc<Self>> {
+        let arch = match model_arch::arch_by_id(weights.model_id()) {
+            Some(arch) => arch,
+            // Only a raw shard that matched no census lacks a registered id;
+            // identify it again for the per-census diff.
+            None => {
+                let records: Vec<(&str, &weights::TensorRecord)> = weights
+                    .names()
+                    .filter_map(|name| weights.record(name).map(|record| (name, record)))
+                    .collect();
+                unlimited_ocr_census::identify_raw(records.iter().copied())?
+            }
+        };
+        let tokenizer = match &sidecars.tokenizer_json {
+            Some(bytes) if pins_tokenizer(arch) => Some(checked_tokenizer(
+                arch,
+                bytes,
+                "the in-memory tokenizer.json sidecar",
+            )?),
+            _ => None,
+        };
         validate_unlimited_ocr_quant_recipe(&weights)?;
         Ok(Arc::new(Self {
             path: PathBuf::from("<in-memory>"),
             sidecars,
+            arch,
             weights,
             decode_params: decode_params_from_env(),
             decoder_cache_i8: FallibleOnce::new(),
@@ -2051,10 +2556,11 @@ impl OcrModel {
             got_statics: FallibleOnce::new(),
             onechart_statics: FallibleOnce::new(),
             smol_statics: FallibleOnce::new(),
-            tokenizer: FallibleOnce::new(),
+            tokenizer: FallibleOnce::prefilled(tokenizer),
             got_tokenizer: FallibleOnce::new(),
             tromr_tokenizer: FallibleOnce::new(),
             music_meta: std::sync::Mutex::new(None),
+            last_decode: std::sync::Mutex::new(None),
         }))
     }
 
@@ -2247,6 +2753,17 @@ impl OcrModel {
         self.music_meta.lock().ok().and_then(|mut slot| slot.take())
     }
 
+    /// Take (consume) the [`DecodeReport`] of the most recent decode through
+    /// the sequential driver — a single-page, multi-page or streaming
+    /// Unlimited-OCR forward — if any. A second take returns `None` until the
+    /// next decode.
+    pub fn take_last_decode(&self) -> Option<DecodeReport> {
+        self.last_decode
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+    }
+
     fn forward_tromr(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
         let t = Instant::now();
@@ -2359,14 +2876,13 @@ impl OcrModel {
     /// The model architecture this loaded model is — the [`model_arch::ModelArch`]
     /// descriptor that drives its identity, config, and the forward dispatch.
     ///
-    /// Read from the `.focrq` v2 `model_id` tag the loader resolved (A2): a v1
-    /// `.focrq` or raw safetensors reports `unlimited-ocr`, a tagged artifact
-    /// reports its own arch (e.g. `got-ocr2`). `model_id()` is always a
-    /// registry-known id (validated at load), so the lookup cannot miss; the
-    /// `unwrap_or_else` is a defensive fallback (e.g. an empty [`Weights::default`]).
+    /// Resolved once at construction: a `.focrq` is the `model_id` it declares
+    /// (absent means `unlimited-ocr`, permanently), a tagged artifact its own
+    /// arch (e.g. `got-ocr2`), and a raw safetensors shard the model whose exact
+    /// census it matched. There is no fallback to the default model.
     #[must_use]
     pub fn arch(&self) -> &'static dyn model_arch::ModelArch {
-        model_arch::arch_by_id(self.weights.model_id()).unwrap_or_else(model_arch::default_arch)
+        self.arch
     }
 
     /// Guard the per-arch forward dispatch (A1): an IMPLEMENTED arch proceeds; a
@@ -2623,7 +3139,7 @@ impl OcrModel {
                 "recognize_multi_page: image_paths must be non-empty"
             )));
         }
-        if self.arch().id() != model_arch::default_arch().id() {
+        if self.arch().unlimited_variant().is_none() {
             return Err(FocrError::NotImplemented(format!(
                 "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
                  contract; model {:?} parses pages independently (use the plain \
@@ -2660,7 +3176,7 @@ impl OcrModel {
                 "recognize_multi_page_dynamic: images must be non-empty"
             )));
         }
-        if self.arch().id() != model_arch::default_arch().id() {
+        if self.arch().unlimited_variant().is_none() {
             return Err(FocrError::NotImplemented(format!(
                 "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
                  contract; model {:?} parses pages independently (use the plain \
@@ -2698,7 +3214,7 @@ impl OcrModel {
                 "recognize_multi_page_dynamic_streaming: images must be non-empty"
             )));
         }
-        if self.arch().id() != model_arch::default_arch().id() {
+        if self.arch().unlimited_variant().is_none() {
             return Err(FocrError::NotImplemented(format!(
                 "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
                  contract; model {:?} parses pages independently (use the plain \
@@ -2747,14 +3263,15 @@ impl OcrModel {
 
         // ── ONE cross-page prompt + embeds (all blocks at the single <image>) ─
         let (prompt_ids, images_seq_mask) = self.build_prompt_multi(&pres)?;
-        if prompt_ids.len() + 1 > MAX_POSITION_EMBEDDINGS {
+        let max_positions = self.decode_params.max_positions;
+        if prompt_ids.len() + 1 > max_positions {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "recognize_multi_page: the assembled {}-page prefix is {} tokens — over the \
-                 {MAX_POSITION_EMBEDDINGS} position budget by {} with no room to generate; \
-                 split the document into smaller multi-page passes",
+                 {max_positions} position budget by {} with no room to generate; {}",
                 pres.len(),
                 prompt_ids.len(),
-                (prompt_ids.len() + 1).saturating_sub(MAX_POSITION_EMBEDDINGS),
+                (prompt_ids.len() + 1).saturating_sub(max_positions),
+                warning_recovery(WarningKind::PromptTooLong),
             )));
         }
         let mut inputs_embeds = self.embed_prompt(&prompt_ids)?;
@@ -2774,40 +3291,38 @@ impl OcrModel {
 
         // ── ONE decode across the whole document (OQ-13) ─────────────────────
         // ngram_window 1024 (multi) per OQ-18; generation capped so
-        // prefix + generated never exceeds the 32K positions.
+        // prefix + generated never exceeds the shared position budget.
+        let position_room = max_positions - prompt_ids.len();
         let params = sampler::DecodeParams {
             ngram_window: sampler::NGRAM_WINDOW_MULTI,
-            max_length: self
-                .decode_params
-                .max_length
-                .min(MAX_POSITION_EMBEDDINGS - prompt_ids.len()),
+            max_length: self.decode_params.max_length.min(position_room),
             ..self.decode_params.clone()
         };
         let td = Instant::now();
         let generated = match on_page {
             None => self.generate_with(inputs_embeds, &prompt_ids, &params)?,
             Some(on_page) => {
-                // Streaming (bd-2z0y): a per-committed-token observer feeds a
-                // [`postprocess::PageStream`]. Boundary checks re-decode the
-                // emitted ids every STREAM_CHECK_EVERY tokens — a full decode
-                // is a linear byte-concat, trivial next to a decode step's
-                // GEMMs — and PageStream is idempotent over re-fed prefixes.
-                // Streaming is BEST-EFFORT: a decode error inside the observer
-                // stops the stream (the terminal decode below still surfaces
-                // real errors); it never changes the emitted ids.
+                // Streaming (bd-2z0y): a per-committed-token observer decodes
+                // each id with a UTF-8-safe incremental decoder (U2-X1), which
+                // holds back a character split across byte-level tokens
+                // instead of failing, and feeds the text so far to a
+                // [`postprocess::PageStream`] every STREAM_CHECK_EVERY tokens
+                // (the scanner is idempotent over re-fed prefixes). Streaming
+                // never changes the emitted ids, and the terminal decode below
+                // still surfaces real errors.
                 const STREAM_CHECK_EVERY: usize = 8;
                 let tok = self.tokenizer()?;
                 let mut stream = postprocess::PageStream::new();
-                let mut ids: Vec<u32> = Vec::new();
-                let mut stream_broken = false;
+                let mut decoder = crate::tokenizer::StreamDecoder::new();
+                let mut text = String::new();
+                let mut seen = 0usize;
                 let mut observer = |id: u32| {
-                    ids.push(id);
-                    if stream_broken || !ids.len().is_multiple_of(STREAM_CHECK_EVERY) {
-                        return;
-                    }
-                    match tok.decode(&ids) {
-                        Ok(text) => stream.feed(&text, &mut *on_page),
-                        Err(_) => stream_broken = true,
+                    seen += 1;
+                    // An id with no token adds no streamed text; the terminal
+                    // decode reports it.
+                    let _ = decoder.push(tok, id, &mut text);
+                    if seen.is_multiple_of(STREAM_CHECK_EVERY) {
+                        stream.feed(&text, &mut *on_page);
                     }
                 };
                 let generated = self.generate_with_observer(
@@ -2818,11 +3333,10 @@ impl OcrModel {
                 )?;
                 // End of decode: flush the final in-flight page (EOS marker
                 // stripped, exactly as finalize_multi strips it before split).
-                if !stream_broken && let Ok(text) = tok.decode(&generated) {
-                    let text = postprocess::strip_eos(&text);
-                    stream.feed(&text, &mut *on_page);
-                    stream.finish(&text, &mut *on_page);
-                }
+                decoder.flush(&mut text);
+                let text = postprocess::strip_eos(&text);
+                stream.feed(&text, &mut *on_page);
+                stream.finish(&text, &mut *on_page);
                 generated
             }
         };
@@ -2832,6 +3346,19 @@ impl OcrModel {
             td.elapsed().as_secs_f64()
         ));
         let decoded = self.tokenizer()?.decode(&generated)?;
+        if let Ok(mut slot) = self.last_decode.lock()
+            && let Some(report) = slot.as_mut()
+        {
+            if report.finish_reason == FinishReason::Length
+                && position_room <= self.decode_params.max_length
+            {
+                report.cap = Some(LengthCap::Positions);
+            }
+            report.pages = Some(PageBodies {
+                expected: pres.len(),
+                bodies: postprocess::page_body_count(&postprocess::strip_eos(&decoded)),
+            });
+        }
         postprocess::finalize_multi(&decoded, pres.len())
     }
 
@@ -2841,14 +3368,14 @@ impl OcrModel {
         // which `generate` selects only when int8 is requested AND the stateless
         // O(n^2) oracle is NOT forced. Engage the spine under EXACTLY that
         // condition so its output tracks whichever sequential oracle is in force.
-        // Arch gate (fresh-eyes fix): the spine pipeline is built for the
-        // default Unlimited-OCR arch (Baidu tensor names, R-SWA rings, the
+        // Arch gate (fresh-eyes fix): the spine pipeline is built for
+        // Unlimited-OCR v1 (Baidu tensor names, R-SWA rings, the
         // BASE_PROMPT tokenizer); a got-ocr2/zoo artifact must take the
         // sequential loop, whose per-page forward() carries the arch dispatch.
         let spine = batch_scheduler::spine_enabled()
             && (int8_decode_requested() || self.artifact_stores_gated_int8())
             && std::env::var_os(DECODE_STATELESS_ENV).is_none()
-            && self.arch().id() == model_arch::default_arch().id();
+            && self.arch().unlimited_variant() == Some(model_arch::UnlimitedVariant::V1Rswa);
         // A7.5 (bd-3jo6.1.7.5): the DENSE continuous-batch spine. GOT decode is
         // int8 by construction (the QInt8 panels), so it needs only the master
         // spine switch; the per-page id-stream is byte-identical to the
@@ -3269,7 +3796,7 @@ impl OcrModel {
         self.tokenizer.get_or_try_init(|| {
             // Byte-loaded models carry the payload directly (no "beside").
             if let Some(bytes) = &self.sidecars.tokenizer_json {
-                return crate::tokenizer::Tokenizer::from_json_bytes(bytes);
+                return checked_tokenizer(self.arch, bytes, "the in-memory tokenizer.json sidecar");
             }
             if let Some([vocab, merges, added]) = &self.sidecars.opt_triple {
                 return crate::tokenizer::Tokenizer::from_opt_files(vocab, merges, added);
@@ -3278,10 +3805,15 @@ impl OcrModel {
             // slow-tokenizer triple instead of tokenizer.json (D9).
             let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
             if self.arch().id() == "onechart" {
-                crate::tokenizer::Tokenizer::from_opt_dir(dir)
-            } else {
-                crate::tokenizer::Tokenizer::load(&dir.join("tokenizer.json"))
+                return crate::tokenizer::Tokenizer::from_opt_dir(dir);
             }
+            // A sidecar absent at open (or a byte-loaded model's) is verified
+            // here, on first use, by the same check the open runs.
+            let path = dir.join("tokenizer.json");
+            let bytes = std::fs::read(&path).map_err(|error| {
+                FocrError::ModelNotFound(format!("tokenizer.json at {}: {error}", path.display()))
+            })?;
+            checked_tokenizer(self.arch, &bytes, &path.display().to_string())
         })
     }
 
@@ -3725,7 +4257,7 @@ impl OcrModel {
         // One controller instance per decode invocation. Unset/0 is a no-op;
         // invalid values fail before model work, and an armed trigger is sticky.
         let mut runaway_guard = sampler::RunawayGuard::from_env()?;
-        if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
+        let generated = if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
             self.generate_stateless(
                 inputs_embeds,
                 prompt_ids,
@@ -3753,7 +4285,28 @@ impl OcrModel {
                 observer,
                 &mut runaway_guard,
             )
+        }?;
+        if let Ok(mut slot) = self.last_decode.lock() {
+            let stopped = generated.last() == Some(&params.eos_token_id);
+            let (decodes, length_stops) = slot
+                .as_ref()
+                .map_or((0, 0), |prior| (prior.decodes, prior.length_stops));
+            *slot = Some(DecodeReport {
+                ids: generated.clone(),
+                finish_reason: if stopped {
+                    FinishReason::Stop
+                } else {
+                    FinishReason::Length
+                },
+                cap: (!stopped).then_some(LengthCap::MaxLength),
+                pages: None,
+                max_length: params.max_length,
+                max_positions: params.max_positions,
+                decodes: decodes + 1,
+                length_stops: length_stops + usize::from(!stopped),
+            });
         }
+        Ok(generated)
     }
 
     /// O(n) cached greedy decode (bd-1gv.17): [`decoder::prefill_with_cache`] once
@@ -4451,6 +5004,137 @@ impl OcrModel {
 mod tests {
     use super::*;
 
+    /// A multi-page report as `recognize_multi_page` records it.
+    fn multi_page_report(
+        finish_reason: FinishReason,
+        cap: Option<LengthCap>,
+        expected: usize,
+        decoded: &str,
+    ) -> DecodeReport {
+        DecodeReport {
+            ids: Vec::new(),
+            finish_reason,
+            cap,
+            pages: Some(PageBodies {
+                expected,
+                bodies: postprocess::page_body_count(decoded),
+            }),
+            max_length: 32_768,
+            max_positions: MAX_POSITION_EMBEDDINGS,
+            decodes: 1,
+            length_stops: usize::from(finish_reason == FinishReason::Length),
+        }
+    }
+
+    /// U2-X2: the frozen `infer_multi` oracle outputs end at EOS with fewer
+    /// page bodies than pages, so each is a `v1_page_merge` with the exact
+    /// counts.
+    #[test]
+    fn recorded_multi_page_outputs_are_page_merges() {
+        for (name, expected, got) in [("p20", 20, 7), ("p10", 10, 9), ("p9_p14", 2, 1)] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("tests/fixtures/multi_page/{name}_raw.md"));
+            let raw = std::fs::read_to_string(&path).expect("recorded oracle output");
+            let report = multi_page_report(FinishReason::Stop, None, expected, &raw);
+            let warnings = decode_warnings(&report);
+            assert_eq!(warnings.len(), 1, "{name}");
+            let w = warnings[0].to_json();
+            assert_eq!(w["kind"], "v1_page_merge", "{name}");
+            assert_eq!(
+                (w["expected"].as_u64(), w["got"].as_u64()),
+                (Some(expected as u64), Some(got)),
+                "{name}"
+            );
+            assert_eq!(
+                w["message"],
+                format!(
+                    "v1 produced {got} page bodies for {expected} pages; page boundaries in this \
+                     output are unreliable"
+                )
+            );
+            assert_eq!(w["recovery"], warning_recovery(WarningKind::V1PageMerge));
+        }
+    }
+
+    /// U2-X2: healthy multi-page outputs, including one whose model skipped
+    /// the opening marker (GH #17), warn nothing.
+    #[test]
+    fn healthy_multi_page_outputs_do_not_warn() {
+        for decoded in ["<PAGE>a<PAGE>b<PAGE>c", "lead text<PAGE>b<PAGE>c"] {
+            let report = multi_page_report(FinishReason::Stop, None, 3, decoded);
+            assert_eq!(report.pages.map(|p| p.bodies), Some(3), "{decoded}");
+            assert!(decode_warnings(&report).is_empty(), "{decoded}");
+        }
+        // A single-page decode has no page report and never warns, even at a cap.
+        let mut single = multi_page_report(FinishReason::Length, Some(LengthCap::MaxLength), 1, "");
+        single.pages = None;
+        assert!(decode_warnings(&single).is_empty());
+        assert_eq!(single.run_finish_reason(), FinishReason::Length);
+    }
+
+    /// U2-X2: a length stop with missing pages is a truncation named by the
+    /// limit that bound it; each cause has its own recovery.
+    #[test]
+    fn truncations_name_their_cap() {
+        let positions = decode_warnings(&multi_page_report(
+            FinishReason::Length,
+            Some(LengthCap::Positions),
+            3,
+            "<PAGE>one<PAGE>tw",
+        ));
+        let w = positions[0].to_json();
+        assert_eq!(
+            (w["kind"].as_str(), w["cause"].as_str()),
+            (Some("v1_truncated"), Some("positions"))
+        );
+        assert_eq!(
+            (w["expected"].as_u64(), w["got"].as_u64()),
+            (Some(3), Some(2))
+        );
+        assert_eq!(
+            w["message"],
+            "stopped after 2 of 3 pages: v1 shares 32,768 positions between prompt and output \
+             (≈29 dense pages)"
+        );
+        assert_eq!(
+            w["recovery"],
+            "split the document with `--pages`, or parse pages independently (omit `--multi-page`)"
+        );
+        let mut capped = multi_page_report(
+            FinishReason::Length,
+            Some(LengthCap::MaxLength),
+            3,
+            "<PAGE>one",
+        );
+        capped.max_length = 1200;
+        let w = decode_warnings(&capped)[0].to_json();
+        assert_eq!(
+            (w["kind"].as_str(), w["cause"].as_str()),
+            (Some("v1_truncated"), Some("user_cap"))
+        );
+        assert_eq!(
+            w["message"],
+            "stopped after 1 of 3 pages: the --max-length cap of 1,200 generated tokens was reached"
+        );
+        assert_eq!(w["recovery"], "raise `--max-length`");
+    }
+
+    #[test]
+    fn test_position_override_has_the_shipping_default() {
+        // Unset in the test environment: the validator passes and decode
+        // params keep the arch's context.
+        if std::env::var_os(TEST_MAX_POSITIONS_ENV).is_none() {
+            assert!(validate_test_max_positions().is_ok());
+            assert_eq!(
+                decode_params_from_env().max_positions,
+                MAX_POSITION_EMBEDDINGS
+            );
+        }
+        assert_eq!(thousands(32_768), "32,768");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+    }
+
     /// Build a synthetic one-tensor artifact holding `model.embed_tokens.weight`
     /// as `QInt8PerChan` — the storage the wasm experts-int4 recipe emits.
     fn synthetic_int8_embed_artifact(rows: usize, cols: usize) -> Weights {
@@ -4650,6 +5334,12 @@ mod tests {
         dir
     }
 
+    /// The v1 source shard's file name, which a directory without an index
+    /// resolves to.
+    fn v1_raw_shard_name() -> &'static str {
+        unlimited_ocr_census::source_shards(model_arch::TensorCensus::UnlimitedOcrV1)[0].0
+    }
+
     #[test]
     fn resolve_model_searches_short_name_focrq_candidate() {
         let dir = temp_model_dir("resolve_short_focrq");
@@ -4666,7 +5356,7 @@ mod tests {
         let root = temp_model_dir("resolve_short_safetensors_root");
         let package = root.join("unlimited-ocr");
         std::fs::create_dir_all(&package).expect("create safetensors package");
-        let shard = package.join(RAW_SAFETENSORS_SHARD_NAME);
+        let shard = package.join(v1_raw_shard_name());
         std::fs::write(&shard, b"only resolver existence is tested").expect("write shard");
 
         let resolved = resolve_model_from_search_dirs(Path::new("unlimited-ocr"), &[root])
@@ -4916,8 +5606,8 @@ mod tests {
         })
         .expect("load the descriptor validated before the path swap");
 
-        assert!(loaded.record("test.original").is_some());
-        assert!(loaded.record("test.replacement").is_none());
+        assert!(loaded.weights.record("test.original").is_some());
+        assert!(loaded.weights.record("test.replacement").is_none());
         let path_now = Weights::load(&model_path).expect("load replacement now at active path");
         assert!(path_now.record("test.original").is_none());
         assert!(path_now.record("test.replacement").is_some());
@@ -4956,8 +5646,8 @@ mod tests {
         })
         .expect("load the descriptor validated before the symlink swap");
 
-        assert!(loaded.record("test.original_link").is_some());
-        assert!(loaded.record("test.replacement_link").is_none());
+        assert!(loaded.weights.record("test.original_link").is_some());
+        assert!(loaded.weights.record("test.replacement_link").is_none());
         let link_now = Weights::load(&active_link).expect("load replacement symlink target");
         assert!(link_now.record("test.original_link").is_none());
         assert!(link_now.record("test.replacement_link").is_some());
@@ -5296,7 +5986,7 @@ mod tests {
     #[test]
     fn resolve_model_accepts_safetensors_directory_shard() {
         let dir = temp_model_dir("resolve_safetensors_dir");
-        let shard = dir.join(RAW_SAFETENSORS_SHARD_NAME);
+        let shard = dir.join(v1_raw_shard_name());
         std::fs::write(&shard, b"not loaded by resolver").expect("write shard");
 
         let resolved = OcrModel::resolve_model(&dir).expect("resolve safetensors directory");
@@ -5306,7 +5996,7 @@ mod tests {
     #[test]
     fn load_safetensors_directory_preserves_format_mismatch() {
         let dir = temp_model_dir("load_safetensors_dir");
-        let shard = dir.join(RAW_SAFETENSORS_SHARD_NAME);
+        let shard = dir.join(v1_raw_shard_name());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(1u64).to_le_bytes());
         bytes.extend_from_slice(b"{");
@@ -5587,7 +6277,7 @@ mod tests {
     #[test]
     fn native_model_available_rejects_incomplete_safetensors_directory_header() {
         let dir = temp_model_dir("available_safetensors_dir");
-        let shard = dir.join(RAW_SAFETENSORS_SHARD_NAME);
+        let shard = dir.join(v1_raw_shard_name());
         let header = br#"{"x":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(header.len() as u64).to_le_bytes());
@@ -5602,7 +6292,7 @@ mod tests {
     #[test]
     fn native_model_available_rejects_empty_safetensors_directory() {
         let dir = temp_model_dir("available_empty_safetensors");
-        let shard = dir.join(RAW_SAFETENSORS_SHARD_NAME);
+        let shard = dir.join(v1_raw_shard_name());
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&(2u64).to_le_bytes());
         bytes.extend_from_slice(b"{}");
@@ -5610,6 +6300,250 @@ mod tests {
 
         assert!(!native_model_available(&dir));
         assert!(load_weights_from_resolved_model(&shard).is_err());
+    }
+
+    #[test]
+    fn a_sharded_directory_resolves_to_its_index_and_opens_through_the_probe() {
+        use shards::tests::{POSITION_IDS_RULE, arange_bytes, index_json, safetensors_file};
+        let dir = temp_model_dir("sharded_dir");
+        let index = dir.join(shards::SHARD_INDEX_NAME);
+        std::fs::write(
+            dir.join("model-00001-of-00002.safetensors"),
+            safetensors_file(&[("enc.w", "BF16", vec![2], vec![1, 0, 2, 0])]),
+        )
+        .expect("write shard 1");
+        std::fs::write(
+            dir.join("model-00002-of-00002.safetensors"),
+            safetensors_file(&[
+                ("dec.w", "BF16", vec![1], vec![3, 0]),
+                ("vision.position_ids", "I64", vec![1, 4], arange_bytes(4)),
+            ]),
+        )
+        .expect("write shard 2");
+        std::fs::write(
+            &index,
+            index_json(
+                &[
+                    ("enc.w", "model-00001-of-00002.safetensors"),
+                    ("dec.w", "model-00002-of-00002.safetensors"),
+                    ("vision.position_ids", "model-00002-of-00002.safetensors"),
+                ],
+                4 + 2 + 32,
+            ),
+        )
+        .expect("write index");
+        // The index wins over a stray single-shard file, and resolves inside the
+        // directory so `parent()` is where the sidecars live.
+        std::fs::write(dir.join(v1_raw_shard_name()), b"stray").expect("write stray shard");
+        assert_eq!(OcrModel::resolve_model(&dir).expect("resolves"), index);
+
+        let opened = shards::open_shards(&index).expect("opens every shard");
+        let merged = read_opened_shard_headers(&opened).expect("headers merge");
+        assert_eq!((merged.records.len(), merged.int64.len()), (2, 1));
+        // An unidentified checkpoint is refused by the probe, as a plain file is.
+        let error = validate_model_header_file(&index).expect_err("no census matches");
+        assert!(
+            error.to_string().contains("matches no registered model"),
+            "{error}"
+        );
+        assert!(load_weights_from_resolved_model(&index).is_err());
+
+        let _rules = shards::test_rules::supply(&POSITION_IDS_RULE);
+        let weights = Weights::load_opened_shards(opened).expect("sharded load");
+        assert_eq!(weights.names().collect::<Vec<_>>(), ["dec.w", "enc.w"]);
+
+        let broken = temp_model_dir("sharded_dir_missing_shard");
+        let broken_index = broken.join(shards::SHARD_INDEX_NAME);
+        std::fs::write(&broken_index, index_json(&[("a", "gone.safetensors")], 2))
+            .expect("write index");
+        let error = validate_model_header_file(&broken_index).expect_err("missing shard");
+        assert!(matches!(error, FocrError::ModelNotFound(_)), "{error}");
+        assert!(
+            error.to_string().contains("lists shard gone.safetensors"),
+            "{error}"
+        );
+    }
+
+    /// Write a header-only stand-in for a census-exact checkpoint into `dir`:
+    /// `tensors` (sorted) split across two shards with real headers and SPARSE
+    /// payloads (`set_len`, no bytes written), plus the index. Only header
+    /// probes may read it. Returns the index path.
+    #[cfg(unix)]
+    fn write_sparse_two_shard_stand_in(
+        dir: &Path,
+        tensors: &[(String, DType, Vec<usize>)],
+    ) -> PathBuf {
+        use std::io::Write as _;
+        let half = tensors.len() / 2;
+        let mut map: Vec<(&str, String)> = Vec::new();
+        let mut total = 0usize;
+        for (position, chunk) in [&tensors[..half], &tensors[half..]].into_iter().enumerate() {
+            let shard = format!("model-{:05}-of-00002.safetensors", position + 1);
+            let mut entries = Vec::with_capacity(chunk.len());
+            let mut offset = 0usize;
+            for (name, dtype, shape) in chunk {
+                let elem = match dtype {
+                    DType::F32 => 4,
+                    DType::F16 | DType::BF16 => 2,
+                    other => panic!("a source census holds no {other:?} tensor"),
+                };
+                let len = shape.iter().product::<usize>() * elem;
+                entries.push(format!(
+                    r#""{name}":{{"dtype":"{dtype:?}","shape":{shape:?},"data_offsets":[{offset},{}]}}"#,
+                    offset + len
+                ));
+                offset += len;
+                map.push((name.as_str(), shard.clone()));
+            }
+            let header = format!("{{{}}}", entries.join(","));
+            let mut file = std::fs::File::create(dir.join(&shard)).expect("create shard");
+            file.write_all(&(header.len() as u64).to_le_bytes())
+                .expect("write prefix");
+            file.write_all(header.as_bytes()).expect("write header");
+            file.set_len((8 + header.len() + offset) as u64)
+                .expect("sparse payload");
+            total += offset;
+        }
+        let pairs: Vec<(&str, &str)> = map
+            .iter()
+            .map(|(name, shard)| (*name, shard.as_str()))
+            .collect();
+        let index = dir.join(shards::SHARD_INDEX_NAME);
+        std::fs::write(&index, shards::tests::index_json(&pairs, total as u64))
+            .expect("write index");
+        index
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sharded_checkpoint_judges_the_sidecar_inside_its_directory() {
+        let parent = temp_model_dir("sharded_sidecar_parent");
+        let dir = parent.join("checkpoint");
+        std::fs::create_dir_all(&dir).expect("checkpoint dir");
+        let index =
+            write_sparse_two_shard_stand_in(&dir, &unlimited_ocr_census::v1_source_tensors());
+        assert_eq!(OcrModel::resolve_model(&dir).expect("resolves"), index);
+
+        // v1 resharded in two is still v1 by census; the probe reads no payload.
+        let arch = validate_model_header_file(&index).expect("the v1 census matches across shards");
+        assert_eq!(arch.id(), model_arch::UNLIMITED_OCR_V1_ID);
+        assert!(native_model_available(&dir));
+
+        // The parent's sidecar is never consulted: with none in the checkpoint
+        // directory, the foreign one beside it does not refuse the open.
+        std::fs::write(parent.join("tokenizer.json"), SIDECAR_JSON).expect("parent sidecar");
+        assert!(
+            eager_sidecar_tokenizer(arch, &index)
+                .expect("an absent sidecar is not an open error")
+                .is_none()
+        );
+
+        // The one inside the directory is judged, before any weight byte is read.
+        let inside = dir.join("tokenizer.json");
+        std::fs::write(&inside, SIDECAR_JSON).expect("inner sidecar");
+        let error = load_weights_from_resolved_model_after_validation(&index, || {
+            panic!("weights must not be read past a refused sidecar")
+        })
+        .expect_err("a foreign sidecar is refused");
+        let message = error.to_string();
+        assert!(message.contains(&inside.display().to_string()), "{message}");
+        assert!(
+            message.contains(arch.tokenizer_sha256().expect("v1 pins its tokenizer")),
+            "{message}"
+        );
+
+        // Armed: the real v1 sidecar inside the directory passes while a foreign
+        // one sits in the parent.
+        if let Some(model) = std::env::var_os("FOCR_MODEL_PATH").map(PathBuf::from) {
+            let real = model.with_file_name("tokenizer.json");
+            let armed = parent.join("armed");
+            std::fs::create_dir_all(&armed).expect("armed dir");
+            std::os::unix::fs::symlink(&real, armed.join("tokenizer.json")).expect("link sidecar");
+            let tokenizer = eager_sidecar_tokenizer(arch, &armed.join(shards::SHARD_INDEX_NAME))
+                .expect("the real sidecar passes");
+            assert!(tokenizer.is_some());
+        }
+    }
+
+    /// The v2 vision `position_ids` rule as U2-A5's census will state it,
+    /// supplied by the test until then.
+    static V2_POSITION_IDS_RULE: [shards::Int64Rule; 1] = [shards::Int64Rule {
+        name: "model.vision_model.embeddings.position_ids",
+        shape: &[1, 257],
+        content: shards::Int64Content::Arange,
+    }];
+
+    /// Model-gated (U2-A3): `FOCR_UOCR2_SOURCE_DIR` names a directory holding
+    /// the real Unlimited-OCR-2 index and both shards, or header-only stand-ins
+    /// (real headers, sparse payloads). Skips with success when unset. Only
+    /// headers are read; the census and the shard pins are U2-A5's.
+    #[test]
+    fn real_v2_index_and_shard_headers_parse_through_the_resolver() {
+        let test = "real_v2_index_and_shard_headers_parse_through_the_resolver";
+        let started = std::time::Instant::now();
+        let line = |case: &str, event: &str, result: &str, extra: serde_json::Value| {
+            let mut object = serde_json::json!({
+                "schema_version": 1, "ts": started.elapsed().as_secs_f64(), "test": test,
+                "case": case, "run_seq": 0, "event": event, "result": result,
+            });
+            if let (Some(object), Some(extra)) = (object.as_object_mut(), extra.as_object()) {
+                object.extend(extra.clone());
+            }
+            println!("{object}");
+        };
+        let Some(dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) else {
+            line(
+                "v2",
+                "skip",
+                "skip_no_model",
+                serde_json::json!({
+                    "reason": "FOCR_UOCR2_SOURCE_DIR unset",
+                }),
+            );
+            return;
+        };
+        let index = OcrModel::resolve_model(&dir).expect("the directory resolves");
+        assert_eq!(index, dir.join(shards::SHARD_INDEX_NAME));
+        let opened = shards::open_shards(&index).expect("every shard opens");
+        for shard in &opened.shards {
+            let file = std::fs::File::open(&shard.path).expect("open shard");
+            let (header, _, _) =
+                read_validated_safetensors_header(&file, shard.len).expect("shard header");
+            line(
+                &shard.name,
+                "assert",
+                "pass",
+                serde_json::json!({
+                    "assertion": "shard header parses and validates",
+                    "pass": true,
+                    "bytes": shard.len, "header_ok": true, "tensors": header.len(),
+                    "hashed": false,
+                }),
+            );
+        }
+        let merged = read_opened_shard_headers(&opened).expect("headers merge against the index");
+        assert_eq!(opened.index.shards().len(), 2);
+        assert_eq!(opened.index.total_size(), 6_687_958_536);
+        assert_eq!(merged.len(), 2_819, "the v2 tensor count");
+        assert_eq!(
+            merged.int64.keys().collect::<Vec<_>>(),
+            ["model.vision_model.embeddings.position_ids"],
+            "exactly one I64 tensor"
+        );
+        shards::check_int64_entries(&merged.int64, &V2_POSITION_IDS_RULE, "unlimited-ocr-2")
+            .expect("the I64 tensor is the rule's");
+        shards::check_int64_rules_present(&merged.int64, &V2_POSITION_IDS_RULE, "unlimited-ocr-2")
+            .expect("the rule's tensor is present");
+        line(
+            "v2",
+            "result",
+            "pass",
+            serde_json::json!({
+                "elapsed_us": started.elapsed().as_micros() as u64,
+                "tensors": merged.len(), "int64": merged.int64.len(),
+                "source_sha256": serde_json::Value::Null,
+            }),
+        );
     }
 
     #[test]
@@ -6026,6 +6960,9 @@ mod tests {
             fn implemented(&self) -> bool {
                 false
             }
+            fn required_quant_recipe(&self, _quant: &str) -> Option<&'static str> {
+                None
+            }
         }
         let err = OcrModel::ensure_arch_implemented(&PlannedArch)
             .expect_err("a planned arch must be rejected");
@@ -6084,5 +7021,240 @@ mod tests {
             .expect("got-ocr2 is implemented, so its forward is admitted");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A one-tensor raw safetensors shard, which matches no embedded census.
+    fn unidentified_safetensors() -> Vec<u8> {
+        let header = br#"{"w":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}"#;
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header);
+        bytes.extend_from_slice(&[0, 0]);
+        bytes
+    }
+
+    /// A small `tokenizer.json` carrying the v1 `<image>` id.
+    const SIDECAR_JSON: &str = r#"{"added_tokens":[{"id":128815,"content":"<image>","special":true}],
+        "model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}"#;
+
+    /// An arch that pins only its tokenizer sidecar.
+    struct SidecarArch {
+        sha256: Option<&'static str>,
+        tokens: &'static [(u32, &'static str)],
+    }
+
+    impl model_arch::ModelArch for SidecarArch {
+        fn id(&self) -> &'static str {
+            "sidecar-test"
+        }
+        fn display_name(&self) -> &'static str {
+            "sidecar test"
+        }
+        fn license_notice(&self) -> &'static str {
+            "test"
+        }
+        fn default_artifact_basename(&self) -> &'static str {
+            "sidecar-test.focrq"
+        }
+        fn vision_encoder(&self) -> model_arch::VisionEncoder {
+            model_arch::VisionEncoder::SamClip
+        }
+        fn decoder(&self) -> model_arch::Decoder {
+            model_arch::Decoder::DeepSeekV2MoeRswa
+        }
+        fn tokenizer(&self) -> model_arch::TokenizerKind {
+            model_arch::TokenizerKind::DeepSeekBpe
+        }
+        fn decode_contract(&self) -> model_arch::DecodeContract {
+            model_arch::default_arch().decode_contract()
+        }
+        fn tasks(&self) -> &'static [model_arch::Task] {
+            &[model_arch::Task::Ocr]
+        }
+        fn implemented(&self) -> bool {
+            false
+        }
+        fn required_quant_recipe(&self, _quant: &str) -> Option<&'static str> {
+            None
+        }
+        fn tokenizer_sha256(&self) -> Option<&'static str> {
+            self.sha256
+        }
+        fn required_token_ids(&self) -> &'static [(u32, &'static str)] {
+            self.tokens
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> &'static str {
+        use sha2::Digest as _;
+        Box::leak(format!("{:x}", sha2::Sha256::digest(bytes)).into_boxed_str())
+    }
+
+    #[test]
+    fn absent_model_id_opens_as_v1_under_another_default() {
+        let got = model_arch::arch_by_id("got-ocr2").expect("got-ocr2 registered");
+        let _flip = model_arch::test_default::flip(got);
+        assert_eq!(
+            compatible_arch("").expect("absent id resolves").id(),
+            model_arch::UNLIMITED_OCR_V1_ID
+        );
+        let mut builder = crate::quant::focrq::FocrqBuilder::new();
+        builder
+            .add_tensor(
+                "model.embed_tokens.weight",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![1, 1],
+                vec![0; 2],
+            )
+            .expect("add tensor");
+        let weights = Weights::from_bytes(builder.build()).expect("v1 container parses");
+        assert_eq!(weights.model_id(), model_arch::UNLIMITED_OCR_V1_ID);
+    }
+
+    #[test]
+    fn an_unidentified_raw_shard_is_refused_on_both_open_paths() {
+        let weights = Weights::from_bytes(unidentified_safetensors()).expect("raw shard parses");
+        assert_eq!(weights.model_id(), "");
+        let message = OcrModel::from_weights(weights, SidecarBundle::default())
+            .err()
+            .expect("byte path refuses it")
+            .to_string();
+        assert!(
+            message.contains("matches no registered model's tensor census"),
+            "{message}"
+        );
+
+        let path = temp_model_dir("unidentified_raw").join("model.safetensors");
+        std::fs::write(&path, unidentified_safetensors()).expect("write raw shard");
+        let message = load_weights_from_resolved_model(&path)
+            .expect_err("file path refuses it")
+            .to_string();
+        assert!(
+            message.contains("matches no registered model's tensor census"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn checked_tokenizer_refuses_a_foreign_sidecar_or_a_missing_token() {
+        let bytes = SIDECAR_JSON.as_bytes();
+        let pinned = SidecarArch {
+            sha256: Some(sha256_hex(bytes)),
+            tokens: &[(128815, "<image>")],
+        };
+        let tokenizer = checked_tokenizer(&pinned, bytes, "t.json").expect("the pinned sidecar");
+        assert_eq!(tokenizer.image_id(), 128815);
+
+        let other = SIDECAR_JSON.replace("\"b\":1", "\"b\":2");
+        let message = checked_tokenizer(&pinned, other.as_bytes(), "t.json")
+            .expect_err("a different file")
+            .to_string();
+        assert!(
+            message.contains(sha256_hex(other.as_bytes())) && message.contains(sha256_hex(bytes)),
+            "names both hashes: {message}"
+        );
+        assert!(message.contains("focr pull sidecar-test"), "{message}");
+
+        let needs_page = SidecarArch {
+            sha256: None,
+            tokens: &[(128815, "<image>"), (128827, "<PAGE>")],
+        };
+        let message = checked_tokenizer(&needs_page, bytes, "t.json")
+            .expect_err("no <PAGE> id")
+            .to_string();
+        assert!(
+            message.contains("maps token id 128827 to None") && message.contains("\"<PAGE>\""),
+            "{message}"
+        );
+
+        let unpinned = SidecarArch {
+            sha256: None,
+            tokens: &[],
+        };
+        assert!(!pins_tokenizer(&unpinned));
+        checked_tokenizer(&unpinned, other.as_bytes(), "t.json").expect("nothing pinned");
+    }
+
+    #[test]
+    fn byte_path_refuses_a_foreign_v1_sidecar_before_the_weights_contract() {
+        // A v1 container (no model_id) that would also fail the v1 census: the
+        // tokenizer refusal must come first.
+        let mut builder = crate::quant::focrq::FocrqBuilder::new();
+        builder
+            .add_tensor(
+                "model.embed_tokens.weight",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![1, 1],
+                vec![0; 2],
+            )
+            .expect("add tensor");
+        let weights = || Weights::from_bytes(builder.clone().build()).expect("v1 container parses");
+        let sidecars = SidecarBundle {
+            tokenizer_json: Some(SIDECAR_JSON.as_bytes().to_vec()),
+            ..SidecarBundle::default()
+        };
+        let message = OcrModel::from_weights(weights(), sidecars)
+            .err()
+            .expect("foreign sidecar refused")
+            .to_string();
+        assert!(
+            message.contains("in-memory tokenizer.json")
+                && message
+                    .contains("a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4")
+                && message.contains("focr pull unlimited-ocr"),
+            "{message}"
+        );
+        // Without a sidecar the same weights fail on their own contract.
+        let message = OcrModel::from_weights(weights(), SidecarBundle::default())
+            .err()
+            .expect("census refused")
+            .to_string();
+        assert!(!message.contains("tokenizer"), "{message}");
+    }
+
+    /// The file path on the real v1 artifact (env-gated: `FOCR_MODEL_PATH`,
+    /// with the pinned `tokenizer.json` beside it). A foreign sidecar is
+    /// refused before the load-stage probe runs, so no weight byte is read;
+    /// the pinned sidecar passes the hash and every required token id; an
+    /// absent one is left to first use.
+    #[cfg(unix)]
+    #[test]
+    fn file_path_judges_the_v1_sidecar_before_reading_weights_when_armed() {
+        let Some(model) = std::env::var_os("FOCR_MODEL_PATH").map(PathBuf::from) else {
+            eprintln!("skip-with-SUCCESS: FOCR_MODEL_PATH unset");
+            return;
+        };
+        let real_sidecar = model.with_file_name("tokenizer.json");
+        let dir = temp_model_dir("sidecar_file_path");
+        let link = dir.join("unlimited-ocr.focrq");
+        if !link.exists() {
+            std::os::unix::fs::symlink(&model, &link).expect("link the real artifact");
+        }
+        let v1 = model_arch::default_arch();
+        assert_eq!(v1.id(), model_arch::UNLIMITED_OCR_V1_ID);
+
+        std::fs::write(dir.join("tokenizer.json"), SIDECAR_JSON).expect("write foreign sidecar");
+        let mut read_weights = false;
+        let message = load_weights_from_resolved_model_after_validation(&link, || {
+            read_weights = true;
+        })
+        .expect_err("foreign sidecar refused")
+        .to_string();
+        assert!(!read_weights, "refused before any weight byte was read");
+        assert!(message.contains("focr pull unlimited-ocr"), "{message}");
+
+        std::fs::copy(&real_sidecar, dir.join("tokenizer.json")).expect("copy pinned sidecar");
+        let tokenizer = eager_sidecar_tokenizer(v1, &link)
+            .expect("pinned sidecar passes the hash and every required id")
+            .expect("present sidecar is parsed at open");
+        for &(id, content) in v1.required_token_ids() {
+            assert_eq!(tokenizer.id_to_token(id), Some(content));
+        }
+
+        let bare = temp_model_dir("sidecar_absent").join("unlimited-ocr.focrq");
+        assert!(
+            eager_sidecar_tokenizer(v1, &bare)
+                .expect("absence is not an open error")
+                .is_none()
+        );
     }
 }

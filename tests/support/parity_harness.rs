@@ -402,7 +402,9 @@ pub fn scrub_volatile(value: &Value) -> Value {
     }
 }
 
-fn is_scrub_key(k: &str) -> bool {
+/// Is `k` a volatile key — one of [`SCRUB_KEYS`] or a timing suffix? The
+/// single volatile-field list every golden comparison shares.
+pub fn is_scrub_key(k: &str) -> bool {
     SCRUB_KEYS.contains(&k)
         || k.ends_with("_ms")
         || k.ends_with("_us")
@@ -1050,8 +1052,10 @@ impl Logger {
     }
 
     /// Emit one NDJSON line on stderr (so it does not pollute any stdout the
-    /// harness captures) with the required common fields filled in.
-    fn emit(&mut self, event: &str, result: &str, mut extra: serde_json::Map<String, Value>) {
+    /// harness captures) with the required common fields filled in. Public so
+    /// a suite can attach its own per-case fields (token counts, artifact SHA)
+    /// to a schema event; the caller still owns the event's required fields.
+    pub fn emit(&mut self, event: &str, result: &str, mut extra: serde_json::Map<String, Value>) {
         let seq = self.next_seq();
         let mut obj = serde_json::Map::new();
         obj.insert("schema_version".into(), json!(LOG_SCHEMA_VERSION));

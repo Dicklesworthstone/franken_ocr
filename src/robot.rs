@@ -94,7 +94,52 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
         "FOCR_RESIDENT_CLIENT_TIMEOUT_SECS",
         "client-side reply timeout for a resident request (default 600)",
     ),
+    (
+        "FOCR_TEST_MAX_POSITIONS",
+        "TEST-ONLY: lower the position budget prompt and output share (1..=32768; a larger \
+         value exits 2) so tests reach the multi-page clamp on small documents",
+    ),
 ];
+
+/// Required and optional fields per event kind, so a consumer can validate an
+/// event and not only its kind (U2-X2). A change that adds a field extends this
+/// table in the same change; `tests/cli_robot_golden.rs` validates every event
+/// it sees against it. `stage` has no emitter yet.
+pub fn event_fields() -> Value {
+    json!({
+        "run_start": {
+            "required": ["schema_version", "event", "command"],
+            "optional": [],
+        },
+        "stage": { "reserved": true },
+        "page": {
+            "required": ["schema_version", "event", "status", "page"],
+            "optional": ["chars", "text", "error_kind", "message"],
+        },
+        "staff": {
+            "required": ["schema_version", "event", "staff", "total", "bbox", "status"],
+            "optional": ["reason"],
+        },
+        "music_warning": {
+            "required": ["schema_version", "event", "kind", "part", "measure", "detail"],
+            "optional": [],
+        },
+        "run_complete": {
+            "required": ["schema_version", "event", "markdown"],
+            // `finish_reason` is on every run whose model records a decode
+            // report (every Unlimited-OCR run); `warnings` only when non-empty.
+            "optional": [
+                "finish_reason", "warnings", "low_yield", "yield_chars", "input_megapixels",
+            ],
+        },
+        "run_error": {
+            "required": ["schema_version", "event", "error_kind", "code", "message", "recovery"],
+            // A partial-output run_error (completed pages written, then a
+            // nonzero exit) adds these; their producers are the v2 beads.
+            "optional": ["finish_reason", "pages_out", "warnings"],
+        },
+    })
+}
 
 /// A machine-readable, self-describing schema for the robot event stream.
 pub fn robot_schema() -> Value {
@@ -105,6 +150,7 @@ pub fn robot_schema() -> Value {
     json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
         "events": EVENT_KINDS,
+        "event_fields": event_fields(),
         "exit_codes": EXIT_CODE_TABLE,
         "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
         "environment_variables": environment,
@@ -119,7 +165,7 @@ pub fn robot_schema() -> Value {
             "doctor": "focr doctor --json",
         },
         "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
-        "status": "live — run_start/run_complete (carries `markdown`)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested; `run_error` carries `recovery`"
+        "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`"
     })
 }
 
@@ -159,15 +205,30 @@ pub fn run_complete_event(markdown: &str) -> Value {
 /// already-advertised `run_complete` kind and absent entirely on healthy
 /// runs, so existing consumers and goldens are unaffected and
 /// [`ROBOT_SCHEMA_VERSION`] is unchanged.
+///
+/// U2-X2 adds `finish_reason` (`stop` | `length`) whenever the decode
+/// recorded one, and `warnings` (`{kind, message, recovery, ...}`) only when
+/// non-empty, so a healthy run differs from before only by `finish_reason`.
 pub fn run_complete_event_assessed(
     markdown: &str,
     low_yield: Option<&crate::tall::LowYield>,
+    finish_reason: Option<crate::native_engine::FinishReason>,
+    warnings: &[crate::native_engine::RunWarning],
 ) -> Value {
     let mut event = run_complete_event(markdown);
     if let Some(assessment) = low_yield {
         event["low_yield"] = json!(true);
         event["yield_chars"] = json!(assessment.yield_chars);
         event["input_megapixels"] = json!(assessment.input_megapixels);
+    }
+    if let Some(reason) = finish_reason {
+        event["finish_reason"] = json!(reason.as_str());
+    }
+    if !warnings.is_empty() {
+        event["warnings"] = warnings
+            .iter()
+            .map(crate::native_engine::RunWarning::to_json)
+            .collect();
     }
     event
 }

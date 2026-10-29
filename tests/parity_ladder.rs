@@ -391,6 +391,7 @@ fn golden_decode_params(golden: &ReferenceGolden) -> Result<DecodeParams, String
         max_length: field("max_length")? as usize,
         no_repeat_ngram_size: field("no_repeat_ngram_size")? as usize,
         ngram_window: field("ngram_window")? as usize,
+        max_positions: sampler::DEFAULT_MAX_POSITIONS,
     })
 }
 

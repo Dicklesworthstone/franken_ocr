@@ -7,7 +7,7 @@
 # one-command local gate, and `.github/workflows/ci.yml` invokes this same script
 # as its single test step rather than duplicating the commands.
 #
-#   scripts/check.sh            # fmt + locked check/clippy/test (the full gate)
+#   scripts/check.sh            # fmt + locked check/clippy/test + token golden gate
 #   scripts/check.sh --fast     # skip clippy (still runs fmt + check + test)
 #   scripts/check.sh --ubs-only # run only the bounded UBS lane
 #
@@ -127,6 +127,9 @@ if [ "$FAST" -eq 0 ]; then
   run cargo clippy --locked --all-targets -- -D warnings
 fi
 run cargo test --locked
+# Token-id golden gate (U2-T3): re-checks v1's real outputs in the optimized
+# profile whenever the weights are on this machine; SKIPs cleanly without them.
+run sh scripts/token_golden_gate.sh
 run_ubs
 
 echo "OK: all gates passed."

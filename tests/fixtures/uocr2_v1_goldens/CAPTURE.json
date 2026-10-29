@@ -1,0 +1,111 @@
+{
+  "model_id": "unlimited-ocr",
+  "artifact": {
+    "file_name": "unlimited-ocr.int8.focrq",
+    "size": 4157448783,
+    "sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592"
+  },
+  "cases": {
+    "page_0009": {
+      "kind": "single",
+      "long": false,
+      "inputs": {
+        "page_0009.png": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da"
+      },
+      "token_count": 98,
+      "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+      "focr_version": "0.9.1",
+      "git_revision": "934c1e4e6f41+dirty",
+      "threads": 36
+    },
+    "page_0014": {
+      "kind": "single",
+      "long": false,
+      "inputs": {
+        "page_0014.png": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2"
+      },
+      "token_count": 495,
+      "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+      "focr_version": "0.9.1",
+      "git_revision": "934c1e4e6f41+dirty",
+      "threads": 36
+    },
+    "p9_p14": {
+      "kind": "multi",
+      "long": false,
+      "inputs": {
+        "page_0009.png": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+        "page_0014.png": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2"
+      },
+      "token_count": 432,
+      "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+      "focr_version": "0.9.1",
+      "git_revision": "934c1e4e6f41+dirty",
+      "threads": 36
+    },
+    "page_0590": {
+      "kind": "single",
+      "long": true,
+      "inputs": {
+        "page_0590.png": "6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3"
+      },
+      "token_count": 4033,
+      "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+      "focr_version": "0.9.1",
+      "git_revision": "934c1e4e6f41+dirty",
+      "threads": 36
+    },
+    "p10": {
+      "kind": "multi",
+      "long": true,
+      "inputs": {
+        "page_0009.png": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+        "page_0014.png": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+        "page_0019.png": "ad98fcc10f580bfa2271cc7ce3b581806d0392844d41201db95eaaa4713a1c1c",
+        "page_0023.png": "a74adb4f437d7955f5f75d3e4f053562c9b7e20cd54840d4488ac2f61ef3f761",
+        "page_0086.png": "016c23bad4ce37739a29efe88b4aa955593bcb116b330d479a436d805c138dc3",
+        "page_0091.png": "34f732f9adc386fb43b69e3befc8f103f83f3ba5f55592e1050f7e343ecd5bfd",
+        "page_0105.png": "90d94f3b6ec19810251866cd40f778866c129d87594592f1cbc68d9577af6040",
+        "page_0107.png": "e2b86f2fd70a80cf2ae5c17c96055446db378bebb2eb1a02d4aedd000ef2cf5f",
+        "page_0108.png": "7a808477b32e565daa998b644c842394d416bd5177bc7c392bfb29b8b94589eb",
+        "page_0126.png": "c7a368051bc12557d7dd34eb9a92c56d48f1afa19a2bc963f97a912d0a9d7ed0"
+      },
+      "token_count": 30310,
+      "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+      "focr_version": "0.9.1",
+      "git_revision": "934c1e4e6f41+dirty",
+      "threads": 36
+    },
+    "p20": {
+      "kind": "multi",
+      "long": true,
+      "inputs": {
+        "page_0009.png": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+        "page_0014.png": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+        "page_0019.png": "ad98fcc10f580bfa2271cc7ce3b581806d0392844d41201db95eaaa4713a1c1c",
+        "page_0023.png": "a74adb4f437d7955f5f75d3e4f053562c9b7e20cd54840d4488ac2f61ef3f761",
+        "page_0086.png": "016c23bad4ce37739a29efe88b4aa955593bcb116b330d479a436d805c138dc3",
+        "page_0091.png": "34f732f9adc386fb43b69e3befc8f103f83f3ba5f55592e1050f7e343ecd5bfd",
+        "page_0105.png": "90d94f3b6ec19810251866cd40f778866c129d87594592f1cbc68d9577af6040",
+        "page_0107.png": "e2b86f2fd70a80cf2ae5c17c96055446db378bebb2eb1a02d4aedd000ef2cf5f",
+        "page_0108.png": "7a808477b32e565daa998b644c842394d416bd5177bc7c392bfb29b8b94589eb",
+        "page_0126.png": "c7a368051bc12557d7dd34eb9a92c56d48f1afa19a2bc963f97a912d0a9d7ed0",
+        "page_0136.png": "8d5351e578187eb95efa98dcfefc20d74f774c62fc3d539595bd4cadc298fbaa",
+        "page_0179.png": "960f985de0e4470eaa7330c5b2017b4a8887e3f9fb3f50b7bac3a1eaf658a115",
+        "page_0250.png": "d966d4e5b7069a879dd5c5216136c2a55bf09f3bc15302ff4d75299a73fb1d15",
+        "page_0358.png": "6e5e3ae68ee7ff4d3dc8d8e15923eae2915cedfe1c05578284524aaeb387f4fa",
+        "page_0400.png": "194d5b3825ac67a7290689f7cfa40f4acf1b648c008a91f599aa0bde740d3790",
+        "page_0437.png": "5af3eb515d920952bc2a28dfdce0bc9bbd186eda9fd78dc50f907c05c870eed0",
+        "page_0547.png": "a386db4dacfdfe5f3c2ee10140b83aaf62bd2c1ec86fc0fb566fd7fd1f48f8e8",
+        "page_0557.png": "c0df8d381521bcbf7244a48ec119be695e4591b6ccde97fdff5c15eb336ac47f",
+        "page_0590.png": "6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3",
+        "page_0645.png": "cf72a678d549955aeb2d011bc90b129a2094ddbc18c608586c6f79134eee2fb2"
+      },
+      "token_count": 30543,
+      "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
+      "focr_version": "0.9.1",
+      "git_revision": "934c1e4e6f41+dirty",
+      "threads": 36
+    }
+  }
+}

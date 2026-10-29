@@ -407,10 +407,13 @@ parsed independently. `--multi-page` instead runs ONE pass over the whole
 document using the Unlimited-OCR `infer_multi` contract, so page N can reference
 content on pages 1..N-1, and the output is a single Markdown document with
 `<PAGE>` separators. On `focr ocr` it is PDF-only and composes with `--pages`;
-for an image list use `focr ocr-batch page1.png page2.png --multi-page`. The
-whole document must fit the 32K context (roughly 290 pages); over-budget
-requests fail with an actionable error instead of truncating. It does not
-compose with `--split-spreads` or `--extract-figures` (per-page semantics).
+for an image list use `focr ocr-batch page1.png page2.png --multi-page`. v1 has
+32,768 positions shared by prompt and output (≈29 dense pages); longer documents
+stop early and report `finish_reason: length` with a `v1_truncated` warning (a
+prompt that alone exceeds the budget fails with an actionable error). When v1
+ends with fewer page bodies than pages, a `v1_page_merge` warning says the page
+boundaries are unreliable. It does not compose with `--split-spreads` or
+`--extract-figures` (per-page semantics).
 
 **Tall captures (full-page screenshots).** A full-page browser capture (e.g. the
 Awesome Screenshot extension) is one extremely tall image — 1:4 to 1:10 aspect.

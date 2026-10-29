@@ -102,7 +102,16 @@ pub struct DecodeParams {
     /// Sliding window for the custom n-gram processor; `0` => HF builtin
     /// behavior ([SPEC-102/103]).
     pub ngram_window: usize,
+    /// Positions the prompt and the generated tokens share (the arch's
+    /// context, [`DEFAULT_MAX_POSITIONS`] for v1). Test-only: lowered through
+    /// `FOCR_TEST_MAX_POSITIONS` so tests reach the multi-page clamp on small
+    /// documents (U2-X2).
+    #[doc(hidden)]
+    pub max_positions: usize,
 }
+
+/// v1's `max_position_embeddings` ([SPEC-101]).
+pub const DEFAULT_MAX_POSITIONS: usize = 32_768;
 
 impl Default for DecodeParams {
     fn default() -> Self {
@@ -112,6 +121,7 @@ impl Default for DecodeParams {
             max_length: DEFAULT_MAX_LENGTH,
             no_repeat_ngram_size: DEFAULT_NO_REPEAT_NGRAM_SIZE,
             ngram_window: NGRAM_WINDOW_SINGLE,
+            max_positions: DEFAULT_MAX_POSITIONS,
         }
     }
 }

@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **60** | **188** |
-| `present` | 115 † | 46 | 161 |
+| Total enumerated rows | **128** | **62** | **190** |
+| `present` | 115 † | 48 | 163 |
 | `partial` | 7 † | 11 | 18 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -48,7 +48,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 |--------------------|----------------------|
 | MUST clauses enumerated (across both populations) | 93 |
 | MUST coverage (enumerated / SPEC MUST) | **1.00** (every `[SPEC-NNN]` MUST clause has a row) |
-| MUST rows `present` / total MUST rows | **139 / 147** (the 8 non-present MUST rows are enumerated debt: see the `partial`/`missing` rows) |
+| MUST rows `present` / total MUST rows | **141 / 149** (the 8 non-present MUST rows are enumerated debt: see the `partial`/`missing` rows) |
 
 > The 4 `excluded` rows are reasoned coverage debt (§16), not omissions; the gauntlet can only account what is listed.
 
@@ -291,6 +291,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `ROBOT_SCHEMA_VERSION` on every line | §7.3 | MUST | present | SURF | bd-223.3 | stable versioned |
 | Frozen JSON-schema fixture + contract test | §7.3 | MUST | present | SURF | bd-zc1o | `tests/fixtures/robot_schema_v1.json` + scrubbed goldens |
 | Deterministic under fixed sampling (byte-identical) | §7.3 | MUST | present | SURF | bd-3kge | shared determinism gate + metamorphic FOCR_THREADS axis |
+| Per-kind `event_fields` (required/optional) + stream contract test | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.51 | `robot schema` carries `event_fields`; every event `cli_robot_golden` sees is validated against it |
+| `finish_reason` on `run_complete` + `warnings[]` (`v1_truncated`, `v1_page_merge`) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.51 | additive (schema v1); `warnings` only when non-empty, also in `--json` and `ocr-batch --multi-page`; v1 exit code unchanged |
 
 ## 14. Parity gates & gauntlet machinery (plan §8.2, §8.5)
 

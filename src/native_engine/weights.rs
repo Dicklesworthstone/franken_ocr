@@ -48,7 +48,7 @@ use std::path::Path;
 use half::bf16;
 use serde::Deserialize;
 
-use super::model_arch;
+use super::model_arch::{self, ModelArch};
 use super::tensor::{Mat, QInt4, QInt8};
 use crate::FOCR_MODEL_LICENSE_NOTICE;
 use crate::error::{FocrError, FocrResult};
@@ -64,17 +64,14 @@ fn checked_shape_len(name: &str, lhs: usize, rhs: usize, expr: &str) -> FocrResu
 
 /// Resolve the architecture id a `.focrq` declares against the model registry.
 ///
-/// An **absent** `model_id` (`""`, the v1 form, since `model_id` is a v2 header
-/// addition) resolves to the default architecture — Unlimited-OCR — so every
-/// pre-existing v1 artifact keeps loading unchanged. A **non-empty** id that is
-/// not in the registry is a forward-incompatible artifact and is **refused**
-/// loudly (mirroring the `format_version > max` rejection), rather than silently
-/// loaded as the default model.
+/// An **absent** `model_id` (`""`; the writer omits it for Unlimited-OCR v1
+/// only) resolves to [`model_arch::UNLIMITED_OCR_V1_ID`] permanently, never to
+/// whatever the default model is. A **non-empty** id that is not in the
+/// registry is a forward-incompatible artifact and is **refused** loudly
+/// (mirroring the `format_version > max` rejection), rather than silently
+/// loaded as another model.
 fn resolve_model_id(declared: &str) -> FocrResult<&'static str> {
-    if declared.is_empty() {
-        return Ok(model_arch::default_arch().id());
-    }
-    model_arch::arch_by_id(declared)
+    model_arch::arch_for_declared_id(declared)
         .map(|arch| arch.id())
         .ok_or_else(|| {
             FocrError::FormatMismatch(format!(
@@ -87,7 +84,7 @@ fn resolve_model_id(declared: &str) -> FocrResult<&'static str> {
 /// Validate the `.focrq` license notice against the notice the *declared
 /// architecture* requires.
 ///
-/// * **Unlimited-OCR** (and every v1 artifact, which resolves to it): the Baidu
+/// * **Unlimited-OCR v1** (every artifact without a `model_id` resolves to it): the Baidu
 ///   MIT contract, accepting any semantically-equivalent notice that carries the
 ///   required copyright + MIT-license tokens (back-compat with the historical
 ///   check — the `model_config`/notice text was hand-authored in early artifacts).
@@ -97,7 +94,7 @@ fn resolve_model_id(declared: &str) -> FocrResult<&'static str> {
 /// `model_id` is the already-resolved (registry-known) id from
 /// [`resolve_model_id`], so the lookup here cannot miss.
 fn validate_license_notice(notice: &str, model_id: &str) -> FocrResult<()> {
-    if model_id == model_arch::default_arch().id() {
+    if model_id == model_arch::UNLIMITED_OCR_V1_ID {
         return if notice == FOCR_MODEL_LICENSE_NOTICE
             || (notice.contains("Copyright (c) 2026 Baidu") && notice.contains("MIT License"))
         {
@@ -186,25 +183,6 @@ pub enum DType {
     /// `group_size`-element group along the contraction dim, plus a per-tensor
     /// precision tier.
     QInt4PerGroup,
-}
-
-impl DType {
-    /// Map a safetensors dtype string (e.g. `"BF16"`, `"F32"`) to a [`DType`].
-    ///
-    /// The upstream shard is bf16; F32/F16 are accepted for robustness against
-    /// mixed-precision checkpoints. Quantized dtypes never appear in a raw
-    /// safetensors header (they are a `.focrq`-only concept).
-    fn from_safetensors_str(s: &str) -> FocrResult<Self> {
-        match s {
-            "F32" => Ok(DType::F32),
-            "F16" => Ok(DType::F16),
-            "BF16" => Ok(DType::BF16),
-            other => Err(FocrError::FormatMismatch(format!(
-                "unsupported safetensors dtype {other:?} \
-                 (expected F32/F16/BF16; the upstream Unlimited-OCR shard is BF16)"
-            ))),
-        }
-    }
 }
 
 /// One entry of the `.focrq` / safetensors tensor directory: dtype + shape +
@@ -330,6 +308,10 @@ struct FocrqHeader {
     /// artifact's own declaration (bd-4l71). Absent ⇒ `None`.
     #[serde(default)]
     packing_manifest: Option<FocrqPackingManifest>,
+    /// The provenance object. The loader reads only its `source_shards` list
+    /// (a multi-shard source, U2-A3); other keys are ignored.
+    #[serde(default)]
+    provenance: Option<super::shards::FocrqProvenance>,
 }
 
 /// The subset of the `.focrq` `packing_manifest` header object the loader
@@ -407,9 +389,9 @@ pub struct Weights {
     source_sha256: String,
     /// The `.focrq` license notice (MIT/Baidu; `""` for safetensors).
     license_notice: String,
-    /// The resolved model-architecture id (`ModelArch::id`). A v2 `.focrq`
-    /// declares it; a v1 `.focrq` or raw safetensors resolves to the default
-    /// `unlimited-ocr`. Always a registry-known id (validated at load).
+    /// The resolved model-architecture id (`ModelArch::id`); see
+    /// [`Weights::model_id`]. A `.focrq` without the key is `unlimited-ocr`; a
+    /// raw shard is the arch whose census it matches, or `""` for none.
     model_id: &'static str,
     /// Whether this came from a `.focrq` container (vs. a raw safetensors shard).
     is_focrq: bool,
@@ -425,19 +407,52 @@ pub struct BlobSegment {
     /// Absolute offset of `bytes[0]` within the logical blob.
     start: u64,
     /// This piece's bytes.
-    bytes: Vec<u8>,
+    bytes: SegmentBytes,
+}
+
+/// One segment's storage: owned bytes, or a read-only map of one shard file.
+enum SegmentBytes {
+    Owned(Vec<u8>),
+    #[cfg(feature = "mmap")]
+    Mapped(memmap2::Mmap),
+}
+
+impl std::ops::Deref for SegmentBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            SegmentBytes::Owned(bytes) => bytes,
+            #[cfg(feature = "mmap")]
+            SegmentBytes::Mapped(map) => map,
+        }
+    }
+}
+
+impl std::fmt::Debug for SegmentBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SegmentBytes::Owned(bytes) => write!(f, "Owned({} bytes)", bytes.len()),
+            #[cfg(feature = "mmap")]
+            SegmentBytes::Mapped(map) => write!(f, "Mapped({} bytes)", map.len()),
+        }
+    }
 }
 
 /// The weight blob's storage: an owned buffer (the safe default), a read-only
 /// memory map explicitly requested with `FOCR_MMAP=1`, or a SEGMENTED blob —
 /// several buffers that together cover `[0, len)`.
 ///
-/// The segmented arm exists for wasm32 (bd-syf2): Rust caps ANY single
-/// allocation (and any slice) at `isize::MAX` = 2 GiB there, so the 3.0 GB
-/// artifact simply cannot live in one `Vec<u8>` even though the 4 GiB heap has
-/// room. Segment boundaries are planned to fall on TENSOR boundaries, so every
-/// tensor's payload (and its inline scales) stays contiguous inside exactly one
-/// segment and every accessor keeps returning a plain `&[u8]`.
+/// The segmented arm serves two layouts:
+/// - wasm32 (bd-syf2): Rust caps ANY single allocation (and any slice) at
+///   `isize::MAX` = 2 GiB there, so the 3.0 GB artifact simply cannot live in
+///   one `Vec<u8>` even though the 4 GiB heap has room. Segment boundaries are
+///   planned to fall on TENSOR boundaries.
+/// - a sharded safetensors checkpoint (U2-A3): each shard file is one segment,
+///   owned or mapped per [`mmap_requested`], and its tensors never leave it.
+///
+/// Either way every tensor's payload (and its inline scales) stays contiguous
+/// inside exactly one segment and every accessor keeps returning a plain
+/// `&[u8]`.
 ///
 /// There is deliberately NO `Deref<Target = [u8]>`: a segmented blob has no
 /// single slice. [`Backing::range`] is the one chokepoint every reader goes
@@ -895,7 +910,7 @@ impl Default for Weights {
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
-            model_id: model_arch::default_arch().id(),
+            model_id: model_arch::UNLIMITED_OCR_V1_ID,
             is_focrq: false,
             quant_recipe: None,
         }
@@ -937,52 +952,92 @@ impl Weights {
     }
 
     fn load_opened_with_mmap_policy(
-        mut file: std::fs::File,
+        file: std::fs::File,
         path: &Path,
         mmap_requested: bool,
     ) -> FocrResult<Self> {
-        #[cfg(feature = "mmap")]
-        if mmap_requested && let Ok(map) = mmap_island::map_readonly(&file) {
-            return Self::from_backing(Backing::Mapped(map));
-        }
-        #[cfg(not(feature = "mmap"))]
-        let _ = mmap_requested; // no mmap island in the core build
+        Self::from_backing(match read_or_map(file, path, mmap_requested)? {
+            SegmentBytes::Owned(bytes) => Backing::Owned(bytes),
+            #[cfg(feature = "mmap")]
+            SegmentBytes::Mapped(map) => Backing::Mapped(map),
+        })
+    }
 
-        // Header validation advances the descriptor offset. Rewind this SAME
-        // open file before the owned fallback; reopening `path` here would
-        // reintroduce the validation/load TOCTOU that this API exists to close.
-        file.seek(SeekFrom::Start(0)).map_err(|e| {
-            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
-        })?;
-        let capacity = file
-            .metadata()
-            .ok()
-            .and_then(|metadata| usize::try_from(metadata.len()).ok())
-            .unwrap_or(0);
-        // EXACT-SIZE read (bd-4l71 residency). `read_to_end` into a
-        // `with_capacity(len)` buffer still probes for EOF once the buffer is
-        // full, and that probe `reserve()`s past capacity — amortized growth
-        // then asks the allocator for a SECOND, twice-as-large buffer for a
-        // multi-GB artifact (fatal on wasm32, where the linear memory would
-        // have to grow to ~2x the model). Sizing the buffer to the file and
-        // `read_exact`-ing into it asks for the blob's bytes exactly once. A
-        // zero/unknown size (an unseekable or racing file) keeps the historical
-        // `read_to_end` path, and a short/long file surfaces the same IO error
-        // shape it always did.
-        let bytes = if capacity > 0 {
-            let mut bytes = vec![0u8; capacity];
-            file.read_exact(&mut bytes).map_err(|e| {
-                FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+    /// Load a sharded safetensors checkpoint from its open shards (U2-A3).
+    ///
+    /// Each shard becomes one segment of a [`Backing::Segmented`] blob, owned
+    /// or mapped per [`mmap_requested`], read from the descriptor the header
+    /// probe validated. The result is one logical tensor directory, checked
+    /// against the index, identified by census, and with any census I64
+    /// tensor verified and skipped. Raw loads hash nothing (D16).
+    pub(super) fn load_opened_shards(opened: super::shards::OpenedShards) -> FocrResult<Self> {
+        let mmap = mmap_requested();
+        let mut segments = Vec::with_capacity(opened.shards.len());
+        for shard in opened.shards {
+            segments.push(read_or_map(shard.file, &shard.path, mmap)?);
+        }
+        Self::from_shard_segments(&opened.index, segments)
+    }
+
+    /// [`Weights::load_opened_shards`] over in-memory shard files, in index
+    /// order.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] on any structural problem with a shard,
+    /// any disagreement with `index`, or an I64 tensor its census rejects.
+    pub fn from_shard_bytes(
+        index: &super::shards::ShardIndex,
+        shards: Vec<Vec<u8>>,
+    ) -> FocrResult<Self> {
+        Self::from_shard_segments(index, shards.into_iter().map(SegmentBytes::Owned).collect())
+    }
+
+    fn from_shard_segments(
+        index: &super::shards::ShardIndex,
+        shards: Vec<SegmentBytes>,
+    ) -> FocrResult<Self> {
+        if shards.len() != index.shards().len() {
+            return Err(FocrError::FormatMismatch(format!(
+                "{} lists {} shards, {} were supplied",
+                super::shards::SHARD_INDEX_NAME,
+                index.shards().len(),
+                shards.len()
+            )));
+        }
+        let mut headers = Vec::with_capacity(shards.len());
+        let mut segments = Vec::with_capacity(shards.len());
+        let mut start = 0u64;
+        for (name, bytes) in index.shards().iter().zip(shards) {
+            let (header, payload_base, _) = parse_safetensors_prefix(&bytes, bytes.len() as u64)
+                .map_err(|error| super::shards::in_shard(name, error))?;
+            headers.push((header, start + payload_base as u64));
+            let len = bytes.len() as u64;
+            segments.push(BlobSegment { start, bytes });
+            start = start.checked_add(len).ok_or_else(|| {
+                FocrError::FormatMismatch("sharded weights: total length overflows u64".into())
             })?;
-            bytes
-        } else {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(|e| {
-                FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
-            })?;
-            bytes
-        };
-        Self::from_backing(Backing::Owned(bytes))
+        }
+        let merged = super::shards::merge_shard_headers(index, headers)?;
+        let bytes = std::sync::Arc::new(Backing::Segmented {
+            segments,
+            len: start,
+        });
+        validate_segment_containment(&bytes, 0, &merged.records)?;
+        Self::from_safetensors_header(bytes, 0, merged, Int64Policy::Identified)
+    }
+
+    /// Parse one shard of a conversion source (owned bytes) for the arch
+    /// `focr convert` targets: an I64 tensor must be one of that arch's
+    /// verify-and-skip tensors, and is verified and skipped. Whether every such
+    /// tensor is present is a whole-source question the caller answers.
+    ///
+    /// # Errors
+    /// As [`Weights::from_bytes`].
+    pub fn from_source_shard(bytes: Vec<u8>, target: &'static dyn ModelArch) -> FocrResult<Self> {
+        let bytes = std::sync::Arc::new(Backing::Owned(bytes));
+        let (header, payload_base, _) =
+            parse_safetensors_prefix(bytes.segment_bytes(0), bytes.len())?;
+        Self::from_safetensors_header(bytes, payload_base, header, Int64Policy::ShardOf(target))
     }
 
     /// Load and immediately run the WeightsManifest census against
@@ -1050,7 +1105,10 @@ impl Weights {
                     "segmented weights: total length overflows u64".to_owned(),
                 )
             })?;
-            built.push(BlobSegment { start, bytes });
+            built.push(BlobSegment {
+                start,
+                bytes: SegmentBytes::Owned(bytes),
+            });
         }
         if built.is_empty() {
             return Err(FocrError::FormatMismatch(
@@ -1139,6 +1197,7 @@ impl Weights {
         } else {
             header.source_sha256
         };
+        super::shards::validate_source_shards(header.provenance.as_ref(), &source_sha256)?;
 
         Ok(Self {
             bytes,
@@ -1158,84 +1217,63 @@ impl Weights {
     /// Parse a raw safetensors blob: `header_len u64 LE | header_json |
     /// payload`. The JSON maps `name -> {dtype, shape, data_offsets:[beg,end]}`
     /// (offsets are payload-relative); a `__metadata__` key, if present, is
-    /// skipped.
+    /// skipped. The blob is a whole checkpoint.
     fn from_safetensors_bytes(bytes: std::sync::Arc<Backing>) -> FocrResult<Self> {
-        let len_prefix = bytes.range(0, 8).ok_or_else(|| {
-            FocrError::FormatMismatch(format!(
-                "safetensors truncated: {} bytes < 8-byte header length prefix",
-                bytes.len()
-            ))
-        })?;
-        let header_len = read_u64_len_le(len_prefix, "safetensors header_len")?;
-        let header_end = 8usize
-            .checked_add(header_len)
-            .ok_or_else(|| FocrError::FormatMismatch("safetensors header_len overflows".into()))?;
-        let header_json = bytes.range(8, header_len).ok_or_else(|| {
-            FocrError::FormatMismatch(format!(
-                "safetensors header ({header_len} bytes) overruns file ({} bytes) or crosses a \
-                 segment edge",
-                bytes.len()
-            ))
-        })?;
+        let (header, payload_base, _) =
+            parse_safetensors_prefix(bytes.segment_bytes(0), bytes.len())?;
+        validate_segment_containment(&bytes, payload_base, &header.records)?;
+        Self::from_safetensors_header(bytes, payload_base, header, Int64Policy::Identified)
+    }
 
-        #[derive(Deserialize)]
-        struct StEntry {
-            dtype: String,
-            shape: Vec<usize>,
-            data_offsets: [usize; 2],
+    /// Finish a raw safetensors load from its validated header: identify the
+    /// checkpoint by census, then verify and skip its I64 tensors.
+    ///
+    /// A raw checkpoint declares no id: it is the model whose exact census it
+    /// matches, or unidentified (`""`) when it matches none. `focr convert`
+    /// names the arch itself; every model open refuses an unidentified
+    /// checkpoint. An I64 tensor is accepted only as one of the census's
+    /// verify-and-skip tensors, whose content is checked here and which is
+    /// never exposed (D8).
+    fn from_safetensors_header(
+        bytes: std::sync::Arc<Backing>,
+        payload_base: usize,
+        header: super::shards::SafetensorsHeader,
+        int64: Int64Policy,
+    ) -> FocrResult<Self> {
+        use super::shards;
+
+        let identified = super::unlimited_ocr_census::identify_raw(
+            header
+                .records
+                .iter()
+                .map(|(name, record)| (name.as_str(), record)),
+        )
+        .ok();
+        let judge = match int64 {
+            Int64Policy::Identified => identified,
+            Int64Policy::ShardOf(target) => Some(target),
+        };
+        let rules = shards::int64_rules(judge);
+        let owner = shards::rules_owner(judge);
+        shards::check_int64_entries(&header.int64, rules, owner)?;
+        if matches!(int64, Int64Policy::Identified) {
+            shards::check_int64_rules_present(&header.int64, rules, owner)?;
         }
-
-        // The header is a flat object of name -> entry, with one reserved
-        // `__metadata__` string-map key. Parse to `serde_json::Value` so we can
-        // skip the reserved key without a custom visitor.
-        let raw: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(header_json)
-            .map_err(|e| {
-            FocrError::FormatMismatch(format!("safetensors header JSON invalid: {e}"))
+        shards::verify_int64_payloads(&header.int64, rules, |name, record| {
+            let start = absolute_payload_start(name, payload_base, record.byte_offset)?;
+            bytes
+                .range(start, record.byte_len)
+                .ok_or_else(|| payload_range_error(name, record.byte_offset, record.byte_len))
         })?;
-
-        let mut directory = BTreeMap::new();
-        for (name, value) in raw {
-            if name == "__metadata__" {
-                continue;
-            }
-            let entry: StEntry = serde_json::from_value(value).map_err(|e| {
-                FocrError::FormatMismatch(format!("safetensors entry {name:?} invalid: {e}"))
-            })?;
-            let [beg, end] = entry.data_offsets;
-            if end < beg {
-                return Err(FocrError::FormatMismatch(format!(
-                    "safetensors entry {name:?} has end {end} < beg {beg}"
-                )));
-            }
-            directory.insert(
-                name,
-                TensorRecord {
-                    dtype: DType::from_safetensors_str(&entry.dtype)?,
-                    shape: entry.shape,
-                    byte_offset: beg,
-                    byte_len: end - beg,
-                    scales_offset: 0,
-                    scales_len: 0,
-                    group_size: 0,
-                    tier: 0,
-                },
-            );
-        }
-
-        let payload_base = header_end;
-        let payload_len = payload_len_of(&bytes, payload_base)?;
-        validate_directory(&directory, payload_len, 0)?;
-        validate_segment_containment(&bytes, payload_base, &directory)?;
 
         Ok(Self {
             bytes,
             payload_base,
-            directory,
+            directory: header.records,
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
-            // A raw safetensors shard is the upstream Unlimited-OCR checkpoint.
-            model_id: model_arch::default_arch().id(),
+            model_id: identified.map_or("", |arch| arch.id()),
             is_focrq: false,
             quant_recipe: None,
         })
@@ -1336,10 +1374,11 @@ impl Weights {
     }
 
     /// The resolved model-architecture id ([`model_arch::ModelArch::id`]) this
-    /// artifact declares — e.g. `"unlimited-ocr"` or `"got-ocr2"`. A v1 `.focrq` (no
-    /// `model_id` header) and a raw safetensors shard both report the default
-    /// `"unlimited-ocr"`. Always a registry-known id (validated at load), so the
-    /// engine can look the arch up with [`model_arch::arch_by_id`] infallibly.
+    /// artifact declares — e.g. `"unlimited-ocr"` or `"got-ocr2"`. A `.focrq`
+    /// without a `model_id` header reports [`model_arch::UNLIMITED_OCR_V1_ID`]
+    /// (always, whatever the default model is). A raw safetensors shard reports
+    /// the model whose exact census it matches, or `""` when it matches none;
+    /// every model open refuses that unidentified case.
     #[must_use]
     pub fn model_id(&self) -> &'static str {
         self.model_id
@@ -1654,6 +1693,102 @@ impl Weights {
             .range(start, len)
             .ok_or_else(|| payload_range_error(name, off, len))
     }
+}
+
+/// Parse a safetensors file's `header_len u64 LE | header_json` prefix from
+/// `head` (the file's bytes from offset 0; the header must lie inside them)
+/// and validate every tensor against the payload that follows, `total_len`
+/// being the whole file's length. Returns the header, the payload base, and the
+/// payload length.
+fn parse_safetensors_prefix(
+    head: &[u8],
+    total_len: u64,
+) -> FocrResult<(super::shards::SafetensorsHeader, usize, usize)> {
+    let len_prefix = head.get(..8).ok_or_else(|| {
+        FocrError::FormatMismatch(format!(
+            "safetensors truncated: {total_len} bytes < 8-byte header length prefix"
+        ))
+    })?;
+    let header_len = read_u64_len_le(len_prefix, "safetensors header_len")?;
+    let header_end = 8usize
+        .checked_add(header_len)
+        .ok_or_else(|| FocrError::FormatMismatch("safetensors header_len overflows".into()))?;
+    let header_json = head.get(8..header_end).ok_or_else(|| {
+        FocrError::FormatMismatch(format!(
+            "safetensors header ({header_len} bytes) overruns file ({total_len} bytes) or crosses \
+             a segment edge"
+        ))
+    })?;
+    let header = super::shards::parse_safetensors_header(header_json)?;
+    let payload_len = total_len
+        .checked_sub(header_end as u64)
+        .and_then(|len| usize::try_from(len).ok())
+        .ok_or_else(|| FocrError::FormatMismatch("safetensors payload length invalid".into()))?;
+    validate_directory(&header.records, payload_len, 0)?;
+    super::shards::validate_int64_records(&header, payload_len)?;
+    Ok((header, header_end, payload_len))
+}
+
+/// Which verify-and-skip rules admit a raw checkpoint's I64 tensors.
+#[derive(Clone, Copy)]
+enum Int64Policy {
+    /// The whole checkpoint: the rules of the arch whose census it matches
+    /// (none when unidentified), and every rule's tensor must be present.
+    Identified,
+    /// One shard of a conversion source: the rules of the target arch.
+    ShardOf(&'static dyn ModelArch),
+}
+
+/// Take `file`'s whole content as one segment: a read-only map when
+/// `mmap_requested` (falling back to owned bytes if mapping fails), owned
+/// bytes otherwise.
+fn read_or_map(
+    mut file: std::fs::File,
+    path: &Path,
+    mmap_requested: bool,
+) -> FocrResult<SegmentBytes> {
+    #[cfg(feature = "mmap")]
+    if mmap_requested && let Ok(map) = mmap_island::map_readonly(&file) {
+        return Ok(SegmentBytes::Mapped(map));
+    }
+    #[cfg(not(feature = "mmap"))]
+    let _ = mmap_requested; // no mmap island in the core build
+
+    // Header validation advances the descriptor offset. Rewind this SAME
+    // open file before the owned fallback; reopening `path` here would
+    // reintroduce the validation/load TOCTOU that this API exists to close.
+    file.seek(SeekFrom::Start(0)).map_err(|e| {
+        FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+    })?;
+    let capacity = file
+        .metadata()
+        .ok()
+        .and_then(|metadata| usize::try_from(metadata.len()).ok())
+        .unwrap_or(0);
+    // EXACT-SIZE read (bd-4l71 residency). `read_to_end` into a
+    // `with_capacity(len)` buffer still probes for EOF once the buffer is
+    // full, and that probe `reserve()`s past capacity — amortized growth
+    // then asks the allocator for a SECOND, twice-as-large buffer for a
+    // multi-GB artifact (fatal on wasm32, where the linear memory would
+    // have to grow to ~2x the model). Sizing the buffer to the file and
+    // `read_exact`-ing into it asks for the blob's bytes exactly once. A
+    // zero/unknown size (an unseekable or racing file) keeps the historical
+    // `read_to_end` path, and a short/long file surfaces the same IO error
+    // shape it always did.
+    let bytes = if capacity > 0 {
+        let mut bytes = vec![0u8; capacity];
+        file.read_exact(&mut bytes).map_err(|e| {
+            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+        })?;
+        bytes
+    } else {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).map_err(|e| {
+            FocrError::ModelNotFound(format!("cannot read weights at {}: {e}", path.display()))
+        })?;
+        bytes
+    };
+    Ok(SegmentBytes::Owned(bytes))
 }
 
 /// Absolute blob offset of a payload-relative tensor offset.
@@ -2083,7 +2218,7 @@ mod tests {
             arch_target: 0,
             source_sha256: String::new(),
             license_notice: String::new(),
-            model_id: model_arch::default_arch().id(),
+            model_id: model_arch::UNLIMITED_OCR_V1_ID,
             is_focrq: true,
             quant_recipe: None,
         }
@@ -2187,11 +2322,13 @@ mod tests {
     }
 
     #[test]
-    fn safetensors_reports_default_model_id() {
-        // A raw upstream shard is the Unlimited-OCR checkpoint.
+    fn safetensors_matching_no_census_is_unidentified_not_the_default() {
+        // A raw shard declares no id. One matching no embedded census is not
+        // assumed to be Unlimited-OCR (or whatever the default is): it parses
+        // (`focr convert` names its arch) but carries no identity.
         let blob = build_safetensors(&[("w", "BF16", vec![1], bf16_le_bytes(&[1.0]))]);
         let w = Weights::from_bytes(blob).unwrap();
-        assert_eq!(w.model_id(), "unlimited-ocr");
+        assert_eq!(w.model_id(), "");
         assert!(!w.is_focrq());
     }
 
@@ -3155,5 +3292,129 @@ mod tests {
         let w = Weights::from_bytes(blob).unwrap();
         let names: Vec<&str> = w.names().collect();
         assert_eq!(names, vec!["alpha", "mid", "zeta"]);
+    }
+
+    /// A two-shard synthetic checkpoint (shard 2 carries the I64 arange) plus
+    /// the same tensors as one plain file: `(index, shard files, plain file)`.
+    fn synthetic_sharded() -> (super::super::shards::ShardIndex, Vec<Vec<u8>>, Vec<u8>) {
+        use super::super::shards::tests::{arange_bytes, index_json, safetensors_file};
+        let enc_w = ("enc.w", "BF16", vec![2, 3], (1u8..=12).collect::<Vec<_>>());
+        let enc_b = ("enc.b", "F32", vec![3], f32_le_bytes(&[0.5, -1.0, 2.0]));
+        let dec_w = ("dec.w", "BF16", vec![3, 2], (21u8..=32).collect::<Vec<_>>());
+        let position_ids = ("vision.position_ids", "I64", vec![1, 4], arange_bytes(4));
+        let one = safetensors_file(&[enc_w.clone(), enc_b.clone()]);
+        let two = safetensors_file(&[dec_w.clone(), position_ids.clone()]);
+        let plain = safetensors_file(&[enc_w, enc_b, dec_w, position_ids]);
+        let index = super::super::shards::ShardIndex::parse(&index_json(
+            &[
+                ("enc.w", "model-00001-of-00002.safetensors"),
+                ("enc.b", "model-00001-of-00002.safetensors"),
+                ("dec.w", "model-00002-of-00002.safetensors"),
+                ("vision.position_ids", "model-00002-of-00002.safetensors"),
+            ],
+            12 + 12 + 12 + 32,
+        ))
+        .expect("synthetic index");
+        (index, vec![one, two], plain)
+    }
+
+    #[test]
+    fn sharded_checkpoint_is_one_logical_directory_with_the_i64_skipped() {
+        use super::super::shards::{test_rules, tests::POSITION_IDS_RULE};
+        let (index, shards, plain) = synthetic_sharded();
+
+        // Without a census rule the I64 tensor is refused, sharded or not.
+        let error = Weights::from_shard_bytes(&index, shards.clone())
+            .expect_err("no rule admits the I64 tensor");
+        assert!(
+            error
+                .to_string()
+                .contains("an unidentified checkpoint accepts I64 only"),
+            "{error}"
+        );
+        assert!(Weights::from_bytes(plain.clone()).is_err());
+
+        let _rules = test_rules::supply(&POSITION_IDS_RULE);
+        let sharded = Weights::from_shard_bytes(&index, shards.clone()).expect("sharded load");
+        let single = Weights::from_bytes(plain).expect("plain-file load");
+        assert_eq!(
+            sharded.names().collect::<Vec<_>>(),
+            ["dec.w", "enc.b", "enc.w"],
+            "one logical directory; the verified I64 tensor is never exposed"
+        );
+        for name in sharded.names() {
+            let (a, b) = (
+                sharded.tensor(name).expect("sharded"),
+                single.tensor(name).expect("single"),
+            );
+            assert_eq!(
+                (a.dtype, a.shape, a.data),
+                (b.dtype, b.shape, b.data),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            sharded.tensor("dec.w").expect("dec.w").data,
+            (21u8..=32).collect::<Vec<_>>()
+        );
+        assert_eq!(sharded.model_id(), "", "matches no census");
+        assert_eq!(sharded.source_sha256(), "", "raw loads hash nothing (D16)");
+        assert!(!sharded.is_focrq());
+
+        // A perturbed arange is refused.
+        let mut perturbed = shards.clone();
+        let last = perturbed[1].len() - 8;
+        perturbed[1][last] = 9;
+        let error = Weights::from_shard_bytes(&index, perturbed).expect_err("not an arange");
+        assert!(error.to_string().contains("element 3 is 9"), "{error}");
+
+        // The index and the shard list must agree.
+        let error = Weights::from_shard_bytes(&index, shards[..1].to_vec()).expect_err("one shard");
+        assert!(
+            error
+                .to_string()
+                .contains("lists 2 shards, 1 were supplied"),
+            "{error}"
+        );
+        let mut corrupt = shards;
+        corrupt[1].truncate(8);
+        let error = Weights::from_shard_bytes(&index, corrupt).expect_err("truncated shard");
+        assert!(
+            error
+                .to_string()
+                .starts_with("format/version mismatch: shard model-00002-of-00002"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn sharded_checkpoint_maps_each_shard_as_its_own_segment() {
+        use super::super::shards::{test_rules, tests::POSITION_IDS_RULE};
+        let (index, shards, _) = synthetic_sharded();
+        let dir = std::env::temp_dir().join(format!(
+            "franken_ocr_weights_mapped_shards_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut mapped = Vec::new();
+        for (name, bytes) in index.shards().iter().zip(&shards) {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).expect("write shard");
+            let file = std::fs::File::open(&path).expect("open shard");
+            let segment = read_or_map(file, &path, true).expect("map shard");
+            assert!(matches!(segment, SegmentBytes::Mapped(_)), "{segment:?}");
+            mapped.push(segment);
+        }
+        let _rules = test_rules::supply(&POSITION_IDS_RULE);
+        let from_maps = Weights::from_shard_segments(&index, mapped).expect("mapped load");
+        let owned = Weights::from_shard_bytes(&index, shards).expect("owned load");
+        for name in owned.names() {
+            assert_eq!(
+                from_maps.tensor(name).expect("mapped").data,
+                owned.tensor(name).expect("owned").data,
+                "{name}"
+            );
+        }
     }
 }

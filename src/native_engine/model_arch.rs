@@ -136,6 +136,63 @@ impl QuantPolicy {
     };
 }
 
+/// The id of the Baidu Unlimited-OCR v1 model (R-SWA), fixed forever.
+///
+/// It is also the identity of every artifact that declares **no** `model_id`:
+/// the `.focrq` writer omits the field for this model only, so all shipped v1
+/// artifacts carry none. Absent therefore means v1 permanently, never "whatever
+/// [`default_arch`] is today", or a later default change would load v1 bytes as
+/// another model.
+pub const UNLIMITED_OCR_V1_ID: &str = "unlimited-ocr";
+
+/// Which Unlimited-OCR generation an arch is. Forward routing matches on this
+/// exhaustively, so a new generation cannot fall through to another's kernels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnlimitedVariant {
+    /// Unlimited-OCR v1: R-SWA decoder attention (window 128).
+    V1Rswa,
+    /// Unlimited-OCR-2: SR-SWA decoder attention (routed page blocks).
+    V2SrSwa,
+}
+
+/// An exact embedded tensor census a raw checkpoint is identified by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TensorCensus {
+    /// The pinned 2,710-tensor Unlimited-OCR v1 shard
+    /// (`unlimited_ocr_census`).
+    UnlimitedOcrV1,
+}
+
+/// Exact recipe for the published GOT-OCR2 int8 artifact.
+pub const GOT_OCR2_INT8_RECIPE: &str = "got-ocr2-decoder-int8-lmhead-omitted-tied-v1";
+/// Exact recipe for the published SmolVLM2 int8 artifact.
+pub const SMOLVLM2_INT8_RECIPE: &str = "smolvlm2-decoder-int8-lmhead-bf16-v1";
+/// Exact recipe for the published OneChart int8 artifact.
+pub const ONECHART_INT8_RECIPE: &str = "onechart-decoder-int8-lmhead-omitted-tied-v1";
+/// Exact recipe for the published TrOMR int8 artifact.
+pub const TROMR_INT8_RECIPE: &str = "tromr-decoder-int8-v1";
+/// Exact recipe for the published TrOMR f32 reference artifact.
+pub const TROMR_F32_RECIPE: &str = "tromr-f32-v1";
+
+/// SHA-256 of the Baidu Unlimited-OCR v1 `tokenizer.json` (9,979,544 bytes),
+/// the one sidecar every shipped v1 install carries (`models/manifest*.json`,
+/// `docs/truth-pack/SOURCE_HASHES.md`).
+const UNLIMITED_OCR_V1_TOKENIZER_SHA256: &str =
+    "a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4";
+
+/// The added tokens the v1 prompt and parser depend on, as `(id, content)`.
+const UNLIMITED_OCR_V1_TOKENS: &[(u32, &str)] = &[
+    (crate::tokenizer::special::EOS, "<｜end▁of▁sentence｜>"),
+    (crate::tokenizer::special::IMAGE, "<image>"),
+    (crate::tokenizer::special::REF, "<|ref|>"),
+    (crate::tokenizer::special::REF_END, "<|/ref|>"),
+    (crate::tokenizer::special::DET, "<|det|>"),
+    (crate::tokenizer::special::DET_END, "<|/det|>"),
+    (crate::tokenizer::special::GROUNDING, "<|grounding|>"),
+    (crate::tokenizer::special::USER, "<|User|>"),
+    (crate::tokenizer::special::ASSISTANT, "<|Assistant|>"),
+];
+
 /// A model-architecture descriptor — the foundation `ModelArch` of the zoo. A
 /// descriptor is pure metadata (no weights, no runtime); the forward dispatch is
 /// wired through it in later A-tasks. `Send + Sync` so a `&'static dyn ModelArch`
@@ -208,6 +265,41 @@ pub trait ModelArch: Send + Sync {
     fn embed_tokens_name(&self) -> &'static str {
         "model.embed_tokens.weight"
     }
+    /// The exact `packing_manifest.quant_recipe` a published artifact of this
+    /// model at manifest quant `quant` (`"int8"`, `"f32"`) must declare; `None`
+    /// when this runtime has no contract for that pair.
+    fn required_quant_recipe(&self, quant: &str) -> Option<&'static str>;
+    /// Which Unlimited-OCR generation this is; `None` for every zoo model.
+    fn unlimited_variant(&self) -> Option<UnlimitedVariant> {
+        None
+    }
+    /// The embedded exact census a raw checkpoint of this model is identified
+    /// by; `None` when the model has none (it is then never inferred from a
+    /// raw shard).
+    fn tensor_census(&self) -> Option<TensorCensus> {
+        None
+    }
+    /// The release version in this model's versioned artifact filename
+    /// (`<stem>.v<version>.<quant>.focrq`).
+    fn artifact_version(&self) -> &'static str {
+        crate::UNLIMITED_OCR_ARTIFACT_VERSION
+    }
+    /// SHA-256 (lowercase hex) of the one `tokenizer.json` this model runs
+    /// with; `None` when no sidecar hash is pinned.
+    fn tokenizer_sha256(&self) -> Option<&'static str> {
+        None
+    }
+    /// Added tokens the model's prompts and parsers depend on, as
+    /// `(id, content)`. The sidecar must map every id to exactly its content.
+    fn required_token_ids(&self) -> &'static [(u32, &'static str)] {
+        &[]
+    }
+}
+
+impl std::fmt::Debug for dyn ModelArch + '_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.id())
+    }
 }
 
 /// The Baidu Unlimited-OCR architecture — the FIRST [`ModelArch`] implementation
@@ -218,7 +310,7 @@ pub struct UnlimitedOcr;
 
 impl ModelArch for UnlimitedOcr {
     fn id(&self) -> &'static str {
-        "unlimited-ocr"
+        UNLIMITED_OCR_V1_ID
     }
     fn display_name(&self) -> &'static str {
         "Baidu Unlimited-OCR"
@@ -253,6 +345,21 @@ impl ModelArch for UnlimitedOcr {
     }
     fn implemented(&self) -> bool {
         true
+    }
+    fn required_quant_recipe(&self, quant: &str) -> Option<&'static str> {
+        (quant == "int8").then_some(crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID)
+    }
+    fn unlimited_variant(&self) -> Option<UnlimitedVariant> {
+        Some(UnlimitedVariant::V1Rswa)
+    }
+    fn tensor_census(&self) -> Option<TensorCensus> {
+        Some(TensorCensus::UnlimitedOcrV1)
+    }
+    fn tokenizer_sha256(&self) -> Option<&'static str> {
+        Some(UNLIMITED_OCR_V1_TOKENIZER_SHA256)
+    }
+    fn required_token_ids(&self) -> &'static [(u32, &'static str)] {
+        UNLIMITED_OCR_V1_TOKENS
     }
 }
 
@@ -296,6 +403,9 @@ pub struct PlannedArch {
     /// Whether this arch's forward RUNS today (`focr models` "ready"). GOT-OCR2 does
     /// (its full pipeline + KV-cache decode ship); the rest are still descriptors.
     implemented: bool,
+    /// `(manifest quant, recipe)` pairs for the published artifacts; see
+    /// [`ModelArch::required_quant_recipe`].
+    quant_recipes: &'static [(&'static str, &'static str)],
 }
 
 /// A not-yet-determined greedy contract for a planned model whose config has not
@@ -353,6 +463,12 @@ impl ModelArch for PlannedArch {
     fn embed_tokens_name(&self) -> &'static str {
         self.embed_tokens_name
     }
+    fn required_quant_recipe(&self, quant: &str) -> Option<&'static str> {
+        self.quant_recipes
+            .iter()
+            .find(|(q, _)| *q == quant)
+            .map(|(_, recipe)| *recipe)
+    }
 }
 
 // ── the planned zoo models (descriptors only; forwards land in sub-epics B-F) ──
@@ -391,6 +507,7 @@ static GOT_OCR2: PlannedArch = PlannedArch {
     lm_head_stored_int8: true,              // moot — tied lm_head is omitted entirely
     embed_tokens_name: "model.embed_tokens.weight",
     implemented: true, // full pipeline + KV-cache decode ship (B1-B9,B11); focr ocr runs it
+    quant_recipes: &[("int8", GOT_OCR2_INT8_RECIPE)],
 };
 // SmolVLM2-500M — censused (docs/zoo/smolvlm2-spec.md, bd-3jo6.3.1): SigLIP-B/16@512²
 // encoder + pixel-shuffle×4 + Linear(12288→960) connector + SmolLM2-360M Llama-dense
@@ -427,6 +544,7 @@ static SMOLVLM2: PlannedArch = PlannedArch {
     // pixel-shuffle connector (C3/C4, cert cos 1.0), prompt/preprocess (C7,
     // L0b maxabs 0.0 + L0c id-exact), `--task describe` routing (C9).
     implemented: true,
+    quant_recipes: &[("int8", SMOLVLM2_INT8_RECIPE)],
 };
 static ONECHART: PlannedArch = PlannedArch {
     id: "onechart",
@@ -464,6 +582,7 @@ static ONECHART: PlannedArch = PlannedArch {
     // both paths (D4), number head + self-verify + recognize (D5),
     // `--task chart-data` routing (D7).
     implemented: true,
+    quant_recipes: &[("int8", ONECHART_INT8_RECIPE)],
 };
 static TROMR: PlannedArch = PlannedArch {
     id: "tromr",
@@ -502,6 +621,7 @@ static TROMR: PlannedArch = PlannedArch {
     // E2-E7+E9 shipped: convert (E2), tokenizer (E6), encoder cos 1.0 (E3),
     // decoder token-exact (E4), merge+MusicXML (E7), `--task music` routing.
     implemented: true,
+    quant_recipes: &[("int8", TROMR_INT8_RECIPE), ("f32", TROMR_F32_RECIPE)],
 };
 static TROCR: PlannedArch = PlannedArch {
     id: "trocr",
@@ -519,6 +639,7 @@ static TROCR: PlannedArch = PlannedArch {
     lm_head_stored_int8: true,  // placeholder until censused (sub-epic F)
     embed_tokens_name: "model.embed_tokens.weight",
     implemented: false,
+    quant_recipes: &[],
 };
 static PIX2TEX: PlannedArch = PlannedArch {
     id: "pix2tex",
@@ -536,6 +657,7 @@ static PIX2TEX: PlannedArch = PlannedArch {
     lm_head_stored_int8: true,  // placeholder until censused (sub-epic F)
     embed_tokens_name: "model.embed_tokens.weight",
     implemented: false,
+    quant_recipes: &[],
 };
 
 /// The model registry, in priority order (the default + implemented first, then the
@@ -564,10 +686,61 @@ pub fn arch_by_id(id: &str) -> Option<&'static dyn ModelArch> {
     registry().iter().copied().find(|a| a.id() == id)
 }
 
+/// Resolve the `model_id` an artifact declares: absent (`""`) is
+/// [`UNLIMITED_OCR_V1_ID`] forever, whatever the default model is; an unknown
+/// non-empty id is `None`.
+#[must_use]
+pub fn arch_for_declared_id(declared: &str) -> Option<&'static dyn ModelArch> {
+    arch_by_id(if declared.is_empty() {
+        UNLIMITED_OCR_V1_ID
+    } else {
+        declared
+    })
+}
+
 /// The default architecture (`focr ocr`): the Baidu Unlimited-OCR model.
+///
+/// This answers "which model does a command use when none is named" and
+/// nothing else. An artifact's identity comes from what it declares
+/// ([`arch_for_declared_id`]) and model-specific behavior from the
+/// capability methods, so changing the default changes no loaded model.
 #[must_use]
 pub fn default_arch() -> &'static dyn ModelArch {
+    #[cfg(test)]
+    if let Some(arch) = test_default::current() {
+        return arch;
+    }
     &UNLIMITED_OCR
+}
+
+/// Test-only: simulate a different default model on the current thread.
+#[cfg(test)]
+pub(crate) mod test_default {
+    use std::cell::Cell;
+
+    use super::ModelArch;
+
+    thread_local! {
+        static OVERRIDE: Cell<Option<&'static dyn ModelArch>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn current() -> Option<&'static dyn ModelArch> {
+        OVERRIDE.with(Cell::get)
+    }
+
+    /// Make `arch` the default on this thread until the guard drops.
+    pub(crate) fn flip(arch: &'static dyn ModelArch) -> Guard {
+        OVERRIDE.with(|cell| cell.set(Some(arch)));
+        Guard
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            OVERRIDE.with(|cell| cell.set(None));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -637,6 +810,62 @@ mod tests {
             a.license_notice(),
             "Polyphonic-TrOMR (NetEase) - Apache-2.0"
         );
+    }
+
+    #[test]
+    fn absent_model_id_is_v1_whatever_the_default_is() {
+        let got = arch_by_id("got-ocr2").expect("got-ocr2 registered");
+        let flip = test_default::flip(got);
+        assert_eq!(
+            default_arch().id(),
+            "got-ocr2",
+            "the seam flips the default"
+        );
+        assert_eq!(
+            arch_for_declared_id("").map(ModelArch::id),
+            Some(UNLIMITED_OCR_V1_ID)
+        );
+        assert_eq!(
+            arch_for_declared_id("got-ocr2").map(ModelArch::id),
+            Some("got-ocr2")
+        );
+        assert!(arch_for_declared_id("unlimited-ocr-9").is_none());
+        drop(flip);
+        assert_eq!(default_arch().id(), UNLIMITED_OCR_V1_ID);
+    }
+
+    #[test]
+    fn capabilities_pin_v1_and_leave_the_zoo_unpinned() {
+        let v1 = arch_by_id(UNLIMITED_OCR_V1_ID).expect("v1 registered");
+        assert_eq!(v1.unlimited_variant(), Some(UnlimitedVariant::V1Rswa));
+        assert_eq!(v1.tensor_census(), Some(TensorCensus::UnlimitedOcrV1));
+        assert_eq!(
+            v1.tokenizer_sha256(),
+            Some("a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4")
+        );
+        assert_eq!(
+            v1.required_quant_recipe("int8"),
+            Some("unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1")
+        );
+        assert_eq!(v1.required_quant_recipe("int4"), None);
+        assert!(v1.required_token_ids().contains(&(128815, "<image>")));
+        assert!(
+            v1.required_token_ids().iter().all(|&(id, _)| id != 128827),
+            "the v1 tokenizer has no <PAGE> token"
+        );
+        for arch in registry() {
+            assert_eq!(
+                arch.artifact_version(),
+                crate::UNLIMITED_OCR_ARTIFACT_VERSION
+            );
+            if arch.id() == UNLIMITED_OCR_V1_ID {
+                continue;
+            }
+            assert_eq!(arch.unlimited_variant(), None, "{}", arch.id());
+            assert_eq!(arch.tensor_census(), None, "{}", arch.id());
+            assert_eq!(arch.tokenizer_sha256(), None, "{}", arch.id());
+            assert!(arch.required_token_ids().is_empty(), "{}", arch.id());
+        }
     }
 
     #[test]

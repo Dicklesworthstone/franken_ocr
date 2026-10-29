@@ -38,7 +38,7 @@ use super::calib::CalibStats;
 use super::focrq::{FocrqBuilder, WriteDType};
 use super::recipe::{Recipe, WasmInt4Policy, classify_wasm_experts_int4};
 use crate::error::{FocrError, FocrResult};
-use crate::native_engine::model_arch::ModelArch;
+use crate::native_engine::model_arch::{ModelArch, UnlimitedVariant};
 use crate::native_engine::nn;
 use crate::native_engine::weights::{DType, Weights};
 
@@ -121,7 +121,9 @@ pub fn sha256_of_bytes(bytes: &[u8]) -> [u8; 32] {
 /// the entire vision tower.
 #[must_use]
 pub fn is_decoder_int8_tensor_for(name: &str, arch: &dyn ModelArch) -> bool {
-    if arch.id() == crate::native_engine::model_arch::default_arch().id() {
+    // Every Unlimited-OCR generation is held to the doctrine recipe: FFN and
+    // expert GEMMs only, attention and `lm_head` high precision.
+    if arch.unlimited_variant().is_some() {
         return Recipe::validated_default().is_quantized(name);
     }
     if name == "lm_head.weight" {
@@ -173,12 +175,24 @@ pub fn is_decoder_int8_tensor_for(name: &str, arch: &dyn ModelArch) -> bool {
     false
 }
 
-/// [`is_decoder_int8_tensor_for`] instantiated at the default (Unlimited-OCR)
-/// arch — the historical name-only classifier, kept so the v1 byte contract has
-/// an explicit, testable anchor.
+/// The Unlimited-OCR name-only classifier ([`is_decoder_int8_tensor_for`] at
+/// any Unlimited-OCR arch), kept so the v1 byte contract has an explicit,
+/// testable anchor.
 #[must_use]
 pub fn is_decoder_int8_tensor(name: &str) -> bool {
-    is_decoder_int8_tensor_for(name, crate::native_engine::model_arch::default_arch())
+    Recipe::validated_default().is_quantized(name)
+}
+
+/// The `packing_manifest.quant_recipe` `focr convert` stamps into an `arch`
+/// artifact at `quant`; `None` when it stamps none (the zoo models carry
+/// their recipe in the download manifest only, so their bytes are unchanged).
+#[must_use]
+pub fn stamped_quant_recipe(arch: &dyn ModelArch, quant: ConvertQuant) -> Option<&'static str> {
+    match (arch.unlimited_variant()?, quant) {
+        (_, ConvertQuant::Int8) => arch.required_quant_recipe("int8"),
+        (UnlimitedVariant::V1Rswa, ConvertQuant::Int4) => Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+        (UnlimitedVariant::V2SrSwa, ConvertQuant::Int4) => None,
+    }
 }
 
 /// Convert a loaded raw-safetensors [`Weights`] into a self-contained `.focrq`
@@ -191,14 +205,14 @@ pub fn is_decoder_int8_tensor(name: &str) -> bool {
 ///
 /// `arch` is the target architecture (its `model_id` + license notice go into the
 /// header, and its [`ModelArch::tie_word_embeddings`] decides whether the tied
-/// `lm_head.weight` is omitted). Passing [`crate::native_engine::model_arch::default_arch`]
-/// reproduces the historical Unlimited-OCR output **byte-for-byte** (default id ⇒
-/// the `model_id` key is omitted, the notice is the Baidu/MIT one, and `lm_head`
-/// is stored), so existing artifacts are unchanged.
+/// `lm_head.weight` is omitted). Passing the Unlimited-OCR v1 arch reproduces the
+/// historical output **byte-for-byte** (the `model_id` key is omitted for that
+/// model only, the notice is the Baidu/MIT one, and `lm_head` is stored), so
+/// existing artifacts are unchanged.
 ///
 /// # Errors
-/// * [`FocrError::NotImplemented`] for [`ConvertQuant::Int4`] on a non-default
-///   arch — the wasm experts-int4 recipe is defined ONLY for Unlimited-OCR.
+/// * [`FocrError::NotImplemented`] for [`ConvertQuant::Int4`] on any arch but
+///   Unlimited-OCR v1 — the wasm experts-int4 recipe is defined only for it.
 /// * [`FocrError::FormatMismatch`] if a decoder int8 tensor is not rank-2
 ///   `[n, k]`, if a tensor's bytes disagree with its shape, or if an input tensor
 ///   is unexpectedly already quantized (the converter input must be raw bf16/f32).
@@ -245,65 +259,140 @@ pub fn safetensors_to_focrq_calibrated(
     if quant == ConvertQuant::Int4 {
         return wasm_int4_to_focrq(weights, arch_target, source_sha256, arch, calib);
     }
+    let mut conversion = Int8Conversion::new(arch, arch_target);
+    conversion.add_shard(weights)?;
+    conversion.finish(source_sha256, None)
+}
 
-    let mut builder = FocrqBuilder::new()
-        .with_arch_target(arch_target)
-        .with_source_sha256(source_sha256)
-        .with_model_id(arch.id())
-        .with_license_notice(arch.license_notice());
-    if arch.id() == crate::native_engine::model_arch::default_arch().id() {
-        builder = builder.with_packing_manifest_json(format!(
-            r#"{{"quant_recipe":"{UNLIMITED_OCR_INT8_RECIPE_ID}"}}"#
-        ));
-    }
+/// The conservative int8 conversion, fed one source shard at a time (U2-A3):
+/// `focr convert` streams a sharded checkpoint through it shard by shard, and
+/// [`safetensors_to_focrq`] feeds a whole checkpoint as its only shard.
+///
+/// Tensors are emitted in sorted name order whatever the shard order (the
+/// builder's `BTreeMap`), so the artifact depends only on the tensor set, and
+/// a one-shard source yields exactly the bytes it always did.
+pub struct Int8Conversion<'a> {
+    arch: &'a dyn ModelArch,
+    arch_target: u8,
+    builder: FocrqBuilder,
+    /// The `lm_head.weight` and `embed_tokens` fingerprints, when the arch's tie
+    /// claim must be checked against the bytes. They may live in different
+    /// shards, so the check runs at [`Int8Conversion::finish`].
+    tie_check: Option<TieEvidence>,
+}
 
-    // When the arch ties `lm_head` to `embed_tokens` (GOT-OCR2: proven byte-identical,
-    // spec §12), omit `lm_head.weight` — it is a duplicate the loader reconstructs
-    // from the stored embedding. Skips ~155 M params from the artifact.
-    let omit_lm_head = arch.tie_word_embeddings();
+/// What the tie checks compare: dtype, shape and a SHA-256 of the bytes of
+/// `lm_head.weight` and of the arch's `embed_tokens` tensor.
+#[derive(Default)]
+struct TieEvidence {
+    lm_head: Option<(DType, Vec<usize>, [u8; 32])>,
+    embed_tokens: Option<(DType, Vec<usize>, [u8; 32])>,
+}
 
-    // When the arch instead declares an UNTIED, high-precision-stored lm_head
-    // (SmolVLM2), re-verify the untie against the actual bytes — the census
-    // (docs/zoo/smolvlm2-spec.md §12) demands the full-tensor inequality be
-    // re-checked at convert time, so a tied checkpoint mislabeled with this
-    // arch id fails loud instead of silently shipping a redundant 47 M params.
-    if !omit_lm_head && !arch.lm_head_stored_int8() {
-        verify_untied_lm_head(weights, arch)?;
-    }
-    // The SYMMETRIC guard (fresh-eyes fix): omitting `lm_head.weight` on an
-    // arch's tie claim was previously taken on trust — a genuinely-untied
-    // checkpoint mislabeled with a tied arch id would silently DROP its real
-    // head (the loader would reconstruct from embed_tokens = wrong logits, no
-    // error anywhere). Verify the tie against the actual bytes before dropping.
-    if omit_lm_head {
-        verify_tied_lm_head(weights, arch)?;
-    }
-
-    // `names()` is already sorted (the directory is a `BTreeMap`); collect so the
-    // immutable directory borrow is released before the per-tensor accessors run.
-    let names: Vec<String> = weights.names().map(str::to_owned).collect();
-    for name in &names {
-        if omit_lm_head && name == "lm_head.weight" {
-            continue;
+impl<'a> Int8Conversion<'a> {
+    /// Start an int8 artifact for `arch`, packed for `arch_target`.
+    #[must_use]
+    pub fn new(arch: &'a dyn ModelArch, arch_target: u8) -> Self {
+        let mut builder = FocrqBuilder::new()
+            .with_arch_target(arch_target)
+            .with_model_id(arch.id())
+            .with_license_notice(arch.license_notice());
+        if let Some(recipe) = stamped_quant_recipe(arch, ConvertQuant::Int8) {
+            builder =
+                builder.with_packing_manifest_json(format!(r#"{{"quant_recipe":"{recipe}"}}"#));
         }
-        if is_decoder_int8_tensor_for(name, arch) {
-            quantize_decoder_tensor(&mut builder, weights, name, arch_target)?;
-        } else {
-            if arch.id() == crate::native_engine::model_arch::default_arch().id()
-                && matches!(
-                    weights.record(name).map(|record| record.dtype),
-                    Some(DType::F16)
-                )
-            {
-                return Err(FocrError::FormatMismatch(format!(
-                    "convert: Unlimited-OCR high-precision tensor {name:?} is F16; recipe \
-                     {UNLIMITED_OCR_INT8_RECIPE_ID} permits only source BF16 or F32"
-                )));
+        // A tied arch omits `lm_head.weight` (GOT-OCR2: proven byte-identical,
+        // spec §12; the loader reconstructs it from the stored embedding), and
+        // an arch with an UNTIED, high-precision lm_head (SmolVLM2) must not be
+        // fed a tied checkpoint (docs/zoo/smolvlm2-spec.md §12). Either claim is
+        // re-verified against the actual bytes, never taken on trust.
+        let tie_check =
+            (arch.tie_word_embeddings() || !arch.lm_head_stored_int8()).then(TieEvidence::default);
+        Self {
+            arch,
+            arch_target,
+            builder,
+            tie_check,
+        }
+    }
+
+    /// Quantize or copy every tensor of one source shard into the artifact.
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if a decoder int8 tensor is not rank-2
+    /// `[n, k]`, a tensor's bytes disagree with its shape, an input tensor is
+    /// already quantized or (for Unlimited-OCR) a high-precision tensor is F16,
+    /// or a tensor already came from an earlier shard.
+    pub fn add_shard(&mut self, weights: &Weights) -> FocrResult<()> {
+        use sha2::Digest as _;
+
+        let omit_lm_head = self.arch.tie_word_embeddings();
+        let embed_name = self.arch.embed_tokens_name();
+        // `names()` is already sorted (the directory is a `BTreeMap`); collect so
+        // the immutable directory borrow is released before the per-tensor
+        // accessors run.
+        let names: Vec<String> = weights.names().map(str::to_owned).collect();
+        for name in &names {
+            if let Some(evidence) = self.tie_check.as_mut() {
+                let slot = if name == "lm_head.weight" {
+                    Some(&mut evidence.lm_head)
+                } else if name == embed_name {
+                    Some(&mut evidence.embed_tokens)
+                } else {
+                    None
+                };
+                if let Some(slot) = slot {
+                    let view = weights.tensor(name)?;
+                    *slot = Some((
+                        view.dtype,
+                        view.shape.to_vec(),
+                        sha2::Sha256::digest(view.data).into(),
+                    ));
+                }
             }
-            copy_high_precision_tensor(&mut builder, weights, name)?;
+            if omit_lm_head && name == "lm_head.weight" {
+                continue;
+            }
+            if is_decoder_int8_tensor_for(name, self.arch) {
+                quantize_decoder_tensor(&mut self.builder, weights, name, self.arch_target)?;
+            } else {
+                if self.arch.unlimited_variant().is_some()
+                    && matches!(
+                        weights.record(name).map(|record| record.dtype),
+                        Some(DType::F16)
+                    )
+                {
+                    return Err(FocrError::FormatMismatch(format!(
+                        "convert: Unlimited-OCR high-precision tensor {name:?} is F16; recipe \
+                         {UNLIMITED_OCR_INT8_RECIPE_ID} permits only source BF16 or F32"
+                    )));
+                }
+                copy_high_precision_tensor(&mut self.builder, weights, name)?;
+            }
         }
+        Ok(())
     }
-    Ok(builder.build())
+
+    /// Check the arch's tie claim against the source bytes, stamp the source
+    /// identity, and serialize the artifact. `provenance` is the multi-shard
+    /// `provenance` object ([`crate::native_engine::shards::provenance_json`]).
+    ///
+    /// # Errors
+    /// [`FocrError::FormatMismatch`] if the tie claim is false.
+    pub fn finish(
+        self,
+        source_sha256: [u8; 32],
+        provenance: Option<String>,
+    ) -> FocrResult<Vec<u8>> {
+        if let Some(evidence) = &self.tie_check {
+            verify_lm_head_tie(evidence, self.arch)?;
+        }
+        let mut builder = self.builder.with_source_sha256(source_sha256);
+        if let Some(provenance) = provenance {
+            builder = builder.with_provenance_json(provenance);
+        }
+        Ok(builder.build())
+    }
 }
 
 /// The pinned per-tensor int4 group size of the wasm recipe
@@ -389,7 +478,7 @@ fn wasm_int4_to_focrq(
     arch: &dyn ModelArch,
     calib: Option<&CalibStats>,
 ) -> FocrResult<Vec<u8>> {
-    if arch.id() != crate::native_engine::model_arch::default_arch().id() {
+    if arch.unlimited_variant() != Some(UnlimitedVariant::V1Rswa) {
         return Err(FocrError::NotImplemented(format!(
             "focr convert --quant int4 implements only the Unlimited-OCR wasm recipe \
              {UNLIMITED_OCR_WASM_INT4_RECIPE_ID:?}; --model-id {:?} has no certified int4 \
@@ -886,45 +975,40 @@ fn quantize_expert_int4_tensor(
     )
 }
 
-/// Convert-time proof that an arch-declared UNTIED `lm_head` really is untied:
-/// when both `lm_head.weight` and the arch's `embed_tokens` tensor exist with
-/// identical shape/dtype, their raw bytes must DIFFER. Bytes-equal means the
-/// checkpoint is tied and the arch descriptor (or the `--model-id`) is wrong —
-/// refuse rather than store a silent duplicate. Either tensor missing is not
-/// this function's problem (the load path reports missing tensors itself).
-fn verify_untied_lm_head(weights: &Weights, arch: &dyn ModelArch) -> FocrResult<()> {
+/// Convert-time proof of the arch's `lm_head` tie claim, when both
+/// `lm_head.weight` and the arch's `embed_tokens` tensor exist. Either tensor
+/// missing is not this check's problem (the load path reports missing tensors
+/// itself; already-tied checkpoints often store no `lm_head` at all).
+///
+/// - An arch that DECLARES tied embeddings omits `lm_head.weight` from the
+///   artifact, so the source head must be byte-identical to `embed_tokens`;
+///   otherwise the omission destroys the real head.
+/// - An arch that declares an UNTIED high-precision head must not be fed a
+///   checkpoint whose head is byte-identical to `embed_tokens` with the same
+///   shape/dtype: that checkpoint ties its embeddings and would store a silent
+///   duplicate.
+///
+/// Bytes are compared by SHA-256, because the two tensors may live in
+/// different shards.
+fn verify_lm_head_tie(evidence: &TieEvidence, arch: &dyn ModelArch) -> FocrResult<()> {
     let embed_name = arch.embed_tokens_name();
-    let (Ok(head), Ok(embed)) = (weights.tensor("lm_head.weight"), weights.tensor(embed_name))
-    else {
+    let (Some(head), Some(embed)) = (&evidence.lm_head, &evidence.embed_tokens) else {
         return Ok(());
     };
-    if head.dtype == embed.dtype && head.shape == embed.shape && head.data == embed.data {
-        return Err(FocrError::FormatMismatch(format!(
-            "convert: arch {:?} declares an UNTIED lm_head, but lm_head.weight is \
-             byte-identical to {embed_name:?} — this checkpoint ties its embeddings; \
-             the --model-id (or its descriptor) is wrong",
-            arch.id()
-        )));
-    }
-    Ok(())
-}
-
-/// The mirror of [`verify_untied_lm_head`]: an arch that DECLARES tied
-/// embeddings (and therefore omits `lm_head.weight` from the artifact) must
-/// actually have byte-identical head/embed tensors in the source checkpoint —
-/// otherwise the omission destroys the real head. Absent `lm_head.weight` is
-/// fine (already-tied checkpoints often don't store one at all).
-fn verify_tied_lm_head(weights: &Weights, arch: &dyn ModelArch) -> FocrResult<()> {
-    let embed_name = arch.embed_tokens_name();
-    let (Ok(head), Ok(embed)) = (weights.tensor("lm_head.weight"), weights.tensor(embed_name))
-    else {
-        return Ok(());
-    };
-    if head.dtype != embed.dtype || head.shape != embed.shape || head.data != embed.data {
+    let identical = head == embed;
+    if arch.tie_word_embeddings() && !identical {
         return Err(FocrError::FormatMismatch(format!(
             "convert: arch {:?} declares TIED embeddings (lm_head omitted from the \
              artifact), but this checkpoint's lm_head.weight differs from \
              {embed_name:?} — omitting it would silently destroy the real head; \
+             the --model-id (or its descriptor) is wrong",
+            arch.id()
+        )));
+    }
+    if !arch.tie_word_embeddings() && identical {
+        return Err(FocrError::FormatMismatch(format!(
+            "convert: arch {:?} declares an UNTIED lm_head, but lm_head.weight is \
+             byte-identical to {embed_name:?} — this checkpoint ties its embeddings; \
              the --model-id (or its descriptor) is wrong",
             arch.id()
         )));

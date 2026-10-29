@@ -49,16 +49,6 @@ pub(crate) use crate::UNLIMITED_OCR_ARTIFACT_VERSION;
 /// the conservative default runtime.
 pub const UNLIMITED_OCR_LEGACY_FULL_INT8_RECIPE: &str =
     "unlimited-ocr-full-int8-attn-int8-lmhead-int8-v1";
-/// Exact recipe for the published GOT-OCR2 int8 artifact.
-pub const GOT_OCR2_INT8_RECIPE: &str = "got-ocr2-decoder-int8-lmhead-omitted-tied-v1";
-/// Exact recipe for the published SmolVLM2 int8 artifact.
-pub const SMOLVLM2_INT8_RECIPE: &str = "smolvlm2-decoder-int8-lmhead-bf16-v1";
-/// Exact recipe for the published OneChart int8 artifact.
-pub const ONECHART_INT8_RECIPE: &str = "onechart-decoder-int8-lmhead-omitted-tied-v1";
-/// Exact recipe for the published TrOMR int8 artifact.
-pub const TROMR_INT8_RECIPE: &str = "tromr-decoder-int8-v1";
-/// Exact recipe for the published TrOMR f32 reference artifact.
-pub const TROMR_F32_RECIPE: &str = "tromr-f32-v1";
 
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_MODELS: usize = 64;
@@ -480,28 +470,21 @@ fn validate_manifest(manifest: &Manifest) -> FocrResult<()> {
     Ok(())
 }
 
-/// Exact recipe required for one published model/quant pair.
-#[must_use]
-pub fn required_quant_recipe(model_id: &str, quant: &str) -> Option<&'static str> {
-    match (model_id, quant) {
-        ("unlimited-ocr", "int8") => Some(UNLIMITED_OCR_REQUIRED_RECIPE),
-        ("got-ocr2", "int8") => Some(GOT_OCR2_INT8_RECIPE),
-        ("smolvlm2", "int8") => Some(SMOLVLM2_INT8_RECIPE),
-        ("onechart", "int8") => Some(ONECHART_INT8_RECIPE),
-        ("tromr", "int8") => Some(TROMR_INT8_RECIPE),
-        ("tromr", "f32") => Some(TROMR_F32_RECIPE),
-        _ => None,
-    }
+/// The exact recipe this runtime requires for one manifest model/quant pair
+/// ([`ModelArch::required_quant_recipe`](crate::model_arch::ModelArch::required_quant_recipe));
+/// `None` for an unknown model id or a pair without a contract.
+fn required_recipe(model_id: &str, quant: &str) -> Option<&'static str> {
+    crate::model_arch::arch_by_id(model_id).and_then(|arch| arch.required_quant_recipe(quant))
 }
 
 /// Whether a manifest quant exactly matches this runtime's model contract.
 #[must_use]
 pub fn quant_recipe_is_compatible(model_id: &str, quant: &str, recipe: &str) -> bool {
-    required_quant_recipe(model_id, quant) == Some(recipe)
+    required_recipe(model_id, quant) == Some(recipe)
 }
 
 fn validate_quant_compatibility(model_id: &str, quant: &str, entry: &QuantEntry) -> FocrResult<()> {
-    let Some(required) = required_quant_recipe(model_id, quant) else {
+    let Some(required) = required_recipe(model_id, quant) else {
         return Err(FocrError::FormatMismatch(format!(
             "manifest artifact {model_id}/{quant} has no recipe contract in this runtime"
         )));
@@ -1255,6 +1238,10 @@ fn install_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_arch::{
+        GOT_OCR2_INT8_RECIPE, ONECHART_INT8_RECIPE, SMOLVLM2_INT8_RECIPE, TROMR_F32_RECIPE,
+        TROMR_INT8_RECIPE,
+    };
 
     fn tiny_file(filename: &str) -> RemoteFile {
         RemoteFile {
@@ -1425,6 +1412,41 @@ mod tests {
         }
     }
 
+    /// Model open refuses a foreign `tokenizer.json` with "re-install its
+    /// sidecars with `focr pull <model>`". That advice holds only for a model
+    /// the builtin manifest publishes, with exactly the pinned sidecar.
+    #[test]
+    fn every_pinned_tokenizer_is_the_one_focr_pull_installs() {
+        let manifest = builtin_manifest().expect("builtin manifest parses");
+        for arch in crate::model_arch::registry() {
+            let Some(pinned) = arch.tokenizer_sha256() else {
+                assert!(
+                    arch.required_token_ids().is_empty(),
+                    "{} pins token ids but no sidecar hash",
+                    arch.id()
+                );
+                continue;
+            };
+            let tokenizer = if manifest.model == arch.id() {
+                &manifest.tokenizer
+            } else {
+                &manifest
+                    .models
+                    .get(arch.id())
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{} pins its tokenizer, but `focr pull {}` cannot fetch it",
+                            arch.id(),
+                            arch.id()
+                        )
+                    })
+                    .tokenizer
+            };
+            assert_eq!(tokenizer.filename, "tokenizer.json", "{}", arch.id());
+            assert_eq!(tokenizer.sha256, pinned, "{}", arch.id());
+        }
+    }
+
     #[test]
     fn every_published_model_quant_requires_its_exact_recipe() {
         let exact = [
@@ -1436,7 +1458,7 @@ mod tests {
             ("tromr", "f32", TROMR_F32_RECIPE),
         ];
         for (model, quant, recipe) in exact {
-            assert_eq!(required_quant_recipe(model, quant), Some(recipe));
+            assert_eq!(required_recipe(model, quant), Some(recipe));
             assert!(quant_recipe_is_compatible(model, quant, recipe));
             assert!(!quant_recipe_is_compatible(model, quant, "arbitrary-v1"));
         }

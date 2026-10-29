@@ -26,7 +26,80 @@ sections as they land.
 
 ## [Unreleased]
 
-No changes yet.
+### Added
+
+- **Honest v1 multi-page reporting** (bead U2-X2). `run_complete` now carries
+  `finish_reason` (`stop` or `length`). A `--multi-page` run that ends with fewer
+  page bodies than pages adds a `warnings[]` entry `{kind, message, recovery, ...}`:
+  - `v1_truncated` (`expected`, `got`, and `cause` of `positions` or `user_cap`):
+    v1 shares 32,768 positions between prompt and output (≈29 dense pages), so a
+    longer document stops early.
+  - `v1_page_merge`: the model ended at EOS with fewer page bodies than pages, so
+    page boundaries are unreliable.
+
+  The same entries appear in `--json` (`warnings`), in `ocr-batch --multi-page
+  --json`, and as a stderr line. Output text and exit codes are unchanged (a v1
+  truncation still exits 0). Healthy runs gain only `finish_reason`.
+- **`event_fields` in `focr robot schema`.** The schema lists the required and
+  optional fields of every event kind, and the CLI contract suite validates every
+  emitted event against it.
+- **Token-id golden gate** (`scripts/token_golden_gate.sh`, U2-T3). It pins v1's
+  generated token ids, markdown and page events on the conservative int8 artifact
+  (`tests/fixtures/uocr2_v1_goldens/`). `scripts/check.sh` runs it when the model
+  is present.
+- `FOCR_TEST_MAX_POSITIONS` (test-only) lowers the shared position budget so tests
+  reach the multi-page clamp on small documents. Values above 32,768 exit 2.
+- **Sharded safetensors checkpoints** (bead U2-A3; spec in `docs/focrq-format.md`,
+  "Sharded sources").
+  - `--model <dir>` and `focr convert <dir>` accept a Hugging Face checkpoint
+    split into shards (`model.safetensors.index.json` plus N files). A directory
+    resolves to its index, so `tokenizer.json` is read from that directory.
+  - Every shard's header is checked against the index, which refuses a tensor in
+    two shards, a missing or unlisted tensor, and a wrong `total_size`. The
+    checkpoint is then identified by census, as a single file is.
+  - An I64 tensor is accepted only when the model's census names it, with an
+    exact shape and content (Unlimited-OCR-2's `position_ids` = `arange(257)`).
+    It is verified and dropped; any other I64 tensor is an error.
+  - `focr convert` reads one shard at a time, hashing it as it reads, so a
+    sharded source no longer has to fit in memory at once. A multi-shard
+    artifact's `source_sha256` is the SHA-256 of the shard SHA-256s in index
+    order, its `provenance.source_shards` lists each shard, and loading
+    refuses a `.focrq` whose list and `source_sha256` disagree (exit 7). The
+    `--json` receipt gains `source_shards`. Single-file sources convert to the
+    same bytes as before.
+  - `--quant int4` refuses a multi-shard source.
+
+### Fixed
+
+- fix: multi-page streaming no longer stops emitting page events after a split
+  multi-byte character (CJK). Byte-level BPE often spells a rarer Chinese or
+  Japanese character, or an emoji, as several tokens. Streaming used to re-decode
+  the ids so far, hit the half character as invalid UTF-8, and stop for the rest
+  of the run, final page included; the final text was always right. A UTF-8-safe
+  incremental decoder (`tokenizer::StreamDecoder`) now holds a split character
+  back until it is complete. On two Chinese test pages the old path streamed 0 of
+  2 page events and the new one streams both.
+- The `--multi-page` help text and README no longer claim a document "must fit the
+  32K context (~290 pages)". The budget is shared with the output, so ≈29 dense
+  pages, and longer documents now say so.
+- `scripts/fetch_sources.sh --verify` checks exactly the files it fetched. It used
+  to also try the large-source rows (tokenizer, weight shard), which it never
+  fetches.
+- Model identity no longer depends on which model is the default (bead U2-A2).
+  - A `.focrq` without a `model_id` is Unlimited-OCR v1, permanently. The writer
+    omits the key for v1 only, so v1 artifacts stay byte-identical.
+  - A raw safetensors shard is identified by the exact tensor census it matches
+    and refused when it matches none; before, every raw shard was assumed to be
+    the default model.
+  - Opening a v1 model now checks the `tokenizer.json` beside it before reading
+    any weights: its SHA-256 must be the pinned `a02f8fd5…55a8b4`, and every
+    required added-token id must map to its expected text. A foreign sidecar
+    used to be accepted silently.
+  - `focr pull --json` reports the pulled model's own license notice when the
+    manifest entry has none, instead of the Unlimited-OCR notice.
+  - Library API: `dist::required_quant_recipe` is replaced by
+    `ModelArch::required_quant_recipe`. The zoo recipe-id constants moved from
+    `dist` to `model_arch`.
 
 ## [0.9.1] - 2026-09-28
 

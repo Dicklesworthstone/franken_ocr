@@ -221,6 +221,43 @@ impl RopeTable {
         }
         Self { cos, sin, head_dim }
     }
+
+    /// Build the tables from precomputed per-row rotation angles, row-major
+    /// `[seq, head_dim / 2]`, duplicated into both halves like [`Self::build`]
+    /// (`emb = cat(ang, ang)`). For position schemes whose angles are not
+    /// `position * inv_freq`, e.g. Unlimited-OCR-2's page2d RoPE
+    /// ([`super::srswa`]), so they reuse [`apply_rope`] unchanged.
+    ///
+    /// # Panics
+    /// Panics if `head_dim` is not even or `angles.len()` is not a multiple of
+    /// `head_dim / 2`.
+    #[must_use]
+    pub fn from_angles(angles: &[f32], head_dim: usize) -> Self {
+        assert!(
+            head_dim.is_multiple_of(2) && head_dim > 0,
+            "RopeTable: head_dim must be even and non-zero"
+        );
+        let half = head_dim / 2;
+        assert!(
+            angles.len().is_multiple_of(half),
+            "RopeTable::from_angles: {} angles is not a multiple of {half}",
+            angles.len()
+        );
+        let seq = angles.len() / half;
+        let mut cos = vec![0.0f32; seq * head_dim];
+        let mut sin = vec![0.0f32; seq * head_dim];
+        for (t, row) in angles.chunks_exact(half).enumerate() {
+            let base = t * head_dim;
+            for (i, &angle) in row.iter().enumerate() {
+                let (s, c) = angle.sin_cos();
+                cos[base + i] = c;
+                cos[base + half + i] = c;
+                sin[base + i] = s;
+                sin[base + half + i] = s;
+            }
+        }
+        Self { cos, sin, head_dim }
+    }
 }
 
 /// Apply Llama-style RoPE in place to a `[seq, num_heads * head_dim]` Q or K

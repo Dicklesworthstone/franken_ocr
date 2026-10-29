@@ -894,6 +894,14 @@ Per the `/idea-wizard` review, the single highest-EV move is **not a kernel** �
 | **OQ-17** | **Does the official model run on CPU at all?** `infer()` is CUDA-oriented (`.cuda()` + autocast). Determine whether a CPU-patched HF run reproduces the GPU oracle's tokens — if not, perf is benchmarked against llama.cpp-GGUF / ONNX on CPU instead. Decides the oracle split (§8.1) and the meaning of G2. | §8.1 oracle, G2 perf claim, Phase −1 | `modeling_unlimitedocr.py` `infer()` (device/autocast) + a CPU smoke run |
 | **OQ-18** | **Full token census per mode** — every token CLASS (image-feature 256, `image_newline` 16, `view_seperator` 1 ⇒ 273 at 1024; prompt; generated) and the exact **Gundam multi-tile** totals per aspect ratio; the `ngram_window` per mode (128 single / 1024 multi). Drives all KV/buffer sizing + the sampler. | preprocess, R-SWA buffer sizing, sampler, the census generator | `modeling_unlimitedocr.py` (`dynamic_preprocess`, placeholder assembly, ngram window) |
 
+**Unlimited-OCR-2 (v2).** This register is v1's. OQ-1–5, 8, 9, 13, 14, 16 and 18 are answered for
+the v1 checkpoint only (R-SWA, 1-D RoPE, the v1 tokenizer and census). v2 replaces the attention
+(SR-SWA with the Token Sieve router), the positional scheme (page2d RoPE) and the token set (`<PAGE>`
+and friends), so it reopens their equivalents as OQ-V2-1…16 in
+[`UNLIMITED_OCR_2_PLAN.md` §14](UNLIMITED_OCR_2_PLAN.md#14-open-questions-register-oq-v2), indexed
+with status and owning bead in `docs/truth-pack/OQ_INDEX.md` (section OQ-V2). The rule above holds
+for them unchanged: no v2 kernel ships against an OPEN OQ-V2 item it depends on.
+
 ---
 
 ## 14. Skills, methodology & the path to beads

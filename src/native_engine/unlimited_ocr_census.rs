@@ -15,7 +15,8 @@ use std::sync::OnceLock;
 
 use serde::Deserialize;
 
-use super::model_arch;
+use super::model_arch::{self, ModelArch, TensorCensus};
+use super::shards::Int64Rule;
 use super::weights::{DType, TensorRecord, Weights};
 use crate::error::{FocrError, FocrResult};
 use crate::quant::convert::{UNLIMITED_OCR_INT8_RECIPE_ID, UNLIMITED_OCR_WASM_INT4_RECIPE_ID};
@@ -36,21 +37,73 @@ const SOURCE_FILE_SIZE: u64 = 6_672_547_120;
 const TENSOR_COUNT: usize = 2_710;
 const DIFF_PREVIEW_LIMIT: usize = 6;
 
-/// Refuse conversion inputs whose output the production artifact loader would
-/// later reject. The conservative Unlimited-OCR format is bound to the exact
-/// pinned source shard, not merely a same-shaped safetensors serialization.
+/// The pinned source shards of `census`'s checkpoint, in index order: each
+/// shard's file name and SHA-256. A single-entry list is also the shard name
+/// the model resolver looks for in a directory without an index.
+pub(crate) fn source_shards(census: TensorCensus) -> &'static [(&'static str, &'static str)] {
+    match census {
+        TensorCensus::UnlimitedOcrV1 => &[(SOURCE_FILE, SOURCE_SHA256)],
+    }
+}
+
+/// The I64 tensors `census` accepts only to verify and skip (D8).
+pub(crate) fn int64_rules(census: TensorCensus) -> &'static [Int64Rule] {
+    match census {
+        TensorCensus::UnlimitedOcrV1 => &[],
+    }
+}
+
+/// Refuse a conversion source whose shard count differs from the pinned
+/// source's, before any shard is read.
 #[cfg_attr(not(feature = "native"), allow(dead_code))] // sole non-test caller is the CLI convert path
-pub(crate) fn validate_conversion_source_sha256(actual: &[u8; 32]) -> FocrResult<()> {
+pub(crate) fn validate_conversion_shard_count(
+    census: TensorCensus,
+    count: usize,
+) -> FocrResult<()> {
+    let pinned = source_shards(census);
+    if count == pinned.len() {
+        return Ok(());
+    }
+    Err(FocrError::FormatMismatch(format!(
+        "{} conversion requires its pinned {}-shard source checkpoint; this source has {count} \
+         shard(s)",
+        census_model_id(census),
+        pinned.len()
+    )))
+}
+
+/// Refuse conversion inputs whose output the production artifact loader would
+/// later reject: shard `position`'s SHA-256 must be the pinned one. The
+/// conservative format is bound to the exact pinned source shards, not merely
+/// a same-shaped safetensors serialization.
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // sole non-test caller is the CLI convert path
+pub(crate) fn validate_conversion_source_shard(
+    census: TensorCensus,
+    position: usize,
+    actual: &[u8; 32],
+) -> FocrResult<()> {
     let actual = actual
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
-    if actual == SOURCE_SHA256 {
-        Ok(())
-    } else {
-        Err(FocrError::FormatMismatch(format!(
-            "Unlimited-OCR conversion requires pinned source shard SHA-256 {SOURCE_SHA256}; got {actual}. Supply the canonical checkpoint or use raw compatible weights directly"
-        )))
+    let pinned = source_shards(census);
+    let Some(&(name, expected)) = pinned.get(position) else {
+        return validate_conversion_shard_count(census, position + 1);
+    };
+    if actual == expected {
+        return Ok(());
+    }
+    Err(FocrError::FormatMismatch(format!(
+        "{} conversion requires pinned source shard {name} SHA-256 {expected}; got {actual}. \
+         Supply the canonical checkpoint or use raw compatible weights directly",
+        census_model_id(census)
+    )))
+}
+
+/// The model id a census describes.
+fn census_model_id(census: TensorCensus) -> &'static str {
+    match census {
+        TensorCensus::UnlimitedOcrV1 => model_arch::UNLIMITED_OCR_V1_ID,
     }
 }
 
@@ -107,7 +160,7 @@ fn parse_and_verify_manifest() -> Result<UnlimitedOcrManifest, String> {
         (
             "model_id",
             manifest.model_id.as_str(),
-            model_arch::default_arch().id(),
+            model_arch::UNLIMITED_OCR_V1_ID,
         ),
         ("hf_commit", manifest.hf_commit.as_str(), HF_COMMIT),
         (
@@ -315,12 +368,33 @@ fn validate_records<'a>(
     Err(FocrError::FormatMismatch(message))
 }
 
-/// Validate the bounded header of the pinned raw source shard.
-pub(super) fn validate_source_header(records: &BTreeMap<String, TensorRecord>) -> FocrResult<()> {
-    validate_records(
-        records.iter().map(|(name, record)| (name.as_str(), record)),
-        CensusSurface::SourceSafetensors,
-    )
+/// Identify a raw safetensors checkpoint, which declares no model id, by the
+/// exact embedded census its directory matches. A shard matching none is
+/// refused with every census's diff, never assumed to be the default model.
+pub(super) fn identify_raw<'a, I>(records: I) -> FocrResult<&'static dyn ModelArch>
+where
+    I: IntoIterator<Item = (&'a str, &'a TensorRecord)> + Clone,
+{
+    let mut failures = Vec::new();
+    for &arch in model_arch::registry() {
+        let Some(census) = arch.tensor_census() else {
+            continue;
+        };
+        let checked = match census {
+            TensorCensus::UnlimitedOcrV1 => {
+                validate_records(records.clone(), CensusSurface::SourceSafetensors)
+            }
+        };
+        match checked {
+            Ok(()) => return Ok(arch),
+            Err(FocrError::FormatMismatch(diff)) => failures.push(format!("{}: {diff}", arch.id())),
+            Err(other) => return Err(other),
+        }
+    }
+    Err(FocrError::FormatMismatch(format!(
+        "raw safetensors checkpoint matches no registered model's tensor census [{}]",
+        failures.join("; ")
+    )))
 }
 
 /// Validate identity, recipe, and complete tensor schema of a conservative
@@ -363,8 +437,9 @@ pub(super) fn validate_focrq_header(
 /// open descriptor; this post-load check proves name/shape/dtype parity survived
 /// the parser handoff.
 pub(super) fn validate_loaded_weights(weights: &Weights) -> FocrResult<()> {
-    if weights.model_id() != model_arch::default_arch().id() {
-        return Ok(());
+    match model_arch::arch_by_id(weights.model_id()).and_then(|arch| arch.tensor_census()) {
+        Some(TensorCensus::UnlimitedOcrV1) => {}
+        None => return Ok(()),
     }
     let surface = if weights.is_focrq() {
         if weights.source_sha256() != SOURCE_SHA256 {
@@ -391,6 +466,18 @@ pub(super) fn validate_loaded_weights(weights: &Weights) -> FocrResult<()> {
         records.push((name, record));
     }
     validate_records(records, surface)
+}
+
+/// `(name, source dtype, shape)` of every tensor in the pinned v1 source
+/// checkpoint, for tests that need a census-exact header without the weights.
+#[cfg(test)]
+pub(super) fn v1_source_tensors() -> Vec<(String, DType, Vec<usize>)> {
+    manifest()
+        .expect("embedded production manifest parses")
+        .tensors
+        .iter()
+        .map(|(name, tensor)| (name.clone(), tensor.source_dtype, tensor.shape.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -437,6 +524,56 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    fn identify(directory: &BTreeMap<String, TensorRecord>) -> FocrResult<&'static dyn ModelArch> {
+        identify_raw(
+            directory
+                .iter()
+                .map(|(name, record)| (name.as_str(), record)),
+        )
+    }
+
+    #[test]
+    fn raw_checkpoints_are_identified_by_census_not_by_the_default() {
+        let source = synthetic_directory(CensusSurface::SourceSafetensors);
+        assert_eq!(
+            identify(&source).expect("the v1 census matches").id(),
+            model_arch::UNLIMITED_OCR_V1_ID
+        );
+        let got = model_arch::arch_by_id("got-ocr2").expect("got-ocr2 registered");
+        let flip = model_arch::test_default::flip(got);
+        assert_eq!(
+            identify(&source).expect("still v1").id(),
+            model_arch::UNLIMITED_OCR_V1_ID,
+            "the default model plays no part"
+        );
+        drop(flip);
+
+        // A shard no census describes (v1 less one tensor, plus a foreign one)
+        // is refused with every census's diff, never assumed to be a model.
+        let mut foreign = source.clone();
+        foreign.remove("lm_head.weight");
+        let mut router = source["model.norm.weight"].clone();
+        router.shape = vec![32, 1280];
+        foreign.insert("model.layers.0.self_attn.router.weight".into(), router);
+        let message = identify(&foreign)
+            .expect_err("matches no census")
+            .to_string();
+        assert!(
+            message.contains("matches no registered model's tensor census"),
+            "{message}"
+        );
+        for arch in model_arch::registry() {
+            if arch.tensor_census().is_some() {
+                assert!(message.contains(&format!("{}: ", arch.id())), "{message}");
+            }
+        }
+        assert!(message.contains("missing 1: [lm_head.weight]"), "{message}");
+        assert!(
+            message.contains("unexpected 1: [model.layers.0.self_attn.router.weight]"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -666,11 +803,20 @@ mod tests {
             *byte = u8::from_str_radix(&SOURCE_SHA256[index * 2..index * 2 + 2], 16)
                 .expect("source SHA constant is hex");
         }
-        validate_conversion_source_sha256(&expected).expect("pinned source accepted");
-        let error = validate_conversion_source_sha256(&[0u8; 32])
+        let census = TensorCensus::UnlimitedOcrV1;
+        validate_conversion_shard_count(census, 1).expect("the pinned source is one shard");
+        validate_conversion_source_shard(census, 0, &expected).expect("pinned source accepted");
+        let error = validate_conversion_source_shard(census, 0, &[0u8; 32])
             .expect_err("reserialized source must fail before conversion output");
         let message = error.to_string();
         assert!(message.contains(SOURCE_SHA256));
+        assert!(message.contains(SOURCE_FILE));
         assert!(message.contains(&"0".repeat(64)));
+        let error = validate_conversion_shard_count(census, 2)
+            .expect_err("a resharded source is not the pinned checkpoint");
+        assert!(error.to_string().contains("1-shard"), "{error}");
+        let error = validate_conversion_source_shard(census, 1, &expected)
+            .expect_err("a second shard has no pin");
+        assert!(error.to_string().contains("2 shard(s)"), "{error}");
     }
 }

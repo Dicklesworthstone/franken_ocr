@@ -227,7 +227,9 @@ pub struct OcrBatchArgs {
     /// `infer_multi` contract): a single cross-page pass where page N can
     /// reference pages 1..N-1, emitting one markdown with `<PAGE>` separators.
     /// Without this flag each image is parsed independently. Unlimited-OCR
-    /// only; the whole document must fit the 32K context.
+    /// only; v1 has 32,768 positions shared by prompt and output (≈29 dense
+    /// pages); longer documents stop early and report `finish_reason: length`
+    /// with a `v1_truncated` warning.
     #[arg(long)]
     pub multi_page: bool,
 }
@@ -346,8 +348,10 @@ pub struct OcrRequestArgs {
     /// ONE cross-page pass over the whole document (PDF inputs only; the
     /// Unlimited-OCR `infer_multi` contract): page N can reference pages
     /// 1..N-1, output is one markdown with `<PAGE>` separators. Composes
-    /// with `--pages`. The document must fit the 32K context (~290 pages).
-    /// Without this flag each page is parsed independently.
+    /// with `--pages`. v1 has 32,768 positions shared by prompt and output
+    /// (≈29 dense pages); longer documents stop early and report
+    /// `finish_reason: length` with a `v1_truncated` warning. Without this
+    /// flag each page is parsed independently.
     #[arg(long)]
     pub multi_page: bool,
     /// Disable the resident warm-model daemon for this run (env analog:
@@ -1037,6 +1041,7 @@ fn write_ocr_output(
     want_json: bool,
     figures: &[WrittenFigure],
     music_meta: Option<&native_engine::MusicPageMeta>,
+    run_warnings: &[native_engine::RunWarning],
 ) -> FocrResult<()> {
     let contents = if want_json {
         let mut value = rec.to_json(figures);
@@ -1044,6 +1049,7 @@ fn write_ocr_output(
             value["staves"] = music_meta_to_json(meta);
             value["warnings"] = music_warnings_to_json(meta);
         }
+        merge_run_warnings(&mut value, run_warnings);
         let mut s = serde_json::to_string_pretty(&value).map_err(|e| {
             FocrError::Other(anyhow::anyhow!(
                 "serializing OCR JSON for {}: {e}",
@@ -1364,6 +1370,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     if let Some(err) = forced_test_error()? {
         return Err(err);
     }
+    native_engine::validate_test_max_positions()?;
     // Resolve the figure-extraction policy BEFORE the forward so a usage error
     // (e.g. `--extract-figures` without a place to put the subfolder) fires fast.
     let figure_plan = FigurePlan::resolve(&args)?;
@@ -1406,6 +1413,9 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
                 .into(),
         ));
     }
+    // A resident run decodes in the daemon, which reports its finish_reason
+    // in the reply (U2-X2); inline runs leave it on this engine's model.
+    let mut resident_finish: Option<native_engine::FinishReason> = None;
     let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, is_pdf) {
         (Some(plan), true) => {
             let (pdf_rec, figs) =
@@ -1456,7 +1466,10 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
                 // falls through to the classic in-process load; the observable
                 // output contract is identical either way.
                 let doc = match resident_recognition(&args, &request)? {
-                    Some(doc) => doc,
+                    Some(reply) => {
+                        resident_finish = reply.finish_reason;
+                        reply.document
+                    }
                     None => {
                         recognize_with_autodownload(&request, robot_mode, |model| match model {
                             Some(m) => engine.recognize_with_layout_model(m, &request.image),
@@ -1468,6 +1481,22 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             }
         }
     };
+
+    // How the run's decodes ended (U2-X2): the run-level finish_reason and
+    // the v1 multi-page truncation / page-merge warnings. Absent when the
+    // model's arm records no decode report (the zoo models).
+    let decode_report = engine.take_last_decode_report();
+    let finish_reason = decode_report
+        .as_ref()
+        .map(native_engine::DecodeReport::run_finish_reason)
+        .or(resident_finish);
+    let run_warnings = decode_report
+        .as_ref()
+        .map(native_engine::decode_warnings)
+        .unwrap_or_default();
+    if !robot_mode {
+        print_run_warnings(&run_warnings);
+    }
 
     // Staff-level metadata from a TrOMR music forward (bd-av64.2): consumed
     // once per run; None for every non-music run.
@@ -1547,7 +1576,14 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // regardless of mode, and is written FIRST so the file already exists when a
     // robot consumer sees the completion event below.
     if let Some(path) = args.output.as_deref() {
-        write_ocr_output(path, &recognition, want_json, &figures, music_meta.as_ref())?;
+        write_ocr_output(
+            path,
+            &recognition,
+            want_json,
+            &figures,
+            music_meta.as_ref(),
+            &run_warnings,
+        )?;
     }
 
     if robot_mode {
@@ -1557,6 +1593,8 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         emit(&robot::run_complete_event_assessed(
             markdown,
             low_yield.as_ref(),
+            finish_reason,
+            &run_warnings,
         ));
     } else if let Some(path) = args.output.as_deref() {
         // Result already went to the file; don't also echo it to stdout. Confirm
@@ -1577,11 +1615,39 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             value["staves"] = music_meta_to_json(meta);
             value["warnings"] = music_warnings_to_json(meta);
         }
+        merge_run_warnings(&mut value, &run_warnings);
         emit(&value);
     } else {
         println!("{markdown}");
     }
     Ok(())
+}
+
+/// Merge the run's decode warnings (U2-X2) into a `--json` value's
+/// `warnings` array, after any music entries. No key is added when there are
+/// none, so healthy runs keep their shape.
+fn merge_run_warnings(value: &mut serde_json::Value, warnings: &[native_engine::RunWarning]) {
+    if warnings.is_empty() {
+        return;
+    }
+    let entries: Vec<serde_json::Value> = warnings
+        .iter()
+        .map(native_engine::RunWarning::to_json)
+        .collect();
+    match value
+        .get_mut("warnings")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.extend(entries),
+        None => value["warnings"] = serde_json::Value::Array(entries),
+    }
+}
+
+/// The human stderr line per decode warning (U2-X2).
+fn print_run_warnings(warnings: &[native_engine::RunWarning]) {
+    for warning in warnings {
+        eprintln!("[focr] warning: {} — {}", warning.message, warning.recovery);
+    }
 }
 
 /// The `--json` `staves` array for a music run (bd-av64.2): one entry per
@@ -1650,7 +1716,7 @@ fn music_meta_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Value 
 fn resident_recognition(
     args: &OcrArgs,
     request: &OcrRequest,
-) -> FocrResult<Option<native_engine::RecognizedDocument>> {
+) -> FocrResult<Option<crate::resident::ResidentReply>> {
     if !crate::resident::enabled(request.no_resident)
         || args.request.task == OcrTask::Music
         || std::env::var_os("FOCR_TIMING").is_some()
@@ -2184,6 +2250,7 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         native_engine::force_int8_decode(true)?;
     }
     native_engine::validate_experimental_full_int8_decode()?;
+    native_engine::validate_test_max_positions()?;
     let experimental_full_int8 = native_engine::experimental_full_int8_decode_requested();
     let decode_mode = if experimental_full_int8 {
         "experimental_full_int8"
@@ -2222,15 +2289,26 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             None => engine.recognize_multi_page(&image_refs),
         }?;
         let elapsed = total.elapsed().as_secs_f64();
+        let report = engine.take_last_decode_report();
+        let run_warnings = report
+            .as_ref()
+            .map(native_engine::decode_warnings)
+            .unwrap_or_default();
+        print_run_warnings(&run_warnings);
         if args.json {
-            emit(&serde_json::json!({
+            let mut value = serde_json::json!({
                 "schema_version": robot::ROBOT_SCHEMA_VERSION,
                 "command": "batch.multi_page",
                 "pages": count,
                 "seconds": elapsed,
                 "decode_mode": decode_mode,
                 "markdown": markdown,
-            }));
+            });
+            if let Some(report) = &report {
+                value["finish_reason"] = report.run_finish_reason().as_str().into();
+            }
+            merge_run_warnings(&mut value, &run_warnings);
+            emit(&value);
         } else {
             println!("{markdown}");
             eprintln!("[focr] multi-page: {count} pages in one cross-page pass, {elapsed:.2}s");
@@ -2326,20 +2404,11 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
         )));
     }
 
-    // Resolve the input the way `ocr` resolves a model (a `.safetensors` file
-    // as-is, or the canonical shard inside a directory).
+    // Resolve the input the way `ocr` resolves a model: a `.safetensors` file
+    // as-is, or a directory's shard index (or its single registered shard).
     let resolved = native_engine::OcrModel::resolve_model(&args.input)?;
-    let bytes = std::fs::read(&resolved).map_err(|e| {
-        FocrError::ModelNotFound(format!(
-            "cannot read safetensors at {}: {e}",
-            resolved.display()
-        ))
-    })?;
-    let input_bytes = bytes.len();
-    let source_sha256 = quant::convert::sha256_of_bytes(&bytes);
-    // `from_bytes` keeps ownership of the single read; the hash above borrowed it.
-    let weights = native_engine::weights::Weights::from_bytes(bytes)?;
-    let tensor_count = weights.len();
+    let source = native_engine::shards::SourceShards::open(&resolved)?;
+    let shard_count = source.files().len();
     // Resolve the target model architecture (the `.focrq` self-declares its id).
     let arch = native_engine::model_arch::arch_by_id(&args.model_id).ok_or_else(|| {
         FocrError::Usage(format!(
@@ -2347,40 +2416,21 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             args.model_id
         ))
     })?;
-    if arch.id() == native_engine::model_arch::default_arch().id() {
-        native_engine::unlimited_ocr_census::validate_conversion_source_sha256(&source_sha256)?;
+    let census = arch.tensor_census();
+    if let Some(census) = census {
+        native_engine::unlimited_ocr_census::validate_conversion_shard_count(census, shard_count)?;
     }
-    let omit_lm_head = arch.tie_word_embeddings();
     let convert_quant = match args.quant {
         QuantTarget::Int8 => quant::convert::ConvertQuant::Int8,
         QuantTarget::Int4 => quant::convert::ConvertQuant::Int4,
     };
-    // `tensors_quantized` counts every LOSSY record the artifact will carry:
-    // the conservative int8 set for --quant int8, or the wasm recipe's
-    // int4 + int8 union for --quant int4.
-    let (quantized_int8, quantized_int4) = match convert_quant {
-        quant::convert::ConvertQuant::Int8 => (
-            weights
-                .names()
-                .filter(|name| quant::convert::is_decoder_int8_tensor_for(name, arch))
-                .filter(|name| !(omit_lm_head && *name == "lm_head.weight"))
-                .count(),
-            0usize,
-        ),
-        quant::convert::ConvertQuant::Int4 => {
-            let mut int8 = 0usize;
-            let mut int4 = 0usize;
-            for name in weights.names() {
-                match quant::recipe::classify_wasm_experts_int4(name) {
-                    quant::recipe::WasmInt4Policy::ExpertInt4 => int4 += 1,
-                    quant::recipe::WasmInt4Policy::Int8 => int8 += 1,
-                    quant::recipe::WasmInt4Policy::KeepHighPrecision => {}
-                }
-            }
-            (int8, int4)
-        }
-    };
-    let quantized = quantized_int8 + quantized_int4;
+    if convert_quant == quant::convert::ConvertQuant::Int4 && shard_count != 1 {
+        return Err(FocrError::NotImplemented(format!(
+            "focr convert --quant int4 (the wasm recipe) needs a single-shard source; {} has \
+             {shard_count} shards",
+            resolved.display()
+        )));
+    }
 
     // `--calib`: load the activation statistics BEFORE the (long) conversion so a
     // bad path fails fast, and report the coverage the artifact was built with.
@@ -2396,18 +2446,102 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             Some(quant::calib::CalibStats::from_json(&text)?)
         }
     };
-    let calib_coverage = calib
-        .as_ref()
-        .map(|stats| quant::convert::calib_coverage(&weights, stats));
 
-    let blob = quant::convert::safetensors_to_focrq_calibrated(
-        &weights,
-        convert_quant,
-        args.arch.packing_byte(),
-        source_sha256,
-        arch,
-        calib.as_ref(),
-    )?;
+    // The bounded header pass: every shard's header is validated and checked
+    // against the index, and any I64 tensor against the arch's census, before
+    // a single payload byte is read.
+    let (headers, prefixes) = native_engine::read_source_headers(&source)?;
+    let int64_rules = native_engine::shards::int64_rules(Some(arch));
+    native_engine::shards::check_int64_entries(&headers.int64, int64_rules, arch.id())?;
+    native_engine::shards::check_int64_rules_present(&headers.int64, int64_rules, arch.id())?;
+
+    // Stream shard by shard, in index order: read each shard once, hashing it
+    // in the same pass, check it against the arch's pin, convert its tensors,
+    // and drop it before the next one is read.
+    let omit_lm_head = arch.tie_word_embeddings();
+    let mut int8 = (convert_quant == quant::convert::ConvertQuant::Int8)
+        .then(|| quant::convert::Int8Conversion::new(arch, args.arch.packing_byte()));
+    let mut int4_blob = None;
+    let mut digests = Vec::with_capacity(shard_count);
+    let mut tensor_count = 0usize;
+    // `tensors_quantized` counts every LOSSY record the artifact will carry:
+    // the conservative int8 set for --quant int8, or the wasm recipe's
+    // int4 + int8 union for --quant int4.
+    let mut quantized_int8 = 0usize;
+    let mut quantized_int4 = 0usize;
+    let mut calib_coverage: Option<((usize, usize), (usize, usize))> = None;
+    for (position, (name, path)) in source.files().iter().enumerate() {
+        let (bytes, digest) = native_engine::shards::read_shard(name, path)?;
+        if !bytes.starts_with(&prefixes[position]) {
+            return Err(FocrError::FormatMismatch(format!(
+                "{} changed between its header check and its conversion",
+                path.display()
+            )));
+        }
+        if let Some(census) = census {
+            native_engine::unlimited_ocr_census::validate_conversion_source_shard(
+                census,
+                position,
+                &digest.sha256,
+            )?;
+        }
+        let weights = native_engine::weights::Weights::from_source_shard(bytes, arch)?;
+        tensor_count += weights.len();
+        match convert_quant {
+            quant::convert::ConvertQuant::Int8 => {
+                quantized_int8 += weights
+                    .names()
+                    .filter(|name| quant::convert::is_decoder_int8_tensor_for(name, arch))
+                    .filter(|name| !(omit_lm_head && *name == "lm_head.weight"))
+                    .count();
+            }
+            quant::convert::ConvertQuant::Int4 => {
+                for name in weights.names() {
+                    match quant::recipe::classify_wasm_experts_int4(name) {
+                        quant::recipe::WasmInt4Policy::ExpertInt4 => quantized_int4 += 1,
+                        quant::recipe::WasmInt4Policy::Int8 => quantized_int8 += 1,
+                        quant::recipe::WasmInt4Policy::KeepHighPrecision => {}
+                    }
+                }
+            }
+        }
+        if let Some(stats) = &calib {
+            let ((i4c, i4t), (i8c, i8t)) = quant::convert::calib_coverage(&weights, stats);
+            let ((c4, t4), (c8, t8)) = calib_coverage.unwrap_or_default();
+            calib_coverage = Some(((c4 + i4c, t4 + i4t), (c8 + i8c, t8 + i8t)));
+        }
+        match int8.as_mut() {
+            Some(conversion) => conversion.add_shard(&weights)?,
+            // int4 is single-shard (checked above), so this shard is the source.
+            None => {
+                int4_blob = Some(quant::convert::safetensors_to_focrq_calibrated(
+                    &weights,
+                    convert_quant,
+                    args.arch.packing_byte(),
+                    digest.sha256,
+                    arch,
+                    calib.as_ref(),
+                )?);
+            }
+        }
+        digests.push(digest);
+    }
+    let source_sha256 = native_engine::shards::source_sha256(&digests);
+    let input_bytes: u64 = digests.iter().map(|digest| digest.size).sum();
+    let quantized = quantized_int8 + quantized_int4;
+    let blob = match (int8, int4_blob) {
+        (Some(conversion), _) => conversion.finish(
+            source_sha256,
+            native_engine::shards::provenance_json(&digests),
+        )?,
+        (None, Some(blob)) => blob,
+        (None, None) => {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "convert produced no artifact for {}",
+                resolved.display()
+            )));
+        }
+    };
     let output_bytes = blob.len();
     std::fs::write(&args.output, &blob).map_err(|e| {
         FocrError::Other(anyhow::anyhow!(
@@ -2417,12 +2551,7 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     })?;
 
     let sha_hex = hex_encode32(&source_sha256);
-    let quant_recipe = (arch.id() == native_engine::model_arch::default_arch().id()).then_some(
-        match convert_quant {
-            quant::convert::ConvertQuant::Int8 => quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID,
-            quant::convert::ConvertQuant::Int4 => quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID,
-        },
-    );
+    let quant_recipe = quant::convert::stamped_quant_recipe(arch, convert_quant);
     if args.json {
         emit(&serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
@@ -2436,6 +2565,14 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             "model_id": arch.id(),
             "quant_recipe": quant_recipe,
             "source_sha256": sha_hex,
+            "source_shards": digests
+                .iter()
+                .map(|digest| serde_json::json!({
+                    "name": digest.name,
+                    "size": digest.size,
+                    "sha256": digest.sha256_hex(),
+                }))
+                .collect::<Vec<_>>(),
             "tensors": tensor_count,
             "tensors_quantized": quantized,
             "tensors_int8": quantized_int8,
@@ -2663,7 +2800,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                     "blocked": pull.blocked.iter().map(|(quant, recipe)| serde_json::json!({
                         "quant": quant,
                         "recipe": recipe,
-                        "required_recipe": dist::required_quant_recipe(a.id(), quant),
+                        "required_recipe": a.required_quant_recipe(quant),
                     })).collect::<Vec<_>>(),
                 });
                 j
@@ -3099,8 +3236,15 @@ fn run_pull(args: &PullArgs) -> FocrResult<()> {
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>(),
             "from_cache": outcome.from_cache,
+            // A manifest entry without a notice falls back to the pulled
+            // model's own built-in notice (the default model's when none was
+            // named), never to the Unlimited-OCR one for every model.
             "model_license_notice": if outcome.license_notice.is_empty() {
-                FOCR_MODEL_LICENSE_NOTICE
+                args.model
+                    .as_deref()
+                    .and_then(crate::model_arch::arch_by_id)
+                    .unwrap_or_else(crate::model_arch::default_arch)
+                    .license_notice()
             } else {
                 &outcome.license_notice
             },
@@ -3894,12 +4038,12 @@ mod tests {
 
         // Markdown form: source lacks a trailing newline, so one is appended.
         let md_path = dir.join("out.md");
-        write_ocr_output(&md_path, &rec, false, &[], None).expect("write md");
+        write_ocr_output(&md_path, &rec, false, &[], None, &[]).expect("write md");
         assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "hello world\n");
 
         // JSON form: valid JSON, newline-terminated, carrying the bounding boxes.
         let json_path = dir.join("out.json");
-        write_ocr_output(&json_path, &rec, true, &[], None).expect("write json");
+        write_ocr_output(&json_path, &rec, true, &[], None, &[]).expect("write json");
         let raw = std::fs::read_to_string(&json_path).unwrap();
         assert!(raw.ends_with('\n'), "json file should end with a newline");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
@@ -4212,6 +4356,272 @@ mod tests {
                         == Some(simd::IsaTier::Scalar.tag())
             }),
             "available tiers must be a non-empty array ending with the scalar floor"
+        );
+    }
+
+    /// A tied-embedding (got-ocr2) checkpoint whose `lm_head.weight` and
+    /// `embed_tokens` live in different shards, with an I64 arange in shard 2.
+    /// `head_matches` false makes the head differ from the embedding.
+    fn sharded_got_tensors(
+        head_matches: bool,
+    ) -> Vec<Vec<native_engine::shards::tests::SyntheticTensor>> {
+        use native_engine::shards::tests::arange_bytes;
+        let bf16 = |values: &[f32]| -> Vec<u8> {
+            values
+                .iter()
+                .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+                .collect()
+        };
+        let embed: Vec<f32> = (0..8).map(|i| i as f32 * 0.25 - 1.0).collect();
+        let mut head = embed.clone();
+        if !head_matches {
+            head[3] += 1.0;
+        }
+        let down: Vec<f32> = (0..32).map(|i| ((i * 7 % 13) as f32 - 6.0) / 8.0).collect();
+        vec![
+            vec![
+                (
+                    "model.embed_tokens.weight",
+                    "BF16",
+                    vec![2, 4],
+                    bf16(&embed),
+                ),
+                (
+                    "model.layers.0.mlp.down_proj.weight",
+                    "BF16",
+                    vec![4, 8],
+                    bf16(&down),
+                ),
+            ],
+            vec![
+                ("lm_head.weight", "BF16", vec![2, 4], bf16(&head)),
+                (
+                    "model.norm.weight",
+                    "BF16",
+                    vec![4],
+                    bf16(&[1.0, 0.5, 2.0, -1.0]),
+                ),
+                ("vision.position_ids", "I64", vec![1, 4], arange_bytes(4)),
+            ],
+        ]
+    }
+
+    /// Write `shards` as an indexed checkpoint in a fresh directory named
+    /// `label`; returns the directory.
+    fn write_sharded_checkpoint(
+        label: &str,
+        shards: &[Vec<native_engine::shards::tests::SyntheticTensor>],
+    ) -> PathBuf {
+        use native_engine::shards::tests::{index_json, safetensors_file};
+        let dir =
+            std::env::temp_dir().join(format!("franken_ocr_cli_{label}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let mut map = Vec::new();
+        let mut total = 0u64;
+        for (position, tensors) in shards.iter().enumerate() {
+            let name: &'static str = Box::leak(
+                format!(
+                    "model-{:05}-of-{:05}.safetensors",
+                    position + 1,
+                    shards.len()
+                )
+                .into_boxed_str(),
+            );
+            std::fs::write(dir.join(name), safetensors_file(tensors)).expect("write shard");
+            for (tensor, _, _, bytes) in tensors {
+                map.push((*tensor, name));
+                total += bytes.len() as u64;
+            }
+        }
+        std::fs::write(
+            dir.join(native_engine::shards::SHARD_INDEX_NAME),
+            index_json(&map, total),
+        )
+        .expect("write index");
+        dir
+    }
+
+    fn convert_args(input: &Path, output: &Path, quant: QuantTarget) -> ConvertArgs {
+        ConvertArgs {
+            input: input.to_path_buf(),
+            output: output.to_path_buf(),
+            quant,
+            arch: ArchTarget::Generic,
+            model_id: "got-ocr2".into(),
+            calib: None,
+            json: false,
+        }
+    }
+
+    /// The `.focrq` header JSON of `blob`.
+    fn focrq_header(blob: &[u8]) -> serde_json::Value {
+        let header_len = u64::from_le_bytes(blob[43..51].try_into().expect("8 bytes")) as usize;
+        serde_json::from_slice(&blob[51..51 + header_len]).expect("header JSON")
+    }
+
+    #[test]
+    fn sharded_source_converts_shard_by_shard_and_reloads() {
+        use native_engine::shards::{self, test_rules, tests::POSITION_IDS_RULE};
+        use native_engine::weights::{DType, Weights};
+        let started = std::time::Instant::now();
+        let test = "sharded_source_converts_shard_by_shard_and_reloads";
+        let dir = write_sharded_checkpoint("sharded_convert", &sharded_got_tensors(true));
+        let out = dir.join("out.focrq");
+
+        // The I64 tensor is refused until the target arch's census admits it.
+        let error = run_convert(&convert_args(&dir, &out, QuantTarget::Int8))
+            .expect_err("got-ocr2 has no verify-and-skip rule");
+        assert!(
+            error.to_string().contains("got-ocr2 accepts I64 only"),
+            "{error}"
+        );
+
+        let _rules = test_rules::supply(&POSITION_IDS_RULE);
+        run_convert(&convert_args(&dir, &out, QuantTarget::Int8)).expect("streaming convert");
+        let blob = std::fs::read(&out).expect("read artifact");
+        let digests =
+            shards::hash_shards(&dir.join(shards::SHARD_INDEX_NAME)).expect("hash the source");
+        for digest in &digests {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1, "ts": started.elapsed().as_secs_f64(), "test": test,
+                    "case": digest.name, "run_seq": 0, "event": "assert", "result": "pass",
+                    "assertion": "shard header checked against the index and hashed",
+                    "pass": true,
+                    "bytes": digest.size, "header_ok": true, "hashed": true,
+                    "sha256": digest.sha256_hex(),
+                })
+            );
+        }
+        let convention: String = shards::source_sha256(&digests)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let header = focrq_header(&blob);
+        assert_eq!(header["source_sha256"], convention.as_str());
+        let listed = header["provenance"]["source_shards"]
+            .as_array()
+            .expect("multi-shard provenance");
+        assert_eq!(listed.len(), 2);
+        for (entry, digest) in listed.iter().zip(&digests) {
+            assert_eq!(entry["name"], digest.name.as_str());
+            assert_eq!(entry["size"], digest.size);
+            assert_eq!(entry["sha256"], digest.sha256_hex().as_str());
+        }
+
+        let reloaded =
+            Weights::from_bytes(blob.clone()).expect("reload passes the provenance gate");
+        assert_eq!(reloaded.model_id(), "got-ocr2");
+        assert_eq!(reloaded.source_sha256(), convention);
+        assert_eq!(
+            reloaded.names().collect::<Vec<_>>(),
+            [
+                "model.embed_tokens.weight",
+                "model.layers.0.mlp.down_proj.weight",
+                "model.norm.weight"
+            ],
+            "tied lm_head omitted; the verified I64 tensor never stored"
+        );
+        assert_eq!(
+            reloaded
+                .record("model.layers.0.mlp.down_proj.weight")
+                .expect("down")
+                .dtype,
+            DType::QInt8PerChan
+        );
+        assert!(native_engine::native_model_available(&out));
+
+        // The same tensors as one plain file convert to the same tensor bytes.
+        let plain_dir = dir.join("plain");
+        std::fs::create_dir_all(&plain_dir).expect("plain dir");
+        let plain = plain_dir.join("model.safetensors");
+        let all: Vec<_> = sharded_got_tensors(true).concat();
+        std::fs::write(&plain, shards::tests::safetensors_file(&all)).expect("write plain");
+        let plain_out = plain_dir.join("plain.focrq");
+        run_convert(&convert_args(&plain, &plain_out, QuantTarget::Int8)).expect("plain convert");
+        let plain_blob = std::fs::read(&plain_out).expect("read plain artifact");
+        assert!(
+            focrq_header(&plain_blob).get("provenance").is_none(),
+            "one shard: no list"
+        );
+        let single = Weights::from_bytes(plain_blob).expect("reload plain");
+        for name in single.names() {
+            let (a, b) = (
+                reloaded.tensor(name).expect("sharded"),
+                single.tensor(name).expect("plain"),
+            );
+            assert_eq!(
+                (a.dtype, a.data, a.scales),
+                (b.dtype, b.data, b.scales),
+                "{name}"
+            );
+        }
+
+        // A provenance whose shard digests disagree with source_sha256 is refused
+        // by the loader and by the header probe (exit 7).
+        let first = digests[0].sha256_hex();
+        let flipped = format!(
+            "{}{}",
+            if first.starts_with('0') { '1' } else { '0' },
+            &first[1..]
+        );
+        let hits: Vec<usize> = blob
+            .windows(64)
+            .enumerate()
+            .filter(|(_, window)| *window == first.as_bytes())
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "the shard digest appears once, in the provenance"
+        );
+        let at = hits[0];
+        let tampered_path = dir.join("tampered.focrq");
+        let mut tampered = blob.clone();
+        tampered[at..at + 64].copy_from_slice(flipped.as_bytes());
+        std::fs::write(&tampered_path, &tampered).expect("write tampered");
+        let error = Weights::load(&tampered_path).expect_err("convention mismatch");
+        assert_eq!(error.exit_code(), 7);
+        assert!(error.to_string().contains("convention digest"), "{error}");
+        assert!(!native_engine::native_model_available(&tampered_path));
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1, "ts": started.elapsed().as_secs_f64(), "test": test,
+                "case": "convert", "run_seq": 0, "event": "result", "result": "pass",
+                "elapsed_us": started.elapsed().as_micros() as u64,
+                "source_sha256": convention, "shards": digests.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn sharded_convert_checks_the_tie_across_shards_and_refuses_int4() {
+        use native_engine::shards::{test_rules, tests::POSITION_IDS_RULE};
+        let _rules = test_rules::supply(&POSITION_IDS_RULE);
+        let dir = write_sharded_checkpoint("sharded_untied", &sharded_got_tensors(false));
+        let out = dir.join("out.focrq");
+        let error = run_convert(&convert_args(&dir, &out, QuantTarget::Int8))
+            .expect_err("a tied arch fed an untied head");
+        assert!(
+            error.to_string().contains("declares TIED embeddings"),
+            "{error}"
+        );
+        assert!(!out.exists(), "nothing is written for a refused source");
+
+        let error = run_convert(&convert_args(&dir, &out, QuantTarget::Int4))
+            .expect_err("int4 is single-shard");
+        assert!(matches!(error, FocrError::NotImplemented(_)), "{error}");
+        assert!(error.to_string().contains("single-shard source"), "{error}");
+
+        let mut args = convert_args(&dir, &out, QuantTarget::Int8);
+        args.model_id = "unlimited-ocr".into();
+        let error = run_convert(&args).expect_err("v1 is pinned to one shard");
+        assert!(
+            error.to_string().contains("pinned 1-shard source"),
+            "{error}"
         );
     }
 }

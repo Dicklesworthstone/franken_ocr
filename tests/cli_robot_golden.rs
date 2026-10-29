@@ -106,7 +106,131 @@ fn fail_test(message: String) -> ! {
 }
 
 fn run_focr_command(mut command: Command, _args: &[&str]) -> Output {
-    command.output().expect("failed to spawn focr binary")
+    let output = command.output().expect("failed to spawn focr binary");
+    validate_robot_events(&String::from_utf8_lossy(&output.stdout));
+    output
+}
+
+/// `event_fields` from the frozen robot schema (U2-X2).
+fn event_fields_contract() -> &'static serde_json::Map<String, serde_json::Value> {
+    static FIELDS: std::sync::OnceLock<serde_json::Map<String, serde_json::Value>> =
+        std::sync::OnceLock::new();
+    FIELDS.get_or_init(|| {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/robot_schema_v1.json");
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("robot_schema_v1.json"))
+                .expect("robot_schema_v1.json parses");
+        schema["event_fields"]
+            .as_object()
+            .cloned()
+            .expect("robot_schema_v1.json carries event_fields")
+    })
+}
+
+/// The stream contract (U2-X2): every robot event any test in this file sees
+/// (a stdout line with `schema_version` and `event`) carries every field
+/// `event_fields` requires for its kind and nothing it does not list.
+fn validate_robot_events(stdout: &str) {
+    for line in stdout.lines() {
+        let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line) else {
+            continue;
+        };
+        let (Some(kind), true) = (
+            event.get("event").and_then(serde_json::Value::as_str),
+            event.contains_key("schema_version"),
+        ) else {
+            continue;
+        };
+        let Some(spec) = event_fields_contract().get(kind) else {
+            fail_test(format!(
+                "event kind {kind:?} is not in event_fields: {line}"
+            ));
+        };
+        if spec.get("reserved") == Some(&serde_json::Value::Bool(true)) {
+            fail_test(format!("reserved event kind {kind:?} was emitted: {line}"));
+        }
+        let names = |key: &str| -> Vec<&str> {
+            spec[key]
+                .as_array()
+                .map(|a| a.iter().filter_map(serde_json::Value::as_str).collect())
+                .unwrap_or_default()
+        };
+        let (required, optional) = (names("required"), names("optional"));
+        for field in &required {
+            if !event.contains_key(*field) {
+                fail_test(format!(
+                    "{kind} event lacks required field {field:?}: {line}"
+                ));
+            }
+        }
+        for field in event.keys() {
+            if !required.contains(&field.as_str()) && !optional.contains(&field.as_str()) {
+                fail_test(format!(
+                    "{kind} event field {field:?} is not in event_fields (extend the table in \
+                     src/robot.rs in the same change): {line}"
+                ));
+            }
+        }
+    }
+}
+
+/// The stream contract validator rejects what it should (a missing required
+/// field, an unlisted field, an unknown kind) and passes a conforming stream.
+#[test]
+fn robot_event_stream_contract_rejects_violations() {
+    let ok = r#"{"schema_version":1,"event":"run_complete","markdown":"x","finish_reason":"stop"}"#;
+    validate_robot_events(&format!("{ok}\nnot json\n{{\"plain\":1}}"));
+    for bad in [
+        r#"{"schema_version":1,"event":"run_complete"}"#,
+        r#"{"schema_version":1,"event":"run_complete","markdown":"x","surprise":1}"#,
+        r#"{"schema_version":1,"event":"no_such_kind"}"#,
+        r#"{"schema_version":1,"event":"stage"}"#,
+    ] {
+        let caught = std::panic::catch_unwind(|| validate_robot_events(bad));
+        assert!(caught.is_err(), "the contract accepted {bad}");
+    }
+    tlog!("robot_event_stream_contract_rejects_violations",
+        "case": "event_fields",
+        "event": "assert",
+        "result": "pass",
+        "rejected": 4,
+    );
+}
+
+/// U2-X2: the test-only position override refuses a budget above the arch's
+/// context with a usage error (exit 2) before any model work.
+#[test]
+fn test_max_positions_above_the_context_is_a_usage_error() {
+    let mut command = Command::new(focr_bin());
+    command
+        .args(["ocr", "--robot", "/nonexistent/page.png"])
+        .env_remove("FOCR_MODEL_PATH")
+        .env_remove(MODEL_DIR_ENV)
+        .env("FOCR_TEST_MAX_POSITIONS", "40000")
+        .env("HOME", hermetic_home());
+    let out = run_focr_command(command, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let error = stdout
+        .lines()
+        .map(|l| parse_json_line(l, "test_max_positions"))
+        .find(|v| v["event"] == "run_error")
+        .unwrap_or_else(|| fail_test(format!("no run_error in {stdout}")));
+    assert_eq!(out.status.code(), Some(2), "{stdout}");
+    assert_eq!(error["error_kind"], "usage");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("FOCR_TEST_MAX_POSITIONS"),
+        "{error}"
+    );
+    tlog!("test_max_positions_above_the_context_is_a_usage_error",
+        "case": "40000",
+        "event": "result",
+        "result": "pass",
+        "exit_code": 2,
+    );
 }
 
 /// A hermetic HOME for every golden invocation: the engine's model resolver

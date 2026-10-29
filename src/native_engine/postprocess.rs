@@ -514,6 +514,18 @@ pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
     Ok(format!("<PAGE>\n{body}"))
 }
 
+/// The page bodies a multi-page decode carries under [`finalize_multi`]'s
+/// split: one per `<PAGE>` marker, plus a non-blank leading chunk when the
+/// model skipped the opening marker (GH #17). `text` is the decoded output
+/// with its EOS stripped. The one count every multi-page report uses (U2-X2
+/// warnings, U2-E3 `pages[]`).
+#[must_use]
+pub fn page_body_count(text: &str) -> usize {
+    let mut chunks = text.split(PAGE_MARKER);
+    let leading = chunks.next().is_some_and(|c| !c.trim().is_empty());
+    usize::from(leading) + chunks.count()
+}
+
 /// Incremental `<PAGE>`-boundary scanner for STREAMING multi-page decodes
 /// (bd-2z0y): fed the full decoded-so-far text, it emits each page body as
 /// soon as the NEXT page's marker arrives (page k is complete when marker
@@ -618,6 +630,27 @@ pub fn parse_layout(decoded: &str, image_w: u32, image_h: u32) -> Vec<(String, V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// U2-X2: the body count follows `finalize_multi`'s split exactly.
+    #[test]
+    fn page_body_count_matches_the_finalize_split() {
+        for (text, bodies) in [
+            ("", 0),
+            ("   ", 0),
+            ("<PAGE>a", 1),
+            ("<PAGE>a<PAGE>b<PAGE>c", 3),
+            ("lead<PAGE>b<PAGE>c", 3),
+            ("  \n<PAGE>a<PAGE>b", 2),
+            ("no marker at all", 1),
+            ("<PAGE>a<PAGE>", 2),
+        ] {
+            assert_eq!(page_body_count(text), bodies, "{text:?}");
+            let assembled = finalize_multi(text, 99).unwrap();
+            if bodies > 0 {
+                assert_eq!(assembled.matches(PAGE_MARKER).count(), bodies, "{text:?}");
+            }
+        }
+    }
 
     #[test]
     fn strip_eos_removes_trailing_marker_and_trims() {

@@ -228,6 +228,41 @@ git add tests/snapshots tests/fixtures && git diff --cached   # reviewer sees th
 This is the same conscience as the negative-evidence ledger: nothing changes the
 "known-good" baseline without a human looking at the measured before/after.
 
+### 4a. The token-id golden gate (U2-T3)
+
+`tests/uocr2_goldens.rs` pins the engine's real outputs at the **token-id** level,
+per model lane: the generated ids, the final markdown, and (for one streamed
+case) the robot `page` events. One drifted token can survive detokenize and
+postprocess unchanged, so markdown goldens alone cannot catch it. The v1 lane
+(`tests/fixtures/uocr2_v1_goldens/`) is the safety net under every
+Unlimited-OCR-2 change to shared code; U2-C4 adds the v2 lane.
+
+```bash
+scripts/token_golden_gate.sh                    # fast subset; scripts/check.sh runs it
+FOCR_E2E_LONG=1 scripts/token_golden_gate.sh    # full set: required before closing any bead
+                                                # that touches the decoder, loader, tokenizer,
+                                                # sampler, PDF walk or CLI output, and at
+                                                # every milestone exit
+UPDATE_GOLDENS=1 FOCR_E2E_LONG=1 scripts/token_golden_gate.sh   # reviewed recapture only
+```
+
+* **Model-gated.** The script builds the optimized `release-perf` profile only
+  when an `unlimited-ocr*.focrq` is on the machine; the test then compares only
+  on the artifact SHA-256 that `CAPTURE.json` pins (a different artifact logs
+  `skip_no_model`). Inputs come from `FOCR_CORPUS_DIR` (default
+  `~/.cache/franken_ocr/corpus/pages`), checked against the captured SHA-256s.
+* **Fast subset:** `page_0009`, `page_0014`, the 2-page `p9_p14` document, and
+  `p9_p14` streamed. **Long:** `page_0590`, `p10`, `p20`.
+* **Robot events compare on a canonical projection:** each event on the golden's
+  own fields, minus the shared volatile list (`parity_harness::is_scrub_key` —
+  `SCRUB_KEYS` plus any `_ms`/`_us`/`_seconds`/`_utc` key). A field added later is
+  ignored (robot changes are additive); a changed, dropped or extra event fails.
+* **A mismatch names the first differing token index and both ids,** and writes
+  `*.actual` beside the golden. Determinism is part of the contract: the gate must
+  pass at any `FOCR_THREADS`.
+* **Regeneration** follows §4 exactly: `UPDATE_GOLDENS=1`, a reviewed `git diff`,
+  and a commit message that says why the tokens moved.
+
 ---
 
 ## 5. `*.actual` and the gitignore contract

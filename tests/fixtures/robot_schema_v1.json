@@ -75,9 +75,101 @@
     {
       "name": "FOCR_RESIDENT_CLIENT_TIMEOUT_SECS",
       "summary": "client-side reply timeout for a resident request (default 600)"
+    },
+    {
+      "name": "FOCR_TEST_MAX_POSITIONS",
+      "summary": "TEST-ONLY: lower the position budget prompt and output share (1..=32768; a larger value exits 2) so tests reach the multi-page clamp on small documents"
     }
   ],
-  "events": ["run_start", "stage", "page", "staff", "music_warning", "run_complete", "run_error"],
+  "event_fields": {
+    "music_warning": {
+      "optional": [],
+      "required": [
+        "schema_version",
+        "event",
+        "kind",
+        "part",
+        "measure",
+        "detail"
+      ]
+    },
+    "page": {
+      "optional": [
+        "chars",
+        "text",
+        "error_kind",
+        "message"
+      ],
+      "required": [
+        "schema_version",
+        "event",
+        "status",
+        "page"
+      ]
+    },
+    "run_complete": {
+      "optional": [
+        "finish_reason",
+        "warnings",
+        "low_yield",
+        "yield_chars",
+        "input_megapixels"
+      ],
+      "required": [
+        "schema_version",
+        "event",
+        "markdown"
+      ]
+    },
+    "run_error": {
+      "optional": [
+        "finish_reason",
+        "pages_out",
+        "warnings"
+      ],
+      "required": [
+        "schema_version",
+        "event",
+        "error_kind",
+        "code",
+        "message",
+        "recovery"
+      ]
+    },
+    "run_start": {
+      "optional": [],
+      "required": [
+        "schema_version",
+        "event",
+        "command"
+      ]
+    },
+    "staff": {
+      "optional": [
+        "reason"
+      ],
+      "required": [
+        "schema_version",
+        "event",
+        "staff",
+        "total",
+        "bbox",
+        "status"
+      ]
+    },
+    "stage": {
+      "reserved": true
+    }
+  },
+  "events": [
+    "run_start",
+    "stage",
+    "page",
+    "staff",
+    "music_warning",
+    "run_complete",
+    "run_error"
+  ],
   "exit_codes": [
     {
       "code": 0,
@@ -127,6 +219,6 @@
   ],
   "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "schema_version": 1,
-  "status": "live — run_start/run_complete (carries `markdown`)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested; `run_error` carries `recovery`",
+  "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`",
   "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr"
 }

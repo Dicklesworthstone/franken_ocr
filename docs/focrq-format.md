@@ -36,7 +36,8 @@ Every `.focrq` file is tied to the Phase -1 truth pack:
   `pymupdf==1.27.2.2`
 
 The fixed prefix stores `source_sha256`, the SHA-256 of the source safetensors
-shard used for conversion. The canonical JSON header stores the pinned commits,
+shard used for conversion; for a source of N ≥ 2 shards it is the multi-shard
+convention defined under [Sharded sources](#sharded-sources). The canonical JSON header stores the pinned commits,
 the relevant frozen `config.json` fields, and the MIT license notice. A file
 without a non-empty Baidu MIT notice is invalid.
 
@@ -61,7 +62,7 @@ The committed v1 fixed prefix is 51 bytes.
 | `0..6` | 6 | `magic` | bytes | Exact bytes `46 4f 43 52 51 00` (`b"FOCRQ\0"`). |
 | `6..10` | 4 | `format_version` | `u32` | Current value `1`. |
 | `10..11` | 1 | `arch_target` | `u8` enum | Offline packing target, see below. |
-| `11..43` | 32 | `source_sha256` | `[u8; 32]` | SHA-256 of source safetensors shard. |
+| `11..43` | 32 | `source_sha256` | `[u8; 32]` | SHA-256 of the source safetensors shard, or the multi-shard convention (see [Sharded sources](#sharded-sources)). |
 | `43..51` | 8 | `header_len` | `u64` | Length of `header_json_utf8`. |
 
 The header begins at byte 51. The payload begins at `51 + header_len` and
@@ -98,8 +99,8 @@ The header object has this top-level shape:
 }
 ```
 
-A non-default architecture additionally declares a `model_id` (placed between
-`model_config` and `packing_manifest`), e.g. for a GOT-OCR2 artifact:
+Every architecture except Unlimited-OCR v1 additionally declares a `model_id`
+(placed between `model_config` and `packing_manifest`), e.g. for a GOT-OCR2 artifact:
 
 ```json
 {
@@ -131,8 +132,8 @@ Forward-compatible optional fields:
 | Field | Type | Rule |
 |-------|------|------|
 | `format_version` | integer | Writer emits the prefix version for traceability. |
-| `model_id` | string | The architecture id (`ModelArch::id`) the loader selects from the model registry. **Absent ⇒ the default `unlimited-ocr`** (so every v1 artifact loads unchanged); a non-empty id not in this binary's registry is **refused** (forward-incompatible artifact). The writer omits it for the default arch so re-converting Unlimited-OCR stays byte-identical to v1. |
-| `provenance` | object | Contains pinned commits and source hashes when attached. |
+| `model_id` | string | The architecture id (`ModelArch::id`) the loader selects from the model registry. **Absent ⇒ `unlimited-ocr` (v1), permanently** (`model_arch::UNLIMITED_OCR_V1_ID`), whatever the default model is, so every shipped v1 artifact loads as v1 even after the default changes; a non-empty id not in this binary's registry is **refused** (forward-incompatible artifact). The writer omits it for Unlimited-OCR v1 only, so re-converting v1 stays byte-identical, and always emits it for every other arch. |
+| `provenance` | object | Contains pinned commits and source hashes when attached. For a multi-shard source the writer emits `source_shards`: one `{"name","size","sha256"}` object per shard in index order, which the loader checks against `source_sha256` (see [Sharded sources](#sharded-sources)). A single-shard source carries no shard list. Other keys are ignored. |
 | `model_config` | object | Forward-compatible config metadata when attached. Format-v1 readers do not treat it as validated or authoritative; see below. |
 | `packing_manifest` | object | Converter/packing metadata and optional bit-allocation table when attached. |
 
@@ -432,8 +433,10 @@ assumptions.
    from the fixed prefix otherwise. Reject `arch_target` outside the closed v1
    enum `0..=3`; the bounded production probe also requires the mirrored header
    and prefix values to agree.
-9. Resolve `model_id` against the model registry: absent ⇒ the default
-   `unlimited-ocr`; a non-empty id the registry lacks ⇒ refuse (forward-incompatible).
+9. Resolve `model_id` against the model registry: absent ⇒ `unlimited-ocr` (v1),
+   never the current default; a non-empty id the registry lacks ⇒ refuse
+   (forward-incompatible). A raw safetensors shard declares no id: it is the model
+   whose exact embedded census it matches, and a shard matching none is refused.
 10. Check `license_notice` against the resolved arch: the Baidu MIT attribution for
     `unlimited-ocr`, else exact equality with that arch's `ModelArch::license_notice`.
 11. For an Unlimited-OCR `.focrq`, validate every present tensor dtype against
@@ -442,16 +445,68 @@ assumptions.
     full-int8 artifacts before any forward.
 12. Treat optional v1 `model_config` as unvalidated provenance; use the compiled
     exact tensor manifest and runtime constants as the active model contract.
+12a. If `provenance.source_shards` is present, it must list at least two
+    shards with plain `*.safetensors` names in strictly ascending order, non-zero
+    sizes and 64-lowercase-hex SHA-256s, and `source_sha256` must equal the
+    multi-shard convention over them; otherwise refuse with `FormatMismatch`
+    (exit 7). The bounded header probe applies the same check.
 13. Validate every tensor record and byte range in the `tensors` map, including
     scale cardinality, bounds, and global non-overlap of every non-empty data and
     scale interval.
 14. Build an immutable map `name -> TensorRange`.
 15. Warn on compatible arch mismatch; error on incompatible packing.
 
+Model open (`OcrModel::load`) runs steps 1–11 as a bounded header probe, then,
+**before reading any tensor payload**, judges the `tokenizer.json` beside the
+artifact when the resolved arch pins one (`ModelArch::tokenizer_sha256`,
+`ModelArch::required_token_ids`; Unlimited-OCR v1 pins
+`a02f8fd5…55a8b4`). A sidecar with another SHA-256, or one mapping a required
+added-token id to other content, is refused, naming both hashes and the
+`focr pull <model>` remediation. An absent sidecar is reported at first use.
+`OcrModel::from_weights` applies the same check to the in-memory
+`SidecarBundle::tokenizer_json` before anything else.
+
 No tensor dequantization is required during header sniffing.
 `native_model_available` performs the bounded structural, recipe, provenance-
 header, and exact schema checks. It does not read or hash the full payload and
 therefore does not claim whole-file identity.
+
+## Sharded sources
+
+A raw checkpoint may be one safetensors file or a sharded Hugging Face
+checkpoint: `model.safetensors.index.json` plus the N shard files it names
+(U2-A3, plan D16).
+
+- **Index order.** The distinct shard file names of the index's `weight_map`,
+  sorted ascending (`model-00001-of-0000N…` first). Each name must be a plain
+  `*.safetensors` file name beside the index.
+- **Resolution.** A model directory resolves to its
+  `model.safetensors.index.json` when present, so the sidecars
+  (`tokenizer.json`) are looked up in that directory; without an index it
+  resolves to the single shard a registered census names
+  (`model-00001-of-000001.safetensors` for Unlimited-OCR v1).
+- **Raw load.** Every shard's bounded header is validated and the headers are
+  merged into one logical tensor directory. The merge refuses a tensor in two
+  shards, a tensor in a shard the index does not map it to, a tensor the index
+  maps to a shard that lacks it, and a `metadata.total_size` other than the
+  summed tensor bytes. The merged directory is identified by census, as a
+  single file is. Raw loads hash nothing. Each shard is owned or mapped per
+  `FOCR_MMAP`, as a single file is.
+- **I64 tensors.** `.focrq` has no integer dtype. An I64 tensor is accepted only
+  when the identified arch's census names it as a verify-and-skip tensor with
+  an exact shape and content (for Unlimited-OCR-2, `position_ids` must equal
+  `arange(257)`, I64 `[1, 257]`). Its content is verified and it is never
+  exposed or stored. Any other I64 tensor is an error.
+- **Convert.** `focr convert <dir>` validates every shard header against the
+  index first, then reads one shard at a time, hashing it in the same pass,
+  checks it against the arch's pinned shard SHA-256 when the arch has a census,
+  converts its tensors, and drops it before the next. The tensor order in the
+  artifact is sorted by name, so it does not depend on the shard order.
+- **Multi-shard `source_sha256`.** For N ≥ 2 shards, `source_sha256` is
+  `SHA-256(sha256(shard_1) ‖ … ‖ sha256(shard_N))` over the raw 32-byte shard
+  digests in index order, and `provenance.source_shards` lists each shard's
+  name, byte size and SHA-256. A single-shard source keeps the shard's own
+  SHA-256 and no shard list, so its artifact bytes are unchanged.
 
 ## Local-file integrity boundary
 

@@ -590,15 +590,15 @@ impl FocrqBuilder {
             s.push(',');
         }
 
-        // model_id (v2 arch tag). Emitted only for a NON-default architecture, so a
-        // re-converted Unlimited-OCR artifact omits it and stays byte-identical to
-        // its v1 form (which never had the key). The reader treats an absent
-        // model_id as the default `unlimited-ocr`.
-        let default_id = model_arch::default_arch().id();
+        // model_id (v2 arch tag). Omitted for Unlimited-OCR v1 only, so a
+        // re-converted v1 artifact stays byte-identical to its original form
+        // (which never had the key); every other model always carries it. The
+        // reader maps an absent model_id to `unlimited-ocr` permanently, so this
+        // never depends on which model is the default.
         if let Some(id) = self
             .model_id
             .as_deref()
-            .filter(|id| !id.is_empty() && *id != default_id)
+            .filter(|id| !id.is_empty() && *id != model_arch::UNLIMITED_OCR_V1_ID)
         {
             s.push_str("\"model_id\":");
             push_json_string(&mut s, id);
@@ -955,6 +955,57 @@ mod tests {
         // And it still loads, resolving to the default arch.
         let w = Weights::from_bytes(unset).unwrap();
         assert_eq!(w.model_id(), "unlimited-ocr");
+    }
+
+    /// SHA-256 of the small v1 artifact [`v1_writer_golden_blob`] builds. It
+    /// pins the v1 header bytes: any writer change that alters a v1 artifact
+    /// (a stamped `model_id`, a reordered key) breaks it.
+    const V1_WRITER_GOLDEN_SHA256: &str =
+        "cbeef828729b12c69217bc91756b9d0f86dd96b266d888470c4db7100f7ab8bd";
+
+    fn v1_writer_golden_blob(model_id: Option<&str>) -> Vec<u8> {
+        let mut b = FocrqBuilder::new()
+            .with_arch_target(1)
+            .with_source_sha256([9u8; 32]);
+        if let Some(id) = model_id {
+            b = b.with_model_id(id);
+        }
+        b.add_tensor("t", WriteDType::Bf16, vec![2], bf16_le(&[3.0, 4.0]))
+            .unwrap();
+        b.build()
+    }
+
+    #[test]
+    fn writer_keys_model_id_on_v1_identity_not_on_the_default() {
+        use sha2::Digest as _;
+
+        // Make another model the default: a v1 artifact must still omit the
+        // key (and so stay byte-identical), and every other model must still
+        // carry it, or a v1 artifact would later load as the new default.
+        let got = model_arch::arch_by_id("got-ocr2").expect("got-ocr2 registered");
+        let _flip = model_arch::test_default::flip(got);
+
+        let v1 = v1_writer_golden_blob(Some(model_arch::UNLIMITED_OCR_V1_ID));
+        assert_eq!(v1, v1_writer_golden_blob(None));
+        assert!(!String::from_utf8_lossy(&v1).contains("model_id"));
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&v1)),
+            V1_WRITER_GOLDEN_SHA256,
+            "the v1 artifact bytes changed"
+        );
+        assert_eq!(
+            Weights::from_bytes(v1).unwrap().model_id(),
+            model_arch::UNLIMITED_OCR_V1_ID
+        );
+
+        let mut b = FocrqBuilder::new()
+            .with_model_id("got-ocr2")
+            .with_license_notice(got.license_notice());
+        b.add_tensor("t", WriteDType::Bf16, vec![2], bf16_le(&[3.0, 4.0]))
+            .unwrap();
+        let tagged = b.build();
+        assert!(String::from_utf8_lossy(&tagged).contains("\"model_id\":\"got-ocr2\""));
+        assert_eq!(Weights::from_bytes(tagged).unwrap().model_id(), "got-ocr2");
     }
 
     #[test]
