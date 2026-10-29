@@ -7159,6 +7159,280 @@ mod tests {
         );
     }
 
+    /// The real Unlimited-OCR-2 checkpoint at `FOCR_UOCR2_SOURCE_DIR`, loaded
+    /// raw (U2-B5's model-gated decoder tests); `None`, after a skip line,
+    /// when unset.
+    fn v2_gated_model(test: &str, started: std::time::Instant) -> Option<OcrModel> {
+        let Some(dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) else {
+            v2_gated_line(
+                test,
+                started,
+                "v2",
+                "skip",
+                "skip_no_model",
+                serde_json::json!({"reason": "FOCR_UOCR2_SOURCE_DIR unset"}),
+            );
+            return None;
+        };
+        let index = OcrModel::resolve_model(&dir).expect("the directory resolves");
+        let opened = load_weights_from_resolved_model(&index).expect("the raw v2 load succeeds");
+        assert_eq!(opened.arch.id(), model_arch::UNLIMITED_OCR_V2_ID);
+        Some(OcrModel::assemble(
+            index,
+            SidecarBundle::default(),
+            opened.arch,
+            opened.weights,
+            opened.tokenizer,
+        ))
+    }
+
+    /// A v2-shaped prompt over `pages`: BOS; per page `<PAGE>` and the page's
+    /// 273-slot visual block; then the instruction. The blocks come from v1's
+    /// preprocessing and connector (the vision tensors are byte-identical; v2's
+    /// own preprocessing is U2-B7) and the instruction is v1's (v2's prompt is
+    /// U2-B6), so this is the decoder's input shape, not v2's exact prompt.
+    fn v2_decoder_prompt(model: &OcrModel, pages: &[PathBuf]) -> (Mat, Vec<u32>) {
+        use crate::tokenizer::special;
+        let table = model.embed_table().expect("embed table");
+        let hidden = table.cols();
+        let (mut ids, mut data) = (Vec::new(), Vec::new());
+        let mut instruction = None;
+        for (i, page) in pages.iter().enumerate() {
+            let pre = preprocess::preprocess_image(page, preprocess_mode()).expect("preprocess");
+            let features = model.vision_tower(&pre).expect("vision tower");
+            let (embeds, page_ids) = model
+                .build_inputs_embeds(&pre, &features)
+                .expect("connector");
+            // v1's prompt: BOS, the visual block, the instruction.
+            let images = page_ids[1..]
+                .iter()
+                .take_while(|&&t| t == special::IMAGE)
+                .count();
+            assert_eq!(images, 273, "a base-1024 page");
+            let block = 1..1 + images;
+            if i == 0 {
+                ids.push(page_ids[0]);
+                data.extend_from_slice(embeds.row(0));
+            }
+            ids.push(special::PAGE);
+            data.extend(table.row_f32(special::PAGE as usize));
+            ids.extend_from_slice(&page_ids[block.clone()]);
+            data.extend_from_slice(&embeds.data[block.start * hidden..block.end * hidden]);
+            instruction.get_or_insert_with(|| {
+                (
+                    page_ids[block.end..].to_vec(),
+                    embeds.data[block.end * hidden..].to_vec(),
+                )
+            });
+        }
+        let (tail_ids, tail_rows) = instruction.expect("at least one page");
+        ids.extend(tail_ids);
+        data.extend(tail_rows);
+        (Mat::from_vec(ids.len(), hidden, data), ids)
+    }
+
+    /// Greedy argmax, lowest id on ties.
+    fn argmax_id(logits: &[f32]) -> u32 {
+        let mut best = 0;
+        for (i, &x) in logits.iter().enumerate() {
+            if x > logits[best] {
+                best = i;
+            }
+        }
+        best as u32
+    }
+
+    fn fixture_page(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/got")
+            .join(name)
+    }
+
+    /// `embeds` with the embedding of `id` appended as a new last row.
+    fn push_embed(embeds: Mat, table: &EmbedTable<'_>, id: u32) -> Mat {
+        let (rows, cols) = (embeds.rows + 1, embeds.cols);
+        let mut data = embeds.data;
+        data.extend(table.row_f32(id as usize));
+        Mat::from_vec(rows, cols, data)
+    }
+
+    /// Model-gated (U2-B5): on the real v2 checkpoint, a single-page base
+    /// prefill plus 32 greedy decode steps produce finite logits on the
+    /// conservative cached path (`prefill_with_cache_srswa` /
+    /// `decode_step_with_cache_srswa`) and on the stateless all-f32 path
+    /// (`forward_srswa`). Their token agreement is logged as information
+    /// only: the cache's int8 FFN differs from f32, and U2-C2's L4 gates it.
+    #[test]
+    fn real_v2_decoder_runs_cached_and_stateless_with_finite_logits() {
+        const STEPS: usize = 32;
+        let test = "real_v2_decoder_runs_cached_and_stateless_with_finite_logits";
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let line = |case: &str, event: &str, result: &str, extra: serde_json::Value| {
+            v2_gated_line(test, started, case, event, result, extra);
+        };
+        let (embeds, ids) = v2_decoder_prompt(&model, &[fixture_page("sample_text.png")]);
+        let table = model.embed_table().expect("embed table");
+        let wc = model.decoder_cache().expect("the v2 weight cache builds");
+        assert_eq!(wc.router().expect("v2 caches its router").len(), 12);
+        let finite = |logits: &Mat| logits.data.iter().all(|x| x.is_finite());
+
+        let coords = srswa::PageCoords::build(&ids).expect("v2 page coordinates");
+        let (hidden, mut state) =
+            decoder::prefill_with_cache_srswa(wc, &embeds, &coords).expect("cached prefill");
+        let mut logits =
+            decoder::lm_head_cached(wc, &OcrModel::last_hidden_row(&hidden).expect("last row"))
+                .expect("lm_head");
+        let mut cached = Vec::new();
+        for step in 0..=STEPS {
+            assert!(finite(&logits), "cached logits at step {step}");
+            let id = argmax_id(&logits.data);
+            cached.push(id);
+            if step == STEPS {
+                break;
+            }
+            let row = Mat::from_vec(1, table.cols(), table.row_f32(id as usize));
+            let h = decoder::decode_step_with_cache_srswa(wc, &mut state, id, &row)
+                .expect("cached decode step");
+            logits = decoder::lm_head_cached(wc, &h).expect("lm_head");
+        }
+        line(
+            "cached",
+            "assert",
+            "pass",
+            serde_json::json!({
+                "assertion": "prefill + 32 decode steps give finite logits",
+                "pass": true, "prompt_rows": ids.len(), "tokens": cached,
+                "elapsed_s": started.elapsed().as_secs_f64(),
+            }),
+        );
+
+        let (mut grown, mut grown_ids) = (embeds, ids.clone());
+        let mut stateless = Vec::new();
+        for step in 0..=STEPS {
+            let coords = srswa::PageCoords::build(&grown_ids).expect("coordinates");
+            let h =
+                decoder::forward_srswa(&model.weights, &grown, &coords).expect("stateless forward");
+            let logits = decoder::lm_head(
+                &model.weights,
+                &OcrModel::last_hidden_row(&h).expect("last row"),
+            )
+            .expect("lm_head");
+            assert!(finite(&logits), "stateless logits at step {step}");
+            let id = argmax_id(&logits.data);
+            stateless.push(id);
+            grown_ids.push(id);
+            grown = push_embed(grown, &table, id);
+        }
+        let agree = cached
+            .iter()
+            .zip(&stateless)
+            .take_while(|(a, b)| a == b)
+            .count();
+        line(
+            "stateless",
+            "assert",
+            "pass",
+            serde_json::json!({
+                "assertion": "32 stateless decode steps give finite logits",
+                "pass": true, "tokens": stateless,
+                "info_agreeing_prefix": agree, "info_of": STEPS + 1,
+                "elapsed_s": started.elapsed().as_secs_f64(),
+            }),
+        );
+    }
+
+    /// Model-gated (U2-B5): on the real v2 checkpoint's conservative cached
+    /// path, incremental decode step t and a fresh prefill over the prompt
+    /// plus the first t generated tokens (plan §5.8) pick the same greedy
+    /// token, on a two-page prompt.
+    ///
+    /// Their logits are not bit-equal on this path for either model. The
+    /// prefill runs multi-row GEMMs and the decode m = 1 GEMVs, whose
+    /// accumulation orders differ, and a last-ulp difference can flip an
+    /// int8 activation rounding in each of the 12 layers' FFNs. v1's
+    /// R-SWA cached path, measured the same way on the same pages
+    /// (2026-10-29), differs by up to 5.0% of the largest logit (2.64 of
+    /// 53.2), and v2 by up to 2.4%. The bound here, 10%, is twice v1's
+    /// gap: a catch for wiring errors, not a precision claim.
+    #[test]
+    fn real_v2_cached_decode_equals_a_reprefill() {
+        const STEPS: usize = 12;
+        let test = "real_v2_cached_decode_equals_a_reprefill";
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let pages = [
+            fixture_page("sample_text.png"),
+            fixture_page("format_corpus/table.png"),
+        ];
+        let (embeds, ids) = v2_decoder_prompt(&model, &pages);
+        let table = model.embed_table().expect("embed table");
+        let wc = model.decoder_cache().expect("the v2 weight cache builds");
+        let last_logits = |embeds: &Mat, ids: &[u32]| {
+            let coords = srswa::PageCoords::build(ids).expect("coordinates");
+            let (h, state) =
+                decoder::prefill_with_cache_srswa(wc, embeds, &coords).expect("cached prefill");
+            let logits =
+                decoder::lm_head_cached(wc, &OcrModel::last_hidden_row(&h).expect("last row"))
+                    .expect("lm_head");
+            (logits, state)
+        };
+        let (mut logits, mut state) = last_logits(&embeds, &ids);
+        let (mut grown, mut grown_ids) = (embeds, ids.clone());
+        let mut gaps = Vec::new();
+        for step in 1..=STEPS {
+            let id = argmax_id(&logits.data);
+            assert_ne!(
+                id,
+                crate::tokenizer::special::IMAGE,
+                "a re-prefill would read it as an image"
+            );
+            let row = Mat::from_vec(1, table.cols(), table.row_f32(id as usize));
+            let h = decoder::decode_step_with_cache_srswa(wc, &mut state, id, &row)
+                .expect("cached decode step");
+            logits = decoder::lm_head_cached(wc, &h).expect("lm_head");
+            grown_ids.push(id);
+            grown = push_embed(grown, &table, id);
+            let (fresh, _) = last_logits(&grown, &grown_ids);
+            let gap = logits
+                .data
+                .iter()
+                .zip(&fresh.data)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            let scale = fresh.data.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            assert_eq!(
+                argmax_id(&logits.data),
+                argmax_id(&fresh.data),
+                "step {step}: incremental and re-prefill pick different tokens"
+            );
+            assert!(
+                gap <= 0.10 * scale,
+                "step {step}: logit gap {gap} exceeds 10% of the largest logit {scale}"
+            );
+            gaps.push((gap, scale));
+        }
+        v2_gated_line(
+            test,
+            started,
+            "two_pages",
+            "assert",
+            "pass",
+            serde_json::json!({
+                "assertion": "incremental decode and a re-prefill pick the same tokens, logits within 10%",
+                "pass": true, "prompt_rows": ids.len(),
+                "max_abs_gap_per_step": gaps.iter().map(|g| g.0).collect::<Vec<_>>(),
+                "max_abs_logit_per_step": gaps.iter().map(|g| g.1).collect::<Vec<_>>(),
+                "tokens": &grown_ids[ids.len()..],
+                "elapsed_s": started.elapsed().as_secs_f64(),
+            }),
+        );
+    }
+
     #[test]
     fn native_model_available_rejects_missing_and_garbage() {
         let missing = Path::new("/definitely/not/a/real/model/path.focrq");

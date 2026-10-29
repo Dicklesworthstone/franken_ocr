@@ -33,7 +33,8 @@
 //! any [`BlockKv`], and the per-layer cache that stores K/V and index keys in
 //! 32-row blocks and frees whole blocks no later query can read (plan §5.12).
 
-use super::decoder::{RopeTable, apply_rope, config as decoder_config, linear_no_bias};
+use super::decoder::{RopeTable, apply_rope, config as decoder_config};
+use super::nn;
 use super::tensor::Mat;
 use super::weights::Weights;
 use crate::error::{FocrError, FocrResult};
@@ -437,9 +438,14 @@ impl RouterParams {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SrSwaLayerWeights {
     /// `q_proj.weight`, `[HEAD_DIM, hidden]` row-major (no bias).
-    pub q_proj: Vec<f32>,
+    q_proj: Vec<f32>,
     /// `k_proj.weight`, `[HEAD_DIM, hidden]` row-major (no bias).
-    pub k_proj: Vec<f32>,
+    k_proj: Vec<f32>,
+    /// `q_proj` and `k_proj` transposed once to `[hidden, HEAD_DIM]`, the
+    /// layout [`project`]'s matmul contracts over (U2-B5: a decode step
+    /// would otherwise transpose both per layer).
+    q_proj_t: Mat,
+    k_proj_t: Mat,
     /// `q_norm.weight` (Gemma style: the scale is `1 + w`).
     pub q_norm: Vec<f32>,
     /// `k_norm.weight`.
@@ -480,6 +486,8 @@ impl SrSwaLayerWeights {
             }
         }
         Ok(Self {
+            q_proj_t: transposed(&q_proj, HEAD_DIM, hidden),
+            k_proj_t: transposed(&k_proj, HEAD_DIM, hidden),
             q_proj,
             k_proj,
             q_norm,
@@ -516,6 +524,19 @@ impl SrSwaLayerWeights {
             .map(|layer| Self::load(weights, layer))
             .collect()
     }
+}
+
+/// `w` (`[rows, cols]` row-major) as a `[cols, rows]` matrix: the transpose
+/// `decoder::linear_no_bias` builds per call, so a matmul against it is
+/// bit-identical to that linear.
+fn transposed(w: &[f32], rows: usize, cols: usize) -> Mat {
+    let mut t = vec![0.0f32; w.len()];
+    for i in 0..cols {
+        for (o, slot) in t[i * rows..(i + 1) * rows].iter_mut().enumerate() {
+            *slot = w[o * cols + i];
+        }
+    }
+    Mat::from_vec(cols, rows, t)
 }
 
 fn router_shape(name: &str, len: usize, want: &str) -> FocrError {
@@ -556,8 +577,8 @@ pub fn project(h: &Mat, w: &SrSwaLayerWeights, rope: &RopeTable) -> FocrResult<(
     for v in &mut hs.data {
         *v = finite_or_zero(*v);
     }
-    let mut iq = linear_no_bias(&hs, &w.q_proj, w.hidden, HEAD_DIM)?;
-    let mut ik = linear_no_bias(&hs, &w.k_proj, w.hidden, HEAD_DIM)?;
+    let mut iq = nn::matmul(&hs, &w.q_proj_t)?;
+    let mut ik = nn::matmul(&hs, &w.k_proj_t)?;
     for r in 0..iq.rows {
         gemma_rms_norm(iq.row_mut(r), &w.q_norm);
         gemma_rms_norm(ik.row_mut(r), &w.k_norm);
@@ -1435,6 +1456,31 @@ pub fn prefill_selections(
     Ok((routes.into_iter().map(BlockSelection::from).collect(), ik))
 }
 
+/// One layer's attention inputs for a run of rows (U2-B5): the
+/// `input_layernorm` output, which the router reads, and the main attention's
+/// RoPE'd queries and keys and its values.
+#[derive(Debug, Clone, Copy)]
+pub struct LayerRows<'a> {
+    /// `[rows, hidden]`.
+    pub normed: &'a Mat,
+    /// `[rows, NUM_HEADS × HEAD_DIM]`, RoPE'd.
+    pub q: &'a Mat,
+    /// `[rows, NUM_HEADS × HEAD_DIM]`, RoPE'd.
+    pub k: &'a Mat,
+    /// `[rows, NUM_HEADS × HEAD_DIM]`.
+    pub v: &'a Mat,
+}
+
+/// One decoded row's coordinates (U2-B5): its page2d RoPE table, which the
+/// main attention and the router share, and its Page Gate query page.
+#[derive(Debug, Clone)]
+pub struct DecodeStep {
+    /// The row's page2d cos/sin table.
+    pub rope: RopeTable,
+    /// Its query page, −1 when there is none.
+    pub query_page: i32,
+}
+
 /// One v2 sequence's attention state between decode steps (U2-B5): each
 /// layer's cache, the page coordinates of the next fed token, and the
 /// routing settings, all fixed at prefill.
@@ -1477,37 +1523,71 @@ impl SrSwaState {
         })
     }
 
-    /// One decode step's attention in `layer`: index the new row, append its
-    /// K, V and index key (a generated row, so no image page), route it from
-    /// the cache, and attend. `normed` is the row's `input_layernorm` output,
-    /// `q`/`k` its RoPE'd projections and `v` its values, each one row; `rope`
-    /// is the row's page2d table and `query_page` its Page Gate page.
+    /// One layer's prompt prefill into its empty cache: route every row
+    /// ([`prefill_selections`]), store the rows' K, V and index keys with
+    /// their image pages, and attend through the cache. `rope` is `coords`'
+    /// page2d table, already applied to `rows.q`/`rows.k`.
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] if the layer's cache is not empty (an extend over
+    /// cached rows is a reused window, U2-D2a), or as [`prefill_selections`]
+    /// and [`attend`].
+    pub fn prefill_layer(
+        &mut self,
+        layer: usize,
+        w: &SrSwaLayerWeights,
+        rows: LayerRows<'_>,
+        rope: &RopeTable,
+        coords: &PageCoords,
+    ) -> FocrResult<Mat> {
+        if self.layers[layer].rows() != 0 {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "srswa prefill: layer {layer} already caches {} rows",
+                self.layers[layer].rows()
+            )));
+        }
+        let (sel, ik) =
+            prefill_selections(rows.normed, w, rope, coords, &self.params, self.domain)?;
+        let cache = &mut self.layers[layer];
+        cache.append(rows.k, rows.v, &ik, &coords.img_page)?;
+        let positions: Vec<usize> = (0..rows.q.rows).collect();
+        attend_with(rows.q, &positions, &sel, &*cache, self.dense)
+    }
+
+    /// Advance the page state over the fed token `id` and return its row's
+    /// coordinates.
+    pub fn feed(&mut self, id: u32) -> DecodeStep {
+        let coord = self.page.feed(id);
+        DecodeStep {
+            rope: page2d_rope_table(&[coord.tok_pos], &[coord.rope_page]),
+            query_page: coord.query_page,
+        }
+    }
+
+    /// One decode step's attention in `layer` for the single row `rows` at
+    /// `step` ([`Self::feed`]): index the row, append its K, V and index key
+    /// (a generated row, so no image page), route it from the cache, and
+    /// attend.
     ///
     /// # Errors
     /// [`FocrError::Other`] on a shape mismatch or when the retirement
     /// detector fires (impossible while retirement is off).
-    // decode attention: the row's tensors plus its coordinates
-    #[allow(clippy::too_many_arguments)]
     pub fn decode_layer(
         &mut self,
         layer: usize,
         w: &SrSwaLayerWeights,
-        normed: &Mat,
-        q: &Mat,
-        k: &Mat,
-        v: &Mat,
-        rope: &RopeTable,
-        query_page: i32,
+        rows: LayerRows<'_>,
+        step: &DecodeStep,
     ) -> FocrResult<Mat> {
-        let (iq, ik) = project(normed, w, rope)?;
+        let (iq, ik) = project(rows.normed, w, &step.rope)?;
         let cache = &mut self.layers[layer];
-        cache.append(k, v, &ik, &[-1])?;
+        cache.append(rows.k, rows.v, &ik, &[-1])?;
         let route = cache
-            .decode_route(iq.row(0), query_page, &self.params, self.domain, false)
+            .decode_route(iq.row(0), step.query_page, &self.params, self.domain, false)
             .map_err(|e| FocrError::Other(anyhow::anyhow!("layer {layer}: {e}")))?;
         let q_pos = cache.rows() - 1;
         attend_with(
-            q,
+            rows.q,
             &[q_pos],
             &[BlockSelection::from(route.route)],
             &*cache,
@@ -2556,6 +2636,13 @@ mod tests {
             }
         }
         assert!(project(&Mat::zeros(rows, hidden + 1), &w, &rope).is_err());
+        // The cached transposes are the per-call linear's, bit for bit.
+        let hm = random_mat(&mut rng, 37, hidden, 1.0);
+        for (proj, t) in [(&w.q_proj, &w.q_proj_t), (&w.k_proj, &w.k_proj_t)] {
+            let linear =
+                super::super::decoder::linear_no_bias(&hm, proj, hidden, HEAD_DIM).unwrap();
+            assert_eq!(nn::matmul(&hm, t).unwrap(), linear);
+        }
     }
 
     #[test]
@@ -4011,7 +4098,8 @@ mod tests {
     }
 
     /// One layer over a base prompt of one or two pages and generated text
-    /// with one `<PAGE>` marker per prompt page: the prompt prefill plus one
+    /// with one `<PAGE>` marker per prompt page, each page body longer than
+    /// the local window: the prompt prefill plus one
     /// [`SrSwaState::decode_layer`] per row equals a prefill of every row,
     /// bit for bit, on the gathered and the dense attention. The one-page
     /// prompt (283 rows, M = 9) has a smaller router window than the longer
@@ -4038,10 +4126,12 @@ mod tests {
         )
         .unwrap();
         let prompt_ids = prompt(pages, 8);
+        // Page bodies longer than the 128-row local window, so the early
+        // generated blocks are routed like any remote block.
         let mut generated = vec![TEXT; 30];
         for _ in pages {
             generated.push(PG);
-            generated.extend(std::iter::repeat_n(TEXT, 25));
+            generated.extend(std::iter::repeat_n(TEXT, 150));
         }
         let all: Vec<u32> = prompt_ids.iter().chain(&generated).copied().collect();
         let (n, s) = (prompt_ids.len(), all.len());
@@ -4077,74 +4167,69 @@ mod tests {
         let pc = PageCoords::build(&prompt_ids).unwrap();
         let mut state = SrSwaState::new(std::slice::from_ref(&w), &pc, 0).unwrap();
         assert!(!state.dense, "FOCR_SRSWA_DENSE is unset in tests");
-        let (psel, pik) = prefill_selections(
-            &row_range(&normed, 0..n),
-            &w,
-            &pc.rope_table(0),
-            &pc,
-            &state.params,
-            state.domain,
-        )
-        .unwrap();
-        state.layers[0]
-            .append(
-                &row_range(&k, 0..n),
-                &row_range(&v, 0..n),
-                &pik,
-                &pc.img_page,
-            )
-            .unwrap();
-        let got = attend(
-            &row_range(&q, 0..n),
-            &positions[..n],
-            &psel,
-            &state.layers[0],
-        )
-        .unwrap();
-        assert_eq!(
-            bits(&got.data),
-            bits(&want.data[..n * width]),
-            "prompt rows"
-        );
         let mut dense = state.clone();
         dense.dense = true;
+        let span = |m: &Mat, r: Range<usize>| row_range(m, r);
+        let (pn, pq, pk, pv) = (
+            span(&normed, 0..n),
+            span(&q, 0..n),
+            span(&k, 0..n),
+            span(&v, 0..n),
+        );
+        let prompt_rows = LayerRows {
+            normed: &pn,
+            q: &pq,
+            k: &pk,
+            v: &pv,
+        };
+        let prompt_rope = pc.rope_table(0);
+        for st in [&mut state, &mut dense] {
+            let got = st
+                .prefill_layer(0, &w, prompt_rows, &prompt_rope, &pc)
+                .unwrap();
+            assert_eq!(
+                bits(&got.data),
+                bits(&want.data[..n * width]),
+                "prompt rows"
+            );
+            // A second prefill into the now-full cache is refused.
+            assert!(
+                st.prefill_layer(0, &w, prompt_rows, &prompt_rope, &pc)
+                    .is_err()
+            );
+        }
         for (i, &id) in generated.iter().enumerate() {
             let r = n + i;
-            let coord = state.page.feed(id);
-            assert_eq!(
-                (coord.bucket, coord.tok_pos, coord.query_page),
-                (coords.bucket[r], coords.tok_pos[r], coords.query_page[r]),
-                "row {r} coordinates"
+            let (rn, rq, rk, rv) = (
+                span(&normed, r..r + 1),
+                span(&q, r..r + 1),
+                span(&k, r..r + 1),
+                span(&v, r..r + 1),
             );
-            let rope = page2d_rope_table(&[coord.tok_pos], &[coord.rope_page]);
-            let one = |m: &Mat| row_range(m, r..r + 1);
-            let out = state
-                .decode_layer(
-                    0,
-                    &w,
-                    &one(&normed),
-                    &one(&q),
-                    &one(&k),
-                    &one(&v),
-                    &rope,
-                    coord.query_page,
-                )
-                .unwrap();
-            assert_eq!(bits(&out.data), bits(want.row(r)), "row {r} (token {id})");
-            dense.page.feed(id);
-            let out = dense
-                .decode_layer(
-                    0,
-                    &w,
-                    &one(&normed),
-                    &one(&q),
-                    &one(&k),
-                    &one(&v),
-                    &rope,
-                    coord.query_page,
-                )
-                .unwrap();
-            assert_eq!(bits(&out.data), bits(want.row(r)), "dense row {r}");
+            let rows = LayerRows {
+                normed: &rn,
+                q: &rq,
+                k: &rk,
+                v: &rv,
+            };
+            for st in [&mut state, &mut dense] {
+                let step = st.feed(id);
+                assert_eq!(step.query_page, coords.query_page[r], "row {r} query page");
+                let at = r * HEAD_DIM..(r + 1) * HEAD_DIM;
+                assert_eq!(
+                    bits(&step.rope.cos),
+                    bits(&rope.cos[at.clone()]),
+                    "row {r} cos"
+                );
+                assert_eq!(bits(&step.rope.sin), bits(&rope.sin[at]), "row {r} sin");
+                let out = st.decode_layer(0, &w, rows, &step).unwrap();
+                assert_eq!(
+                    bits(&out.data),
+                    bits(want.row(r)),
+                    "row {r} (token {id}), dense {}",
+                    st.dense
+                );
+            }
         }
         assert_eq!(state.layers[0].rows(), s);
     }

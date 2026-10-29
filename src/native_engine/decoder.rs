@@ -1549,19 +1549,9 @@ pub fn prefill_with_cache_srswa(
     let router = wc.router()?;
     let mut state = srswa::SrSwaState::new(router, coords, 0)?;
     let rope = coords.rope_table(0);
-    let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
     let x = prefill_layers(wc, inputs_embeds, &rope, |layer, normed, q, k, v| {
-        let (sel, ik) = srswa::prefill_selections(
-            normed,
-            &router[layer],
-            &rope,
-            coords,
-            &state.params,
-            state.domain,
-        )?;
-        let cache = &mut state.layers[layer];
-        cache.append(k, v, &ik, &coords.img_page)?;
-        srswa::attend_with(q, &positions, &sel, &*cache, state.dense)
+        let rows = srswa::LayerRows { normed, q, k, v };
+        state.prefill_layer(layer, &router[layer], rows, &rope, coords)
     })?;
     Ok((x, state))
 }
@@ -1684,19 +1674,10 @@ pub fn decode_step_with_cache_srswa(
             config::NUM_HIDDEN_LAYERS
         )));
     }
-    let coord = state.page.feed(token_id);
-    let rope = srswa::page2d_rope_table(&[coord.tok_pos], &[coord.rope_page]);
-    decode_layers(wc, token_embed, &rope, |layer, normed, q, k, v| {
-        state.decode_layer(
-            layer,
-            &router[layer],
-            normed,
-            q,
-            k,
-            v,
-            &rope,
-            coord.query_page,
-        )
+    let step = state.feed(token_id);
+    decode_layers(wc, token_embed, &step.rope, |layer, normed, q, k, v| {
+        let rows = srswa::LayerRows { normed, q, k, v };
+        state.decode_layer(layer, &router[layer], rows, &step)
     })
 }
 
@@ -5524,6 +5505,89 @@ mod tests {
         assert!((out.data[0] - 111.0).abs() < 1e-4, "{}", out.data[0]);
         assert!((out.data[1] - 121.0).abs() < 1e-4, "{}", out.data[1]);
         Ok(())
+    }
+
+    #[test]
+    fn layer_forward_hands_the_attention_the_input_layernorm_output() -> FocrResult<()> {
+        // The SR-SWA router reads the same normed rows q/k/v are projected
+        // from (U2-B5): rms_norm([3, 4]) with weights [2, 0.5].
+        let x = Mat::from_vec(1, 2, vec![3.0, 4.0]);
+        let ident = vec![1.0, 0.0, 0.0, 1.0];
+        let lw = LayerWeights {
+            input_ln: &[2.0, 0.5],
+            post_attn_ln: &[1.0, 1.0],
+            q_proj: &ident,
+            k_proj: &ident,
+            v_proj: &ident,
+            o_proj: &ident,
+            gate_w: &[],
+            up_w: &[],
+            down_w: &[],
+        };
+        let rope = RopeTable::build(&[0], 2, 10000.0);
+        let mut seen = None;
+        layer_forward(
+            &x,
+            &lw,
+            &rope,
+            2,
+            2,
+            1e-6,
+            |normed, _q, _k, v| {
+                seen = Some(normed.data.clone());
+                Ok(v.clone())
+            },
+            |n| Ok(Mat::zeros(n.rows, n.cols)),
+        )?;
+        let rms = ((9.0f32 + 16.0) / 2.0 + 1e-6).sqrt();
+        let seen = seen.expect("the attention ran");
+        assert!((seen[0] - 2.0 * 3.0 / rms).abs() < 1e-5, "{seen:?}");
+        assert!((seen[1] - 0.5 * 4.0 / rms).abs() < 1e-5, "{seen:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn srswa_entry_points_check_their_inputs_before_any_weight() {
+        use crate::tokenizer::special as tokenizer_special;
+        // An empty cache with no router stands in for a v1 cache: every guard
+        // fires before a layer would be read.
+        let v1 = DecoderWeightCache {
+            layers: Vec::new(),
+            final_norm: Vec::new(),
+            lm_head: Vec::new(),
+            router: None,
+        };
+        let ids = [
+            vec![tokenizer_special::BOS, tokenizer_special::PAGE],
+            vec![tokenizer_special::IMAGE; 3],
+            vec![1000, 1001],
+        ]
+        .concat();
+        let coords = srswa::PageCoords::build(&ids).expect("coordinates");
+        let embeds = Mat::zeros(ids.len(), config::HIDDEN_SIZE);
+        let short = Mat::zeros(ids.len() - 1, config::HIDDEN_SIZE);
+        let refused = |input: &Mat, want: &str| {
+            let error = prefill_with_cache_srswa(&v1, input, &coords)
+                .expect_err("refused")
+                .to_string();
+            assert!(error.contains(want), "{error}");
+        };
+        refused(&short, "7 page coordinates for 6 rows");
+        refused(&embeds, "no SR-SWA router");
+        refused(&Mat::zeros(ids.len(), 8), "!= hidden");
+        let w = Weights::default();
+        let stateless = forward_srswa(&w, &short, &coords).expect_err("refused");
+        assert!(
+            stateless.to_string().contains("page coordinates"),
+            "{stateless}"
+        );
+        // Stateless reads its weights per layer: a missing tensor is a clean
+        // FormatMismatch.
+        assert!(matches!(
+            forward_srswa(&w, &embeds, &coords),
+            Err(FocrError::FormatMismatch(_))
+        ));
+        assert!(v1.router().is_err());
     }
 
     // ── Top-level entrypoints are wired to the Weights accessors ────────────

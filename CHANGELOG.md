@@ -123,6 +123,18 @@ sections as they land.
     daemon refuses it.
   - `focr convert --quant int4` refuses v2, and every other model without an
     int4 recipe, as soon as `--model-id` resolves.
+- **Unlimited-OCR-2 decoder wired, not yet reachable** (bead U2-B5).
+  - The shared Unlimited decoder runs SR-SWA attention with page2d RoPE on
+    v2's two supported paths: the conservative cached path
+    (`prefill_with_cache_srswa` / `decode_step_with_cache_srswa`, the path the
+    certified artifact runs) and the stateless all-f32 path (`forward_srswa`).
+    The conservative weight cache holds v2's router weights in f32. v1's
+    paths are unchanged, and its token-id goldens still match exactly.
+  - `FOCR_SRSWA_DENSE=1` swaps in the dense oracle attention, which is
+    bit-identical and much slower.
+  - The cached path refuses `FOCR_PREFILL_CHUNK` for v2 (U2-F2 lifts it).
+  - The CLI still refuses v2 before load: the v2 prompt and decode loop
+    (U2-B6) come next.
   - `parity_ladder` skips its model-gated rungs, and logs why, when
     `FOCR_MODEL_PATH` is a model other than v1 (`native_engine::model_id_at`).
 
