@@ -98,6 +98,33 @@ sections as they land.
     until its recipe contract lands (U2-C3).
   - Short names resolve each model's artifacts by that model's own release
     version (`unlimited-ocr-2.v0.1.0.int8.focrq`); v1's names are unchanged.
+- **Unlimited-OCR-2 fails closed before load** (bead U2-A7).
+  - Once the header identifies a v2 artifact, the run is judged before its
+    tokenizer sidecar or any weight byte is read. A refusal exits 2 and names
+    every lever at fault. Before, v2 failed later, after load, with exit 1.
+  - Refused for v2: `--experimental-full-int8` and `FOCR_DECODE_INT8`,
+    `FOCR_PREFILL_CHUNK`, `FOCR_BATCH_SPINE`, and `FOCR_LMHEAD_SHARD`. Also
+    refused until U2-C2 re-runs parity with them on: `FOCR_FUSE_SWIGLU`,
+    `FOCR_MOE_SCORE_ORDER`, `FOCR_SOFTMAX_COPY`, and `FOCR_INT8_AUTOVEC=0`.
+  - Levers that cannot reach a v2 path are ignored with a stderr warning of the
+    new kind `ignored_lever`. These include R-SWA and all-int8 decoder tuning,
+    the speculative-decode levers, the batch-spine sub-levers, and
+    `FOCR_RESAMPLE`. `focr robot schema` now lists `warning_kinds`.
+  - Every `FOCR_*` variable read in `src/` has exactly one row in
+    `UOCR2_LEVER_POLICY` (`src/native_engine/lever_policy.rs`). A census test
+    fails when a new variable has no row.
+  - With no lever at fault, v2 still refuses with exit 2 ("registered but not
+    yet implemented in this build") until its forward lands.
+  - Forward and multi-page dispatch match exhaustively on the model generation,
+    so v2 can never reach v1's R-SWA forward or multi-page loop.
+  - `ocr-batch` admits a v2 model once, so its refusal is the run's exit code,
+    not a per-image failure.
+  - The resident daemon never serves v2: the client runs it inline and the
+    daemon refuses it.
+  - `focr convert --quant int4` refuses v2, and every other model without an
+    int4 recipe, as soon as `--model-id` resolves.
+  - `parity_ladder` skips its model-gated rungs, and logs why, when
+    `FOCR_MODEL_PATH` is a model other than v1 (`native_engine::model_id_at`).
 
 ### Fixed
 

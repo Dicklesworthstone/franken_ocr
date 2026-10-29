@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **62** | **190** |
-| `present` | 115 † | 48 | 163 |
+| Total enumerated rows | **128** | **63** | **191** |
+| `present` | 115 † | 49 | 164 |
 | `partial` | 7 † | 11 | 18 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -293,6 +293,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Deterministic under fixed sampling (byte-identical) | §7.3 | MUST | present | SURF | bd-3kge | shared determinism gate + metamorphic FOCR_THREADS axis |
 | Per-kind `event_fields` (required/optional) + stream contract test | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.51 | `robot schema` carries `event_fields`; every event `cli_robot_golden` sees is validated against it |
 | `finish_reason` on `run_complete` + `warnings[]` (`v1_truncated`, `v1_page_merge`) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.51 | additive (schema v1); `warnings` only when non-empty, also in `--json` and `ocr-batch --multi-page`; v1 exit code unchanged |
+| `ignored_lever` warning kind + `warning_kinds` in `robot schema` | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.8 | additive (schema v1); Unlimited-OCR-2's pre-load lever admission prints it on stderr today; it joins `warnings[]` once v2 runs (U2-B6) |
 
 ## 14. Parity gates & gauntlet machinery (plan §8.2, §8.5)
 

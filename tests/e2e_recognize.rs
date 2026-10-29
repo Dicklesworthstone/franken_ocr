@@ -1934,7 +1934,14 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
     let image = image.display().to_string();
 
     // (case, extra args, env, the lever refused, the levers warned about)
-    let cases: [(&str, &[&str], &[(&str, &str)], Option<&str>, &[&str]); 8] = [
+    type Case<'a> = (
+        &'a str,
+        &'a [&'a str],
+        &'a [(&'a str, &'a str)],
+        Option<&'a str>,
+        &'a [&'a str],
+    );
+    let cases: [Case; 8] = [
         ("bare", &["ocr"], &[], None, &[]),
         (
             "prefill_chunk",

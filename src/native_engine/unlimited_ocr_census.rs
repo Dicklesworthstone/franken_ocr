@@ -859,8 +859,6 @@ pub(super) fn validate_loaded_weights(weights: &Weights) -> FocrResult<()> {
     validate_records(census, records, surface)
 }
 
-/// `(name, source dtype, shape)` of every tensor in the pinned v1 source
-/// checkpoint, for tests that need a census-exact header without the weights.
 /// The census's full-tensor SHA-256 of each v2 vision tensor.
 #[cfg(test)]
 pub(super) fn v2_vision_identity_sha256() -> &'static BTreeMap<String, String> {
@@ -869,8 +867,18 @@ pub(super) fn v2_vision_identity_sha256() -> &'static BTreeMap<String, String> {
         .vision_identity_sha256
 }
 
+/// A source tensor as `(name, source dtype, shape)`.
 #[cfg(test)]
-pub(super) fn v1_source_tensors() -> Vec<(String, DType, Vec<usize>)> {
+pub(super) type SourceTensor = (String, DType, Vec<usize>);
+
+/// An I64 source tensor as `(name, shape)`; its content is `arange`.
+#[cfg(test)]
+pub(super) type Int64SourceTensor = (&'static str, &'static [usize]);
+
+/// Every tensor in the pinned v1 source checkpoint, for tests that need a
+/// census-exact header without the weights.
+#[cfg(test)]
+pub(super) fn v1_source_tensors() -> Vec<SourceTensor> {
     manifest()
         .expect("embedded production manifest parses")
         .tensors
@@ -879,13 +887,9 @@ pub(super) fn v1_source_tensors() -> Vec<(String, DType, Vec<usize>)> {
         .collect()
 }
 
-/// [`v1_source_tensors`] for the v2 census, plus its I64 tensors (`arange`
-/// content) as `(name, shape)`.
+/// [`v1_source_tensors`] for the v2 census, plus its I64 tensors.
 #[cfg(test)]
-pub(super) fn v2_source_tensors() -> (
-    Vec<(String, DType, Vec<usize>)>,
-    Vec<(&'static str, &'static [usize])>,
-) {
+pub(super) fn v2_source_tensors() -> (Vec<SourceTensor>, Vec<Int64SourceTensor>) {
     let tensors = v2_census()
         .expect("embedded v2 delta verifies")
         .tensors

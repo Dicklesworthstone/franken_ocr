@@ -4620,14 +4620,26 @@ mod tests {
         );
         assert!(!out.exists(), "nothing is written for a refused source");
 
+        // The arch is judged first: GOT-OCR2 has no int4 recipe at any
+        // shard count (U2-A7). v1, the one model with one, is pinned to a
+        // single shard by its census, below.
         let error = run_convert(&convert_args(&dir, &out, QuantTarget::Int4))
-            .expect_err("int4 is single-shard");
+            .expect_err("got-ocr2 has no int4 recipe");
         assert!(matches!(error, FocrError::NotImplemented(_)), "{error}");
-        assert!(error.to_string().contains("single-shard source"), "{error}");
+        assert!(
+            error.to_string().contains("has no certified int4 recipe"),
+            "{error}"
+        );
 
         let mut args = convert_args(&dir, &out, QuantTarget::Int8);
         args.model_id = "unlimited-ocr".into();
         let error = run_convert(&args).expect_err("v1 is pinned to one shard");
+        assert!(
+            error.to_string().contains("pinned 1-shard source"),
+            "{error}"
+        );
+        args.quant = QuantTarget::Int4;
+        let error = run_convert(&args).expect_err("v1 int4 is pinned to one shard too");
         assert!(
             error.to_string().contains("pinned 1-shard source"),
             "{error}"
