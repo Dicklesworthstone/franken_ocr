@@ -493,8 +493,8 @@ name two artifacts.
 
 **D25. Model resolution is deterministic and visible.**
 - Precedence: `--model` > `FOCR_MODEL_PATH` > the mode default (§10) > v1.
-- If the mode default is not installed, v1 serves the run and prints a one-line pull hint (on stderr,
-  plus a robot note).
+- If the mode default is not installed, v1 serves the run and prints a one-line pull hint. The hint
+  goes to stderr, plus a `run_complete.warnings[]` entry of kind `pull_hint` (§9.2).
 - JSON output and `run_complete` carry `model_id` and `artifact_sha256`, and the run store records
   both.
 
@@ -1425,13 +1425,20 @@ and (K'+1)-th candidates and the entmax support size. A mismatch below the measu
 **Single page.** The 20-page corpus, v2 base mode, comparing the v2 int8 artifact against the v2 f32
 HF reference.
 - **Gate shape per `docs/conformance/RATCHET.md` §4.2.** Graded metrics enter as thresholded
-  pass/fail, never as raw means.
-  - Each page passes iff its normalized CER is within the per-page budget (v1's documented 0.25 unless
-    a tighter one is justified).
-  - The gate is the per-category Jeffreys/Hoeffding lower bound at alpha 0.05, with n ≥
-    `MIN_CALIBRATION_N`, ratcheted, with a transparency card.
-- Aggregate CER is **reported against v1's measured 0.193 as information only**, so a worse port
-  cannot hide behind a loose mean.
+  pass/fail, never as raw means. Two facts shape the gate:
+  - 0.25 is v1's **corpus-mean** budget. v1 passes at 0.193, yet page_0590 alone scores 0.6165
+    (`docs/DISCREPANCIES.md:158-161`), so a per-page 0.25 would fail v1 itself.
+  - With n = 20, every category below `MIN_CALIBRATION_N` falls back to a point estimate
+    (`src/conformance.rs:834-843`), and a new category is admissible by definition (RATCHET.md §2).
+    A v2 lane alone can never fail.
+- **The gate (U2-C4; all required):**
+  1. a per-page CER budget pre-registered before the run (proposed: 0.45 vs the v2 f32 reference);
+  2. v1 int8 vs v1 BF16 run through the same harness, in the same invocation, as the baseline;
+  3. `ratchet_decide(v1 bounds, v2 bounds)` admits category `all`;
+  4. every per-category fallback card is ≥ v1's point estimate;
+  5. aggregate normalized CER ≤ 0.25 is a hard gate, reported next to v1's 0.193;
+  6. EOS on every hard page (below).
+- C4 also captures v2 goldens, which become a v2 lane in U2-T3's gate for every later v2 change.
 - Hard pages must emit EOS. Under the guard, EOS is reachable only after `<PAGE>`.
 
 **Multi-page.** S2 and S3 against the v2 reference: per-document CER, page-count equality, and the
@@ -1633,7 +1640,7 @@ documents and long documents", and pull state. The ID column is widened (`cli.rs
 ```
 {event:"page", status:"decoded"|"skipped", page:<run index, unchanged semantics>, text, chars,
  source_page:<1-based PDF page / file index>, half:"left"|"right"|null,
- window:<k>|null, tokens, finish:"marker"|"eos"|"page_cap"|null, elapsed_ms, model_id}
+ window:<k>|null, tokens, finish:"marker"|"eos"|"page_cap"|"length"|null, elapsed_ms, model_id}
 ```
 - It is emitted as each page body completes, using token-id segmentation (D20).
 - `source_page` is added to both statuses.
@@ -1645,9 +1652,17 @@ documents and long documents", and pull state. The ID column is widened (`cli.rs
 ```
 
 **`run_complete` additions:** `model_id`, `artifact_sha256`, `pages_out`, `pages_skipped`, `windows`,
-`extra_markers`, `finish_reason` (`stop|length|cancelled|budget`) and `resumed_from`.
+`extra_markers`, `finish_reason` (`stop|length|cancelled|budget`), `warnings[]` and `resumed_from`.
+- `warnings[]` is `[{kind, message, remediation, …}]`, present only when non-empty. That follows the
+  `low_yield` precedent (`robot.rs:155-174`).
+- Every "note" in this plan is a `warnings[]` entry: `v1_truncated`, `v1_page_merge`, `v2_length`,
+  `leading_text`, `pull_hint`. No new event kind is added for them.
+- U2-X2 ships `finish_reason` and `warnings[]` for v1 in M0.
 
 **Contract upkeep.**
+- **Field-level contract (U2-D5).** `robot_schema()` gains an additive `event_fields` key,
+  `{kind: {required, optional}}`. Contract tests validate every emitted line against it. Today the
+  schema lists only event kinds, so no field can be validated.
 - `robot schema` and the frozen fixture `tests/fixtures/robot_schema_v1.json` are regenerated with
   `UPDATE_GOLDENS=1` as a reviewed golden change. The schema stays v1 (additive).
 - `tests/surface_matrix.rs` and `docs/FEATURE_PARITY.md` §13 get a `window` row and a rollup bump. New
@@ -1800,9 +1815,13 @@ Each milestone ends with something a user can run, and each has an exit gate.
   - A6: oracle;
   - A7: fail-closed dispatch;
   - **X1:** CJK streaming fix (v1);
+  - **X2:** v1 multi-page honest reporting: truncation and page-merge warnings, `finish_reason`,
+    corrected help text;
   - **D0:** streaming page source (v1 multi-page memory).
 - **User value:**
   - v1 Chinese multi-page streaming no longer dies after a split character;
+  - v1 `--multi-page` no longer exits 0 silently when it truncates (about 30–295 pages) or merges
+    pages. The p20 fixture shows 20 pages with only 7 markers;
   - v1 `--multi-page` no longer holds every raster twice;
   - a v1 tokenizer sidecar can no longer be silently accepted for the wrong arch.
 - **Exit:**
@@ -1851,13 +1870,16 @@ Each milestone ends with something a user can run, and each has an exit gate.
 **M5 — Ecosystem and further perf (backlog).** F4 bf16 KV; F5 cross-document batching; H1
 iOS/WASM/site v2 lanes.
 
-**Critical path.** The longest blocking chain in the bead graph has 13 beads:
+**Critical path.** The longest blocking chain in the bead graph has 14 beads (recomputed after bead
+polish round 2):
 ```
-A1 → B1 → B2 → B4 → B5 → B6 → C2 → C4 → E4 → T1a → T1b → E5a → E6b
+A1 → B1 → B2 → B4 → B5 → B6 → E3 → E2 → D1b → D4 → D5 → T1b → E5a → E6b
 ```
-The windowed-books track joins it at T1b and E5a:
+E3 owns the library `PageResult` that E2 reuses. The certification track runs alongside and joins at
+T1b and E5a:
 ```
-T3 → A2 → A5 → A7 → B5 ┐
+T3 → A2 → A5 → A7 → B5 → C1 → C2 → C4 → E4 → T1a → T1b
+T3 → X2 → B6
 B4, B6 → D1a ─┬→ D2b (← D2a ← A1, A6) → C5b → E5a
 D0, E2 ───────┴→ D1b → D3, D4 → D5 → T1b
 ```
@@ -1869,7 +1891,7 @@ G1 → G2 → E5b runs off the critical path. Bead ids are listed in §12.
 ## 12. Task graph (mirrored into beads; labels in brackets)
 
 Each entry is written **ID — title** [labels] (blocking deps) — `bead id`. This list was regenerated
-from the live `br` graph after bead polish round 1; when they disagree, the beads win. Each bead carries
+from the live `br` graph after bead polish round 2; when they disagree, the beads win. Each bead carries
 milestone labels `uocr2-m0`…`uocr2-m5` (omitted here) and:
 - the full spec excerpt it needs;
 - acceptance criteria;
@@ -1890,14 +1912,15 @@ evidence-gated defaults [uocr2,epic].
 - **U2-A6** — v2 reference oracle: f32 CPU primary (feasibility first), bf16 ledger, dumps, fixtures S1–S5, nondeterminism floor [uocr2,conformance,oracle] (A1) — `bd-uocr2-epic-cgux.7`
 - **U2-A7** — Fail-closed v2 dispatch: every decode path, lever, daemon and recipe supports v2 or refuses it before weights load [uocr2,identity,safety] (A5) — `bd-uocr2-epic-cgux.8`
 - **U2-X1** — Fix PageStream: page events stop permanently after a split multi-byte UTF-8 char (v1 bug); UTF-8-safe incremental decoder [uocr2,bug,streaming] (T3) — `bd-uocr2-epic-cgux.9`
+- **U2-X2** — v1 multi-page honest reporting: truncation and page-merge warnings, run_complete finish_reason/warnings, help-text fix [uocr2,bug,cli,robot] (T3) — `bd-uocr2-epic-cgux.51`
 
 **B — Native SR-SWA decoder**
 - **U2-B1** — page2d coordinates, decode state machine, page_base, and RoPE tables [uocr2,decoder,rope] (A1) — `bd-uocr2-epic-cgux.10`
 - **U2-B2** — Token Sieve router math (projections, Gemma norm, RoPE, kbar, scores, Page Gate, both entmax domains, top-K, bias) with a scalar oracle [uocr2,attention,decoder] (B1) — `bd-uocr2-epic-cgux.11`
-- **U2-B3** — Block-sparse biased attention (prefill and decode): dense scalar oracle plus gathered path [uocr2,attention,decoder,kernel] (B2) — `bd-uocr2-epic-cgux.12`
+- **U2-B3** — Block-sparse biased attention (prefill and decode): dense scalar oracle plus gathered path [uocr2,attention,decoder,kernel] (B1) — `bd-uocr2-epic-cgux.12`
 - **U2-B4** — SR-SWA caches: K/V, index keys, incremental kbar, bmin/bmax, page state, block-granular retirement with open-row detector, memory accounting [uocr2,decoder,memory] (B1,B2) — `bd-uocr2-epic-cgux.13`
 - **U2-B5** — Decoder integration: LayerAttention dispatch; v2 f32 cached (certified-artifact path) + stateless paths; weight caches; v1 byte-identity [uocr2,decoder] (T3,A5,A7,B3,B4) — `bd-uocr2-epic-cgux.14`
-- **U2-B6** — v2 decode contract: prompt, guard, generated-only n-gram, per-page budgets, token-id page split, postprocess; flip implemented=true (experimental) [uocr2,decoder,sampler] (A4,A6,X1,B5,B7) — `bd-uocr2-epic-cgux.15`
+- **U2-B6** — v2 decode contract: prompt, guard, generated-only n-gram, per-page budgets, token-id page split, postprocess; flip implemented=true (experimental) [uocr2,decoder,sampler] (A4,A6,X1,B5,B7,X2) — `bd-uocr2-epic-cgux.15`
 - **U2-B7** — v2 preprocessing: base-1024 letterbox (PIL-bicubic exact), gundam max 16 tiles, small-image rule [uocr2,preprocess] (T3,A1,A6) — `bd-uocr2-epic-cgux.16`
 
 **C — Parity and certification**
@@ -1920,14 +1943,14 @@ evidence-gated defaults [uocr2,epic].
 
 **E — Product surface**
 - **U2-E1** — CLI/robot basics for v2: id resolution with per-model version, crop-mode semantics, `focr models` row, model_id in outputs, schema/surface rows [uocr2,cli,robot] (B6) — `bd-uocr2-epic-cgux.29`
-- **U2-E2** — Library `recognize_document` replacing `recognize_multi_page*`; streaming sink; window/resume options; CLI built on it [uocr2,library] (B6,D0) — `bd-uocr2-epic-cgux.30`
+- **U2-E2** — Library `recognize_document` replacing `recognize_multi_page*`; streaming sink; window/resume options; CLI built on it [uocr2,library] (B6,D0,E3) — `bd-uocr2-epic-cgux.30`
 - **U2-E3** — Structured document output: per-page `pages[]`, layout, figures, split-spreads from token-level `<PAGE>` segmentation [uocr2,cli,postprocess] (B6,D0) — `bd-uocr2-epic-cgux.31`
-- **U2-E4** — Distribution: manifest entry, artifact parts, `focr pull unlimited-ocr-2`, tokenizer sidecar transaction, v1→v2 pull hints [uocr2,dist,release] (C4,E1) — `bd-uocr2-epic-cgux.32`
+- **U2-E4** — Distribution: manifest entry, artifact parts, `focr pull unlimited-ocr-2`, tokenizer sidecar transaction, v1→v2 pull hints [uocr2,dist,release] (C4,E1,X2) — `bd-uocr2-epic-cgux.32`
 - **U2-E5a** — Document/multi-page default policy (D17, D25) and flip if the gate passes [uocr2,policy] (A2,C5b,D4,D5,E3,E4,F1,T1b,T2) — `bd-uocr2-epic-cgux.33`
 - **U2-E5b** — Single-page default policy and flip if the gate passes [uocr2,policy] (C5a,E4,G2) — `bd-uocr2-epic-cgux.34`
-- **U2-E6a** — Docs for opt-in v2: README, AGENTS, CHANGELOG, DISCREPANCIES, PERF_LEDGER [uocr2,docs] (C5a,E1,E3,E4,F1) — `bd-uocr2-epic-cgux.35`
+- **U2-E6a** — Docs for opt-in v2: README, AGENTS, CHANGELOG, DISCREPANCIES, PERF_LEDGER [uocr2,docs] (E1,E3,E4,F1) — `bd-uocr2-epic-cgux.35`
 - **U2-E6b** — Docs for books and defaults: long-document section, wall-time, limitations, migration table [uocr2,docs] (D4,D5,E5a,T1b) — `bd-uocr2-epic-cgux.36`
-- **U2-E7** — Health/doctor/triage awareness of v2 (multi-model health, sidecar checks, recommendations) [uocr2,cli,doctor] (E4) — `bd-uocr2-epic-cgux.37`
+- **U2-E7** — Health/doctor/triage awareness of v2 (multi-model health, sidecar checks, recommendations) [uocr2,cli,doctor] (E4,T1a) — `bd-uocr2-epic-cgux.37`
 
 **F — Performance**
 - **U2-F1** — Same-invocation v1 vs v2 baseline + FOCR_TIMING rows + RSS + PERF_LEDGER [uocr2,perf] (A6,C2,C3) — `bd-uocr2-epic-cgux.38`
@@ -2115,6 +2138,59 @@ tree first. The material corrections:
   - D3, D4, D5, F3, F5 and T2 moved from D1 to D1b.
   - §12 was regenerated from the live graph: 116 blocking edges; `br dep cycles` shows only the two
     cycles that predate this plan.
+
+**Round 3 (2026-10-28): bead polish round 2.** A second independent read-only reviewer checked
+self-containment, test and logging ownership, plan features lost in conversion, value to users, and
+dependency sanity. It reported 39 findings. The load-bearing ones were verified in code before
+integration; one was corrected rather than taken as written:
+- **C4 could not fail (§7.3).** A per-page 0.25 budget would fail v1 itself. A new ratchet category is
+  admissible by definition, and n = 20 forces fallback bounds. So the gate now:
+  - pre-registers a per-page budget;
+  - runs a same-invocation v1 baseline through `ratchet_decide`;
+  - keeps aggregate ≤ 0.25 as a hard gate.
+
+  C4 also captures v2 goldens, which give U2-T3 a v2 lane that every later v2 change must keep green.
+- **v1 page merging.** Verified in `tests/fixtures/multi_page/p20_meta.json`: 20 pages, 7 markers,
+  ended by EOS with no clamp.
+  - The reviewer proposed counting "N−1 markers". I corrected that to `finalize_multi`'s body count:
+    one body per marker plus a non-blank leading chunk (GH #17). The p10 fixture's 9 markers can be
+    complete.
+  - New M0 bead **U2-X2** reports truncation and merging for v1 now, via `run_complete.finish_reason`
+    and `warnings[]`. That replaces every undefined "robot note" (§9.2), and it fixes v1's help text.
+  - U2-E3 emits v1 `pages[]` only when the body count is N. U2-C5a/C5b score document-level edit
+    distance first.
+- **Robot contract.** `robot_schema()` has no field-level description, so U2-D5 adds `event_fields`,
+  and the e2e steps validate against it.
+- **Windowed figures.** Rasters are dropped before decode, so U2-D0 adds `PageSource::fetch` and
+  per-page sizes. U2-D1b re-fetches figure pages, and U2-T1b gains a figures step.
+- **Resume journal.** U2-D4's `.partial` is an NDJSON `PageResult` journal. For stdout runs it lives in
+  `document-runs/`, because doctor quarantines `*.partial` under `models/` (`doctor.rs:246-285`).
+- **Fail-closed completeness.** Twelve-plus `FOCR_*` levers were missing from U2-A7's matrix (verified
+  by grep). U2-A7 now classifies every lever in a `V2_LEVER_POLICY` table, with a census test that
+  scans `src/`.
+- **Smaller changes:**
+  - sharded-directory tokenizer resolution (A3);
+  - eager tokenizer validation before weights load (A2);
+  - the test-log schema enums (C1) and the TEST_LOGGING contract in T1a/T1b;
+  - the `EntmaxDomain` selector (B6);
+  - `ModelArch::maturity()` (B6, E1, C4);
+  - directory input in the mode table (E1, E5a);
+  - a first-run download that follows the table (E1);
+  - the 60-page limit arithmetic, re-derived by C4;
+  - R20 drift checks (C2, E4);
+  - named S2/S4 fixtures (A6);
+  - wheel-file citation keys (D1a).
+- **Edges.**
+  - B3 depends on B1, not B2.
+  - E2 depends on E3, which owns `PageResult`.
+  - E6a no longer waits on the 15–40 CPU-hour C5a evaluation.
+  - B6 and E4 depend on X2.
+  - E7 depends on T1a and adds its own e2e step. The reviewer proposed the reverse edge, but that put
+    E7 on the critical path.
+- **Persistence.** The 307-line SGLang windowing spec existed only in the session scratchpad. It is
+  now attached to U2-A1 as a `br` comment.
+- **Result.** 52 beads, 120 blocking edges, longest chain 14 (§11). `br dep cycles` still shows only
+  the two cycles that predate this plan.
 
 **Not yet done.** No GPT Pro or other non-Claude review round has run. The planning workflow
 recommends 4–5 rounds with GPT Pro Extended Reasoning. The exact prompt is in the planning-workflow
