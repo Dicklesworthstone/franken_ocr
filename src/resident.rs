@@ -341,8 +341,12 @@ fn options_value(request: &ResidentRequest<'_>) -> Value {
 /// Recognition errors reported by the daemon (`kind: "ocr"`), plus
 /// [`FocrError::Cancelled`] when cooperative shutdown fires while waiting for
 /// the reply (matching the inline decode loop's Ctrl+C contract); every
-/// transport-shaped failure is `Ok(None)`.
+/// transport-shaped failure is `Ok(None)`. A model the daemon does not serve
+/// (U2-A7) is `Ok(None)` before any connect or spawn.
 pub fn try_recognize(request: &ResidentRequest<'_>) -> FocrResult<Option<ResidentReply>> {
+    if !crate::native_engine::resident_daemon_serves(&request.model) {
+        return Ok(None);
+    }
     match connect(&request.model) {
         Some(stream) => roundtrip(stream, request),
         None => Ok(None),
@@ -860,6 +864,17 @@ fn handle_connection(
         }
     }
 
+    // A model with a lever policy (Unlimited-OCR-2) runs inline until the
+    // protocol carries its flags (bd-fuh2, U2-A7); the client falls back.
+    if !crate::native_engine::resident_daemon_serves(model_root) {
+        refuse(
+            &mut stream,
+            "model",
+            "the resident daemon does not serve this model; run inline",
+        );
+        return;
+    }
+
     // The daemon inherits its spawner's environment; a client whose
     // inference-steering env differs must run inline instead (env cannot be
     // re-applied to a live process at arbitrary points).
@@ -1149,6 +1164,49 @@ mod tests {
         let value: Value = serde_json::from_str(&reply).unwrap();
         assert_eq!(value.get("ok").and_then(Value::as_bool), Some(false));
         assert_eq!(value.get("kind").and_then(Value::as_str), Some("env"));
+        handle.join().unwrap();
+    }
+
+    /// U2-A7: a daemon keyed to an Unlimited-OCR-2 checkpoint refuses
+    /// transport-shaped, before building an engine; the client falls back
+    /// inline, where the pre-load check refuses with exit 2. (The client's
+    /// own skip is pinned by the e2e CLI matrix: no daemon state appears.)
+    #[test]
+    fn daemon_refuses_unlimited_ocr_2_transport_shaped() {
+        use std::io::{BufRead, BufReader};
+
+        let dir =
+            std::env::temp_dir().join(format!("franken_ocr_resident_v2_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let index = crate::native_engine::write_sparse_v2_stand_in(&dir);
+        assert!(!crate::native_engine::resident_daemon_serves(&index));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let root = index.clone();
+        let handle = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut resident = None;
+            handle_connection(stream, &root, "tok", 0, &mut resident);
+            assert!(resident.is_none(), "no engine was built for v2");
+        });
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        let request = json!({
+            "protocol": PROTOCOL,
+            "op": "ocr",
+            "token": "tok",
+            "version": env!("CARGO_PKG_VERSION"),
+            "model_root": index.display().to_string(),
+            "image": "/nonexistent/page.png",
+            "options": {},
+            "env": env_fingerprint(),
+        });
+        stream.write_all(format!("{request}\n").as_bytes()).unwrap();
+        let mut reply = String::new();
+        BufReader::new(&mut stream).read_line(&mut reply).unwrap();
+        let value: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(value.get("ok").and_then(Value::as_bool), Some(false));
+        assert_eq!(value.get("kind").and_then(Value::as_str), Some("model"));
         handle.join().unwrap();
     }
 }

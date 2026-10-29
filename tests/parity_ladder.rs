@@ -52,7 +52,7 @@ use franken_ocr::native_engine::sampler::{self, DecodeParams};
 use franken_ocr::native_engine::tensor::Mat;
 use franken_ocr::native_engine::weights::Weights;
 use franken_ocr::native_engine::{
-    connector, decoder, postprocess, vision_bridge, vision_clip, vision_sam,
+    connector, decoder, model_arch, postprocess, vision_bridge, vision_clip, vision_sam,
 };
 use franken_ocr::preprocess;
 use franken_ocr::tokenizer::{Tokenizer, special};
@@ -72,8 +72,33 @@ fn fixtures_present() -> bool {
 /// default). The model-gated e2e rungs check this resolves to a real artifact;
 /// absent ⇒ skip-with-SUCCESS, proving the native path by the `/nonexistent`
 /// fallback the log carries.
-fn model_present() -> bool {
-    subject_model_path().exists()
+fn model_present(log: &mut Logger) -> bool {
+    subject_model_path().exists() && subject_is_ladder_model(log)
+}
+
+/// Whether `$FOCR_MODEL_PATH` may arm the ladder (U2-A7). The oracle fixtures
+/// are v1 R-SWA activations, so a subject the header identifies as another
+/// model (Unlimited-OCR-2's ladder is U2-C3) skips with the reason logged.
+/// A header that does not identify still arms the rungs, so a broken v1
+/// artifact fails loudly instead of skipping.
+fn subject_is_ladder_model(log: &mut Logger) -> bool {
+    let Some(spec) = std::env::var_os("FOCR_MODEL_PATH") else {
+        return true;
+    };
+    match franken_ocr::native_engine::model_id_at(Path::new(&spec)) {
+        Some(id) if id != model_arch::UNLIMITED_OCR_V1_ID => {
+            log.assertion(
+                &format!(
+                    "FOCR_MODEL_PATH is {id}: the ladder's oracle fixtures are {} only, \
+                     so its model-gated rungs skip",
+                    model_arch::UNLIMITED_OCR_V1_ID
+                ),
+                true,
+            );
+            false
+        }
+        Some(_) | None => true,
+    }
 }
 
 /// One golden's doc stem (`<stem>_reference.json` → `<stem>`).
@@ -167,7 +192,7 @@ fn subject_model_path() -> PathBuf {
 }
 
 /// Resolve + load the subject model weights via [`subject_model_path`]. Only
-/// called after a rung confirms `model_present()`, so a failure here is a
+/// called after a rung confirms [`model_present`], so a failure here is a
 /// genuine load error worth surfacing (never silently skipped).
 fn load_subject_weights() -> Result<Weights, String> {
     let path = subject_model_path();
@@ -997,7 +1022,7 @@ fn l0_preprocess_exact() {
         SLOTS_PER_1024_VIEW == 273,
     );
 
-    if !fixtures_present() || !model_present() {
+    if !fixtures_present() || !model_present(&mut log) {
         log.skip_no_model(
             "L0 preprocess-tensor comparison needs the oracle sam_input activation \
              (bd-3s7v fixtures); contract anchors above ran. Set FOCR_FIXTURES_DIR + \
@@ -1199,7 +1224,7 @@ fn l1_per_op_cosine() {
     log.setup(0);
     let t0 = Instant::now();
 
-    if !fixtures_present() || !model_present() {
+    if !fixtures_present() || !model_present(&mut log) {
         log.skip_no_model(
             "L1 per-op cosine needs the per-stage oracle activations (.npy) AND the \
              engine forward producing the same-stage tensor. Comparator math \
@@ -1374,7 +1399,7 @@ fn l2_per_layer_cosine_and_ledger() {
         vision_seams.len() == 3,
     );
 
-    if !fixtures_present() || !model_present() {
+    if !fixtures_present() || !model_present(&mut log) {
         log.skip_no_model(
             "L2 per-layer cosine + max-abs ledger needs all 12 decoder_layer_NN_hidden \
              oracle activations and the engine hidden states. The max-abs ledger \
@@ -1557,7 +1582,7 @@ fn l3_logits_measured_budget_and_argmax() {
         tokens_a == tokens_b,
     );
 
-    if !fixtures_present() || !model_present() {
+    if !fixtures_present() || !model_present(&mut log) {
         log.skip_no_model(&format!(
             "L3 logit compare needs lm_head_logits oracle activation + the engine \
              prefill logits. The §2 nondeterminism floor (derived L3 tolerance \
@@ -1713,7 +1738,7 @@ fn l4_token_exact_prefix() {
         exact_over_prefix,
     );
 
-    if !fixtures_present() || !model_present() {
+    if !fixtures_present() || !model_present(&mut log) {
         log.skip_no_model(
             "L4 token-exact compare needs the golden token_stream (bd-3s7v fixtures) \
              AND the engine greedy decode seeded from the oracle inputs_embeds. \
@@ -1968,8 +1993,10 @@ fn run_l5_multi(
         let all: Vec<PathBuf> = page_names.iter().map(|n| dir.join(n)).collect();
         all.iter().all(|p| p.is_file()).then_some(all)
     });
-    let model_dir = std::env::var_os("FOCR_MODEL_PATH").map(PathBuf::from);
-    let (Some(pages), Some(model_dir)) = (pages, model_dir.filter(|p| p.exists())) else {
+    let model_dir = std::env::var_os("FOCR_MODEL_PATH")
+        .map(PathBuf::from)
+        .filter(|p| p.exists() && subject_is_ladder_model(&mut log));
+    let (Some(pages), Some(model_dir)) = (pages, model_dir) else {
         log.skip_no_model(
             "L5-multi needs FOCR_MODEL_PATH (the baseline model dir with its \
              tokenizer beside the shard) AND FOCR_CORPUS_DIR containing \
@@ -2057,7 +2084,7 @@ fn l5_end_to_end_cer_budget() {
         (cer_one_edit - 0.2).abs() < 1e-9,
     );
 
-    if !fixtures_present() || !model_present() {
+    if !fixtures_present() || !model_present(&mut log) {
         log.skip_no_model(
             "L5 decoded-text CER compare needs the golden <doc>_reference.json \
              (decoded text) AND the 6.67 GB weights for the engine decode + \
@@ -2282,7 +2309,7 @@ fn differential_per_op_vs_bf16_oracle() {
             && row.get("xfail").is_some(),
     );
 
-    if !fixtures_present() || !model_present() {
+    if !fixtures_present() || !model_present(&mut log) {
         log.skip_no_model(
             "differential per-op needs the per-stage oracle activations + the engine \
              (the live bridge supplies ad-hoc inputs; frozen .npy supply the corpus). \

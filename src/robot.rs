@@ -154,6 +154,8 @@ pub fn robot_schema() -> Value {
         "exit_codes": EXIT_CODE_TABLE,
         "model_license_notice": FOCR_MODEL_LICENSE_NOTICE,
         "environment_variables": environment,
+        // Every machine-stable `warnings[].kind` (U2-X2, U2-A7): additive.
+        "warning_kinds": crate::native_engine::RUN_WARNING_KINDS,
         // How an agent orients in one round-trip each (the franken_whisper
         // `agent_discovery` pattern): additive keys, schema stays v1.
         "agent_discovery": {

@@ -306,12 +306,17 @@ fn run_focr_with_forced_error(args: &[&str], forced_error: &str) -> Output {
 }
 
 fn fresh_run_store_path() -> PathBuf {
+    // The wall clock alone is not unique: macOS reports whole microseconds, so
+    // two parallel tests could share a path and race one store's first-run
+    // init (seen as "empty _meta" on stderr). The counter makes it unique.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "focr_golden_run_store_{}_{}.db",
+        "focr_golden_run_store_{}_{}_{serial}.db",
         std::process::id(),
         nanos
     ))

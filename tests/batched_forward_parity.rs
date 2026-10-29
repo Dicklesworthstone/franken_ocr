@@ -205,6 +205,9 @@ fn batched_forward_parity_is_model_gated() {
     // per stream, assert byte-equal hidden rows over several steps) is wired by the
     // spine-driver bead that consumes this API; this build-only bead leaves the
     // gated branch as an acknowledged no-op so the skip path remains the proof.
+    // Whoever wires it skips a model `model_id_at` names other than v1
+    // `unlimited-ocr`: the int8 cache and batched step are R-SWA only, and
+    // Unlimited-OCR-2's batched lane is U2-F5 (U2-A7).
     eprintln!(
         "[batched_forward_parity] FOCR_BATCH_PARITY_MODEL set — full-forward parity is \
          exercised by the spine-driver bead (bd-1azu.*)"

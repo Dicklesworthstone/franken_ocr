@@ -26,6 +26,7 @@ pub mod connector;
 pub mod decoder;
 pub mod decoder_qwen2;
 pub mod got;
+pub(crate) mod lever_policy;
 pub mod model_arch;
 pub mod moe;
 pub mod nn;
@@ -510,7 +511,13 @@ pub enum WarningKind {
     /// A multi-page prompt alone exceeds the position budget (an error, not a
     /// warning; it shares the recovery text).
     PromptTooLong,
+    /// A `FOCR_*` lever that reaches no path of the loaded model (U2-A7).
+    IgnoredLever,
 }
+
+/// Every machine-stable `warnings[].kind` a run can report, in the robot
+/// schema's `warning_kinds` (U2-A7 registers `ignored_lever`).
+pub const RUN_WARNING_KINDS: &[&str] = &["v1_truncated", "v1_page_merge", "ignored_lever"];
 
 /// The one actionable next step for each [`WarningKind`]: the single source
 /// U2-E4 extends with `focr pull unlimited-ocr-2` once v2 is published.
@@ -524,6 +531,7 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
         WarningKind::V1PageMerge => {
             "parse pages independently (omit `--multi-page`) when page boundaries matter"
         }
+        WarningKind::IgnoredLever => "unset it for this model's runs",
     }
 }
 
@@ -2024,6 +2032,17 @@ pub fn native_model_available(path: &Path) -> bool {
     validate_model_header_file(&resolved).is_ok()
 }
 
+/// The id of the model `path` resolves to, from the same bounded header
+/// probe as [`native_model_available`] (no payload byte is read); `None`
+/// when it does not resolve or its header is not one this binary accepts.
+#[must_use]
+pub fn model_id_at(path: &Path) -> Option<&'static str> {
+    let resolved = OcrModel::resolve_model(path).ok()?;
+    validate_model_header_file(&resolved)
+        .ok()
+        .map(model_arch::ModelArch::id)
+}
+
 /// A filesystem model open: the model the header identified, its tokenizer
 /// when the sidecar was verified at open, and the weights.
 struct OpenedModel {
@@ -2042,23 +2061,31 @@ impl std::fmt::Debug for OpenedModel {
     }
 }
 
+#[cfg(test)]
 fn load_weights_from_resolved_model(resolved: &Path) -> FocrResult<OpenedModel> {
-    load_weights_from_resolved_model_after_validation(resolved, || {})
+    load_weights_from_resolved_model_after_validation(resolved, |_| Ok(()), || {})
 }
 
+/// Open `resolved`: identify its model from the header, `admit` that model,
+/// judge its tokenizer sidecar, then read the weights. `after_validation`
+/// runs just before the first weight byte is read.
 fn load_weights_from_resolved_model_after_validation(
     resolved: &Path,
+    admit: impl FnOnce(&'static dyn model_arch::ModelArch) -> FocrResult<()>,
     after_validation: impl FnOnce(),
 ) -> FocrResult<OpenedModel> {
-    // The tokenizer sidecar is judged before a single weight byte is read.
+    // The admission and the tokenizer sidecar are judged before a single
+    // weight byte is read.
     let (arch, tokenizer, weights) = if shards::is_index_path(resolved) {
         let (arch, opened) = validate_sharded_model(resolved)?;
+        admit(arch)?;
         let tokenizer = eager_sidecar_tokenizer(arch, resolved)?;
         after_validation();
         (arch, tokenizer, Weights::load_opened_shards(opened)?)
     } else {
         let (file, file_len) = open_model_file(resolved)?;
         let arch = validate_model_header_from_reader(&file, file_len)?;
+        admit(arch)?;
         let tokenizer = eager_sidecar_tokenizer(arch, resolved)?;
         after_validation();
         (arch, tokenizer, Weights::load_opened(file, resolved)?)
@@ -2077,6 +2104,114 @@ fn load_weights_from_resolved_model_after_validation(
         tokenizer,
         weights,
     })
+}
+
+/// The pre-load inference gate (U2-A7): print the ignored-lever warnings,
+/// then refuse an armed unsupported lever or an unimplemented model.
+fn admit_for_inference(arch: &'static dyn model_arch::ModelArch) -> FocrResult<()> {
+    let admission = lever_policy::admit_from_process(arch);
+    for warning in &admission.warnings {
+        crate::progress::stderr_message(format_args!(
+            "[focr] warning: {} — {}",
+            warning.message, warning.recovery
+        ));
+    }
+    admission.verdict
+}
+
+/// The forward a model's single-image entry points run (U2-A7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForwardRoute {
+    UnlimitedV1,
+    GotOcr2,
+    SmolVlm2,
+    OneChart,
+    Tromr,
+}
+
+/// Route `arch`'s single-image forward: exhaustive over the decoder family
+/// and Unlimited variant, so no model falls through into v1's R-SWA forward.
+/// A planned zoo model keeps its [`FocrError::NotImplemented`]; an
+/// implemented model with no wired forward is an explicit error.
+fn forward_route(arch: &dyn model_arch::ModelArch) -> FocrResult<ForwardRoute> {
+    use model_arch::{Decoder, UnlimitedVariant};
+    let route = match (arch.decoder(), arch.unlimited_variant()) {
+        (Decoder::DeepSeekV2MoeRswa, Some(UnlimitedVariant::V1Rswa)) => {
+            Some(ForwardRoute::UnlimitedV1)
+        }
+        (Decoder::DeepSeekV2MoeSrSwa, Some(UnlimitedVariant::V2SrSwa)) => {
+            return Err(FocrError::NotImplemented(format!(
+                "{} has no forward in this build (U2-B5); it never runs v1's R-SWA forward",
+                arch.id()
+            )));
+        }
+        (Decoder::Qwen2Dense, None) if arch.id() == "got-ocr2" => Some(ForwardRoute::GotOcr2),
+        (Decoder::LlamaDense, None) if arch.id() == "smolvlm2" => Some(ForwardRoute::SmolVlm2),
+        (Decoder::OptDense, None) if arch.id() == "onechart" => Some(ForwardRoute::OneChart),
+        (Decoder::Seq2SeqDense, None) if arch.id() == "tromr" => Some(ForwardRoute::Tromr),
+        (
+            Decoder::DeepSeekV2MoeRswa
+            | Decoder::DeepSeekV2MoeSrSwa
+            | Decoder::Qwen2Dense
+            | Decoder::LlamaDense
+            | Decoder::OptDense
+            | Decoder::Seq2SeqDense,
+            _,
+        ) => None,
+    };
+    if let Some(route) = route {
+        return Ok(route);
+    }
+    OcrModel::ensure_arch_implemented(arch)?;
+    Err(FocrError::NotImplemented(format!(
+        "model architecture '{}' has no forward wired in this build",
+        arch.id()
+    )))
+}
+
+/// Admit `arch` to multi-page cross-page parsing (`infer_multi`): only v1
+/// enters v1's 640-squash R-SWA multi-page loop. v2 waits for its own
+/// document loop (U2-B6); the zoo parses pages independently.
+fn multi_page_route(arch: &dyn model_arch::ModelArch) -> FocrResult<()> {
+    match arch.unlimited_variant() {
+        Some(model_arch::UnlimitedVariant::V1Rswa) => OcrModel::ensure_arch_implemented(arch),
+        Some(model_arch::UnlimitedVariant::V2SrSwa) => Err(FocrError::NotImplemented(format!(
+            "{} multi-page parsing runs its own document loop, which this build does not have \
+             (U2-B6); it never runs v1's multi-page loop",
+            arch.id()
+        ))),
+        None => Err(FocrError::NotImplemented(format!(
+            "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR contract; model \
+             {:?} parses pages independently (use the plain multi-input/batch path)",
+            arch.id()
+        ))),
+    }
+}
+
+/// Load the model at `spec` up front when it has a lever policy (U2-A7), so a
+/// batch reports its refusal as the run's exit code, not as a per-image
+/// failure; hold the result for the batch and every per-image load is a
+/// cache hit. Other models, and specs that do not resolve to a readable
+/// header, are left to the per-image path exactly as before.
+///
+/// # Errors
+/// As [`OcrModel::load`], for a model with a lever policy.
+pub fn load_if_policed(spec: &Path) -> FocrResult<Option<Arc<OcrModel>>> {
+    let Ok(resolved) = OcrModel::resolve_model(spec) else {
+        return Ok(None);
+    };
+    match validate_model_header_file(&resolved) {
+        Ok(arch) if lever_policy::policy_for(arch).is_some() => OcrModel::load(&resolved).map(Some),
+        Ok(_) | Err(_) => Ok(None),
+    }
+}
+
+/// Whether the resident daemon may serve the model at `path` (U2-A7). A
+/// header the probe cannot read leaves the decision to the daemon's own
+/// load, as before.
+#[must_use]
+pub fn resident_daemon_serves(path: &Path) -> bool {
+    validate_model_header_file(path).map_or(true, lever_policy::resident_daemon_serves)
 }
 
 /// Whether `arch` pins anything about its `tokenizer.json` sidecar.
@@ -2470,7 +2605,9 @@ impl OcrModel {
     /// file is unreadable). Existing paths that are not recognized model
     /// containers, and recognized containers with structural faults, surface
     /// [`FocrError::FormatMismatch`] so the public format/version exit-code
-    /// contract remains intact.
+    /// contract remains intact. [`FocrError::Usage`] when the model's lever
+    /// policy refuses a set `FOCR_*` lever, or the model is registered but not
+    /// implemented (U2-A7) — both before a weight byte is read.
     pub fn load(path: &Path) -> FocrResult<Arc<Self>> {
         let resolved = Self::resolve_model(path)?;
         let _load_permit = model_load_admission().acquire();
@@ -2481,6 +2618,9 @@ impl OcrModel {
                 && *cached_path == resolved
                 && let Some(strong) = weak.upgrade()
             {
+                // The force flag can change between loads; the warnings
+                // were printed when the model was first admitted.
+                lever_policy::admit_from_process(strong.arch).verdict?;
                 return Ok(strong);
             }
         }
@@ -2488,26 +2628,18 @@ impl OcrModel {
         // Route through `Weights::load`: owned bytes are the safe default.
         // `FOCR_MMAP=1` is an explicit opt-in for trusted immutable artifacts;
         // mmap failures retain the owned-buffer fallback.
-        let opened = load_weights_from_resolved_model(&resolved)?;
-        let model = Arc::new(Self {
-            path: resolved.clone(),
-            sidecars: SidecarBundle::default(),
-            arch: opened.arch,
-            weights: opened.weights,
-            decode_params: decode_params_from_env(),
-            decoder_cache_i8: FallibleOnce::new(),
-            decoder_cache: FallibleOnce::new(),
-            clip_cache: FallibleOnce::new(),
-            unlimited_vision: FallibleOnce::new(),
-            got_statics: FallibleOnce::new(),
-            onechart_statics: FallibleOnce::new(),
-            smol_statics: FallibleOnce::new(),
-            tokenizer: FallibleOnce::prefilled(opened.tokenizer),
-            got_tokenizer: FallibleOnce::new(),
-            tromr_tokenizer: FallibleOnce::new(),
-            music_meta: std::sync::Mutex::new(None),
-            last_decode: std::sync::Mutex::new(None),
-        });
+        let opened = load_weights_from_resolved_model_after_validation(
+            &resolved,
+            admit_for_inference,
+            || {},
+        )?;
+        let model = Arc::new(Self::assemble(
+            resolved.clone(),
+            SidecarBundle::default(),
+            opened.arch,
+            opened.weights,
+            opened.tokenizer,
+        ));
 
         let mut guard = model_cache_guard()?;
         *guard = Some((resolved, Arc::downgrade(&model)));
@@ -2527,7 +2659,8 @@ impl OcrModel {
     /// model pins (checked first, before the weights' contract), or if the
     /// weights violate the fixed Unlimited-OCR quant recipe (other archs have
     /// separate storage contracts, validated by their own tensor accessors at
-    /// forward time).
+    /// forward time). [`FocrError::Usage`] as [`Self::load`], before the
+    /// tokenizer check.
     pub fn from_weights(weights: Weights, sidecars: SidecarBundle) -> FocrResult<Arc<Self>> {
         let arch = match model_arch::arch_by_id(weights.model_id()) {
             Some(arch) => arch,
@@ -2541,6 +2674,7 @@ impl OcrModel {
                 unlimited_ocr_census::identify_raw(records.iter().copied())?
             }
         };
+        admit_for_inference(arch)?;
         let tokenizer = match &sidecars.tokenizer_json {
             Some(bytes) if pins_tokenizer(arch) => Some(checked_tokenizer(
                 arch,
@@ -2550,8 +2684,25 @@ impl OcrModel {
             _ => None,
         };
         validate_unlimited_ocr_quant_recipe(&weights)?;
-        Ok(Arc::new(Self {
-            path: PathBuf::from("<in-memory>"),
+        Ok(Arc::new(Self::assemble(
+            PathBuf::from("<in-memory>"),
+            sidecars,
+            arch,
+            weights,
+            tokenizer,
+        )))
+    }
+
+    /// A model over admitted weights, its caches empty.
+    fn assemble(
+        path: PathBuf,
+        sidecars: SidecarBundle,
+        arch: &'static dyn model_arch::ModelArch,
+        weights: Weights,
+        tokenizer: Option<crate::tokenizer::Tokenizer>,
+    ) -> Self {
+        Self {
+            path,
             sidecars,
             arch,
             weights,
@@ -2568,7 +2719,7 @@ impl OcrModel {
             tromr_tokenizer: FallibleOnce::new(),
             music_meta: std::sync::Mutex::new(None),
             last_decode: std::sync::Mutex::new(None),
-        }))
+        }
     }
 
     /// The frozen greedy decode contract this model drives with (plan §6.10).
@@ -2617,17 +2768,20 @@ impl OcrModel {
     /// error from [`preprocess::preprocess_image`].
     pub fn forward(&self, image_path: &Path) -> FocrResult<(String, u32, u32)> {
         let _admission = forward_admission().acquire();
-        if self.arch().id() == "got-ocr2" {
-            return self.forward_got(&preprocess::decode_path(image_path)?);
-        }
-        if self.arch().id() == "smolvlm2" {
-            return self.forward_smolvlm2(&preprocess::decode_path(image_path)?);
-        }
-        if self.arch().id() == "onechart" {
-            return self.forward_onechart(&preprocess::decode_path(image_path)?);
-        }
-        if self.arch().id() == "tromr" {
-            return self.forward_tromr(&preprocess::decode_path(image_path)?);
+        match forward_route(self.arch())? {
+            ForwardRoute::GotOcr2 => {
+                return self.forward_got(&preprocess::decode_path(image_path)?);
+            }
+            ForwardRoute::SmolVlm2 => {
+                return self.forward_smolvlm2(&preprocess::decode_path(image_path)?);
+            }
+            ForwardRoute::OneChart => {
+                return self.forward_onechart(&preprocess::decode_path(image_path)?);
+            }
+            ForwardRoute::Tromr => {
+                return self.forward_tromr(&preprocess::decode_path(image_path)?);
+            }
+            ForwardRoute::UnlimitedV1 => {}
         }
         let t = Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
@@ -2649,17 +2803,12 @@ impl OcrModel {
     /// As [`Self::forward`] (sans the file-open path).
     pub fn forward_dynamic(&self, img: image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         let _admission = forward_admission().acquire();
-        if self.arch().id() == "got-ocr2" {
-            return self.forward_got(&img);
-        }
-        if self.arch().id() == "smolvlm2" {
-            return self.forward_smolvlm2(&img);
-        }
-        if self.arch().id() == "onechart" {
-            return self.forward_onechart(&img);
-        }
-        if self.arch().id() == "tromr" {
-            return self.forward_tromr(&img);
+        match forward_route(self.arch())? {
+            ForwardRoute::GotOcr2 => return self.forward_got(&img),
+            ForwardRoute::SmolVlm2 => return self.forward_smolvlm2(&img),
+            ForwardRoute::OneChart => return self.forward_onechart(&img),
+            ForwardRoute::Tromr => return self.forward_tromr(&img),
+            ForwardRoute::UnlimitedV1 => {}
         }
         let t = Instant::now();
         progress::emit("preprocess", 0, 0);
@@ -3146,15 +3295,7 @@ impl OcrModel {
                 "recognize_multi_page: image_paths must be non-empty"
             )));
         }
-        if self.arch().unlimited_variant().is_none() {
-            return Err(FocrError::NotImplemented(format!(
-                "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
-                 contract; model {:?} parses pages independently (use the plain \
-                 multi-input/batch path)",
-                self.arch().id()
-            )));
-        }
-        Self::ensure_arch_implemented(self.arch())?;
+        multi_page_route(self.arch())?;
 
         // ── per-page Base-640 preprocess (multi-page forces no-crop, §2.4) ──
         let mut pres = Vec::with_capacity(image_paths.len());
@@ -3183,15 +3324,7 @@ impl OcrModel {
                 "recognize_multi_page_dynamic: images must be non-empty"
             )));
         }
-        if self.arch().unlimited_variant().is_none() {
-            return Err(FocrError::NotImplemented(format!(
-                "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
-                 contract; model {:?} parses pages independently (use the plain \
-                 multi-input/batch path)",
-                self.arch().id()
-            )));
-        }
-        Self::ensure_arch_implemented(self.arch())?;
+        multi_page_route(self.arch())?;
         let mut pres = Vec::with_capacity(images.len());
         for img in images {
             pres.push(preprocess::preprocess_dynamic_squash(
@@ -3221,15 +3354,7 @@ impl OcrModel {
                 "recognize_multi_page_dynamic_streaming: images must be non-empty"
             )));
         }
-        if self.arch().unlimited_variant().is_none() {
-            return Err(FocrError::NotImplemented(format!(
-                "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR \
-                 contract; model {:?} parses pages independently (use the plain \
-                 multi-input/batch path)",
-                self.arch().id()
-            )));
-        }
-        Self::ensure_arch_implemented(self.arch())?;
+        multi_page_route(self.arch())?;
         let mut pres = Vec::with_capacity(images.len());
         for img in images {
             pres.push(preprocess::preprocess_dynamic_squash(
@@ -5007,6 +5132,15 @@ impl OcrModel {
     }
 }
 
+/// A census-exact two-shard Unlimited-OCR-2 checkpoint in `dir` with a sparse
+/// payload, for tests whose run must be refused before any weight is read.
+/// Returns its index.
+#[cfg(test)]
+pub(crate) fn write_sparse_v2_stand_in(dir: &Path) -> PathBuf {
+    let (tensors, int64) = unlimited_ocr_census::v2_source_tensors();
+    tests::write_sparse_two_shard_stand_in(dir, &tensors, &int64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5658,10 +5792,15 @@ mod tests {
             .expect("add replacement marker tensor");
         std::fs::write(&replacement_path, replacement.build()).expect("write replacement model");
 
-        let loaded = load_weights_from_resolved_model_after_validation(&model_path, || {
-            std::fs::rename(&model_path, &displaced_path).expect("preserve validated path entry");
-            std::fs::rename(&replacement_path, &model_path).expect("swap active path entry");
-        })
+        let loaded = load_weights_from_resolved_model_after_validation(
+            &model_path,
+            |_| Ok(()),
+            || {
+                std::fs::rename(&model_path, &displaced_path)
+                    .expect("preserve validated path entry");
+                std::fs::rename(&replacement_path, &model_path).expect("swap active path entry");
+            },
+        )
         .expect("load the descriptor validated before the path swap");
 
         assert!(loaded.weights.record("test.original").is_some());
@@ -5698,10 +5837,14 @@ mod tests {
         symlink(&original_path, &active_link).expect("link active path to original");
         symlink(&replacement_path, &next_link).expect("prepare replacement symlink");
 
-        let loaded = load_weights_from_resolved_model_after_validation(&active_link, || {
-            std::fs::rename(&active_link, &retired_link).expect("preserve validated symlink");
-            std::fs::rename(&next_link, &active_link).expect("swap active symlink");
-        })
+        let loaded = load_weights_from_resolved_model_after_validation(
+            &active_link,
+            |_| Ok(()),
+            || {
+                std::fs::rename(&active_link, &retired_link).expect("preserve validated symlink");
+                std::fs::rename(&next_link, &active_link).expect("swap active symlink");
+            },
+        )
         .expect("load the descriptor validated before the symlink swap");
 
         assert!(loaded.weights.record("test.original_link").is_some());
@@ -6077,6 +6220,7 @@ mod tests {
         std::fs::write(&tmp, compatible_test_model_builder().build())
             .expect("write compatible focrq");
         assert!(native_model_available(&tmp));
+        assert_eq!(model_id_at(&tmp), Some("got-ocr2"), "the builder's arch");
         assert!(load_weights_from_resolved_model(&tmp).is_ok());
 
         let mut magic_only = tmp.clone();
@@ -6086,6 +6230,7 @@ mod tests {
         ));
         std::fs::write(&magic_only, weights::FOCRQ_MAGIC).expect("write magic-only focrq");
         assert!(!native_model_available(&magic_only));
+        assert_eq!(model_id_at(&magic_only), None);
         assert!(load_weights_from_resolved_model(&magic_only).is_err());
     }
 
@@ -6427,11 +6572,14 @@ mod tests {
     /// payloads (`set_len`, no bytes written), plus the index. Only header
     /// probes may read it. Returns the index path.
     #[cfg(unix)]
-    fn write_sparse_two_shard_stand_in(
+    /// A census-exact two-shard checkpoint with a sparse (all-zero) payload,
+    /// plus `int64` tensors in the second shard holding `arange` content.
+    pub(super) fn write_sparse_two_shard_stand_in(
         dir: &Path,
         tensors: &[(String, DType, Vec<usize>)],
+        int64: &[(&str, &[usize])],
     ) -> PathBuf {
-        use std::io::Write as _;
+        use std::io::{Seek as _, SeekFrom, Write as _};
         let half = tensors.len() / 2;
         let mut map: Vec<(&str, String)> = Vec::new();
         let mut total = 0usize;
@@ -6453,6 +6601,19 @@ mod tests {
                 offset += len;
                 map.push((name.as_str(), shard.clone()));
             }
+            let mut aranges = Vec::new();
+            if position == 1 {
+                for &(name, shape) in int64 {
+                    let count = shape.iter().product::<usize>();
+                    entries.push(format!(
+                        r#""{name}":{{"dtype":"I64","shape":{shape:?},"data_offsets":[{offset},{}]}}"#,
+                        offset + count * 8
+                    ));
+                    aranges.push((offset, count));
+                    offset += count * 8;
+                    map.push((name, shard.clone()));
+                }
+            }
             let header = format!("{{{}}}", entries.join(","));
             let mut file = std::fs::File::create(dir.join(&shard)).expect("create shard");
             file.write_all(&(header.len() as u64).to_le_bytes())
@@ -6460,6 +6621,12 @@ mod tests {
             file.write_all(header.as_bytes()).expect("write header");
             file.set_len((8 + header.len() + offset) as u64)
                 .expect("sparse payload");
+            for (start, count) in aranges {
+                let bytes: Vec<u8> = (0..count as i64).flat_map(i64::to_le_bytes).collect();
+                file.seek(SeekFrom::Start((8 + header.len() + start) as u64))
+                    .expect("seek to the I64 tensor");
+                file.write_all(&bytes).expect("write arange");
+            }
             total += offset;
         }
         let pairs: Vec<(&str, &str)> = map
@@ -6479,7 +6646,7 @@ mod tests {
         let dir = parent.join("checkpoint");
         std::fs::create_dir_all(&dir).expect("checkpoint dir");
         let index =
-            write_sparse_two_shard_stand_in(&dir, &unlimited_ocr_census::v1_source_tensors());
+            write_sparse_two_shard_stand_in(&dir, &unlimited_ocr_census::v1_source_tensors(), &[]);
         assert_eq!(OcrModel::resolve_model(&dir).expect("resolves"), index);
 
         // v1 resharded in two is still v1 by census; the probe reads no payload.
@@ -6499,9 +6666,11 @@ mod tests {
         // The one inside the directory is judged, before any weight byte is read.
         let inside = dir.join("tokenizer.json");
         std::fs::write(&inside, SIDECAR_JSON).expect("inner sidecar");
-        let error = load_weights_from_resolved_model_after_validation(&index, || {
-            panic!("weights must not be read past a refused sidecar")
-        })
+        let error = load_weights_from_resolved_model_after_validation(
+            &index,
+            |_| Ok(()),
+            || panic!("weights must not be read past a refused sidecar"),
+        )
         .expect_err("a foreign sidecar is refused");
         let message = error.to_string();
         assert!(message.contains(&inside.display().to_string()), "{message}");
@@ -6521,6 +6690,260 @@ mod tests {
                 .expect("the real sidecar passes");
             assert!(tokenizer.is_some());
         }
+    }
+
+    /// U2-A7: a census-exact v2 checkpoint is identified, then refused (exit
+    /// 2) before its tokenizer sidecar is judged or a weight byte is read;
+    /// the resident daemon never serves it.
+    #[cfg(unix)]
+    #[test]
+    fn v2_is_refused_after_identification_before_its_sidecar_and_weights() {
+        let test = "v2_is_refused_after_identification_before_its_sidecar_and_weights";
+        let started = std::time::Instant::now();
+        let dir = temp_model_dir("v2_admission").join("checkpoint");
+        std::fs::create_dir_all(&dir).expect("checkpoint dir");
+        let index = write_sparse_v2_stand_in(&dir);
+        let arch = validate_model_header_file(&index).expect("the v2 census matches");
+        assert_eq!(arch.id(), model_arch::UNLIMITED_OCR_V2_ID);
+        assert_eq!(model_id_at(&dir), Some(model_arch::UNLIMITED_OCR_V2_ID));
+
+        // A foreign sidecar would refuse the open; the admission comes first.
+        // The hook panics rather than let a regression read 6.7 GB of zeros.
+        std::fs::write(dir.join("tokenizer.json"), SIDECAR_JSON).expect("foreign sidecar");
+        let error =
+            load_weights_from_resolved_model_after_validation(&index, admit_for_inference, || {
+                panic!("v2 weights must not be read past the admission")
+            })
+            .expect_err("v2 is refused");
+        let message = error.to_string();
+        assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
+        assert!(message.contains("unlimited-ocr-2"), "{message}");
+        assert!(
+            !message.contains("tokenizer"),
+            "the sidecar was not judged: {message}"
+        );
+
+        // Admitted, the same open reaches the sidecar check, still before weights.
+        let sidecar = load_weights_from_resolved_model_after_validation(
+            &index,
+            |_| Ok(()),
+            || panic!("weights must not be read past a refused sidecar"),
+        )
+        .expect_err("the foreign sidecar is refused")
+        .to_string();
+        assert!(sidecar.contains("tokenizer.json"), "{sidecar}");
+
+        // The public entry refuses the same way, exit 2.
+        let Err(public) = OcrModel::load(&dir) else {
+            panic!("OcrModel::load refuses v2");
+        };
+        assert_eq!(public.exit_code(), 2, "{public}");
+        assert!(public.to_string().contains("unlimited-ocr-2"), "{public}");
+        assert!(!resident_daemon_serves(&index));
+        v2_gated_line(
+            test,
+            started,
+            "sparse_v2_stand_in",
+            "assert",
+            "pass",
+            serde_json::json!({
+                "assertion": "identified as v2, refused exit 2 before sidecar and weights",
+                "pass": true, "exit_code": public.exit_code(), "message": message,
+                "weights_touched": false, "resident_daemon_serves": false,
+            }),
+        );
+
+        // Armed: the real artifacts identify from their headers alone, and
+        // only v2 is kept from the daemon.
+        if let Some(v1) = std::env::var_os("FOCR_MODEL_PATH").map(PathBuf::from) {
+            assert_eq!(model_id_at(&v1), Some(model_arch::UNLIMITED_OCR_V1_ID));
+            assert!(resident_daemon_serves(&v1));
+        }
+        if let Some(v2) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) {
+            assert_eq!(model_id_at(&v2), Some(model_arch::UNLIMITED_OCR_V2_ID));
+            assert!(!resident_daemon_serves(&v2.join(shards::SHARD_INDEX_NAME)));
+        }
+    }
+
+    /// An arch for routing tests: any decoder and variant, implemented or not.
+    struct RouteArch {
+        decoder: model_arch::Decoder,
+        variant: Option<model_arch::UnlimitedVariant>,
+        implemented: bool,
+    }
+
+    impl model_arch::ModelArch for RouteArch {
+        fn id(&self) -> &'static str {
+            "route-test"
+        }
+        fn display_name(&self) -> &'static str {
+            "route test"
+        }
+        fn license_notice(&self) -> &'static str {
+            "test"
+        }
+        fn default_artifact_basename(&self) -> &'static str {
+            "route-test.focrq"
+        }
+        fn vision_encoder(&self) -> model_arch::VisionEncoder {
+            model_arch::VisionEncoder::SamClip
+        }
+        fn decoder(&self) -> model_arch::Decoder {
+            self.decoder
+        }
+        fn tokenizer(&self) -> model_arch::TokenizerKind {
+            model_arch::TokenizerKind::DeepSeekBpe
+        }
+        fn decode_contract(&self) -> model_arch::DecodeContract {
+            model_arch::default_arch().decode_contract()
+        }
+        fn tasks(&self) -> &'static [model_arch::Task] {
+            &[model_arch::Task::Ocr]
+        }
+        fn implemented(&self) -> bool {
+            self.implemented
+        }
+        fn required_quant_recipe(&self, _quant: &str) -> Option<&'static str> {
+            None
+        }
+        fn unlimited_variant(&self) -> Option<model_arch::UnlimitedVariant> {
+            self.variant
+        }
+    }
+
+    /// U2-A7: every registered model routes explicitly; only v1 reaches v1's
+    /// forward or its multi-page loop, and no unknown pairing falls through.
+    #[test]
+    fn every_arch_routes_explicitly_and_only_v1_reaches_v1() {
+        use model_arch::{Decoder, UnlimitedVariant};
+        for arch in model_arch::registry() {
+            let single = forward_route(*arch);
+            let multi = multi_page_route(*arch);
+            match arch.id() {
+                model_arch::UNLIMITED_OCR_V1_ID => {
+                    assert_eq!(single.expect("v1 routes"), ForwardRoute::UnlimitedV1);
+                    multi.expect("v1 multi-page routes");
+                }
+                model_arch::UNLIMITED_OCR_V2_ID => {
+                    let single = single.expect_err("v2 has no forward yet").to_string();
+                    assert!(single.contains("U2-B5") && single.contains("never runs v1"));
+                    let multi = multi.expect_err("v2 has no document loop yet").to_string();
+                    assert!(multi.contains("U2-B6") && multi.contains("never runs v1"));
+                }
+                id => {
+                    let expected = match id {
+                        "got-ocr2" => Some(ForwardRoute::GotOcr2),
+                        "smolvlm2" => Some(ForwardRoute::SmolVlm2),
+                        "onechart" => Some(ForwardRoute::OneChart),
+                        "tromr" => Some(ForwardRoute::Tromr),
+                        _ => None,
+                    };
+                    match expected {
+                        Some(route) => assert_eq!(single.expect("zoo routes"), route, "{id}"),
+                        // A planned zoo model keeps its exit-1 NotImplemented.
+                        None => {
+                            let error = single.expect_err("planned");
+                            assert_eq!(error.exit_code(), 1, "{id}");
+                            assert!(error.to_string().contains("epic bd-3jo6"), "{error}");
+                        }
+                    }
+                    let multi = multi.expect_err("the zoo parses pages independently");
+                    assert!(multi.to_string().contains("parses pages independently"));
+                }
+            }
+        }
+
+        // Pairings no registered model has: never v1's forward or loop.
+        let pairs = [
+            (Decoder::DeepSeekV2MoeRswa, Some(UnlimitedVariant::V2SrSwa)),
+            (Decoder::DeepSeekV2MoeSrSwa, Some(UnlimitedVariant::V1Rswa)),
+            (Decoder::DeepSeekV2MoeRswa, None),
+            (Decoder::Qwen2Dense, None),
+        ];
+        for (decoder, variant) in pairs {
+            for implemented in [false, true] {
+                let arch = RouteArch {
+                    decoder,
+                    variant,
+                    implemented,
+                };
+                let route = forward_route(&arch);
+                assert!(
+                    !matches!(route, Ok(ForwardRoute::UnlimitedV1)),
+                    "{decoder:?}/{variant:?} reached v1's forward"
+                );
+                let error = route.expect_err("no route").to_string();
+                let expected = if implemented {
+                    "no forward wired"
+                } else {
+                    "not yet implemented"
+                };
+                assert!(error.contains(expected), "{error}");
+            }
+        }
+    }
+
+    /// U2-A7: a v2 model refuses each inference entry point at routing, before
+    /// any image is read; v1 over the same empty weights gets past routing.
+    #[test]
+    fn a_v2_model_refuses_every_entry_point_before_reading_its_input() {
+        let v2 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V2_ID).expect("v2 registered");
+        let model = OcrModel::assemble(
+            PathBuf::from("<route-test>"),
+            SidecarBundle::default(),
+            v2,
+            Weights::default(),
+            None,
+        );
+        let missing = Path::new("/nonexistent/franken_ocr_route_test_page.png");
+        let image = || image::DynamicImage::new_rgb8(4, 4);
+        let no_forward = |error: FocrError| {
+            assert!(matches!(error, FocrError::NotImplemented(_)), "{error:?}");
+            assert!(error.to_string().contains("U2-B5"), "{error}");
+        };
+        no_forward(model.forward(missing).expect_err("forward"));
+        no_forward(model.forward_dynamic(image()).expect_err("forward_dynamic"));
+        no_forward(model.recognize(missing).expect_err("recognize"));
+        for result in model.recognize_batch(&[missing, missing]) {
+            no_forward(result.expect_err("recognize_batch"));
+        }
+        let no_loop = |error: FocrError| {
+            assert!(matches!(error, FocrError::NotImplemented(_)), "{error:?}");
+            assert!(error.to_string().contains("U2-B6"), "{error}");
+        };
+        no_loop(
+            model
+                .recognize_multi_page(&[missing])
+                .expect_err("multi-page"),
+        );
+        no_loop(
+            model
+                .recognize_multi_page_dynamic(vec![image()])
+                .expect_err("multi-page dynamic"),
+        );
+        no_loop(
+            model
+                .recognize_multi_page_dynamic_streaming(vec![image()], &mut |_, _| {
+                    panic!("no page streams")
+                })
+                .expect_err("multi-page streaming"),
+        );
+
+        let v1 = OcrModel::assemble(
+            PathBuf::from("<route-test>"),
+            SidecarBundle::default(),
+            model_arch::default_arch(),
+            Weights::default(),
+            None,
+        );
+        assert!(matches!(
+            v1.forward(missing),
+            Err(FocrError::InputDecode(_))
+        ));
+        assert!(matches!(
+            v1.recognize_multi_page(&[missing]),
+            Err(FocrError::InputDecode(_))
+        ));
     }
 
     /// One NDJSON log line of a model-gated v2 test (`scripts/check_test_logs.py`).
@@ -7423,9 +7846,13 @@ mod tests {
 
         std::fs::write(dir.join("tokenizer.json"), SIDECAR_JSON).expect("write foreign sidecar");
         let mut read_weights = false;
-        let message = load_weights_from_resolved_model_after_validation(&link, || {
-            read_weights = true;
-        })
+        let message = load_weights_from_resolved_model_after_validation(
+            &link,
+            |_| Ok(()),
+            || {
+                read_weights = true;
+            },
+        )
         .expect_err("foreign sidecar refused")
         .to_string();
         assert!(!read_weights, "refused before any weight byte was read");

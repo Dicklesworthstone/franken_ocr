@@ -220,5 +220,10 @@
   "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "schema_version": 1,
   "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`",
-  "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr"
+  "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
+  "warning_kinds": [
+    "v1_truncated",
+    "v1_page_merge",
+    "ignored_lever"
+  ]
 }

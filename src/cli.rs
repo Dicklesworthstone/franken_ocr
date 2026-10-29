@@ -2275,6 +2275,11 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     let count = args.images.len();
     let total = std::time::Instant::now();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(count);
+    // A model with a lever policy is admitted once here, so its refusal is
+    // the run's exit code (U2-A7); held, it serves every image below.
+    let _policed = native_engine::load_if_policed(
+        &model.clone().unwrap_or_else(crate::OcrEngine::model_path),
+    )?;
 
     if args.multi_page {
         // ONE cross-page document pass (bd-1gv.25): page N attends to pages
@@ -2416,14 +2421,17 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             args.model_id
         ))
     })?;
-    let census = arch.tensor_census();
-    if let Some(census) = census {
-        native_engine::unlimited_ocr_census::validate_conversion_shard_count(census, shard_count)?;
-    }
     let convert_quant = match args.quant {
         QuantTarget::Int8 => quant::convert::ConvertQuant::Int8,
         QuantTarget::Int4 => quant::convert::ConvertQuant::Int4,
     };
+    if convert_quant == quant::convert::ConvertQuant::Int4 {
+        quant::convert::ensure_int4_recipe(arch)?;
+    }
+    let census = arch.tensor_census();
+    if let Some(census) = census {
+        native_engine::unlimited_ocr_census::validate_conversion_shard_count(census, shard_count)?;
+    }
     if convert_quant == quant::convert::ConvertQuant::Int4 && shard_count != 1 {
         return Err(FocrError::NotImplemented(format!(
             "focr convert --quant int4 (the wasm recipe) needs a single-shard source; {} has \

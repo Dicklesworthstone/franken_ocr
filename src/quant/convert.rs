@@ -201,6 +201,25 @@ pub fn stamped_quant_recipe(arch: &dyn ModelArch, quant: ConvertQuant) -> Option
     }
 }
 
+/// Refuse `--quant int4` for an `arch` without a certified int4 recipe: only
+/// v1 Unlimited-OCR has one (the wasm recipe). `focr convert` calls this as
+/// soon as `--model-id` resolves, before reading any shard (U2-A7).
+///
+/// # Errors
+/// [`FocrError::NotImplemented`] for every other arch, Unlimited-OCR-2
+/// included.
+pub fn ensure_int4_recipe(arch: &dyn ModelArch) -> FocrResult<()> {
+    if arch.unlimited_variant() == Some(UnlimitedVariant::V1Rswa) {
+        return Ok(());
+    }
+    Err(FocrError::NotImplemented(format!(
+        "focr convert --quant int4 implements only the Unlimited-OCR wasm recipe \
+         {UNLIMITED_OCR_WASM_INT4_RECIPE_ID:?}; --model-id {:?} has no certified int4 \
+         recipe (use --quant int8)",
+        arch.id()
+    )))
+}
+
 /// Convert a loaded raw-safetensors [`Weights`] into a self-contained `.focrq`
 /// blob (preamble + header JSON + payload), ready to write to disk.
 ///
@@ -484,14 +503,7 @@ fn wasm_int4_to_focrq(
     arch: &dyn ModelArch,
     calib: Option<&CalibStats>,
 ) -> FocrResult<Vec<u8>> {
-    if arch.unlimited_variant() != Some(UnlimitedVariant::V1Rswa) {
-        return Err(FocrError::NotImplemented(format!(
-            "focr convert --quant int4 implements only the Unlimited-OCR wasm recipe \
-             {UNLIMITED_OCR_WASM_INT4_RECIPE_ID:?}; --model-id {:?} has no certified int4 \
-             recipe (use --quant int8)",
-            arch.id()
-        )));
-    }
+    ensure_int4_recipe(arch)?;
     if arch_target != 0 {
         return Err(FocrError::Usage(format!(
             "focr convert --quant int4 targets the wasm runtime: only --arch generic \
@@ -1684,6 +1696,25 @@ mod tests {
         let err = safetensors_to_focrq(&w, ConvertQuant::Int4, 1, [0u8; 32], arch)
             .expect_err("non-generic arch_target int4 must be refused");
         assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+    }
+
+    /// U2-A7: the v1 wasm int4 recipe never applies to Unlimited-OCR-2, and
+    /// nothing is stamped for it.
+    #[test]
+    fn int4_refuses_unlimited_ocr_2() {
+        let v2 = crate::native_engine::model_arch::arch_by_id("unlimited-ocr-2").unwrap();
+        let err = ensure_int4_recipe(v2).expect_err("v2 has no int4 recipe");
+        assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
+        assert!(err.to_string().contains("\"unlimited-ocr-2\""), "{err}");
+        assert_eq!(stamped_quant_recipe(v2, ConvertQuant::Int4), None);
+
+        let w = Weights::from_bytes(synthetic_wasm_safetensors()).expect("wasm parse");
+        let err = safetensors_to_focrq(&w, ConvertQuant::Int4, 0, [0u8; 32], v2)
+            .expect_err("the converter refuses v2 int4 itself");
+        assert!(matches!(err, FocrError::NotImplemented(_)), "got {err:?}");
+
+        let v1 = crate::native_engine::model_arch::arch_by_id("unlimited-ocr").unwrap();
+        assert!(ensure_int4_recipe(v1).is_ok());
     }
 
     // ── B2: arch-aware GOT-OCR2 convert ──────────────────────────────────────

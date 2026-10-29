@@ -879,6 +879,26 @@ pub(super) fn v1_source_tensors() -> Vec<(String, DType, Vec<usize>)> {
         .collect()
 }
 
+/// [`v1_source_tensors`] for the v2 census, plus its I64 tensors (`arange`
+/// content) as `(name, shape)`.
+#[cfg(test)]
+pub(super) fn v2_source_tensors() -> (
+    Vec<(String, DType, Vec<usize>)>,
+    Vec<(&'static str, &'static [usize])>,
+) {
+    let tensors = v2_census()
+        .expect("embedded v2 delta verifies")
+        .tensors
+        .iter()
+        .map(|(name, tensor)| (name.clone(), tensor.source_dtype, tensor.shape.clone()))
+        .collect();
+    let int64 = V2_INT64_RULES
+        .iter()
+        .map(|rule| (rule.name, rule.shape))
+        .collect();
+    (tensors, int64)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Read;
@@ -1015,6 +1035,12 @@ mod tests {
             added
                 .iter()
                 .all(|name| v2.tensors[*name].source_dtype == DType::BF16)
+        );
+        // No router or indexer tensor is ever quantized (U2-C3's recipe).
+        assert!(
+            added
+                .iter()
+                .all(|name| v2.tensors[*name].storage_dtype == DType::BF16)
         );
         assert_eq!(v2.vision_identity_sha256.len(), V2_VISION_TENSOR_COUNT);
         assert!(

@@ -1806,3 +1806,302 @@ fn v1_single_page_reports_finish_reason_when_armed() {
         );
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// U2-A7: Unlimited-OCR-2 is fail-closed through the CLI (no weights needed).
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A census-exact Unlimited-OCR-2 raw checkpoint, built from the committed
+/// census files: one safetensors file whose payload is sparse (zeros) except
+/// the I64 `position_ids` (`arange`). Its header identifies it as v2, and no
+/// weight byte is ever read, because the run is refused first.
+fn write_sparse_v2_stand_in(dir: &Path) -> PathBuf {
+    use std::io::{Seek as _, SeekFrom, Write as _};
+    let census = |name: &str| -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/native_engine")
+            .join(name);
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read census manifest"))
+            .expect("census manifest parses")
+    };
+    let v1 = census("unlimited_ocr_manifest.json");
+    let delta = census("unlimited_ocr_2_manifest.json");
+    let mut tensors = std::collections::BTreeMap::new();
+    for table in [&v1["tensors"], &delta["added_tensors"]] {
+        for (name, tensor) in table.as_object().expect("tensor table") {
+            let dtype = tensor["source_dtype"]
+                .as_str()
+                .expect("source_dtype")
+                .to_owned();
+            let shape: Vec<u64> = serde_json::from_value(tensor["shape"].clone()).expect("shape");
+            tensors.insert(name.clone(), (dtype, shape));
+        }
+    }
+    let mut entries = Vec::new();
+    let mut offset = 0u64;
+    for (name, (dtype, shape)) in &tensors {
+        let elem = match dtype.as_str() {
+            "F32" => 4,
+            "F16" | "BF16" => 2,
+            other => panic!("a source census holds no {other} tensor"),
+        };
+        let len = shape.iter().product::<u64>() * elem;
+        entries.push(format!(
+            r#""{name}":{{"dtype":"{dtype}","shape":{shape:?},"data_offsets":[{offset},{}]}}"#,
+            offset + len
+        ));
+        offset += len;
+    }
+    let mut aranges = Vec::new();
+    for (name, rule) in delta["int64_tensors"].as_object().expect("int64 table") {
+        assert_eq!(rule["content"], "arange", "{name}");
+        let shape: Vec<u64> = serde_json::from_value(rule["shape"].clone()).expect("shape");
+        let count = shape.iter().product::<u64>();
+        entries.push(format!(
+            r#""{name}":{{"dtype":"I64","shape":{shape:?},"data_offsets":[{offset},{}]}}"#,
+            offset + count * 8
+        ));
+        aranges.push((offset, count));
+        offset += count * 8;
+    }
+    let header = format!("{{{}}}", entries.join(","));
+    let path = dir.join("unlimited-ocr-2-stand-in.safetensors");
+    let mut file = std::fs::File::create(&path).expect("create stand-in");
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .expect("write prefix");
+    file.write_all(header.as_bytes()).expect("write header");
+    file.set_len(8 + header.len() as u64 + offset)
+        .expect("sparse payload");
+    for (start, count) in aranges {
+        let bytes: Vec<u8> = (0..count as i64).flat_map(i64::to_le_bytes).collect();
+        file.seek(SeekFrom::Start(8 + header.len() as u64 + start))
+            .expect("seek to the I64 tensor");
+        file.write_all(&bytes).expect("write arange");
+    }
+    path
+}
+
+/// Run `focr` with exactly `envs` among the `FOCR_*` variables: the caller's
+/// own `FOCR_*` settings would otherwise steer the lever policy.
+fn run_focr_only(bin: &Path, args: &[&str], envs: &[(&str, String)]) -> CliOut {
+    let mut command = Command::new(bin);
+    command.args(args);
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("FOCR_") {
+            command.env_remove(key);
+        }
+    }
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let out = command
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", bin.display()));
+    CliOut {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    }
+}
+
+/// U2-A7: through the CLI, an Unlimited-OCR-2 checkpoint is refused with exit
+/// 2 before its weights load. An armed unsupported lever is named; an ignored
+/// lever is a one-line stderr warning; with no lever, the message says v2 is
+/// registered but not implemented. The resident daemon is never spawned.
+#[test]
+fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
+    const TEST: &str = "cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever";
+    const NOT_IMPLEMENTED: &str =
+        "unlimited-ocr-2 is registered but not yet implemented in this build";
+    let Some(bin) = focr_bin() else {
+        log_success(
+            TEST,
+            "no_bin",
+            "focr binary not built; CLI lever matrix deferred",
+        );
+        return;
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("focr_e2e_uocr2_{}_{nanos}", std::process::id()));
+    let resident_dir = dir.join("resident");
+    std::fs::create_dir_all(&resident_dir).expect("create temp dirs");
+    let model = write_sparse_v2_stand_in(&dir);
+    let model = model.display().to_string();
+    let image = write_tiny_png();
+    let image = image.display().to_string();
+
+    // (case, extra args, env, the lever refused, the levers warned about)
+    let cases: [(&str, &[&str], &[(&str, &str)], Option<&str>, &[&str]); 8] = [
+        ("bare", &["ocr"], &[], None, &[]),
+        (
+            "prefill_chunk",
+            &["ocr"],
+            &[("FOCR_PREFILL_CHUNK", "64")],
+            Some("FOCR_PREFILL_CHUNK"),
+            &[],
+        ),
+        (
+            "decode_int8",
+            &["ocr"],
+            &[("FOCR_DECODE_INT8", "1")],
+            Some("FOCR_DECODE_INT8"),
+            &[],
+        ),
+        (
+            "lmhead_shard_zero",
+            &["ocr"],
+            &[("FOCR_LMHEAD_SHARD", "0")],
+            Some("FOCR_LMHEAD_SHARD"),
+            &[],
+        ),
+        (
+            "batch_spine_off",
+            &["ocr"],
+            &[("FOCR_BATCH_SPINE", "0")],
+            None,
+            &["FOCR_BATCH_SPINE"],
+        ),
+        (
+            "ignored_levers",
+            &["ocr"],
+            &[
+                ("FOCR_QKV_FUSED", "0"),
+                ("FOCR_RUNAWAY_GUARD", "maybe"),
+                ("FOCR_THREADS", "2"),
+            ],
+            None,
+            &["FOCR_QKV_FUSED", "FOCR_RUNAWAY_GUARD"],
+        ),
+        (
+            "robot_batch_spine",
+            &["ocr", "--robot"],
+            &[("FOCR_BATCH_SPINE", "1")],
+            Some("FOCR_BATCH_SPINE"),
+            &[],
+        ),
+        (
+            "ocr_batch_full_int8",
+            &["ocr-batch", "--experimental-full-int8"],
+            &[("FOCR_INT8_ATTN", "1"), ("FOCR_INT8_LMHEAD", "1")],
+            Some("--experimental-full-int8"),
+            &["FOCR_INT8_ATTN", "FOCR_INT8_LMHEAD"],
+        ),
+    ];
+    for (case, command, levers, refused, warned) in cases {
+        let mut args: Vec<&str> = command.to_vec();
+        args.extend([image.as_str(), "--model", model.as_str()]);
+        let mut envs: Vec<(&str, String)> = vec![
+            ("FOCR_RESIDENT_DIR", resident_dir.display().to_string()),
+            // Were a daemon spawned anyway, it would not linger.
+            ("FOCR_RESIDENT_IDLE_SECS", "2".into()),
+            // A safety net only: were the gate bypassed, the sparse payload
+            // would be mapped, not copied into memory.
+            ("FOCR_MMAP", "1".into()),
+        ];
+        envs.extend(
+            levers
+                .iter()
+                .map(|(key, value)| (*key, (*value).to_owned())),
+        );
+        let started = Instant::now();
+        let out = run_focr_only(&bin, &args, &envs);
+        let elapsed_us = started.elapsed().as_micros();
+        let robot = command.contains(&"--robot");
+        let message = if robot {
+            let events: Vec<serde_json::Value> = out
+                .stdout
+                .lines()
+                .map(|l| {
+                    serde_json::from_str(l).unwrap_or_else(|e| panic!("{case}: stdout {l:?}: {e}"))
+                })
+                .collect();
+            let error = events
+                .iter()
+                .find(|v| v["event"] == "run_error")
+                .unwrap_or_else(|| panic!("{case}: no run_error: {}", out.stdout));
+            assert_eq!(error["code"], 2, "{case}: {error}");
+            error["message"].as_str().unwrap_or_default().to_owned()
+        } else {
+            out.stderr.clone()
+        };
+        let warning_lines: Vec<&str> = out
+            .stderr
+            .lines()
+            .filter(|l| l.starts_with("[focr] warning: FOCR_"))
+            .collect();
+        let mut pass = out.code == Some(2) && warning_lines.len() == warned.len();
+        match refused {
+            Some(lever) => {
+                pass &= message.contains(&format!("{lever} is not supported for unlimited-ocr-2"))
+                    && !message.contains(NOT_IMPLEMENTED);
+            }
+            None => pass &= message.contains(NOT_IMPLEMENTED),
+        }
+        for lever in warned {
+            pass &= warning_lines
+                .iter()
+                .any(|l| l.contains(&format!("{lever} has no effect on unlimited-ocr-2")));
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1, "ts": 0.0, "test": TEST, "case": case, "run_seq": 0,
+                "event": "assert", "result": if pass { "pass" } else { "fail" },
+                "assertion": "v2 refused exit 2 before weights; levers named or warned",
+                "pass": pass, "arch": "unlimited-ocr-2", "args": args, "levers": levers,
+                "expected_refused": refused, "expected_warned": warned,
+                "exit_code": out.code, "message": message.trim(),
+                "warning_lines": warning_lines, "elapsed_us": elapsed_us,
+                "weights_touched": false,
+            })
+        );
+        assert!(
+            pass,
+            "{case}: exit {:?}\nstdout:\n{}\nstderr:\n{}",
+            out.code, out.stdout, out.stderr
+        );
+    }
+    let spawned: Vec<_> = std::fs::read_dir(&resident_dir)
+        .expect("read resident dir")
+        .collect();
+    assert!(
+        spawned.is_empty(),
+        "a resident daemon was spawned for v2: {spawned:?}"
+    );
+
+    // The v1 wasm int4 recipe is refused for v2 by arch, before any shard is
+    // read (exit 1, as for every model without a certified int4 recipe).
+    let output = dir.join("v2.int4.focrq").display().to_string();
+    let args = [
+        "convert",
+        model.as_str(),
+        "--output",
+        output.as_str(),
+        "--quant",
+        "int4",
+        "--model-id",
+        "unlimited-ocr-2",
+    ];
+    let started = Instant::now();
+    let out = run_focr_only(&bin, &args, &[]);
+    let pass = out.code == Some(1)
+        && out
+            .stderr
+            .contains("--model-id \"unlimited-ocr-2\" has no certified int4 recipe")
+        && !Path::new(&output).exists();
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema_version": 1, "ts": 0.0, "test": TEST, "case": "convert_int4", "run_seq": 0,
+            "event": "assert", "result": if pass { "pass" } else { "fail" },
+            "assertion": "v2 int4 convert refused by arch before any shard is read",
+            "pass": pass, "arch": "unlimited-ocr-2", "args": args, "exit_code": out.code,
+            "message": out.stderr.trim(), "elapsed_us": started.elapsed().as_micros(),
+            "weights_touched": false,
+        })
+    );
+    assert!(pass, "convert_int4: exit {:?}\n{}", out.code, out.stderr);
+}
