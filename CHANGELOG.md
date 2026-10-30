@@ -269,6 +269,31 @@ sections as they land.
     50 ids exactly. On the two-page S3 it first differs at step 73, a near-tie
     (logit gap 0.065) that the all-f32 path resolves like the reference. That
     gap is U2-C2's to close.
+- **Unlimited-OCR-2 windowed decoding core** (bead U2-D1a), a library API
+  (`OcrModel::decode_document_windowed`) that U2-D1b wires into the CLI. A
+  document longer than one window decodes as windows of W own pages
+  (default 10), with SGLang's semantics, so memory stays bounded at any length.
+  - Every window but the last also reads the next window's first page and ends
+    on the `<PAGE>` that would open it. Vision runs once per page: the
+    lookahead page's block is carried into the next window.
+  - A later window reuses its predecessor's tail. It copies that window's last
+    page marker, its 128–159-row image tail and the lookahead page, prefills
+    only its new pages, splices in the last ≤ 128 ids of text, and decodes from
+    a forced `<PAGE>`. Copied keys keep their rotation, because the page base
+    keeps each row's page parity. The forced ids are hidden and count for the
+    n-gram ban and the guard.
+  - A window that cannot reuse is recomputed from its full prompt, and the
+    reason is recorded. Only a recomputed last window bans `<PAGE>` on its last
+    page (DISC-U2-3). The rows a successor copies are pinned against block
+    retirement.
+  - Each window yields exactly its own pages. A spent
+    `FOCR_STAGE_BUDGET_FORWARD_MS` (per page, scaled by the window's pages)
+    stops the document as `budget` with the pages done.
+  - Per-window statistics go to `FOCR_TIMING`, with no robot event yet (U2-D5).
+  - On the f32 cache, every window's forced and generated ids equal the
+    independent windowed oracle's (U2-D2a), retirement on. This covers W = 2
+    and 3, the one-page variant, a marker-only splice, and three forced
+    recomputes.
 - **Directory input, and documents read one page at a time** (bead U2-D0).
   - `focr ocr ./pages/` reads a directory of page images as one document, in
     natural order (`p2.png` before `p10.png`). `--pages`, `--split-spreads`
