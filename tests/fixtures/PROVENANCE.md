@@ -57,6 +57,15 @@ absent — committed here would be multi-GB:
   around every `<PAGE>`. `f32/t12` is the oracle; the other tags exist for the floor
   and the bf16 ledger. Verify with
   `scripts/check_oracle_provenance.py --uocr2-dumps $FOCR_FIXTURES_DIR/uocr2_oracle`,
+* the S1-corpus references (U2-C4's corpus gate, `uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline`):
+  * v2: `uocr2_oracle/f32/t12/S1C-page_*`, one base page per corpus page, from
+    `python -I scripts/gen_reference_fixtures_uocr2.py --model-dir <v2 HF snapshot> --out $FOCR_FIXTURES_DIR/uocr2_oracle --sets S1C --dtype f32 --threads 12 --tag t12`
+    in the v2 oracle venv. Not committed, so no FLOOR coverage is needed. `S1C-page_0009`, `_0014` and `_0590` repeat
+    the S1 fixtures' token SHA-256s.
+  * v1: `v1_oracle_s1c/f32/page_*_reference.json`, from
+    `python -I scripts/gen_reference_fixtures.py --model-dir <v1 HF snapshot> --corpus <corpus pages> --out $FOCR_FIXTURES_DIR/v1_oracle_s1c/f32 --mode base --device cpu --cpu-patch --f32`
+    on the pinned v1 stack (torch 2.10.0, transformers 4.57.1). The remote code also imports matplotlib, requests and
+    tqdm. `HF_MODULES_CACHE` must name a writable directory.
 * `<zoo>/{got,smolvlm2,onechart}_*.bin|npz` seams,
 * `<zoo>/tromr_preproc.bin` + `tromr_seam_*.bin` + `tromr_oracle_fixtures.json`
   (floors 0.0 recorded in-file; `scripts/gen_reference_fixtures_tromr.py`).
