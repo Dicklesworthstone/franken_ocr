@@ -31,6 +31,16 @@
 //! onto [`pil_resample`], a Pillow-bit-exact fixed-point BICUBIC, for L0 EXACT
 //! oracle comparison. The default stays CatmullRom (byte-identical to the
 //! pre-DISC-001 pipeline, doctrine #2).
+//!
+//! **Per-model rules ([`PreprocessProfile`], U2-B7).** Unlimited-OCR-2 keeps
+//! v1's views, pad and normalization (`MU:531-580`), with three differences:
+//! - gundam grids hold at most 16 tiles, not 32;
+//! - no tiles when both sides are at most the tile size (v1 compares with 640);
+//! - every resize takes the PIL-exact kernel, so L0 is exact whatever
+//!   `FOCR_RESAMPLE` says.
+//!
+//! A v2 document page is the same 1024 letterbox as a single page; the 640
+//! squash ([`preprocess_dynamic_squash`]) is v1's alone.
 
 pub mod pil_resample;
 pub mod staff_detect;
@@ -64,10 +74,13 @@ pub const GUNDAM_TILE_SIZE: usize = 640;
 pub const MIN_NUM: usize = 2;
 /// Gundam `dynamic_preprocess` maximum tile count ([SPEC-024], OQ-7).
 pub const MAX_NUM: usize = 32;
+/// Unlimited-OCR-2's gundam maximum tile count (`max_crops=16`, `MU:229,1043`).
+pub const V2_MAX_NUM: usize = 16;
 
-/// The crop short-circuit threshold: an image `<= 640` in BOTH dims gets
+/// The v1 crop short-circuit threshold: an image `<= 640` in BOTH dims gets
 /// `crop_ratio=[1,1]` (no local tiling) ([SPEC-023],
-/// `modeling_unlimitedocr.py:859`).
+/// `modeling_unlimitedocr.py:859`). v2 compares with the tile size instead
+/// (`MU:554`).
 pub const CROP_THRESHOLD: u32 = 640;
 
 /// Gray pad fill value, `int(0.5 * 255) = 127` per channel ([SPEC-022],
@@ -131,6 +144,50 @@ impl PreprocessMode {
             PreprocessMode::Base { base_size } | PreprocessMode::Gundam { base_size, .. } => {
                 base_size
             }
+        }
+    }
+}
+
+/// Which model's preprocessing rules apply (U2-B7). The engine picks it from
+/// the arch; nothing here reads it from the environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreprocessProfile {
+    /// Unlimited-OCR v1, and every caller that is not v2. Gundam grids hold up
+    /// to [`MAX_NUM`] tiles, an image within [`CROP_THRESHOLD`] on both sides
+    /// gets none, and every resize takes the kernel [`resample_kind`] selects
+    /// (CatmullRom unless `FOCR_RESAMPLE`, DISC-001).
+    V1,
+    /// Unlimited-OCR-2 (`MU:531-580`). Gundam grids hold up to
+    /// [`V2_MAX_NUM`] tiles, an image within the tile size on both sides gets
+    /// none, and every resize takes the PIL-exact bicubic kernel, whatever
+    /// `FOCR_RESAMPLE` says. A document page is a base view like a single page.
+    V2,
+}
+
+impl PreprocessProfile {
+    /// The largest gundam grid, in tiles.
+    #[must_use]
+    pub fn max_num(self) -> usize {
+        match self {
+            PreprocessProfile::V1 => MAX_NUM,
+            PreprocessProfile::V2 => V2_MAX_NUM,
+        }
+    }
+
+    /// The kernel every resize under this profile takes.
+    #[must_use]
+    pub fn resample_kind(self) -> ResampleKind {
+        match self {
+            PreprocessProfile::V1 => resample_kind(),
+            PreprocessProfile::V2 => ResampleKind::PilBicubic,
+        }
+    }
+
+    /// The edge an image may not exceed on either side to skip gundam tiling.
+    fn crop_threshold(self, tile: u32) -> u32 {
+        match self {
+            PreprocessProfile::V1 => CROP_THRESHOLD,
+            PreprocessProfile::V2 => tile,
         }
     }
 }
@@ -283,7 +340,8 @@ impl Preprocessed {
 
 // ── public entrypoints ───────────────────────────────────────────────────
 
-/// Decode + normalize + tile a document image at `path` for `mode`.
+/// Decode + normalize + tile a document image at `path` for `mode`, under
+/// `profile`'s rules.
 ///
 /// Decodes the image (EXIF-transposed, RGB), builds the global view (and, in
 /// Gundam mode, the local tile grid), normalizes every view to `[-1, 1]`, and
@@ -291,18 +349,27 @@ impl Preprocessed {
 ///
 /// # Errors
 /// [`FocrError::InputDecode`] if the file cannot be opened/decoded.
-pub fn preprocess_image(path: &Path, mode: PreprocessMode) -> FocrResult<Preprocessed> {
+pub fn preprocess_image(
+    path: &Path,
+    mode: PreprocessMode,
+    profile: PreprocessProfile,
+) -> FocrResult<Preprocessed> {
     let img = decode_path(path)?;
-    preprocess_dynamic(img, mode)
+    preprocess_dynamic(img, mode, profile)
 }
 
-/// Decode + normalize + tile a document image from raw `bytes` for `mode`.
+/// Decode + normalize + tile a document image from raw `bytes` for `mode`,
+/// under `profile`'s rules.
 ///
 /// # Errors
 /// [`FocrError::InputDecode`] if the bytes cannot be decoded.
-pub fn preprocess_bytes(bytes: &[u8], mode: PreprocessMode) -> FocrResult<Preprocessed> {
+pub fn preprocess_bytes(
+    bytes: &[u8],
+    mode: PreprocessMode,
+    profile: PreprocessProfile,
+) -> FocrResult<Preprocessed> {
     let img = decode_bytes(bytes)?;
-    preprocess_dynamic(img, mode)
+    preprocess_dynamic(img, mode, profile)
 }
 
 /// Core pipeline over an already-decoded (EXIF-applied, any color) image.
@@ -311,17 +378,21 @@ pub fn preprocess_bytes(bytes: &[u8], mode: PreprocessMode) -> FocrResult<Prepro
 /// without touching the filesystem ([SPEC-022..031]), and so an in-memory image
 /// (e.g. a PDF page rasterized by [`crate::pdf`]) can enter the pipeline without
 /// a temp file, identically to a decoded file.
-pub fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult<Preprocessed> {
+pub fn preprocess_dynamic(
+    img: DynamicImage,
+    mode: PreprocessMode,
+    profile: PreprocessProfile,
+) -> FocrResult<Preprocessed> {
     let original_size = img.dimensions();
     let validated = validate_mode(mode)?;
 
     // Global view: aspect-preserving resize + gray pad to base_size² ([SPEC-022]).
-    let global_img = pad_to_square(&img, validated.base_size);
+    let global_img = pad_to_square(&img, validated.base_size, profile.resample_kind());
     let global = view_tensor(&global_img);
 
     let (tiles, crop_grid) = match mode {
         PreprocessMode::Base { .. } => (Vec::new(), CropGrid::single()),
-        PreprocessMode::Gundam { .. } => build_gundam_tiles(&img, validated.tile_size)?,
+        PreprocessMode::Gundam { .. } => build_gundam_tiles(&img, validated.tile_size, profile)?,
     };
 
     Ok(Preprocessed {
@@ -333,7 +404,8 @@ pub fn preprocess_dynamic(img: DynamicImage, mode: PreprocessMode) -> FocrResult
     })
 }
 
-/// Multi-page per-page preprocess (bd-1gv.25/bd-1gv.26): the reference
+/// Unlimited-OCR v1's multi-page per-page preprocess (bd-1gv.25/bd-1gv.26;
+/// v2 letterboxes each page instead, [`PreprocessProfile::V2`]): the reference
 /// `infer_multi` SQUASHES each page to `size × size` when `image_size <= 640`
 /// (`image.resize((image_size, image_size))` — aspect-DESTROYING, unlike the
 /// single-image Base mode's aspect-preserving `ImageOps.pad`), then the
@@ -470,7 +542,8 @@ fn decode_reader<R: std::io::BufRead + std::io::Seek>(
 /// Kill-switch for the L0 resampling kernel (DISC-001, bd-30me). Unset (the
 /// default) keeps the shipped [`FilterType::CatmullRom`]; `pil-bicubic`
 /// restores the reference-bit-exact Pillow BICUBIC ([`pil_resample`]) at every
-/// resize site, for L0 EXACT comparison against the torch/PIL oracle.
+/// resize site, for L0 EXACT comparison against the torch/PIL oracle. Only the
+/// v1 profile reads it: [`PreprocessProfile::V2`] always takes the PIL kernel.
 pub const RESAMPLE_ENV: &str = "FOCR_RESAMPLE";
 
 /// Which resampling kernel the preprocess resize sites use (see
@@ -534,11 +607,11 @@ fn resample_exact_with(kind: ResampleKind, img: &DynamicImage, w: u32, h: u32) -
 /// center-pad the short axis with the mean gray color `(127,127,127)`
 /// ([SPEC-022], `modeling_unlimitedocr.py:872-873`).
 ///
-/// PIL `ImageOps.pad` uses `BICUBIC` resampling by default; the default kernel
-/// here is `CatmullRom` (DISC-001; `FOCR_RESAMPLE=pil-bicubic` restores the
-/// bit-exact reference). The pad geometry (fit + centered placement + gray
-/// fill) is exact.
-fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
+/// PIL `ImageOps.pad` uses `BICUBIC` resampling by default; `kernel` is the
+/// profile's (v1: `CatmullRom` unless `FOCR_RESAMPLE=pil-bicubic`, DISC-001;
+/// v2: always the bit-exact PIL kernel). The pad geometry (fit + centered
+/// placement + gray fill) is exact.
+fn pad_to_square(img: &DynamicImage, size: u32, kernel: ResampleKind) -> DynamicImage {
     let (w, h) = img.dimensions();
     // Aspect-preserving fit: scale so the longer side == size.
     // (w, h) -> (rw, rh) with max(rw, rh) == size, preserving ratio, >= 1px.
@@ -551,7 +624,7 @@ fn pad_to_square(img: &DynamicImage, size: u32) -> DynamicImage {
         let rw = pillow_fit_edge(w, h, size);
         (rw, size)
     };
-    let resized = resample_exact(img, rw, rh).to_rgb8();
+    let resized = resample_exact_with(kernel, img, rw, rh).to_rgb8();
 
     // Center on a gray canvas.
     let mut canvas = image::RgbImage::from_pixel(size, size, image::Rgb([PAD_FILL; 3]));
@@ -598,30 +671,36 @@ fn round_ties_even_positive(value: f64) -> u32 {
 // ── Gundam tiling ([SPEC-024], OQ-7) ─────────────────────────────────────────
 
 /// Build the Gundam local tiles + chosen crop grid for an image ([SPEC-023/024],
-/// OQ-7).
+/// OQ-7), under `profile`'s rules.
 ///
-/// If the image is `<= 640` in BOTH dims, returns no tiles and a 1×1 grid (the
-/// short-circuit at `modeling_unlimitedocr.py:859`). Otherwise selects the grid
-/// via [`find_closest_aspect_ratio`], resizes to `(tile*W, tile*H)`, and slices
-/// a row-major `W×H` grid of `tile×tile` tiles ([SPEC-024],
+/// If the image is within the profile's crop threshold in BOTH dims, returns
+/// no tiles and a 1×1 grid (the short-circuit at `modeling_unlimitedocr.py:859`;
+/// v2 `MU:554`). Otherwise selects the grid via [`find_closest_aspect_ratio`]
+/// over the profile's candidates, resizes to `(tile*W, tile*H)`, and slices a
+/// row-major `W×H` grid of `tile×tile` tiles ([SPEC-024],
 /// `modeling_unlimitedocr.py:192-208`).
-fn build_gundam_tiles(img: &DynamicImage, tile: u32) -> FocrResult<(Vec<ViewTensor>, CropGrid)> {
+fn build_gundam_tiles(
+    img: &DynamicImage,
+    tile: u32,
+    profile: PreprocessProfile,
+) -> FocrResult<(Vec<ViewTensor>, CropGrid)> {
     let (w, h) = img.dimensions();
-    if w <= CROP_THRESHOLD && h <= CROP_THRESHOLD {
+    let threshold = profile.crop_threshold(tile);
+    if w <= threshold && h <= threshold {
         // No crop ([SPEC-023]): crop_ratio = [1, 1], no local tiles.
         return Ok((Vec::new(), CropGrid::single()));
     }
 
-    let ratios = candidate_ratios(MIN_NUM, MAX_NUM);
+    let ratios = candidate_ratios(MIN_NUM, profile.max_num());
     let (wc, hc) = find_closest_aspect_ratio(w as f64 / h as f64, &ratios, w, h, tile);
 
     // Resize to (tile*W, tile*H), then crop a row-major W×H grid of tiles.
     let target_w = checked_tile_extent(tile, wc, "width")?;
     let target_h = checked_tile_extent(tile, hc, "height")?;
-    // PIL `image.resize((W,H))` default resample is BICUBIC; the default kernel
-    // here is CatmullRom (DISC-001; FOCR_RESAMPLE=pil-bicubic restores the
-    // bit-exact reference). Tile geometry (crop boxes) is exact.
-    let resized = resample_exact(img, target_w, target_h);
+    // PIL `image.resize((W,H))` default resample is BICUBIC; the kernel is the
+    // profile's (v1 CatmullRom unless FOCR_RESAMPLE, DISC-001; v2 PIL-exact).
+    // Tile geometry (crop boxes) is exact.
+    let resized = resample_exact_with(profile.resample_kind(), img, target_w, target_h);
 
     let cols = wc; // target_width // tile
     let blocks = wc * hc;
@@ -1216,10 +1295,11 @@ mod tests {
         let page = textured(1182, 1837, 7);
         let strip = textured(300, 6000, 11);
         let small = textured(500, 400, 13);
+        let v1 = PreprocessProfile::V1;
         let digests = [
             (
                 "page_base",
-                preprocess_dynamic(page.clone(), PreprocessMode::base()),
+                preprocess_dynamic(page.clone(), PreprocessMode::base(), v1),
             ),
             (
                 "page_squash_640",
@@ -1227,15 +1307,15 @@ mod tests {
             ),
             (
                 "page_gundam",
-                preprocess_dynamic(page, PreprocessMode::gundam()),
+                preprocess_dynamic(page, PreprocessMode::gundam(), v1),
             ),
             (
                 "strip_gundam",
-                preprocess_dynamic(strip, PreprocessMode::gundam()),
+                preprocess_dynamic(strip, PreprocessMode::gundam(), v1),
             ),
             (
                 "small_gundam",
-                preprocess_dynamic(small, PreprocessMode::gundam()),
+                preprocess_dynamic(small, PreprocessMode::gundam(), v1),
             ),
         ]
         .map(|(case, pre)| (case, preprocess_digest(&pre.expect(case))));
@@ -1243,23 +1323,56 @@ mod tests {
             ResampleKind::CatmullRom => V1_PREPROCESS_GOLDEN_CATMULLROM,
             ResampleKind::PilBicubic => V1_PREPROCESS_GOLDEN_PIL_BICUBIC,
         };
-        let got = digests.each_ref().map(|(case, digest)| (*case, digest.as_str()));
+        let got = digests
+            .each_ref()
+            .map(|(case, digest)| (*case, digest.as_str()));
         assert_eq!(got, expected, "under {:?}", resample_kind());
     }
 
+    // Captured from the tree before U2-B7 changed this module (2026-10-29).
     const V1_PREPROCESS_GOLDEN_CATMULLROM: [(&str, &str); 5] = [
-        ("page_base", ""),
-        ("page_squash_640", ""),
-        ("page_gundam", ""),
-        ("strip_gundam", ""),
-        ("small_gundam", ""),
+        (
+            "page_base",
+            "1x1 1 273 b97820a75c17746ae7273ceefadd17c607ee4d71ce33c6d22172d2b609a6b6a0",
+        ),
+        (
+            "page_squash_640",
+            "1x1 1 111 5243f0f65337b19696b509e394b6f613fe70cf1e136647f23cc71f446fe2a7d3",
+        ),
+        (
+            "page_gundam",
+            "2x3 7 903 e3f980f292aae84c7b187461f31b3275c8041454d976c1147c0b9374f8ede704",
+        ),
+        (
+            "strip_gundam",
+            "1x20 21 2473 4eae58b26cbaebafad94d9e39a226b2e1257296ef81e759241d457f52167bf09",
+        ),
+        (
+            "small_gundam",
+            "1x1 1 273 6499b8d704b75fbb710e0bf86a7b0da5d64ae3c7e71674db85458c2d3eaaefc4",
+        ),
     ];
     const V1_PREPROCESS_GOLDEN_PIL_BICUBIC: [(&str, &str); 5] = [
-        ("page_base", ""),
-        ("page_squash_640", ""),
-        ("page_gundam", ""),
-        ("strip_gundam", ""),
-        ("small_gundam", ""),
+        (
+            "page_base",
+            "1x1 1 273 00d0fb35a3d6cb4a18cfa04f3e2370e282e6143e62016599b6d2e50b08fd3b62",
+        ),
+        (
+            "page_squash_640",
+            "1x1 1 111 5243f0f65337b19696b509e394b6f613fe70cf1e136647f23cc71f446fe2a7d3",
+        ),
+        (
+            "page_gundam",
+            "2x3 7 903 a3e8ed786c6f97f3ba2385475d2b3f9f5324d63442275ff798c03c4b4080e693",
+        ),
+        (
+            "strip_gundam",
+            "1x20 21 2473 1e8092fdbdb149871a70925c4b413e1a96ef67eef08a86b8c0618f7d2c8e7dba",
+        ),
+        (
+            "small_gundam",
+            "1x1 1 273 742263bb52f3304c4ef8da0283455de17f7dd5634071bd8c3ccd5e2ca8a0b3db",
+        ),
     ];
 
     // ── num_queries / census ([SPEC-027], OQ-18) ────────────────────────────
@@ -1444,7 +1557,12 @@ mod tests {
         // A wide 100x40 image in base mode -> one 64x64 padded view (use a small
         // base_size so the test is fast; geometry is identical at 1024).
         let img = solid(100, 40, [200, 100, 50]);
-        let p = preprocess_dynamic(img, PreprocessMode::Base { base_size: 64 }).unwrap();
+        let p = preprocess_dynamic(
+            img,
+            PreprocessMode::Base { base_size: 64 },
+            PreprocessProfile::V1,
+        )
+        .unwrap();
         assert_eq!(p.num_views(), 1);
         assert!(p.tiles.is_empty());
         assert_eq!(p.crop_grid, CropGrid::single());
@@ -1485,8 +1603,11 @@ mod tests {
             "bomb must be a typed InputDecode, got {err:?}"
         );
         // And the whole preprocess entry stays total on it too.
-        let err = preprocess_bytes(&BOMB, PreprocessMode::base()).expect_err("rejected");
-        assert!(matches!(err, crate::FocrError::InputDecode(_)));
+        for profile in [PreprocessProfile::V1, PreprocessProfile::V2] {
+            let err =
+                preprocess_bytes(&BOMB, PreprocessMode::base(), profile).expect_err("rejected");
+            assert!(matches!(err, crate::FocrError::InputDecode(_)));
+        }
         println!(r#"{{"check":"decompression_bomb_bound","bytes":100,"result":"pass"}}"#);
     }
 
@@ -1500,7 +1621,7 @@ mod tests {
 
         // 100x40 -> 64x26, y offset 19. The old floor-based path made this
         // 64x25 and left row 44 as padding.
-        let rounded_size = pad_to_square(&solid(100, 40, color), 64).to_rgb8();
+        let rounded_size = pad_to_square(&solid(100, 40, color), 64, resample_kind()).to_rgb8();
         assert_eq!(rounded_size.get_pixel(0, 18).0, pad);
         assert_eq!(rounded_size.get_pixel(0, 19).0, color);
         assert_eq!(rounded_size.get_pixel(0, 44).0, color);
@@ -1508,7 +1629,7 @@ mod tests {
 
         // 101x40 -> 64x25, y offset round(39*0.5)=20. The old floor-based
         // centering started content at row 19.
-        let rounded_offset = pad_to_square(&solid(101, 40, color), 64).to_rgb8();
+        let rounded_offset = pad_to_square(&solid(101, 40, color), 64, resample_kind()).to_rgb8();
         assert_eq!(rounded_offset.get_pixel(0, 19).0, pad);
         assert_eq!(rounded_offset.get_pixel(0, 20).0, color);
         assert_eq!(rounded_offset.get_pixel(0, 44).0, color);
@@ -1591,7 +1712,7 @@ mod tests {
     fn gundam_small_image_short_circuits_to_no_crop() {
         // <=640 in both dims -> no tiles, 1x1 grid ([SPEC-023]).
         let img = solid(320, 200, [10, 20, 30]);
-        let p = preprocess_dynamic(img, PreprocessMode::gundam()).unwrap();
+        let p = preprocess_dynamic(img, PreprocessMode::gundam(), PreprocessProfile::V1).unwrap();
         assert!(p.tiles.is_empty());
         assert_eq!(p.crop_grid, CropGrid::single());
         // Global view still at 1024.
@@ -1612,7 +1733,7 @@ mod tests {
         let expected = find_closest_aspect_ratio(1000.0 / 500.0, &ratios, 1000, 500, 640);
         assert_eq!(expected, (2, 1), "pinned config: 2:1 wide -> (2,1)");
 
-        let p = preprocess_dynamic(img, PreprocessMode::gundam()).unwrap();
+        let p = preprocess_dynamic(img, PreprocessMode::gundam(), PreprocessProfile::V1).unwrap();
         assert_eq!(
             p.crop_grid,
             CropGrid {
@@ -1642,7 +1763,7 @@ mod tests {
             base_size: 128,
             tile_size: 64,
         };
-        let p = preprocess_dynamic(img, mode).unwrap();
+        let p = preprocess_dynamic(img, mode, PreprocessProfile::V1).unwrap();
         assert_eq!(p.tiles.len(), p.crop_grid.blocks());
         assert!(p.crop_grid.is_tiled());
         // census = global + (q_local*W + 1)(q_local*H), q_base/q_local per size.
@@ -1679,13 +1800,108 @@ mod tests {
             },
         ];
         for mode in cases {
-            let err = preprocess_dynamic(img.clone(), mode).unwrap_err();
-            assert!(
-                matches!(err, FocrError::Usage(_)),
-                "mode {mode:?} should be a usage error, got {err:?}"
-            );
+            for profile in [PreprocessProfile::V1, PreprocessProfile::V2] {
+                let err = preprocess_dynamic(img.clone(), mode, profile).unwrap_err();
+                assert!(
+                    matches!(err, FocrError::Usage(_)),
+                    "mode {mode:?} should be a usage error under {profile:?}, got {err:?}"
+                );
+            }
         }
     }
+
+    // ── Unlimited-OCR-2 rules (U2-B7) ───────────────────────────────────────
+
+    /// v2's small-image rule compares both sides with the tile size
+    /// (`MU:554`), v1's with 640. At the shipped 640 tile they agree; at a
+    /// 320 tile a 500×400 image is tiled under v2 only.
+    #[test]
+    fn v2_small_image_rule_follows_the_tile_size() {
+        for profile in [PreprocessProfile::V1, PreprocessProfile::V2] {
+            let whole = solid(640, 640, [9, 8, 7]);
+            let whole = preprocess_dynamic(whole, PreprocessMode::gundam(), profile).unwrap();
+            assert!(whole.tiles.is_empty(), "640x640 under {profile:?}");
+            let wide = solid(641, 320, [9, 8, 7]);
+            let wide = preprocess_dynamic(wide, PreprocessMode::gundam(), profile).unwrap();
+            assert_eq!(wide.crop_grid.blocks(), 2, "641x320 under {profile:?}");
+        }
+        let mode = PreprocessMode::Gundam {
+            base_size: BASE_SIZE,
+            tile_size: 320,
+        };
+        let img = solid(500, 400, [9, 8, 7]);
+        let v1 = preprocess_dynamic(img.clone(), mode, PreprocessProfile::V1).unwrap();
+        let v2 = preprocess_dynamic(img, mode, PreprocessProfile::V2).unwrap();
+        assert!(v1.tiles.is_empty());
+        assert!(v2.crop_grid.is_tiled());
+        assert_eq!(v2.tiles.len(), v2.crop_grid.blocks());
+    }
+
+    /// The placeholder count over every grid v2 allows is
+    /// `273 + (10·w + 1)·(10·h)`: 483 (2×1) to 2,033 (1×16). The 49 grids
+    /// include 1×16 and 16×1.
+    #[test]
+    fn v2_placeholder_counts_cover_every_allowed_grid() {
+        let grids = candidate_ratios(MIN_NUM, PreprocessProfile::V2.max_num());
+        assert_eq!(grids.len(), 49);
+        assert!(grids.contains(&(1, 16)) && grids.contains(&(16, 1)));
+        assert!(grids.iter().all(|&(w, h)| (2..=16).contains(&(w * h))));
+        let counts: Vec<usize> = grids
+            .iter()
+            .map(|&(w, h)| {
+                let pre = Preprocessed {
+                    mode: PreprocessMode::gundam(),
+                    crop_grid: CropGrid {
+                        width_crop_num: w,
+                        height_crop_num: h,
+                    },
+                    ..Preprocessed::default()
+                };
+                let count = pre.placeholder_token_count();
+                assert_eq!(count, 273 + (10 * w + 1) * (10 * h), "{w}x{h}");
+                count
+            })
+            .collect();
+        assert_eq!(counts.iter().min(), Some(&483));
+        assert_eq!(counts.iter().max(), Some(&2033));
+    }
+
+    /// Where v2's rules agree with v1's (the base view, a 2×3 page, an
+    /// untiled small image), v2's views are v1's under the `pil-bicubic`
+    /// switch; the 1×20 strip v1 allows becomes 1×16. The digests are the
+    /// same whatever `FOCR_RESAMPLE` says: run the suite once with it unset
+    /// and once with `pil-bicubic`.
+    #[test]
+    fn v2_preprocess_is_v1_pil_and_ignores_focr_resample() {
+        assert_eq!(
+            PreprocessProfile::V2.resample_kind(),
+            ResampleKind::PilBicubic
+        );
+        let page = textured(1182, 1837, 7);
+        let strip = textured(300, 6000, 11);
+        let small = textured(500, 400, 13);
+        let digest = |img: &DynamicImage, mode| {
+            let pre = preprocess_dynamic(img.clone(), mode, PreprocessProfile::V2);
+            preprocess_digest(&pre.expect("v2 preprocess"))
+        };
+        let pil = |case: &str| {
+            V1_PREPROCESS_GOLDEN_PIL_BICUBIC
+                .iter()
+                .find(|(name, _)| *name == case)
+                .expect(case)
+                .1
+        };
+        assert_eq!(digest(&page, PreprocessMode::base()), pil("page_base"));
+        assert_eq!(digest(&page, PreprocessMode::gundam()), pil("page_gundam"));
+        assert_eq!(
+            digest(&small, PreprocessMode::gundam()),
+            pil("small_gundam")
+        );
+        assert_eq!(digest(&strip, PreprocessMode::gundam()), V2_STRIP_GUNDAM);
+    }
+
+    const V2_STRIP_GUNDAM: &str =
+        "1x16 17 2033 2c6d4d7285d310cad7121dcbfd0e8aa9639ac0d5c4d7f9d55a76ed1344bc845b";
 
     #[test]
     fn malformed_crop_grid_blocks_rejects_overflow() {
@@ -1734,13 +1950,18 @@ mod tests {
         let r = preprocess_image(
             Path::new("/definitely/not/a/real/image.png"),
             PreprocessMode::base(),
+            PreprocessProfile::V1,
         );
         assert!(matches!(r, Err(FocrError::InputDecode(_))));
     }
 
     #[test]
     fn preprocess_garbage_bytes_is_input_decode_error() {
-        let r = preprocess_bytes(&[0u8, 1, 2, 3, 4, 5, 6, 7], PreprocessMode::base());
+        let r = preprocess_bytes(
+            &[0u8, 1, 2, 3, 4, 5, 6, 7],
+            PreprocessMode::base(),
+            PreprocessProfile::V1,
+        );
         assert!(matches!(r, Err(FocrError::InputDecode(_))));
     }
 
@@ -1753,7 +1974,12 @@ mod tests {
         let mut buf = std::io::Cursor::new(Vec::new());
         img.write_to(&mut buf, image::ImageFormat::Png).unwrap();
         let bytes = buf.into_inner();
-        let p = preprocess_bytes(&bytes, PreprocessMode::Base { base_size: 32 }).unwrap();
+        let p = preprocess_bytes(
+            &bytes,
+            PreprocessMode::Base { base_size: 32 },
+            PreprocessProfile::V1,
+        )
+        .unwrap();
         assert_eq!(p.global.shape(), (32, 32));
         assert_eq!(p.original_size, (50, 30));
     }

@@ -22,7 +22,7 @@ use anyhow::{Context, Result, bail};
 use franken_ocr::native_engine::tensor::Mat;
 use franken_ocr::native_engine::weights::Weights;
 use franken_ocr::native_engine::{connector, decoder, vision_bridge, vision_clip, vision_sam};
-use franken_ocr::preprocess::{PreprocessMode, preprocess_image};
+use franken_ocr::preprocess::{PreprocessMode, PreprocessProfile, preprocess_image};
 use std::io::Read;
 use std::path::Path;
 use std::time::Instant;
@@ -144,8 +144,12 @@ fn main() -> Result<()> {
         );
         Mat::from_vec(3, side * side, data)
     } else {
-        let pre =
-            preprocess_image(Path::new(&page), PreprocessMode::base()).context("preprocess")?;
+        let pre = preprocess_image(
+            Path::new(&page),
+            PreprocessMode::base(),
+            PreprocessProfile::V1,
+        )
+        .context("preprocess")?;
         let g = pre.global.pixels;
         eprintln!("[e2e] preprocessed global [{},{}]", g.rows, g.cols);
         g

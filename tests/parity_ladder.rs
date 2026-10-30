@@ -1100,8 +1100,12 @@ fn l0_preprocess_exact() {
         };
         let outcome = (|| -> Result<(Mat, NormalizedValue, String), String> {
             let oracle = loader.load_activation(&doc_stem, "sam_input", entry)?;
-            let pre = preprocess::preprocess_image(&image_path, preprocess::PreprocessMode::base())
-                .map_err(|e| format!("preprocess_image {}: {e}", image_path.display()))?;
+            let pre = preprocess::preprocess_image(
+                &image_path,
+                preprocess::PreprocessMode::base(),
+                preprocess::PreprocessProfile::V1,
+            )
+            .map_err(|e| format!("preprocess_image {}: {e}", image_path.display()))?;
             let subject = pre.global.pixels.clone();
             if subject.data.len() != oracle.data.len() {
                 return Err(format!(
@@ -1249,7 +1253,9 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
     );
     let oracle: Value = serde_json::from_slice(&std::fs::read(oracle_path).expect("ORACLE.json"))
         .expect("ORACLE.json parses");
-    let fixtures = oracle["fixtures"].as_object().expect("ORACLE.json fixtures");
+    let fixtures = oracle["fixtures"]
+        .as_object()
+        .expect("ORACLE.json fixtures");
     let npy = |fixture: &str, stage: &str| -> Vec<u8> {
         let path = dumps
             .join("activations")
@@ -1290,7 +1296,11 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
         };
         let (ori_shape, ori) =
             parity_harness::read_npy_f32(&npy(fixture, "images_ori")).expect("images_ori");
-        assert_eq!(ori_shape, [pages.len(), 3, 1024, 1024], "{fixture} images_ori");
+        assert_eq!(
+            ori_shape,
+            [pages.len(), 3, 1024, 1024],
+            "{fixture} images_ori"
+        );
         let (_, spatial) = parity_harness::read_npy_i32(&npy(fixture, "images_spatial_crop"))
             .expect("images_spatial_crop");
         let (_, seq_mask) =
@@ -1306,9 +1316,8 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
                 "{fixture}: {} is not the page the oracle read",
                 path.display()
             );
-            let pre =
-                preprocess::preprocess_bytes(&bytes, mode, preprocess::PreprocessProfile::V2)
-                    .expect("v2 preprocess");
+            let pre = preprocess::preprocess_bytes(&bytes, mode, preprocess::PreprocessProfile::V2)
+                .expect("v2 preprocess");
             let want = &ori[index * view..(index + 1) * view];
             assert_eq!(
                 first_mismatch(&pre.global.pixels.data, want),
@@ -1319,9 +1328,17 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
                 pre.crop_grid.width_crop_num as i32,
                 pre.crop_grid.height_crop_num as i32,
             ];
-            assert_eq!(grid, spatial[2 * index..2 * index + 2], "{fixture} page {index}: grid");
+            assert_eq!(
+                grid,
+                spatial[2 * index..2 * index + 2],
+                "{fixture} page {index}: grid"
+            );
             placeholders += pre.placeholder_token_count();
-            tiles.extend(pre.tiles.iter().flat_map(|tile| tile.pixels.data.iter().copied()));
+            tiles.extend(
+                pre.tiles
+                    .iter()
+                    .flat_map(|tile| tile.pixels.data.iter().copied()),
+            );
         }
         if gundam {
             let (crop_shape, crop) =
@@ -1338,6 +1355,10 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
         }
         let image_rows = seq_mask.iter().filter(|&&m| m == 1).count();
         assert_eq!(placeholders, image_rows, "{fixture}: placeholder count");
+        let reference_path = dumps.join(format!("{fixture}_reference.json"));
+        let reference: Value =
+            serde_json::from_slice(&std::fs::read(&reference_path).expect("reference json"))
+                .expect("reference json parses");
         ran += 1;
         log.parity(
             "L0",
@@ -1345,7 +1366,9 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
             0.0,
             0.0,
             fixture,
-            entry["prompt_token_ids_sha256"].as_str().unwrap_or_default(),
+            reference["activations"]["images_ori"]["file_sha256"]
+                .as_str()
+                .unwrap_or_default(),
             json!({
                 "seam": "v2 preprocess (letterbox / gundam tiles -> normalized views)",
                 "pages": pages.len(),

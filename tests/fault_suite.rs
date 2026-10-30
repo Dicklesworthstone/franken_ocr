@@ -26,7 +26,7 @@
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
-use franken_ocr::preprocess::{self, PreprocessMode};
+use franken_ocr::preprocess::{self, PreprocessMode, PreprocessProfile};
 use franken_ocr::{FocrError, MODEL_PATH_ENV};
 
 fn scratch(name: &str) -> PathBuf {
@@ -91,8 +91,9 @@ fn corrupt_truncated_and_zero_byte_images_are_typed_input_decode() {
     for (name, bytes) in cases {
         let p = scratch(&format!("{name}.png"));
         std::fs::write(&p, &bytes).expect("write fault input");
-        let err = preprocess::preprocess_image(&p, PreprocessMode::default())
-            .expect_err("fault input must not preprocess");
+        let err =
+            preprocess::preprocess_image(&p, PreprocessMode::default(), PreprocessProfile::V1)
+                .expect_err("fault input must not preprocess");
         let (kind, exit) = (err.kind(), err.exit_code());
         let pass = matches!(&err, FocrError::InputDecode(_)) && exit == 4;
         emit(

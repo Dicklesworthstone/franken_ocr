@@ -463,6 +463,7 @@ fn run_input_fault_entry() -> GateResult {
             match crate::preprocess::preprocess_image(
                 &p,
                 crate::preprocess::PreprocessMode::default(),
+                crate::preprocess::PreprocessProfile::V1,
             ) {
                 Err(crate::FocrError::InputDecode(_)) => Ok(()),
                 Err(other) => Err(other),

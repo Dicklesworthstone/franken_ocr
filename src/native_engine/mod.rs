@@ -986,6 +986,15 @@ fn preprocess_mode() -> preprocess::PreprocessMode {
     )
 }
 
+/// `arch`'s preprocessing rules (U2-B7): Unlimited-OCR-2 takes v2's (16-tile
+/// gundam cap, PIL-exact resampling); every other arch keeps v1's.
+fn preprocess_profile(arch: &dyn model_arch::ModelArch) -> preprocess::PreprocessProfile {
+    match arch.unlimited_variant() {
+        Some(model_arch::UnlimitedVariant::V2SrSwa) => preprocess::PreprocessProfile::V2,
+        Some(model_arch::UnlimitedVariant::V1Rswa) | None => preprocess::PreprocessProfile::V1,
+    }
+}
+
 /// The process-global [`DecodeOverrides`] store. A `Mutex` (not `OnceLock`) so a
 /// long-lived embedder can re-set between recognitions; reads happen once per
 /// model load, never per token.
@@ -2865,7 +2874,11 @@ impl OcrModel {
         // Mode = the certified Base-1024 default unless the CLI overrode it
         // (--base-size/--image-size/--crop-mode, bd-1e9n).
         progress::emit("preprocess", 0, 0);
-        let pre = preprocess::preprocess_image(image_path, preprocess_mode())?;
+        let pre = preprocess::preprocess_image(
+            image_path,
+            preprocess_mode(),
+            preprocess_profile(self.arch()),
+        )?;
         progress::emit("preprocess", 1, 1);
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
@@ -2889,7 +2902,11 @@ impl OcrModel {
         }
         let t = Instant::now();
         progress::emit("preprocess", 0, 0);
-        let pre = preprocess::preprocess_dynamic(img, preprocess_mode())?;
+        let pre = preprocess::preprocess_dynamic(
+            img,
+            preprocess_mode(),
+            preprocess_profile(self.arch()),
+        )?;
         progress::emit("preprocess", 1, 1);
         timing_log(&format!("preprocess {:.2}s", t.elapsed().as_secs_f64()));
         self.forward_pre(pre)
@@ -3731,10 +3748,10 @@ impl OcrModel {
         // Same mode resolution as the single-page forward (bd-1e9n) — the
         // batched-vision stage groups views by side, so Gundam's mixed
         // 640/1024 views batch correctly too.
-        let mode = preprocess_mode();
+        let (mode, profile) = (preprocess_mode(), preprocess_profile(self.arch()));
         let mut pres: Vec<Option<Preprocessed>> = (0..n).map(|_| None).collect();
         for (gi, &path) in image_paths.iter().enumerate() {
-            match preprocess::preprocess_image(path, mode) {
+            match preprocess::preprocess_image(path, mode, profile) {
                 Ok(p) => pres[gi] = Some(p),
                 Err(e) => out[gi] = Some(Err(e)),
             }
@@ -7340,10 +7357,10 @@ mod tests {
     }
 
     /// A v2-shaped prompt over `pages`: BOS; per page `<PAGE>` and the page's
-    /// 273-slot visual block; then the instruction. The blocks come from v1's
-    /// preprocessing and connector (the vision tensors are byte-identical; v2's
-    /// own preprocessing is U2-B7) and the instruction is v1's (v2's prompt is
-    /// U2-B6), so this is the decoder's input shape, not v2's exact prompt.
+    /// 273-slot visual block; then the instruction. The blocks come from v2's
+    /// preprocessing (U2-B7) and v1's connector (the vision tensors are
+    /// byte-identical), and the instruction is v1's (v2's prompt is U2-B6), so
+    /// this is the decoder's input shape, not v2's exact prompt.
     fn v2_decoder_prompt(model: &OcrModel, pages: &[PathBuf]) -> (Mat, Vec<u32>) {
         use crate::tokenizer::special;
         let table = model.embed_table().expect("embed table");
@@ -7351,7 +7368,12 @@ mod tests {
         let (mut ids, mut data) = (Vec::new(), Vec::new());
         let mut instruction = None;
         for (i, page) in pages.iter().enumerate() {
-            let pre = preprocess::preprocess_image(page, preprocess_mode()).expect("preprocess");
+            let pre = preprocess::preprocess_image(
+                page,
+                preprocess_mode(),
+                preprocess_profile(model.arch()),
+            )
+            .expect("preprocess");
             let features = model.vision_tower(&pre).expect("vision tower");
             let (embeds, page_ids) = model
                 .build_inputs_embeds(&pre, &features)
@@ -7685,6 +7707,7 @@ mod tests {
                 preprocess::preprocess_image(
                     Path::new(p),
                     preprocess::PreprocessMode::Base { base_size: 1024 },
+                    preprocess::PreprocessProfile::V1,
                 )
                 .expect("page preprocesses")
             })
@@ -7746,6 +7769,20 @@ mod tests {
             }),
             M::Base { base_size: 768 }
         );
+    }
+
+    /// [`preprocess_profile`] (U2-B7): only Unlimited-OCR-2 takes v2's
+    /// preprocessing; v1 and every zoo arch keep v1's.
+    #[test]
+    fn only_unlimited_ocr_2_takes_the_v2_preprocess_profile() {
+        for &arch in model_arch::registry() {
+            let want = if arch.id() == model_arch::UNLIMITED_OCR_V2_ID {
+                preprocess::PreprocessProfile::V2
+            } else {
+                preprocess::PreprocessProfile::V1
+            };
+            assert_eq!(preprocess_profile(arch), want, "{}", arch.id());
+        }
     }
 
     /// [`apply_decode_overrides`] is the pure CLI-flag → [`DecodeParams`] mapping

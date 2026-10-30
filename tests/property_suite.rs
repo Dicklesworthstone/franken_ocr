@@ -40,7 +40,7 @@ use proptest_support::{
 
 use franken_ocr::FocrError;
 use franken_ocr::native_engine::weights::Weights;
-use franken_ocr::preprocess::{self, PreprocessMode};
+use franken_ocr::preprocess::{self, PreprocessMode, PreprocessProfile};
 use franken_ocr::quant::focrq::{FocrqBuilder, WriteDType};
 use franken_ocr::simd;
 
@@ -162,15 +162,18 @@ proptest! {
     fn preprocess_geometry_invariants_hold(
         img in small_rgb_image(),
         base_640 in any::<bool>(),
+        v2 in any::<bool>(),
     ) {
         let base = if base_640 { 640usize } else { 1024 };
         let nq = preprocess::num_queries(base);
         let census = (nq + 1) * nq + 1;
+        let profile = if v2 { PreprocessProfile::V2 } else { PreprocessProfile::V1 };
 
         // Base mode: aspect-preserving pad — never panics, exact geometry.
         let pre = preprocess::preprocess_dynamic(
             img.clone(),
             PreprocessMode::Base { base_size: base },
+            profile,
         ).expect("Base preprocess is total over decodable RGB images");
         prop_assert_eq!(pre.global.pixels.data.len(), 3 * base * base);
         prop_assert_eq!(pre.placeholder_token_count(), census);
@@ -181,6 +184,60 @@ proptest! {
             .expect("squash preprocess is total over decodable RGB images");
         prop_assert_eq!(sq.global.pixels.data.len(), 3 * base * base);
         prop_assert_eq!(sq.placeholder_token_count(), census);
+    }
+}
+
+/// The reference's gundam grid choice transliterated (`dynamic_preprocess` and
+/// `find_closest_aspect_ratio`, `MU:211-243`). Every `(i, j)` has
+/// `2 ≤ i·j ≤ max_num`, and the candidates are stably sorted by `i·j`. Python
+/// iterates a `set`, so its order within one tile count is hash order, which a
+/// Rust port cannot reproduce; `reverse_ties` runs the two extreme orders
+/// instead.
+fn reference_grid(w: u32, h: u32, max_num: usize, reverse_ties: bool) -> (usize, usize) {
+    let mut ratios: Vec<(usize, usize)> = (2..=max_num)
+        .flat_map(|n| (1..=n).flat_map(move |i| (1..=n).map(move |j| (i, j))))
+        .filter(|&(i, j)| (2..=max_num).contains(&(i * j)))
+        .collect();
+    ratios.sort_unstable();
+    ratios.dedup();
+    if reverse_ties {
+        ratios.reverse();
+    }
+    ratios.sort_by_key(|&(i, j)| i * j);
+    let aspect = f64::from(w) / f64::from(h);
+    let area = f64::from(w) * f64::from(h);
+    let (mut best_diff, mut best) = (f64::INFINITY, (1, 1));
+    for (i, j) in ratios {
+        let diff = (aspect - i as f64 / j as f64).abs();
+        if diff < best_diff {
+            (best_diff, best) = (diff, (i, j));
+        } else if diff == best_diff && area > 0.5 * 640.0 * 640.0 * (i * j) as f64 {
+            best = (i, j);
+        }
+    }
+    best
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// U2-B7: the gundam grid franken_ocr picks is the reference's for any
+    /// image size, under v2's 16-tile cap and v1's 32, whichever order
+    /// Python's set gives grids of equal tile count.
+    #[test]
+    fn gundam_grid_matches_the_reference_selection(
+        w in 1u32..=8192,
+        h in 1u32..=8192,
+        v2 in any::<bool>(),
+    ) {
+        prop_assume!(w > 640 || h > 640);
+        let profile = if v2 { PreprocessProfile::V2 } else { PreprocessProfile::V1 };
+        let max_num = profile.max_num();
+        let ratios = preprocess::candidate_ratios(preprocess::MIN_NUM, max_num);
+        let ours = preprocess::find_closest_aspect_ratio(f64::from(w) / f64::from(h), &ratios, w, h, 640);
+        prop_assert_eq!(ours, reference_grid(w, h, max_num, false));
+        prop_assert_eq!(ours, reference_grid(w, h, max_num, true));
+        prop_assert!(ours.0 * ours.1 <= max_num);
     }
 }
 
