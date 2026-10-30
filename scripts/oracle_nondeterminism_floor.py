@@ -138,6 +138,10 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 # Output artifact names.
 ENVELOPE_FILE = "oracle_nondeterminism_envelope.json"
 DEFAULT_TOLERANCES_FILE = "tolerances.toml"
+# Unlimited-OCR-2 (U2-A6): the committed envelope of the v2 oracle's runs.
+UOCR2_FLOOR_FILE = "tests/fixtures/uocr2_oracle/FLOOR.json"
+# The v2 oracle keeps logits for every one of the first 64 steps.
+UOCR2_HEAD_STEPS = 64
 
 # Schema version for the committed envelope/tolerances — bumped on any layout
 # change so a stale fixture is detectable (mirrors the gen_reference_fixtures
@@ -244,6 +248,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Torch device for the oracle. Per OQ-17 the correctness oracle is "
         "CUDA-only; a non-cuda value is allowed ONLY for the separate, "
         "must-be-proven CPU-equivalence experiment.",
+    )
+    p.add_argument(
+        "--uocr2-group",
+        action="append",
+        default=[],
+        metavar="NAME=RUN_DIR,RUN_DIR[,...]",
+        help="Unlimited-OCR-2 (U2-A6): compare runs already written by "
+        "scripts/gen_reference_fixtures_uocr2.py (each RUN_DIR is <out>/<dtype>/<tag>) "
+        "instead of running the v1 oracle. Repeatable; numpy only, no torch.",
+    )
+    p.add_argument(
+        "--uocr2-out",
+        type=Path,
+        default=Path(UOCR2_FLOOR_FILE),
+        help="Where --uocr2-group writes the envelope JSON.",
     )
     return p.parse_args(argv)
 
@@ -828,8 +847,146 @@ def _build_provenance(
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Unlimited-OCR-2 floor (U2-A6): compare runs of gen_reference_fixtures_uocr2.py
+# ─────────────────────────────────────────────────────────────────────────────
+def _uocr2_layer_delta(np: Any, a: Any, b: Any) -> dict[str, float]:
+    """max |a - b| and that maximum relative to max |a| (normwise, so rows near
+    zero cannot inflate it)."""
+    diff = float(np.max(np.abs(a.astype(np.float64) - b.astype(np.float64)))) if a.size else 0.0
+    scale = float(np.max(np.abs(a))) if a.size else 0.0
+    return {"max_abs": diff, "max_rel": diff / scale if scale > 0 else 0.0}
+
+
+def _uocr2_compare_fixture(np: Any, run_dirs: list[Path], fixture: str) -> dict[str, Any]:
+    refs, acts = [], []
+    for run_dir in run_dirs:
+        refs.append(json.loads((run_dir / f"{fixture}_reference.json").read_text()))
+        acts.append(run_dir / "activations" / fixture)
+
+    def load(i: int, stage: str) -> Any:
+        return np.load(acts[i] / f"{stage}.npy", allow_pickle=False)
+
+    if any(r["prompt_token_ids"] != refs[0]["prompt_token_ids"] for r in refs):
+        raise SystemExit(f"{fixture}: the runs' prompt ids differ")
+    runs = []
+    for i, ref in enumerate(refs):
+        steps = load(i, "steps.index")
+        logits = load(i, "steps.logits")[steps < UOCR2_HEAD_STEPS]
+        runs.append(
+            {
+                "token_ids": ref["token_ids"],
+                "n_tokens": len(ref["token_ids"]),
+                "logits": logits,
+                "vocab_dim": int(logits.shape[1]),
+                "decoded_sha256": ref["decoded_text_sha256"],
+            }
+        )
+    rows = min(r["logits"].shape[0] for r in runs)
+    for r in runs:
+        r["logits"] = r["logits"][:rows]
+    envelope = _compute_doc_envelope(runs)
+    envelope["token_ids_identical"] = len({json.dumps(r["token_ids"]) for r in refs}) == 1
+    envelope["logit_rows_compared"] = rows
+
+    n_layers = len(refs[0]["routing"]["infer_params"])
+    layers = []
+    for layer in range(n_layers):
+        entry: dict[str, Any] = {"layer": layer}
+        for stage in ("hidden_in", "attn_out"):
+            base = load(0, f"prefill.L{layer:02d}.{stage}")
+            worst = {"max_abs": 0.0, "max_rel": 0.0}
+            for i in range(1, len(runs)):
+                d = _uocr2_layer_delta(np, base, load(i, f"prefill.L{layer:02d}.{stage}"))
+                worst = {k: max(worst[k], d[k]) for k in worst}
+            entry[stage] = worst
+        topi0 = load(0, f"prefill.L{layer:02d}.topi")
+        valid0 = load(0, f"prefill.L{layer:02d}.valid")
+        differing = np.zeros(topi0.shape[0], dtype=bool)
+        for i in range(1, len(runs)):
+            differing |= np.any(topi0 != load(i, f"prefill.L{layer:02d}.topi"), axis=-1)
+            differing |= np.any(valid0 != load(i, f"prefill.L{layer:02d}.valid"), axis=-1)
+        entry["routing_rows_differing"] = int(differing.sum())
+        layers.append(entry)
+    final0 = load(0, "prefill.final_hidden")
+    final = {"max_abs": 0.0, "max_rel": 0.0}
+    for i in range(1, len(runs)):
+        d = _uocr2_layer_delta(np, final0, load(i, "prefill.final_hidden"))
+        final = {k: max(final[k], d[k]) for k in final}
+    return {
+        "runs": [
+            {"dtype": r["provenance"]["dtype"], "threads": r["provenance"]["threads"], "tokens": len(r["token_ids"]), "wall_seconds": r["wall_seconds"]}
+            for r in refs
+        ],
+        "prefill_rows_compared": int(final0.shape[0]),
+        "envelope": envelope,
+        "layers": layers,
+        "final_hidden": final,
+    }
+
+
+def _uocr2_floor(groups: list[str], out: Path) -> int:
+    import numpy as np  # noqa: WPS433
+
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "generator": "scripts/oracle_nondeterminism_floor.py --uocr2-group",
+        "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "groups": {},
+    }
+    for spec in groups:
+        name, _, dirs = spec.partition("=")
+        run_dirs = [Path(d) for d in dirs.split(",") if d]
+        if not name or len(run_dirs) < 2:
+            raise SystemExit(f"--uocr2-group {spec!r}: need NAME=RUN_DIR,RUN_DIR[,...]")
+        names = [{p.name.removesuffix("_reference.json") for p in d.glob("*_reference.json")} for d in run_dirs]
+        fixtures = sorted(set.intersection(*names))
+        if not fixtures:
+            raise SystemExit(f"--uocr2-group {name}: the runs share no fixture")
+        per_fixture = {}
+        for fixture in fixtures:
+            cmp = _uocr2_compare_fixture(np, run_dirs, fixture)
+            per_fixture[fixture] = cmp
+            env = cmp["envelope"]
+            print(
+                json.dumps(
+                    {
+                        "test": "uocr2_floor",
+                        "group": name,
+                        "fixture": fixture,
+                        "token_ids_identical": env["token_ids_identical"],
+                        "first_divergence_pos": env["first_divergence_pos"],
+                        "logit_spread_in_prefix": env["logit_spread_in_prefix"],
+                        "max_hidden_rel": max(l["hidden_in"]["max_rel"] for l in cmp["layers"]),
+                        "routing_rows_differing": sum(l["routing_rows_differing"] for l in cmp["layers"]),
+                    }
+                ),
+                flush=True,
+            )
+        summary = {
+            "fixtures": len(fixtures),
+            "all_token_ids_identical": all(c["envelope"]["token_ids_identical"] for c in per_fixture.values()),
+            "max_logit_spread_in_prefix": max(c["envelope"]["logit_spread_in_prefix"] for c in per_fixture.values()),
+            "max_hidden_in": {
+                k: max(l["hidden_in"][k] for c in per_fixture.values() for l in c["layers"]) for k in ("max_abs", "max_rel")
+            },
+            "max_attn_out": {
+                k: max(l["attn_out"][k] for c in per_fixture.values() for l in c["layers"]) for k in ("max_abs", "max_rel")
+            },
+            "max_final_hidden": {k: max(c["final_hidden"][k] for c in per_fixture.values()) for k in ("max_abs", "max_rel")},
+            "routing_rows_differing": sum(l["routing_rows_differing"] for c in per_fixture.values() for l in c["layers"]),
+        }
+        result["groups"][name] = {"run_dirs": [str(d) for d in run_dirs], "summary": summary, "fixtures": per_fixture}
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=1) + "\n")
+    print(json.dumps({"test": "uocr2_floor", "event": "wrote", "file": str(out)}))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.uocr2_group:
+        return _uocr2_floor(args.uocr2_group, args.uocr2_out)
 
     if len(args.thread_counts) < 2:
         raise SystemExit(

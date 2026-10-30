@@ -34,6 +34,23 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 REPLAY_SCHEMA_VERSION = 1
 DETERMINISTIC_CUBLAS_WORKSPACE_CONFIG = ":4096:8"
 
+# Unlimited-OCR-2 (U2-A6). The v2 oracle has its own stack and pin, never the v1 ones
+# above: HF f32 on CPU, committed twin in tests/fixtures/uocr2_oracle, dumps off-tree.
+UOCR2_ORACLE = ROOT / "tests" / "fixtures" / "uocr2_oracle"
+UOCR2_GENERATOR = ROOT / "scripts" / "gen_reference_fixtures_uocr2.py"
+UOCR2_SOURCE_HASHES = ROOT / "docs" / "truth-pack" / "SOURCE_HASHES.md"
+UOCR2_PIN_PYTHON = "3.10"
+UOCR2_PIN_TORCH = "2.13.0"
+UOCR2_PIN_TRANSFORMERS = "4.52.1"
+UOCR2_PIN_TOKENIZERS = "0.21.4"
+UOCR2_PIN_HF_HUB = "0.36.0"
+UOCR2_HF_COMMIT = "5632329a32e103d5f1add270681e0f5c1233c6e4"
+UOCR2_NGRAM_SIZE = 35
+UOCR2_NGRAM_WINDOW_SINGLE = 128
+UOCR2_NGRAM_WINDOW_MULTI = 1024
+UOCR2_MAX_PAGE_TOKENS = 20000
+UOCR2_IDS_HEADER = re.compile(r"^# .+ generated token ids: (\S+) \((\d+) ids\)$")
+
 
 def emit(check: str, ok: bool, **fields: object) -> None:
     payload = {"check": check, "result": "pass" if ok else "fail", **fields}
@@ -589,8 +606,319 @@ def reference_validation_failures(record: dict[str, Any], *, quiet: bool = False
     return failures
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Unlimited-OCR-2 oracle (U2-A6)
+# ─────────────────────────────────────────────────────────────────────────────
+def uocr2_source_pins(text: str) -> dict[str, str]:
+    """`{file: sha256}` from the Unlimited-OCR-2 tables of SOURCE_HASHES.md."""
+    start = text.find("# Unlimited-OCR-2")
+    if start < 0:
+        return {}
+    end = text.find("**Upstream license text**", start)
+    section = text[start : end if end >= 0 else len(text)]
+    return {f: h for h, f in re.findall(r"^\| `([0-9a-f]{64})` \| `([^`]+)` \|", section, re.M)}
+
+
+def uocr2_ids_sha256(ids: list[int]) -> str:
+    return hashlib.sha256(json.dumps(ids, separators=(",", ":")).encode("ascii")).hexdigest()
+
+
+def uocr2_parse_ids(fixture: str, text: str) -> list[int] | str:
+    """The ids of a committed `<fixture>.ids.txt`, or why it is malformed."""
+    lines = text.splitlines()
+    head = UOCR2_IDS_HEADER.match(lines[0]) if lines else None
+    if head is None or head.group(1) != fixture:
+        return "bad header"
+    try:
+        ids = [int(t) for line in lines[1:] for t in line.split()]
+    except ValueError:
+        return "non-integer id"
+    if len(ids) != int(head.group(2)):
+        return f"header says {head.group(2)} ids, body has {len(ids)}"
+    return ids
+
+
+def uocr2_record_failures(
+    doc: dict[str, Any],
+    files: dict[str, bytes],
+    source_pins: dict[str, str],
+    corpus: Path | None,
+) -> list[str]:
+    """Every problem with the committed v2 oracle twin. `files` maps the committed
+    file names to their bytes; `corpus`, when present, holds the input pages."""
+    problems: list[str] = []
+    prov = doc.get("provenance")
+    if not isinstance(prov, dict):
+        return ["ORACLE.json: missing provenance"]
+    pinned = {"python": UOCR2_PIN_PYTHON, "torch": UOCR2_PIN_TORCH, "transformers": UOCR2_PIN_TRANSFORMERS, "tokenizers": UOCR2_PIN_TOKENIZERS, "huggingface_hub": UOCR2_PIN_HF_HUB}
+    if prov.get("pinned") != pinned:
+        problems.append(f"provenance.pinned {prov.get('pinned')} != {pinned}")
+    stack = prov.get("stack") if isinstance(prov.get("stack"), dict) else {}
+    for key, want in pinned.items():
+        if stack.get(key) != want:
+            problems.append(f"provenance.stack.{key} {stack.get(key)!r} != {want!r}")
+    if prov.get("hf_commit") != UOCR2_HF_COMMIT:
+        problems.append(f"provenance.hf_commit {prov.get('hf_commit')!r} != {UOCR2_HF_COMMIT}")
+    for key, want in (("device", "cpu"), ("dtype", "f32"), ("compute_dtype", "float32"), ("shims", ["cpu-patch", "f32"]), ("smoke", False)):
+        if prov.get(key) != want:
+            problems.append(f"provenance.{key} {prov.get(key)!r} != {want!r}")
+    det = prov.get("determinism") if isinstance(prov.get("determinism"), dict) else {}
+    if not (is_json_int(det.get("seed")) and det.get("torch_manual_seed") is True and det.get("torch_deterministic_algorithms") is True):
+        problems.append(f"provenance.determinism not seeded and deterministic: {det}")
+    if not (isinstance(prov.get("exact_command"), str) and "gen_reference_fixtures_uocr2.py" in prov["exact_command"]):
+        problems.append("provenance.exact_command must name gen_reference_fixtures_uocr2.py")
+    if not is_non_empty_string_list(prov.get("command_argv")):
+        problems.append("provenance.command_argv must be a non-empty list of strings")
+    if not (isinstance(prov.get("script_sha256"), str) and HEX64.match(prov["script_sha256"])):
+        problems.append("provenance.script_sha256 must be a sha256")
+    model_files = prov.get("model_files_sha256")
+    if not isinstance(model_files, dict) or not model_files:
+        problems.append("provenance.model_files_sha256 missing")
+    else:
+        for name, got in sorted(model_files.items()):
+            if source_pins.get(name) != got:
+                problems.append(f"model file {name}: {got} is not the SOURCE_HASHES.md pin {source_pins.get(name)}")
+        if not {"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "modeling_unlimitedocr.py"} <= set(model_files):
+            problems.append("provenance.model_files_sha256 must cover both shards and the remote code")
+
+    fixtures = doc.get("fixtures")
+    if not isinstance(fixtures, dict) or not fixtures:
+        return problems + ["ORACLE.json: no fixtures"]
+    for fixture, entry in sorted(fixtures.items()):
+        where = f"{fixture}:"
+        pages = entry.get("pages")
+        if not isinstance(pages, list) or not pages:
+            problems.append(f"{where} no pages")
+            continue
+        for page in pages:
+            if not (isinstance(page, dict) and isinstance(page.get("sha256"), str) and HEX64.match(page["sha256"])):
+                problems.append(f"{where} page without a sha256: {page}")
+            elif corpus is not None and (corpus / page["name"]).is_file() and sha256_file(corpus / page["name"]) != page["sha256"]:
+                problems.append(f"{where} input {page['name']} no longer matches its recorded sha256")
+        params = entry.get("params") if isinstance(entry.get("params"), dict) else {}
+        window = UOCR2_NGRAM_WINDOW_SINGLE if len(pages) == 1 else UOCR2_NGRAM_WINDOW_MULTI
+        want_params = {
+            "no_repeat_ngram_size": UOCR2_NGRAM_SIZE,
+            "ngram_window": window,
+            "max_page_tokens": UOCR2_MAX_PAGE_TOKENS,
+            "page_count_guard": True,
+            "temperature": 0.0,
+            "crop_mode": entry.get("mode") == "gundam",
+            "max_new_tokens": None,
+        }
+        for key, want in want_params.items():
+            if params.get(key, "absent") != want:
+                problems.append(f"{where} params.{key} {params.get(key, 'absent')!r} != {want!r}")
+        counters = entry.get("counters") if isinstance(entry.get("counters"), dict) else {}
+        hits = counters.get("disc_u2_2_all_neg_inf_steps")
+        if not is_json_int(hits) or hits != 0:
+            problems.append(f"{where} DISC-U2-2 all-(-inf) steps {hits!r} (must be recorded, and 0)")
+        routing = entry.get("routing") if isinstance(entry.get("routing"), dict) else {}
+        for key in ("route_replica_mismatches", "kbar_replica_mismatches"):
+            if routing.get(key) != 0:
+                problems.append(f"{where} routing.{key} {routing.get(key)!r} != 0")
+        if routing.get("stage0") != ["head_cls"]:
+            problems.append(f"{where} routing.stage0 {routing.get('stage0')!r} != ['head_cls']")
+        if entry.get("finish_reason") == "stop" and not (
+            is_json_int(entry.get("num_pages_out")) and is_json_int(entry.get("expected_pages")) and entry["num_pages_out"] >= entry["expected_pages"] == len(pages)
+        ):
+            problems.append(f"{where} stopped with {entry.get('num_pages_out')} of {entry.get('expected_pages')} pages")
+        ids_name, md_name = f"{fixture}.ids.txt", f"{fixture}.md"
+        if ids_name not in files:
+            problems.append(f"{where} {ids_name} missing")
+        else:
+            ids = uocr2_parse_ids(fixture, files[ids_name].decode("utf-8", errors="replace"))
+            if isinstance(ids, str):
+                problems.append(f"{where} {ids_name}: {ids}")
+            elif len(ids) != entry.get("token_count") or uocr2_ids_sha256(ids) != entry.get("token_ids_sha256"):
+                problems.append(f"{where} {ids_name} does not match token_count/token_ids_sha256")
+        if md_name not in files:
+            problems.append(f"{where} {md_name} missing")
+        elif hashlib.sha256(files[md_name]).hexdigest() != entry.get("decoded_text_sha256"):
+            problems.append(f"{where} {md_name} does not match decoded_text_sha256")
+    return problems
+
+
+def uocr2_floor_failures(floor: dict[str, Any], fixtures: set[str]) -> list[str]:
+    groups = floor.get("groups")
+    if not isinstance(groups, dict) or "f32" not in groups:
+        return ["FLOOR.json: no f32 group"]
+    problems = []
+    for name, group in sorted(groups.items()):
+        runs = group.get("run_dirs")
+        if not (isinstance(runs, list) and len(runs) >= 2):
+            problems.append(f"FLOOR.json group {name}: fewer than two runs")
+        if name == "f32" and set(group.get("fixtures", {})) != fixtures:
+            problems.append(f"FLOOR.json group f32 covers {sorted(group.get('fixtures', {}))}, ORACLE.json has {sorted(fixtures)}")
+        if not isinstance(group.get("summary"), dict):
+            problems.append(f"FLOOR.json group {name}: no summary")
+    return problems
+
+
+def uocr2_dump_failures(dumps: Path, doc: dict[str, Any]) -> list[str]:
+    """The off-tree dumps of the committed run agree with ORACLE.json, file by file."""
+    problems = []
+    for fixture, entry in sorted(doc.get("fixtures", {}).items()):
+        run = entry.get("run", {})
+        ref_path = dumps / str(run.get("dtype")) / str(run.get("tag")) / f"{fixture}_reference.json"
+        if not ref_path.is_file():
+            problems.append(f"{fixture}: dump {ref_path} missing")
+            continue
+        ref = json.loads(ref_path.read_text())
+        for key in ("token_ids_sha256", "decoded_text_sha256"):
+            if ref.get(key) != entry.get(key):
+                problems.append(f"{fixture}: dump {key} differs from ORACLE.json")
+        for stage, act in sorted(ref.get("activations", {}).items()):
+            path = ref_path.parent / "activations" / fixture / act["file"]
+            if not path.is_file() or sha256_file(path) != act.get("file_sha256"):
+                problems.append(f"{fixture}: activation {stage} missing or changed")
+    return problems
+
+
+def uocr2_generator_pins() -> dict[str, Any] | None:
+    """The generator's own pin constants, read without importing torch."""
+    import importlib.util  # noqa: WPS433
+
+    spec = importlib.util.spec_from_file_location("gen_reference_fixtures_uocr2", UOCR2_GENERATOR)
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules.setdefault(spec.name, module)
+    spec.loader.exec_module(module)
+    return {
+        "python": module.PIN_PYTHON,
+        "torch": module.PIN_TORCH,
+        "transformers": module.PIN_TRANSFORMERS,
+        "tokenizers": module.PIN_TOKENIZERS,
+        "huggingface_hub": module.PIN_HF_HUB,
+        "hf_commit": module.HF_COMMIT,
+    }
+
+
+def validate_uocr2(failures: list[str], dumps: Path | None) -> None:
+    pins = {"python": UOCR2_PIN_PYTHON, "torch": UOCR2_PIN_TORCH, "transformers": UOCR2_PIN_TRANSFORMERS, "tokenizers": UOCR2_PIN_TOKENIZERS, "huggingface_hub": UOCR2_PIN_HF_HUB, "hf_commit": UOCR2_HF_COMMIT}
+    generator = uocr2_generator_pins()
+    same = generator == pins
+    emit("uocr2-oracle-pins-match-generator", same, checker=pins, generator=generator)
+    if not same:
+        failures.append("the v2 pins in check_oracle_provenance.py and gen_reference_fixtures_uocr2.py differ")
+    oracle_json = UOCR2_ORACLE / "ORACLE.json"
+    if not oracle_json.is_file():
+        emit("uocr2-oracle-provenance", True, skipped=True, reason="tests/fixtures/uocr2_oracle/ORACLE.json absent")
+        return
+    doc = json.loads(oracle_json.read_text())
+    files = {p.name: p.read_bytes() for p in UOCR2_ORACLE.iterdir() if p.is_file()}
+    corpus_env = os.environ.get("FOCR_CORPUS_DIR")
+    corpus = Path(corpus_env) if corpus_env else Path.home() / ".cache/franken_ocr/corpus/pages"
+    corpus = corpus if corpus.is_dir() else None
+    problems = uocr2_record_failures(doc, files, uocr2_source_pins(UOCR2_SOURCE_HASHES.read_text()), corpus)
+    floor_path = UOCR2_ORACLE / "FLOOR.json"
+    if floor_path.is_file():
+        problems += uocr2_floor_failures(json.loads(floor_path.read_text()), set(doc.get("fixtures", {})))
+    else:
+        problems.append("tests/fixtures/uocr2_oracle/FLOOR.json missing (the nondeterminism floor)")
+    if dumps is not None:
+        problems += uocr2_dump_failures(dumps, doc)
+    for problem in problems:
+        fail(failures, f"uocr2_oracle: {problem}", "uocr2-oracle-provenance-problem")
+    emit(
+        "uocr2-oracle-provenance",
+        not problems,
+        fixtures=len(doc.get("fixtures", {})),
+        inputs_verified=corpus is not None,
+        dumps_verified=dumps is not None,
+    )
+
+
+def uocr2_self_test_doc() -> tuple[dict[str, Any], dict[str, bytes], dict[str, str]]:
+    ids = [128827, 128828, 2067]
+    text = "<PAGE><BLOCK>x"
+    pins = {"model-00001-of-00002.safetensors": "1" * 64, "model-00002-of-00002.safetensors": "2" * 64, "modeling_unlimitedocr.py": "3" * 64}
+    stack = {"python": UOCR2_PIN_PYTHON, "torch": UOCR2_PIN_TORCH, "transformers": UOCR2_PIN_TRANSFORMERS, "tokenizers": UOCR2_PIN_TOKENIZERS, "huggingface_hub": UOCR2_PIN_HF_HUB}
+    doc = {
+        "schema_version": 1,
+        "provenance": {
+            "pinned": dict(stack),
+            "stack": dict(stack, python_full="3.10.19"),
+            "hf_commit": UOCR2_HF_COMMIT,
+            "device": "cpu",
+            "dtype": "f32",
+            "compute_dtype": "float32",
+            "shims": ["cpu-patch", "f32"],
+            "smoke": False,
+            "determinism": {"seed": 1337, "torch_manual_seed": True, "torch_deterministic_algorithms": True},
+            "exact_command": "python -I scripts/gen_reference_fixtures_uocr2.py --sets S1",
+            "command_argv": ["python", "scripts/gen_reference_fixtures_uocr2.py"],
+            "script_sha256": "4" * 64,
+            "model_files_sha256": dict(pins),
+        },
+        "fixtures": {
+            "S1-page_0009": {
+                "mode": "base",
+                "pages": [{"name": "page_0009.png", "sha256": "5" * 64}],
+                "params": {"no_repeat_ngram_size": 35, "ngram_window": 128, "max_page_tokens": 20000, "page_count_guard": True, "temperature": 0.0, "crop_mode": False, "max_new_tokens": None},
+                "token_count": len(ids),
+                "token_ids_sha256": uocr2_ids_sha256(ids),
+                "decoded_text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                "finish_reason": "stop",
+                "num_pages_out": 1,
+                "expected_pages": 1,
+                "counters": {"disc_u2_2_all_neg_inf_steps": 0},
+                "routing": {"route_replica_mismatches": 0, "kbar_replica_mismatches": 0, "stage0": ["head_cls"]},
+            }
+        },
+    }
+    files = {
+        "S1-page_0009.ids.txt": ("# m generated token ids: S1-page_0009 (3 ids)\n" + " ".join(map(str, ids)) + "\n").encode(),
+        "S1-page_0009.md": text.encode(),
+    }
+    return doc, files, pins
+
+
+def uocr2_self_test() -> bool:
+    import copy  # noqa: WPS433
+
+    doc, files, pins = uocr2_self_test_doc()
+    good = uocr2_record_failures(doc, files, pins, None)
+    emit("uocr2-oracle-self-test-good", not good, failures=good)
+    ok = not good
+    entry = ("fixtures", "S1-page_0009")
+    bad_cases = [
+        ("v1-torch-pin", lambda d, f: d["provenance"]["stack"].update(torch="2.10.0")),
+        ("wrong-hf-commit", lambda d, f: d["provenance"].update(hf_commit="3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5")),
+        ("unpinned-shard", lambda d, f: d["provenance"]["model_files_sha256"].update({"model-00001-of-00002.safetensors": "9" * 64})),
+        ("bf16-run-committed", lambda d, f: d["provenance"].update(dtype="bf16")),
+        ("smoke-run-committed", lambda d, f: d["provenance"].update(smoke=True)),
+        ("nondeterministic", lambda d, f: d["provenance"]["determinism"].update(torch_deterministic_algorithms=False)),
+        ("disc-u2-2-hit", lambda d, f: d[entry[0]][entry[1]]["counters"].update(disc_u2_2_all_neg_inf_steps=1)),
+        ("disc-u2-2-unrecorded", lambda d, f: d[entry[0]][entry[1]].update(counters={})),
+        ("route-replica-drift", lambda d, f: d[entry[0]][entry[1]]["routing"].update(route_replica_mismatches=2)),
+        ("multi-page-window-on-single", lambda d, f: d[entry[0]][entry[1]]["params"].update(ngram_window=1024)),
+        ("capped-run", lambda d, f: d[entry[0]][entry[1]]["params"].update(max_new_tokens=80)),
+        ("stopped-short-of-its-pages", lambda d, f: d[entry[0]][entry[1]].update(num_pages_out=0)),
+        ("ids-file-edited", lambda d, f: f.update({"S1-page_0009.ids.txt": b"# m generated token ids: S1-page_0009 (3 ids)\n128827 128828 2068\n"})),
+        ("ids-file-miscounted", lambda d, f: f.update({"S1-page_0009.ids.txt": b"# m generated token ids: S1-page_0009 (4 ids)\n128827 128828 2067\n"})),
+        ("markdown-edited", lambda d, f: f.update({"S1-page_0009.md": b"<PAGE>"})),
+        ("markdown-missing", lambda d, f: f.pop("S1-page_0009.md")),
+        ("page-hash-missing", lambda d, f: d[entry[0]][entry[1]]["pages"][0].pop("sha256")),
+    ]
+    for case, mutate in bad_cases:
+        d, f = copy.deepcopy(doc), dict(files)
+        mutate(d, f)
+        rejected = bool(uocr2_record_failures(d, f, pins, None))
+        emit("uocr2-oracle-self-test-bad", rejected, case=case)
+        ok = ok and rejected
+    floor_ok = not uocr2_floor_failures({"groups": {"f32": {"run_dirs": ["a", "b"], "summary": {}, "fixtures": {"S1-page_0009": {}}}}}, {"S1-page_0009"})
+    floor_bad = bool(uocr2_floor_failures({"groups": {"f32": {"run_dirs": ["a"], "summary": {}, "fixtures": {}}}}, {"S1-page_0009"}))
+    emit("uocr2-oracle-self-test-floor", floor_ok and floor_bad)
+    text = "# Unlimited-OCR (v1)\n| `" + "a" * 64 + "` | `config.json` | 1 | v1 |\n# Unlimited-OCR-2 (v2)\n| `" + "b" * 64 + "` | `config.json` | 1 | v2 |\n"
+    pins_ok = uocr2_source_pins(text) == {"config.json": "b" * 64}
+    emit("uocr2-oracle-self-test-source-pins", pins_ok)
+    return ok and floor_ok and floor_bad and pins_ok
+
+
 def self_test() -> int:
-    ok = True
+    ok = uocr2_self_test()
     good_record = self_test_reference_record()
     good_failures = reference_validation_failures(good_record, quiet=True)
     emit("oracle-provenance-self-test-good", not good_failures, failures=good_failures)
@@ -713,6 +1041,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="model-gated: rerun recorded generator commands into a temp dir and compare decoded hashes",
     )
+    parser.add_argument(
+        "--uocr2-dumps",
+        type=Path,
+        default=None,
+        help="also verify the off-tree Unlimited-OCR-2 oracle dumps (<FOCR_FIXTURES_DIR>/uocr2_oracle) file by file",
+    )
     return parser.parse_args(argv)
 
 
@@ -722,6 +1056,7 @@ def main(argv: list[str] | None = None) -> int:
         return self_test()
 
     failures: list[str] = []
+    validate_uocr2(failures, args.uocr2_dumps)
 
     if not NATIVE.exists():
         emit("oracle-native-fixtures-root", True, file=str(NATIVE.relative_to(ROOT)), skipped=True)
@@ -733,6 +1068,10 @@ def main(argv: list[str] | None = None) -> int:
                 skipped=True,
                 reason="native fixtures root absent",
             )
+        if failures:
+            for failure in failures:
+                print(f"ERROR: {failure}", file=sys.stderr)
+            return 1
         emit("oracle-provenance-summary", True, manifests=0, references=0, skipped=True)
         return 0
 

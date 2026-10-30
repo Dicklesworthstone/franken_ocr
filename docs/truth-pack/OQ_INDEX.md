@@ -46,7 +46,7 @@
 | **OQ-V2-1** | RESOLVED | plan §5.6.4 | SR-SWA candidate semantics |
 | **OQ-V2-2** | RESOLVED | plan §5.6 | Router constants at inference |
 | **OQ-V2-3** | OPEN | U2-A6 floor (`bd-uocr2-epic-cgux.7`) + U2-C1 (`.17`) | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance |
-| **OQ-V2-4** | OPEN | U2-A6 step 1 (`.7`) | Does HF v2 run in f32 on CPU (dense SDPA path); is a ported dense fallback needed? |
+| **OQ-V2-4** | RESOLVED (yes; nothing ported) | U2-A6 (`.7`): `scripts/gen_reference_fixtures_uocr2.py` runs HF v2 at `5632329a` on CPU in f32 under v1's `--cpu-patch`/`--f32` shims (torch 2.13.0, transformers 4.52.1). The Triton paths require `q.is_cuda`, so prefill takes `_infer_prefill_attend` → `_forward_dense` and decode `_decode_attend`, both unmodified. `torch.use_deterministic_algorithms(True)` holds. The hooked oracle emits the same ids as a hook-free run, and its route and `kbar` replicas reproduce the reference bit for bit | Does HF v2 run in f32 on CPU (dense SDPA path); is a ported dense fallback needed? |
 | **OQ-V2-5** | RESOLVED (no) | plan §5.6.7, D8 | Are the `indexer.*` projections used at inference? |
 | **OQ-V2-6** | RESOLVED | plan §5.5 | 1-D RoPE fallback: franken builds `<PAGE>` prompts, so none |
 | **OQ-V2-7** | RESOLVED | plan §5.9, DISC-U2-2 | n-gram vs guard order hazard: the forced token wins |

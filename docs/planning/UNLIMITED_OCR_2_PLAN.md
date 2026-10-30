@@ -2521,7 +2521,7 @@ evidence-gated defaults [uocr2,epic].
 | OQ-V2-1 | SR-SWA candidate semantics | RESOLVED | §5.6.4 |
 | OQ-V2-2 | Router constants at inference | RESOLVED | §5.6 |
 | OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | OPEN | U2-A6 floor + U2-C1 |
-| OQ-V2-4 | Does HF v2 run in f32 on CPU (dense SDPA path), and is a ported dense fallback needed? | OPEN | U2-A6 step 1 |
+| OQ-V2-4 | Does HF v2 run in f32 on CPU (dense SDPA path), and is a ported dense fallback needed? | RESOLVED (yes; no port: prefill `_forward_dense`, decode `_decode_attend`, deterministic algorithms on) | U2-A6 (`OQ_INDEX.md`) |
 | OQ-V2-5 | Are the `indexer.*` projections used at inference? | RESOLVED (no) | §5.6.7, D8 |
 | OQ-V2-6 | 1-D RoPE fallback | RESOLVED (franken builds `<PAGE>` prompts; no fallback) | §5.5 |
 | OQ-V2-7 | n-gram vs guard order hazard | RESOLVED (the forced token wins) | DISC-U2-2 |

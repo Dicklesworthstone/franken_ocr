@@ -94,7 +94,19 @@ tokenizers == 0.21.4
 huggingface-hub == 0.36.0
 ```
 
-U2-A6 owns the oracle that asserts these (and the provenance-script constants).
+The v2 oracle (`scripts/gen_reference_fixtures_uocr2.py`, U2-A6) asserts these five at
+runtime, and `scripts/check_oracle_provenance.py` holds the same constants and checks
+they agree with the generator's. The remote code also imports `torchvision`, `addict`,
+`einops` and `easydict`, and Pillow does the base-mode letterbox resize. So the oracle venv
+(macOS arm64, uv 0.9.13, 2026-10-29) resolved to:
+
+```
+torchvision == 0.28.0   pillow == 12.3.0   numpy == 2.2.6   safetensors == 0.8.0
+addict == 2.4.0         einops == 0.8.2    easydict == 1.13
+```
+
+Recreate it with `uv venv --python 3.10` and one `uv pip install` of all of the above.
+Never share it with the v1 oracle venv.
 
 ## License
 

@@ -40,6 +40,8 @@ fixture** (`_meta` blocks) — this file is the index, not the authority.
 | `cjk_stream/page_{1,2}.png` | [R→C] | `scripts/gen_cjk_stream_fixture.py` (Pillow, `/System/Library/Fonts/Hiragino Sans GB.ttc`; the script refuses a font missing any glyph): two 1024² pages of Chinese text mixing single-token characters with ones the v1 byte-level BPE splits, for `multi_page_streaming_survives_split_cjk_characters_when_armed` (U2-X1) | `python3 -I scripts/gen_cjk_stream_fixture.py --font "/System/Library/Fonts/Hiragino Sans GB.ttc" --out tests/fixtures/cjk_stream` |
 | `uocr2_v1_goldens/` | [R→C] | `tests/uocr2_goldens.rs` on the pinned v1 conservative int8 artifact (size + sha256, inputs, token counts, git revision and threads in `CAPTURE.json`): generated token ids, final markdown and projected robot `page` events for the fast cases (`page_0009`, `page_0014`, `p9_p14`, its streamed twin) and the long ones (`page_0590`, `p10`, `p20`) (U2-T3) | `UPDATE_GOLDENS=1 FOCR_E2E_LONG=1 scripts/token_golden_gate.sh`, only with a reviewed reason (`docs/conformance/GOLDEN.md` §4a) |
 
+| `uocr2_oracle/` | [R→C] | `scripts/gen_reference_fixtures_uocr2.py`: Baidu's HF Unlimited-OCR-2 (`5632329a`) in f32 on CPU, on the v2 reference stack (`docs/truth-pack/PINNED_SOURCES.md`), with explicit `no_repeat_ngram_size=35`, `ngram_window` 128 (single page) or 1024 (multi-page), `max_page_tokens=20000` and the page guard (U2-A6). Contents: `<fixture>.ids.txt` and `<fixture>.md` for S1 (`page_0590`, `page_0009`, `page_0014`, base), S2 (`page_0009`, `page_0014`, `page_0019`, base), S3 (the `multi_page/` p9_p14, p10 and p20 page lists, base) and S4 (`page_0590` and `page_0009`, gundam, 2×3 tiles); `ORACLE.json` (input sha256s, params, counters, provenance); `FLOOR.json` (the nondeterminism floor and the bf16 ledger). `scripts/check_oracle_provenance.py` validates all of it | Each run below writes `<out>/<dtype>/<tag>/`; `--commit-dir` is passed only to the f32 t12 run. `P=<venv>/bin/python -I`, `G="scripts/gen_reference_fixtures_uocr2.py --model-dir <hf snapshot> --corpus ~/.cache/franken_ocr/corpus/pages --out $FOCR_FIXTURES_DIR/uocr2_oracle --sets S1,S2,S4,S3"`: `$P $G --dtype f32 --threads 12 --tag t12 --commit-dir tests/fixtures/uocr2_oracle`; `$P $G --dtype f32 --threads 12 --tag t12r`; `$P $G --dtype f32 --threads 4 --tag t4`; `$P $G --dtype bf16 --threads 12 --tag t12`; `$P $G --dtype bf16 --threads 4 --tag t4`; then `$P scripts/oracle_nondeterminism_floor.py --uocr2-group f32=<f32/t12>,<f32/t12r>,<f32/t4> --uocr2-group bf16=<bf16/t12>,<bf16/t4> --uocr2-group ledger=<f32/t12>,<bf16/t12>` |
+
 ## The weights-gated fixture families (NOT in this tree)
 
 Large oracle dumps live **beside the zoo weights** (`$FOCR_<MODEL>_DIR` /
@@ -48,6 +50,14 @@ absent — committed here would be multi-GB:
 
 * `fixtures/native_f32` (Unlimited-OCR L0–L5 oracle set; bf16 twin is the
   cross-precision ledger only),
+* `uocr2_oracle/<dtype>/<tag>/` (Unlimited-OCR-2, U2-A6): `<fixture>_reference.json`
+  plus `activations/<fixture>/*.npy` in the `native_f32` layout. The L0 tensors, the
+  page2d coordinates and cos/sin, per-layer router seams (`iq`, `ik`, `kbar`, scores,
+  candidate mask, fallback flag, entmax top-M, topi/bias/valid), the layer inputs,
+  attention outputs and logits, for the prefill and for decode steps 0–63 and ±8
+  around every `<PAGE>`. `f32/t12` is the oracle; the other tags exist for the floor
+  and the bf16 ledger. Verify with
+  `scripts/check_oracle_provenance.py --uocr2-dumps $FOCR_FIXTURES_DIR/uocr2_oracle`,
 * `<zoo>/{got,smolvlm2,onechart}_*.bin|npz` seams,
 * `<zoo>/tromr_preproc.bin` + `tromr_seam_*.bin` + `tromr_oracle_fixtures.json`
   (floors 0.0 recorded in-file; `scripts/gen_reference_fixtures_tromr.py`).

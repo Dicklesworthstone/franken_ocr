@@ -1,0 +1,1400 @@
+{
+ "schema_version": 1,
+ "fixtures": {
+  "S1-page_0009": {
+   "mode": "base",
+   "pages": [
+    {
+     "name": "page_0009.png",
+     "sha256": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+     "bytes": 544258,
+     "width": 1182,
+     "height": 1837
+    }
+   ],
+   "params": {
+    "prompt": "",
+    "crop_mode": false,
+    "no_repeat_ngram_size": 35,
+    "ngram_window": 128,
+    "max_page_tokens": 20000,
+    "page_count_guard": true,
+    "temperature": 0.0,
+    "base_size": 1024,
+    "image_size": 640,
+    "max_crops": 16,
+    "dash_topm": 16,
+    "max_length": 131072,
+    "max_new_tokens": null,
+    "eval_mode": true
+   },
+   "prompt_token_count": 279,
+   "prompt_token_ids_sha256": "ab76d4583c7ea313a0227bfd943ed5e1e11ed4fc6eca8963dfe238c6d8b38e3d",
+   "token_count": 50,
+   "token_ids_sha256": "b1c9ab8154b61f312b3a0fb77625d0bd8b4dca9cd56f5e35ce4008862c5797f7",
+   "decoded_text_sha256": "9aac896fd921e740a17902764b5b779bbc025622120b65f6cae111c1de0a1f0e",
+   "finish_reason": "stop",
+   "num_pages_out": 1,
+   "expected_pages": 1,
+   "counters": {
+    "disc_u2_2_all_neg_inf_steps": 0,
+    "disc_u2_2_first_steps": [],
+    "guard_eos_only_steps": 0,
+    "guard_cap_forced_steps": 0,
+    "guard_eos_banned_steps": 1,
+    "ngram_banning_steps": 0,
+    "raw_argmax_overridden_steps": 0
+   },
+   "routing": {
+    "stage0": [
+     "head_cls"
+    ],
+    "infer_params": {
+     "0": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "1": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "2": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "3": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "4": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "5": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "6": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "7": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "8": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "9": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "10": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "11": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     }
+    },
+    "prefill_rows": 279,
+    "prompt_rows": 279,
+    "fallback_rows_per_page": {
+     "0": {},
+     "1": {},
+     "2": {},
+     "3": {},
+     "4": {},
+     "5": {},
+     "6": {},
+     "7": {},
+     "8": {},
+     "9": {},
+     "10": {},
+     "11": {}
+    },
+    "no_remote_rows": {
+     "0": 128,
+     "1": 128,
+     "2": 128,
+     "3": 128,
+     "4": 128,
+     "5": 128,
+     "6": 128,
+     "7": 128,
+     "8": 128,
+     "9": 128,
+     "10": 128,
+     "11": 128
+    },
+    "route_replica_mismatches": 0,
+    "kbar_replica_mismatches": 0,
+    "kept_steps": 51
+   },
+   "run": {
+    "dtype": "f32",
+    "threads": 12,
+    "tag": "t12",
+    "wall_s": 4.13
+   }
+  },
+  "S1-page_0014": {
+   "mode": "base",
+   "pages": [
+    {
+     "name": "page_0014.png",
+     "sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+     "bytes": 297844,
+     "width": 1182,
+     "height": 1837
+    }
+   ],
+   "params": {
+    "prompt": "",
+    "crop_mode": false,
+    "no_repeat_ngram_size": 35,
+    "ngram_window": 128,
+    "max_page_tokens": 20000,
+    "page_count_guard": true,
+    "temperature": 0.0,
+    "base_size": 1024,
+    "image_size": 640,
+    "max_crops": 16,
+    "dash_topm": 16,
+    "max_length": 131072,
+    "max_new_tokens": null,
+    "eval_mode": true
+   },
+   "prompt_token_count": 279,
+   "prompt_token_ids_sha256": "ab76d4583c7ea313a0227bfd943ed5e1e11ed4fc6eca8963dfe238c6d8b38e3d",
+   "token_count": 256,
+   "token_ids_sha256": "0c90af2fed8d93fe6b8a020126c0a7c2fa0b260012af0264b54badfb11099b42",
+   "decoded_text_sha256": "d77ec3dfe797406ff89fdd55be748bbc8578ca334c6b114db0fa03b980716bd2",
+   "finish_reason": "stop",
+   "num_pages_out": 1,
+   "expected_pages": 1,
+   "counters": {
+    "disc_u2_2_all_neg_inf_steps": 0,
+    "disc_u2_2_first_steps": [],
+    "guard_eos_only_steps": 0,
+    "guard_cap_forced_steps": 0,
+    "guard_eos_banned_steps": 1,
+    "ngram_banning_steps": 0,
+    "raw_argmax_overridden_steps": 0
+   },
+   "routing": {
+    "stage0": [
+     "head_cls"
+    ],
+    "infer_params": {
+     "0": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "1": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "2": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "3": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "4": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "5": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "6": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "7": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "8": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "9": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "10": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "11": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     }
+    },
+    "prefill_rows": 279,
+    "prompt_rows": 279,
+    "fallback_rows_per_page": {
+     "0": {},
+     "1": {},
+     "2": {},
+     "3": {},
+     "4": {},
+     "5": {},
+     "6": {},
+     "7": {},
+     "8": {},
+     "9": {},
+     "10": {},
+     "11": {}
+    },
+    "no_remote_rows": {
+     "0": 128,
+     "1": 128,
+     "2": 128,
+     "3": 128,
+     "4": 128,
+     "5": 128,
+     "6": 128,
+     "7": 128,
+     "8": 128,
+     "9": 128,
+     "10": 128,
+     "11": 128
+    },
+    "route_replica_mismatches": 0,
+    "kbar_replica_mismatches": 0,
+    "kept_steps": 64
+   },
+   "run": {
+    "dtype": "f32",
+    "threads": 12,
+    "tag": "t12",
+    "wall_s": 16.15
+   }
+  },
+  "S1-page_0590": {
+   "mode": "base",
+   "pages": [
+    {
+     "name": "page_0590.png",
+     "sha256": "6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3",
+     "bytes": 916081,
+     "width": 1182,
+     "height": 1837
+    }
+   ],
+   "params": {
+    "prompt": "",
+    "crop_mode": false,
+    "no_repeat_ngram_size": 35,
+    "ngram_window": 128,
+    "max_page_tokens": 20000,
+    "page_count_guard": true,
+    "temperature": 0.0,
+    "base_size": 1024,
+    "image_size": 640,
+    "max_crops": 16,
+    "dash_topm": 16,
+    "max_length": 131072,
+    "max_new_tokens": null,
+    "eval_mode": true
+   },
+   "prompt_token_count": 279,
+   "prompt_token_ids_sha256": "ab76d4583c7ea313a0227bfd943ed5e1e11ed4fc6eca8963dfe238c6d8b38e3d",
+   "token_count": 2329,
+   "token_ids_sha256": "4cdfda9929840d1a3d1bcbd02a2310779ae8c424491348c4a889815536ecbc79",
+   "decoded_text_sha256": "14ab550ecc548ab34a2a1ed179f86750ced005872207ce08863bb4d6a5266342",
+   "finish_reason": "stop",
+   "num_pages_out": 1,
+   "expected_pages": 1,
+   "counters": {
+    "disc_u2_2_all_neg_inf_steps": 0,
+    "disc_u2_2_first_steps": [],
+    "guard_eos_only_steps": 0,
+    "guard_cap_forced_steps": 0,
+    "guard_eos_banned_steps": 1,
+    "ngram_banning_steps": 28,
+    "raw_argmax_overridden_steps": 20
+   },
+   "routing": {
+    "stage0": [
+     "head_cls"
+    ],
+    "infer_params": {
+     "0": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "1": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "2": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "3": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "4": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "5": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "6": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "7": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "8": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "9": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "10": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "11": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     }
+    },
+    "prefill_rows": 279,
+    "prompt_rows": 279,
+    "fallback_rows_per_page": {
+     "0": {},
+     "1": {},
+     "2": {},
+     "3": {},
+     "4": {},
+     "5": {},
+     "6": {},
+     "7": {},
+     "8": {},
+     "9": {},
+     "10": {},
+     "11": {}
+    },
+    "no_remote_rows": {
+     "0": 128,
+     "1": 128,
+     "2": 128,
+     "3": 128,
+     "4": 128,
+     "5": 128,
+     "6": 128,
+     "7": 128,
+     "8": 128,
+     "9": 128,
+     "10": 128,
+     "11": 128
+    },
+    "route_replica_mismatches": 0,
+    "kbar_replica_mismatches": 0,
+    "kept_steps": 64
+   },
+   "run": {
+    "dtype": "f32",
+    "threads": 12,
+    "tag": "t12",
+    "wall_s": 150.57
+   }
+  },
+  "S2-p9_p14_p19": {
+   "mode": "base",
+   "pages": [
+    {
+     "name": "page_0009.png",
+     "sha256": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+     "bytes": 544258,
+     "width": 1182,
+     "height": 1837
+    },
+    {
+     "name": "page_0014.png",
+     "sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+     "bytes": 297844,
+     "width": 1182,
+     "height": 1837
+    },
+    {
+     "name": "page_0019.png",
+     "sha256": "ad98fcc10f580bfa2271cc7ce3b581806d0392844d41201db95eaaa4713a1c1c",
+     "bytes": 603286,
+     "width": 1182,
+     "height": 1837
+    }
+   ],
+   "params": {
+    "prompt": "",
+    "crop_mode": false,
+    "no_repeat_ngram_size": 35,
+    "ngram_window": 1024,
+    "max_page_tokens": 20000,
+    "page_count_guard": true,
+    "temperature": 0.0,
+    "base_size": 1024,
+    "image_size": 640,
+    "max_crops": 16,
+    "dash_topm": 16,
+    "max_length": 131072,
+    "max_new_tokens": null,
+    "eval_mode": true
+   },
+   "prompt_token_count": 827,
+   "prompt_token_ids_sha256": "ac6fd0e6bfc502e6c4b73371398a3714a57b3defc6125475363feefdeb78e35b",
+   "token_count": 2152,
+   "token_ids_sha256": "a623655879bf930ab433385000f7f3fd63e6fe7d4dce1923a2f80e9d11c97dae",
+   "decoded_text_sha256": "7e1c4eed1609989bdee73d0f24102d4b0d3354830c9dfa0d50e25df6c00dced3",
+   "finish_reason": "stop",
+   "num_pages_out": 3,
+   "expected_pages": 3,
+   "counters": {
+    "disc_u2_2_all_neg_inf_steps": 0,
+    "disc_u2_2_first_steps": [],
+    "guard_eos_only_steps": 0,
+    "guard_cap_forced_steps": 0,
+    "guard_eos_banned_steps": 311,
+    "ngram_banning_steps": 43,
+    "raw_argmax_overridden_steps": 37
+   },
+   "routing": {
+    "stage0": [
+     "head_cls"
+    ],
+    "infer_params": {
+     "0": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "1": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "2": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "3": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "4": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "5": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "6": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "7": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "8": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "9": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "10": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "11": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     }
+    },
+    "prefill_rows": 827,
+    "prompt_rows": 827,
+    "fallback_rows_per_page": {
+     "0": {
+      "1": 109,
+      "2": 123
+     },
+     "1": {
+      "1": 109,
+      "2": 123
+     },
+     "2": {
+      "1": 109,
+      "2": 123
+     },
+     "3": {
+      "1": 109,
+      "2": 123
+     },
+     "4": {
+      "1": 109,
+      "2": 123
+     },
+     "5": {
+      "1": 109,
+      "2": 123
+     },
+     "6": {
+      "1": 109,
+      "2": 123
+     },
+     "7": {
+      "1": 109,
+      "2": 123
+     },
+     "8": {
+      "1": 109,
+      "2": 123
+     },
+     "9": {
+      "1": 109,
+      "2": 123
+     },
+     "10": {
+      "1": 109,
+      "2": 123
+     },
+     "11": {
+      "1": 109,
+      "2": 123
+     }
+    },
+    "no_remote_rows": {
+     "0": 128,
+     "1": 128,
+     "2": 128,
+     "3": 128,
+     "4": 128,
+     "5": 128,
+     "6": 128,
+     "7": 128,
+     "8": 128,
+     "9": 128,
+     "10": 128,
+     "11": 128
+    },
+    "route_replica_mismatches": 0,
+    "kbar_replica_mismatches": 0,
+    "kept_steps": 81
+   },
+   "run": {
+    "dtype": "f32",
+    "threads": 12,
+    "tag": "t12",
+    "wall_s": 156.29
+   }
+  },
+  "S3-p9_p14": {
+   "mode": "base",
+   "pages": [
+    {
+     "name": "page_0009.png",
+     "sha256": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+     "bytes": 544258,
+     "width": 1182,
+     "height": 1837
+    },
+    {
+     "name": "page_0014.png",
+     "sha256": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+     "bytes": 297844,
+     "width": 1182,
+     "height": 1837
+    }
+   ],
+   "params": {
+    "prompt": "",
+    "crop_mode": false,
+    "no_repeat_ngram_size": 35,
+    "ngram_window": 1024,
+    "max_page_tokens": 20000,
+    "page_count_guard": true,
+    "temperature": 0.0,
+    "base_size": 1024,
+    "image_size": 640,
+    "max_crops": 16,
+    "dash_topm": 16,
+    "max_length": 131072,
+    "max_new_tokens": null,
+    "eval_mode": true
+   },
+   "prompt_token_count": 553,
+   "prompt_token_ids_sha256": "dda5847198b44dee7db4cd8b9e3f1cbff5ee0b0248ca9306cfaecee3026fbf15",
+   "token_count": 538,
+   "token_ids_sha256": "9c3948822e0c01644df75671d5a60445b7c6346f157b1b0766b2fc98406f46f8",
+   "decoded_text_sha256": "9bc0d805cf456d0c5fac7de3a6ca9694c6922ed81ec53b054054e15c00aaa685",
+   "finish_reason": "stop",
+   "num_pages_out": 2,
+   "expected_pages": 2,
+   "counters": {
+    "disc_u2_2_all_neg_inf_steps": 0,
+    "disc_u2_2_first_steps": [],
+    "guard_eos_only_steps": 0,
+    "guard_cap_forced_steps": 0,
+    "guard_eos_banned_steps": 51,
+    "ngram_banning_steps": 1,
+    "raw_argmax_overridden_steps": 1
+   },
+   "routing": {
+    "stage0": [
+     "head_cls"
+    ],
+    "infer_params": {
+     "0": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "1": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "2": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "3": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "4": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "5": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "6": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "7": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "8": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "9": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "10": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "11": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     }
+    },
+    "prefill_rows": 553,
+    "prompt_rows": 553,
+    "fallback_rows_per_page": {
+     "0": {
+      "1": 109
+     },
+     "1": {
+      "1": 109
+     },
+     "2": {
+      "1": 109
+     },
+     "3": {
+      "1": 109
+     },
+     "4": {
+      "1": 109
+     },
+     "5": {
+      "1": 109
+     },
+     "6": {
+      "1": 109
+     },
+     "7": {
+      "1": 109
+     },
+     "8": {
+      "1": 109
+     },
+     "9": {
+      "1": 109
+     },
+     "10": {
+      "1": 109
+     },
+     "11": {
+      "1": 109
+     }
+    },
+    "no_remote_rows": {
+     "0": 128,
+     "1": 128,
+     "2": 128,
+     "3": 128,
+     "4": 128,
+     "5": 128,
+     "6": 128,
+     "7": 128,
+     "8": 128,
+     "9": 128,
+     "10": 128,
+     "11": 128
+    },
+    "route_replica_mismatches": 0,
+    "kbar_replica_mismatches": 0,
+    "kept_steps": 64
+   },
+   "run": {
+    "dtype": "f32",
+    "threads": 12,
+    "tag": "t12",
+    "wall_s": 46.29
+   }
+  },
+  "S4-page_0009-gundam": {
+   "mode": "gundam",
+   "pages": [
+    {
+     "name": "page_0009.png",
+     "sha256": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+     "bytes": 544258,
+     "width": 1182,
+     "height": 1837
+    }
+   ],
+   "params": {
+    "prompt": "",
+    "crop_mode": true,
+    "no_repeat_ngram_size": 35,
+    "ngram_window": 128,
+    "max_page_tokens": 20000,
+    "page_count_guard": true,
+    "temperature": 0.0,
+    "base_size": 1024,
+    "image_size": 640,
+    "max_crops": 16,
+    "dash_topm": 16,
+    "max_length": 131072,
+    "max_new_tokens": null,
+    "eval_mode": true
+   },
+   "prompt_token_count": 909,
+   "prompt_token_ids_sha256": "a8304aee28be5d4ce65f57c8f1ae61706d372d8acfdf4b1d886aa2a1057733fe",
+   "token_count": 78,
+   "token_ids_sha256": "56a1baf1ed2980a0010ba8e882b4ac22fe16a3d81baf800e14f4f4052eed718b",
+   "decoded_text_sha256": "4ed62aefd77f270fa3e5e9c8ff10b640cf998fca676bf94373535ac6522472fc",
+   "finish_reason": "stop",
+   "num_pages_out": 1,
+   "expected_pages": 1,
+   "counters": {
+    "disc_u2_2_all_neg_inf_steps": 0,
+    "disc_u2_2_first_steps": [],
+    "guard_eos_only_steps": 0,
+    "guard_cap_forced_steps": 0,
+    "guard_eos_banned_steps": 1,
+    "ngram_banning_steps": 0,
+    "raw_argmax_overridden_steps": 0
+   },
+   "routing": {
+    "stage0": [
+     "head_cls"
+    ],
+    "infer_params": {
+     "0": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "1": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "2": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "3": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "4": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "5": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "6": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "7": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "8": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "9": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "10": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "11": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     }
+    },
+    "prefill_rows": 909,
+    "prompt_rows": 909,
+    "fallback_rows_per_page": {
+     "0": {},
+     "1": {},
+     "2": {},
+     "3": {},
+     "4": {},
+     "5": {},
+     "6": {},
+     "7": {},
+     "8": {},
+     "9": {},
+     "10": {},
+     "11": {}
+    },
+    "no_remote_rows": {
+     "0": 128,
+     "1": 128,
+     "2": 128,
+     "3": 128,
+     "4": 128,
+     "5": 128,
+     "6": 128,
+     "7": 128,
+     "8": 128,
+     "9": 128,
+     "10": 128,
+     "11": 128
+    },
+    "route_replica_mismatches": 0,
+    "kbar_replica_mismatches": 0,
+    "kept_steps": 64
+   },
+   "run": {
+    "dtype": "f32",
+    "threads": 12,
+    "tag": "t12",
+    "wall_s": 9.75
+   }
+  },
+  "S4-page_0590-gundam": {
+   "mode": "gundam",
+   "pages": [
+    {
+     "name": "page_0590.png",
+     "sha256": "6d71d9c94f2370f51824fb91e3291ce4c64052979adc8f3b14dfe618683512d3",
+     "bytes": 916081,
+     "width": 1182,
+     "height": 1837
+    }
+   ],
+   "params": {
+    "prompt": "",
+    "crop_mode": true,
+    "no_repeat_ngram_size": 35,
+    "ngram_window": 128,
+    "max_page_tokens": 20000,
+    "page_count_guard": true,
+    "temperature": 0.0,
+    "base_size": 1024,
+    "image_size": 640,
+    "max_crops": 16,
+    "dash_topm": 16,
+    "max_length": 131072,
+    "max_new_tokens": null,
+    "eval_mode": true
+   },
+   "prompt_token_count": 909,
+   "prompt_token_ids_sha256": "a8304aee28be5d4ce65f57c8f1ae61706d372d8acfdf4b1d886aa2a1057733fe",
+   "token_count": 2971,
+   "token_ids_sha256": "07d02d0408a4467362411941621867b4082949db526ea5249830ffb7fda287ff",
+   "decoded_text_sha256": "f324fdcf24260d5c0c5d6de10327e1c0588833a73196eaf056fc68873a1a80da",
+   "finish_reason": "stop",
+   "num_pages_out": 1,
+   "expected_pages": 1,
+   "counters": {
+    "disc_u2_2_all_neg_inf_steps": 0,
+    "disc_u2_2_first_steps": [],
+    "guard_eos_only_steps": 0,
+    "guard_cap_forced_steps": 0,
+    "guard_eos_banned_steps": 1,
+    "ngram_banning_steps": 61,
+    "raw_argmax_overridden_steps": 37
+   },
+   "routing": {
+    "stage0": [
+     "head_cls"
+    ],
+    "infer_params": {
+     "0": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "1": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "2": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "3": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "4": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "5": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "6": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "7": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "8": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "9": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "10": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     },
+     "11": {
+      "idx_scale": 11.31370849898476,
+      "floor": 0.0001,
+      "sigma": 1.0,
+      "K": 12,
+      "topm": 16
+     }
+    },
+    "prefill_rows": 909,
+    "prompt_rows": 909,
+    "fallback_rows_per_page": {
+     "0": {},
+     "1": {},
+     "2": {},
+     "3": {},
+     "4": {},
+     "5": {},
+     "6": {},
+     "7": {},
+     "8": {},
+     "9": {},
+     "10": {},
+     "11": {}
+    },
+    "no_remote_rows": {
+     "0": 128,
+     "1": 128,
+     "2": 128,
+     "3": 128,
+     "4": 128,
+     "5": 128,
+     "6": 128,
+     "7": 128,
+     "8": 128,
+     "9": 128,
+     "10": 128,
+     "11": 128
+    },
+    "route_replica_mismatches": 0,
+    "kbar_replica_mismatches": 0,
+    "kept_steps": 64
+   },
+   "run": {
+    "dtype": "f32",
+    "threads": 12,
+    "tag": "t12",
+    "wall_s": 247.31
+   }
+  }
+ },
+ "provenance": {
+  "oracle": "hf-reference-cpu",
+  "script": "scripts/gen_reference_fixtures_uocr2.py",
+  "script_sha256": "2972c359008b8add7c6d76691ebff4c14c62f5645d17cd3633d0a021a8c9048e",
+  "git_revision": "4b465a71850db1df490115de0746a0449149016d+dirty",
+  "command_argv": [
+   "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/oracle_v2_venv/bin/python",
+   "scripts/gen_reference_fixtures_uocr2.py",
+   "--model-dir",
+   "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/oracle_v2_model",
+   "--corpus",
+   "/Users/jemanuel/.cache/franken_ocr/corpus/pages",
+   "--out",
+   "/Users/jemanuel/.cache/franken_ocr_local_models/uocr2_oracle",
+   "--sets",
+   "S1,S2,S4,S3",
+   "--dtype",
+   "f32",
+   "--threads",
+   "12",
+   "--tag",
+   "t12",
+   "--commit-dir",
+   "tests/fixtures/uocr2_oracle"
+  ],
+  "exact_command": "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/oracle_v2_venv/bin/python scripts/gen_reference_fixtures_uocr2.py --model-dir /private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/oracle_v2_model --corpus /Users/jemanuel/.cache/franken_ocr/corpus/pages --out /Users/jemanuel/.cache/franken_ocr_local_models/uocr2_oracle --sets S1,S2,S4,S3 --dtype f32 --threads 12 --tag t12 --commit-dir tests/fixtures/uocr2_oracle",
+  "hf_repo": "baidu/Unlimited-OCR-2",
+  "hf_commit": "5632329a32e103d5f1add270681e0f5c1233c6e4",
+  "model_files_sha256": {
+   "config.json": "607d130a70d5af5a35329aa237acd68651f45504c62cc7ced981066f4e781126",
+   "generation_config.json": "dcd0479f3a12e5e4413d956197f8a4074408e4901834b38c7e036519134e05af",
+   "configuration_deepseek_v2.py": "b8470dd616ba8745fce6e27b093aef73a098863cc891b2477dcf9326a36000f7",
+   "conversation.py": "ec7b6ce89bcda643de1f43269ffa66a7b2e65dc3ed30e427958f776546b4ba03",
+   "dash_attention.py": "960b460acd816df8e561e73dccd5683acb95445eddc723c4f0d6ed1f462b2f77",
+   "deepencoder.py": "419b63388c1645b9b72c716070cdca36cd0be6047049424dc75941d3a00aaf1f",
+   "modeling_deepseekv2.py": "24a15dfd47578ab24a7a4d4e977dc5d7a23dfef0a2a4c4bf73fcf3e2ce7acaf2",
+   "modeling_unlimitedocr.py": "f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f",
+   "_sparse_base_impl.py": "86da9c5638704bb9338575040568a97b3e10820bbeb426f51c07e866f3423ccd",
+   "packing_patch.py": "e60d842c210c9f1d6cd2ae328cf9127a75f7941a0cea2a8e9abc14662f770c6c",
+   "sparse_gather_triton.py": "c3de717ffaca40240c665b8d645f15a9d1999feeabaa94beb35caad877c2f0f4",
+   "sparse_gather_e2e_triton.py": "58f1bc46093d47b00744970677e66bfbd7485a2d13810f46d13d867ceda13dd4",
+   "special_tokens_map.json": "9e89493d7938e7710c524dbaff613c3648f0a018262417af78505128004e5cb4",
+   "tokenizer_config.json": "ceba7d221f265cca4c98b5e0a1d48c10107270b7b29c12396610d6d0fd64b126",
+   "tokenizer.json": "c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589",
+   "model.safetensors.index.json": "dc60a31ecb77eb03e166345d18cbe25bc71d2a19cc6fc089d8a9ac1c7f209671",
+   "model-00001-of-00002.safetensors": "4c40b740f209fd7682040d4ebf19409208acde5c401ccd2dde426d0f41542f18",
+   "model-00002-of-00002.safetensors": "9490b82fa47f89e5110eb5577f8ab1b6694c12121905dbc086ddb10207a4ba0c"
+  },
+  "pinned": {
+   "python": "3.10",
+   "torch": "2.13.0",
+   "transformers": "4.52.1",
+   "tokenizers": "0.21.4",
+   "huggingface_hub": "0.36.0"
+  },
+  "stack": {
+   "python": "3.10",
+   "torch": "2.13.0",
+   "transformers": "4.52.1",
+   "tokenizers": "0.21.4",
+   "huggingface_hub": "0.36.0",
+   "python_full": "3.10.19"
+  },
+  "platform": {
+   "system": "macOS-27.0.1-arm64-arm-64bit",
+   "machine": "arm64"
+  },
+  "device": "cpu",
+  "dtype": "f32",
+  "compute_dtype": "float32",
+  "shims": [
+   "cpu-patch",
+   "f32"
+  ],
+  "threads": 12,
+  "determinism": {
+   "seed": 1337,
+   "torch_manual_seed": true,
+   "torch_deterministic_algorithms": true,
+   "error": null
+  },
+  "env": {
+   "SPARSE_DIAG_LOG": "0",
+   "TIME_DIAG": "0",
+   "CODE_STAMP_LOG": "0"
+  },
+  "load_seconds": 4.0,
+  "smoke": false
+ }
+}
