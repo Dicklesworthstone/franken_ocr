@@ -11,14 +11,18 @@
 //! the streaming robot `page` events, and fails on any change.
 //!
 //! **Lanes.** A lane is one model artifact, pinned by SHA-256, plus one golden
-//! directory. The v1 lane (`unlimited-ocr`, `tests/fixtures/uocr2_v1_goldens/`)
-//! lands here; U2-C4 adds the v2 lane on the same machinery.
+//! directory: v1 (`unlimited-ocr`, `tests/fixtures/uocr2_v1_goldens/`) and,
+//! from U2-C4, v2 (`unlimited-ocr-2`, `tests/fixtures/uocr2_v2_goldens/`) on
+//! the int8 artifact U2-C4 certified. Every later change on the v2 path keeps
+//! the v2 lane green.
 //!
-//! **Cases.** The fast subset — `page_0009`, `page_0014`, the 2-page `p9_p14`
+//! **Cases.** v1's fast subset — `page_0009`, `page_0014`, the 2-page `p9_p14`
 //! document and `p9_p14` streamed — runs whenever the gate is armed.
 //! `FOCR_E2E_LONG=1` adds `page_0590` (~4k tokens, the runaway-prone table
-//! page), `p10` and `p20`. Inputs come from `FOCR_CORPUS_DIR` (default
-//! `~/.cache/franken_ocr/corpus/pages`); multi-page page lists come from
+//! page), `p10` and `p20`. v2's cases are all fast: `page_0009`, `page_0014`,
+//! the 3-page S2 document (`s2`: pages 9, 14 and 19) and `s2` streamed. Inputs
+//! come from `FOCR_CORPUS_DIR` (default `~/.cache/franken_ocr/corpus/pages`);
+//! v1's multi-page page lists come from
 //! `tests/fixtures/multi_page/{name}_meta.json`.
 //!
 //! **Gating** (LOGGING_AND_E2E.md §4):
@@ -43,7 +47,6 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -53,11 +56,10 @@ mod parity_harness;
 use franken_ocr::FocrError;
 use franken_ocr::native_engine::OcrModel;
 use parity_harness::{
-    Logger, NATIVE_PATH_FALLBACK, actual_sidecar, golden_diff, is_scrub_key, sha256_hex,
-    update_goldens,
+    Logger, NATIVE_PATH_FALLBACK, actual_sidecar, file_sha256, golden_diff, is_scrub_key,
+    sha256_hex, update_goldens,
 };
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 
 const TEST: &str = "uocr2_goldens";
 /// Arms the model-backed lanes. A resolvable model alone must not: a
@@ -91,13 +93,32 @@ struct Case {
 enum Kind {
     /// One image, single-page base mode (`OcrModel::recognize`).
     Single(&'static str),
-    /// One cross-page pass over a `tests/fixtures/multi_page` fixture's pages.
-    Multi(&'static str),
+    /// One cross-page pass over a document's pages.
+    Multi(Doc),
     /// The same pass through the CLI's driver — the pages read lazily from a
     /// `PageSource` (U2-D0), streaming robot `page` events. Streaming is
-    /// observational, so its ids and markdown must equal the named fixture
+    /// observational, so its ids and markdown must equal the named document
     /// case's goldens (never rewritten from this case).
-    Stream(&'static str),
+    Stream(Doc),
+}
+
+/// A document's pages.
+#[derive(Clone, Copy)]
+enum Doc {
+    /// A `tests/fixtures/multi_page` fixture's page list; the fixture names
+    /// its case.
+    Fixture(&'static str),
+    /// The named case's pages, listed here.
+    Pages(&'static str, &'static [&'static str]),
+}
+
+impl Doc {
+    /// The document case's name.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fixture(name) | Self::Pages(name, _) => name,
+        }
+    }
 }
 
 const V1_LANE: Lane = Lane {
@@ -120,12 +141,12 @@ const V1_LANE: Lane = Lane {
         },
         Case {
             name: "p9_p14",
-            kind: Kind::Multi("p9_p14"),
+            kind: Kind::Multi(Doc::Fixture("p9_p14")),
             long: false,
         },
         Case {
             name: "p9_p14_stream",
-            kind: Kind::Stream("p9_p14"),
+            kind: Kind::Stream(Doc::Fixture("p9_p14")),
             long: false,
         },
         Case {
@@ -135,30 +156,71 @@ const V1_LANE: Lane = Lane {
         },
         Case {
             name: "p10",
-            kind: Kind::Multi("p10"),
+            kind: Kind::Multi(Doc::Fixture("p10")),
             long: true,
         },
         Case {
             name: "p20",
-            kind: Kind::Multi("p20"),
+            kind: Kind::Multi(Doc::Fixture("p20")),
             long: true,
         },
     ],
 };
+
+/// U2-A6's S2 document: three corpus pages read in one pass.
+const S2: Doc = Doc::Pages("s2", &["page_0009.png", "page_0014.png", "page_0019.png"]);
+
+/// The v2 lane (U2-C4): the regression gate for every later change on the v2
+/// path. Its artifact is the conservative int8 build U2-C4 certified.
+const V2_LANE: Lane = Lane {
+    model_id: "unlimited-ocr-2",
+    golden_dir: "tests/fixtures/uocr2_v2_goldens",
+    artifact_names: &["unlimited-ocr-2.v0.1.0.int8.focrq"],
+    cases: &[
+        Case {
+            name: "page_0009",
+            kind: Kind::Single("page_0009.png"),
+            long: false,
+        },
+        Case {
+            name: "page_0014",
+            kind: Kind::Single("page_0014.png"),
+            long: false,
+        },
+        Case {
+            name: "s2",
+            kind: Kind::Multi(S2),
+            long: false,
+        },
+        Case {
+            name: "s2_stream",
+            kind: Kind::Stream(S2),
+            long: false,
+        },
+    ],
+};
+
+/// Every lane, in the order the always-on checks walk them.
+const LANES: [&Lane; 2] = [&V1_LANE, &V2_LANE];
 
 impl Case {
     /// The input image names, in order.
     fn inputs(&self) -> Result<Vec<String>, String> {
         match self.kind {
             Kind::Single(image) => Ok(vec![image.to_string()]),
-            Kind::Multi(fixture) | Kind::Stream(fixture) => multi_page_names(fixture),
+            Kind::Multi(Doc::Fixture(fixture)) | Kind::Stream(Doc::Fixture(fixture)) => {
+                multi_page_names(fixture)
+            }
+            Kind::Multi(Doc::Pages(_, pages)) | Kind::Stream(Doc::Pages(_, pages)) => {
+                Ok(pages.iter().map(|p| (*p).to_string()).collect())
+            }
         }
     }
 
     /// The case whose ids/markdown goldens this case is compared against.
     fn golden_stem(&self) -> &'static str {
         match self.kind {
-            Kind::Stream(fixture) => fixture,
+            Kind::Stream(doc) => doc.name(),
             _ => self.name,
         }
     }
@@ -202,22 +264,6 @@ fn corpus_dir() -> Option<PathBuf> {
         _ => std::env::var_os("HOME")
             .map(|home| PathBuf::from(home).join(".cache/franken_ocr/corpus/pages")),
     }
-}
-
-fn file_sha256(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 8 << 20];
-    loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -643,6 +689,16 @@ fn run_lane(lane: &Lane) {
         ]),
     );
     let model = OcrModel::load(&artifact.path).expect("load the pinned artifact");
+    // A recapture takes the first artifact that exists, `FOCR_MODEL_PATH`
+    // first: it must be this lane's model.
+    assert_eq!(
+        model.identity().model_id,
+        lane.model_id,
+        "{} is not a {} artifact (recapture one lane at a time, with FOCR_MODEL_PATH \
+         naming that lane's artifact or unset)",
+        artifact.path.display(),
+        lane.model_id
+    );
     let golden_dir = repo_path(lane.golden_dir);
     fs::create_dir_all(&golden_dir).expect("golden dir");
     let revision = git_revision();
@@ -837,6 +893,12 @@ fn v1_lane_matches_goldens() {
     run_lane(&V1_LANE);
 }
 
+/// The v2 lane (U2-C4): every later change on the v2 path keeps it green.
+#[test]
+fn v2_lane_matches_goldens() {
+    run_lane(&V2_LANE);
+}
+
 /// Always on: an explicit model path that does not exist is a clean
 /// `ModelNotFound` (exit 3), never a fallback to some other artifact. This is
 /// what lets an armed lane log `native_path_ran: true`.
@@ -863,8 +925,13 @@ fn native_path_has_no_fallback() {
 /// has its files with a matching token count.
 #[test]
 fn committed_goldens_are_well_formed() {
-    let lane = &V1_LANE;
-    let mut log = Logger::new(TEST, "golden_files");
+    for lane in LANES {
+        lane_goldens_are_well_formed(lane);
+    }
+}
+
+fn lane_goldens_are_well_formed(lane: &Lane) {
+    let mut log = Logger::new(TEST, lane.model_id);
     let t0 = Instant::now();
     let dir = repo_path(lane.golden_dir);
     let Some(capture) = load_capture(lane).expect("CAPTURE.json parses") else {

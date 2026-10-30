@@ -172,6 +172,15 @@ def multi_page_case(fixture: str, meta: str) -> Case:
 # 1182x1837 and tiles as a 2x3 grid (2026-10-29), so that is page_0009.
 S4_NON_SQUARE_PAGE = "page_0009.png"
 
+# The 20-page corpus (`PAGES.txt`), the S1-corpus references of U2-C4's
+# single-page gate (plan §7.1 "S1-corpus"; base mode, one page each).
+CORPUS_PAGES = (
+    "page_0009.png", "page_0014.png", "page_0019.png", "page_0023.png", "page_0086.png",
+    "page_0091.png", "page_0105.png", "page_0107.png", "page_0108.png", "page_0126.png",
+    "page_0136.png", "page_0179.png", "page_0250.png", "page_0358.png", "page_0400.png",
+    "page_0437.png", "page_0547.png", "page_0557.png", "page_0590.png", "page_0645.png",
+)
+
 
 def fixture_sets() -> dict[str, list[Case]]:
     return {
@@ -190,6 +199,7 @@ def fixture_sets() -> dict[str, list[Case]]:
             Case("S4-page_0590-gundam", ("page_0590.png",), True),
             Case(f"S4-{S4_NON_SQUARE_PAGE.removesuffix('.png')}-gundam", (S4_NON_SQUARE_PAGE,), True),
         ],
+        "S1C": [Case(f"S1C-{page.removesuffix('.png')}", (page,), False) for page in CORPUS_PAGES],
     }
 
 

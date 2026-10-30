@@ -786,7 +786,9 @@ fn npy_payload<'a>(
         std::str::from_utf8(&bytes[header_start..header_end]).map_err(|_| "non-utf8 npy header")?;
     // The header is a Python-dict literal: {'descr':'<f4','fortran_order':False,'shape':(.. ,)}.
     if !descrs.iter().any(|descr| header.contains(descr)) {
-        return Err(format!("unsupported descr (need one of {descrs:?}): {header}"));
+        return Err(format!(
+            "unsupported descr (need one of {descrs:?}): {header}"
+        ));
     }
     if header.contains("'fortran_order': True") || header.contains("'fortran_order':True") {
         return Err("fortran_order True unsupported (need C-order)".into());
@@ -842,6 +844,25 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+/// Lowercase-hex SHA-256 of the file at `path`, streamed (a model artifact is
+/// gigabytes).
+pub fn file_sha256(path: &Path) -> Result<String, String> {
+    use std::io::Read as _;
+    let mut file = fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 8 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn required_hex64(value: Option<&str>, field: &str) -> Result<String, String> {
@@ -1609,7 +1630,10 @@ mod tests {
         assert!(read_npy_u8(&bytes).is_err(), "an <i4 file is not |u1");
 
         let mask = synthetic_npy_v1_typed("|u1", &[1, 0, 1], "(3,)");
-        assert_eq!(read_npy_u8(&mask).expect("u1 parses"), (vec![3], vec![1, 0, 1]));
+        assert_eq!(
+            read_npy_u8(&mask).expect("u1 parses"),
+            (vec![3], vec![1, 0, 1])
+        );
         assert!(read_npy_i32(&mask).is_err(), "a |u1 file is not <i4");
 
         let short = synthetic_npy_v1_typed("<i4", &ints[..12], "(2, 2)");
