@@ -74,6 +74,619 @@ since exact-token OCR fails in the tail.
 
 ---
 
+DISC-009 to DISC-021 are the Unlimited-OCR-2 entries. They resolve against the v2 truth
+pack, not the v1 pins above: Hugging Face `baidu/Unlimited-OCR-2`
+`5632329a32e103d5f1add270681e0f5c1233c6e4` and the v2 reference stack (torch 2.13.0,
+transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimited-OCR-2
+(v2)". Each title opens with the entry's plan name, U2-k for DISC-U2-k
+(`docs/planning/UNLIMITED_OCR_2_PLAN.md` §5.11). Source tags follow the plan's §5:
+`MU` `modeling_unlimitedocr.py`, `MD` `modeling_deepseekv2.py`, `SB` `_sparse_base_impl.py`,
+`DA` `dash_attention.py`.
+
+## DISC-009: U2-1 — router entmax domain: HF's top-M window by default, SGLang's all-candidates domain selectable
+
+- claim_id / evidence_id: CLAIM-uocr2-entmax-domain → `src/native_engine/srswa.rs`
+    (`EntmaxDomain`, `entmax15_topm`, `entmax15_all`, `route`) +
+    `srswa::tests::all_candidates_equals_top_m_under_its_preconditions` +
+    `real_v2_entmax_domains_decode_s1_alike` (`src/native_engine/mod.rs`) +
+    the U2-B2 and U2-B6 close comments (bd-uocr2-epic-cgux.11, bd-uocr2-epic-cgux.15).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_deepseekv2.py` sha256
+    `24a15dfd47578ab24a7a4d4e977dc5d7a23dfef0a2a4c4bf73fcf3e2ce7acaf2` lines 346-362;
+    `dash_attention.py` sha256
+    `960b460acd816df8e561e73dccd5683acb95445eddc723c4f0d6ed1f462b2f77` lines 762-813;
+    SGLang wheel `sglang-0.5.20.dev10+g8d62f5fb9c` sha256
+    `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`route_triton.py:129-212`); oracle `tests/fixtures/uocr2_oracle/ORACLE.json` sha256
+    `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90`; shipping artifact
+    `unlimited-ocr-2.v0.1.0.int8.focrq` sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4).
+- Exact command + env: model-free:
+    `cargo test --lib all_candidates_equals_top_m_under_its_preconditions`. Model-gated:
+    `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages
+    cargo test --profile release-perf --lib real_v2_entmax_domains_decode_s1_alike -- --nocapture`.
+- Reference behavior: HF runs entmax-1.5 over the top-M window of all blocks, M = min(16, nblk),
+    and reads the candidates among the first K' = min(12, M) slots (`MD:346-362`). SGLang's Triton
+    router runs entmax-1.5 over every candidate block and no other block. It solves τ with a 24-step
+    bisection (fp64 sums) and finds the read set, the 12 highest-score candidates, with a 40-step
+    count bisection, so a tie at 12th place can read fewer than 12 blocks (`route_triton.py:129-212`).
+    The two agree when a query has at most 16 candidates (every own-page query in base mode), up to
+    bisection precision and ties. They can differ on fallback queries (BOS, instruction, the early
+    image rows of pages 2..N, text before the first `<PAGE>`) and on gundam pages (plan §5.6.6).
+- Our impl: both domains (D21). `EntmaxDomain::TopM` is HF's form and the default.
+    `EntmaxDomain::AllCandidates` (`entmax15_all`) follows SGLang's rule with an exact sort-based τ in
+    place of both bisections, so a tie never shortens its read set. `DecodeParams.entmax_domain`
+    carries the choice into the v2 document loop.
+- Fallback / kill-switch state: `FOCR_SRSWA_ENTMAX`, read once per process. Unset, empty or `topm`
+    selects HF's top-M (the parity default); `all` selects the all-candidates domain. Any other value
+    exits 2 at admission.
+- Measured impact:
+    * S1-page_0009 (one base page): top-M and all-candidates decode the same 50 ids, equal to the
+      f32 oracle's (`real_v2_entmax_domains_decode_s1_alike`, U2-B6, 2026-10-30). A base page has at
+      most 10 blocks, so this run checks the `all` wiring; it cannot separate the domains.
+    * Model-free: on 2,000 random rows that meet the preconditions (at most 16 candidates, no tie at
+      12th place, best candidate input ≥ −1e4+2, none ≤ −1e4) the domains read the same blocks, with
+      biases within 1e-5. With 20 near-equal candidates both read the same 12 blocks, but the support
+      is 20 vs 16 and the biases differ by more than 1e-4.
+    * Where they can differ on real prompts: U2-C1 counted fallback queries per layer at 232 on S2,
+      109 on S3-p9_p14, 1,037 on S3-p10 and 2,161 on S3-p20. No decode has compared the domains on
+      these documents: U2-B6 did not run the S2 comparison, and U2-C5b owns it.
+    * Our exact τ against SGLang's bisections: not measured. No SGLang run exists in this repo.
+- Resolution: ACCEPTED for parity: top-M is the default and the f32 oracle's domain. The default for
+    long documents stays open until U2-C5b scores both domains against ground truth (D21).
+- Tests affected: `all_candidates_equals_top_m_under_its_preconditions`,
+    `top_m_slots_break_ties_by_lower_block`, `the_entmax_domain_env_names_a_domain_or_is_refused`
+    (`srswa.rs`); `real_v2_entmax_domains_decode_s1_alike` (`mod.rs`, model-gated). No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-010: U2-2 — n-gram ban vs page guard order: a forced token is emitted even when the n-gram bans it
+
+- claim_id / evidence_id: CLAIM-uocr2-forced-token-wins → `src/native_engine/sampler.rs`
+    `decode_step_guarded` (`GuardedStep.hf_all_neg_inf`) +
+    `sampler::tests::{forced_token_is_authoritative_over_the_ngram_ban,
+    guard_and_ngram_replay_the_v2_oracle_counters}` + the `disc_u2_2_steps` field of the
+    `real_v2_l4_*` NDJSON lines (U2-C2) + the U2-B6 close comment (bd-uocr2-epic-cgux.15).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` lines 583-623 (guard and
+    n-gram) and 1168-1173 (their order); SGLang wheel dev10 sha256
+    `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`custom_logit_processor.py:194-262,325-338`); `ORACLE.json` sha256
+    `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90`; shipping artifact sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4). The rule is integer control flow.
+- Exact command + env: `cargo test --lib -- forced_token_is_authoritative_over_the_ngram_ban
+    guard_and_ngram_replay_the_v2_oracle_counters`. Model-gated:
+    `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages
+    FOCR_E2E_LONG=1 cargo test --profile release-perf --lib -- real_v2_l4
+    real_v2_document_limits_stop_where_the_contract_says --nocapture`.
+- Reference behavior: HF's `_uocr_generate` applies the n-gram ban first, then the page guard
+    (`MU:1168-1173`). If the guard allows a single token and the n-gram has banned it, every logit is
+    −inf and argmax emits id 0. SGLang applies the guard first, and a forced token skips the n-gram
+    (`custom_logit_processor.py:194-262,325-338`).
+- Our impl: SGLang's order. `decode_step_guarded` returns a forced token without consulting the
+    n-gram. It then runs the n-gram scan only to set `hf_all_neg_inf` on a step where HF would emit
+    id 0, and `DocumentStats.hf_all_neg_inf_steps` counts those steps. EOS is never appended to the
+    generated ids, so the n-gram cannot ban it: only a cap-forced `<PAGE>` can reach the case.
+- Fallback / kill-switch state: none. No switch restores HF's order, which would emit id 0 on such a
+    step.
+- Measured impact: never reached on any run.
+    * HF oracle: `disc_u2_2_all_neg_inf_steps` is 0 on all nine fixtures (`ORACLE.json`). The
+      reference forced no token on any of them (`guard_cap_forced_steps` and
+      `guard_eos_only_steps` are 0), so the case cannot arise there.
+    * franken_ocr: `hf_all_neg_inf_steps` is 0 on S1, on S3, and on S2 with the page cap lowered to
+      50, the one run that forced tokens (2 forced steps; U2-B6). It is 0 on all 28 U2-C2 L4 runs,
+      which assert it.
+    * The unit test builds the case: a cap-forced `<PAGE>` whose 2-gram is banned is still emitted,
+      with `hf_all_neg_inf` set.
+- Resolution: ACCEPTED. OQ-V2-7 is RESOLVED: the forced token wins.
+- Tests affected: `forced_token_is_authoritative_over_the_ngram_ban`,
+    `guard_and_ngram_replay_the_v2_oracle_counters`,
+    `guarded_loop_keeps_the_page_contract_under_random_logits` (`sampler.rs`);
+    `real_v2_l4_s1_pages_decode_the_oracle_ids`, `real_v2_l4_documents_decode_the_oracle_ids`,
+    `real_v2_l4_long_documents_decode_the_oracle_ids`,
+    `real_v2_document_limits_stop_where_the_contract_says` (`mod.rs`, model-gated). No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-011: U2-3 — `<PAGE>` ban on the last page: HF's rule when unwindowed, SGLang's when windowed
+
+- claim_id / evidence_id: CLAIM-uocr2-last-page-marker-ban → `src/native_engine/sampler.rs`
+    (`PageGuard::ban_last_page_marker`) + `src/native_engine/window.rs` (`window_guard`) +
+    `postprocess::split_pages_by_token` (`extra_markers`) + `tests/fixtures/uocr2_windowed/` +
+    the U2-D1a close comment (bd-uocr2-epic-cgux.24).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` lines 583-605; SGLang wheel
+    dev10 sha256 `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`custom_logit_processor.py:227,256-262`, `uocr_doc_reuse.py:1101-1109`); `ORACLE.json` sha256
+    `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90`;
+    `degenerate-s2-w3-t12.json` sha256
+    `af019ec1f81f8c60bbede053066277ceefc134ba183a7351525d016a54d6ce91`;
+    `w2-n7-recompute-t12.json` sha256
+    `5f9953e6d4e500c59cd9ae7d935fc7800e1253d41c1a468bad55a340172afcaa`; shipping artifact sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4).
+- Exact command + env: `cargo test --lib -- guard_last_page_ban_masks_the_marker
+    only_a_recomputed_last_window_bans_the_marker`. Model-gated:
+    `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages
+    cargo test --profile release-perf --lib real_v2_windowed_decode_matches_the_windowed_oracle --
+    --nocapture`. The S2 check below:
+    `python3 -I -c "import json; a=json.load(open('tests/fixtures/uocr2_windowed/degenerate-s2-w3-t12.json'))['windows'][0]['generated_ids']; b=[int(t) for l in open('tests/fixtures/uocr2_oracle/S2-p9_p14_p19.ids.txt') if not l.startswith('#') for t in l.split()]; print(len(a), len(b), a == b)"`
+    prints `2152 2152 True`.
+- Reference behavior: HF's guard never bans `<PAGE>` (`MU:583-605`). Once every page has its
+    marker, another `<PAGE>` is allowed, and the guard then forces EOS. SGLang bans `<PAGE>` on the
+    last page unless `end_on_marker` (`custom_logit_processor.py:256-262`), where
+    `end_on_marker = lookahead > 0 or reused` (`:227`; a reused window sets it,
+    `uocr_doc_reuse.py:1101-1109`). The ban therefore reaches only an unsplit request and a last
+    window that was recomputed.
+- Our impl: an unwindowed decode (every document of N ≤ W pages, D13) follows HF: no ban. An extra
+    marker is counted in `extra_markers` and the empty trailing body is dropped, so N pages give N
+    bodies (`split_pages_by_token`). A windowed decode follows SGLang: `window_guard` adds the ban
+    only for a last window that was recomputed.
+- Fallback / kill-switch state: none. The rule follows from whether the document is windowed.
+- Measured impact: no id changed on any measured run.
+    * HF oracle: `guard_eos_only_steps` is 0 on all nine fixtures, so HF never emitted a `<PAGE>`
+      past the page count. On the oracle's own logits the ban would have changed no id.
+    * S2 (3 pages), direct: the U2-D2a windowed oracle's unsplit run applies SGLang's ban on 1,842
+      steps of the last page and generates the same 2,152 ids as the HF oracle (command above,
+      run 2026-10-30).
+    * franken_ocr: `extra_markers` is 0 on all 28 U2-C2 L4 runs (unwindowed). The recomputed last
+      window of `w2-n7-recompute-t12` (ban active on 595 steps) is token-exact against the windowed
+      oracle on the f32 cache.
+    * The 25-page W=10 run had 1 extra marker, in its reused last window, which neither stack bans.
+      It was counted as extra, its body was dropped, and the document kept 25 bodies (U2-D1a).
+- Resolution: ACCEPTED.
+- Tests affected: `guard_last_page_ban_masks_the_marker_once_every_page_has_one` (`sampler.rs`);
+    `only_a_recomputed_last_window_bans_the_marker` (`window.rs`);
+    `split_pages_by_token_keeps_n_bodies_and_reports_head_and_extras` (`postprocess.rs`);
+    model-gated `real_v2_l4_*`, `real_v2_windowed_decode_matches_the_windowed_oracle`,
+    `real_v2_windowed_25_pages_own_every_page_once` (`mod.rs`). No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-012: U2-4 — windowed stitching never drops a leading blank body
+
+- claim_id / evidence_id: CLAIM-uocr2-no-leading-blank-drop →
+    `postprocess::split_window_pages` + `postprocess::tests::split_window_pages_keeps_own_pages_only`
+    + `window::tests::windowed_bodies_match_the_oracle_stitching` + the U2-D1a close comment
+    (bd-uocr2-epic-cgux.24).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; SGLang wheel dev10 sha256
+    `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d` (`doc_split.py:237-257`,
+    the drop at `:253-254`; `serving_chat.py:1114-1124`); v2 `tokenizer.json` sha256
+    `c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589`; windowed fixtures
+    `w2-n7-t12.json` `3bbb36eeb764e474f2c16f1b4c34577668052e0be027d4f5e1b137cae784d79d`,
+    `w3-n7-t12.json` `9f748c896dce0e260304fb5e6142f91ffc79fe482f844c7e1a617299b3b9f36d`,
+    `w2-n7-recompute-t12.json` `5f9953e6d4e500c59cd9ae7d935fc7800e1253d41c1a468bad55a340172afcaa`,
+    `w2-n5-markeronly-t12.json` `152e0626c7c7ffd172643a5f012090ed33b244e4ce2821795bffabc08c73ff27`,
+    `degenerate-s2-w3-t12.json` `af019ec1f81f8c60bbede053066277ceefc134ba183a7351525d016a54d6ce91`;
+    shipping artifact sha256 `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4). The split is byte-level text handling.
+- Exact command + env: `cargo test --lib split_window_pages_keeps_own_pages_only`;
+    `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> cargo test --lib
+    windowed_bodies_match_the_oracle_stitching` (it reads only `tokenizer.json` from that dir).
+- Reference behavior: HF never splits a document, so it has no counterpart. SGLang's
+    `select_batch_output` drops leading blank bodies while a window has more bodies than own pages:
+    `while len(bodies) > input_pages and not bodies[0].strip(): bodies = bodies[1:]`
+    (`doc_split.py:253-254`). It runs on the non-streaming path and in the streaming handler's
+    end-of-window call (`serving_chat.py:1114-1124`); the incremental `stream_owned_text`
+    (`:260-275`) has no such drop. When a window's first own page is blank and the window ended on
+    the lookahead marker, the drop removes that page's body and the blank page moves to the end of
+    the window's bodies.
+- Our impl: `split_window_pages` keeps every body in page order and keeps only the own pages (D5). A
+    blank page stays a blank body at its own index.
+- Fallback / kill-switch state: none. The drop shifts page alignment, so nothing restores it.
+- Measured impact: not reached. On all 5 committed U2-D2a runs, our split of the oracle's own
+    generated ids stitches to the wheel's document bodies byte for byte
+    (`windowed_bodies_match_the_oracle_stitching`). So no window there had a blank first own page,
+    and the drop never fired. The unit test pins the rule on synthetic ids: a blank first body is
+    kept ("no leading-blank drop"). The 40-60-page S5 document (U2-A6b, U2-D2b) is the next corpus
+    that can contain a blank page.
+- Resolution: ACCEPTED (D5).
+- Tests affected: `split_window_pages_keeps_own_pages_only` (`postprocess.rs`);
+    `windowed_bodies_match_the_oracle_stitching` (`window.rs`, tokenizer-gated);
+    `real_v2_windowed_decode_matches_the_windowed_oracle` (`mod.rs`, model-gated). No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-013: U2-5 — numerics: f32 throughout, compared with an f32 oracle; routing tie-flips at near-ties
+
+- claim_id / evidence_id: CLAIM-uocr2-f32-numerics → `tests/parity_ladder.rs` (L1/L2, L3) +
+    `real_v2_l4_*` (`src/native_engine/mod.rs`) + `tests/metamorphic.rs` (MR-6) +
+    `tests/fixtures/uocr2_oracle/FLOOR.json` + the U2-C1 and U2-C2 close comments
+    (bd-uocr2-epic-cgux.17, .18) + the U2-C4 comment of 2026-10-30 04:19 UTC (bd-uocr2-epic-cgux.20).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_deepseekv2.py` sha256
+    `24a15dfd47578ab24a7a4d4e977dc5d7a23dfef0a2a4c4bf73fcf3e2ce7acaf2` lines 447-450, 530;
+    `dash_attention.py` sha256 `960b460acd816df8e561e73dccd5683acb95445eddc723c4f0d6ed1f462b2f77`
+    lines 1230-1261; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` lines 1165-1167; `ORACLE.json`
+    sha256 `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90`; `FLOOR.json` sha256
+    `0b9978731408e7ddc51587feb975b42da9116efa56502def81a75b71d28e93ed` (torch 2.13.0, transformers
+    4.52.1, f32 CPU, 12 threads); shipping artifact sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4); the oracle ran on macOS arm64.
+- Exact command + env: with `FOCR_UOCR2_FIXTURES_DIR=~/.cache/franken_ocr_local_models/uocr2_oracle/f32/t12
+    FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages`:
+    `cargo test --profile release-perf --test parity_ladder -- uocr2_l1_l2_prefill_matches_the_f32_oracle
+    uocr2_l3_decode_steps_match_the_f32_oracle --nocapture` (about 140 s and 1,020 s);
+    `FOCR_E2E_LONG=1 cargo test --profile release-perf --lib real_v2_l4 -- --nocapture`;
+    `cargo test --profile release-perf --test metamorphic mr6_uocr2_reprefill_equals_incremental`.
+- Reference behavior: every path computes the same math; only rounding differs (plan §5.7). GPU
+    prefill (Triton, `MD:447-450`) keeps the bias and online softmax in fp32 but rounds q·scale and P
+    to bf16. CPU prefill runs SDPA in the activation dtype (`DA:1230-1261`). Decode does fp32 math over
+    activation-dtype q/K/V and casts back before `o_proj` (`MD:530`). Logits come from `lm_head` in
+    the activation dtype, then `.float()` (`MU:1165-1167`). SGLang serves bf16 Triton.
+- Our impl: activations, router, attention, norms and `lm_head` run in f32 over the bf16 weights.
+    The gathered `srswa::attend` equals the dense `attend_dense` bit for bit (`FOCR_SRSWA_DENSE=1`
+    selects the dense one). The parity target is HF `infer()` in f32 on CPU (D4). The shipping
+    cache's int8 FFN/expert storage is DISC-019 (U2-11), not this entry.
+- Fallback / kill-switch state: none. v2 has no bf16 compute path; f32 is its only precision.
+- Measured impact:
+    * Reference floor (f32, 12 vs 4 threads, nine fixtures): identical ids, logit spread ≤ 4.8e-4,
+      layer-input max_rel ≤ 2.3e-4, and 4 rows that change their selected block set. HF bf16 vs f32:
+      ids leave within 7-94 steps and 12,169 routing rows differ.
+    * Prefill (L1/L2): every stage of every layer at cosine ≥ 0.9999; worst 0.99999992 on S1-S3 and
+      0.99999946 on S4. The router run on the oracle's scores has 0 selection mismatches.
+    * Prefill routing, chained: 5 single-row tie-flips over 9 fixtures × 12 layers, each swap gap
+      within 2× the layer's score noise: S3-p10 L3 row 2245 (gap 1.5e-8) and S3-p20 L3 row 2245
+      (gap 0), the block 56/64 swap the oracle itself makes between 12 and 4 threads; S3-p20 L4 row
+      5037 (1.9e-7) and L7 row 5041 (1.2e-7); S4-page_0590-gundam L11 row 823 (1.2e-4).
+    * The S4 flip follows an MoE expert near-tie: at layer 8, row 823's 6th and 7th experts (53 and
+      26) score 0.031048 each, margin 4.5e-7, the smallest of the page's 909 rows by 4×. From layer
+      9 on, row 823 holds the largest native-vs-oracle difference. The MoE code is v1's (DISC-006).
+    * Decode (L3, stateless f32, S1 ×3, S2, S3-p9_p14, S4 ×2): logit cosine ≥ 0.9999865, no
+      raw-argmax mismatch on any dumped step. Decode routing differs only on S4-page_0590-gundam:
+      3 tie-flips at layers 5, 7 and 10, steps 11, 11 and 59, swap gaps 1.6e-7, 3.5e-4 and 4.3e-6,
+      each within 2× the layer's score noise.
+    * Ids (L4): the f32 paths are exact on all 7 base fixtures (50 to 16,880 ids), retirement on and
+      off, so the tie-flips change no generated id on S1-S3. L4 does not run S4. MR-6 on the f32
+      cache: max relative logit gap 8.95e-7 over 2,152 steps (S2), tokens equal.
+    * Not measured: the bf16 ledger tolerance (OQ-V2-3 is PARTIAL) and any run against SGLang.
+- Resolution: ACCEPTED. The math is the same, and the tie-flips sit within the measured score noise.
+- Tests affected: `uocr2_l1_l2_prefill_matches_the_f32_oracle`,
+    `uocr2_l3_decode_steps_match_the_f32_oracle`, `real_v2_l4_s1_pages_decode_the_oracle_ids`,
+    `real_v2_l4_documents_decode_the_oracle_ids`, `real_v2_l4_long_documents_decode_the_oracle_ids`,
+    `mr6_uocr2_reprefill_equals_incremental`; all model-gated. No XFAIL on the f32 paths.
+- Review date: 2026-10-30
+
+## DISC-014: U2-6 — crop mode for multi-image requests: base views, not SGLang's gundam default
+
+- claim_id / evidence_id: CLAIM-uocr2-document-crop-mode → `src/native_engine/mod.rs`
+    (`paged_document_view`, `OcrModel::document_page`) +
+    `gundam_is_refused_for_a_v2_document_and_warns_on_a_v2_page` + plan D12 and OQ-V2-14.
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` lines 541 and 1117; SGLang
+    wheel dev10 sha256 `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`multimodal/processors/unlimited_ocr.py:23`); `ORACLE.json` sha256
+    `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90` (S1-page_0590 ids sha256
+    `666cd4633da039c5cf085b0b918c43868e9f779d84cbf54d196518108da6d982`, S4-page_0590-gundam ids
+    sha256 `a6b19ee98007eee6f9f740988eb88ebf143a76c7c97b19939e845e0e40d50fc7`); shipping artifact
+    sha256 `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4).
+- Exact command + env: `cargo test --lib gundam_is_refused_for_a_v2_document_and_warns_on_a_v2_page`.
+    The token counts below are `fixtures.<name>.token_count` in `ORACLE.json`. The gundam parity rungs
+    run as in DISC-013.
+- Reference behavior: HF `infer_multi` reads every page of a multi-image request as one base 1024
+    view (`MU:1117`). HF `infer` with `crop_mode=None` uses gundam only for a single image
+    (`MU:541`). SGLang's processor defaults to gundam for every request, multi-image included
+    (`unlimited_ocr.py:23`). Baidu's report does not state the crop mode behind its long-document
+    scores, and its latency table uses gundam (plan §2, OQ-V2-14).
+- Our impl: a v2 document reads each page as a base 1024 letterbox (`OcrModel::document_page`), as
+    HF `infer_multi` does. A v2 `--multi-page` document given `--crop-mode gundam` exits 2
+    (`paged_document_view`, U2-E1). A single v2 page also defaults to base (D12); `--crop-mode
+    gundam` there runs gundam with an `uncertified_crop_mode` warning.
+- Fallback / kill-switch state: none. No environment variable selects the crop mode. A single page can
+    still run gundam through `--crop-mode gundam`; there is no gundam document mode.
+- Measured impact: not measured for documents. OQ-V2-14 is OPEN; U2-C5b decides it against ground
+    truth, or hands its gundam cells to U2-G2.
+    * The HF reference itself decodes a page differently by crop mode: page_0590 gives 2,329 ids in
+      base (S1) and 2,971 in gundam (S4); page_0009 gives 50 and 78. No ground-truth score ranks the
+      two yet.
+    * Gundam parity holds where it was measured: S4 preprocessing is bit-exact, S4 prefill stages
+      reach cosine ≥ 0.99999946, and S4 decode steps pass L3 (DISC-013).
+    * Cost: plan D12 estimates gundam's CPU vision cost at 1.7-6.4× base from §8.1's per-view
+      figures. Not measured on v2.
+- Resolution: ACCEPTED: base is the default (D12). OQ-V2-14 stays open.
+- Tests affected: `gundam_is_refused_for_a_v2_document_and_warns_on_a_v2_page` (`mod.rs`);
+    the S4 legs of `uocr2_l0_preprocess_is_bit_exact_against_the_oracle`,
+    `uocr2_l1_l2_prefill_matches_the_f32_oracle` and `uocr2_l3_decode_steps_match_the_f32_oracle`
+    (`tests/parity_ladder.rs`, model-gated). No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-015: U2-7 — page2d tok_pos after an extra `<PAGE>`: HF's reset, not SGLang's running count
+
+- claim_id / evidence_id: CLAIM-uocr2-extra-marker-tok → `src/native_engine/srswa.rs`
+    (`DecodePageState::feed`) + `srswa::tests::an_extra_generated_marker_clamps_to_the_last_page` +
+    `window::tests::windowed_rows_match_the_oracle_dumps` (its `decode_rows` helper) + the
+    `disc_u2_7_steps` field of the `real_v2_l4_*` NDJSON lines (U2-C2).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `_sparse_base_impl.py` sha256
+    `86da9c5638704bb9338575040568a97b3e10820bbeb426f51c07e866f3423ccd` lines 1484-1489 and
+    2555-2561; SGLang wheel dev10 sha256
+    `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d` (`page2d_rope.py:579-591`);
+    `ORACLE.json` sha256 `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90`;
+    `w2-n7-t12.json` `3bbb36eeb764e474f2c16f1b4c34577668052e0be027d4f5e1b137cae784d79d`,
+    `w3-n7-t12.json` `9f748c896dce0e260304fb5e6142f91ffc79fe482f844c7e1a617299b3b9f36d`,
+    `w2-n5-markeronly-t12.json` `152e0626c7c7ffd172643a5f012090ed33b244e4ce2821795bffabc08c73ff27`;
+    shipping artifact sha256 `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4). The state machine is integer arithmetic.
+- Exact command + env: `cargo test --lib -- an_extra_generated_marker_clamps_to_the_last_page
+    windowed_rows_match_the_oracle_dumps`. Model-gated: the L4 command of DISC-013, and
+    `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages
+    cargo test --profile release-perf --lib real_v2_windowed_decode_matches_the_windowed_oracle --
+    --nocapture`.
+- Reference behavior: a fed `<PAGE>` moves the page state to `page = min(page+1, n_pg−1)`, and HF
+    then sets `tok = pf_cnt[page]` (`SB:1484-1489`). A marker past the page count therefore clamps
+    to the last page and repeats the tok_pos of that page's response `<PAGE>`. SGLang keeps the
+    running count, `tok + 1` (`page2d_rope.py:579-591`). HF's prefill builder has no upper clamp
+    (`SB:2555,2561`).
+- Our impl: HF's reset (`DecodePageState::feed`). `PageCoords::build` has no upper clamp either, so
+    "state machine ≡ prefill builder" holds only for sequences with at most N generated markers.
+- Fallback / kill-switch state: none.
+- Measured impact: no id can change. Under the guard, a marker past the page count forces EOS on the
+    next step, and that forced step is the only one that reads the reset coordinate.
+    * Unwindowed: the reset never fired. The HF oracle emitted no extra marker on any of the nine
+      fixtures (`guard_eos_only_steps` 0), and `disc_u2_7_steps` is 0 on all 28 U2-C2 L4 runs.
+    * Windowed: it fires in each reused last window that ends on an extra `<PAGE>`. That is 3 of the
+      15 committed U2-D2a windows (the last window of `w2-n7-t12`, `w3-n7-t12` and
+      `w2-n5-markeronly-t12`), and the last window of the 25-page W=10 run. All four committed
+      windowed runs are token-exact (`real_v2_windowed_decode_matches_the_windowed_oracle`, f32
+      cache). `windowed_rows_match_the_oracle_dumps` gives a clamped `<PAGE>` row the running count
+      before hashing. With that substitution (and DISC-020's on the marker-only run) every row array
+      hashes equal to the oracle's.
+- Resolution: ACCEPTED.
+- Tests affected: `an_extra_generated_marker_clamps_to_the_last_page` (`srswa.rs`);
+    `windowed_rows_match_the_oracle_dumps` (`window.rs`); model-gated `real_v2_l4_*`,
+    `real_v2_windowed_decode_matches_the_windowed_oracle`,
+    `real_v2_windowed_25_pages_own_every_page_once` (`mod.rs`). No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-016: U2-8 — page guard lag: none here; SGLang can lag one step under overlap scheduling
+
+- claim_id / evidence_id: CLAIM-uocr2-guard-lag → `OcrModel::document_loop` (calls
+    `sampler::decode_step_guarded` on every step) + `window::cut_at_extra_marker` +
+    `window::tests::text_tail_and_extra_marker_cut_follow_the_wheel` + plan §5.10.7.
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` lines 583-605; SGLang wheel
+    dev10 sha256 `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`uocr_doc_reuse.py:807-820`, `_cut_at_extra_marker`, per
+    `docs/truth-pack/oq/uocr2-windowed-sglang.md` §3a); windowed oracle script
+    `scripts/gen_reference_fixtures_uocr2.py` sha256
+    `5edc7645e72207c6b02724134907dcd721273e22e303a533344d2c1627780e92` (the U2-D2a runs); shipping
+    artifact sha256 `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4).
+- Exact command + env: `cargo test --lib text_tail_and_extra_marker_cut_follow_the_wheel`. No
+    command runs live SGLang.
+- Reference behavior: HF applies the guard to every step's logits before the argmax, so it cannot
+    lag. SGLang's guard can lag one step under overlap scheduling, so one extra token can precede the
+    forced EOS (plan §5.10.7). `_cut_at_extra_marker` cuts a window's output at the first marker
+    past its own pages (`uocr_doc_reuse.py:807-820`).
+- Our impl: no overlap scheduling. `document_loop` applies the guard to every step before it picks
+    the token, so a forced token is emitted on the step it is due. `cut_at_extra_marker` mirrors the
+    wheel's cut for windows.
+- Fallback / kill-switch state: none.
+- Measured impact: not measured. No live SGLang run exists in this repo. The U2-D2a windowed oracle
+    replaces SGLang's scheduler with one request at a time and no overlap scheduling
+    (`WINDOWED_SUBSTITUTIONS`, `scripts/gen_reference_fixtures_uocr2.py:1067-1068`), so it cannot show
+    the lag: in every committed window that ended on a marker, its guard forced EOS on the next
+    step (`guard_steps.forced_eos_extra_marker` is 1). Our ids equal its ids on all four windowed
+    runs.
+- Resolution: ACCEPTED by design. A future comparison against live SGLang must tolerate one extra
+    token before a forced EOS.
+- Tests affected: `text_tail_and_extra_marker_cut_follow_the_wheel` (`window.rs`). No test runs
+    live SGLang.
+- Review date: 2026-10-30
+
+## DISC-017: U2-9 — text before the first `<PAGE>` joins page 1 with a `leading_text` warning
+
+- claim_id / evidence_id: CLAIM-uocr2-leading-text → `postprocess::split_pages_by_token`,
+    `postprocess::split_window_pages` and `join_head` + the `leading_text` run warning
+    (`src/native_engine/mod.rs`) + the U2-B6 and U2-D1a close comments (bd-uocr2-epic-cgux.15,
+    bd-uocr2-epic-cgux.24).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` line 1210; SGLang wheel dev10
+    sha256 `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`doc_split.py:251-255`); `ORACLE.json` sha256
+    `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90` and the nine
+    `tests/fixtures/uocr2_oracle/*.ids.txt`; the five `tests/fixtures/uocr2_windowed/*.json` (hashes
+    in DISC-012); shipping artifact sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4). The split is byte-level text handling.
+- Exact command + env: `cargo test --lib -- split_pages_by_token_keeps_n_bodies_and_reports_head_and_extras
+    split_window_pages_keeps_own_pages_only`; `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> cargo test
+    --lib windowed_bodies_match_the_oracle_stitching`; model-gated L4 as in DISC-013. The oracle
+    check: `python3 -I -c "import glob; print(sorted({[l for l in open(f) if not
+    l.startswith('#')][0].split()[0] for f in glob.glob('tests/fixtures/uocr2_oracle/*.ids.txt')}))"`
+    prints `['128827']`.
+- Reference behavior: HF's `_uocr_save_results` splits the output on `<PAGE>` and keeps `[1:]`, so
+    text before the first marker is dropped (`MU:1210`). SGLang keeps a non-blank head of a
+    recomputed window as body 0 (`[head, *tail] if leads_with_body or head.strip() else tail`,
+    `doc_split.py:251-255`). With front-anchored ownership that shifts every page by one and drops
+    the last own page's body.
+- Our impl: a non-blank head is prepended to the first own page's body, and the run adds
+    `warnings[{kind:"leading_text"}]`. The rule is the same unwindowed (`split_pages_by_token`) and in
+    every window (`split_window_pages`), so N pages give N bodies at any W.
+- Fallback / kill-switch state: none. Neither reference keeps both the text and the page alignment.
+- Measured impact: not reached.
+    * HF oracle: all nine outputs open with `<PAGE>` (id 128827 is the first generated id of every
+      committed `.ids.txt`, checked 2026-10-30), so none had a head to drop.
+    * franken_ocr: `leading_text` is false on all 28 U2-C2 L4 runs (asserted), on S1, S3 and the S2
+      CLI run (U2-B6: 0 heads in 3 documents), and on the 25-page W=10 run (U2-D1a).
+    * Windowed: on all 5 committed U2-D2a runs our split stitches to the wheel's bodies byte for
+      byte, so no recomputed window there had a non-blank head.
+- Resolution: ACCEPTED.
+- Tests affected: `split_pages_by_token_keeps_n_bodies_and_reports_head_and_extras`,
+    `split_window_pages_keeps_own_pages_only` (`postprocess.rs`);
+    `document_reports_warn_in_v2_terms_and_only_a_stopped_one_is_partial` (`mod.rs`);
+    `windowed_bodies_match_the_oracle_stitching` (`window.rs`, tokenizer-gated); model-gated
+    `real_v2_l4_*`, `real_v2_windowed_25_pages_own_every_page_once`. No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-018: U2-10 — EXIF orientation is applied; both v2 references ignore it
+
+- claim_id / evidence_id: CLAIM-uocr2-exif-orientation → `src/preprocess/mod.rs` (`decode_path`,
+    `decode_bytes`, `decode_reader`) + the U2-B7 close comment (bd-uocr2-epic-cgux.16) + the U2-C4
+    comments of 2026-10-30 02:31 and 10:38 UTC (bd-uocr2-epic-cgux.20).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` line 1070; SGLang wheel dev10
+    sha256 `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`base_processor.py:215`, `utils/common.py:1834`); v1 `modeling_unlimitedocr.py` sha256
+    `268bdcbe12cf37bf5a2debb53faf542e56570958a5d9f3314aab3cab2cf6cb48` lines 27-34; `ORACLE.json`
+    sha256 `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90` (PNG pages, input
+    sha256s inside); shipping artifact sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4).
+- Exact command + env: `cargo test --lib decode_applies_the_exif_orientation_tag`. L0 rung:
+    `FOCR_UOCR2_FIXTURES_DIR=~/.cache/franken_ocr_local_models/uocr2_oracle/f32/t12
+    FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages cargo test --profile release-perf --test
+    parity_ladder uocr2_l0_preprocess_is_bit_exact_against_the_oracle -- --nocapture`.
+    The U2-C4 measurement (2026-10-30):
+    * Inputs: corpus page_0009 and page_0019 stored sideways with Pillow 12.3.0,
+      `im.convert("RGB").rotate(90, expand=True).save(out, exif=e)` where `e` is an `Image.Exif()`
+      with `e[0x0112] = 6`. `ImageOps.exif_transpose` restores the original pixels exactly. The
+      tagged files hash to `2f6428fe953c6306ece8d1a2cc569711915cc919578ce9992db121564b86bfb7` and
+      `01ee93a55cd4a29cee812e1db0820f5b6d093bde2382f60b8147d81ef215b375`.
+    * HF: `python -I scripts/gen_reference_fixtures_uocr2.py --model-dir <v2 snapshot> --corpus
+      <tagged dir> --out <dir> --sets S1C --only S1C-page_0009,S1C-page_0019 --dtype f32
+      --threads 8`.
+    * franken_ocr: `focr ocr --model <dir>/unlimited-ocr-2.v0.1.0.int8.focrq <tagged page> --json`,
+      with v2's `tokenizer.json` in `<dir>`.
+    * CER: `scripts/corpus_cer.py`'s `normalize` and `levenshtein`, against the upright S1C f32
+      reference. HF texts are rendered by deleting `<PAGE>` and every block prefix.
+- Reference behavior: HF v2 opens each image with `Image.open(f).convert('RGB')` (`MU:1070`) and
+    applies no EXIF orientation. SGLang's `smart_to_rgb` would transpose (`utils/common.py:1834`),
+    but only for a processor that sets `smart_rgb_conversion = True`. The base default is False
+    (`base_processor.py:215`) and only glm4v sets it, so Unlimited-OCR gets a plain
+    `convert("RGB")`. v1's HF reference did transpose (`load_image` → `ImageOps.exif_transpose`,
+    v1 `MU:27-34`). Both v2 references drop alpha in `convert('RGB')`.
+- Our impl: the shared decoder applies the Orientation tag for every model (`decode_reader`:
+    `decoder.orientation()`, then `apply_orientation`). Every image entry reads through
+    `decode_path`: single images, `ocr-batch`, directory pages, and `ocr-batch --multi-page` since
+    U2-D0. Alpha is dropped by `to_rgb8`, as in HF.
+- Fallback / kill-switch state: none. No switch skips orientation. Stripping the Orientation tag from
+    the input gives the references' behavior.
+- Measured impact: only an image with a non-identity Orientation tag differs. On one, the
+    references read the page as stored and franken_ocr reads it upright.
+    * Tagged page_0009: HF v2 f32 sees a 1837×1182 page and reads it sideways, 47 ids against the
+      upright page's 50, with CER 0.2500 (22/88): "WILLIAM CLOVIS", "SEAMING PRINTED AND CUTLING
+      HOUSE". franken_ocr's markdown equals its markdown for the untagged page: CER 0.
+    * Tagged page_0019 (prose): HF v2 reads 1,590 ids against the upright page's 802, with CER
+      0.8349 (1,917/2,296). franken_ocr again equals its untagged reading: CER 0.
+    * Untagged pages, which include all 20 corpus pages and every oracle fixture: no difference. The
+      L0 rung is bit-exact on them.
+- Resolution: ACCEPTED. The deviation is deliberate: it keeps v1's behavior and reads a rotated
+    photo upright.
+- Tests affected: `decode_applies_the_exif_orientation_tag` (`src/preprocess/mod.rs`; a sideways PNG
+    with an `eXIf` Orientation 6 chunk decodes upright, the same PNG untagged decodes as stored);
+    `uocr2_l0_preprocess_is_bit_exact_against_the_oracle` (`tests/parity_ladder.rs`, untagged pages).
+    No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-020: U2-12 — reused window without a text splice: the last prompt row keeps its page
+
+- claim_id / evidence_id: CLAIM-uocr2-markeronly-seed → `srswa::DecodePageState::reused_window` +
+    `window::WindowedOptions::marker_only_splice` (test hook) +
+    `window::tests::windowed_rows_match_the_oracle_dumps` +
+    `real_v2_windowed_decode_matches_the_windowed_oracle` on `w2-n5-markeronly-t12` + the U2-D1a
+    close comment (bd-uocr2-epic-cgux.24).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; SGLang wheel dev10 sha256
+    `a3f3e2c94e09de90b61b43d01475fd5d1aa818d16eec05204b8079c09c2ba70d`
+    (`session/uocr_doc_reuse.py:490-497`, `_seed_continuation`); `w2-n5-markeronly-t12.json` sha256
+    `152e0626c7c7ffd172643a5f012090ed33b244e4ce2821795bffabc08c73ff27`; shipping artifact sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4).
+- Exact command + env: `cargo test --lib windowed_rows_match_the_oracle_dumps`;
+    `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir> FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages
+    cargo test --profile release-perf --lib real_v2_windowed_decode_matches_the_windowed_oracle --
+    --nocapture`. The oracle run: `gen_reference_fixtures_uocr2.py --windowed 2 --doc S3-p10:5
+    --threads 12 --force-fallback 1:splice_alloc_failed --tag w2-n5-markeronly-t12`
+    (`tests/fixtures/PROVENANCE.md`).
+- Reference behavior: HF has no windows. In SGLang, when a reused window's text KV allocation
+    fails, only the forced `<PAGE>` is spliced. The first decode step's carry is then written into
+    the slot of the prompt's last row (`_seed_continuation`, `uocr_doc_reuse.py:490-497`), so that
+    image row's page reads −1.
+- Our impl: the reused-window seed (`DecodePageState::reused_window`) carries the step, and the row
+    keeps its page. Both stacks read a row's page only through its 32-row block's (min, max), which
+    skips −1. They differ only when that row opens its block, that is when the rewritten prompt
+    length is ≡ 1 (mod 32).
+- Fallback / kill-switch state: none. franken_ocr's KV is never pool-allocated, so a text splice
+    cannot fail in production; only the `marker_only_splice` test hook reaches this path.
+- Measured impact: no difference reached. In `w2-n5-markeronly-t12`, window 1 is forced to a
+    marker-only splice with a 956-row prompt. The run is token-exact against the windowed oracle
+    (windows of 311, 1,506 and 770 generated ids). 956 ≡ 28 (mod 32), so the row does not open its
+    block, and the case that differs was not reached. `windowed_rows_match_the_oracle_dumps` sets
+    that slot's page to −1 before hashing. With that change (and DISC-015's for a clamped `<PAGE>`)
+    all ten per-row arrays hash equal to the oracle's.
+- Resolution: ACCEPTED.
+- Tests affected: `windowed_rows_match_the_oracle_dumps`,
+    `every_fallback_reason_is_detected_where_the_wheel_checks_it` (`window.rs`);
+    `real_v2_windowed_decode_matches_the_windowed_oracle` (`mod.rs`, model-gated). No XFAIL.
+- Review date: 2026-10-30
+
+## DISC-021: U2-13 — v2 block grammar rendered under v1's span rule
+
+- claim_id / evidence_id: CLAIM-uocr2-block-grammar → `src/native_engine/postprocess.rs`
+    (`scan_block_spans`, `block_prefix`) +
+    `postprocess::tests::every_oracle_v2_block_parses_and_none_reaches_the_markdown` +
+    `v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed`
+    (`tests/e2e_recognize.rs`) + the U2-E3b close comment (bd-uocr2-epic-cgux.53).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; `modeling_unlimitedocr.py` sha256
+    `f6df813cef23cc28b1daca40fd8cb20740d05a238e7b9dfa2334531fdcf39f1f` lines 44-59; v2
+    `tokenizer.json` sha256 `c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589`
+    (`<BLOCK>` 128828, `<FORK>` 128829); `ORACLE.json` sha256
+    `41236faf439dce1abcc2f7795f3efbbeccb21314d66d8649464912b6a9154f90` and the nine committed
+    `tests/fixtures/uocr2_oracle/*.md`; shipping artifact sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398`.
+- CPU feature string: aarch64+neon+dotprod (Apple M4). The scanner is byte-level text handling.
+- Exact command + env: `cargo test --lib -- every_oracle_v2_block_parses_and_none_reaches_the_markdown
+    v2_blocks_render_in_v1_shape_with_layout_and_figures
+    v2_block_prefixes_off_the_grammar_stay_as_emitted`; `cargo test --test property_suite
+    every_v2_image_block_is_referenced_once`; model-gated: `FOCR_UOCR2_SOURCE_DIR=<v2 checkpoint dir>
+    FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages cargo test --profile release-perf --test
+    e2e_recognize v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed`.
+- Reference behavior: v2 opens every block with `<BLOCK>label[<LEVELn>][x1, y1, x2, y2]<FORK>`. HF's
+    `_uocr_save_results` runs `re_match` (`MU:44-59`), which knows only v1's `<|ref|>`/`<|det|>`
+    spans, so `result.md` keeps every block prefix raw. SGLang returns the generated text with no
+    postprocess.
+- Our impl: each prefix is a span under v1's rule (`scan_block_spans`). An `image` block becomes
+    `![](images/…)` and a figure; every other prefix is deleted. Titles stay unmarked, one newline
+    separates blocks and tables stay HTML, so the text has v1's shape. `--json` `layout` keeps each
+    block's label, its `level` (titles only) and its box, rescaled from the 0-999 grid as v1's boxes
+    are. A prefix off the grammar, such as one cut by the page token cap, stays in the text.
+    `cross_text`/`append_text` continuations stay on their own pages.
+- Fallback / kill-switch state: none. No switch emits the raw grammar; bd-v73v (GH #11) tracks a raw
+    output surface.
+- Measured impact:
+    * All 431 blocks (5 of them images) in the nine oracle outputs parse, and none of the grammar
+      reaches the markdown. The 12 labels are pinned, `level` appears only on `title`, and boxes are
+      ordered on the 999 grid.
+    * page_0009 through `focr ocr`: the markdown is 88 characters; with the prefixes left in it was
+      125 (U2-E3b).
+    * page_0590 through `focr ocr --model <v2> page_0590.png --json` renders
+      `( 535 )\nAPPENDIX TO CHAPTER XXIV.\n…`. Its layout is header, title level 1, title level 2,
+      text and table, in pixels. v1's `x/999·W` crops land on the header and both titles, in base
+      and in gundam.
+    * Property tests, 2,000 cases each: every postprocess entry point is total on mixes of both
+      grammars, and on block pages each image reference appears exactly once.
+- Resolution: ACCEPTED.
+- Tests affected: `every_oracle_v2_block_parses_and_none_reaches_the_markdown`,
+    `v2_blocks_render_in_v1_shape_with_layout_and_figures`,
+    `v2_block_prefixes_off_the_grammar_stay_as_emitted`,
+    `document_pages_number_figures_and_map_boxes_per_page` (`postprocess.rs`);
+    `a_layout_span_round_trips_its_json` (`src/cli.rs`); `postprocess_is_total_on_grounding_fragments`,
+    `every_v2_image_block_is_referenced_once` (`tests/property_suite.rs`);
+    `v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed`
+    (`tests/e2e_recognize.rs`, model-gated). No XFAIL.
+- Review date: 2026-10-30
+
+---
+
 ## DISC-006: MoE routing reproduces pinned torch-2.10 CPU `topk(sorted=False)` and production-width reduction
 
 - claim_id / evidence_id: CLAIM-bd-2mo30-moe-route-order ->
