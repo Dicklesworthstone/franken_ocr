@@ -24,6 +24,14 @@
 //! Out of scope for v1 (matching the stub note): box-overlay drawing, the
 //! `line_type` geometry special case, image-crop file I/O (we emit the markdown
 //! `![](images/{idx}.jpg)` references but do not write the JPEGs).
+//!
+//! Unlimited-OCR-2 grounds its output in a different grammar, which no
+//! reference parses (U2-E3b, DISC-U2-13): each block opens with
+//! `<BLOCK>{label}[<LEVELn>][x1, y1, x2, y2]<FORK>`, and its text runs to the
+//! next block. The coordinates are 0..=999 per page, as v1's are. Each block
+//! prefix is a span ([`scan_block_spans`]) under v1's rule: an `image` block
+//! becomes a markdown image reference, any other prefix is deleted. The
+//! rendered text so has v1's shape.
 
 use crate::error::FocrResult;
 
@@ -58,6 +66,9 @@ pub struct RefMatch {
     /// A single bare quad in the source (`[a,b,c,d]`) yields one entry; a list of
     /// quads (`[[..],[..]]`) yields several.
     pub boxes: Vec<[i64; 4]>,
+    /// The `<LEVELn>` of an Unlimited-OCR-2 block (its `title`s carry one);
+    /// `None` for every v1 span and every unleveled block.
+    pub level: Option<u8>,
 }
 
 impl RefMatch {
@@ -173,6 +184,7 @@ fn scan_ref_spans(text: &str) -> Vec<RefMatch> {
             full: full.to_string(),
             label: label.to_string(),
             boxes: parse_boxes(box_text),
+            level: None,
         });
         i = span_end;
     }
@@ -246,10 +258,101 @@ fn scan_det_spans(text: &str) -> Vec<RefMatch> {
             full: full.to_string(),
             label: label.to_string(),
             boxes: parse_boxes(box_text),
+            level: None,
         });
         i = span_end;
     }
     out
+}
+
+/// Opens every Unlimited-OCR-2 block (added token 128828).
+const BLOCK_OPEN: &str = "<BLOCK>";
+/// Ends a block's prefix; the block's text follows (added token 128829).
+const BLOCK_FORK: &str = "<FORK>";
+/// Opens a block's level, `<LEVEL1>`, `<LEVEL2>`, …: plain BPE text.
+const BLOCK_LEVEL: &str = "<LEVEL";
+
+/// Unlimited-OCR-2's block prefixes, left to right, each with its byte offset:
+/// `<BLOCK>{label}[<LEVELn>][x1, y1, x2, y2]<FORK>` with nothing between the
+/// parts, the label an identifier as in [`scan_det_spans`], and exactly four
+/// non-negative integers in the box. Every one of the nine oracle outputs
+/// (U2-A6) is in this form. A `<BLOCK>` not in it, such as one cut off by a
+/// page's token cap, is not a span and stays in the text as it was emitted.
+fn scan_block_spans(text: &str) -> Vec<(usize, RefMatch)> {
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    let mut i = 0usize;
+    while let Some(open) = find_from(bytes, i, BLOCK_OPEN) {
+        i = open + BLOCK_OPEN.len();
+        let Some((label, level, quad, end)) = block_prefix(text, i) else {
+            continue;
+        };
+        let span = RefMatch {
+            full: text[open..end].to_string(),
+            label: label.to_string(),
+            boxes: vec![quad],
+            level,
+        };
+        out.push((open, span));
+        i = end;
+    }
+    out
+}
+
+/// The block prefix whose label starts at `at` (just past `<BLOCK>`): its
+/// label, level, box, and the byte index just past its `<FORK>`.
+fn block_prefix(text: &str, at: usize) -> Option<(&str, Option<u8>, [i64; 4], usize)> {
+    let bytes = text.as_bytes();
+    let first = text[at..].chars().next()?;
+    if !is_ident_start(first) {
+        return None;
+    }
+    let mut p = at + first.len_utf8();
+    while let Some(ch) = text[p..].chars().next() {
+        if !is_ident_continue(ch) {
+            break;
+        }
+        p += ch.len_utf8();
+    }
+    let label = &text[at..p];
+    // Each search below looks no further than the longest valid form, so a
+    // degenerate page of unclosed prefixes stays linear.
+    let mut level = None;
+    if slice_starts_with(bytes, p, BLOCK_LEVEL) {
+        let digits = p + BLOCK_LEVEL.len();
+        let window = &bytes[digits..bytes.len().min(digits + 4)]; // `255>`
+        let close = digits + window.iter().position(|&b| b == b'>')?;
+        let n = &text[digits..close];
+        if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        level = Some(n.parse().ok()?);
+        p = close + 1;
+    }
+    if bytes.get(p) != Some(&b'[') {
+        return None;
+    }
+    let inner_start = p + 1;
+    // Four i64s with separators fit in 4 * 19 + 3 * 2 bytes.
+    let window = &bytes[inner_start..bytes.len().min(inner_start + 82)];
+    let inner_end = inner_start + window.iter().position(|&b| b == b']')?;
+    let mut quad = [0_i64; 4];
+    let mut parts = text[inner_start..inner_end].split(',');
+    for slot in &mut quad {
+        let part = parts.next()?.trim_matches(' ');
+        if part.is_empty() || !part.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        *slot = part.parse().ok()?;
+    }
+    if parts.next().is_some() {
+        return None;
+    }
+    let fork = inner_end + 1;
+    if !slice_starts_with(bytes, fork, BLOCK_FORK) {
+        return None;
+    }
+    Some((label, level, quad, fork + BLOCK_FORK.len()))
 }
 
 /// Parse a Python-list-literal coordinate text into `[x1,y1,x2,y2]` quads,
@@ -371,6 +474,13 @@ fn is_ident_continue(ch: char) -> bool {
 /// `str.replace` substituting ALL occurrences of the matched span (Python
 /// semantics). `\coloneqq` / `\eqqcolon` are normalized globally after the span
 /// rewrites, per SPEC-115.
+///
+/// Unlimited-OCR-2 block prefixes ([`scan_block_spans`]) go under the same
+/// rule, numbering their images after v1's ([`grounding_spans`] order). No
+/// reference fixes their replacement semantics, so each prefix is rewritten
+/// in place, by its offset: two identical image prefixes get their own
+/// indices, as [`figure_refs`] counts them. Text without a block is untouched
+/// by that pass, so v1 output is unchanged.
 fn assemble_page(text: &str, img_base: &str) -> String {
     let matches = re_match(text);
     let mut images = Vec::new();
@@ -383,7 +493,20 @@ fn assemble_page(text: &str, img_base: &str) -> String {
         }
     }
 
-    let mut out = text.to_string();
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    let mut idx = images.len();
+    for (open, m) in scan_block_spans(text) {
+        out.push_str(&text[copied..open]);
+        if m.is_image() {
+            out.push_str(&image_md_token(img_base, idx));
+            out.push('\n');
+            idx += 1;
+        }
+        copied = open + m.full.len();
+    }
+    out.push_str(&text[copied..]);
+
     for (idx, m) in images.iter().enumerate() {
         let replacement = format!("{}\n", image_md_token(img_base, idx));
         out = out.replace(&m.full, &replacement);
@@ -392,6 +515,16 @@ fn assemble_page(text: &str, img_base: &str) -> String {
         out = out.replace(&m.full, "");
     }
     normalize_colon_equals(&out)
+}
+
+/// Every grounding span of a page in the order the renderer numbers images:
+/// v1's [`re_match`] spans, then Unlimited-OCR-2's block prefixes. A page
+/// carries one grammar or the other: v1's vocabulary has no `<BLOCK>`, and v2
+/// emits no ref/det spans.
+fn grounding_spans(text: &str) -> Vec<RefMatch> {
+    let mut spans = re_match(text);
+    spans.extend(scan_block_spans(text).into_iter().map(|(_, m)| m));
+    spans
 }
 
 /// The exact markdown image token `assemble_page` emits for the `idx`-th image
@@ -427,12 +560,13 @@ pub struct FigureRef {
 /// must match the value passed to `assemble_page` for this page (`""` single-page,
 /// `"page_{n}_"` multi-page) so `markdown_ref` lands on the right token.
 ///
-/// This shares [`re_match`] + [`RefMatch::is_image`] with `assemble_page`, so the
-/// figures a caller crops are byte-for-byte the ones the markdown references.
+/// This shares [`grounding_spans`] + [`RefMatch::is_image`] with `assemble_page`,
+/// so the figures a caller crops are byte-for-byte the ones the markdown
+/// references.
 #[must_use]
 pub fn figure_refs(decoded: &str, image_w: u32, image_h: u32, img_base: &str) -> Vec<FigureRef> {
     let stripped = strip_eos(decoded);
-    re_match(&stripped)
+    grounding_spans(&stripped)
         .into_iter()
         .filter(RefMatch::is_image)
         .enumerate()
@@ -821,23 +955,24 @@ impl PageStream {
     }
 }
 
-/// Parse the layout (ref/det spans) from raw decoded text and return each span's
-/// label plus its pixel-rescaled boxes, for callers that need the bounding-box
-/// geometry (overlay drawing, structured layout export) rather than the markdown
-/// body.
+/// Parse the layout (ref/det spans, or Unlimited-OCR-2 blocks) from raw decoded
+/// text and return each span's label, level and pixel-rescaled boxes, for
+/// callers that need the bounding-box geometry (overlay drawing, structured
+/// layout export) rather than the markdown body.
 ///
 /// EOS is stripped first (so a trailing marker never leaks into the last span),
-/// then [`re_match`] runs and every box is de-normalized to `(image_w, image_h)`
-/// pixels via the `/999` rescale (`modeling_unlimitedocr.py:107-111`). Returns
-/// `(label, boxes)` pairs in match order.
+/// then [`grounding_spans`] runs and every box is de-normalized to
+/// `(image_w, image_h)` pixels via the `/999` rescale
+/// (`modeling_unlimitedocr.py:107-111`). Returns the spans in match order.
 #[must_use]
-pub fn parse_layout(decoded: &str, image_w: u32, image_h: u32) -> Vec<(String, Vec<[i64; 4]>)> {
+pub fn parse_layout(decoded: &str, image_w: u32, image_h: u32) -> Vec<super::LayoutSpan> {
     let stripped = strip_eos(decoded);
-    re_match(&stripped)
+    grounding_spans(&stripped)
         .into_iter()
-        .map(|m| {
-            let boxes = m.rescaled_boxes(image_w, image_h);
-            (m.label, boxes)
+        .map(|m| super::LayoutSpan {
+            boxes: m.rescaled_boxes(image_w, image_h),
+            label: m.label,
+            level: m.level,
         })
         .collect()
 }
@@ -991,12 +1126,14 @@ mod tests {
             full: "<|ref|>image<|/ref|><|det|>[1,2,3,4]<|/det|>".into(),
             label: "image".into(),
             boxes: vec![[1, 2, 3, 4]],
+            level: None,
         };
         assert!(m.is_image());
         let m2 = RefMatch {
             full: "<|ref|>title<|/ref|><|det|>[1,2,3,4]<|/det|>".into(),
             label: "title".into(),
             boxes: vec![[1, 2, 3, 4]],
+            level: None,
         };
         assert!(!m2.is_image());
     }
@@ -1372,13 +1509,13 @@ mod tests {
         let raw = format!("<|ref|>title<|/ref|><|det|>[0, 0, 999, 999]<|/det|>{EOS_MARKER}");
         let layout = parse_layout(&raw, 1920, 1080);
         // first entry is the full ref/det span labelled "title"
-        let (label, boxes) = layout
+        let span = layout
             .iter()
-            .find(|(l, _)| l == "title")
+            .find(|s| s.label == "title")
             .expect("title span");
-        assert_eq!(label, "title");
         // 0->0, 999/999*W = W (truncated), 999/999*H = H
-        assert_eq!(boxes, &vec![[0, 0, 1920, 1080]]);
+        assert_eq!(span.boxes, vec![[0, 0, 1920, 1080]]);
+        assert_eq!(span.level, None);
     }
 
     #[test]
@@ -1435,5 +1572,162 @@ mod tests {
     fn figure_refs_empty_without_image_spans() {
         let decoded = "<|ref|>title<|/ref|><|det|>[[0,0,9,9]]<|/det|>plain text";
         assert!(figure_refs(decoded, 100, 100, "").is_empty());
+    }
+
+    /// U2-E3b: a v2 page renders in v1's shape (prefixes deleted, images as
+    /// references numbered once each), and its layout keeps label, level and
+    /// box. The page size and expected pixels are page_0590's (1182x1837),
+    /// whose header and title crops were checked by eye.
+    #[test]
+    fn v2_blocks_render_in_v1_shape_with_layout_and_figures() {
+        let page = "<BLOCK>header[391, 31, 513, 53]<FORK>( 535 )\n\
+                    <BLOCK>title<LEVEL1>[223, 178, 656, 197]<FORK>APPENDIX\n\
+                    <BLOCK>image[0, 0, 499, 499]<FORK>\n\
+                    <BLOCK>image[0, 0, 499, 499]<FORK>\n\
+                    <BLOCK>cross_text[10, 900, 990, 990]<FORK>continues";
+        let md = finalize(page, 1182, 1837).unwrap();
+        assert_eq!(
+            md,
+            "( 535 )\nAPPENDIX\n![](images/0.jpg)\n\n![](images/1.jpg)\n\ncontinues"
+        );
+
+        let layout = parse_layout(page, 1182, 1837);
+        let labels: Vec<_> = layout.iter().map(|s| (s.label.as_str(), s.level)).collect();
+        assert_eq!(
+            labels,
+            [
+                ("header", None),
+                ("title", Some(1)),
+                ("image", None),
+                ("image", None),
+                ("cross_text", None),
+            ]
+        );
+        assert_eq!(layout[0].boxes, vec![[462, 57, 606, 97]]);
+        assert_eq!(layout[1].boxes, vec![[263, 327, 776, 362]]);
+
+        let refs = figure_refs(page, 1182, 1837, "");
+        assert_eq!(refs.len(), 2);
+        for (i, r) in refs.iter().enumerate() {
+            assert_eq!(r.index, i);
+            assert_eq!(r.markdown_ref, format!("![](images/{i}.jpg)"));
+            assert_eq!(md.matches(&r.markdown_ref).count(), 1, "{md}");
+        }
+    }
+
+    /// U2-E3b: document output names each page's figures by page, as v1's
+    /// multi-page assembly does.
+    #[test]
+    fn v2_blocks_number_figures_per_page_in_document_output() {
+        let bodies = [
+            "<BLOCK>image[1, 2, 3, 4]<FORK>\n<BLOCK>text[5, 6, 7, 8]<FORK>a",
+            "<BLOCK>image[1, 2, 3, 4]<FORK>",
+        ];
+        assert_eq!(
+            finalize_pages(&bodies, 2),
+            "<PAGE>\n![](images/page_0_0.jpg)\n\na\n<PAGE>\n![](images/page_1_0.jpg)\n"
+        );
+    }
+
+    /// U2-E3b: a `<BLOCK>` off the grammar is no span and stays as emitted, so
+    /// a page cut off mid-prefix shows where it stopped.
+    #[test]
+    fn v2_block_prefixes_off_the_grammar_stay_as_emitted() {
+        for raw in [
+            "<BLOCK>text[1, 2, 3]<FORK>x",
+            "<BLOCK>text[1, 2, 3, 4, 5]<FORK>x",
+            "<BLOCK>text[1, 2, 3, 4]x",
+            "<BLOCK>text [1, 2, 3, 4]<FORK>x",
+            "<BLOCK>text[1, -2, 3, 4]<FORK>x",
+            "<BLOCK>text[1, 2,, 4]<FORK>x",
+            "<BLOCK>title<LEVEL>[1, 2, 3, 4]<FORK>x",
+            "<BLOCK>title<LEVEL999>[1, 2, 3, 4]<FORK>x",
+            "<BLOCK>[1, 2, 3, 4]<FORK>x",
+            "<BLOCK>text[12, 3",
+        ] {
+            assert_eq!(finalize(raw, 999, 999).unwrap(), raw);
+            assert!(parse_layout(raw, 999, 999).is_empty(), "{raw}");
+        }
+        let cut = "<BLOCK>text[1, 2, 3, 4]<FORK>a\n<BLOCK>image[12, 3";
+        assert_eq!(finalize(cut, 999, 999).unwrap(), "a\n<BLOCK>image[12, 3");
+        assert!(figure_refs(cut, 999, 999, "").is_empty());
+    }
+
+    /// U2-E3b over every committed U2-A6 oracle output (S1–S4): every
+    /// `<BLOCK>` parses, none of the grammar reaches the markdown, the labels
+    /// are the ones the oracle emits, only titles carry a level, and boxes are
+    /// ordered corners on the 0..=999 grid.
+    #[test]
+    fn every_oracle_v2_block_parses_and_none_reaches_the_markdown() {
+        const LABELS: [&str; 12] = [
+            "text",
+            "title",
+            "header",
+            "footer",
+            "page_number",
+            "page_footnote",
+            "cross_text",
+            "append_text",
+            "table",
+            "image",
+            "image_caption",
+            "other",
+        ];
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uocr2_oracle");
+        let mut outputs = 0;
+        let mut blocks = 0;
+        let mut images = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            outputs += 1;
+            let name = path.display().to_string();
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let spans: Vec<_> = scan_block_spans(&raw).into_iter().map(|(_, m)| m).collect();
+            assert_eq!(spans.len(), raw.matches(BLOCK_OPEN).count(), "{name}");
+            assert!(re_match(&raw).is_empty(), "{name}");
+            for s in &spans {
+                assert!(LABELS.contains(&s.label.as_str()), "{name}: {}", s.full);
+                assert!(
+                    s.level.is_none() || s.label == "title",
+                    "{name}: {}",
+                    s.full
+                );
+                let [x1, y1, x2, y2] = s.boxes[0];
+                assert!(
+                    x1 <= x2 && y1 <= y2 && x2 <= 999 && y2 <= 999,
+                    "{name}: {}",
+                    s.full
+                );
+            }
+            blocks += spans.len();
+            images += spans.iter().filter(|s| s.is_image()).count();
+
+            let md = finalize_multi(&raw, usize::MAX).unwrap();
+            for grammar in [BLOCK_OPEN, BLOCK_FORK, BLOCK_LEVEL] {
+                assert!(!md.contains(grammar), "{name}: {grammar} in the markdown");
+            }
+            for (page, body) in raw.split(PAGE_MARKER).skip(1).enumerate() {
+                let base = format!("page_{page}_");
+                for r in figure_refs(body, 999, 999, &base) {
+                    assert_eq!(md.matches(&r.markdown_ref).count(), 1, "{name}");
+                }
+            }
+        }
+        assert_eq!(outputs, 9);
+        assert_eq!((blocks, images), (431, 5));
+
+        let raw = std::fs::read_to_string(dir.join("S1-page_0590.md")).unwrap();
+        let md = finalize_multi(&raw, 1).unwrap();
+        assert!(
+            md.starts_with(
+                "<PAGE>\n( 535 )\nAPPENDIX TO CHAPTER XXIV.\n\
+                 LOSSES OF H.M. SHIPS FROM THE REVOLUTION TO 1714.\nNote.—This list"
+            ),
+            "{md}"
+        );
     }
 }
