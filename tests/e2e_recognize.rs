@@ -2112,3 +2112,177 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
     );
     assert!(pass, "convert_int4: exit {:?}\n{}", out.code, out.stderr);
 }
+
+/// U2-C3's loader gate through the CLI (model-gated: the converted v2
+/// `.focrq` supplies a census-exact header). Each case is a sparse copy of the
+/// real header, untouched or with one field tampered, behind a payload that is
+/// never read. The untouched copy passes the gate and reaches U2-A7's exit-2
+/// refusal; a wrong recipe id (v1's, or the wasm int4 one), a quantized router
+/// tensor, or a non-convention `source_sha256` is refused with exit 7 naming
+/// the field or tensor. Both `--model <file>` and short-name resolution
+/// (`--model unlimited-ocr-2` under `FOCR_MODEL_DIR`) take the same gate.
+#[test]
+fn cli_holds_v2_focrq_to_its_recipe_by_path_and_by_short_name() {
+    const TEST: &str = "cli_holds_v2_focrq_to_its_recipe_by_path_and_by_short_name";
+    let Some(real) = std::env::var_os("FOCR_TEST_UNLIMITED_2_RECIPE_MODEL").map(PathBuf::from)
+    else {
+        log_success(
+            TEST,
+            "no_model",
+            "FOCR_TEST_UNLIMITED_2_RECIPE_MODEL unset; v2 .focrq gate deferred",
+        );
+        return;
+    };
+    let Some(bin) = focr_bin() else {
+        log_success(
+            TEST,
+            "no_bin",
+            "focr binary not built; v2 .focrq gate deferred",
+        );
+        return;
+    };
+    use std::io::{Read as _, Write as _};
+    let mut file = std::fs::File::open(&real).expect("open the v2 artifact");
+    let file_len = file.metadata().expect("stat the v2 artifact").len();
+    let mut preamble = [0u8; 51];
+    file.read_exact(&mut preamble).expect("read the preamble");
+    let header_len = u64::from_le_bytes(preamble[43..51].try_into().expect("8 bytes"));
+    let mut header = vec![0u8; usize::try_from(header_len).expect("header fits")];
+    file.read_exact(&mut header).expect("read the header");
+    let header: serde_json::Value = serde_json::from_slice(&header).expect("header JSON");
+    let payload_len = file_len - 51 - header_len;
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let root =
+        std::env::temp_dir().join(format!("focr_e2e_v2_gate_{}_{nanos}", std::process::id()));
+    let image = write_tiny_png();
+    let image = image.display().to_string();
+
+    let router = "model.layers.4.self_attn.dash_router.q_proj.weight";
+    let flipped_sha = {
+        let sha = header["source_sha256"].as_str().expect("source_sha256");
+        format!(
+            "{}{}",
+            if sha.starts_with('0') { '1' } else { '0' },
+            &sha[1..]
+        )
+    };
+    // (case, tamper, expected exit, every substring the message must hold)
+    type Tamper = fn(&mut serde_json::Value, &str);
+    let cases: [(&str, Tamper, i32, Vec<String>); 5] = [
+        (
+            "untouched",
+            |_, _| {},
+            2,
+            vec!["unlimited-ocr-2 is registered but not yet implemented".into()],
+        ),
+        (
+            "v1_recipe_id",
+            |h, _| {
+                h["packing_manifest"]["quant_recipe"] =
+                    "unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1".into();
+            },
+            7,
+            vec!["quant_recipe must be exactly".into()],
+        ),
+        (
+            "wasm_int4_recipe_id",
+            |h, _| {
+                h["packing_manifest"]["quant_recipe"] =
+                    "unlimited-ocr-wasm-experts-int4-attn-int8-lmhead-int8-v1".into();
+            },
+            7,
+            vec![
+                "quant_recipe must be exactly".into(),
+                "no int4 or wasm recipe".into(),
+            ],
+        ),
+        (
+            "quantized_router",
+            |h, _| {
+                // Re-declare the router BF16 matrix as int8 inside its own
+                // byte range: half for the weights, then its scales.
+                let record =
+                    &mut h["tensors"]["model.layers.4.self_attn.dash_router.q_proj.weight"];
+                let offset = record["byte_offset"].as_u64().expect("offset");
+                let rows = record["shape"][0].as_u64().expect("rows");
+                let half = record["byte_len"].as_u64().expect("byte_len") / 2;
+                record["dtype"] = "QInt8PerChan".into();
+                record["byte_len"] = half.into();
+                record["scales_offset"] = (offset + half).into();
+                record["scales_len"] = (rows * 4).into();
+            },
+            7,
+            vec![router.into(), "expected BF16".into()],
+        ),
+        (
+            "flipped_source_sha256",
+            |h, flipped| h["source_sha256"] = flipped.into(),
+            7,
+            vec!["source_sha256".into()],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, tamper, expected, needles) in &cases {
+        let mut tampered = header.clone();
+        tamper(&mut tampered, &flipped_sha);
+        let bytes = serde_json::to_vec(&tampered).expect("serialize header");
+        let mut head = preamble;
+        head[43..51].copy_from_slice(&(bytes.len() as u64).to_le_bytes());
+        if *case == "flipped_source_sha256" {
+            for (at, pair) in flipped_sha.as_bytes().chunks(2).enumerate() {
+                let hex = std::str::from_utf8(pair).expect("ascii");
+                head[11 + at] = u8::from_str_radix(hex, 16).expect("hex digit pair");
+            }
+        }
+        let dir = root.join(case);
+        std::fs::create_dir_all(&dir).expect("case dir");
+        let path = dir.join("unlimited-ocr-2.v0.1.0.int8.focrq");
+        let mut out = std::fs::File::create(&path).expect("create stand-in");
+        out.write_all(&head).expect("write preamble");
+        out.write_all(&bytes).expect("write header");
+        out.set_len(51 + bytes.len() as u64 + payload_len)
+            .expect("sparse payload");
+        drop(out);
+
+        let file_spec = path.display().to_string();
+        for (route, spec, envs) in [
+            ("path", file_spec.as_str(), vec![]),
+            (
+                "short_name",
+                "unlimited-ocr-2",
+                vec![("FOCR_MODEL_DIR", dir.display().to_string())],
+            ),
+        ] {
+            let args = ["ocr", image.as_str(), "--model", spec];
+            let started = Instant::now();
+            let got = run_focr_only(&bin, &args, &envs);
+            let pass = got.code == Some(*expected)
+                && needles
+                    .iter()
+                    .all(|needle| got.stderr.contains(needle.as_str()));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema_version": 1, "ts": 0.0, "test": TEST, "case": format!("{case}:{route}"),
+                    "run_seq": 0, "event": "assert", "result": if pass { "pass" } else { "fail" },
+                    "assertion": "v2 .focrq held to its recipe before any weight is read",
+                    "pass": pass, "args": args, "expected_exit": expected, "exit_code": got.code,
+                    "needles": needles, "message": got.stderr.trim(),
+                    "elapsed_us": started.elapsed().as_micros(), "weights_touched": false,
+                })
+            );
+            if !pass {
+                failures.push(format!(
+                    "{case}:{route}: exit {:?}: {}",
+                    got.code,
+                    got.stderr.trim()
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

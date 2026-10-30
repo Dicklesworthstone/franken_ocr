@@ -685,10 +685,13 @@ pub struct ConvertArgs {
     #[arg(long, value_enum, default_value_t = ArchTarget::Generic)]
     pub arch: ArchTarget,
     /// Target model-architecture id the `.focrq` self-declares (the loader selects
-    /// it from the registry). Default `unlimited-ocr`; e.g. `got-ocr2` (omits the
-    /// tied `lm_head`, writes the Apache-2.0 notice). See `focr models`.
-    #[arg(long, default_value = "unlimited-ocr")]
-    pub model_id: String,
+    /// it from the registry). Omitted: the model whose tensor census the source
+    /// matches (`unlimited-ocr` or `unlimited-ocr-2`). Required for the other
+    /// models, e.g. `got-ocr2` (omits the tied `lm_head`, writes the Apache-2.0
+    /// notice). An id that a different census matches is refused. See
+    /// `focr models`.
+    #[arg(long)]
+    pub model_id: Option<String>,
     /// Activation-calibration JSON from a `FOCR_CALIB_OUT` run (bd-50wo stages
     /// B/C). Only honored by `--quant int4`: the expert/attention scales are then
     /// chosen by an importance-weighted clip search plus an AWQ channel-scale
@@ -2414,19 +2417,40 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
     let resolved = native_engine::OcrModel::resolve_model(&args.input)?;
     let source = native_engine::shards::SourceShards::open(&resolved)?;
     let shard_count = source.files().len();
-    // Resolve the target model architecture (the `.focrq` self-declares its id).
-    let arch = native_engine::model_arch::arch_by_id(&args.model_id).ok_or_else(|| {
-        FocrError::Usage(format!(
-            "unknown --model-id {:?} (see `focr models` for the registry)",
-            args.model_id
-        ))
-    })?;
     let convert_quant = match args.quant {
         QuantTarget::Int8 => quant::convert::ConvertQuant::Int8,
         QuantTarget::Int4 => quant::convert::ConvertQuant::Int4,
     };
-    if convert_quant == quant::convert::ConvertQuant::Int4 {
-        quant::convert::ensure_int4_recipe(arch)?;
+    // An explicit `--model-id` without an int4 recipe is refused before any
+    // header is read.
+    let int4_refusal = |arch: &dyn native_engine::model_arch::ModelArch| -> FocrResult<()> {
+        if convert_quant == quant::convert::ConvertQuant::Int4 {
+            quant::convert::ensure_int4_recipe(arch)?;
+        }
+        Ok(())
+    };
+    let explicit = match args.model_id.as_deref() {
+        None => None,
+        Some(id) => {
+            let arch = native_engine::model_arch::arch_by_id(id).ok_or_else(|| {
+                FocrError::Usage(format!(
+                    "unknown --model-id {id:?} (see `focr models` for the registry)"
+                ))
+            })?;
+            int4_refusal(arch)?;
+            Some(arch)
+        }
+    };
+
+    // The bounded header pass: every shard's header is validated and checked
+    // against the index before a single payload byte is read. The census then
+    // picks (or cross-checks) the target arch, so a disagreeing `--model-id`
+    // is named before the census's pinned shard count or digests are judged
+    // (U2-C3).
+    let (headers, prefixes) = native_engine::read_source_headers(&source)?;
+    let arch = native_engine::conversion_arch(explicit, &headers)?;
+    if explicit.is_none() {
+        int4_refusal(arch)?;
     }
     let census = arch.tensor_census();
     if let Some(census) = census {
@@ -2455,10 +2479,8 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
         }
     };
 
-    // The bounded header pass: every shard's header is validated and checked
-    // against the index, and any I64 tensor against the arch's census, before
-    // a single payload byte is read.
-    let (headers, prefixes) = native_engine::read_source_headers(&source)?;
+    // Any I64 tensor is checked against the arch's census, still before a
+    // single payload byte is read.
     let int64_rules = native_engine::shards::int64_rules(Some(arch));
     native_engine::shards::check_int64_entries(&headers.int64, int64_rules, arch.id())?;
     native_engine::shards::check_int64_rules_present(&headers.int64, int64_rules, arch.id())?;
@@ -2551,6 +2573,7 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
         }
     };
     let output_bytes = blob.len();
+    let output_sha256 = hex_encode32(&quant::convert::sha256_of_bytes(&blob));
     std::fs::write(&args.output, &blob).map_err(|e| {
         FocrError::Other(anyhow::anyhow!(
             "writing .focrq to {}: {e}",
@@ -2587,6 +2610,7 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
             "tensors_int4": quantized_int4,
             "input_bytes": input_bytes,
             "output_bytes": output_bytes,
+            "output_sha256": output_sha256,
             "calib": args.calib,
             "calib_covered_int4": calib_coverage.map(|((c, _), _)| c),
             "calib_total_int4": calib_coverage.map(|((_, t), _)| t),
@@ -2597,7 +2621,8 @@ fn run_convert(args: &ConvertArgs) -> FocrResult<()> {
         eprintln!(
             "[focr] convert: wrote {} ({} quant {}: {tensor_count} tensors, \
              {quantized_int8} int8 + {quantized_int4} int4, \
-             {input_bytes} -> {output_bytes} bytes) source_sha256={sha_hex}{}",
+             {input_bytes} -> {output_bytes} bytes) source_sha256={sha_hex} \
+             output_sha256={output_sha256}{}",
             args.output.display(),
             args.arch.as_str(),
             args.quant.as_str(),
@@ -4456,7 +4481,7 @@ mod tests {
             output: output.to_path_buf(),
             quant,
             arch: ArchTarget::Generic,
-            model_id: "got-ocr2".into(),
+            model_id: Some("got-ocr2".into()),
             calib: None,
             json: false,
         }
@@ -4631,18 +4656,28 @@ mod tests {
             "{error}"
         );
 
+        // v1 has a census, and these headers do not match it: refused on the
+        // census (exit 7) before any payload byte is read, at int8 and int4.
         let mut args = convert_args(&dir, &out, QuantTarget::Int8);
-        args.model_id = "unlimited-ocr".into();
-        let error = run_convert(&args).expect_err("v1 is pinned to one shard");
-        assert!(
-            error.to_string().contains("pinned 1-shard source"),
-            "{error}"
-        );
-        args.quant = QuantTarget::Int4;
-        let error = run_convert(&args).expect_err("v1 int4 is pinned to one shard too");
-        assert!(
-            error.to_string().contains("pinned 1-shard source"),
-            "{error}"
-        );
+        args.model_id = Some("unlimited-ocr".into());
+        for quant in [QuantTarget::Int8, QuantTarget::Int4] {
+            args.quant = quant;
+            let error = run_convert(&args).expect_err("not v1's census");
+            assert!(matches!(error, FocrError::FormatMismatch(_)), "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unlimited-ocr source safetensors tensor census failed"),
+                "{error}"
+            );
+            assert!(!out.exists(), "nothing is written for a refused source");
+        }
+
+        // With no --model-id, a source no census matches must be named.
+        args.model_id = None;
+        args.quant = QuantTarget::Int8;
+        let error = run_convert(&args).expect_err("no census, no id");
+        assert!(matches!(error, FocrError::Usage(_)), "{error}");
+        assert!(error.to_string().contains("pass --model-id"), "{error}");
     }
 }

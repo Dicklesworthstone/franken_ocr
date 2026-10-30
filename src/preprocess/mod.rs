@@ -1171,6 +1171,97 @@ mod tests {
         DynamicImage::ImageRgb8(RgbImage::from_pixel(w, h, Rgb(color)))
     }
 
+    /// A deterministic page-like RGB image: a gradient under LCG noise, so
+    /// every resample tap sees varied pixels.
+    fn textured(w: u32, h: u32, seed: u32) -> DynamicImage {
+        let mut state = seed;
+        DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (state >> 24) as u8;
+            Rgb([
+                (x * 255 / w) as u8 ^ noise,
+                (y * 255 / h) as u8 ^ (noise >> 1),
+                ((x + y) % 256) as u8 ^ (noise >> 2),
+            ])
+        }))
+    }
+
+    /// `{grid} {views} {tokens} {sha256}` over every view's f32 pixel bytes,
+    /// global first, then the tiles in order.
+    fn preprocess_digest(pre: &Preprocessed) -> String {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for view in std::iter::once(&pre.global).chain(&pre.tiles) {
+            for value in &view.pixels.data {
+                hasher.update(value.to_le_bytes());
+            }
+        }
+        format!(
+            "{}x{} {} {} {:x}",
+            pre.crop_grid.width_crop_num,
+            pre.crop_grid.height_crop_num,
+            pre.num_views(),
+            pre.placeholder_token_count(),
+            hasher.finalize()
+        )
+    }
+
+    /// U2-B7's v1 preprocessing golden, captured before v2's preprocessing
+    /// touched this shared code. It pins base, the multi-page 640 squash and
+    /// gundam, including a 1×20 grid that only v1's `MAX_NUM = 32` allows,
+    /// under whichever kernel `FOCR_RESAMPLE` selects. Run it once with the
+    /// variable unset and once with `FOCR_RESAMPLE=pil-bicubic`.
+    #[test]
+    fn v1_preprocess_golden_is_unchanged() {
+        let page = textured(1182, 1837, 7);
+        let strip = textured(300, 6000, 11);
+        let small = textured(500, 400, 13);
+        let digests = [
+            (
+                "page_base",
+                preprocess_dynamic(page.clone(), PreprocessMode::base()),
+            ),
+            (
+                "page_squash_640",
+                preprocess_dynamic_squash(page.clone(), 640),
+            ),
+            (
+                "page_gundam",
+                preprocess_dynamic(page, PreprocessMode::gundam()),
+            ),
+            (
+                "strip_gundam",
+                preprocess_dynamic(strip, PreprocessMode::gundam()),
+            ),
+            (
+                "small_gundam",
+                preprocess_dynamic(small, PreprocessMode::gundam()),
+            ),
+        ]
+        .map(|(case, pre)| (case, preprocess_digest(&pre.expect(case))));
+        let expected = match resample_kind() {
+            ResampleKind::CatmullRom => V1_PREPROCESS_GOLDEN_CATMULLROM,
+            ResampleKind::PilBicubic => V1_PREPROCESS_GOLDEN_PIL_BICUBIC,
+        };
+        let got = digests.each_ref().map(|(case, digest)| (*case, digest.as_str()));
+        assert_eq!(got, expected, "under {:?}", resample_kind());
+    }
+
+    const V1_PREPROCESS_GOLDEN_CATMULLROM: [(&str, &str); 5] = [
+        ("page_base", ""),
+        ("page_squash_640", ""),
+        ("page_gundam", ""),
+        ("strip_gundam", ""),
+        ("small_gundam", ""),
+    ];
+    const V1_PREPROCESS_GOLDEN_PIL_BICUBIC: [(&str, &str); 5] = [
+        ("page_base", ""),
+        ("page_squash_640", ""),
+        ("page_gundam", ""),
+        ("strip_gundam", ""),
+        ("small_gundam", ""),
+    ];
+
     // ── num_queries / census ([SPEC-027], OQ-18) ────────────────────────────
 
     #[test]

@@ -414,11 +414,15 @@ measured, kill-switched exception:
 - all norms
 - decoder attention `q/k/v/o`
 - `lm_head`
+- Unlimited-OCR-2's SR-SWA block selection: every
+  `model.layers.{i}.self_attn.dash_router.*` and `self_attn.indexer.*` tensor,
+  under every lever (it steers a discrete choice; U2-C3)
 
 The default validated quantized set is exactly the 2,148 decoder
-FFN/expert/dense matrices. The 48 attention projections and `lm_head` are
-separate measured levers behind independent kill switches, not baseline
-assumptions.
+FFN/expert/dense matrices, for v1 and v2 alike. The 48 attention projections and
+`lm_head` are separate measured levers behind independent kill switches, not
+baseline assumptions. The attention lever matches exactly the names
+`model.layers.{i}.self_attn.{q,k,v,o}_proj.weight`.
 
 ## Loader Algorithm
 
@@ -442,7 +446,11 @@ assumptions.
 11. For an Unlimited-OCR `.focrq`, validate every present tensor dtype against
     `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`: recipe FFNs must be
     `QInt8PerChan`; every other tensor must be BF16 or F32. Reject legacy
-    full-int8 artifacts before any forward.
+    full-int8 artifacts before any forward. An Unlimited-OCR-2 `.focrq` must
+    declare exactly `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1` (any
+    other id, v1's wasm int4 one included, is refused), carry the pinned two-shard
+    `source_sha256`, and store exactly that recipe's dtypes over its census
+    (U2-C3).
 12. Treat optional v1 `model_config` as unvalidated provenance; use the compiled
     exact tensor manifest and runtime constants as the active model contract.
 12a. If `provenance.source_shards` is present, it must list at least two

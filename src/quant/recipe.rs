@@ -16,7 +16,9 @@
 //!   and widened BF16→f32 at load: the whole SAM + CLIP vision tower, the
 //!   projector, `model.embed_tokens`, the MoE router `mlp.gate.weight`, and ALL
 //!   norms (`*_layernorm`, `*.norm`, `model.norm`, vision `LayerNorm`s). Also the
-//!   two learned connector params (`image_newline` / `view_seperator`).
+//!   two learned connector params (`image_newline` / `view_seperator`) and every
+//!   Unlimited-OCR-2 SR-SWA `self_attn.dash_router.*` / `self_attn.indexer.*`
+//!   tensor.
 //! * **[`QuantPolicy::Int8`]** — the **validated** quantizable set: the decoder
 //!   FFN / expert GEMMs only. The dense layer-0 SwiGLU (`gate`/`up`/`down_proj`),
 //!   the 64 routed experts × 3 proj per MoE layer, and the 2 fused shared experts
@@ -125,7 +127,8 @@ pub struct Classification {
 //   - dense:    model.layers.0.mlp.{gate,up,down}_proj.weight
 //   - routed:   model.layers.{1..11}.mlp.experts.{0..63}.{gate,up,down}_proj.weight
 //   - shared:   model.layers.{1..11}.mlp.shared_experts.{gate,up,down}_proj.weight
-//   - attn:     model.layers.{0..11}.self_attn.{q,k,v,o}_proj.weight
+//   - attn:     model.layers.{0..11}.self_attn.{q,k,v,o}_proj.weight   (exactly)
+//   - srswa:    model.layers.{0..11}.self_attn.{dash_router,indexer}.*  (v2 only)
 //   - lm_head:  lm_head.weight
 
 /// Whether `name` is a vision-tower tensor (CLIP-L or SAM). The whole tower is
@@ -188,16 +191,40 @@ fn is_norm(name: &str) -> bool {
         || name.ends_with(".ln_post.bias")
 }
 
-/// Whether `name` is an attention projection (`self_attn.{q,k,v,o}_proj.weight`).
-/// This is the GATED set (behind [`FOCR_INT8_ATTN_ENV`]). Vision attention
-/// (`qkv_proj`/`out_proj` under `vision_model`/`sam_model`) is excluded — the
-/// vision check runs first and wins.
+/// Whether `name` is an Unlimited-OCR-2 SR-SWA block-selection tensor: a
+/// `self_attn.dash_router.*` or `self_attn.indexer.*` projection, norm, or the
+/// router's `head_cls` — KEEP_BF16. They are small (≈0.33M MACs per layer per
+/// token) and steer a DISCRETE block selection, so quantizing them is all risk
+/// and no gain (U2-C3).
+fn is_srswa_selector(name: &str) -> bool {
+    name.contains(".self_attn.dash_router.") || name.contains(".self_attn.indexer.")
+}
+
+/// Whether `name` is exactly a decoder attention projection,
+/// `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight` — the GATED set (behind
+/// [`FOCR_INT8_ATTN_ENV`]). The exact shape matters: a suffix match would also
+/// catch the SR-SWA `self_attn.dash_router.q_proj.weight` and
+/// `self_attn.indexer.q_proj.weight` (U2-C3). Vision attention never matches
+/// (it is not under `model.layers.`, and the vision check runs first anyway).
 fn is_decoder_attn_proj(name: &str) -> bool {
-    name.contains(".self_attn.")
-        && (name.ends_with(".q_proj.weight")
-            || name.ends_with(".k_proj.weight")
-            || name.ends_with(".v_proj.weight")
-            || name.ends_with(".o_proj.weight"))
+    let Some(rest) = name
+        .strip_prefix("model.layers.")
+        .or_else(|| name.strip_prefix("layers."))
+    else {
+        return false;
+    };
+    let Some((layer, leaf)) = rest.split_once('.') else {
+        return false;
+    };
+    !layer.is_empty()
+        && layer.bytes().all(|byte| byte.is_ascii_digit())
+        && matches!(
+            leaf,
+            "self_attn.q_proj.weight"
+                | "self_attn.k_proj.weight"
+                | "self_attn.v_proj.weight"
+                | "self_attn.o_proj.weight"
+        )
 }
 
 /// Whether `name` is `lm_head.weight` — the GATED set (behind
@@ -269,6 +296,13 @@ pub fn classify(name: &str) -> Classification {
         return Classification {
             policy: QuantPolicy::KeepBf16,
             reason: "keep-bf16: norm tensor — all norms stay high precision (doctrine #2)",
+        };
+    }
+    if is_srswa_selector(name) {
+        return Classification {
+            policy: QuantPolicy::KeepBf16,
+            reason: "keep-bf16: SR-SWA dash_router/indexer — steers a discrete block selection, \
+                     NEVER quantized (U2-C3)",
         };
     }
 
@@ -649,6 +683,66 @@ mod tests {
             assert_eq!(
                 resolve_with(classify(&n).policy, true, false),
                 ResolvedPolicy::Int8
+            );
+        }
+    }
+
+    /// The SR-SWA router and indexer share the `self_attn.` subtree and the
+    /// `{q,k}_proj.weight` leaf names with attention, but stay BF16 under every
+    /// lever and under the wasm recipe (U2-C3).
+    #[test]
+    fn srswa_router_and_indexer_never_quantize() {
+        for module in ["dash_router", "indexer"] {
+            for part in [
+                "q_proj.weight",
+                "k_proj.weight",
+                "q_norm.weight",
+                "k_norm.weight",
+            ] {
+                let n = format!("model.layers.7.self_attn.{module}.{part}");
+                let c = classify(&n);
+                assert_eq!(c.policy, QuantPolicy::KeepBf16, "{n}");
+                assert!(c.reason.contains("SR-SWA"), "{n}: {}", c.reason);
+                for (attn, lmhead) in [(false, false), (true, false), (false, true), (true, true)] {
+                    assert!(!Recipe::new(attn, lmhead).is_quantized(&n), "{n}");
+                }
+                assert_eq!(
+                    classify_wasm_experts_int4(&n),
+                    WasmInt4Policy::KeepHighPrecision,
+                    "{n}"
+                );
+            }
+        }
+        let head = "model.layers.0.self_attn.dash_router.head_cls";
+        assert_eq!(classify(head).policy, QuantPolicy::KeepBf16);
+        assert!(!Recipe::new(true, true).is_quantized(head));
+    }
+
+    /// Only the exact `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight` shape
+    /// is attention; look-alikes that a suffix match accepted are not.
+    #[test]
+    fn attention_matcher_is_exact() {
+        for n in [
+            "layers.3.self_attn.v_proj.weight",
+            "model.layers.10.self_attn.o_proj.weight",
+        ] {
+            assert_eq!(
+                classify(n).policy,
+                QuantPolicy::Gated(GatedKind::Attention),
+                "{n}"
+            );
+        }
+        for n in [
+            "model.layers.x.self_attn.q_proj.weight",
+            "model.layers..self_attn.q_proj.weight",
+            "model.layers.3.self_attn.q_proj.bias",
+            "model.layers.3.self_attn.extra.q_proj.weight",
+            "model.layers.3.cross.self_attn.q_proj.weight",
+            "decoder.layers.3.self_attn.q_proj.weight",
+        ] {
+            assert!(
+                !matches!(classify(n).policy, QuantPolicy::Gated(_)),
+                "{n} must not be gated attention"
             );
         }
     }

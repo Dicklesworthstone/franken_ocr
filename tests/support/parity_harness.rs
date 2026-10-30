@@ -726,6 +726,42 @@ fn activation_from_manifest_bytes(
 /// `deps_wanted`). Returns `(shape, flat_c_order_data)`. Rejects anything outside
 /// that subset with a self-diagnosing error rather than silently misreading.
 pub fn read_npy_f32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<f32>), String> {
+    let (shape, payload) = npy_payload(bytes, &["<f4", "|f4"], 4)?;
+    let data = payload
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect();
+    Ok((shape, data))
+}
+
+/// [`read_npy_f32`] for little-endian `<i4`, the dtype of the Unlimited-OCR-2
+/// oracle's ids, block indices and grids (`gen_reference_fixtures_uocr2.py`).
+pub fn read_npy_i32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<i32>), String> {
+    let (shape, payload) = npy_payload(bytes, &["<i4"], 4)?;
+    let data = payload
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| i32::from_le_bytes(*chunk))
+        .collect();
+    Ok((shape, data))
+}
+
+/// [`read_npy_f32`] for `|u1`, the dtype of the Unlimited-OCR-2 oracle's masks.
+pub fn read_npy_u8(bytes: &[u8]) -> Result<(Vec<usize>, Vec<u8>), String> {
+    let (shape, payload) = npy_payload(bytes, &["|u1"], 1)?;
+    Ok((shape, payload.to_vec()))
+}
+
+/// The shape and the C-order payload bytes of a `.npy` whose `descr` is one of
+/// `descrs`, `elem` bytes per element: the parse the typed readers share.
+fn npy_payload<'a>(
+    bytes: &'a [u8],
+    descrs: &[&str],
+    elem: usize,
+) -> Result<(Vec<usize>, &'a [u8]), String> {
     const MAGIC: &[u8] = b"\x93NUMPY";
     if bytes.len() < 10 || &bytes[..6] != MAGIC {
         return Err("not a .npy file (bad magic)".into());
@@ -749,10 +785,8 @@ pub fn read_npy_f32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<f32>), String> {
     let header =
         std::str::from_utf8(&bytes[header_start..header_end]).map_err(|_| "non-utf8 npy header")?;
     // The header is a Python-dict literal: {'descr':'<f4','fortran_order':False,'shape':(.. ,)}.
-    if !(header.contains("<f4") || header.contains("|f4") || header.contains("'<f4'")) {
-        return Err(format!(
-            "unsupported descr (need little-endian <f4): {header}"
-        ));
+    if !descrs.iter().any(|descr| header.contains(descr)) {
+        return Err(format!("unsupported descr (need one of {descrs:?}): {header}"));
     }
     if header.contains("'fortran_order': True") || header.contains("'fortran_order':True") {
         return Err("fortran_order True unsupported (need C-order)".into());
@@ -763,19 +797,15 @@ pub fn read_npy_f32(bytes: &[u8]) -> Result<(Vec<usize>, Vec<f32>), String> {
         .product::<usize>()
         .max(usize::from(shape.is_empty()));
     let data_bytes = &bytes[header_end..];
-    if data_bytes.len() < numel * 4 {
+    if data_bytes.len() < numel * elem {
         return Err(format!(
-            "data truncated: have {} bytes, need {} ({} elems × 4)",
+            "data truncated: have {} bytes, need {} ({} elems × {elem})",
             data_bytes.len(),
-            numel * 4,
+            numel * elem,
             numel
         ));
     }
-    let mut data = Vec::with_capacity(numel);
-    for chunk in data_bytes[..numel * 4].as_chunks::<4>().0 {
-        data.push(f32::from_le_bytes(*chunk));
-    }
-    Ok((shape, data))
+    Ok((shape, &data_bytes[..numel * elem]))
 }
 
 /// Extract the `shape` tuple from a `.npy` header dict literal.
@@ -1543,7 +1573,12 @@ mod tests {
     }
 
     fn synthetic_npy_v1(data: &[f32], shape: &str) -> Vec<u8> {
-        let header = format!("{{'descr': '<f4', 'fortran_order': False, 'shape': {shape}, }}");
+        let payload: Vec<u8> = data.iter().flat_map(|x| x.to_le_bytes()).collect();
+        synthetic_npy_v1_typed("<f4", &payload, shape)
+    }
+
+    fn synthetic_npy_v1_typed(descr: &str, payload: &[u8], shape: &str) -> Vec<u8> {
+        let header = format!("{{'descr': '{descr}', 'fortran_order': False, 'shape': {shape}, }}");
         let mut hdr = header;
         let base = 10 + hdr.len() + 1; // +1 for trailing \n
         let pad = (64 - base % 64) % 64;
@@ -1555,10 +1590,34 @@ mod tests {
         bytes.push(0); // minor
         bytes.extend_from_slice(&(hdr.len() as u16).to_le_bytes());
         bytes.extend_from_slice(hdr.as_bytes());
-        for &x in data {
-            bytes.extend_from_slice(&x.to_le_bytes());
-        }
+        bytes.extend_from_slice(payload);
         bytes
+    }
+
+    #[test]
+    fn read_npy_typed_readers_hold_their_dtype() {
+        let ints: Vec<u8> = [-1i32, 0, 7, 128_815]
+            .iter()
+            .flat_map(|x| x.to_le_bytes())
+            .collect();
+        let bytes = synthetic_npy_v1_typed("<i4", &ints, "(2, 2)");
+        assert_eq!(
+            read_npy_i32(&bytes).expect("i4 parses"),
+            (vec![2, 2], vec![-1, 0, 7, 128_815])
+        );
+        assert!(read_npy_f32(&bytes).is_err(), "an <i4 file is not <f4");
+        assert!(read_npy_u8(&bytes).is_err(), "an <i4 file is not |u1");
+
+        let mask = synthetic_npy_v1_typed("|u1", &[1, 0, 1], "(3,)");
+        assert_eq!(read_npy_u8(&mask).expect("u1 parses"), (vec![3], vec![1, 0, 1]));
+        assert!(read_npy_i32(&mask).is_err(), "a |u1 file is not <i4");
+
+        let short = synthetic_npy_v1_typed("<i4", &ints[..12], "(2, 2)");
+        assert!(
+            read_npy_i32(&short)
+                .expect_err("a short payload fails")
+                .contains("truncated")
+        );
     }
 
     #[test]

@@ -576,6 +576,7 @@ Offline weight transformation: a bf16 safetensors checkpoint into a custom `.foc
 
 ```bash
 focr convert model.safetensors -o unlimited-ocr.focrq --quant int8
+focr convert unlimited-ocr-2/ -o unlimited-ocr-2.v0.1.0.int8.focrq --quant int8
 focr convert got.safetensors -o got-ocr2.int8.focrq --quant int8 --model-id got-ocr2
 focr convert smolvlm2.safetensors -o smolvlm2.int8.focrq --quant int8 --model-id smolvlm2
 focr convert onechart.safetensors -o onechart.int8.focrq --quant int8 --model-id onechart
@@ -583,7 +584,11 @@ focr convert tromr/model.safetensors -o tromr.int8.focrq --quant int8 --model-id
 focr convert model.safetensors -o out.focrq --quant int8 --json
 ```
 
-For Unlimited-OCR, conversion stamps recipe `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`, quantizes exactly 2,148 FFN/expert matrices, and copies all 48 attention projections plus `lm_head` at source precision. The source SHA256 is stamped into the header, and the loader rejects any default-model `.focrq` whose tensor dtypes violate that recipe. `--model-id` selects the architecture descriptor, tied-head policy, tensor-name prefixes, tokenizer expectation, and license notice for each zoo model. `--arch <target>` records architecture-specific prepacking intent (default: `generic`). Int4 remains gated and unvalidated.
+For Unlimited-OCR, conversion stamps recipe `unlimited-ocr-ffn-int8-attn-bf16-lmhead-bf16-v1`, quantizes exactly 2,148 FFN/expert matrices, and copies all 48 attention projections plus `lm_head` at source precision. The source SHA256 is stamped into the header, and the loader rejects any default-model `.focrq` whose tensor dtypes violate that recipe.
+
+Unlimited-OCR-2 converts from its checkpoint directory (the index plus two shards). The same 2,148 matrices are int8 under recipe `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1`. Attention, `lm_head`, and every SR-SWA `dash_router` and `indexer` tensor stay at source precision; the router steers a discrete block choice, so it is never quantized. The header's `source_sha256` is the SHA-256 over the two shard digests in index order, and each shard is listed in its provenance. The loader refuses a v2 `.focrq` with any other recipe id, any other source, or a tensor stored outside the recipe. v2 has no int4 recipe yet.
+
+`--model-id` selects the architecture descriptor, tied-head policy, tensor-name prefixes, tokenizer expectation, and license notice. Without it, the converter picks the Unlimited-OCR generation whose tensor census the source matches; the zoo models need it. An id that disagrees with the source's census exits 2 and names both, after reading only the shard headers. `--arch <target>` records architecture-specific prepacking intent (default: `generic`). Int4 remains gated and unvalidated.
 
 ### `focr robot <subcommand>`
 

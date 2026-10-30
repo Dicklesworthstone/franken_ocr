@@ -1414,6 +1414,11 @@ fn model_search_specs(spec: &Path) -> Vec<PathBuf> {
 /// most the preamble + bounded header; any read/parse failure (including a
 /// non-`.focrq` file) answers `false` so resolution behavior is otherwise
 /// unchanged.
+///
+/// Only a v1 header (its `model_id` absent or `unlimited-ocr`) counts: the
+/// wasm recipe is v1's alone, so another model's artifact declaring it is not
+/// skipped but selected, and its load gate refuses it by name (exit 7, U2-C3)
+/// rather than the search reporting no artifact at all.
 fn focrq_declares_wasm_recipe(path: &Path) -> bool {
     const FOCRQ_PREAMBLE_LEN: usize = 6 + 4 + 1 + 32 + 8;
 
@@ -1444,12 +1449,18 @@ fn focrq_declares_wasm_recipe(path: &Path) -> bool {
     #[derive(serde::Deserialize)]
     struct RecipeProbe {
         #[serde(default)]
+        model_id: Option<String>,
+        #[serde(default)]
         packing_manifest: Option<FocrqPackingManifestProbe>,
     }
     let Ok(probe) = serde_json::from_slice::<RecipeProbe>(&header_bytes) else {
         return false;
     };
-    probe
+    let v1 = probe
+        .model_id
+        .as_deref()
+        .is_none_or(|id| id == model_arch::UNLIMITED_OCR_V1_ID);
+    v1 && probe
         .packing_manifest
         .and_then(|manifest| manifest.quant_recipe)
         .as_deref()
@@ -1859,6 +1870,54 @@ pub(crate) fn read_source_headers(
             .ok_or_else(|| FocrError::Other(anyhow::anyhow!("a source has one file")))?,
     };
     Ok((merged, prefixes))
+}
+
+/// The architecture `focr convert` targets for a source whose merged `header`
+/// [`read_source_headers`] returned, reconciled with an explicit `--model-id`
+/// (U2-C3). Runs on the bounded headers, so it decides before any payload byte
+/// is read or any pinned shard digest is checked.
+///
+/// * No `--model-id`: the model whose tensor census the source matches.
+/// * An explicit id that a different census matches: [`FocrError::Usage`]
+///   naming both ids.
+/// * An explicit id with a census the source does not match: that census's
+///   [`FocrError::FormatMismatch`] diff.
+/// * An explicit id without a census (the zoo models): that id.
+///
+/// # Errors
+/// As above; [`FocrError::Usage`] also when there is no `--model-id` and the
+/// source matches no census, since only an explicit id can name it then.
+#[cfg_attr(not(feature = "native"), allow(dead_code))] // sole non-test caller is the CLI convert path
+pub(crate) fn conversion_arch(
+    explicit: Option<&'static dyn model_arch::ModelArch>,
+    header: &shards::SafetensorsHeader,
+) -> FocrResult<&'static dyn model_arch::ModelArch> {
+    let identified = unlimited_ocr_census::identify_raw(
+        header
+            .records
+            .iter()
+            .map(|(name, record)| (name.as_str(), record)),
+    );
+    match (explicit, identified) {
+        (Some(arch), Ok(found)) if found.id() != arch.id() => Err(FocrError::Usage(format!(
+            "--model-id {:?} disagrees with the source: its tensor census is {:?}'s. Pass \
+             --model-id {:?}, or omit it to use the census",
+            arch.id(),
+            found.id(),
+            found.id()
+        ))),
+        (Some(arch), Ok(_)) => Ok(arch),
+        (Some(arch), Err(FocrError::FormatMismatch(_))) if arch.tensor_census().is_none() => {
+            Ok(arch)
+        }
+        (Some(_), Err(error)) => Err(error),
+        (None, Ok(found)) => Ok(found),
+        (None, Err(FocrError::FormatMismatch(diff))) => Err(FocrError::Usage(format!(
+            "the source matches no registered model's tensor census; pass --model-id (see \
+             `focr models`). {diff}"
+        ))),
+        (None, Err(error)) => Err(error),
+    }
 }
 
 fn validate_model_header_from_reader(
@@ -2309,24 +2368,29 @@ fn validate_unlimited_ocr_quant_records<'a>(
     if !is_focrq {
         return Ok(());
     }
-    match model_arch::arch_by_id(model_id).and_then(|arch| arch.unlimited_variant()) {
-        Some(model_arch::UnlimitedVariant::V1Rswa) => {}
-        Some(model_arch::UnlimitedVariant::V2SrSwa) => {
-            return Err(FocrError::FormatMismatch(format!(
-                "{model_id} .focrq: this binary has no quant-recipe contract for SR-SWA artifacts"
-            )));
-        }
-        None => return Ok(()),
+    let Some(variant) = model_arch::arch_by_id(model_id).and_then(|arch| arch.unlimited_variant())
+    else {
+        return Ok(());
+    };
+    // Unlimited-OCR-2 has exactly one recipe, the conservative one (U2-C3):
+    // its declared id must be that recipe's, so the wasm int4 id is refused.
+    let v2 = variant == model_arch::UnlimitedVariant::V2SrSwa;
+    if v2 && declared_recipe != Some(crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID) {
+        return Err(FocrError::FormatMismatch(format!(
+            "{model_id} .focrq packing_manifest.quant_recipe must be exactly {:?}, got \
+             {declared_recipe:?}; {model_id} has no int4 or wasm recipe",
+            crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID
+        )));
     }
 
     // The explicitly-tagged NON-DEFAULT wasm experts-int4 recipe (bd-4l71) is
-    // honored ONLY when the artifact's packing manifest declares it; every
+    // honored ONLY when a v1 artifact's packing manifest declares it; every
     // other Unlimited-OCR `.focrq` is held to the conservative default exactly
     // as before. Under the wasm recipe: expert FFN tensors MUST be
     // QInt4PerGroup, attention/lm_head/embed MUST be QInt8PerChan, everything
     // else BF16/F32 — so e.g. int4 attention is rejected loudly.
     let wasm_recipe =
-        declared_recipe == Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID);
+        !v2 && declared_recipe == Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID);
     let recipe = Recipe::validated_default();
     let mut violations = Vec::new();
     for (name, dtype) in records {
@@ -2368,13 +2432,24 @@ fn validate_unlimited_ocr_quant_records<'a>(
     } else {
         format!("; and {omitted} more")
     };
-    let recipe_id = if wasm_recipe {
-        crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID
+    let (model, recipe_id) = if v2 {
+        (
+            "Unlimited-OCR-2",
+            crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID,
+        )
+    } else if wasm_recipe {
+        (
+            "Unlimited-OCR",
+            crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID,
+        )
     } else {
-        crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID
+        (
+            "Unlimited-OCR",
+            crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID,
+        )
     };
     Err(FocrError::FormatMismatch(format!(
-        "Unlimited-OCR .focrq violates quant recipe {recipe_id}: {shown}{suffix}. Re-convert the \
+        "{model} .focrq violates quant recipe {recipe_id}: {shown}{suffix}. Re-convert the \
          original safetensors with this build; legacy full-int8 artifacts are not accepted",
     )))
 }
@@ -3787,8 +3862,11 @@ impl OcrModel {
     /// `FOCR_INT8_ATTN`/`FOCR_INT8_LMHEAD` env kill-switches (which gate the
     /// quantize-at-load experiment) are not required and not consulted.
     fn artifact_stores_gated_int8(&self) -> bool {
-        self.weights.quant_recipe()
-            == Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID)
+        // The wasm recipe is v1's alone; the loader refuses it on a v2 artifact
+        // (U2-C3), and this never reads it as one either.
+        self.arch().unlimited_variant() == Some(model_arch::UnlimitedVariant::V1Rswa)
+            && self.weights.quant_recipe()
+                == Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID)
     }
 
     /// Authorize the all-int8 decoder cache: either the artifact itself stores
@@ -6012,6 +6090,73 @@ mod tests {
         assert!(err.to_string().contains("expected BF16 or F32"));
     }
 
+    /// U2-C3: a v2 `.focrq` is held to the v2 conservative recipe alone. Its
+    /// own id with conservative dtypes passes; any other id (the wasm int4 one
+    /// included) or a quantized router/indexer/attention tensor is refused with
+    /// exit 7, naming the id or the tensor.
+    #[test]
+    fn v2_records_hold_only_the_v2_conservative_recipe() {
+        let v2_id = model_arch::UNLIMITED_OCR_V2_ID;
+        let v2_recipe = crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID;
+        let good = [
+            (
+                "model.layers.3.mlp.experts.7.up_proj.weight",
+                DType::QInt8PerChan,
+            ),
+            ("model.layers.0.mlp.down_proj.weight", DType::QInt8PerChan),
+            ("model.layers.0.self_attn.q_proj.weight", DType::BF16),
+            (
+                "model.layers.0.self_attn.dash_router.q_proj.weight",
+                DType::BF16,
+            ),
+            ("model.layers.0.self_attn.dash_router.head_cls", DType::BF16),
+            (
+                "model.layers.11.self_attn.indexer.k_norm.weight",
+                DType::BF16,
+            ),
+            ("model.layers.5.mlp.gate.weight", DType::BF16),
+            ("lm_head.weight", DType::BF16),
+        ];
+        validate_unlimited_ocr_quant_records(true, v2_id, Some(v2_recipe), good)
+            .expect("the v2 recipe accepts its own storage dtypes");
+        validate_unlimited_ocr_quant_records(false, v2_id, None, good)
+            .expect("raw checkpoints carry no recipe");
+
+        for declared in [
+            None,
+            Some(crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID),
+            Some(crate::quant::convert::UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+        ] {
+            let err = validate_unlimited_ocr_quant_records(true, v2_id, declared, good)
+                .expect_err("only the v2 recipe id is accepted");
+            assert_eq!(err.exit_code(), 7, "{err}");
+            assert!(err.to_string().contains("must be exactly"), "{err}");
+            assert!(err.to_string().contains(v2_recipe), "{err}");
+        }
+
+        for name in [
+            "model.layers.4.self_attn.dash_router.q_proj.weight",
+            "model.layers.4.self_attn.indexer.k_proj.weight",
+            "model.layers.4.self_attn.o_proj.weight",
+        ] {
+            let err = validate_unlimited_ocr_quant_records(
+                true,
+                v2_id,
+                Some(v2_recipe),
+                [(name, DType::QInt8PerChan)],
+            )
+            .expect_err("a quantized high-precision tensor is refused");
+            assert_eq!(err.exit_code(), 7, "{err}");
+            let message = err.to_string();
+            assert!(message.contains(name), "{message}");
+            assert!(
+                message.contains("Unlimited-OCR-2 .focrq violates quant recipe"),
+                "{message}"
+            );
+            assert!(message.contains(v2_recipe), "{message}");
+        }
+    }
+
     #[test]
     fn conservative_recipe_still_rejects_int4_expert_storage() {
         // No declared wasm recipe (None, or the conservative id): QInt4 expert
@@ -6137,6 +6282,14 @@ mod tests {
         );
         std::fs::write(&wasm_path, wasm_builder.build()).expect("write wasm-recipe artifact");
         assert!(focrq_declares_wasm_recipe(&wasm_path));
+        // The wasm recipe is v1's alone: a v2 header declaring it is not
+        // skipped, so its load gate names the bad recipe id (U2-C3).
+        let v2_path = dir.join("v2-declaring-wasm.focrq");
+        let v2_builder = crate::quant::focrq::FocrqBuilder::new()
+            .with_model_id(model_arch::UNLIMITED_OCR_V2_ID)
+            .with_packing_manifest_json(wasm_recipe_manifest_json());
+        std::fs::write(&v2_path, v2_builder.build()).expect("write v2 artifact");
+        assert!(!focrq_declares_wasm_recipe(&v2_path));
 
         let err =
             resolve_model_from_search_dirs(Path::new("unlimited-ocr"), std::slice::from_ref(&dir))

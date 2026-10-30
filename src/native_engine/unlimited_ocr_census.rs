@@ -501,8 +501,8 @@ fn verify_v2_delta(json: &str, pinned_sha256: &str) -> Result<UnlimitedOcr2Censu
                 tensor.source_dtype
             ));
         }
-        // The storage dtype is the v1 recipe's classification; v2's own recipe
-        // contract, and any `.focrq` surface, is U2-C3's.
+        // v2's conservative recipe is the same validated classification as
+        // v1's; the SR-SWA router and indexer are kept BF16 by name (U2-C3).
         let storage_dtype = if recipe.is_quantized(name) {
             DType::QInt8PerChan
         } else {
@@ -613,20 +613,25 @@ fn census_tensors(census: TensorCensus) -> FocrResult<&'static BTreeMap<String, 
     }
 }
 
-/// An Unlimited-OCR-2 `.focrq` must come from the pinned shards; past that it
-/// is refused until U2-C3 lands the v2 artifact's recipe contract.
-fn validate_v2_focrq(source_sha256: &str) -> FocrResult<()> {
+/// An Unlimited-OCR-2 `.focrq` must come from the pinned shards (D16) and
+/// declare exactly the v2 conservative recipe (U2-C3). The wasm int4 recipe,
+/// and every other id, is refused: v2 has no int4 recipe yet (U2-H1). The
+/// caller then holds every tensor to the census's storage dtypes.
+fn validate_v2_focrq_identity(source_sha256: &str, quant_recipe: Option<&str>) -> FocrResult<()> {
     if source_sha256 != V2_SOURCE_SHA256 {
         return Err(FocrError::FormatMismatch(format!(
             "Unlimited-OCR-2 .focrq source_sha256 is {source_sha256:?}, expected the pinned \
              two-shard source {V2_SOURCE_SHA256:?}"
         )));
     }
-    Err(FocrError::FormatMismatch(format!(
-        "Unlimited-OCR-2 .focrq artifacts are not supported by this build: recipe {:?} has no \
-         loader contract yet (U2-C3); load the raw checkpoint directory instead",
-        crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID
-    )))
+    let expected = crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID;
+    if quant_recipe != Some(expected) {
+        return Err(FocrError::FormatMismatch(format!(
+            "Unlimited-OCR-2 .focrq packing_manifest.quant_recipe must be exactly {expected:?}, \
+             got {quant_recipe:?}; Unlimited-OCR-2 has no int4 or wasm recipe"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -788,7 +793,12 @@ pub(super) fn validate_focrq_header(
     quant_recipe: Option<&str>,
 ) -> FocrResult<()> {
     if census == TensorCensus::UnlimitedOcrV2 {
-        return validate_v2_focrq(source_sha256);
+        validate_v2_focrq_identity(source_sha256, quant_recipe)?;
+        return validate_records(
+            census,
+            records.iter().map(|(name, record)| (name.as_str(), record)),
+            CensusSurface::ConservativeFocrq,
+        );
     }
     let manifest = manifest()?;
     if source_sha256 != manifest.source_sha256 {
@@ -829,17 +839,16 @@ pub(super) fn validate_loaded_weights(weights: &Weights) -> FocrResult<()> {
     else {
         return Ok(());
     };
-    if census == TensorCensus::UnlimitedOcrV2 && weights.is_focrq() {
-        return validate_v2_focrq(weights.source_sha256());
-    }
     let surface = if weights.is_focrq() {
-        if weights.source_sha256() != SOURCE_SHA256 {
+        if census == TensorCensus::UnlimitedOcrV2 {
+            validate_v2_focrq_identity(weights.source_sha256(), weights.quant_recipe())?;
+            CensusSurface::ConservativeFocrq
+        } else if weights.source_sha256() != SOURCE_SHA256 {
             return Err(FocrError::FormatMismatch(format!(
                 "Unlimited-OCR .focrq source_sha256 is {:?}, expected pinned source {SOURCE_SHA256:?}",
                 weights.source_sha256()
             )));
-        }
-        if weights.quant_recipe() == Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID) {
+        } else if weights.quant_recipe() == Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID) {
             CensusSurface::WasmInt4Focrq
         } else {
             CensusSurface::ConservativeFocrq
@@ -1313,35 +1322,224 @@ mod tests {
         assert!(message.contains("unexpected 107"), "{message}");
     }
 
+    /// U2-C3's loader gate: a v2 `.focrq` passes only with the pinned two-shard
+    /// source, exactly the v2 recipe id, and the recipe's storage dtypes; each
+    /// refusal is a FormatMismatch (exit 7) naming the field or tensor.
     #[test]
-    fn v2_focrq_headers_are_checked_for_source_then_refused() {
+    fn v2_focrq_headers_hold_source_recipe_and_storage_dtypes() {
+        let v2_recipe = crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID;
         let directory = synthetic_census_directory(
             TensorCensus::UnlimitedOcrV2,
-            CensusSurface::SourceSafetensors,
+            CensusSurface::ConservativeFocrq,
         );
-        let recipe = Some(crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID);
-        let wrong = validate_focrq_header(
-            TensorCensus::UnlimitedOcrV2,
-            &directory,
-            SOURCE_SHA256,
-            recipe,
-        )
-        .expect_err("v1's source digest is not v2's")
-        .to_string();
-        assert!(wrong.contains("pinned two-shard source"), "{wrong}");
-        let refused = validate_focrq_header(
+        validate_focrq_header(
             TensorCensus::UnlimitedOcrV2,
             &directory,
             V2_SOURCE_SHA256,
-            recipe,
+            Some(v2_recipe),
         )
-        .expect_err("no v2 recipe contract until U2-C3")
-        .to_string();
-        assert!(refused.contains("U2-C3"), "{refused}");
-        assert!(
-            refused.contains("load the raw checkpoint directory"),
-            "{refused}"
+        .expect("the v2 recipe's own artifact passes");
+
+        let refuse =
+            |directory: &BTreeMap<String, TensorRecord>, source: &str, recipe: Option<&str>| {
+                let error =
+                    validate_focrq_header(TensorCensus::UnlimitedOcrV2, directory, source, recipe)
+                        .expect_err("refused");
+                assert_eq!(error.exit_code(), 7, "{error}");
+                error.to_string()
+            };
+        let wrong = refuse(&directory, SOURCE_SHA256, Some(v2_recipe));
+        assert!(wrong.contains("pinned two-shard source"), "{wrong}");
+        for recipe in [
+            None,
+            Some(UNLIMITED_OCR_INT8_RECIPE_ID),
+            Some(UNLIMITED_OCR_WASM_INT4_RECIPE_ID),
+        ] {
+            let message = refuse(&directory, V2_SOURCE_SHA256, recipe);
+            assert!(
+                message.contains("quant_recipe must be exactly") && message.contains(v2_recipe),
+                "{message}"
+            );
+        }
+
+        // A quantized router, an int8 attention projection, and a BF16 expert
+        // each violate the recipe, by name.
+        for (name, dtype) in [
+            (
+                "model.layers.4.self_attn.dash_router.q_proj.weight",
+                DType::QInt8PerChan,
+            ),
+            (
+                "model.layers.9.self_attn.indexer.k_proj.weight",
+                DType::QInt8PerChan,
+            ),
+            (
+                "model.layers.2.self_attn.q_proj.weight",
+                DType::QInt8PerChan,
+            ),
+            ("model.layers.6.mlp.experts.11.up_proj.weight", DType::BF16),
+        ] {
+            let mut tampered = directory.clone();
+            tampered.get_mut(name).expect("census tensor").dtype = dtype;
+            let message = refuse(&tampered, V2_SOURCE_SHA256, Some(v2_recipe));
+            assert!(
+                message.contains("wrong dtype 1") && message.contains(name),
+                "{message}"
+            );
+        }
+    }
+
+    /// U2-C3: `focr convert` picks the arch by census on the bounded headers
+    /// and refuses an explicit `--model-id` that another census matches (exit
+    /// 2, naming both), all before any payload byte or shard digest is read.
+    #[test]
+    fn convert_arch_is_the_census_match_and_cross_checks_model_id() {
+        use crate::native_engine::{conversion_arch, shards::SafetensorsHeader};
+        let header = |census, drop: Option<&str>| {
+            let mut records = synthetic_census_directory(census, CensusSurface::SourceSafetensors);
+            if let Some(name) = drop {
+                records.remove(name).expect("census tensor");
+            }
+            SafetensorsHeader {
+                records,
+                int64: BTreeMap::new(),
+            }
+        };
+        let arch = |id| model_arch::arch_by_id(id).expect("registered");
+        let (v1_id, v2_id) = (
+            model_arch::UNLIMITED_OCR_V1_ID,
+            model_arch::UNLIMITED_OCR_V2_ID,
         );
+        let v1 = header(TensorCensus::UnlimitedOcrV1, None);
+        let v2 = header(TensorCensus::UnlimitedOcrV2, None);
+
+        assert_eq!(
+            conversion_arch(None, &v1).expect("v1 by census").id(),
+            v1_id
+        );
+        assert_eq!(
+            conversion_arch(None, &v2).expect("v2 by census").id(),
+            v2_id
+        );
+        for (explicit, source) in [(v1_id, &v1), (v2_id, &v2)] {
+            let picked = conversion_arch(Some(arch(explicit)), source).expect("agreeing id");
+            assert_eq!(picked.id(), explicit);
+        }
+        for (explicit, source, found) in [
+            (v1_id, &v2, v2_id),
+            (v2_id, &v1, v1_id),
+            ("got-ocr2", &v2, v2_id),
+        ] {
+            let error = conversion_arch(Some(arch(explicit)), source).expect_err("disagreeing id");
+            assert_eq!(error.exit_code(), 2, "{error}");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("--model-id {explicit:?} disagrees"))
+                    && message.contains(&format!("{found:?}'s")),
+                "{message}"
+            );
+        }
+
+        // A source no census matches: only an explicit id can name it.
+        let partial = header(
+            TensorCensus::UnlimitedOcrV2,
+            Some("model.layers.5.self_attn.indexer.k_norm.weight"),
+        );
+        let error = conversion_arch(None, &partial).expect_err("no census, no id");
+        assert_eq!(error.exit_code(), 2, "{error}");
+        assert!(error.to_string().contains("pass --model-id"), "{error}");
+        let error = conversion_arch(Some(arch(v2_id)), &partial).expect_err("census diff");
+        assert_eq!(error.exit_code(), 7, "{error}");
+        assert!(
+            error.to_string().contains("indexer.k_norm.weight"),
+            "{error}"
+        );
+        assert_eq!(
+            conversion_arch(Some(arch("got-ocr2")), &partial)
+                .expect("a zoo id has no census to disagree with")
+                .id(),
+            "got-ocr2"
+        );
+    }
+
+    /// U2-C3's recipe over the full v2 census: exactly 2,148 int8 FFN/expert
+    /// matrices and 670 high-precision tensors (the I64 `position_ids` is the
+    /// one skipped). No lever ever quantizes a router or indexer tensor, and
+    /// the attention lever moves exactly the 48 decoder projections.
+    #[test]
+    fn v2_recipe_classifies_the_census_exactly() {
+        let v2 = &v2_census().expect("embedded v2 census").tensors;
+        assert_eq!(v2.len() + V2_INT64_RULES.len(), V2_TENSOR_COUNT);
+        let count = |dtype| v2.values().filter(|t| t.storage_dtype == dtype).count();
+        assert_eq!(
+            (count(DType::QInt8PerChan), count(DType::BF16)),
+            (2_148, 670)
+        );
+        let selectors: Vec<&String> = v2
+            .keys()
+            .filter(|n| n.contains(".dash_router.") || n.contains(".indexer."))
+            .collect();
+        assert_eq!(selectors.len(), V2_ADDED_COUNT);
+        let baseline = Recipe::validated_default();
+        for (attn, lmhead) in [(false, false), (true, false), (false, true), (true, true)] {
+            let recipe = Recipe::new(attn, lmhead);
+            assert!(
+                selectors.iter().all(|n| !recipe.is_quantized(n)),
+                "a router/indexer tensor quantized at attn={attn} lmhead={lmhead}"
+            );
+            let moved: Vec<&String> = v2
+                .keys()
+                .filter(|n| recipe.is_quantized(n) != baseline.is_quantized(n))
+                .collect();
+            let attention = moved
+                .iter()
+                .filter(|n| n.ends_with("_proj.weight") && n.contains(".self_attn."))
+                .count();
+            assert_eq!(attention, if attn { 48 } else { 0 }, "attn={attn}");
+            assert_eq!(moved.len(), attention + usize::from(lmhead), "{moved:?}");
+        }
+    }
+
+    /// The exact attention matcher leaves v1's recipe output unchanged: over
+    /// the v1 census, every lever quantizes the same set the old suffix match
+    /// did (no v1 tensor is a router or indexer).
+    #[test]
+    fn v1_recipe_output_is_unchanged_by_the_exact_attention_matcher() {
+        fn legacy_is_attention(name: &str) -> bool {
+            name.contains(".self_attn.")
+                && [
+                    ".q_proj.weight",
+                    ".k_proj.weight",
+                    ".v_proj.weight",
+                    ".o_proj.weight",
+                ]
+                .iter()
+                .any(|leaf| name.ends_with(leaf))
+        }
+        use crate::quant::recipe::{GatedKind, QuantPolicy, classify};
+        let v1 = &manifest().expect("v1 census").tensors;
+        // The vision check ran before the attention one, so the old gated set
+        // was the suffix match minus the vision tower.
+        let legacy: Vec<&String> = v1
+            .keys()
+            .filter(|n| legacy_is_attention(n))
+            .filter(|n| !n.starts_with("model.vision_model.") && !n.starts_with("model.sam_model."))
+            .collect();
+        let exact: Vec<&String> = v1
+            .keys()
+            .filter(|n| classify(n).policy == QuantPolicy::Gated(GatedKind::Attention))
+            .collect();
+        assert_eq!(legacy.len(), 48);
+        assert_eq!(exact, legacy);
+        for (attn, lmhead) in [(false, false), (true, false), (false, true), (true, true)] {
+            let recipe = Recipe::new(attn, lmhead);
+            let quantized = v1.keys().filter(|n| recipe.is_quantized(n)).count();
+            assert_eq!(
+                quantized,
+                2_148 + if attn { 48 } else { 0 } + usize::from(lmhead),
+                "attn={attn} lmhead={lmhead}"
+            );
+        }
     }
 
     #[test]
@@ -1554,6 +1752,90 @@ mod tests {
         let weights = Weights::load_opened(file, &path).expect("mmap real artifact");
         validate_loaded_weights(&weights).expect("real loaded directory must match the census");
         assert_eq!(weights.len(), TENSOR_COUNT);
+    }
+
+    /// U2-C3 round trip on the real v2 artifact (model-gated). The converted
+    /// `.focrq` passes the bounded header probe, the post-load census and the
+    /// recipe check. Given the source shards too, every high-precision tensor
+    /// is byte-equal to its source, and a sample of the int8 matrices (dense
+    /// layer 0, expert 0 and the shared experts of every MoE layer) dequantizes
+    /// to within half a quantization step of the source.
+    #[test]
+    fn real_v2_artifact_round_trips_when_configured() {
+        let Some(path) = std::env::var_os("FOCR_TEST_UNLIMITED_2_RECIPE_MODEL").map(PathBuf::from)
+        else {
+            eprintln!(
+                "skip-with-SUCCESS: set FOCR_TEST_UNLIMITED_2_RECIPE_MODEL to the converted v2 \
+                 .focrq (and FOCR_TEST_UNLIMITED_2_SOURCE_DIR to its shards for the tensor check)"
+            );
+            return;
+        };
+        let (file, file_len) = super::super::open_model_file(&path).expect("open v2 artifact");
+        let arch = super::super::validate_model_header_from_reader(&file, file_len)
+            .expect("bounded v2 header must pass the census and recipe");
+        assert_eq!(arch.id(), model_arch::UNLIMITED_OCR_V2_ID);
+        let weights = Weights::load_opened(file, &path).expect("load v2 artifact");
+        validate_loaded_weights(&weights).expect("loaded v2 directory must match the census");
+        super::super::validate_unlimited_ocr_quant_recipe(&weights)
+            .expect("loaded v2 directory must hold the recipe");
+        assert_eq!(weights.len(), V2_TENSOR_COUNT - V2_INT64_RULES.len());
+        assert_eq!(
+            weights.quant_recipe(),
+            Some(crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID)
+        );
+        assert_eq!(weights.source_sha256(), V2_SOURCE_SHA256);
+
+        let Some(dir) = std::env::var_os("FOCR_TEST_UNLIMITED_2_SOURCE_DIR").map(PathBuf::from)
+        else {
+            eprintln!(
+                "skip-with-SUCCESS: FOCR_TEST_UNLIMITED_2_SOURCE_DIR unset; tensors not compared"
+            );
+            return;
+        };
+        let sampled = |name: &str| {
+            name.starts_with("model.layers.0.mlp.")
+                || name.contains(".mlp.experts.0.")
+                || name.contains(".mlp.shared_experts.")
+        };
+        let (mut kept, mut int8, mut checked) = (0usize, 0usize, 0usize);
+        for (shard, _) in V2_SOURCE_SHARDS {
+            let bytes = std::fs::read(dir.join(shard)).expect("read source shard");
+            let source = Weights::from_source_shard(bytes, arch).expect("parse source shard");
+            for name in source.names() {
+                let (src, out) = (
+                    source.tensor(name).expect("source tensor"),
+                    weights.tensor(name).expect("artifact tensor"),
+                );
+                assert_eq!(src.shape, out.shape, "{name}");
+                if out.dtype != DType::QInt8PerChan {
+                    assert_eq!((src.dtype, src.data), (out.dtype, out.data), "{name}");
+                    kept += 1;
+                    continue;
+                }
+                int8 += 1;
+                if !sampled(name) {
+                    continue;
+                }
+                let (w, q) = (
+                    source.mat(name).expect("source f32"),
+                    weights.qint8(name).expect("artifact int8"),
+                );
+                let deq = weights.mat(name).expect("artifact dequant");
+                for row in 0..q.n {
+                    let step = q.scales[row];
+                    let span = row * q.k..(row + 1) * q.k;
+                    for (a, b) in w.data[span.clone()].iter().zip(&deq.data[span]) {
+                        assert!(
+                            (a - b).abs() <= step * 0.500_01 + a.abs() * 1e-6,
+                            "{name} row {row}: source {a} vs dequantized {b} (step {step})"
+                        );
+                    }
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!((int8, kept), (2_148, 670));
+        assert_eq!(checked, 3 + 11 * 3 + 11 * 3);
     }
 
     #[test]

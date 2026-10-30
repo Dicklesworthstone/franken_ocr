@@ -274,6 +274,14 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             AllowListed("multi-page budget tests (U2-X2)"),
         ),
         lever(
+            "FOCR_TEST_UNLIMITED_2_RECIPE_MODEL",
+            AllowListed("census tests"),
+        ),
+        lever(
+            "FOCR_TEST_UNLIMITED_2_SOURCE_DIR",
+            AllowListed("census tests"),
+        ),
+        lever(
             "FOCR_TEST_UNLIMITED_RECIPE_MODEL",
             AllowListed("census tests"),
         ),

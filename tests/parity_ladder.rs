@@ -1210,6 +1210,157 @@ fn l0_preprocess_exact() {
     }
 }
 
+/// U2-B7 L0, EXACT: Unlimited-OCR-2 preprocessing equals the U2-A6 f32 oracle
+/// bit for bit on every committed fixture: S1 and S3 (base), S2 (multi-page
+/// base) and S4 (gundam). Checked per fixture:
+/// - every page's global view against `images_ori`;
+/// - the gundam tiles against `images_crop`;
+/// - the grids against `images_spatial_crop`;
+/// - the placeholder count against `images_seq_mask`.
+///
+/// `FOCR_UOCR2_FIXTURES_DIR` names the oracle run's dump directory
+/// (`<root>/f32/t12`). The pages come from `FOCR_CORPUS_DIR` (default
+/// `~/.cache/franken_ocr/corpus/pages`), each held to its sha256 in
+/// `ORACLE.json`. Skips with success when the dumps or the corpus are absent.
+/// No tolerance: v2 always resamples with the PIL-exact kernel, whatever
+/// `FOCR_RESAMPLE` says.
+#[test]
+fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
+    let mut log = Logger::new("uocr2_L0_preprocess", "uocr2_oracle");
+    log.setup(0);
+    let t0 = Instant::now();
+    let Some(dumps) = std::env::var_os("FOCR_UOCR2_FIXTURES_DIR").map(PathBuf::from) else {
+        log.skip_no_model(
+            "FOCR_UOCR2_FIXTURES_DIR unset: point it at the U2-A6 dump directory \
+             (<oracle root>/f32/t12)",
+        );
+        return;
+    };
+    let corpus = std::env::var_os("FOCR_CORPUS_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join(".cache/franken_ocr/corpus/pages"))
+        })
+        .expect("FOCR_CORPUS_DIR or HOME is set");
+    let oracle_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/uocr2_oracle/ORACLE.json"
+    );
+    let oracle: Value = serde_json::from_slice(&std::fs::read(oracle_path).expect("ORACLE.json"))
+        .expect("ORACLE.json parses");
+    let fixtures = oracle["fixtures"].as_object().expect("ORACLE.json fixtures");
+    let npy = |fixture: &str, stage: &str| -> Vec<u8> {
+        let path = dumps
+            .join("activations")
+            .join(fixture)
+            .join(format!("{stage}.npy"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    };
+    let first_mismatch = |got: &[f32], want: &[f32]| -> Option<(usize, f32, f32)> {
+        got.iter()
+            .zip(want)
+            .position(|(a, b)| a.to_bits() != b.to_bits())
+            .map(|i| (i, got[i], want[i]))
+    };
+
+    let page_path = |page: &Value| corpus.join(page["name"].as_str().expect("page name"));
+    let missing = fixtures
+        .values()
+        .flat_map(|entry| entry["pages"].as_array().expect("fixture pages"))
+        .map(page_path)
+        .find(|path| !path.is_file());
+    if let Some(missing) = missing {
+        log.skip_no_model(&format!(
+            "corpus page {} absent (set FOCR_CORPUS_DIR)",
+            missing.display()
+        ));
+        return;
+    }
+
+    let mut ran = 0usize;
+    for (fixture, entry) in fixtures {
+        let pages = entry["pages"].as_array().expect("fixture pages");
+        let page_paths: Vec<PathBuf> = pages.iter().map(page_path).collect();
+        let gundam = entry["params"]["crop_mode"].as_bool() == Some(true);
+        let mode = if gundam {
+            preprocess::PreprocessMode::gundam()
+        } else {
+            preprocess::PreprocessMode::base()
+        };
+        let (ori_shape, ori) =
+            parity_harness::read_npy_f32(&npy(fixture, "images_ori")).expect("images_ori");
+        assert_eq!(ori_shape, [pages.len(), 3, 1024, 1024], "{fixture} images_ori");
+        let (_, spatial) = parity_harness::read_npy_i32(&npy(fixture, "images_spatial_crop"))
+            .expect("images_spatial_crop");
+        let (_, seq_mask) =
+            parity_harness::read_npy_u8(&npy(fixture, "images_seq_mask")).expect("images_seq_mask");
+        let view = 3 * 1024 * 1024;
+        let mut tiles = Vec::new();
+        let mut placeholders = 0usize;
+        for (index, (page, path)) in pages.iter().zip(&page_paths).enumerate() {
+            let bytes = std::fs::read(path).expect("corpus page reads");
+            assert_eq!(
+                sha256_hex(&bytes),
+                page["sha256"].as_str().expect("page sha256"),
+                "{fixture}: {} is not the page the oracle read",
+                path.display()
+            );
+            let pre =
+                preprocess::preprocess_bytes(&bytes, mode, preprocess::PreprocessProfile::V2)
+                    .expect("v2 preprocess");
+            let want = &ori[index * view..(index + 1) * view];
+            assert_eq!(
+                first_mismatch(&pre.global.pixels.data, want),
+                None,
+                "{fixture} page {index}: global view (index, ours, oracle)"
+            );
+            let grid = [
+                pre.crop_grid.width_crop_num as i32,
+                pre.crop_grid.height_crop_num as i32,
+            ];
+            assert_eq!(grid, spatial[2 * index..2 * index + 2], "{fixture} page {index}: grid");
+            placeholders += pre.placeholder_token_count();
+            tiles.extend(pre.tiles.iter().flat_map(|tile| tile.pixels.data.iter().copied()));
+        }
+        if gundam {
+            let (crop_shape, crop) =
+                parity_harness::read_npy_f32(&npy(fixture, "images_crop")).expect("images_crop");
+            assert_eq!(crop_shape[1..], [3, 640, 640], "{fixture} images_crop");
+            assert_eq!(tiles.len(), crop.len(), "{fixture}: tile count");
+            assert_eq!(
+                first_mismatch(&tiles, &crop),
+                None,
+                "{fixture}: tiles (index, ours, oracle)"
+            );
+        } else {
+            assert!(tiles.is_empty(), "{fixture}: base mode emitted tiles");
+        }
+        let image_rows = seq_mask.iter().filter(|&&m| m == 1).count();
+        assert_eq!(placeholders, image_rows, "{fixture}: placeholder count");
+        ran += 1;
+        log.parity(
+            "L0",
+            "mismatched_elements",
+            0.0,
+            0.0,
+            fixture,
+            entry["prompt_token_ids_sha256"].as_str().unwrap_or_default(),
+            json!({
+                "seam": "v2 preprocess (letterbox / gundam tiles -> normalized views)",
+                "pages": pages.len(),
+                "mode": if gundam { "gundam" } else { "base" },
+                "tiles": tiles.len() / (3 * 640 * 640),
+                "placeholders": placeholders,
+                "resample_env": std::env::var(preprocess::RESAMPLE_ENV).ok(),
+            }),
+            true,
+        );
+    }
+    assert_eq!(ran, fixtures.len(), "every ORACLE.json fixture compared");
+    log.result("pass", t0.elapsed().as_micros());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // L1 — per-op parity (cosine ≥ 0.9999 + ULP table) — bd-re8.5
 //

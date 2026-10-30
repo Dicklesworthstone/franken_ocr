@@ -155,9 +155,39 @@ sections as they land.
     10- and 20-page lists of `tests/fixtures/multi_page`, and two gundam pages.
     The ids, markdown and `ORACLE.json` are committed in
     `tests/fixtures/uocr2_oracle`; the dumps stay beside the weights.
-  - FLOOR_SENTENCE
+  - `FLOOR.json` records the reference's own noise. A repeated f32 run is
+    bit-identical, and so are bf16 runs at 12 and 4 threads. f32 at 12 vs 4
+    threads gives the same token ids on all nine fixtures. Its logits differ
+    by at most 4.8e-4 and its layer inputs by 2.3e-4 relative. Even so, 11
+    near-tie routing rows on the 10- and 20-page prompts pick different
+    blocks. bf16 is no oracle: its tokens leave f32's within 7–94 tokens, and
+    its routing differs on thousands of rows.
   - No fixture hit DISC-U2-2's all-(−inf) case. `check_oracle_provenance.py`
     checks the committed fixtures against the v2 pins and input hashes.
+- **Unlimited-OCR-2 int8 artifact** (bead U2-C3).
+  - `focr convert <v2 checkpoint dir> -o unlimited-ocr-2.v0.1.0.int8.focrq
+    --quant int8` converts the two-shard source in 56 s to a 4,173,206,653-byte
+    artifact (sha256 `54b8a1ec…5486035b4398`); two runs are byte-identical.
+  - The recipe is `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1`: the same
+    2,148 FFN/expert matrices as v1 in int8, and the other 670 tensors at
+    source precision. Those include attention, `lm_head`, and every SR-SWA
+    `dash_router`/`indexer` tensor.
+  - The `FOCR_INT8_ATTN` matcher now accepts only the exact
+    `model.layers.{i}.self_attn.{q,k,v,o}_proj.weight` names. Its old suffix
+    match would also have quantized the v2 router and indexer projections.
+    v1's recipe is unchanged: a v1 re-conversion with this build is
+    byte-identical to the verified v1 artifact (`573340…fb592`).
+  - `focr convert` without `--model-id` picks the Unlimited-OCR generation
+    whose tensor census the source matches. An explicit id that a different
+    census matches exits 2 and names both, after reading only the shard
+    headers. The zoo models still need `--model-id`.
+  - The loader accepts a v2 `.focrq` only with the pinned two-shard
+    `source_sha256`, exactly the v2 recipe id, and the recipe's storage dtypes.
+    Anything else exits 7 naming the field or tensor, whether the file is
+    given by path or found by short name; the wasm int4 id is refused too.
+    The search-dir resolver's wasm skip now applies to v1 artifacts only, so a
+    v2 file declaring that id gets the named error, not "not found".
+  - `focr convert` reports `output_sha256`.
 
 ### Fixed
 
