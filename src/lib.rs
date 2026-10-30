@@ -53,7 +53,10 @@ pub use error::{FocrError, FocrResult};
 /// Multi-model architecture descriptors + registry (the "model zoo" foundation,
 /// epic bd-3jo6 / A1). Additive metadata layer; the live forward is unchanged.
 pub use native_engine::model_arch;
-pub use native_engine::{ExtractedFigure, LayoutSpan, RecognizedDocument};
+pub use native_engine::{
+    DocumentPages, ExtractedFigure, Half, LayoutSpan, PageFinish, PageOrigin, PageResult,
+    RecognizedDocument, StreamedPage,
+};
 
 #[cfg(feature = "native")]
 use std::path::Path;
@@ -341,10 +344,9 @@ where
 }
 
 /// Boxed per-page streaming sink for multi-page passes (bd-2z0y): called
-/// with the 1-based page index and the trimmed raw body as each `<PAGE>`
-/// boundary is crossed in the token stream. `Send` because the pass runs on
-/// the engine's blocking pool.
-pub type PageSink = Box<dyn FnMut(usize, &str) + Send>;
+/// with each [`StreamedPage`] as its `<PAGE>` boundary is crossed in the
+/// token stream. `Send` because the pass runs on the engine's blocking pool.
+pub type PageSink = Box<dyn FnMut(&StreamedPage<'_>) + Send>;
 
 #[cfg(feature = "native")]
 pub struct OcrEngine {
@@ -785,9 +787,9 @@ impl OcrEngine {
     }
 
     /// [`OcrEngine::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING
-    /// sink (bd-2z0y): `on_page(k, body)` fires from the decode driver as
-    /// page `k`'s `<PAGE>` boundary is crossed in the token stream (boxed +
-    /// `Send` because the pass runs on the blocking pool). The returned
+    /// sink (bd-2z0y): `on_page` gets each [`StreamedPage`] from the decode
+    /// driver as its `<PAGE>` boundary is crossed in the token stream (boxed
+    /// + `Send` because the pass runs on the blocking pool). The returned
     /// markdown is still the full terminal assembly.
     ///
     /// # Errors
@@ -811,6 +813,7 @@ impl OcrEngine {
     /// `on_item` sees every page before it is read, a skipped one included;
     /// `on_page`, when given, streams page bodies as
     /// [`OcrEngine::recognize_multi_page_dynamic_streaming_with_model`] does.
+    /// Returns the markdown and the pages (U2-E3).
     ///
     /// The source is consumed: a caller that retries (a first-run download)
     /// opens a fresh one.
@@ -824,7 +827,7 @@ impl OcrEngine {
         mut source: page_source::PageSource,
         mut on_item: Box<dyn FnMut(&page_source::PageItem) + Send>,
         on_page: Option<PageSink>,
-    ) -> FocrResult<String> {
+    ) -> FocrResult<DocumentPages> {
         let model = self.model_at(model_path)?;
         let budget = Self::forward_budget(&model, source.len());
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || match on_page {

@@ -15,7 +15,8 @@
 //! points at its own thin shim that just calls [`cli_main`]. See AGENTS.md
 //! doctrine #9.
 
-use crate::page_source::{Half, PageItem, PageSource};
+use crate::native_engine::Half;
+use crate::page_source::{PageItem, PageSource};
 use crate::{
     FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine, dist,
     native_engine, pdf, progress, quant, robot, simd,
@@ -989,11 +990,14 @@ impl Recognition {
 
     /// The structured JSON form. Always carries `schema_version` + `markdown`; a
     /// single image adds a top-level `layout` array, a document adds a `pages`
-    /// array of `{page, layout}`. Every `layout` is a list of `{label, boxes}`, and each box
-    /// is `[x1, y1, x2, y2]` in source-image pixels (top-left origin). When figures
-    /// were extracted, a top-level `figures` array of `{label, page, bbox, path}`
-    /// is appended (each `path` is the saved file, also referenced from the
-    /// markdown).
+    /// array of `{page, layout}` (plus `half` on a split spread's halves). A
+    /// `--multi-page` document's pages also carry `run_index` and `text`, and
+    /// `tokens` and `finish` when the model counts them
+    /// ([`native_engine::PageResult::to_json`], U2-E3). Every `layout` is a list
+    /// of `{label, boxes}`, and each box is `[x1, y1, x2, y2]` in source-image
+    /// pixels (top-left origin). When figures were extracted, a top-level
+    /// `figures` array of `{label, page, bbox, path}` (plus `half`) is appended
+    /// (each `path` is the saved file, also referenced from the markdown).
     fn to_json(&self, figures: &[WrittenFigure]) -> serde_json::Value {
         let mut value = match self {
             Recognition::Single(doc) => serde_json::json!({
@@ -1002,22 +1006,27 @@ impl Recognition {
                 "layout": layout_to_json(&doc.layout),
             }),
             Recognition::Document(document) => {
-                let pages: Vec<serde_json::Value> = document
-                    .pages
-                    .iter()
-                    .map(|p| {
-                        let mut page = serde_json::json!({
-                            "page": p.page,
-                            "layout": layout_to_json(&p.layout),
-                        });
-                        // Split-spread halves carry their side; unsplit pages
-                        // keep the exact pre-bd-av64.11 shape (no key).
-                        if let Some(half) = p.half {
-                            page["half"] = serde_json::json!(half);
-                        }
-                        page
-                    })
-                    .collect();
+                let pages: Vec<serde_json::Value> = match &document.pages {
+                    DocumentPageList::Layouts(layouts) => layouts
+                        .iter()
+                        .map(|p| {
+                            let mut page = serde_json::json!({
+                                "page": p.page,
+                                "layout": layout_to_json(&p.layout),
+                            });
+                            // Split-spread halves carry their side; unsplit
+                            // pages keep the exact pre-bd-av64.11 shape (no key).
+                            if let Some(half) = p.half {
+                                page["half"] = serde_json::json!(half);
+                            }
+                            page
+                        })
+                        .collect(),
+                    DocumentPageList::Read(pages) => pages
+                        .iter()
+                        .map(native_engine::PageResult::to_json)
+                        .collect(),
+                };
                 serde_json::json!({
                     "schema_version": robot::ROBOT_SCHEMA_VERSION,
                     "markdown": document.markdown,
@@ -1031,12 +1040,16 @@ impl Recognition {
             let arr: Vec<serde_json::Value> = figures
                 .iter()
                 .map(|f| {
-                    serde_json::json!({
+                    let mut figure = serde_json::json!({
                         "label": f.label,
                         "page": f.page,
                         "bbox": f.bbox,
                         "path": f.path,
-                    })
+                    });
+                    if let Some(half) = f.half {
+                        figure["half"] = half.as_str().into();
+                    }
+                    figure
                 })
                 .collect();
             obj.insert("figures".to_string(), serde_json::Value::Array(arr));
@@ -1195,6 +1208,8 @@ struct WrittenFigure {
     label: String,
     /// 1-based source page (1 for a single image).
     page: usize,
+    /// The half of a split spread the figure is on.
+    half: Option<Half>,
     /// Source-pixel box `[x1, y1, x2, y2]` the figure was cropped from.
     bbox: [i64; 4],
     /// The reference path written into the markdown/JSON (relative to the output).
@@ -1306,18 +1321,21 @@ impl FigureWriter {
     /// Write one page's figures and return its markdown with each figure token
     /// rewritten to point at the saved file. `page` is 1-based (1 for a single
     /// image); figures are named `page{page}_figure_{n}.{ext}` (n 1-based, matching
-    /// the page-local markdown index).
+    /// the page-local markdown index), and a spread's halves
+    /// `page{page}l_figure_{n}` and `page{page}r_figure_{n}` (U2-E3).
     fn process_page(
         &mut self,
         page: usize,
+        half: Option<Half>,
         markdown: &str,
         figures: Vec<native_engine::ExtractedFigure>,
     ) -> FocrResult<String> {
         let mut md = markdown.to_string();
+        let side = half.map(Half::initial).map(String::from).unwrap_or_default();
         for fig in figures {
             let fignum = fig.index + 1;
             let fmt = choose_figure_format(&fig.image);
-            let name = format!("page{page}_figure_{fignum}.{}", fmt.ext());
+            let name = format!("page{page}{side}_figure_{fignum}.{}", fmt.ext());
             self.ensure_dir()?;
             write_figure(&fig.image, &self.dir.join(&name), fmt)?;
             let rel = format!("{}{name}", self.ref_prefix);
@@ -1325,6 +1343,7 @@ impl FigureWriter {
             self.written.push(WrittenFigure {
                 label: fig.label,
                 page,
+                half,
                 bbox: fig.bbox,
                 path: rel,
             });
@@ -1453,26 +1472,33 @@ fn run_ocr_inner(
             request.image.display()
         )));
     }
-    if request.multi_page && (request.split_spreads || figure_plan.is_some()) {
-        return Err(FocrError::Usage(
-            "--multi-page is one cross-page pass over whole pages; it does not compose \
-             with --split-spreads or --extract-figures (run those per-page passes \
-             separately)"
-                .into(),
-        ));
-    }
-    if request.split_spreads && figure_plan.is_some() {
-        return Err(FocrError::Usage(
-            "--split-spreads does not compose with --extract-figures yet (figure \
-             naming is per source page; splitting would collide the indices) — \
-             run the passes separately"
-                .into(),
-        ));
-    }
     // The mode default (D25): an installed non-v1 default names the model; a
     // missing one leaves v1 serving with a pull hint.
     let mode = RunMode::of_ocr(&request, is_document);
     let pull_hint = apply_mode_default(&mut request.model, mode, &MODE_DEFAULTS);
+    // A model that splits a document into pages exactly (Unlimited-OCR-2,
+    // U2-E3) gives one cross-page pass real pages, so its document mode
+    // composes with --split-spreads and --extract-figures. v1 merges pages.
+    let paged_model = is_document.then(|| paged_model_id(&request)).flatten();
+    let paged_document = request.multi_page && paged_model.is_some();
+    if request.multi_page && !paged_document && (request.split_spreads || figure_plan.is_some())
+    {
+        return Err(FocrError::Usage(
+            "--multi-page is one cross-page pass over whole pages; it does not compose \
+             with --split-spreads or --extract-figures (run those per-page passes \
+             separately, or pass --model unlimited-ocr-2, whose pages are exact)"
+                .into(),
+        ));
+    }
+    if request.split_spreads && figure_plan.is_some() && !paged_document {
+        return Err(FocrError::Usage(
+            "--split-spreads does not compose with --extract-figures yet (figure \
+             naming is per source page; splitting would collide the indices) — \
+             run the passes separately, or with --model unlimited-ocr-2 add \
+             --multi-page"
+                .into(),
+        ));
+    }
     // A document's pages, opened once here so a bad `--pages` spec or a
     // directory without page images fails before the model loads. Files a
     // directory leaves out are reported now, and again on `run_complete`,
@@ -1496,13 +1522,30 @@ fn run_ocr_inner(
     let mut resident_finish: Option<native_engine::FinishReason> = None;
     let mut resident_model: Option<native_engine::ModelIdentity> = None;
     let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, source) {
+        (plan, Some(source)) if request.multi_page => {
+            let (document, figs) = recognize_document_multi_page(
+                &engine,
+                &request,
+                source,
+                DocumentRun {
+                    robot_mode,
+                    show_progress,
+                    paged_model,
+                },
+                plan.as_ref(),
+            )?;
+            (Recognition::Document(document), figs)
+        }
         (Some(plan), Some(source)) => {
             let (pages, figs) = recognize_document_pages_with_figures(
                 &engine,
                 &request,
                 source,
-                robot_mode,
-                show_progress,
+                DocumentRun {
+                    robot_mode,
+                    show_progress,
+                    paged_model,
+                },
                 plan,
             )?;
             (Recognition::Document(pages), figs)
@@ -1514,26 +1557,19 @@ fn run_ocr_inner(
                     None => engine.recognize_with_figures(&request.image),
                 })?;
             let mut writer = plan.writer();
-            doc.markdown = writer.process_page(1, &doc.markdown, raw)?;
+            doc.markdown = writer.process_page(1, None, &doc.markdown, raw)?;
             (Recognition::Single(doc), writer.into_written())
         }
-        (None, Some(source)) if request.multi_page => (
-            Recognition::Document(recognize_document_multi_page(
-                &engine,
-                &request,
-                source,
-                robot_mode,
-                show_progress,
-            )?),
-            Vec::new(),
-        ),
         (None, Some(source)) => (
             Recognition::Document(recognize_document_pages(
                 &engine,
                 &request,
                 source,
-                robot_mode,
-                show_progress,
+                DocumentRun {
+                    robot_mode,
+                    show_progress,
+                    paged_model,
+                },
             )?),
             Vec::new(),
         ),
@@ -1967,6 +2003,19 @@ fn model_path_env_set() -> bool {
     std::env::var_os(crate::MODEL_PATH_ENV).is_some()
 }
 
+/// The run's model id when that model splits a document into pages exactly
+/// (a page contract, as Unlimited-OCR-2's, U2-E3), by the bounded header
+/// probe of the model `--model` names, else `FOCR_MODEL_PATH` or the default.
+/// `None` when the model is not installed or merges pages as v1 does.
+fn paged_model_id(request: &OcrRequest) -> Option<&'static str> {
+    let path = request.model.clone().unwrap_or_else(OcrEngine::model_path);
+    let id = native_engine::model_id_at(&path)?;
+    native_engine::model_arch::arch_by_id(id)?
+        .decode_contract()
+        .pages
+        .map(|_| id)
+}
+
 /// Apply the mode default to `model` (D25): an installed non-v1 default
 /// becomes the run's model; a missing one leaves v1 serving and returns the
 /// `pull_hint` warning to report once.
@@ -2166,17 +2215,32 @@ fn page_noun(request: &OcrRequest) -> &'static str {
     }
 }
 
+/// How a document run reports its pages.
+#[derive(Debug, Clone, Copy)]
+struct DocumentRun {
+    /// NDJSON `page` events, not stderr lines.
+    robot_mode: bool,
+    /// The human-mode progress bar (GH #2).
+    show_progress: bool,
+    /// The model's id when it splits pages exactly (U2-E3): its `page`
+    /// events name the source page.
+    paged_model: Option<&'static str>,
+}
+
 /// Surface a skipped page where the caller reads: a robot `page` event with
 /// `status: "skipped"`, else a human stderr line that does not tear `bar`.
 fn report_skipped_page(
-    robot_mode: bool,
+    run: DocumentRun,
     bar: &progress::Progress,
     noun: &str,
     page: usize,
     err: &FocrError,
 ) {
-    if robot_mode {
-        emit(&robot::page_skipped_event(page, err));
+    if run.robot_mode {
+        emit(&match run.paged_model {
+            Some(model_id) => robot::document_page_skipped_event(page, err, model_id),
+            None => robot::page_skipped_event(page, err),
+        });
     } else {
         bar.note(&format!("[focr] {noun} {page} skipped: {err}"));
     }
@@ -2193,36 +2257,57 @@ struct DocumentPageLayout {
     layout: Vec<crate::native_engine::LayoutSpan>,
 }
 
+/// A document's JSON `pages`.
+enum DocumentPageList {
+    /// Page-by-page passes: each decoded page's layout.
+    Layouts(Vec<DocumentPageLayout>),
+    /// One cross-page pass (U2-E3): the pages it read, empty when v1 merged
+    /// them.
+    Read(Vec<native_engine::PageResult>),
+}
+
 /// A recognized document: the concatenated markdown plus per-page layout for
 /// the pages that decoded (skipped pages are absent from `pages`, as from the
 /// markdown).
 struct DocumentRecognition {
     markdown: String,
-    pages: Vec<DocumentPageLayout>,
+    pages: DocumentPageList,
 }
 
 /// `--multi-page` (bd-2z0y): ONE cross-page pass over the selected pages of a
 /// PDF or a directory of page images (the Unlimited-OCR `infer_multi`
 /// contract, bd-1gv.25) — page N attends to pages 1..N−1; the output is one
-/// markdown with `<PAGE>` separators. Per-page bbox layout is not produced in
-/// this mode (the reference emits document-level markdown), so `pages` is
-/// empty in the JSON.
+/// markdown with `<PAGE>` separators. The JSON `pages` are the pages the pass
+/// read (U2-E3): every page for a model that splits pages exactly, and for
+/// v1 only when its text holds one body per page; otherwise `pages: []`,
+/// which the run's `v1_page_merge` warning explains.
 ///
 /// The pages are read lazily (U2-D0): the forward stage rasterizes each one,
 /// preprocesses it and drops the raster before reading the next, so a long
 /// book never holds every raster. A page that fails to RASTER is skipped with
 /// the same surfaced page event as the per-page path (the pass runs over the
 /// pages that rendered); decode errors are whole-document by construction.
+///
+/// With `figures` (a page-splitting model's run only), each page with figure
+/// boxes is rasterized again ([`PageSource::fetch`]) after the pass, which
+/// encodes every page before it decodes, so it holds no raster when a page
+/// completes. Its figures are cropped, written as `page{N}[l|r]_figure_{M}`
+/// and referenced from its markdown, once, outside the retryable pass.
 fn recognize_document_multi_page(
     engine: &OcrEngine,
     request: &OcrRequest,
     source: PageSource,
-    robot_mode: bool,
-    show_progress: bool,
-) -> FocrResult<DocumentRecognition> {
+    run: DocumentRun,
+    figures: Option<&FigurePlan>,
+) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>)> {
+    let DocumentRun {
+        robot_mode,
+        show_progress,
+        ..
+    } = run;
     let opened = std::cell::Cell::new(Some(source));
     let noun = page_noun(request);
-    let markdown = recognize_with_autodownload(request, robot_mode, |model| {
+    let document = recognize_with_autodownload(request, robot_mode, |model| {
         let source = attempt_source(&opened, request)?;
         let model_path = model
             .map(std::path::Path::to_path_buf)
@@ -2241,9 +2326,7 @@ fn recognize_document_multi_page(
                 raster_bar.start_item(format!("page {}/{page_count}", item.source_page));
                 match &item.raster {
                     Ok(_) => rendered += 1,
-                    Err(e) => {
-                        report_skipped_page(robot_mode, &raster_bar, noun, item.source_page, e)
-                    }
+                    Err(e) => report_skipped_page(run, &raster_bar, noun, item.source_page, e),
                 }
                 if item.half != Some(Half::Left) {
                     raster_bar.complete_item();
@@ -2259,13 +2342,17 @@ fn recognize_document_multi_page(
             })
         };
         // Robot mode streams a `page` event per crossed <PAGE> boundary
-        // (bd-2z0y); the terminal run_complete still carries the assembled
-        // markdown. A human TTY advances the decode bar instead; off-TTY (or
-        // FOCR_NO_PROGRESS) the pass streams nothing, and its markdown is the
-        // same either way.
+        // (bd-2z0y), naming the source page when the model splits pages
+        // exactly (U2-E3); the terminal run_complete still carries the
+        // assembled markdown. A human TTY advances the decode bar instead;
+        // off-TTY (or FOCR_NO_PROGRESS) the pass streams nothing, and its
+        // markdown is the same either way.
         let on_page: Option<crate::PageSink> = if robot_mode {
-            Some(Box::new(|page: usize, body: &str| {
-                emit(&robot::page_decoded_event(page, body));
+            Some(Box::new(|streamed: &crate::StreamedPage<'_>| {
+                emit(&match streamed.page {
+                    Some(page) => robot::document_page_decoded_event(page, streamed.body),
+                    None => robot::page_decoded_event(streamed.index, streamed.body),
+                });
             }))
         } else if decode_bar.is_enabled() {
             Some(decode_bar.page_sink())
@@ -2281,10 +2368,50 @@ fn recognize_document_multi_page(
         }
         out
     })?;
-    Ok(DocumentRecognition {
-        markdown,
-        pages: Vec::new(),
-    })
+    let native_engine::DocumentPages {
+        mut markdown,
+        mut pages,
+    } = document;
+    let written = match figures {
+        Some(plan) => write_page_figures(request, &mut pages, plan)?,
+        None => Vec::new(),
+    };
+    if !written.is_empty() {
+        markdown = native_engine::postprocess::join_page_texts(pages.iter().map(|p| &p.text));
+    }
+    Ok((
+        DocumentRecognition {
+            markdown,
+            pages: DocumentPageList::Read(pages),
+        },
+        written,
+    ))
+}
+
+/// Write the figures of a document's `pages` (U2-E3): each page with figure
+/// boxes is rasterized again from the run's source ([`PageSource::fetch`]),
+/// its figures are cropped and written as `page{N}[l|r]_figure_{M}`, and its
+/// markdown is rewritten to reference them. Opens the source only when a
+/// page has a figure.
+///
+/// # Errors
+/// The source's open or a page's re-fetch error, or a write error.
+fn write_page_figures(
+    request: &OcrRequest,
+    pages: &mut [native_engine::PageResult],
+    plan: &FigurePlan,
+) -> FocrResult<Vec<WrittenFigure>> {
+    if pages.iter().all(|p| p.figures.is_empty()) {
+        return Ok(Vec::new());
+    }
+    let rasters = open_page_source(request)?;
+    let mut writer = plan.writer();
+    for page in pages.iter_mut().filter(|p| !p.figures.is_empty()) {
+        let raster = rasters.fetch(page.source_page, page.half)?;
+        let crops = native_engine::crop_figure_refs(&page.figures, &raster);
+        page.text = writer.process_page(page.source_page, page.half, &page.text, crops)?;
+    }
+    Ok(writer.into_written())
 }
 
 /// Recognize every page of a PDF or a directory of page images, concatenating
@@ -2317,9 +2444,13 @@ fn recognize_document_pages(
     engine: &OcrEngine,
     request: &OcrRequest,
     source: PageSource,
-    robot_mode: bool,
-    show_progress: bool,
+    run: DocumentRun,
 ) -> FocrResult<DocumentRecognition> {
+    let DocumentRun {
+        robot_mode,
+        show_progress,
+        ..
+    } = run;
     let opened = std::cell::Cell::new(Some(source));
     let noun = page_noun(request);
     recognize_with_autodownload(request, robot_mode, |model| {
@@ -2373,7 +2504,7 @@ fn recognize_document_pages(
                 // mode (so a machine consumer can tell the document is missing
                 // pages), else a human stderr warning.
                 Err(e) => {
-                    report_skipped_page(robot_mode, &bar, noun, item.source_page, &e);
+                    report_skipped_page(run, &bar, noun, item.source_page, &e);
                     first_error.get_or_insert(e);
                 }
             }
@@ -2394,7 +2525,7 @@ fn recognize_document_pages(
         }
         Ok(DocumentRecognition {
             markdown: document,
-            pages: page_layouts,
+            pages: DocumentPageList::Layouts(page_layouts),
         })
     })
 }
@@ -2411,8 +2542,7 @@ fn recognize_document_pages_with_figures(
     engine: &OcrEngine,
     request: &OcrRequest,
     source: PageSource,
-    robot_mode: bool,
-    show_progress: bool,
+    run: DocumentRun,
     plan: &FigurePlan,
 ) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>)> {
     type OkPage = (
@@ -2420,6 +2550,11 @@ fn recognize_document_pages_with_figures(
         native_engine::RecognizedDocument,
         Vec<native_engine::ExtractedFigure>,
     );
+    let DocumentRun {
+        robot_mode,
+        show_progress,
+        ..
+    } = run;
     let opened = std::cell::Cell::new(Some(source));
     let noun = page_noun(request);
     let ok_pages: Vec<OkPage> = recognize_with_autodownload(request, robot_mode, |model| {
@@ -2445,7 +2580,7 @@ fn recognize_document_pages_with_figures(
                     | FocrError::FormatMismatch(_)),
                 ) => return Err(e),
                 Err(e) => {
-                    report_skipped_page(robot_mode, &bar, noun, item.source_page, &e);
+                    report_skipped_page(run, &bar, noun, item.source_page, &e);
                     first_error.get_or_insert(e);
                 }
             }
@@ -2470,7 +2605,7 @@ fn recognize_document_pages_with_figures(
     let mut document = String::new();
     let mut page_layouts: Vec<DocumentPageLayout> = Vec::new();
     for (i, (page_no, doc, figs)) in ok_pages.into_iter().enumerate() {
-        let md = writer.process_page(page_no, &doc.markdown, figs)?;
+        let md = writer.process_page(page_no, None, &doc.markdown, figs)?;
         if i > 0 {
             document.push_str("\n\n");
         }
@@ -2484,7 +2619,7 @@ fn recognize_document_pages_with_figures(
     Ok((
         DocumentRecognition {
             markdown: document,
-            pages: page_layouts,
+            pages: DocumentPageList::Layouts(page_layouts),
         },
         writer.into_written(),
     ))
@@ -4551,6 +4686,109 @@ mod tests {
         }
     }
 
+    /// U2-E3: a `--multi-page` run's figures are cropped from each page's
+    /// raster fetched again from the source, named by source page and half,
+    /// and referenced from that page's markdown. A page without figures is
+    /// not fetched or changed.
+    #[test]
+    fn document_figures_are_cropped_from_refetched_pages_and_named_by_half() {
+        let dir = std::env::temp_dir().join(format!("focr_cli_doc_figs_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let synth = crate::pdf::tests::synth_page;
+        synth(200, 300, &[(40, 160)])
+            .save(dir.join("1.png"))
+            .expect("write page 1");
+        synth(800, 500, &[(50, 350), (450, 750)])
+            .save(dir.join("2.png"))
+            .expect("write the spread");
+        synth(200, 300, &[(40, 160)])
+            .save(dir.join("3.png"))
+            .expect("write page 3");
+        let request = ocr_args_with(|a| {
+            a.request.image = dir.clone();
+            a.request.split_spreads = true;
+        })
+        .to_request()
+        .expect("request");
+        // The pass's pages, rasters dropped: 1, 2 left, 2 right, 3.
+        let walked: Vec<PageItem> = open_page_source(&request).expect("open").collect();
+        let boxes = [[30, 20, 90, 70], [40, 30, 140, 230], [10, 50, 210, 90]];
+        let mut pages: Vec<native_engine::PageResult> = walked
+            .iter()
+            .map(|item| {
+                let k = item.index;
+                let token = format!("![](images/page_{k}_0.jpg)");
+                let figures = boxes
+                    .get(k)
+                    .map(|&b| native_engine::postprocess::FigureRef {
+                        index: 0,
+                        label: "image".to_string(),
+                        boxes: vec![b],
+                        markdown_ref: token.clone(),
+                    })
+                    .into_iter()
+                    .collect();
+                native_engine::PageResult {
+                    run_index: k + 1,
+                    source_page: item.source_page,
+                    half: item.half,
+                    window: None,
+                    text: format!("before\n{token}"),
+                    layout: Vec::new(),
+                    figures,
+                    tokens: Some(1),
+                    finish: Some(native_engine::PageFinish::Marker),
+                    elapsed_ms: Some(1),
+                    model_id: native_engine::model_arch::UNLIMITED_OCR_V2_ID,
+                }
+            })
+            .collect();
+        assert_eq!(
+            pages
+                .iter()
+                .map(|p| (p.source_page, p.half))
+                .collect::<Vec<_>>(),
+            [
+                (1, None),
+                (2, Some(Half::Left)),
+                (2, Some(Half::Right)),
+                (3, None)
+            ]
+        );
+        let plan = FigurePlan {
+            dir: dir.join("figs"),
+            ref_prefix: "figs/".to_string(),
+        };
+        let written = write_page_figures(&request, &mut pages, &plan).expect("figures");
+        let names: Vec<&str> = written.iter().map(|w| w.path.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "figs/page1_figure_1.png",
+                "figs/page2l_figure_1.png",
+                "figs/page2r_figure_1.png"
+            ]
+        );
+        for ((page, item), want) in pages.iter().zip(&walked).zip(&written) {
+            assert_eq!(page.text, format!("before\n![figure 1]({})", want.path));
+            assert_eq!((want.page, want.half), (page.source_page, page.half));
+            // The crop is the walk's raster at the box, pixel for pixel.
+            let [x1, y1, x2, y2] = boxes[item.index];
+            assert_eq!(want.bbox, [x1, y1, x2, y2]);
+            let raster = item.raster.as_ref().expect("rasterized");
+            #[allow(clippy::cast_sign_loss)]
+            let expected = raster
+                .crop_imm(x1 as u32, y1 as u32, (x2 - x1) as u32, (y2 - y1) as u32)
+                .to_luma8();
+            let file = dir.join(want.path.as_str());
+            let got = image::open(&file).expect("figure decodes").to_luma8();
+            assert_eq!(got, expected, "{}", file.display());
+        }
+        assert_eq!(pages[3].text, "before\n![](images/page_3_0.jpg)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// U2-D0: a first-run download re-runs the recognition attempt, and the
     /// retry must read the whole selection again from a fresh page source,
     /// never resume the one the failed attempt consumed.
@@ -4598,7 +4836,7 @@ mod tests {
     fn pdf_json_carries_per_page_layout_with_one_based_page_numbers() {
         let rec = Recognition::Document(DocumentRecognition {
             markdown: "p1\n\np2".to_string(),
-            pages: vec![
+            pages: DocumentPageList::Layouts(vec![
                 DocumentPageLayout {
                     page: 1,
                     half: None,
@@ -4613,7 +4851,7 @@ mod tests {
                     half: None,
                     layout: vec![],
                 },
-            ],
+            ]),
         });
         let json = rec.to_json(&[]);
         assert_eq!(json["markdown"], "p1\n\np2");
@@ -4624,6 +4862,84 @@ mod tests {
         );
         assert_eq!(json["pages"][1]["page"], 2);
         assert_eq!(json["pages"][1]["layout"], serde_json::json!([]));
+        // Page-by-page entries keep their shape: no multi-page keys.
+        let mut keys: Vec<&str> = json["pages"][0]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["layout", "page"]);
+    }
+
+    /// U2-E3: a `--multi-page` document's `pages[]` are its pages as read:
+    /// the source page, `half` on a split spread, the run index, the page's
+    /// markdown and layout, and the decode facts the model counts. A page
+    /// that failed to rasterize has no entry, so source pages skip ahead of
+    /// run indices.
+    #[test]
+    fn multi_page_json_carries_each_page_as_read() {
+        let span = native_engine::LayoutSpan {
+            label: "title".to_string(),
+            boxes: vec![[1, 2, 3, 4]],
+            level: Some(1),
+        };
+        let page = |run_index, source_page, half, finish| native_engine::PageResult {
+            run_index,
+            source_page,
+            half,
+            window: None,
+            text: format!("page {source_page}"),
+            layout: vec![span.clone()],
+            figures: Vec::new(),
+            tokens: Some(7),
+            finish,
+            elapsed_ms: Some(1234),
+            model_id: native_engine::model_arch::UNLIMITED_OCR_V2_ID,
+        };
+        let rec = Recognition::Document(DocumentRecognition {
+            markdown: "<PAGE>\npage 1\n<PAGE>\npage 3\n<PAGE>\npage 3".to_string(),
+            pages: DocumentPageList::Read(vec![
+                page(1, 1, None, Some(native_engine::PageFinish::Marker)),
+                page(
+                    2,
+                    3,
+                    Some(Half::Left),
+                    Some(native_engine::PageFinish::PageCap),
+                ),
+                page(3, 3, Some(Half::Right), Some(native_engine::PageFinish::Eos)),
+            ]),
+        });
+        let json = rec.to_json(&[]);
+        assert_eq!(
+            json["pages"][0],
+            serde_json::json!({
+                "page": 1, "run_index": 1, "text": "page 1", "tokens": 7, "finish": "marker",
+                "layout": [{"label": "title", "boxes": [[1, 2, 3, 4]], "level": 1}],
+            }),
+            "no half, no window, and elapsed_ms only on the robot event"
+        );
+        let sides: Vec<_> = json["pages"]
+            .as_array()
+            .expect("pages")
+            .iter()
+            .map(|p| (p["page"].clone(), p["half"].clone(), p["finish"].clone()))
+            .collect();
+        assert_eq!(
+            sides,
+            [
+                (1.into(), serde_json::Value::Null, "marker".into()),
+                (3.into(), "left".into(), "page_cap".into()),
+                (3.into(), "right".into(), "eos".into()),
+            ]
+        );
+        // v1 without one body per page: `pages: []`, type-stable.
+        let merged = Recognition::Document(DocumentRecognition {
+            markdown: "<PAGE>\nall".to_string(),
+            pages: DocumentPageList::Read(Vec::new()),
+        });
+        assert_eq!(merged.to_json(&[])["pages"], serde_json::json!([]));
     }
 
     #[test]
@@ -4810,7 +5126,7 @@ mod tests {
             )),
         };
         let md = writer
-            .process_page(1, "before ![](images/0.jpg)\nafter", vec![fig])
+            .process_page(1, None, "before ![](images/0.jpg)\nafter", vec![fig.clone()])
             .expect("process page");
 
         // The placeholder is rewritten to `![figure 1](<ref_prefix><name>)`.
@@ -4821,12 +5137,35 @@ mod tests {
         assert!(!md.contains("images/0.jpg"), "old token gone; md: {md}");
         // The PNG file actually exists.
         assert!(dir.join("page1_figure_1.png").is_file());
-        // The JSON record carries the relative path, page, and bbox.
+
+        // U2-E3: a spread's halves name their figures by side, so the two
+        // halves of page 2 never collide.
+        for (half, side) in [(Half::Left, 'l'), (Half::Right, 'r')] {
+            let fig = native_engine::ExtractedFigure {
+                markdown_ref: "![](images/page_1_0.jpg)".to_string(),
+                ..fig.clone()
+            };
+            let md = writer
+                .process_page(2, Some(half), "![](images/page_1_0.jpg)", vec![fig])
+                .expect("process a half");
+            assert_eq!(md, format!("![figure 1](figs/page2{side}_figure_1.png)"));
+            assert!(dir.join(format!("page2{side}_figure_1.png")).is_file());
+        }
+
+        // The JSON record carries the relative path, page, half and bbox.
         let written = writer.into_written();
-        assert_eq!(written.len(), 1);
+        assert_eq!(written.len(), 3);
         assert_eq!(written[0].path, "figs/page1_figure_1.png");
         assert_eq!(written[0].page, 1);
+        assert_eq!(written[0].half, None);
         assert_eq!(written[0].bbox, [5, 6, 25, 16]);
+        assert_eq!(
+            written[1..]
+                .iter()
+                .map(|w| (w.page, w.half))
+                .collect::<Vec<_>>(),
+            [(2, Some(Half::Left)), (2, Some(Half::Right))]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4837,16 +5176,28 @@ mod tests {
             markdown: "see ![figure 1](figs/page1_figure_1.png)".to_string(),
             layout: vec![],
         });
-        let figures = vec![WrittenFigure {
-            label: "image".to_string(),
-            page: 1,
-            bbox: [1, 2, 3, 4],
-            path: "figs/page1_figure_1.png".to_string(),
-        }];
+        let figures = vec![
+            WrittenFigure {
+                label: "image".to_string(),
+                page: 1,
+                half: None,
+                bbox: [1, 2, 3, 4],
+                path: "figs/page1_figure_1.png".to_string(),
+            },
+            WrittenFigure {
+                label: "image".to_string(),
+                page: 2,
+                half: Some(Half::Right),
+                bbox: [1, 2, 3, 4],
+                path: "figs/page2r_figure_1.png".to_string(),
+            },
+        ];
         let json = rec.to_json(&figures);
         assert_eq!(json["figures"][0]["path"], "figs/page1_figure_1.png");
         assert_eq!(json["figures"][0]["page"], 1);
         assert_eq!(json["figures"][0]["bbox"], serde_json::json!([1, 2, 3, 4]));
+        assert!(json["figures"][0].get("half").is_none(), "absent unsplit");
+        assert_eq!(json["figures"][1]["half"], "right");
         // No figures ⇒ no `figures` key.
         assert!(rec.to_json(&[]).get("figures").is_none());
     }

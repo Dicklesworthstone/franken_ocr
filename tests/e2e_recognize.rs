@@ -821,11 +821,11 @@ fn stream_against_plain(
     let events: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    let sink = Box::new(move |page: usize, body: &str| {
+    let sink = Box::new(move |page: &franken_ocr::StreamedPage<'_>| {
         sink_events
             .lock()
             .expect("sink mutex")
-            .push((page, body.to_string()));
+            .push((page.index, page.body.to_string()));
     });
     let streamed = engine
         .recognize_multi_page_dynamic_streaming_with_model(
@@ -2583,6 +2583,232 @@ fn v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed() {
             started.elapsed().as_secs_f64()
         ),
     );
+}
+
+/// U2-E3: an Unlimited-OCR-2 document's structure end to end. A directory
+/// read with `--multi-page --pages 1-4 --split-spreads --extract-figures
+/// --robot -o out.json`:
+/// 1. page_0136, a figure page;
+/// 2. a spread of page_0009 and page_0014 side by side, read as two halves;
+/// 3. an unreadable file, skipped;
+/// 4. page_0437, a figure page;
+/// 5. page_0019, left out by `--pages`.
+///
+/// The robot stream has one decoded event per prompt page naming its source
+/// page and half, with its tokens, finish and elapsed time, and the skipped
+/// page's event names its source page; every page event fits the binary's
+/// own `event_fields`. The JSON file's `pages` are the same four pages with
+/// the facts the events streamed, their markdown joins into the document's,
+/// and each figure is a written file named by its page and half, cropped at
+/// an image block's box and referenced once from the markdown.
+#[test]
+fn v2_cli_document_json_reads_pages_spreads_skips_and_figures_when_armed() {
+    const TEST: &str = "v2_cli_document_json_reads_pages_spreads_skips_and_figures_when_armed";
+    let Some((model, bin, _)) = v2_inputs(TEST) else {
+        return;
+    };
+    let Some(corpus) = corpus_pages(&[
+        "page_0136.png",
+        "page_0009.png",
+        "page_0014.png",
+        "page_0437.png",
+        "page_0019.png",
+    ]) else {
+        log_success(TEST, "gate", "corpus pages absent");
+        return;
+    };
+    let work = unique_output_path("e3");
+    let pages_dir = work.join("pages");
+    std::fs::create_dir_all(&pages_dir).expect("the page directory");
+    let rgb = |p: &PathBuf| image::open(p).expect("corpus page decodes").to_rgb8();
+    let save = |img: &image::RgbImage, name: &str| {
+        img.save(pages_dir.join(name)).expect("write a page");
+    };
+    save(&rgb(&corpus[0]), "1.png");
+    let (left, right) = (rgb(&corpus[1]), rgb(&corpus[2]));
+    let mut spread = image::RgbImage::from_pixel(
+        left.width() + right.width(),
+        left.height().max(right.height()),
+        image::Rgb([255, 255, 255]),
+    );
+    image::imageops::replace(&mut spread, &left, 0, 0);
+    image::imageops::replace(&mut spread, &right, i64::from(left.width()), 0);
+    save(&spread, "2.png");
+    std::fs::write(pages_dir.join("3.png"), b"not a png").expect("write the bad page");
+    save(&rgb(&corpus[3]), "4.png");
+    save(&rgb(&corpus[4]), "5.png");
+    let out_json = work.join("out.json");
+    let (dir_arg, out_arg) = (
+        pages_dir.display().to_string(),
+        out_json.display().to_string(),
+    );
+
+    let started = Instant::now();
+    let out = run_v2(
+        &bin,
+        &model,
+        &[
+            "ocr",
+            &dir_arg,
+            "--multi-page",
+            "--pages",
+            "1-4",
+            "--split-spreads",
+            "--extract-figures",
+            "--robot",
+            "-o",
+            &out_arg,
+        ],
+        &[],
+    );
+    assert_eq!(out.code, Some(0), "{}\n{}", out.stdout, out.stderr);
+    let events = json_lines(&out.stdout);
+    let complete = events
+        .iter()
+        .find(|e| e["event"] == "run_complete")
+        .unwrap_or_else(|| panic!("no run_complete:\n{}", out.stdout));
+    assert_eq!(complete["finish_reason"], "stop", "{complete}");
+
+    // Every page event fits the binary's own `event_fields`.
+    let schema = json_lines(&run_focr_only(&bin, &["robot", "schema"], &[]).stdout)
+        .into_iter()
+        .next()
+        .expect("the robot schema");
+    let names = |list: &serde_json::Value| -> Vec<String> {
+        list.as_array()
+            .expect("a field list")
+            .iter()
+            .filter_map(|n| n.as_str().map(str::to_owned))
+            .collect()
+    };
+    let spec = &schema["event_fields"]["page"];
+    let (required, optional) = (names(&spec["required"]), names(&spec["optional"]));
+    let page_events: Vec<&serde_json::Value> =
+        events.iter().filter(|e| e["event"] == "page").collect();
+    for event in &page_events {
+        let keys = event.as_object().expect("an object");
+        assert!(
+            keys.keys()
+                .all(|k| required.contains(k) || optional.contains(k)),
+            "undeclared key: {event}"
+        );
+        assert!(
+            required.iter().all(|k| keys.contains_key(k)),
+            "missing key: {event}"
+        );
+    }
+
+    let decoded: Vec<&serde_json::Value> = page_events
+        .iter()
+        .copied()
+        .filter(|e| e["status"] == "decoded")
+        .collect();
+    let origins: Vec<(Option<u64>, Option<u64>, Option<&str>)> = decoded
+        .iter()
+        .map(|e| (e["page"].as_u64(), e["source_page"].as_u64(), e["half"].as_str()))
+        .collect();
+    assert_eq!(
+        origins,
+        [
+            (Some(1), Some(1), None),
+            (Some(2), Some(2), Some("left")),
+            (Some(3), Some(2), Some("right")),
+            (Some(4), Some(4), None),
+        ],
+        "decoded events: {decoded:#?}"
+    );
+    let finishes: Vec<&str> = decoded.iter().filter_map(|e| e["finish"].as_str()).collect();
+    assert_eq!(finishes, ["marker", "marker", "marker", "eos"]);
+    for event in &decoded {
+        assert_eq!(event["model_id"], "unlimited-ocr-2", "{event}");
+        assert!(event["tokens"].as_u64().is_some_and(|t| t > 0), "{event}");
+        assert!(event["elapsed_ms"].is_u64(), "{event}");
+    }
+    let skipped: Vec<&serde_json::Value> = page_events
+        .iter()
+        .copied()
+        .filter(|e| e["status"] == "skipped")
+        .collect();
+    assert_eq!(skipped.len(), 1, "{skipped:#?}");
+    assert_eq!(
+        (&skipped[0]["page"], &skipped[0]["source_page"]),
+        (&serde_json::json!(3), &serde_json::json!(3)),
+    );
+    assert_eq!(skipped[0]["model_id"], "unlimited-ocr-2");
+    assert_eq!(skipped[0]["error_kind"], "input_decode");
+
+    // The JSON file: the same pages with the facts the events streamed.
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_json).expect("the JSON output"))
+            .expect("the JSON output parses");
+    let pages = doc["pages"].as_array().expect("pages");
+    assert_eq!(pages.len(), decoded.len(), "{doc}");
+    for (page, event) in pages.iter().zip(&decoded) {
+        assert_eq!(page["page"], event["source_page"], "{page}");
+        assert_eq!(page["half"], event["half"], "{page}");
+        assert_eq!(page["run_index"], event["page"], "{page}");
+        assert_eq!(page["tokens"], event["tokens"], "{page}");
+        assert_eq!(page["finish"], event["finish"], "{page}");
+        assert!(page.get("elapsed_ms").is_none(), "{page}");
+    }
+    let markdown = doc["markdown"].as_str().expect("markdown");
+    let texts: Vec<&str> = pages
+        .iter()
+        .map(|p| p["text"].as_str().expect("text"))
+        .collect();
+    assert_eq!(markdown, format!("<PAGE>\n{}", texts.join("\n<PAGE>\n")));
+
+    // Figures: one written file per image block with a box, named by its
+    // page and half, referenced once.
+    let image_boxes: Vec<(String, serde_json::Value)> = pages
+        .iter()
+        .flat_map(|p| {
+            let side = match p["half"].as_str() {
+                Some("left") => "l",
+                Some("right") => "r",
+                _ => "",
+            };
+            let name = format!("page{}{side}_figure_", p["page"]);
+            p["layout"]
+                .as_array()
+                .expect("layout")
+                .iter()
+                .filter(|s| s["label"] == "image")
+                .map(move |s| (name.clone(), s["boxes"][0].clone()))
+        })
+        .collect();
+    let figures = doc["figures"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !figures.is_empty(),
+        "no figure on page_0136 or page_0437: {doc}"
+    );
+    assert_eq!(figures.len(), image_boxes.len(), "{figures:#?}");
+    for (figure, (name, bbox)) in figures.iter().zip(&image_boxes) {
+        let path = figure["path"].as_str().expect("path");
+        assert!(
+            path.starts_with(&format!("out_figures/{name}")),
+            "{path} vs {name}"
+        );
+        assert!(work.join(path).is_file(), "{path} written");
+        assert_eq!(markdown.matches(path).count(), 1, "{path} referenced once");
+        assert_eq!(&figure["bbox"], bbox, "{figure}");
+    }
+    log_line(
+        TEST,
+        "document",
+        "result",
+        "pass",
+        &format!(
+            "prompt_pages=4 skipped=1 figures={} tokens={:?} exit_code=0 wall_s={:.1}",
+            figures.len(),
+            decoded
+                .iter()
+                .filter_map(|e| e["tokens"].as_u64())
+                .collect::<Vec<_>>(),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&work);
 }
 
 /// U2-B6: a document that stops early writes the pages it produced, then

@@ -30,7 +30,7 @@ use web_time::Instant;
 use image::DynamicImage;
 
 use crate::error::{FocrError, FocrResult};
-use crate::native_engine::{RunWarning, WarningKind, timing_log, warning_recovery};
+use crate::native_engine::{Half, RunWarning, WarningKind, timing_log, warning_recovery};
 use crate::pdf::{self, PdfPages};
 
 /// The file extensions a directory source reads as page images
@@ -41,24 +41,6 @@ pub const PAGE_IMAGE_EXTENSIONS: &[&str] = &[
 
 /// How many ignored file names an `ignored_files` warning names.
 const IGNORED_EXAMPLES: usize = 3;
-
-/// Which half of a split two-page spread a page is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Half {
-    Left,
-    Right,
-}
-
-impl Half {
-    /// `"left"` or `"right"`: the JSON and robot `half` value.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Half::Left => "left",
-            Half::Right => "right",
-        }
-    }
-}
 
 /// One page from a [`PageSource`].
 #[derive(Debug)]

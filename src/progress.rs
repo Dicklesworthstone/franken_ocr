@@ -303,13 +303,14 @@ impl Progress {
     /// model runtime's blocking worker or its timeout cleanup.
     pub fn page_sink(&self) -> crate::PageSink {
         let Some(inner) = &self.inner else {
-            return Box::new(|_page, _body| {});
+            return Box::new(|_: &crate::StreamedPage<'_>| {});
         };
         let Some(renderer) = self.renderer.as_ref().cloned() else {
-            return Box::new(|_page, _body| {});
+            return Box::new(|_: &crate::StreamedPage<'_>| {});
         };
         let inner = Arc::clone(inner);
-        Box::new(move |page, _body| {
+        Box::new(move |streamed: &crate::StreamedPage<'_>| {
+            let page = streamed.index;
             if inner.finished.load(Ordering::Acquire) || PROGRESS_SUPPRESSED.load(Ordering::Acquire)
             {
                 return;
@@ -610,6 +611,15 @@ mod tests {
 
     static TEST_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
+    /// A streamed v1 page `index`.
+    fn streamed(index: usize) -> crate::StreamedPage<'static> {
+        crate::StreamedPage {
+            index,
+            body: "body",
+            page: None,
+        }
+    }
+
     fn test_bar(total: usize) -> (Progress, Arc<Shared>, std::thread::JoinHandle<()>) {
         let shared = Arc::new(Shared {
             state: Mutex::new(Inner {
@@ -669,7 +679,7 @@ mod tests {
         bar.suspend();
         bar.retire();
         let mut sink = bar.page_sink();
-        sink(3, "body");
+        sink(&streamed(3));
     }
 
     #[test]
@@ -696,7 +706,7 @@ mod tests {
         bar.set_total(2);
         assert_eq!(lock(&shared.state).done, 2, "done never exceeds total");
         let mut sink = bar.page_sink();
-        sink(1, "body");
+        sink(&streamed(1));
         assert_eq!(lock(&shared.state).current, "page 1/2");
         bar.finish();
         bar.set_total(9);
@@ -858,7 +868,7 @@ mod tests {
         let output_guard = output_lock();
         let (tx, rx) = mpsc::channel();
         let callback = std::thread::spawn(move || {
-            sink(1, "body");
+            sink(&streamed(1));
             let _ = tx.send(());
         });
 

@@ -630,36 +630,72 @@ pub fn finalize(decoded: &str, _image_w: u32, _image_h: u32) -> FocrResult<Strin
 /// Infallible today; see [`finalize`] for why the `FocrResult` shape is kept.
 pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
     let stripped = strip_eos(decoded);
-    let mut chunks = stripped.split(PAGE_MARKER);
+    let pages = text_page_bodies(&stripped)
+        .enumerate()
+        .map(|(page_idx, page)| {
+            if page_idx >= num_pages {
+                page.trim().to_string()
+            } else {
+                page_text(page, page_idx)
+            }
+        });
+    Ok(join_page_texts(pages))
+}
+
+/// The page bodies of a multi-page decode's text (EOS stripped) under
+/// [`finalize_multi`]'s split: one per `<PAGE>` marker, after a non-blank
+/// leading chunk when the model skipped the opening marker (GH #17).
+pub fn text_page_bodies(text: &str) -> impl Iterator<Item = &str> {
+    let mut chunks = text.split(PAGE_MARKER);
     // The reference's `[1:]` drops the leading chunk; keep it as page 0 when
     // the model skipped the opening marker and it carries text (GH #17).
     let leading = chunks.next().filter(|c| !c.trim().is_empty());
-    Ok(join_pages(leading.into_iter().chain(chunks), num_pages))
+    leading.into_iter().chain(chunks)
 }
 
-/// [`finalize_multi`]'s assembly over page bodies already split: each body
-/// `.trim()`-ed and postprocessed with prefix `page_{n}_` (bodies at index
-/// `>= num_pages` passed through), rejoined as `"<PAGE>\n" +
-/// "\n<PAGE>\n".join(pages)`. Unlimited-OCR-2's bodies come from
-/// [`split_pages_by_token`].
-#[must_use]
-pub fn finalize_pages<S: AsRef<str>>(bodies: &[S], num_pages: usize) -> String {
-    join_pages(bodies.iter().map(AsRef::as_ref), num_pages)
+/// The markdown of page `page_idx` (0-based) of a document from its raw
+/// `body`: `.trim()`-ed and postprocessed with the image prefix
+/// `page_{page_idx}_`.
+fn page_text(body: &str, page_idx: usize) -> String {
+    assemble_page(body.trim(), &format!("page_{page_idx}_"))
 }
 
-fn join_pages<'a>(bodies: impl Iterator<Item = &'a str>, num_pages: usize) -> String {
-    let mut processed = Vec::new();
-    for (page_idx, page) in bodies.enumerate() {
-        let page = page.trim();
-        if page_idx >= num_pages {
-            processed.push(page.to_string());
-            continue;
+/// A document's markdown from its pages' markdown:
+/// `"<PAGE>\n" + "\n<PAGE>\n".join(pages)`, the reference's rejoin.
+pub fn join_page_texts<S: AsRef<str>>(pages: impl IntoIterator<Item = S>) -> String {
+    let mut out = format!("{PAGE_MARKER}\n");
+    for (i, page) in pages.into_iter().enumerate() {
+        if i > 0 {
+            out.push_str(&format!("\n{PAGE_MARKER}\n"));
         }
-        let prefix = format!("page_{page_idx}_");
-        processed.push(assemble_page(page, &prefix));
+        out.push_str(page.as_ref());
     }
-    let body = processed.join("\n<PAGE>\n");
-    format!("<PAGE>\n{body}")
+    out
+}
+
+/// One document page's markdown, layout and figure boxes (U2-E3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageOutput {
+    /// The page's markdown, its images as `![](images/page_{i}_{m}.jpg)`:
+    /// the document's markdown joins these ([`join_page_texts`]).
+    pub text: String,
+    /// The page's grounding spans in its own pixels.
+    pub layout: Vec<super::LayoutSpan>,
+    /// The page's image spans, as its markdown numbers them.
+    pub figures: Vec<FigureRef>,
+}
+
+/// Page `page_idx` (0-based) of a document from its raw `body` and the
+/// page's `(width, height)`: its markdown (as [`finalize_multi`] renders that
+/// page), its layout and its figure boxes, all mapped through this page's own
+/// size, since the model's boxes are 0–999 per page.
+#[must_use]
+pub fn finalize_page(body: &str, page_idx: usize, (width, height): (u32, u32)) -> PageOutput {
+    PageOutput {
+        text: page_text(body, page_idx),
+        layout: parse_layout(body, width, height),
+        figures: figure_refs(body, width, height, &format!("page_{page_idx}_")),
+    }
 }
 
 /// Unlimited-OCR-2's output split into pages by token id (U2-B6, D20).
@@ -804,7 +840,8 @@ fn join_head(
 /// time, it emits each page's `.trim()`-ed body, 1-based, once the next
 /// marker arrives or the decode ends, under [`split_pages_by_token`]'s rule:
 /// a non-blank head joins page 1, and nothing past the page count is emitted
-/// (the guard ends the decode there). So its bodies are the split's, trimmed.
+/// (the guard ends the decode there). So its bodies are the split's, trimmed,
+/// and its id counts the split's [`TokenPages::tokens`].
 #[derive(Debug)]
 pub struct TokenPageStream<'t> {
     tok: &'t crate::tokenizer::Tokenizer,
@@ -812,6 +849,9 @@ pub struct TokenPageStream<'t> {
     pages: usize,
     decoder: crate::tokenizer::StreamDecoder,
     current: String,
+    /// Ids in the page in flight, its marker excluded; the head's count
+    /// with page 1's.
+    tokens: usize,
     markers: usize,
     emitted: usize,
 }
@@ -826,17 +866,19 @@ impl<'t> TokenPageStream<'t> {
             pages,
             decoder: crate::tokenizer::StreamDecoder::new(),
             current: String::new(),
+            tokens: 0,
             markers: 0,
             emitted: 0,
         }
     }
 
-    /// Take the next generated id; emit the page it completes, if any. An id
-    /// the tokenizer does not know adds no text (the terminal split reports
-    /// it).
-    pub fn push(&mut self, id: u32, mut on_page: impl FnMut(usize, &str)) {
+    /// Take the next generated id; emit the page it completes, if any, as
+    /// `on_page(page, body, ids)`. An id the tokenizer does not know adds no
+    /// text (the terminal split reports it).
+    pub fn push(&mut self, id: u32, mut on_page: impl FnMut(usize, &str, usize)) {
         if id != self.marker {
             let _ = self.decoder.push(self.tok, id, &mut self.current);
+            self.tokens += 1;
             return;
         }
         self.decoder.flush(&mut self.current);
@@ -848,31 +890,28 @@ impl<'t> TokenPageStream<'t> {
             }
         } else if self.emitted < self.pages {
             self.emitted += 1;
-            on_page(self.emitted, self.current.trim());
+            on_page(self.emitted, self.current.trim(), self.tokens);
             self.current.clear();
+            self.tokens = 0;
         }
     }
 
     /// End of decode: emit the page in flight.
-    pub fn finish(mut self, mut on_page: impl FnMut(usize, &str)) {
+    pub fn finish(mut self, mut on_page: impl FnMut(usize, &str, usize)) {
         self.decoder.flush(&mut self.current);
         let started = self.markers > 0 || !self.current.trim().is_empty();
         if started && self.emitted < self.pages.max(1) {
-            on_page(self.emitted + 1, self.current.trim());
+            on_page(self.emitted + 1, self.current.trim(), self.tokens);
         }
     }
 }
 
-/// The page bodies a multi-page decode carries under [`finalize_multi`]'s
-/// split: one per `<PAGE>` marker, plus a non-blank leading chunk when the
-/// model skipped the opening marker (GH #17). `text` is the decoded output
-/// with its EOS stripped. The one count every multi-page report uses (U2-X2
-/// warnings, U2-E3 `pages[]`).
+/// How many page bodies a multi-page decode carries: [`text_page_bodies`]
+/// counted. `text` is the decoded output with its EOS stripped. The one count
+/// every multi-page report uses (U2-X2 warnings, U2-E3 `pages[]`).
 #[must_use]
 pub fn page_body_count(text: &str) -> usize {
-    let mut chunks = text.split(PAGE_MARKER);
-    let leading = chunks.next().is_some_and(|c| !c.trim().is_empty());
-    usize::from(leading) + chunks.count()
+    text_page_bodies(text).count()
 }
 
 /// Incremental `<PAGE>`-boundary scanner for STREAMING multi-page decodes
@@ -1363,12 +1402,12 @@ mod tests {
         assert_eq!(split.extra_markers, 1, "the empty trailing body is dropped");
 
         // The same stream rendered: two pages, the v1 multi-page shape.
-        let md = finalize_pages(&split.bodies, 2);
+        let md = document_markdown(&split.bodies);
         assert_eq!(md, "<PAGE>\nhi one \u{FFFD}\n<PAGE>\ntwo");
         // finalize_multi over the text form gives the same for marker-led text.
         assert_eq!(
             finalize_multi("<PAGE>a\n<PAGE>b", 2).unwrap(),
-            finalize_pages(&["a", "b"], 2)
+            document_markdown(&["a", "b"])
         );
 
         // A marker-led, blank-headed decode: no warning, exactly N bodies.
@@ -1488,17 +1527,18 @@ mod tests {
             }
             let split = split_pages_by_token(&t, &ids, PAGE, pages).unwrap();
             let mut stream = TokenPageStream::new(&t, PAGE, pages);
-            let mut got: Vec<(usize, String)> = Vec::new();
+            let mut got: Vec<(usize, String, usize)> = Vec::new();
             for &id in &ids {
-                stream.push(id, |k, body| got.push((k, body.to_string())));
+                stream.push(id, |k, body, n| got.push((k, body.to_string(), n)));
             }
-            stream.finish(|k, body| got.push((k, body.to_string())));
-            let want: Vec<(usize, String)> = split
+            stream.finish(|k, body, n| got.push((k, body.to_string(), n)));
+            let want: Vec<(usize, String, usize)> = split
                 .bodies
                 .iter()
+                .zip(&split.tokens)
                 .enumerate()
-                .filter(|(_, b)| markers > 0 || !b.trim().is_empty())
-                .map(|(i, b)| (i + 1, b.trim().to_string()))
+                .filter(|(_, (b, _))| markers > 0 || !b.trim().is_empty())
+                .map(|(i, (b, &n))| (i + 1, b.trim().to_string(), n))
                 .collect();
             assert_eq!(got, want, "{pages} pages: {ids:?}");
         }
@@ -1615,18 +1655,82 @@ mod tests {
         }
     }
 
-    /// U2-E3b: document output names each page's figures by page, as v1's
-    /// multi-page assembly does.
+    /// U2-E3b, U2-E3: document output names each page's figures by page, as
+    /// v1's multi-page assembly does, and maps each page's 0–999 boxes
+    /// through that page's own size.
     #[test]
-    fn v2_blocks_number_figures_per_page_in_document_output() {
+    fn document_pages_number_figures_and_map_boxes_per_page() {
         let bodies = [
-            "<BLOCK>image[1, 2, 3, 4]<FORK>\n<BLOCK>text[5, 6, 7, 8]<FORK>a",
-            "<BLOCK>image[1, 2, 3, 4]<FORK>",
+            "<BLOCK>image[100, 200, 500, 999]<FORK>\n<BLOCK>text[0, 0, 999, 499]<FORK>a",
+            "<BLOCK>image[100, 200, 500, 999]<FORK>",
         ];
+        let sizes = [(1998, 999), (999, 2997)];
+        let pages: Vec<PageOutput> = bodies
+            .iter()
+            .zip(sizes)
+            .enumerate()
+            .map(|(i, (body, size))| finalize_page(body, i, size))
+            .collect();
         assert_eq!(
-            finalize_pages(&bodies, 2),
+            join_page_texts(pages.iter().map(|p| &p.text)),
             "<PAGE>\n![](images/page_0_0.jpg)\n\na\n<PAGE>\n![](images/page_1_0.jpg)\n"
         );
+        let boxes = |p: &PageOutput| -> Vec<(String, Vec<[i64; 4]>)> {
+            p.layout
+                .iter()
+                .map(|s| (s.label.clone(), s.boxes.clone()))
+                .collect()
+        };
+        assert_eq!(
+            boxes(&pages[0]),
+            [
+                ("image".to_string(), vec![[200, 200, 1000, 999]]),
+                ("text".to_string(), vec![[0, 0, 1998, 499]]),
+            ]
+        );
+        assert_eq!(
+            boxes(&pages[1]),
+            [("image".to_string(), vec![[100, 600, 500, 2997]])]
+        );
+        for (page, want) in pages.iter().zip([[200, 200, 1000, 999], [100, 600, 500, 2997]]) {
+            let [figure] = page.figures.as_slice() else {
+                panic!("one figure per page: {:?}", page.figures);
+            };
+            assert_eq!(figure.boxes, [want]);
+            assert_eq!(page.text.matches(&figure.markdown_ref).count(), 1);
+        }
+    }
+
+    /// U2-E3: a document's markdown is its pages' markdown joined, as
+    /// `finalize_multi` joins the bodies of a decoded text.
+    #[test]
+    fn document_markdown_joins_the_page_texts() {
+        assert_eq!(join_page_texts(Vec::<String>::new()), "<PAGE>\n");
+        assert_eq!(join_page_texts(["a"]), "<PAGE>\na");
+        for text in [
+            "<PAGE>a<PAGE>b",
+            "lead<PAGE>b<PAGE>c",
+            "  \n<PAGE><|ref|>image<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\n<PAGE>x",
+            "no marker at all",
+        ] {
+            let bodies: Vec<&str> = text_page_bodies(text).collect();
+            assert_eq!(bodies.len(), page_body_count(text), "{text:?}");
+            assert_eq!(
+                finalize_multi(text, bodies.len()).unwrap(),
+                document_markdown(&bodies),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// The markdown of a document whose page bodies are `bodies`.
+    fn document_markdown<S: AsRef<str>>(bodies: &[S]) -> String {
+        join_page_texts(
+            bodies
+                .iter()
+                .enumerate()
+                .map(|(i, b)| finalize_page(b.as_ref(), i, (999, 999)).text),
+        )
     }
 
     /// U2-E3b: a `<BLOCK>` off the grammar is no span and stays as emitted, so

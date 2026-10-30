@@ -570,7 +570,7 @@ fn multi_page_page_source_completes_within_budget() {
         };
         let pass = engine
             .recognize_multi_page_source_with_model(&model, source, on_item, None)
-            .map(|markdown| markdown.len())
+            .map(|document| document.markdown.len())
             .map_err(|e| e.kind());
         // The walk itself: every page rasterized, preprocessed, dropped.
         let (mut walked, mut preprocessed) = (0usize, 0usize);

@@ -346,10 +346,13 @@ fn run_case(model: &OcrModel, case: &Case, pages: &[PathBuf]) -> Result<Observed
                         skipped.push(format!("page {}: {e}", item.source_page));
                     }
                 },
-                Some(&mut |page: usize, body: &str| {
-                    seen.push(franken_ocr::robot::page_decoded_event(page, body));
+                Some(&mut |page: &franken_ocr::StreamedPage<'_>| {
+                    seen.push(franken_ocr::robot::page_decoded_event(
+                        page.index, page.body,
+                    ));
                 }),
-            );
+            )
+            .map(|document| document.markdown);
             if !skipped.is_empty() {
                 return Err(format!("corpus pages failed to decode: {skipped:?}"));
             }

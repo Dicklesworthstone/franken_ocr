@@ -123,7 +123,12 @@ pub fn event_fields() -> Value {
         "stage": { "reserved": true },
         "page": {
             "required": ["schema_version", "event", "status", "page"],
-            "optional": ["chars", "text", "error_kind", "message"],
+            // The source-page fields are on Unlimited-OCR-2 runs (U2-E3);
+            // `tokens`, `finish` and `elapsed_ms` on its decoded pages.
+            "optional": [
+                "chars", "text", "error_kind", "message", "source_page", "half", "model_id",
+                "tokens", "finish", "elapsed_ms",
+            ],
         },
         "staff": {
             "required": ["schema_version", "event", "staff", "total", "bbox", "status"],
@@ -282,16 +287,6 @@ pub fn run_error_event(err: &FocrError) -> Value {
     event
 }
 
-/// Build a robot-mode `page` event recording that one document page was SKIPPED
-/// mid-run (e.g. an undecodable PDF page the resilient document loop dropped to
-/// keep the rest of the document).
-///
-/// This is the machine-stream counterpart of the human stderr warning: without
-/// it a robot consumer would receive a short document with no signal that pages
-/// were dropped. `page` is 1-based; `error_kind` mirrors [`FocrError::kind`] so
-/// the skip reason is machine-classifiable, and `message` carries the human
-/// detail. `page` is an advertised [`EVENT_KINDS`] kind, so this finalizes a slice
-/// of its payload without changing the advertised event set (schema stays v1).
 /// Build a robot-mode `page` event for one DECODED page of a `--multi-page`
 /// cross-page pass (bd-2z0y): emitted as the page's `<PAGE>` boundary is
 /// crossed in the token stream, so a machine consumer sees per-page progress
@@ -312,6 +307,41 @@ pub fn page_decoded_event(page: usize, text: &str) -> Value {
     })
 }
 
+/// [`page_decoded_event`] for a page of a model that splits pages exactly
+/// (Unlimited-OCR-2, U2-E3): `page` stays the emission index, and the event
+/// adds the page's `source_page`, `half` when split, `model_id`, and its
+/// `tokens`, `finish` and `elapsed_ms`. v1 bodies may merge pages, so v1
+/// events name no source page.
+#[must_use]
+pub fn document_page_decoded_event(page: &crate::PageResult, body: &str) -> Value {
+    let mut event = page_decoded_event(page.run_index, body);
+    event["source_page"] = page.source_page.into();
+    if let Some(half) = page.half {
+        event["half"] = half.as_str().into();
+    }
+    event["model_id"] = page.model_id.into();
+    if let Some(tokens) = page.tokens {
+        event["tokens"] = tokens.into();
+    }
+    if let Some(finish) = page.finish {
+        event["finish"] = finish.as_str().into();
+    }
+    if let Some(elapsed_ms) = page.elapsed_ms {
+        event["elapsed_ms"] = elapsed_ms.into();
+    }
+    event
+}
+
+/// Build a robot-mode `page` event recording that one document page was SKIPPED
+/// mid-run (e.g. an undecodable PDF page the resilient document loop dropped to
+/// keep the rest of the document).
+///
+/// This is the machine-stream counterpart of the human stderr warning: without
+/// it a robot consumer would receive a short document with no signal that pages
+/// were dropped. `page` is 1-based; `error_kind` mirrors [`FocrError::kind`] so
+/// the skip reason is machine-classifiable, and `message` carries the human
+/// detail. `page` is an advertised [`EVENT_KINDS`] kind, so this finalizes a slice
+/// of its payload without changing the advertised event set (schema stays v1).
 pub fn page_skipped_event(page: usize, err: &FocrError) -> Value {
     json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
@@ -321,6 +351,17 @@ pub fn page_skipped_event(page: usize, err: &FocrError) -> Value {
         "error_kind": err.kind(),
         "message": err.to_string(),
     })
+}
+
+/// [`page_skipped_event`] on a run of a model that splits pages exactly
+/// (Unlimited-OCR-2, U2-E3): adds `source_page`, the same 1-based source page
+/// as `page`, so decoded and skipped events share one key, and `model_id`.
+#[must_use]
+pub fn document_page_skipped_event(page: usize, err: &FocrError, model_id: &str) -> Value {
+    let mut event = page_skipped_event(page, err);
+    event["source_page"] = page.into();
+    event["model_id"] = model_id.into();
+    event
 }
 
 /// One `staff` event from a TrOMR full-page music run (bd-av64.2): the
@@ -518,5 +559,81 @@ mod tests {
         assert_eq!(event["message"], "input decode error: bad xobject");
         // `page` is an advertised kind, so no schema bump is implied.
         assert!(EVENT_KINDS.contains(&"page"));
+    }
+
+    /// Every key of `event` is declared for `page`, and every required key
+    /// is present.
+    fn assert_page_fields(event: &Value) {
+        let fields = event_fields();
+        let spec = &fields["page"];
+        let declared = |list: &Value| -> Vec<String> {
+            list.as_array()
+                .expect("a field list")
+                .iter()
+                .map(|k| k.as_str().expect("a field name").to_string())
+                .collect()
+        };
+        let (required, optional) = (declared(&spec["required"]), declared(&spec["optional"]));
+        let keys = event.as_object().expect("an object");
+        for key in keys.keys() {
+            assert!(
+                required.contains(key) || optional.contains(key),
+                "{key} is declared for page"
+            );
+        }
+        for key in &required {
+            assert!(keys.contains_key(key), "{key} is present: {event}");
+        }
+    }
+
+    /// U2-E3: an Unlimited-OCR-2 run's `page` events name the source page.
+    /// `page` keeps its meaning per status (the emission index when decoded,
+    /// the source page when skipped), and `source_page` is on both.
+    #[test]
+    fn document_page_events_name_the_source_page() {
+        let page = crate::PageResult {
+            run_index: 2,
+            source_page: 3,
+            half: Some(crate::Half::Left),
+            window: None,
+            text: "markdown".into(),
+            layout: Vec::new(),
+            figures: Vec::new(),
+            tokens: Some(41),
+            finish: Some(crate::PageFinish::PageCap),
+            elapsed_ms: Some(950),
+            model_id: "unlimited-ocr-2",
+        };
+        let decoded = document_page_decoded_event(&page, "raw body");
+        assert_eq!(
+            decoded,
+            json!({
+                "schema_version": ROBOT_SCHEMA_VERSION, "event": "page", "status": "decoded",
+                "page": 2, "chars": 8, "text": "raw body", "source_page": 3, "half": "left",
+                "model_id": "unlimited-ocr-2", "tokens": 41, "finish": "page_cap",
+                "elapsed_ms": 950,
+            })
+        );
+        assert_page_fields(&decoded);
+        let whole = document_page_decoded_event(
+            &crate::PageResult {
+                half: None,
+                ..page
+            },
+            "raw body",
+        );
+        assert!(whole.get("half").is_none(), "absent on a whole page");
+
+        let skipped = document_page_skipped_event(
+            4,
+            &FocrError::InputDecode("bad xobject".into()),
+            "unlimited-ocr-2",
+        );
+        assert_eq!((&skipped["page"], &skipped["source_page"]), (&json!(4), &json!(4)));
+        assert_eq!(skipped["model_id"], "unlimited-ocr-2");
+        assert_page_fields(&skipped);
+        // v1 events keep their keys.
+        assert_page_fields(&page_decoded_event(1, "body"));
+        assert!(page_decoded_event(1, "body").get("source_page").is_none());
     }
 }

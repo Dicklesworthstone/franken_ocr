@@ -106,7 +106,13 @@
         "chars",
         "text",
         "error_kind",
-        "message"
+        "message",
+        "source_page",
+        "half",
+        "model_id",
+        "tokens",
+        "finish",
+        "elapsed_ms"
       ],
       "required": [
         "schema_version",

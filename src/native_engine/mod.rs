@@ -1111,10 +1111,97 @@ pub fn partial_output(
     })))
 }
 
-/// Streaming sink for completed multi-page bodies (bd-2z0y): called with the
-/// 1-based page index and the trimmed raw body as each `<PAGE>` boundary is
-/// crossed in the token stream.
-type PageSink<'a> = &'a mut dyn FnMut(usize, &str);
+/// Streaming sink for completed multi-page bodies (bd-2z0y): called with
+/// each [`StreamedPage`] as its `<PAGE>` boundary is crossed in the token
+/// stream.
+type PageSink<'a> = &'a mut dyn FnMut(&StreamedPage<'_>);
+
+/// A page body an Unlimited-OCR-2 document decode closed (U2-E3), as it
+/// streams: [`StreamedPage`]'s facts before the page's origin is known.
+struct ClosedPage<'a> {
+    /// 1-based, in the model's emission order.
+    index: usize,
+    /// The `.trim()`-ed raw body.
+    body: &'a str,
+    /// Generated ids in the body, its `<PAGE>` excluded.
+    tokens: usize,
+    /// How the body ended.
+    finish: PageFinish,
+    /// Wall time decoding the body ([`PageResult::elapsed_ms`]).
+    elapsed: std::time::Duration,
+}
+
+/// What a document's pages are read against (U2-E3): each prompt page's
+/// raster size and origin, and the model.
+#[derive(Debug)]
+struct PageFrame<'a> {
+    /// Page `k + 1`'s raster `(width, height)`, its boxes' frame.
+    sizes: Vec<(u32, u32)>,
+    /// Page `k + 1`'s origin.
+    origins: &'a [PageOrigin],
+    model_id: &'static str,
+}
+
+impl PageFrame<'_> {
+    /// Page `index` (1-based, at most the page count) from its raw body.
+    fn page(&self, index: usize, body: &str) -> PageResult {
+        let k = index - 1;
+        PageResult::read(index, body, self.sizes[k], self.origins[k], self.model_id)
+    }
+
+    /// A streamed page with its decode facts.
+    fn closed_page(&self, page: &ClosedPage<'_>) -> PageResult {
+        PageResult {
+            tokens: Some(page.tokens),
+            finish: Some(page.finish),
+            elapsed_ms: Some(millis(page.elapsed)),
+            ..self.page(page.index, page.body)
+        }
+    }
+
+    /// Unlimited-OCR-2's pages: one per body of the token split, which
+    /// yields at most one per page (D20), with its decode facts.
+    fn token_pages(&self, decoded: &DecodedDocument) -> Vec<PageResult> {
+        let split = &decoded.split;
+        split
+            .bodies
+            .iter()
+            .enumerate()
+            .map(|(k, body)| PageResult {
+                tokens: split.tokens.get(k).copied(),
+                finish: decoded.finish.get(k).copied(),
+                elapsed_ms: decoded.elapsed.get(k).copied().map(millis),
+                ..self.page(k + 1, body)
+            })
+            .collect()
+    }
+
+    /// v1's pages from its decoded `text` (EOS stripped): body k is page k
+    /// only when there is one body per page. Otherwise none, and the run's
+    /// `v1_page_merge` warning says why.
+    fn text_pages(&self, text: &str) -> Vec<PageResult> {
+        let bodies: Vec<&str> = postprocess::text_page_bodies(text).collect();
+        if bodies.len() != self.sizes.len() {
+            return Vec::new();
+        }
+        bodies
+            .iter()
+            .enumerate()
+            .map(|(k, body)| self.page(k + 1, body))
+            .collect()
+    }
+}
+
+/// An Unlimited-OCR-2 document decode split into pages (U2-B6, U2-E3).
+#[derive(Debug)]
+struct DecodedDocument {
+    /// The bodies, by token id.
+    split: postprocess::TokenPages,
+    /// How each body ended ([`DocumentStats::page_finish`]).
+    finish: Vec<PageFinish>,
+    /// Each body's decode wall time ([`PageResult::elapsed_ms`]).
+    elapsed: Vec<std::time::Duration>,
+}
 
 /// Env override for the generated-token cap (`max_length` in [`DecodeParams`]).
 /// Unset ⇒ the reference default ([`sampler::DEFAULT_MAX_LENGTH`]). Setting it
@@ -1890,6 +1977,163 @@ impl LayoutSpan {
             level,
         })
     }
+}
+
+/// Which half of a split two-page spread a page is (`--split-spreads`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Half {
+    Left,
+    Right,
+}
+
+impl Half {
+    /// `"left"` or `"right"`: the JSON and robot `half` value.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Half::Left => "left",
+            Half::Right => "right",
+        }
+    }
+
+    /// `'l'` or `'r'`: the mark a half's figure names carry after the page
+    /// number (`page3l_figure_1`).
+    #[must_use]
+    pub fn initial(self) -> char {
+        match self {
+            Half::Left => 'l',
+            Half::Right => 'r',
+        }
+    }
+}
+
+/// Where one page of a document came from. A document read from an image
+/// list has no source document, so its pages are their 1-based positions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageOrigin {
+    /// 1-based page of the source.
+    pub source_page: usize,
+    /// The half of a split spread, or `None` for a whole page.
+    pub half: Option<Half>,
+}
+
+/// One page of a document parse (U2-E3): its markdown, layout and figure
+/// boxes, where it came from, and how its decode ended. Unlimited-OCR-2
+/// splits its output into pages by token id, one body per page (D20), so
+/// every page it reads has one. v1 merges pages, so a v1 document has
+/// pages only when its text splits into exactly one body per page, and
+/// then without `tokens`, `finish` or `elapsed_ms`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageResult {
+    /// 1-based position among the pages the model read: the page's `<PAGE>`
+    /// in the prompt, which a page that failed to rasterize does not get.
+    pub run_index: usize,
+    /// 1-based page of the source.
+    pub source_page: usize,
+    /// The half of a split spread, or `None` for a whole page.
+    pub half: Option<Half>,
+    /// The decode window that read the page (U2-D1b); `None` unwindowed.
+    pub window: Option<usize>,
+    /// The page's markdown, its figures as `![](images/page_{i}_{m}.jpg)`
+    /// with `i = run_index − 1`. The document's markdown joins these
+    /// ([`postprocess::join_page_texts`]).
+    pub text: String,
+    /// The page's layout, boxes in its own pixels.
+    pub layout: Vec<LayoutSpan>,
+    /// The page's figure boxes, numbered as its markdown numbers them.
+    pub figures: Vec<postprocess::FigureRef>,
+    /// Generated ids in the page's body, its `<PAGE>` excluded.
+    pub tokens: Option<usize>,
+    /// How the page's body ended.
+    pub finish: Option<PageFinish>,
+    /// Wall time decoding the page's body: from its `<PAGE>` (page 1: the
+    /// first generated id) to the id that closed it. Vision and prefill,
+    /// which serve every page at once, are not in it.
+    pub elapsed_ms: Option<u64>,
+    /// The model that read the page.
+    pub model_id: &'static str,
+}
+
+impl PageResult {
+    /// Page `run_index` (1-based) of a document read by `model_id`, from its
+    /// raw `body`, the raster `size` its boxes map through, and `origin`;
+    /// no decode facts yet.
+    fn read(
+        run_index: usize,
+        body: &str,
+        size: (u32, u32),
+        origin: PageOrigin,
+        model_id: &'static str,
+    ) -> Self {
+        let postprocess::PageOutput {
+            text,
+            layout,
+            figures,
+        } = postprocess::finalize_page(body, run_index - 1, size);
+        Self {
+            run_index,
+            source_page: origin.source_page,
+            half: origin.half,
+            window: None,
+            text,
+            layout,
+            figures,
+            tokens: None,
+            finish: None,
+            elapsed_ms: None,
+            model_id,
+        }
+    }
+
+    /// The page's `--json` `pages[]` entry: `page` (the source page), `half`
+    /// when split, `run_index`, `window` when windowed, `text`, `layout`,
+    /// then `tokens` and `finish` when the model counts them. Its figures go
+    /// in the run's `figures[]`, and `elapsed_ms`, which differs run to run,
+    /// only in the robot `page` event.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({ "page": self.source_page });
+        if let Some(half) = self.half {
+            value["half"] = half.as_str().into();
+        }
+        value["run_index"] = self.run_index.into();
+        if let Some(window) = self.window {
+            value["window"] = window.into();
+        }
+        value["text"] = self.text.as_str().into();
+        value["layout"] = self.layout.iter().map(LayoutSpan::to_json).collect();
+        if let Some(tokens) = self.tokens {
+            value["tokens"] = tokens.into();
+        }
+        if let Some(finish) = self.finish {
+            value["finish"] = finish.as_str().into();
+        }
+        value
+    }
+}
+
+/// One page a document decode streams as the decode crosses the page's end:
+/// the next `<PAGE>`, or the end of the decode (bd-2z0y).
+#[derive(Debug, Clone, Copy)]
+pub struct StreamedPage<'a> {
+    /// 1-based, in the model's emission order.
+    pub index: usize,
+    /// The page's `.trim()`-ed raw body; its markdown comes with the result.
+    pub body: &'a str,
+    /// The page's result when the model splits pages exactly
+    /// (Unlimited-OCR-2, U2-E3); `None` for v1, whose bodies may merge pages.
+    pub page: Option<&'a PageResult>,
+}
+
+/// A document parse: its markdown and its pages (U2-E3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentPages {
+    /// The document's markdown, pages joined by `<PAGE>`.
+    pub markdown: String,
+    /// One entry per page read, in run order. Empty for a v1 document
+    /// whose text did not split into one body per page (its
+    /// `v1_page_merge` warning says so).
+    pub pages: Vec<PageResult>,
 }
 
 /// A recognized document: the rendered markdown body plus the structured layout
@@ -2869,6 +3113,61 @@ fn forward_route(arch: &dyn model_arch::ModelArch) -> FocrResult<ForwardRoute> {
     )))
 }
 
+/// Crop each of a page's `figures` out of `source`, its raster at the size
+/// its boxes were mapped through (a document page's re-fetched raster,
+/// U2-E3). Boxes are corner-ordered and clamped to the image; a degenerate
+/// (empty) box is skipped while KEEPING the figure's index, so a written
+/// figure's `markdown_ref` always matches the rendered placeholder.
+#[must_use]
+pub fn crop_figure_refs(
+    figures: &[postprocess::FigureRef],
+    source: &image::DynamicImage,
+) -> Vec<ExtractedFigure> {
+    let iw = i64::from(source.width());
+    let ih = i64::from(source.height());
+    figures
+        .iter()
+        .filter_map(|fr| {
+            // The standard image span carries one box; use the first.
+            let &[x1, y1, x2, y2] = fr.boxes.first()?;
+            let cx1 = x1.min(x2).clamp(0, iw);
+            let cy1 = y1.min(y2).clamp(0, ih);
+            let cx2 = x1.max(x2).clamp(0, iw);
+            let cy2 = y1.max(y2).clamp(0, ih);
+            let w = u32::try_from(cx2 - cx1).unwrap_or(0);
+            let h = u32::try_from(cy2 - cy1).unwrap_or(0);
+            if w == 0 || h == 0 {
+                return None; // degenerate box — nothing to crop
+            }
+            #[allow(clippy::cast_sign_loss)] // cx1/cy1 >= 0 after clamp
+            let image = source.crop_imm(cx1 as u32, cy1 as u32, w, h);
+            Some(ExtractedFigure {
+                index: fr.index,
+                label: fr.label.clone(),
+                bbox: [cx1, cy1, cx2, cy2],
+                markdown_ref: fr.markdown_ref.clone(),
+                image,
+            })
+        })
+        .collect()
+}
+
+/// The origins of a document read from `pages` images: their 1-based
+/// positions, whole.
+fn list_origins(pages: usize) -> Vec<PageOrigin> {
+    (1..=pages)
+        .map(|source_page| PageOrigin {
+            source_page,
+            half: None,
+        })
+        .collect()
+}
+
+/// `elapsed` in whole milliseconds, saturating.
+fn millis(elapsed: std::time::Duration) -> u64 {
+    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Admit `arch` to multi-page cross-page parsing (`infer_multi`): v1 enters
 /// v1's 640-squash R-SWA multi-page loop and v2 its own document loop
 /// ([`OcrModel::decode_document`], U2-B6), each once implemented; the zoo
@@ -3820,7 +4119,7 @@ impl OcrModel {
         let (image_w, image_h) = Self::image_dims(&pre);
         if self.arch().decode_contract().pages.is_some() {
             // Unlimited-OCR-2: a document of one page; its body is the text.
-            let split = self.decode_document(std::slice::from_ref(&pre), None)?;
+            let split = self.decode_document(std::slice::from_ref(&pre), None)?.split;
             progress::emit("postprocess", 0, 0);
             let body = split.bodies.into_iter().next().unwrap_or_default();
             return Ok((body, image_w, image_h));
@@ -3973,33 +4272,10 @@ impl OcrModel {
         image_h: u32,
         img_base: &str,
     ) -> Vec<ExtractedFigure> {
-        let iw = i64::from(source.width());
-        let ih = i64::from(source.height());
-        postprocess::figure_refs(decoded, image_w, image_h, img_base)
-            .into_iter()
-            .filter_map(|fr| {
-                // The standard image span carries one box; use the first.
-                let &[x1, y1, x2, y2] = fr.boxes.first()?;
-                let cx1 = x1.min(x2).clamp(0, iw);
-                let cy1 = y1.min(y2).clamp(0, ih);
-                let cx2 = x1.max(x2).clamp(0, iw);
-                let cy2 = y1.max(y2).clamp(0, ih);
-                let w = u32::try_from(cx2 - cx1).unwrap_or(0);
-                let h = u32::try_from(cy2 - cy1).unwrap_or(0);
-                if w == 0 || h == 0 {
-                    return None; // degenerate box — nothing to crop
-                }
-                #[allow(clippy::cast_sign_loss)] // cx1/cy1 >= 0 after clamp
-                let image = source.crop_imm(cx1 as u32, cy1 as u32, w, h);
-                Some(ExtractedFigure {
-                    index: fr.index,
-                    label: fr.label,
-                    bbox: [cx1, cy1, cx2, cy2],
-                    markdown_ref: fr.markdown_ref,
-                    image,
-                })
-            })
-            .collect()
+        crop_figure_refs(
+            &postprocess::figure_refs(decoded, image_w, image_h, img_base),
+            source,
+        )
     }
 
     /// Recognize a batch of document images, returning one [`FocrResult`] per
@@ -4056,7 +4332,8 @@ impl OcrModel {
         for path in image_paths {
             pres.push(self.document_page(preprocess::decode_path(path)?)?);
         }
-        self.recognize_multi_page_pres(pres, None)
+        let origins = list_origins(pres.len());
+        Ok(self.recognize_multi_page_pres(pres, &origins, None)?.markdown)
     }
 
     /// One document page's preprocess: v1's Base-640 squash, or a paged
@@ -4123,7 +4400,8 @@ impl OcrModel {
         for img in images {
             pres.push(self.document_page(img)?);
         }
-        self.recognize_multi_page_pres(pres, None)
+        let origins = list_origins(pres.len());
+        Ok(self.recognize_multi_page_pres(pres, &origins, None)?.markdown)
     }
 
     /// [`Self::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING sink
@@ -4138,7 +4416,7 @@ impl OcrModel {
     pub fn recognize_multi_page_dynamic_streaming(
         &self,
         images: Vec<image::DynamicImage>,
-        on_page: &mut dyn FnMut(usize, &str),
+        on_page: &mut dyn FnMut(&StreamedPage<'_>),
     ) -> FocrResult<String> {
         if images.is_empty() {
             return Err(FocrError::Other(anyhow::anyhow!(
@@ -4151,7 +4429,10 @@ impl OcrModel {
         for img in images {
             pres.push(self.document_page(img)?);
         }
-        self.recognize_multi_page_pres(pres, Some(on_page))
+        let origins = list_origins(pres.len());
+        Ok(self
+            .recognize_multi_page_pres(pres, &origins, Some(on_page))?
+            .markdown)
     }
 
     /// [`Self::recognize_multi_page`] over a lazy
@@ -4160,7 +4441,8 @@ impl OcrModel {
     /// one raster at a time, never the whole document. Every page reaches
     /// `on_item` before it is read; a page that did not rasterize is left out
     /// of the prompt. `on_page` streams page bodies as
-    /// [`Self::recognize_multi_page_dynamic_streaming`] does.
+    /// [`Self::recognize_multi_page_dynamic_streaming`] does. Returns the
+    /// markdown and the pages (U2-E3), each named by its source page.
     ///
     /// # Errors
     /// As [`Self::recognize_multi_page`]; when no page rasterized, the first
@@ -4171,15 +4453,22 @@ impl OcrModel {
         source: &mut crate::page_source::PageSource,
         on_item: &mut dyn FnMut(&crate::page_source::PageItem),
         on_page: Option<PageSink<'_>>,
-    ) -> FocrResult<String> {
+    ) -> FocrResult<DocumentPages> {
         multi_page_route(self.arch())?;
         self.check_document_pages(source.len(), true)?;
         let mut pres = Vec::with_capacity(source.len());
+        let mut origins = Vec::with_capacity(source.len());
         let mut first_error: Option<FocrError> = None;
         for item in source.by_ref() {
             on_item(&item);
             match item.raster {
-                Ok(img) => pres.push(self.document_page(img)?),
+                Ok(img) => {
+                    pres.push(self.document_page(img)?);
+                    origins.push(PageOrigin {
+                        source_page: item.source_page,
+                        half: item.half,
+                    });
+                }
                 Err(e) => {
                     first_error.get_or_insert(e);
                 }
@@ -4192,21 +4481,47 @@ impl OcrModel {
         }
         // Split spreads can make more logical pages than source pages.
         self.check_document_pages(pres.len(), true)?;
-        self.recognize_multi_page_pres(pres, on_page)
+        self.recognize_multi_page_pres(pres, &origins, on_page)
     }
 
     /// The shared multi-page core (bd-1gv.25): per-page vision, ONE fused
     /// cross-page prefill, ONE decode, `finalize_multi` assembly. `on_page`
     /// (bd-2z0y) streams each completed page body as its boundary is crossed.
+    /// `origins[k]` is where page `k + 1` of the prompt came from.
+    ///
+    /// The pages (U2-E3): Unlimited-OCR-2 splits its ids into one body per
+    /// page (D20), so each page it read has a [`PageResult`], streamed with
+    /// its body. v1 splits text, and merges pages; its pages are read from
+    /// the text only when it holds exactly one body per page.
     fn recognize_multi_page_pres(
         &self,
         pres: Vec<Preprocessed>,
-        on_page: Option<PageSink<'_>>,
-    ) -> FocrResult<String> {
+        origins: &[PageOrigin],
+        mut on_page: Option<PageSink<'_>>,
+    ) -> FocrResult<DocumentPages> {
         let _admission = forward_admission().acquire();
+        let frame = PageFrame {
+            sizes: pres.iter().map(|p| p.original_size).collect(),
+            origins,
+            model_id: self.arch().id(),
+        };
         if self.arch().decode_contract().pages.is_some() {
-            let split = self.decode_document(&pres, on_page)?;
-            return Ok(postprocess::finalize_pages(&split.bodies, pres.len()));
+            let mut closed = |page: &ClosedPage<'_>| {
+                if let Some(sink) = on_page.as_deref_mut() {
+                    let result = frame.closed_page(page);
+                    sink(&StreamedPage {
+                        index: page.index,
+                        body: page.body,
+                        page: Some(&result),
+                    });
+                }
+            };
+            let decoded = self.decode_document(&pres, Some(&mut closed))?;
+            let pages = frame.token_pages(&decoded);
+            return Ok(DocumentPages {
+                markdown: postprocess::join_page_texts(pages.iter().map(|p| &p.text)),
+                pages,
+            });
         }
         // ── vision tower per page, sequential (§6.5: one live forward) ──────
         let tv = Instant::now();
@@ -4282,13 +4597,21 @@ impl OcrModel {
                 let mut decoder = crate::tokenizer::StreamDecoder::new();
                 let mut text = String::new();
                 let mut seen = 0usize;
+                // v1 merges pages, so a streamed body names no page.
+                let mut on_body = |index: usize, body: &str| {
+                    on_page(&StreamedPage {
+                        index,
+                        body,
+                        page: None,
+                    });
+                };
                 let mut observer = |id: u32| {
                     seen += 1;
                     // An id with no token adds no streamed text; the terminal
                     // decode reports it.
                     let _ = decoder.push(tok, id, &mut text);
                     if seen.is_multiple_of(STREAM_CHECK_EVERY) {
-                        stream.feed(&text, &mut *on_page);
+                        stream.feed(&text, &mut on_body);
                     }
                 };
                 let generated = self.generate_with_observer(
@@ -4301,8 +4624,8 @@ impl OcrModel {
                 // stripped, exactly as finalize_multi strips it before split).
                 decoder.flush(&mut text);
                 let text = postprocess::strip_eos(&text);
-                stream.feed(&text, &mut *on_page);
-                stream.finish(&text, &mut *on_page);
+                stream.feed(&text, &mut on_body);
+                stream.finish(&text, &mut on_body);
                 generated
             }
         };
@@ -4312,6 +4635,7 @@ impl OcrModel {
             td.elapsed().as_secs_f64()
         ));
         let decoded = self.tokenizer()?.decode(&generated)?;
+        let stripped = postprocess::strip_eos(&decoded);
         if let Ok(mut slot) = self.last_decode.lock()
             && let Some(report) = slot.as_mut()
         {
@@ -4322,10 +4646,13 @@ impl OcrModel {
             }
             report.pages = Some(PageBodies {
                 expected: pres.len(),
-                bodies: postprocess::page_body_count(&postprocess::strip_eos(&decoded)),
+                bodies: postprocess::page_body_count(&stripped),
             });
         }
-        postprocess::finalize_multi(&decoded, pres.len())
+        Ok(DocumentPages {
+            markdown: postprocess::finalize_multi(&decoded, pres.len())?,
+            pages: frame.text_pages(&stripped),
+        })
     }
 
     /// Unlimited-OCR-2's document parse (U2-B6) up to the page split: the
@@ -4333,9 +4660,10 @@ impl OcrModel {
     /// decode ([`Self::generate_document`]), and its ids split into one body
     /// per page by token id ([`postprocess::split_pages_by_token`]). One
     /// page is a document of one. Records the [`DecodeReport`] with its
-    /// [`DocumentStats`]; `on_page` gets each page's body as the page ends
-    /// ([`postprocess::TokenPageStream`]). The caller holds the forward
-    /// admission.
+    /// [`DocumentStats`]; `on_page` gets each page as the page ends
+    /// ([`postprocess::TokenPageStream`]), with its finish by the decode
+    /// loop's rule, from a guard that sees the same ids. The caller holds the
+    /// forward admission.
     ///
     /// # Errors
     /// A model without a page contract, a prompt that leaves no position to
@@ -4343,8 +4671,8 @@ impl OcrModel {
     fn decode_document(
         &self,
         pres: &[Preprocessed],
-        on_page: Option<PageSink<'_>>,
-    ) -> FocrResult<postprocess::TokenPages> {
+        mut on_page: Option<&mut dyn FnMut(&ClosedPage<'_>)>,
+    ) -> FocrResult<DecodedDocument> {
         let Some(paging) = self.arch().decode_contract().pages else {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "{} has no page contract, so no document loop",
@@ -4372,23 +4700,71 @@ impl OcrModel {
         }
         let (inputs_embeds, prompt_ids) = self.document_inputs(pres)?;
         let tok = self.tokenizer()?;
-        let decode = match on_page {
-            None => self.generate_document(&inputs_embeds, &prompt_ids, &params, deadline, None)?,
-            Some(on_page) => {
-                let mut stream =
-                    postprocess::TokenPageStream::new(tok, paging.marker_id, pres.len());
-                let mut observer = |id: u32| stream.push(id, &mut *on_page);
-                let decode = self.generate_document(
-                    &inputs_embeds,
-                    &prompt_ids,
-                    &params,
-                    deadline,
-                    Some(&mut observer),
-                )?;
-                stream.finish(&mut *on_page);
-                decode
-            }
+        // The pages close as the ids stream in. A page's clock starts at its
+        // `<PAGE>` (page 1: the first id) and stops at the id that closes it.
+        let mut stream = postprocess::TokenPageStream::new(tok, paging.marker_id, pres.len());
+        let markers = prompt_ids
+            .iter()
+            .filter(|&&id| id == paging.marker_id)
+            .count();
+        let mut mirror = document_guard(
+            if paging.guard { markers } else { 0 },
+            paging.marker_id,
+            &params,
+        );
+        let mut elapsed = Vec::with_capacity(pres.len());
+        let mut opened: Option<Instant> = None;
+        let mut observer = |id: u32| {
+            let now = Instant::now();
+            let since = now - *opened.get_or_insert(now);
+            // The decode loop's rule for a page a marker closes.
+            let finish = if mirror.at_cap() {
+                PageFinish::PageCap
+            } else {
+                PageFinish::Marker
+            };
+            mirror.observe(id);
+            stream.push(id, |index, body, tokens| {
+                elapsed.push(since);
+                opened = Some(now);
+                if let Some(sink) = on_page.as_deref_mut() {
+                    sink(&ClosedPage {
+                        index,
+                        body,
+                        tokens,
+                        finish,
+                        elapsed: since,
+                    });
+                }
+            });
         };
+        let decode = self.generate_document(
+            &inputs_embeds,
+            &prompt_ids,
+            &params,
+            deadline,
+            Some(&mut observer),
+        )?;
+        // The page in flight ends with the decode, by the loop's rule.
+        let since = opened.map_or_else(std::time::Duration::default, |t| t.elapsed());
+        let last = match decode.finish_reason {
+            FinishReason::Stop if mirror.at_cap() => PageFinish::PageCap,
+            FinishReason::Stop => PageFinish::Eos,
+            FinishReason::Length => PageFinish::Length,
+            FinishReason::Budget => PageFinish::Budget,
+        };
+        stream.finish(|index, body, tokens| {
+            elapsed.push(since);
+            if let Some(sink) = on_page.as_deref_mut() {
+                sink(&ClosedPage {
+                    index,
+                    body,
+                    tokens,
+                    finish: last,
+                    elapsed: since,
+                });
+            }
+        });
         let split =
             postprocess::split_pages_by_token(tok, &decode.ids, paging.marker_id, pres.len())?;
         let mut stats = decode.stats;
@@ -4398,6 +4774,7 @@ impl OcrModel {
         stats.gundam_view = pres
             .iter()
             .any(|p| matches!(p.mode, preprocess::PreprocessMode::Gundam { .. }));
+        let finish = stats.page_finish.clone();
         timing_log(&format!(
             "document {} pages: {} tokens, finish {}, pages {:?}, forced {}, hf-id-0 {}, \
              retired {} blocks, peak kv {} bytes, retire fallbacks {}",
@@ -4437,7 +4814,11 @@ impl OcrModel {
                 admission_warnings: lever_policy::admit_from_process(self.arch()).warnings,
             });
         }
-        Ok(split)
+        Ok(DecodedDocument {
+            split,
+            finish,
+            elapsed,
+        })
     }
 
     /// Unlimited-OCR-2's prompt ids and `inputs_embeds` over `pres` (U2-B6):
@@ -6740,7 +7121,167 @@ mod tests {
                 )
             );
             assert_eq!(w["recovery"], warning_recovery(WarningKind::V1PageMerge));
+            // U2-E3: so their JSON `pages` stay `[]`.
+            let origins = list_origins(expected);
+            let frame = PageFrame {
+                sizes: vec![(999, 999); expected],
+                origins: &origins,
+                model_id: model_arch::UNLIMITED_OCR_V1_ID,
+            };
+            assert!(
+                frame
+                    .text_pages(&postprocess::strip_eos(&raw))
+                    .is_empty(),
+                "{name}"
+            );
         }
+    }
+
+    /// U2-E3: v1's text has pages only when it holds one body per page, the
+    /// head before a missing opening marker included (GH #17); they carry no
+    /// decode facts, which v1's text split cannot know.
+    #[test]
+    fn v1_text_has_pages_only_with_one_body_per_page() {
+        let origins = list_origins(3);
+        let frame = PageFrame {
+            sizes: vec![(999, 999); 3],
+            origins: &origins,
+            model_id: model_arch::UNLIMITED_OCR_V1_ID,
+        };
+        for text in ["<PAGE>a<PAGE>b<PAGE>c", "a<PAGE>b<PAGE>c"] {
+            let pages = frame.text_pages(text);
+            let summary: Vec<_> = pages
+                .iter()
+                .map(|p| (p.run_index, p.source_page, p.text.as_str(), p.tokens, p.finish))
+                .collect();
+            assert_eq!(
+                summary,
+                [
+                    (1, 1, "a", None, None),
+                    (2, 2, "b", None, None),
+                    (3, 3, "c", None, None),
+                ],
+                "{text:?}"
+            );
+            assert_eq!(
+                postprocess::join_page_texts(pages.iter().map(|p| &p.text)),
+                postprocess::finalize_multi(text, 3).unwrap(),
+                "{text:?}"
+            );
+        }
+        for merged in ["<PAGE>a<PAGE>b", "<PAGE>a<PAGE>b<PAGE>c<PAGE>d", ""] {
+            assert!(frame.text_pages(merged).is_empty(), "{merged:?}");
+        }
+    }
+
+    /// U2-E3: an Unlimited-OCR-2 decode's pages map to their source pages. A
+    /// page that failed to rasterize has no prompt page (source page 2 here),
+    /// a spread's halves share their source page, a non-blank head joins
+    /// page 1 (so there are still exactly N pages), and an extra trailing
+    /// `<PAGE>` adds none. Boxes map through each page's own size, and the
+    /// pages streamed as the ids arrive are the final ones.
+    #[test]
+    fn document_pages_map_to_their_source_pages() {
+        use crate::tokenizer::special::PAGE;
+        use crate::tokenizer::tests::{byte_id, byte_tokenizer};
+        let t = byte_tokenizer();
+        let text = |s: &str| s.bytes().map(byte_id).collect::<Vec<u32>>();
+        let figure = "<BLOCK>image[0, 0, 999, 499]<FORK>";
+        let ids = [
+            text("hi "),
+            vec![PAGE],
+            text("one"),
+            vec![PAGE],
+            text(figure),
+            vec![PAGE],
+            text("three"),
+            vec![PAGE],
+        ]
+        .concat();
+        let decoded = DecodedDocument {
+            split: postprocess::split_pages_by_token(&t, &ids, PAGE, 3).unwrap(),
+            finish: vec![PageFinish::Marker, PageFinish::PageCap, PageFinish::Marker],
+            elapsed: [5, 6, 7]
+                .map(std::time::Duration::from_millis)
+                .to_vec(),
+        };
+        let origins = [
+            PageOrigin {
+                source_page: 1,
+                half: None,
+            },
+            PageOrigin {
+                source_page: 3,
+                half: Some(Half::Left),
+            },
+            PageOrigin {
+                source_page: 3,
+                half: Some(Half::Right),
+            },
+        ];
+        let frame = PageFrame {
+            sizes: vec![(999, 999), (1998, 2997), (999, 999)],
+            origins: &origins,
+            model_id: model_arch::UNLIMITED_OCR_V2_ID,
+        };
+        let pages = frame.token_pages(&decoded);
+        let summary: Vec<_> = pages
+            .iter()
+            .map(|p| {
+                (
+                    (p.run_index, p.source_page, p.half),
+                    p.text.as_str(),
+                    (p.tokens, p.finish, p.elapsed_ms),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (
+                    (1, 1, None),
+                    "hi one",
+                    (Some(6), Some(PageFinish::Marker), Some(5))
+                ),
+                (
+                    (2, 3, Some(Half::Left)),
+                    "![](images/page_1_0.jpg)\n",
+                    (Some(figure.len()), Some(PageFinish::PageCap), Some(6))
+                ),
+                (
+                    (3, 3, Some(Half::Right)),
+                    "three",
+                    (Some(5), Some(PageFinish::Marker), Some(7))
+                ),
+            ]
+        );
+        assert!(
+            pages
+                .iter()
+                .all(|p| p.window.is_none() && p.model_id == model_arch::UNLIMITED_OCR_V2_ID)
+        );
+        // The left half's box maps through its own 1998x2997 raster.
+        assert_eq!(pages[1].layout[0].boxes, [[0, 0, 1998, 1497]]);
+        assert_eq!(pages[1].figures[0].boxes, [[0, 0, 1998, 1497]]);
+        assert_eq!(pages[1].figures[0].markdown_ref, "![](images/page_1_0.jpg)");
+        assert!(pages[0].layout.is_empty() && pages[2].figures.is_empty());
+
+        let mut stream = postprocess::TokenPageStream::new(&t, PAGE, 3);
+        let mut streamed = Vec::new();
+        let mut close = |index: usize, body: &str, tokens: usize| {
+            streamed.push(frame.closed_page(&ClosedPage {
+                index,
+                body,
+                tokens,
+                finish: decoded.finish[index - 1],
+                elapsed: decoded.elapsed[index - 1],
+            }));
+        };
+        for &id in &ids {
+            stream.push(id, &mut close);
+        }
+        stream.finish(&mut close);
+        assert_eq!(streamed, pages, "streamed pages are the final pages");
     }
 
     /// U2-X2: healthy multi-page outputs, including one whose model skipped
@@ -8670,9 +9211,10 @@ mod tests {
         );
         too_long(
             model
-                .recognize_multi_page_dynamic_streaming(vec![image(); over], &mut |_, _| {
-                    panic!("no page streams")
-                })
+                .recognize_multi_page_dynamic_streaming(
+                    vec![image(); over],
+                    &mut |_: &StreamedPage<'_>| panic!("no page streams"),
+                )
                 .expect_err("over the limit, streaming"),
         );
         model
@@ -9151,11 +9693,17 @@ mod tests {
                 })
                 .collect();
             let t = std::time::Instant::now();
-            let mut events: Vec<(usize, String)> = Vec::new();
-            let mut sink = |k: usize, body: &str| events.push((k, body.to_string()));
-            let split = model
-                .decode_document(&pres, stream.then_some(&mut sink as PageSink<'_>))
+            let mut events: Vec<(usize, String, usize, PageFinish)> = Vec::new();
+            let mut sink = |p: &ClosedPage<'_>| {
+                events.push((p.index, p.body.to_string(), p.tokens, p.finish));
+            };
+            let decoded = model
+                .decode_document(
+                    &pres,
+                    stream.then_some(&mut sink as &mut dyn FnMut(&ClosedPage<'_>)),
+                )
                 .expect("the document decodes");
+            let split = &decoded.split;
             let report = model.take_last_decode().expect("a decode report");
             let stats = report.document.clone().expect("document stats");
             let n = pages.len();
@@ -9211,14 +9759,20 @@ mod tests {
                 stats.page_tokens.iter().sum::<usize>() + n,
                 report.ids.len()
             );
+            // U2-E3: every page's facts come with its body, the streamed
+            // ones as the final split's.
+            assert_eq!(decoded.finish, stats.page_finish, "{fixture}");
+            assert_eq!(decoded.elapsed.len(), n, "{fixture}: a clock per page");
             if stream {
-                let split_bodies: Vec<(usize, String)> = split
+                let split_pages: Vec<(usize, String, usize, PageFinish)> = split
                     .bodies
                     .iter()
+                    .zip(&split.tokens)
+                    .zip(&stats.page_finish)
                     .enumerate()
-                    .map(|(i, b)| (i + 1, b.trim().to_string()))
+                    .map(|(i, ((b, &t), &f))| (i + 1, b.trim().to_string(), t, f))
                     .collect();
-                assert_eq!(events, split_bodies, "{fixture}: streamed pages");
+                assert_eq!(events, split_pages, "{fixture}: streamed pages");
             }
             v2_gated_line(
                 test,
@@ -9987,8 +10541,9 @@ mod tests {
     /// f32 path: S1 page_0009 and page_0014, about a quarter hour together.
     const V2_L4_STATELESS_MAX_IDS: usize = 256;
 
-    /// The levers U2-A7 refuses until U2-C2, with their values where set: a
-    /// lever's re-certification is the L4 rung run with it armed.
+    /// The decode levers U2-A7 left to U2-C2, with their values where set: a
+    /// lever's certification is the L4 rung run with it armed. U2-C2 supports
+    /// all but `FOCR_MOE_SCORE_ORDER`, which still refuses.
     fn v2_armed_levers() -> serde_json::Value {
         [
             "FOCR_FUSE_SWIGLU",
