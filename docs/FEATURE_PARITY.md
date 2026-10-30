@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **73** | **201** |
-| `present` | 115 † | 59 | 174 |
+| Total enumerated rows | **128** | **75** | **203** |
+| `present` | 115 † | 61 | 176 |
 | `partial` | 7 † | 11 | 18 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -277,6 +277,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `--max-page-tokens N` (Unlimited-OCR-2 per-page cap; default 20,000, `0` lifts it) | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | forwarded to the decode overrides and the resident wire; other models ignore it; negative exits 2 |
 | Explicit tuning flags always forwarded (`--crop-mode base`, `--no-repeat-ngram 35`, `--max-length 32768`) | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | each is `None` unless given, so a model whose defaults differ from v1's still receives an explicit value; v1 behavior unchanged |
 | `--crop-mode gundam` on Unlimited-OCR-2: page warns `uncertified_crop_mode`; `--multi-page` document refuses it (exit 2) | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | the paged document reads every page as a base view; invalid values exit 2 (golden) |
+| Unlimited-OCR-2 document `pages[]` (`page`, `half`, `run_index`, `text`, `layout`, `tokens`, `finish`); `--multi-page` with `--split-spreads` and `--extract-figures` (`page{N}{l,r}_figure_{M}`) | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.31 | split on the `<PAGE>` token id, so each entry is that page's output; boxes in each page's own pixels; figures cropped from a re-fetched page; v1 keeps the refusals and lists pages only with exactly one body per page |
 | `--version` carries Baidu MIT attribution | §11 | MUST | present | SURF | bd-223.14 | license compliance |
 | `pdf` input (native scanned fast path) | §7.7 | SHOULD | partial | SURF | bd-0a7.4 | **moved from `excluded`**: scanned-PDF native path shipped v0.2.0 (lopdf, decompress-bomb bounded bd-2zpu); vector-page rasterization deferred |
 | Directory input (`focr ocr <dir>`: page images as one document, natural order) + lazy page source | §7.7 | SHOULD | present | SURF | bd-uocr2-epic-cgux.23 | `page_source::PageSource` reads PDF, directory and image-list pages one at a time; `--pages`/`--split-spreads`/`--multi-page` apply as to a PDF; `e2e_recognize::directory_input_is_a_document_and_keeps_its_refusals_without_a_model` + the model-gated `v1_directory_input_matches_the_image_list_when_armed`; memory gate `tests/page_source_memory.rs` (Flate/JPEG/PNG walks flat vs 546 MiB eager); watchdog `multi_page_page_source_completes_within_budget` |
@@ -304,6 +305,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Partial document output: exit 5 `run_error` with `finish_reason`, `pages_out`, `warnings[]` (`v2_length`, `v2_budget`, `leading_text`) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.15 | additive (schema v1); an Unlimited-OCR-2 document stopped by its position limit or forward budget writes its pages first and emits no `run_complete`; `robot::partial_output_run_error_carries_its_pages_and_warnings` + the model-gated `v2_cli_writes_a_stopped_document_then_exits_5_when_armed` |
 | `model_id` + `source_sha256` on `run_complete`, a partial `run_error`, `--json`, `-o *.json` and `ocr-batch --multi-page --json`; run store `model_version_tag = <model_id>@<source_sha256>` | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | additive (schema v1); the model that ran (resident replies carry it too); `source_sha256` is the digest a `.focrq` records, `null` for a raw checkpoint (raw loads hash nothing), and nothing hashes the artifact per run; model-gated v1/v2 e2e asserts + run-store tag |
 | `uncertified_crop_mode` and `pull_hint` warning kinds | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | additive (schema v1); `pull_hint` `{model_id, mode}` prints once before the decode and rides `run_complete`/`--json`; dormant while every mode default is v1 |
+| `page` event fields of an Unlimited-OCR-2 document (`source_page`, `half`, `model_id`; decoded: `tokens`, `finish`, `elapsed_ms`) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.31 | additive (schema v1); optional in `event_fields`; `page` keeps its per-status meaning; v1 events unchanged |
 
 ## 14. Parity gates & gauntlet machinery (plan §8.2, §8.5)
 

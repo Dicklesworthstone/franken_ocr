@@ -490,10 +490,16 @@ Levers are classified by **effective state** (U2-A7's `UOCR2_LEVER_POLICY`):
     (`:4284`), so U2-B5/B6 must not build or check it on the v2 arm;
 - only levers that would change v2 numerics on a reachable v2 path are refused. `FOCR_LMHEAD_SHARD` and
   `FOCR_LMHEAD_SHARD_TILES` reach `lm_head_cached` (`decoder.rs:1088-1090`) on the conservative path,
-  so they are **refused until U2-C2**. Levers that select a refused path are refused with it:
+  so they were **refused until U2-C2**. Levers that select a refused path are refused with it:
   `FOCR_DECODE_INT8` (the `_i8` path), `FOCR_PREFILL_CHUNK` (chunked prefill, until U2-F2) and
   `FOCR_BATCH_SPINE` (until U2-F5); `FOCR_DECODE_STATELESS` selects a supported path;
 - U2-C2 re-runs L4 with each "refuse until C2" lever on and flips each pass to supported-exact.
+  *Outcome (2026-10-30):* `FOCR_FUSE_SWIGLU`, `FOCR_INT8_AUTOVEC=0`, `FOCR_LMHEAD_SHARD` (with
+  `FOCR_LMHEAD_SHARD_TILES=7`) and `FOCR_SOFTMAX_COPY` give the f32 paths the oracle's ids on every L4
+  case and the int8-FFN path its unarmed ids, so they are supported. `FOCR_MOE_SCORE_ORDER=1` routes
+  experts in score order, not the reference's `torch.topk` slot order: the f32 paths still match, but
+  the int8-FFN decode's ids move (S2's first departure from step 44 to 103, page_0014's from 47 to 44,
+  S3 p9_p14 from 314 to 446 generated ids), so it stays refused.
 
 *Why:*
 - Today `forward` and `forward_dynamic` (`mod.rs:2105`, `:2137`) dispatch on id strings and fall
@@ -1541,7 +1547,7 @@ It reuses the domain-agnostic per-token sampling primitives from `sampler.rs`.
 | Chunked prefill (`decoder.rs:1198` `chunk_prefill_attention`, `:1287` `prefill_with_cache_chunked`, `:2842` `prefill_with_cache_i8_chunked`; `FOCR_PREFILL_CHUNK`, presence-based: any value arms it) | Refuse when `prefill_chunk_size()` is `Some` | F2 |
 | Batched / spine (`batched_decode_step_i8*` `decoder.rs:3211,3243`; `recognize_batch_spine` `mod.rs:2984`; `batch_scheduler.rs:43,440,487`) | Refuse | F5 |
 | Spec decode / verify (`spec_decode_i8` `mod.rs:4064`, reachable only via `generate_cached_i8` `:3887`; `verify_forward*` `decoder.rs:3495,3575`, no production caller) | Unreachable from the v2 paths: the `_i8` path is refused, and `FOCR_SPEC_DECODE`/`FOCR_SPEC_VERIFY` are ignored (row below) | Backlog |
-| `FOCR_LMHEAD_SHARD`, `FOCR_LMHEAD_SHARD_TILES` (presence-based, `decoder.rs:2098,2105,2115`; reach `lm_head_cached`, `decoder.rs:1088-1090`, on the conservative path) | Refuse | U2-C2 (L4 with the lever on), then supported-exact |
+| `FOCR_LMHEAD_SHARD`, `FOCR_LMHEAD_SHARD_TILES` (presence-based, `decoder.rs:2098,2105,2115`; reach `lm_head_cached`, `decoder.rs:1088-1090`, on the conservative path) | Refuse | Supported-exact since U2-C2 (L4 with the lever on, §6.2) |
 | `FOCR_INT8_KV`, `FOCR_ATTN_GEMM`, `FOCR_RSWA_PARALLEL_ATTN` (read only in `rswa::decode_attention`/`RingCache::new`, which the SR-SWA arm never calls); `FOCR_QKV_FUSED` (default ON, `_i8` only); `FOCR_FUSE_NORM_QUANT` (`decoder.rs:2990`, `_i8` only); `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_SPEC_DECODE` (`generate_cached_i8` only, `mod.rs:3939,3949`); `FOCR_SPEC_VERIFY` (no production reader); `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD` (full-int8 recipe only, `mod.rs:480`); `FOCR_RESAMPLE` | Ignored, with `warnings[{kind:"ignored_lever"}]` | — |
 | `RunawayGuard`, `FOCR_RUNAWAY_GUARD` (`sampler.rs:53`) | Ignored, **once U2-B5/B6 stop building it on the v2 arm**: today it is built for every path (`mod.rs:3727`) and checked in `generate_cached` (`:3830`) and `generate_stateless` (`:4284`). The page guard plus the per-page cap replace it | — |
 | Resident daemon (`cli.rs:1650`, `resident.rs`) | Refuse for v2 until its protocol carries the v2 flags | Backlog (bd-fuh2) |
@@ -1668,7 +1674,7 @@ PageSource (lazy) ─▶ window planner (§5.10.1) ─▶ per window:
 **Driver and sinks.** `recognize_document` (D23) drives the pipeline. The CLI is a sink: markdown,
 JSON `pages[]`, figures, or robot events.
 
-**JSON pages.** `--multi-page --json` today returns `pages: []` (`cli.rs:1911`).
+**JSON pages.** `--multi-page --json` returned `pages: []` (`cli.rs:1911`) until U2-E3 (§9.3).
 - With v2 it returns real pages.
 - With v1 it returns real pages from `<PAGE>` splitting only when the body count is exactly N
   (U2-X2's shared body-count function). Otherwise it keeps `pages: []` (type-stable), and the
@@ -2174,6 +2180,17 @@ This lifts, for v2 document mode only, the `--multi-page` refusal of `--extract-
 - Figure pages are re-fetched through `PageSource::fetch` in both unwindowed and windowed mode, because
   document mode prefills every page before decoding.
 - Coordinate with bd-hfdt-admission-prereqs-dfr1, bd-json-per-span-text-wbbu and bd-v73v.
+
+*As built (2026-10-30).*
+- `PageResult` and `Half` live in `native_engine`, so the library type builds without the `pdf`
+  feature. `postprocess::finalize_page(body, index, size)` turns one body into its text, layout and
+  figure boxes; the document markdown is the page texts joined by `<PAGE>`.
+- The v2 document loop always runs the token-id page stream, which records each page's generated-id
+  count and wall time. A page's `finish` is the guard's (`stats.page_finish`); the streaming sink gets
+  the same `PageResult` the final `pages[]` holds.
+- The CLI decides "this model has exact pages" by the bounded header probe after the mode default
+  (`paged_model_id`), so the refusals stay for v1 and for an absent model.
+- v1 takes decision (a): pages only when the text has exactly one body per page.
 
 ### 9.4 Library (U2-E2, D23)
 

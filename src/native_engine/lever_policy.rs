@@ -17,9 +17,8 @@ use super::model_arch::{ModelArch, UnlimitedVariant};
 use crate::error::{FocrError, FocrResult};
 
 /// When a lever's value changes behaviour from its default, matching its
-/// reader's parse. `NotFalsy` and `Falsy` compare trimmed and
-/// case-insensitively; a reader with a stricter parse (`FOCR_INT8_AUTOVEC`
-/// matches exact lowercase) is over-approximated, which only refuses more.
+/// reader's parse. `NotFalsy` compares trimmed and case-insensitively; a
+/// reader with a stricter parse is over-approximated, which only refuses more.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Armed {
     /// Any value, `0` and the empty string included (`var_os(..).is_some()`).
@@ -28,20 +27,18 @@ pub(crate) enum Armed {
     Truthy,
     /// Anything but empty, `0`, `off`, `false` or `no`.
     NotFalsy,
-    /// `0`, `off`, `false` or `no`: a default-on lever switched off.
-    Falsy,
 }
 
 impl Armed {
     /// Whether `value` arms the lever.
     pub(crate) fn by(self, value: &str) -> bool {
         let value = value.trim().to_ascii_lowercase();
-        let falsy = matches!(value.as_str(), "0" | "off" | "false" | "no");
         match self {
             Self::Present => true,
             Self::Truthy => crate::quant::recipe::is_truthy(&value),
-            Self::NotFalsy => !value.is_empty() && !falsy,
-            Self::Falsy => falsy,
+            Self::NotFalsy => {
+                !value.is_empty() && !matches!(value.as_str(), "0" | "off" | "false" | "no")
+            }
         }
     }
 }
@@ -84,7 +81,6 @@ const fn lever(name: &'static str, decision: Decision) -> Lever {
 
 use Decision::{AllowListed, Ignored, NotApplicable, Refuse, Supported};
 
-const UNVERIFIED: &str = "it reaches this model's decode and is unverified for it until U2-C2";
 const R_SWA_ONLY: &str = "it reaches only v1's R-SWA attention";
 const INT8_DECODER_ONLY: &str = "it reaches only the all-int8 decoder, which this model refuses";
 const UNDER_SPINE: &str = "it takes effect only under FOCR_BATCH_SPINE, which this model refuses";
@@ -129,7 +125,10 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
         ),
         lever("FOCR_FUSE_NGRAM_LMHEAD", Ignored(INT8_DECODER_ONLY)),
         lever("FOCR_FUSE_NORM_QUANT", Ignored(INT8_DECODER_ONLY)),
-        lever("FOCR_FUSE_SWIGLU", Refuse(Armed::Present, UNVERIFIED)),
+        lever(
+            "FOCR_FUSE_SWIGLU",
+            Supported("the fused SwiGLU gives v2's decodes their unfused ids (U2-C2)"),
+        ),
         lever("FOCR_GOT_FORMAT", NotApplicable("GOT-OCR2's")),
         lever("FOCR_GOT_INT8_LMHEAD", NotApplicable("GOT-OCR2's")),
         lever("FOCR_GOT_MODEL", AllowListed("GOT-OCR2 model-gated tests")),
@@ -141,13 +140,19 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             Ignored("it is a `focr convert --quant int4` knob, and this model has no int4 recipe"),
         ),
         lever("FOCR_INT8_ATTN", Ignored(INT8_DECODER_ONLY)),
-        lever("FOCR_INT8_AUTOVEC", Refuse(Armed::Falsy, UNVERIFIED)),
+        lever(
+            "FOCR_INT8_AUTOVEC",
+            Supported("either int8 kernel tier gives v2's decode the same ids (U2-C2)"),
+        ),
         lever("FOCR_INT8_KV", Ignored(R_SWA_ONLY)),
         lever("FOCR_INT8_LMHEAD", Ignored(INT8_DECODER_ONLY)),
-        lever("FOCR_LMHEAD_SHARD", Refuse(Armed::Present, UNVERIFIED)),
+        lever(
+            "FOCR_LMHEAD_SHARD",
+            Supported("the vocab-tiled lm_head gives v2's f32 and int8 decodes their ids (U2-C2)"),
+        ),
         lever(
             "FOCR_LMHEAD_SHARD_TILES",
-            Ignored("it takes effect only under FOCR_LMHEAD_SHARD, which this model refuses"),
+            Supported("the tile count only groups lm_head columns (U2-C2)"),
         ),
         lever(
             "FOCR_MANIFEST_URL",
@@ -167,7 +172,14 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             "FOCR_MOE_POLICY_TEST_CASE",
             AllowListed("MoE policy child-process tests"),
         ),
-        lever("FOCR_MOE_SCORE_ORDER", Refuse(Armed::Truthy, UNVERIFIED)),
+        lever(
+            "FOCR_MOE_SCORE_ORDER",
+            Refuse(
+                Armed::Truthy,
+                "it routes experts in score order, not the reference's torch.topk slot \
+                 order, which moves v2's int8 decode off its ids (U2-C2)",
+            ),
+        ),
         lever("FOCR_NO_PROGRESS", Supported("progress rendering only")),
         lever(
             "FOCR_NO_REPEAT_NGRAM",
@@ -240,7 +252,10 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             "FOCR_SMOLVLM2_TOKENIZER_JSON",
             AllowListed("SmolVLM2 tokenizer tests"),
         ),
-        lever("FOCR_SOFTMAX_COPY", Refuse(Armed::Truthy, UNVERIFIED)),
+        lever(
+            "FOCR_SOFTMAX_COPY",
+            Supported("the copying softmax gives v2's f32 and int8 decodes their ids (U2-C2)"),
+        ),
         lever(
             "FOCR_SPEC_DECODE",
             Ignored("speculative decoding runs only inside the all-int8 decoder"),
@@ -491,7 +506,6 @@ mod tests {
         match decision {
             Refuse(Armed::Present, _) => "0",
             Refuse(Armed::Truthy | Armed::NotFalsy, _) => "1",
-            Refuse(Armed::Falsy, _) => "off",
             Supported(_) | Ignored(_) | NotApplicable(_) | AllowListed(_) => "1",
         }
     }
@@ -613,18 +627,16 @@ mod tests {
         ("FOCR_DECODE_INT8", "0", Expect::Ignored),
         ("FOCR_PREFILL_CHUNK", "512", Expect::Refused),
         ("FOCR_PREFILL_CHUNK", "0", Expect::Refused),
-        ("FOCR_LMHEAD_SHARD", "0", Expect::Refused),
+        ("FOCR_LMHEAD_SHARD", "0", Expect::Silent),
         ("FOCR_BATCH_SPINE", "1", Expect::Refused),
         ("FOCR_BATCH_SPINE", "0", Expect::Ignored),
         ("FOCR_BATCH_SPINE", "", Expect::Ignored),
         ("FOCR_BATCH_SPINE", " OFF ", Expect::Ignored),
         ("FOCR_MOE_SCORE_ORDER", "1", Expect::Refused),
         ("FOCR_MOE_SCORE_ORDER", "0", Expect::Ignored),
-        ("FOCR_FUSE_SWIGLU", "0", Expect::Refused),
-        ("FOCR_SOFTMAX_COPY", "yes", Expect::Refused),
-        ("FOCR_SOFTMAX_COPY", "0", Expect::Ignored),
-        ("FOCR_INT8_AUTOVEC", "0", Expect::Refused),
-        ("FOCR_INT8_AUTOVEC", "1", Expect::Ignored),
+        ("FOCR_FUSE_SWIGLU", "0", Expect::Silent),
+        ("FOCR_SOFTMAX_COPY", "yes", Expect::Silent),
+        ("FOCR_INT8_AUTOVEC", "0", Expect::Silent),
         ("FOCR_SPEC_DECODE", "1", Expect::Ignored),
         ("FOCR_SPEC_VERIFY", "1", Expect::Ignored),
         ("FOCR_INT8_ATTN", "1", Expect::Ignored),
@@ -639,7 +651,7 @@ mod tests {
         ("FOCR_RUNAWAY_GUARD", "1", Expect::Ignored),
         ("FOCR_RUNAWAY_GUARD", "maybe", Expect::Ignored),
         ("FOCR_RESAMPLE", "pil-bicubic", Expect::Ignored),
-        ("FOCR_LMHEAD_SHARD_TILES", "4", Expect::Ignored),
+        ("FOCR_LMHEAD_SHARD_TILES", "4", Expect::Silent),
         ("FOCR_BATCH_PACK", "1", Expect::Ignored),
         ("FOCR_BATCH_VISION", "0", Expect::Ignored),
         ("FOCR_BATCH_SIZE", "4", Expect::Ignored),
@@ -876,10 +888,10 @@ mod tests {
         assert_eq!(json["kind"], "ignored_lever");
         assert_eq!(json["env"], "FOCR_QKV_FUSED");
         assert!(super::super::RUN_WARNING_KINDS.contains(&"ignored_lever"));
-        let refused = admit_with(&PlannedV2, &[("FOCR_LMHEAD_SHARD", "")], false);
+        let refused = admit_with(&PlannedV2, &[("FOCR_PREFILL_CHUNK", "")], false);
         assert!(
             matches!(refused.verdict, Err(FocrError::Usage(ref m))
-                if m.contains("FOCR_LMHEAD_SHARD") && !m.contains(NOT_IMPLEMENTED)),
+                if m.contains("FOCR_PREFILL_CHUNK") && !m.contains(NOT_IMPLEMENTED)),
             "{refused:?}"
         );
     }
@@ -895,25 +907,9 @@ mod tests {
             (Armed::NotFalsy, "", false),
             (Armed::NotFalsy, " Off ", false),
             (Armed::NotFalsy, "anything", true),
-            (Armed::Falsy, "No", true),
-            (Armed::Falsy, "1", false),
-            (Armed::Falsy, "", false),
         ];
         for (armed, value, expected) in cases {
             assert_eq!(armed.by(value), expected, "{armed:?} by {value:?}");
-        }
-        // The v2 readers this table claims to mirror.
-        for value in ["0", "off", "1", "", "maybe"] {
-            assert_eq!(
-                !Armed::Falsy.by(value),
-                crate::native_engine::srswa::retire_enabled_for(Some(value)),
-                "FOCR_SRSWA_RETIRE {value:?}"
-            );
-            assert_eq!(
-                !Armed::Falsy.by(value),
-                super::super::unlimited_vision_cache_enabled_for(Some(value)),
-                "FOCR_UNLIMITED_VISION_CACHE {value:?}"
-            );
         }
     }
 }

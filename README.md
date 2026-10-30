@@ -389,7 +389,8 @@ source image and saved into a subfolder (default `<output-stem>_figures/`, or se
 JSON gains a `figures` array of `{label, page, bbox, path}`. Each figure's format is
 chosen by content: JPG (quality 85) for photographic regions, lossless PNG for
 line-art / charts / screenshots. Requires `-o` (or `--figures-dir` for a stdout run).
-PDFs name figures per page (`page{N}_figure_{M}`).
+PDFs name figures per page (`page{N}_figure_{M}`); an Unlimited-OCR-2 document
+with `--split-spreads` names a half's figures `page{N}l_…` / `page{N}r_…`.
 
 **Directory input.** `focr ocr ./scans/` reads a directory of page images
 (`.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.webp`, `.bmp`, `.gif`, `.pnm` and
@@ -425,8 +426,20 @@ page1.png page2.png --multi-page`. v1 has
 stop early and report `finish_reason: length` with a `v1_truncated` warning (a
 prompt that alone exceeds the budget fails with an actionable error). When v1
 ends with fewer page bodies than pages, a `v1_page_merge` warning says the page
-boundaries are unreliable. It does not compose with `--split-spreads` or
-`--extract-figures` (per-page semantics).
+boundaries are unreliable. On v1 it does not compose with `--split-spreads` or
+`--extract-figures` (per-page semantics), and `--json` lists real `pages[]` only
+when the text has exactly one body per page (otherwise `pages: []`).
+
+Unlimited-OCR-2 (`--model unlimited-ocr-2`) emits exactly one `<PAGE>` per page,
+so its document mode has real pages. `--json` lists one `pages[]` entry per page
+read: `page` (the source page), `half` on a split spread, `run_index`, `text`,
+`layout` (boxes in that page's own pixels), `tokens` and `finish` (`marker`,
+`eos`, `page_cap`, `length` or `budget`). It composes with `--split-spreads`
+(each half is one page of the prompt) and with `--extract-figures`: figures are
+cropped from their page after the decode and named `page{N}_figure_{M}`, or
+`page{N}l_figure_{M}` / `page{N}r_figure_{M}` on a half. Robot `page` events add
+`source_page`, `half`, `model_id`, and for decoded pages `tokens`, `finish` and
+`elapsed_ms`.
 
 **Tall captures (full-page screenshots).** A full-page browser capture (e.g. the
 Awesome Screenshot extension) is one extremely tall image — 1:4 to 1:10 aspect.

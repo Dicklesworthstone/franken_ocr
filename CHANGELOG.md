@@ -103,9 +103,13 @@ sections as they land.
     tokenizer sidecar or any weight byte is read. A refusal exits 2 and names
     every lever at fault. Before, v2 failed later, after load, with exit 1.
   - Refused for v2: `--experimental-full-int8` and `FOCR_DECODE_INT8`,
-    `FOCR_PREFILL_CHUNK`, `FOCR_BATCH_SPINE`, and `FOCR_LMHEAD_SHARD`. Also
-    refused until U2-C2 re-runs parity with them on: `FOCR_FUSE_SWIGLU`,
-    `FOCR_MOE_SCORE_ORDER`, `FOCR_SOFTMAX_COPY`, and `FOCR_INT8_AUTOVEC=0`.
+    `FOCR_PREFILL_CHUNK`, `FOCR_BATCH_SPINE`, and `FOCR_MOE_SCORE_ORDER=1`.
+    U2-C2 re-ran parity with `FOCR_FUSE_SWIGLU`, `FOCR_INT8_AUTOVEC=0`,
+    `FOCR_LMHEAD_SHARD` (with `FOCR_LMHEAD_SHARD_TILES`) and
+    `FOCR_SOFTMAX_COPY` on; each leaves every v2 decode's ids unchanged, so
+    they are supported. `FOCR_MOE_SCORE_ORDER=1` routes experts in score
+    order, not the reference's `torch.topk` slot order, and moves the
+    int8-FFN decode's ids, so it stays refused.
   - Levers that cannot reach a v2 path are ignored with a stderr warning of the
     new kind `ignored_lever`. These include R-SWA and all-int8 decoder tuning,
     the speculative-decode levers, the batch-spine sub-levers, and
@@ -362,6 +366,33 @@ sections as they land.
     `page_number`, `table`, `cross_text`, …) and its box in source pixels. A
     leveled title adds `level` (`<LEVEL1>` gives 1). v1 entries are unchanged.
   - A block prefix cut off by the page token cap stays in the text as emitted.
+- **Unlimited-OCR-2 documents come back page by page** (bead U2-E3). The model
+  emits exactly one `<PAGE>` per page and the run splits its output on that
+  token's id, so each page's output is its own.
+  - `--multi-page --json` lists one `pages[]` entry per page read: `page` (the
+    source page), `half` on a split spread, `run_index`, `text`, `layout`
+    (boxes in that page's own pixels, whatever the other pages' sizes),
+    `tokens` and `finish` (`marker`, `eos`, `page_cap`, `length` or `budget`).
+    The markdown is the page texts joined by `<PAGE>`.
+  - `--multi-page` now composes with `--split-spreads` and `--extract-figures`
+    on an Unlimited-OCR-2 document. Each half of a spread is one page of the
+    prompt. After the decode, each page with figures is rasterized again and
+    its figures cropped from it, named `page{N}_figure_{M}` (`page{N}l_…` and
+    `page{N}r_…` on a half), where N is the source page. `figures[]` entries
+    add `half`.
+  - Robot `page` events of an Unlimited-OCR-2 document add `source_page`,
+    `half` and `model_id`; decoded pages also add `tokens`, `finish` and
+    `elapsed_ms`. `page` keeps its meaning: the emission index when decoded,
+    the source page when skipped.
+  - v1 merges pages, so its `--multi-page --json` gives real `pages[]` only
+    when its text has exactly one body per page (decision (a) of the bead).
+    Otherwise `pages` stays `[]` and the `v1_page_merge` warning says why: the
+    recorded p20 run has 7 bodies for 20 pages. v1 keeps all three refusals,
+    and its markdown is unchanged.
+  - Library: `recognize_multi_page_source_with_model` returns
+    `DocumentPages { markdown, pages }`, each page a `PageResult` (also its
+    `model_id` and `elapsed_ms`). The streaming sink receives a `StreamedPage`
+    that carries the `PageResult` when the model has one.
 
 ### Fixed
 
