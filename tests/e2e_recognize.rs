@@ -1965,7 +1965,7 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
         Option<&'a str>,
         &'a [&'a str],
     );
-    let cases: [Case; 8] = [
+    let cases: [Case; 9] = [
         ("bare", &["ocr"], &[], None, &[]),
         (
             "prefill_chunk",
@@ -1981,11 +1981,19 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
             Some("FOCR_DECODE_INT8"),
             &[],
         ),
+        // U2-C2 certified the vocab-tiled lm_head for this model.
         (
             "lmhead_shard_zero",
             &["ocr"],
             &[("FOCR_LMHEAD_SHARD", "0")],
-            Some("FOCR_LMHEAD_SHARD"),
+            None,
+            &[],
+        ),
+        (
+            "moe_score_order",
+            &["ocr"],
+            &[("FOCR_MOE_SCORE_ORDER", "1")],
+            Some("FOCR_MOE_SCORE_ORDER"),
             &[],
         ),
         (
@@ -2705,7 +2713,13 @@ fn v2_cli_document_json_reads_pages_spreads_skips_and_figures_when_armed() {
         .collect();
     let origins: Vec<(Option<u64>, Option<u64>, Option<&str>)> = decoded
         .iter()
-        .map(|e| (e["page"].as_u64(), e["source_page"].as_u64(), e["half"].as_str()))
+        .map(|e| {
+            (
+                e["page"].as_u64(),
+                e["source_page"].as_u64(),
+                e["half"].as_str(),
+            )
+        })
         .collect();
     assert_eq!(
         origins,
@@ -2717,7 +2731,10 @@ fn v2_cli_document_json_reads_pages_spreads_skips_and_figures_when_armed() {
         ],
         "decoded events: {decoded:#?}"
     );
-    let finishes: Vec<&str> = decoded.iter().filter_map(|e| e["finish"].as_str()).collect();
+    let finishes: Vec<&str> = decoded
+        .iter()
+        .filter_map(|e| e["finish"].as_str())
+        .collect();
     assert_eq!(finishes, ["marker", "marker", "marker", "eos"]);
     for event in &decoded {
         assert_eq!(event["model_id"], "unlimited-ocr-2", "{event}");
