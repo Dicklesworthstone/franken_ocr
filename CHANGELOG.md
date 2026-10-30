@@ -294,6 +294,13 @@ sections as they land.
     independent windowed oracle's (U2-D2a), retirement on. This covers W = 2
     and 3, the one-page variant, a marker-only splice, and three forced
     recomputes.
+  - The oracle runs are committed as compact fixtures
+    (`tests/fixtures/uocr2_windowed`, bead U2-D2b), so `cargo test` checks them
+    without the model. It checks each window's copy plan, text tail, splice
+    rows and retained rows, and every KV row's coordinates, which must hash
+    equal to the oracle's. With the v2 tokenizer present, the stitched page
+    bodies must equal the wheel's byte for byte. One difference remains, on a
+    path only a test hook reaches (DISC-U2-12).
 - **Directory input, and documents read one page at a time** (bead U2-D0).
   - `focr ocr ./pages/` reads a directory of page images as one document, in
     natural order (`p2.png` before `p10.png`). `--pages`, `--split-spreads`

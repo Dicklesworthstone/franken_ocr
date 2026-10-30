@@ -395,8 +395,8 @@ since exact-token OCR fails in the tail.
     decode runs the conservative recipe (f32 attention and `lm_head` over
     FFN/expert matrices quantized to int8 at load, even from the bf16 shard;
     `OcrModel::generate_cached`), the same recipe the int8 artifact stores.
-- Measured impact (2026-10-30, armed, f32 subject; CER over the
-    oracle-length prefix, both sides through the same `finalize_multi`):
+- Measured impact: (2026-10-30, armed, f32 subject; CER over the
+    oracle-length prefix, both sides through the same `finalize_multi`)
     * 2 pages: **0.0522** (was 0.1791 before bd-p8hu); the three-line plate
       is exact.
     * 10 pages: **0.3186** (was 0.4045); markers 8-vs-9. The 10-page plate's
