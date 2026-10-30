@@ -293,6 +293,7 @@ pattern with measured budgets:
 | GOT-OCR2 | `scripts/gen_reference_fixtures_got.py`, `gen_got_token_id_fixtures.py`, `gen_got_format_corpus.py` | `src/native_engine/got.rs`, `vision_sam.rs`, `decoder_qwen2.rs`, `postprocess.rs` | `scripts/spec_gate_e2e.sh` | `FOCR_GOT_DIR` |
 | SmolVLM2-500M | `scripts/gen_reference_fixtures_smolvlm2.py`, `…_smolvlm2_vision.py`, `gen_smolvlm2_token_id_fixtures.py`, `gen_smolvlm2_vqa_fixtures.py` | `src/native_engine/smolvlm2.rs`, `vision_siglip.rs`, `token_compress.rs` | `scripts/smolvlm2_convert_e2e.sh`, `smolvlm2_describe_e2e.sh` | `FOCR_SMOLVLM2_DIR` |
 | OneChart | `scripts/gen_reference_fixtures_onechart.py` | `src/native_engine/onechart.rs`, `decoder_qwen2.rs` | `scripts/onechart_chart_e2e.sh` | `FOCR_ONECHART_DIR` |
+| Unlimited-OCR-2 | `scripts/gen_reference_fixtures_uocr2.py` (f32 CPU, U2-A6; `FLOOR.json`) | `tests/parity_ladder.rs`: L0 exact so far (`uocr2_l0_preprocess_is_bit_exact_against_the_oracle`, U2-B7); L1–L4 are U2-C1/C2 | — (U2-C1) | `FOCR_UOCR2_FIXTURES_DIR` (the `f32/t12` dump dir) + `FOCR_CORPUS_DIR` |
 
 **The recipe a new model lane (TrOMR E, TrOCR/pix2tex F) follows:**
 

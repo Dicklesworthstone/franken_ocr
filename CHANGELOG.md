@@ -188,6 +188,22 @@ sections as they land.
     The search-dir resolver's wasm skip now applies to v1 artifacts only, so a
     v2 file declaring that id gets the named error, not "not found".
   - `focr convert` reports `output_sha256`.
+- **Unlimited-OCR-2 preprocessing** (bead U2-B7).
+  - `preprocess_image`, `preprocess_bytes` and `preprocess_dynamic` take a
+    `PreprocessProfile`, which the engine picks from the model. v2's profile
+    applies three rules. Gundam grids have at most 16 tiles (v1 allows 32).
+    The small-image rule compares both sides with the tile size. Every resize
+    uses the PIL-exact bicubic kernel, whatever `FOCR_RESAMPLE` says.
+  - A v2 document page is a 1024 letterbox like a single page. The 640 squash
+    stays v1's.
+  - On all nine U2-A6 oracle fixtures, the v2 global views, gundam tiles,
+    grids and placeholder counts equal the reference's bit for bit
+    (`uocr2_l0_preprocess_is_bit_exact_against_the_oracle`).
+  - A model-free golden pins v1's preprocessing under both kernels, and it
+    still passes: base, the multi-page squash, gundam, and a 1×20 grid only
+    v1 allows.
+  - The v2 references ignore EXIF orientation; franken_ocr applies it for
+    every model (DISC-U2-10).
 
 ### Fixed
 

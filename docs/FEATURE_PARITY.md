@@ -64,7 +64,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | 2 | Normalize ToTensor→(0.5,0.5) ⇒ [-1,1] | SPEC-021 | MUST | present | L0 | preprocess/normalize.rs | bd-1gv.2 | [-1,1] normalize (mod.rs:667); L0 anchor NORM_LO/HI |
 | 3 | Pad-to-square gray (127,127,127) | SPEC-022 | MUST | present | L0 | preprocess/pad.rs | bd-1gv.2 | gray-127 pad (mod.rs:73,479); L0 anchor GRAY_PAD==127 |
 | 4 | Crop decision (crop_mode, ≤640 both ⇒ [1,1]) | SPEC-023 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | crop decision ≤640⇒[1,1] (mod.rs:548); L0 + unit tests |
-| 5 | `dynamic_preprocess` tiling (min 2/max 32, row-major) | SPEC-024 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | dynamic_preprocess tiling (mod.rs:546-610); gundam census test |
+| 5 | `dynamic_preprocess` tiling (min 2/max 32, row-major) | SPEC-024 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | dynamic_preprocess tiling (mod.rs:546-610); gundam census test. Unlimited-OCR-2 (`PreprocessProfile::V2`, U2-B7): max 16, small-image rule against the tile size, PIL-exact resampling everywhere, 1024 letterbox per document page; L0 bit-exact against the U2-A6 oracle on all nine fixtures |
 | 6 | `find_closest_aspect_ratio` (tie-break larger area) | SPEC-025 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | find_closest_aspect_ratio tie-break (mod.rs:637,1184); L0 |
 | 7 | crop_ratio (width_crop_num, height_crop_num) | SPEC-026 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | CropGrid (mod.rs:173,203,230); L0 |
 | 8 | Token query counts (base 16, tile 10) | SPEC-027 | MUST | present | L0 | preprocess/tile.rs | bd-1gv.3 | num_queries base16/tile10 (mod.rs:138); base_global_placeholder_is_273 |
