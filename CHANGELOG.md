@@ -137,6 +137,27 @@ sections as they land.
     (U2-B6) come next.
   - `parity_ladder` skips its model-gated rungs, and logs why, when
     `FOCR_MODEL_PATH` is a model other than v1 (`native_engine::model_id_at`).
+- **Unlimited-OCR-2 reference oracle** (bead U2-A6).
+  - `scripts/gen_reference_fixtures_uocr2.py` runs Baidu's HF Unlimited-OCR-2
+    (`5632329a`) in f32 on CPU, unmodified, on its own pinned stack (Python
+    3.10, torch 2.13.0, transformers 4.52.1). It checks every model file
+    against `SOURCE_HASHES.md` first. No part of the reference needed porting
+    (OQ-V2-4).
+  - It dumps what the v2 parity ladder compares: preprocessed images, prompt
+    ids, page2d coordinates and cos/sin; per layer the router's `iq`, `ik`,
+    `kbar`, scores, candidate mask, fallback flag, entmax prior and
+    topi/bias/valid; the layer inputs and attention outputs; the logits and
+    generated ids. This covers the prefill, the first 64 decode steps and
+    8 steps either side of every generated `<PAGE>`. The router intermediates
+    are recomputed with the reference's own code, and the run fails unless they
+    reproduce its outputs bit for bit.
+  - Nine fixtures (S1–S4): three single pages, a three-page document, the 2-,
+    10- and 20-page lists of `tests/fixtures/multi_page`, and two gundam pages.
+    The ids, markdown and `ORACLE.json` are committed in
+    `tests/fixtures/uocr2_oracle`; the dumps stay beside the weights.
+  - FLOOR_SENTENCE
+  - No fixture hit DISC-U2-2's all-(−inf) case. `check_oracle_provenance.py`
+    checks the committed fixtures against the v2 pins and input hashes.
 
 ### Fixed
 
