@@ -1984,6 +1984,48 @@ mod tests {
         assert_eq!(p.original_size, (50, 30));
     }
 
+    /// SPEC-020, DISC-018: the shared decoder applies the EXIF Orientation
+    /// tag, as PIL's `ImageOps.exif_transpose` does, for every model. A page
+    /// stored sideways with Orientation 6 ("rotate 90° clockwise to display")
+    /// decodes upright; the same PNG without the tag decodes as stored.
+    #[test]
+    fn decode_applies_the_exif_orientation_tag() {
+        fn crc32(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &b in bytes {
+                crc ^= u32::from(b);
+                for _ in 0..8 {
+                    crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                }
+            }
+            !crc
+        }
+        let stored = RgbImage::from_fn(3, 2, |x, y| Rgb([x as u8 * 80, y as u8 * 120, 7]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        stored.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        let png = buf.into_inner();
+        // A big-endian TIFF block with one IFD entry: 0x0112 Orientation,
+        // SHORT, count 1, value 6.
+        let exif: [u8; 26] = [
+            b'M', b'M', 0, 42, 0, 0, 0, 8, 0, 1, 0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0, 0, 0, 0,
+            0,
+        ];
+        let mut chunk = (exif.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(b"eXIf");
+        chunk.extend_from_slice(&exif);
+        chunk.extend_from_slice(&crc32(&chunk[4..]).to_be_bytes());
+        // The signature (8 bytes) and IHDR (25) come first; eXIf precedes IDAT.
+        let mut tagged = png[..33].to_vec();
+        tagged.extend_from_slice(&chunk);
+        tagged.extend_from_slice(&png[33..]);
+
+        let plain = decode_bytes(&png).expect("untagged PNG decodes").to_rgb8();
+        assert_eq!(plain, stored);
+        let upright = decode_bytes(&tagged).expect("tagged PNG decodes").to_rgb8();
+        assert_eq!(upright.dimensions(), (2, 3));
+        assert_eq!(upright, image::imageops::rotate90(&stored));
+    }
+
     #[test]
     fn view_tensor_layout_is_channel_major() {
         // Distinct per-channel values so we can prove channel-major ordering.
