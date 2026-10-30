@@ -1063,16 +1063,18 @@ dev10 wheel's `sglang/srt/`, and its section 5 reviews the dev13 delta). Citatio
     and 1514 for gundam (`doc_split.py:28-35,141-143`).
   - In the wheel, `ctx` is the server's `max_req_input_len` (`W/entrypoints/openai/serving_chat.py:378`)
     = min(context_len − 1, KV pool − 1) − 5 (`W/managers/tp_worker.py:544-557`). context_len defaults
-    to min((W+la)·2034 + W·max_page_tokens + 1024, 131072) (`W/configs/model_config.py:305-327`), so
-    under the README configuration ctx ≤ 131,066. It does not matter at W = 10, where the `W` term
-    binds.
+    to min((W+la)·2034 + W·max_page_tokens + 1024, 131072), with W the larger of the gundam and base
+    windows, or to 131,072 outright when the doc limit is off or the page cap is ≤ 0
+    (`W/configs/model_config.py:305-327`). So under the README configuration ctx ≤ 131,066. It does
+    not matter at W = 10, where the `W` term binds.
   - franken_ocr's bound adds the output side, because outputs share the window's 131,072 positions:
     own pages per window = min(prompt-derived bound, W, the U2-B6/C4 pre-windowing page limit, D11).
 - **Ownership.** Windows are contiguous and own their pages. Every window except the last also encodes
   **one lookahead page**, the next window's first page, which is never transcribed.
-- **Short documents.** If `N ≤ W`, decoding is unwindowed. The wheel would still split if `max_tokens`
-  exceeded capacity (`:149-156`), but franken_ocr has no global cap in document mode (D11), so that
-  cannot arise.
+- **Short documents.** If `N ≤ W`, decoding is unwindowed. The wheel never splits a document that
+  fits: it returns one window `[(0, N, 0)]`, with no lookahead and `max_tokens` clamped to its
+  capacity, or no plan at all (`doc_split.py:150-156`). franken_ocr has no global cap in document mode
+  (D11), so the clamp does not arise.
 
 **5.10.2 Window 0 and any recomputed window.**
 - Prompt: `[BOS] (<PAGE> img)×(own) [<PAGE> img(lookahead)] "Multi page parsing."`, with **page_base =
@@ -1082,8 +1084,10 @@ dev10 wheel's `sglang/srt/`, and its section 5 reviews the dev13 delta). Citatio
   because `marks > expected` forces EOS. A natural EOS on the last own page is also accepted.
 
 **5.10.3 Retention at the end of window k.** This applies only if window k ended by EOS (or a stop
-string) and is not the last window. Keep exactly these KV rows with their router index keys, and free
-the rest. Page state is **not** copied; it is replayed in the new frame (§5.10.4; `:500-516`, where
+string) and is not the last window. Keep these KV rows with their router index keys, and free the
+rest. The wheel keeps the whole 32-row KV pages that hold them, clipped to the allocation
+(`tail_ranges`, `:323-366`; `_trim_to_tails` frees only the gaps, `:903-932`). Only these rows are
+read, so that affects memory only. Page state is **not** copied; it is replayed in the new frame (§5.10.4; `:500-516`, where
 `move_kv_cache` is followed by `_write_page_state` from `replay_page_isolation`, and `:1120-1138`):
 - **(a)** the `<PAGE>` marker of window k's last own page. This page is the **tail page**, global page
   lo−1.
@@ -1118,16 +1122,20 @@ rope_page_coord = local_bucket + (page_base mod 2)   if local_bucket > 0
 - Either way, `local_bucket + page_base` ≡ global bucket (= global page + 1) mod 2 for every row.
 
 *Recomputed state.* **Router block summaries are recomputed** for the new block grouping. **Page state
-is replayed** in the new frame:
+is replayed** in the new frame. A slot's img_page is the page its key belongs to in the Page Gate, −1
+on every non-image row (`replay_page_isolation`, `:368-387`; the text splice writes
+`(-1, *plan.iso)`, `:1274`). The query page applies only to rows that query in the new frame; copied
+and spliced rows never do.
 
-| Row class | Gate page (img_page / query page) | RoPE bucket (before base) | tok_pos |
-|---|---|---|---|
-| (a) tail marker | 0 | 1 | kept (copied) |
-| (b) tail image rows | 0 | 1 | kept (copied) |
-| (c) lookahead marker + images | 1 | 2 | kept (copied) |
-| first newly prefilled marker (page lo+1) | 2 | 3 | 0 |
-| (d) text tail | 0 (response of local page 0) | 1 (carry `mc + CONTEXT_PAGES`, `:409-437,1274`) | kept (copied) |
-| forced `<PAGE>` (opens page lo) | 1 | 2 | `pf_cnt[2] = 1 + n_img(lo)` |
+| Row class | Slot img_page | Query page | RoPE bucket (before base) | tok_pos |
+|---|---|---|---|---|
+| (a) tail marker | −1 | – | 1 | kept (copied) |
+| (b) tail image rows | 0 | – | 1 | kept (copied) |
+| (c) lookahead marker | −1 | – | 2 | kept (copied) |
+| (c) lookahead images | 1 | – | 2 | kept (copied) |
+| first newly prefilled marker (page lo+1) | −1 | 2 | 3 | 0 |
+| (d) text tail | −1 | – | 1 (carry `mc + CONTEXT_PAGES`, `:409-437,1274`) | kept (copied) |
+| forced `<PAGE>` (opens page lo) | −1 | 1 | 2 | `pf_cnt[2] = 1 + n_img(lo)` |
 
 U2-D1a's first deliverable re-derives this table from the wheel and asserts it in unit tests. U2-D2b
 checks it against the U2-D2a Python windowed oracle.
@@ -1166,7 +1174,16 @@ least one token to run.
   than 128 + (E mod 32) image tokens (`:256-268`);
 - (v) there was no output at all, or `len(tail) + 2 ≥ max_new_tokens` (`:1069-1077`);
 - (vi) KV allocation fails (`:1093`);
-- (vii) a multimodal item straddles the copy boundary (`:1095`).
+- (vii) a multimodal item straddles the copy boundary (`:1095`);
+- (viii) the reuse planning raises; `try_match_prefix` catches it and recomputes (`:963-971`);
+- (ix) a matched follow-up cannot be admitted while nothing runs, so its reuse is dropped after the
+  prompt rewrite and the prompt is restored (`:792-795` → `_drop_reuse` `:684-691` →
+  `_restore_prompt` `:660-681`). franken_ocr has no shared KV pool; this maps onto (vi).
+
+A finished window whose prompt does not parse is never retained (`next_page_after` returns None,
+`:884-885`), a case of (i). The `cache.page_size != bs` check (`:1047`) cannot fire, because the
+model override forces page_size to the 32-row block
+(`W/arg_groups/model_overrides/unlimited_ocr_v2.py:24-32`).
 
 An empty last body is **not** a fallback (`:319-320`). A recomputed window has BOS and the instruction,
 and no cross-window context.
@@ -1193,11 +1210,12 @@ last-page `<PAGE>` ban applies (§5.10.7), and it is compared through EOS. U2-D2
 configuration (page_base, expected marker count, end_on_marker, logit-processor order) from the wheel
 source and records it in its notes.
 
-HF `infer_multi` is **not** that reference when lo is odd:
-- the page parity differs (`serving_chat.py:512-515`, `KEY_PAGE_BASE: lo`;
-  `unlimited_ocr_v2_backend.py:1008-1031`);
-- HF's expected count is all markers (`MU:1141`), so it keeps transcribing the lookahead page;
-- HF applies n-gram before the guard (`MU:1168-1172`).
+HF `infer_multi` is **not** that reference for any window, whatever lo's parity:
+- HF's expected count is all markers (`MU:1141`), so it keeps transcribing the lookahead page, while
+  the wheel's excludes it and ends on the marker (`custom_logit_processor.py:227-237`);
+- HF applies n-gram before the guard (`MU:1168-1172`);
+- when lo is odd, the page parity differs as well (`serving_chat.py:512-515`, `KEY_PAGE_BASE: lo`;
+  `unlimited_ocr_v2_backend.py:1008-1031`).
 
 **5.10.6 Positions.** 1-D positions are window-local; they only index blocks and causality. There are
 no absolute document positions, and the 131072 limit applies per window.
