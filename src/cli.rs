@@ -308,6 +308,11 @@ pub struct OcrRequestArgs {
     /// unlimited-ocr). (got-ocr2's guard is global.)
     #[arg(long)]
     pub ngram_window: Option<i64>,
+    /// Generated-token cap per page for unlimited-ocr-2. Default: the model's
+    /// (20,000). 0 lifts this cap only: `--max-length` and the position limit
+    /// still apply. Models without pages ignore it.
+    #[arg(long)]
+    pub max_page_tokens: Option<i64>,
     /// GOT-OCR2 structured output: use the model's `OCR with format:` mode instead
     /// of plain text, emitting Mathpix-Markdown (.mmd) — inline LaTeX math, Markdown
     /// tables, TikZ geometry, SMILES molecules, and `**kern` sheet music (the model
@@ -384,6 +389,7 @@ pub struct OcrRequest {
     pub temperature: Option<f32>,
     pub no_repeat_ngram: Option<u32>,
     pub ngram_window: Option<u32>,
+    pub max_page_tokens: Option<u32>,
     pub format: bool,
     pub question: Option<String>,
     pub pages: Option<String>,
@@ -433,6 +439,7 @@ fn decode_overrides_from(request: &OcrRequest) -> native_engine::DecodeOverrides
         temperature: request.temperature,
         no_repeat_ngram: request.no_repeat_ngram.map(|v| v as usize),
         ngram_window: request.ngram_window.map(|v| v as usize),
+        max_page_tokens: request.max_page_tokens.map(|v| v as usize),
     }
 }
 
@@ -471,6 +478,10 @@ impl OcrRequestArgs {
             ngram_window: self
                 .ngram_window
                 .map(|v| non_negative_u32("ngram-window", v))
+                .transpose()?,
+            max_page_tokens: self
+                .max_page_tokens
+                .map(|v| non_negative_u32("max-page-tokens", v))
                 .transpose()?,
             // `--format` and a format-implying `--task` compose OR-wise: an
             // explicit `--format` wins / is idempotent alongside `--task`.
@@ -820,7 +831,7 @@ pub enum SyncCmd {
 #[derive(Subcommand)]
 pub enum RobotCmd {
     /// Stream OCR pipeline events as NDJSON.
-    Run(RobotRunArgs),
+    Run(Box<RobotRunArgs>),
     /// Self-describing event/contract schema (versioned).
     Schema,
     /// Diagnostics: model present? arch features? threads?
@@ -902,7 +913,7 @@ pub fn run(cli: Cli) -> FocrResult<()> {
             cmd: RobotCmd::Run(args),
         } => {
             emit(&robot::run_start_event("ocr"));
-            run_ocr(args.into_ocr_args(), true)
+            run_ocr((*args).into_ocr_args(), true)
         }
         Command::Robot {
             cmd: RobotCmd::Schema,
@@ -1049,9 +1060,9 @@ fn output_is_json(output: Option<&Path>) -> bool {
 }
 
 /// Write the recognition result to `path` as pretty JSON (with per-span bounding
-/// boxes + any extracted `figures`) when `want_json`, else as the rendered
-/// markdown. Both forms end with a trailing newline so the file is well-formed for
-/// downstream tools.
+/// boxes + any extracted `figures`, and the `model` that ran) when `want_json`,
+/// else as the rendered markdown. Both forms end with a trailing newline so the
+/// file is well-formed for downstream tools.
 fn write_ocr_output(
     path: &Path,
     rec: &Recognition,
@@ -1059,6 +1070,7 @@ fn write_ocr_output(
     figures: &[WrittenFigure],
     music_meta: Option<&native_engine::MusicPageMeta>,
     run_warnings: &[native_engine::RunWarning],
+    model: Option<&native_engine::ModelIdentity>,
 ) -> FocrResult<()> {
     let contents = if want_json {
         let mut value = rec.to_json(figures);
@@ -1067,6 +1079,9 @@ fn write_ocr_output(
             value["warnings"] = music_warnings_to_json(meta);
         }
         merge_run_warnings(&mut value, run_warnings);
+        if let Some(model) = model {
+            model.merge_into(&mut value);
+        }
         let mut s = serde_json::to_string_pretty(&value).map_err(|e| {
             FocrError::Other(anyhow::anyhow!(
                 "serializing OCR JSON for {}: {e}",
@@ -1326,7 +1341,8 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         .as_ref()
         .map_or_else(|| "default".to_owned(), |p| p.display().to_string());
     let started = crate::storage::now_millis();
-    let outcome = run_ocr_inner(args, robot_mode);
+    let mut ran = None;
+    let outcome = run_ocr_inner(args, robot_mode, &mut ran);
     let quant = if telemetry_model.contains("int8") {
         "int8"
     } else if telemetry_model.contains("int4") {
@@ -1346,7 +1362,12 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         input_path: telemetry_input,
         mode: "ocr".into(),
         quant: quant.into(),
-        model_version_tag: telemetry_model,
+        // `<model_id>@<source_sha256>` for the model that ran (U2-E1, D25);
+        // `unknown` when the run ended before one loaded.
+        model_version_tag: ran.as_ref().map_or_else(
+            || "unknown".to_owned(),
+            native_engine::ModelIdentity::version_tag,
+        ),
         exit_code,
         status: status.into(),
     };
@@ -1372,7 +1393,14 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     outcome
 }
 
-fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
+/// One `focr ocr` run. `ran` is set to the model that served it as soon as the
+/// recognition returns, so the run store records it even when the run then
+/// fails (a partial document, a low yield).
+fn run_ocr_inner(
+    args: OcrArgs,
+    robot_mode: bool,
+    ran: &mut Option<native_engine::ModelIdentity>,
+) -> FocrResult<()> {
     let request = args.to_request()?;
     // GOT-OCR2 `--format` (.mmd) mode and the decode tuning flags (`--max-length`,
     // `--temperature`, `--no-repeat-ngram`, `--ngram-window`) are threaded to the
@@ -1448,8 +1476,10 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         source_warnings.iter().for_each(print_run_warning);
     }
     // A resident run decodes in the daemon, which reports its finish_reason
-    // in the reply (U2-X2); inline runs leave it on this engine's model.
+    // (U2-X2) and model (U2-E1) in the reply; inline runs leave both on this
+    // engine's model.
     let mut resident_finish: Option<native_engine::FinishReason> = None;
+    let mut resident_model: Option<native_engine::ModelIdentity> = None;
     let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, source) {
         (Some(plan), Some(source)) => {
             let (pages, figs) = recognize_document_pages_with_figures(
@@ -1515,6 +1545,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
                 let doc = match resident_recognition(&args, &request)? {
                     Some(reply) => {
                         resident_finish = reply.finish_reason;
+                        resident_model = reply.model;
                         reply.document
                     }
                     None => {
@@ -1538,6 +1569,8 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         .as_ref()
         .map(native_engine::DecodeReport::run_finish_reason)
         .or(resident_finish);
+    let model = resident_model.or_else(|| engine.loaded_model_identity());
+    ran.clone_from(&model);
     let mut run_warnings = source_warnings;
     run_warnings.extend(
         decode_report
@@ -1546,10 +1579,13 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             .unwrap_or_default(),
     );
     // An Unlimited-OCR-2 document that stopped at its position limit or
-    // stage budget writes what it produced below, then exits 5 (U2-B6).
+    // stage budget writes what it produced below, then exits 5 (U2-B6). A
+    // decode report comes from this engine's loaded model, so `model` is
+    // known whenever there is one.
     let partial = decode_report
         .as_ref()
-        .and_then(|report| native_engine::partial_output(report, &run_warnings));
+        .zip(model.as_ref())
+        .and_then(|(report, model)| native_engine::partial_output(report, &run_warnings, model));
     if !robot_mode {
         print_run_warnings(&run_warnings);
     }
@@ -1639,6 +1675,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             &figures,
             music_meta.as_ref(),
             &run_warnings,
+            model.as_ref(),
         )?;
     }
 
@@ -1653,6 +1690,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
                 low_yield.as_ref(),
                 finish_reason,
                 &run_warnings,
+                model.as_ref(),
             ));
         }
     } else if let Some(path) = args.output.as_deref() {
@@ -1675,6 +1713,9 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             value["warnings"] = music_warnings_to_json(meta);
         }
         merge_run_warnings(&mut value, &run_warnings);
+        if let Some(model) = &model {
+            model.merge_into(&mut value);
+        }
         emit(&value);
     } else {
         println!("{markdown}");
@@ -2346,13 +2387,17 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         }?;
         let elapsed = total.elapsed().as_secs_f64();
         let report = engine.take_last_decode_report();
+        let model = engine.loaded_model_identity();
         let run_warnings = report
             .as_ref()
             .map(native_engine::decode_warnings)
             .unwrap_or_default();
         let partial = report
             .as_ref()
-            .and_then(|report| native_engine::partial_output(report, &run_warnings));
+            .zip(model.as_ref())
+            .and_then(|(report, model)| {
+                native_engine::partial_output(report, &run_warnings, model)
+            });
         print_run_warnings(&run_warnings);
         if args.json {
             let mut value = serde_json::json!({
@@ -2367,6 +2412,9 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
                 value["finish_reason"] = report.run_finish_reason().as_str().into();
             }
             merge_run_warnings(&mut value, &run_warnings);
+            if let Some(model) = &model {
+                model.merge_into(&mut value);
+            }
             emit(&value);
         } else {
             println!("{markdown}");
@@ -2819,8 +2867,15 @@ fn model_arch_json(a: &dyn crate::model_arch::ModelArch) -> serde_json::Value {
         "decoder": format!("{:?}", a.decoder()),
         "tokenizer": format!("{:?}", a.tokenizer()),
         "default_artifact": a.default_artifact_basename(),
+        "recipe": a.required_quant_recipe("int8"),
         "license": a.license_notice(),
     })
+}
+
+/// Whether `arch`'s own artifact is installed: its registry id resolves, and
+/// the bounded header probe finds that model there (U2-E1).
+fn model_installed(arch: &dyn crate::model_arch::ModelArch) -> bool {
+    native_engine::model_id_at(Path::new(arch.id())) == Some(arch.id())
 }
 
 #[derive(Debug, Default)]
@@ -2874,6 +2929,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             .iter()
             .map(|a| {
                 let mut j = model_arch_json(*a);
+                j["installed"] = model_installed(*a).into();
                 let pull = pull_availability(Some(&manifest), a.id());
                 j["pull"] = serde_json::json!({
                     "in_manifest": pull.in_manifest,
@@ -2897,7 +2953,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "models": models,
             "guidance": {
                 "unlimited-ocr": "default runtime; FAST plain-text OCR; `focr pull` installs the conservative exact-recipe int8 artifact",
-                "unlimited-ocr-2": "experimental: Baidu's long-document successor (SR-SWA); runs from its raw checkpoint (`--model <dir>`) on single pages and on documents of up to 60 pages (`--multi-page`), not yet certified against the reference — use unlimited-ocr for production",
+                "unlimited-ocr-2": "experimental; best for documents and long documents: Baidu's long-document successor (SR-SWA); runs from its raw checkpoint (`--model unlimited-ocr-2` once it is in a model directory, or `--model <dir>`) on single pages and on documents of up to 60 pages (`--multi-page`), not yet certified against the reference — use unlimited-ocr for production",
                 "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text; shorthand: `focr ocr --task formula|tables|chart|molecular|geometry|music` (implies `--format`)"
             },
         }));
@@ -2905,8 +2961,8 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         // TASKS last: its width varies per model (GOT-OCR2 serves seven), so a
         // fixed-width column would misalign — keep it trailing.
         println!(
-            "{:<16}  {:<12}  {:<12}  {:<22}  TASKS",
-            "ID", "STATUS", "PULL", "MODEL"
+            "{:<16}  {:<12}  {:<12}  {:<5}  {:<22}  TASKS",
+            "ID", "STATUS", "PULL", "LOCAL", "MODEL"
         );
         for a in archs {
             let tasks = a
@@ -2932,10 +2988,11 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 "-".to_owned()
             };
             println!(
-                "{:<16}  {:<12}  {:<12}  {:<22}  {}",
+                "{:<16}  {:<12}  {:<12}  {:<5}  {:<22}  {}",
                 a.id(),
                 status,
                 pull,
+                if model_installed(*a) { "yes" } else { "-" },
                 a.display_name(),
                 tasks
             );
@@ -2944,6 +3001,11 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         println!("Choosing a model:");
         println!("  unlimited-ocr (default)  FAST plain-text OCR. `focr pull` installs the");
         println!("                           conservative exact-recipe int8 artifact.");
+        println!("  unlimited-ocr-2          EXPERIMENTAL. Best for documents and long documents");
+        println!("                           (`--multi-page` over a PDF or a directory of pages).");
+        println!("                           Runs from its raw checkpoint; not yet certified");
+        println!("                           against the reference, so unlimited-ocr stays the");
+        println!("                           default.");
         println!(
             "  got-ocr2                 SPECIALIZED structured output the default can't produce:"
         );
@@ -3573,6 +3635,7 @@ mod tests {
                     temperature: None,
                     no_repeat_ngram: None,
                     ngram_window: None,
+                    max_page_tokens: None,
                     format: false,
                     task: OcrTask::Ocr,
                     question: None,
@@ -3596,7 +3659,7 @@ mod tests {
     fn robot_run_selects_robot_error_mode() {
         let cli = Cli {
             command: Command::Robot {
-                cmd: RobotCmd::Run(RobotRunArgs {
+                cmd: RobotCmd::Run(Box::new(RobotRunArgs {
                     request: OcrRequestArgs {
                         image: PathBuf::from("scan.png"),
                         model: None,
@@ -3607,6 +3670,7 @@ mod tests {
                         temperature: None,
                         no_repeat_ngram: None,
                         ngram_window: None,
+                        max_page_tokens: None,
                         format: false,
                         task: OcrTask::Ocr,
                         question: None,
@@ -3616,7 +3680,7 @@ mod tests {
                         no_resident: false,
                         fail_on_low_yield: false,
                     },
-                }),
+                })),
             },
         };
         assert_eq!(ErrorMode::from_cli(&cli), ErrorMode::Robot);
@@ -3635,6 +3699,7 @@ mod tests {
                 temperature: None,
                 no_repeat_ngram: None,
                 ngram_window: None,
+                max_page_tokens: None,
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,
@@ -3966,6 +4031,8 @@ mod tests {
             "20",
             "--ngram-window",
             "1024",
+            "--max-page-tokens",
+            "0",
         ])
         .expect("ocr with tuning flags parses");
         let Command::Ocr(args) = cli.command else {
@@ -3976,6 +4043,7 @@ mod tests {
         assert_eq!(o.temperature, Some(0.5));
         assert_eq!(o.no_repeat_ngram, Some(20));
         assert_eq!(o.ngram_window, Some(1024));
+        assert_eq!(o.max_page_tokens, Some(0));
 
         // An explicit value equal to unlimited-ocr's default is still forwarded:
         // another model's defaults differ (U2-E1).
@@ -4179,12 +4247,16 @@ mod tests {
 
         // Markdown form: source lacks a trailing newline, so one is appended.
         let md_path = dir.join("out.md");
-        write_ocr_output(&md_path, &rec, false, &[], None, &[]).expect("write md");
+        write_ocr_output(&md_path, &rec, false, &[], None, &[], None).expect("write md");
         assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "hello world\n");
 
         // JSON form: valid JSON, newline-terminated, carrying the bounding boxes.
         let json_path = dir.join("out.json");
-        write_ocr_output(&json_path, &rec, true, &[], None, &[]).expect("write json");
+        let model = native_engine::ModelIdentity {
+            model_id: "unlimited-ocr",
+            source_sha256: Some("cd".repeat(32)),
+        };
+        write_ocr_output(&json_path, &rec, true, &[], None, &[], Some(&model)).expect("write json");
         let raw = std::fs::read_to_string(&json_path).unwrap();
         assert!(raw.ends_with('\n'), "json file should end with a newline");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
@@ -4193,6 +4265,9 @@ mod tests {
             parsed["layout"][0]["boxes"][0],
             serde_json::json!([1, 2, 3, 4])
         );
+        // U2-E1: the model that ran rides along.
+        assert_eq!(parsed["model_id"], "unlimited-ocr");
+        assert_eq!(parsed["source_sha256"], "cd".repeat(32));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4210,6 +4285,7 @@ mod tests {
                 temperature: None,
                 no_repeat_ngram: None,
                 ngram_window: None,
+                max_page_tokens: None,
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,

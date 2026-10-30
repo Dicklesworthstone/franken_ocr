@@ -386,6 +386,16 @@ impl OcrEngine {
             .and_then(|model| model.take_last_decode())
     }
 
+    /// The identity of the model this engine last loaded (U2-E1); `None`
+    /// before any load.
+    #[must_use]
+    pub fn loaded_model_identity(&self) -> Option<native_engine::ModelIdentity> {
+        self.model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|model| model.identity()))
+    }
+
     /// Construct the engine, building the single owned `asupersync` runtime
     /// (plan §3.3: `worker_threads(2)`, `blocking_threads(1, 4)`,
     /// `thread_name_prefix("focr")`). The model is loaded lazily on the first

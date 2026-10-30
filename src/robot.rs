@@ -136,16 +136,19 @@ pub fn event_fields() -> Value {
         "run_complete": {
             "required": ["schema_version", "event", "markdown"],
             // `finish_reason` is on every run whose model records a decode
-            // report (every Unlimited-OCR run); `warnings` only when non-empty.
+            // report (every Unlimited-OCR run); `warnings` only when non-empty;
+            // `model_id` and `source_sha256` (null for a raw checkpoint)
+            // whenever the model that ran is known.
             "optional": [
                 "finish_reason", "warnings", "low_yield", "yield_chars", "input_megapixels",
+                "model_id", "source_sha256",
             ],
         },
         "run_error": {
             "required": ["schema_version", "event", "error_kind", "code", "message", "recovery"],
             // A partial-output run_error (completed pages written, then a
             // nonzero exit) adds these; their producers are the v2 beads.
-            "optional": ["finish_reason", "pages_out", "warnings"],
+            "optional": ["finish_reason", "pages_out", "warnings", "model_id", "source_sha256"],
         },
     })
 }
@@ -176,7 +179,7 @@ pub fn robot_schema() -> Value {
             "doctor": "focr doctor --json",
         },
         "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
-        "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out` and `warnings` when a document stopped early (exit 5, no `run_complete`)"
+        "status": "live — run_start/run_complete (carries `markdown`, `finish_reason`, `model_id` and `source_sha256`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` when a document stopped early (exit 5, no `run_complete`)"
     })
 }
 
@@ -220,13 +223,19 @@ pub fn run_complete_event(markdown: &str) -> Value {
 /// U2-X2 adds `finish_reason` (`stop` | `length` | `budget`) whenever the decode
 /// recorded one, and `warnings` (`{kind, message, recovery, ...}`) only when
 /// non-empty, so a healthy run differs from before only by `finish_reason`.
+/// U2-E1 adds `model_id` and `source_sha256` whenever the model that ran is
+/// known.
 pub fn run_complete_event_assessed(
     markdown: &str,
     low_yield: Option<&crate::tall::LowYield>,
     finish_reason: Option<crate::native_engine::FinishReason>,
     warnings: &[crate::native_engine::RunWarning],
+    model: Option<&crate::native_engine::ModelIdentity>,
 ) -> Value {
     let mut event = run_complete_event(markdown);
+    if let Some(model) = model {
+        model.merge_into(&mut event);
+    }
     if let Some(assessment) = low_yield {
         event["low_yield"] = json!(true);
         event["yield_chars"] = json!(assessment.yield_chars);
@@ -267,6 +276,8 @@ pub fn run_error_event(err: &FocrError) -> Value {
         if !partial.warnings.is_empty() {
             event["warnings"] = partial.warnings.clone().into();
         }
+        event["model_id"] = partial.model_id.into();
+        event["source_sha256"] = partial.source_sha256.clone().into();
     }
     event
 }
@@ -435,6 +446,8 @@ mod tests {
             finish_reason: "length",
             pages_out: 2,
             warnings: vec![warning.clone()],
+            model_id: "unlimited-ocr-2",
+            source_sha256: None,
             message: "stopped in page 2 of 3".into(),
         }));
         let event = run_error_event(&err);
@@ -443,6 +456,8 @@ mod tests {
         assert_eq!(event["finish_reason"], "length");
         assert_eq!(event["pages_out"], 2);
         assert_eq!(event["warnings"], json!([warning]));
+        assert_eq!(event["model_id"], "unlimited-ocr-2");
+        assert_eq!(event["source_sha256"], serde_json::Value::Null);
         assert!(
             event["message"]
                 .as_str()

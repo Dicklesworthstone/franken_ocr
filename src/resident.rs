@@ -46,7 +46,7 @@ use crate::error::{
     EXIT_CANCELLED, EXIT_FORMAT_MISMATCH, EXIT_INPUT_DECODE, EXIT_MODEL_NOT_FOUND, EXIT_TIMEOUT,
     EXIT_USAGE, FocrError, FocrResult,
 };
-use crate::native_engine::{DecodeOverrides, FinishReason, PreprocessOverrides};
+use crate::native_engine::{DecodeOverrides, FinishReason, ModelIdentity, PreprocessOverrides};
 use crate::{LayoutSpan, OcrEngine, RecognizedDocument};
 
 /// Default idle unload period. Overridable through `FOCR_RESIDENT_IDLE_SECS`
@@ -280,13 +280,31 @@ fn env_fingerprint() -> Value {
 // ------------------------------------------------------------------------ client
 
 /// A daemon's successful reply: the document plus how its decode ended
-/// (U2-X2), so a resident run reports the same `finish_reason` an inline one
-/// would.
+/// (U2-X2) and which model ran (U2-E1), so a resident run reports the same
+/// `finish_reason` and `model_id` an inline one would.
 pub struct ResidentReply {
     /// The recognized document.
     pub document: RecognizedDocument,
     /// `None` when the daemon's model recorded no decode report.
     pub finish_reason: Option<FinishReason>,
+    /// `None` when the reply names no model this binary registers.
+    pub model: Option<ModelIdentity>,
+}
+
+/// The reply's `model_id`/`source_sha256` pair, its id mapped back onto the
+/// registry.
+fn model_from_reply(reply: &Value) -> Option<ModelIdentity> {
+    let arch = reply
+        .get("model_id")
+        .and_then(Value::as_str)
+        .and_then(crate::native_engine::model_arch::arch_by_id)?;
+    Some(ModelIdentity {
+        model_id: arch.id(),
+        source_sha256: reply
+            .get("source_sha256")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
 }
 
 /// One recognition request as it crosses the wire: everything the daemon needs
@@ -317,6 +335,7 @@ fn options_value(request: &ResidentRequest<'_>) -> Value {
             "temperature": request.decode.temperature,
             "no_repeat_ngram": request.decode.no_repeat_ngram,
             "ngram_window": request.decode.ngram_window,
+            "max_page_tokens": request.decode.max_page_tokens,
         },
         "preprocess": {
             "base_size": request.preprocess.base_size,
@@ -576,6 +595,7 @@ fn roundtrip(
         return Ok(Some(ResidentReply {
             document: RecognizedDocument { markdown, layout },
             finish_reason,
+            model: model_from_reply(&reply),
         }));
     }
     // A recognition error is real and final; anything transport-shaped means
@@ -733,6 +753,7 @@ fn decode_overrides_from_wire(options: &Value) -> DecodeOverrides {
             .map(|t| t as f32),
         no_repeat_ngram: usize_of("no_repeat_ngram"),
         ngram_window: usize_of("ngram_window"),
+        max_page_tokens: usize_of("max_page_tokens"),
     }
 }
 
@@ -982,12 +1003,15 @@ fn handle_connection(
                 .engine
                 .take_last_decode_report()
                 .map(|report| report.run_finish_reason().as_str());
-            let reply = json!({
+            let mut reply = json!({
                 "ok": true,
                 "markdown": document.markdown,
                 "layout": layout,
                 "finish_reason": finish_reason,
             });
+            if let Some(model) = engine.engine.loaded_model_identity() {
+                model.merge_into(&mut reply);
+            }
             let _ = stream.write_all(format!("{reply}\n").as_bytes());
             let _ = stream.flush();
         }
@@ -1051,6 +1075,7 @@ mod tests {
                 temperature: Some(0.5),
                 no_repeat_ngram: None,
                 ngram_window: Some(512),
+                max_page_tokens: Some(0),
             },
             preprocess: PreprocessOverrides {
                 base_size: Some(1024),
@@ -1066,6 +1091,7 @@ mod tests {
         assert_eq!(decode.temperature, Some(0.5));
         assert_eq!(decode.no_repeat_ngram, None);
         assert_eq!(decode.ngram_window, Some(512));
+        assert_eq!(decode.max_page_tokens, Some(0));
         let preprocess = preprocess_overrides_from_wire(&wire);
         assert_eq!(preprocess.base_size, Some(1024));
         assert_eq!(preprocess.image_size, None);

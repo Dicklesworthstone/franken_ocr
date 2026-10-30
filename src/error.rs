@@ -85,7 +85,8 @@ pub const EXIT_CODE_TABLE: &[ExitCodeSpec] = &[
 ];
 
 /// What a run that stopped early wrote before failing (U2-B6): the additive
-/// `finish_reason`, `pages_out` and `warnings` of its robot `run_error`.
+/// `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` of
+/// its robot `run_error`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartialOutput {
     /// `length` (the position limit) or `budget` (the stage budget).
@@ -94,6 +95,10 @@ pub struct PartialOutput {
     pub pages_out: usize,
     /// The run's warnings, each a `{kind, message, recovery, ...}` object.
     pub warnings: Vec<serde_json::Value>,
+    /// The model that wrote the pages (U2-E1).
+    pub model_id: &'static str,
+    /// Its recorded source digest; `None` for a raw checkpoint.
+    pub source_sha256: Option<String>,
     /// The human summary.
     pub message: String,
 }
@@ -257,6 +262,8 @@ mod tests {
             finish_reason: "length",
             pages_out: 2,
             warnings: Vec::new(),
+            model_id: "unlimited-ocr-2",
+            source_sha256: None,
             message: "x".into(),
         }));
         assert_eq!(partial.exit_code(), EXIT_TIMEOUT);

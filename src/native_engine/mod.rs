@@ -900,6 +900,37 @@ impl RunWarning {
     }
 }
 
+/// The model that served a run (U2-E1, D25): its registry id and the source
+/// digest a `.focrq` records in its fixed prefix. A raw checkpoint load hashes
+/// nothing (docs/focrq-format.md), so its digest is `None`; nothing here
+/// hashes the artifact file itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelIdentity {
+    /// The [`model_arch::ModelArch::id`] that ran.
+    pub model_id: &'static str,
+    /// The lowercase-hex `source_sha256` the artifact records, if any.
+    pub source_sha256: Option<String>,
+}
+
+impl ModelIdentity {
+    /// The run store's `model_version_tag`: `<model_id>@<source_sha256>`, or
+    /// the bare id when the artifact records no digest.
+    #[must_use]
+    pub fn version_tag(&self) -> String {
+        match &self.source_sha256 {
+            Some(sha) => format!("{}@{sha}", self.model_id),
+            None => self.model_id.to_owned(),
+        }
+    }
+
+    /// Set `model_id` and `source_sha256` (`null` without a digest) on a JSON
+    /// object.
+    pub fn merge_into(&self, value: &mut serde_json::Value) {
+        value["model_id"] = self.model_id.into();
+        value["source_sha256"] = self.source_sha256.clone().into();
+    }
+}
+
 /// `32768` → `"32,768"`.
 fn thousands(n: usize) -> String {
     let digits = n.to_string();
@@ -1044,10 +1075,15 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
 
 /// The partial-output error (exit 5) for a run whose Unlimited-OCR-2 decode
 /// stopped at its position limit or stage budget, carrying `warnings` (the
-/// run's, in order); `None` for every other run (U2-B6). The CLI returns it
-/// after writing the pages, so a short document never exits 0.
+/// run's, in order) and the `model` that wrote the pages; `None` for every
+/// other run (U2-B6). The CLI returns it after writing the pages, so a short
+/// document never exits 0.
 #[must_use]
-pub fn partial_output(report: &DecodeReport, warnings: &[RunWarning]) -> Option<FocrError> {
+pub fn partial_output(
+    report: &DecodeReport,
+    warnings: &[RunWarning],
+    model: &ModelIdentity,
+) -> Option<FocrError> {
     report.document.as_ref()?;
     let finish = report.run_finish_reason();
     if finish == FinishReason::Stop {
@@ -1058,6 +1094,8 @@ pub fn partial_output(report: &DecodeReport, warnings: &[RunWarning]) -> Option<
         finish_reason: finish.as_str(),
         pages_out,
         warnings: warnings.iter().map(RunWarning::to_json).collect(),
+        model_id: model.model_id,
+        source_sha256: model.source_sha256.clone(),
         message: format!(
             "the document stopped early ({}) after {pages_out} of {expected} page bodies; the \
              pages produced were written",
@@ -1362,6 +1400,9 @@ pub struct DecodeOverrides {
     pub no_repeat_ngram: Option<usize>,
     /// Sliding no-repeat n-gram lookback window (`--ngram-window`).
     pub ngram_window: Option<usize>,
+    /// A paged model's generated-token cap per page (`--max-page-tokens`; 0
+    /// lifts only this cap). Other models have no pages and ignore it.
+    pub max_page_tokens: Option<usize>,
 }
 
 /// CLI preprocess overrides (`--base-size`, `--image-size`, `--crop-mode`) —
@@ -1460,6 +1501,7 @@ static DECODE_OVERRIDES: Mutex<DecodeOverrides> = Mutex::new(DecodeOverrides {
     temperature: None,
     no_repeat_ngram: None,
     ngram_window: None,
+    max_page_tokens: None,
 });
 
 /// Set (or clear, with `DecodeOverrides::default()`) the process-wide decode
@@ -1550,7 +1592,9 @@ fn decode_params_for(arch: &dyn model_arch::ModelArch) -> DecodeParams {
         if !matches!(test_max_positions(), Ok(Some(_))) {
             p.max_positions = sampler::UOCR2_MAX_POSITIONS;
         }
-        p.max_page_tokens = pages.max_page_tokens;
+        p.max_page_tokens = decode_overrides()
+            .max_page_tokens
+            .unwrap_or(pages.max_page_tokens);
         if let Ok(domain) = srswa::entmax_domain() {
             p.entmax_domain = *domain;
         }
@@ -3675,6 +3719,16 @@ impl OcrModel {
     #[must_use]
     pub fn arch(&self) -> &'static dyn model_arch::ModelArch {
         self.arch
+    }
+
+    /// Which model this is, for a run's outputs (U2-E1).
+    #[must_use]
+    pub fn identity(&self) -> ModelIdentity {
+        let sha = self.weights.source_sha256();
+        ModelIdentity {
+            model_id: self.arch.id(),
+            source_sha256: (!sha.is_empty()).then(|| sha.to_owned()),
+        }
     }
 
     /// Guard the per-arch forward dispatch (A1): an IMPLEMENTED arch proceeds; a
@@ -6518,10 +6572,15 @@ mod tests {
                 admission_warnings: vec![lever.clone()],
             };
 
+        let model = ModelIdentity {
+            model_id: model_arch::UNLIMITED_OCR_V2_ID,
+            source_sha256: None,
+        };
+        assert_eq!(model.version_tag(), "unlimited-ocr-2");
         let done = report(FinishReason::Stop, 3, false);
         let warnings = decode_warnings(&done);
         assert_eq!(warnings, std::slice::from_ref(&lever));
-        assert!(partial_output(&done, &warnings).is_none());
+        assert!(partial_output(&done, &warnings, &model).is_none());
 
         let cut = report(FinishReason::Length, 2, true);
         let warnings = decode_warnings(&cut);
@@ -6541,7 +6600,7 @@ mod tests {
             "{}",
             warnings[2].message
         );
-        let Some(FocrError::Partial(partial)) = partial_output(&cut, &warnings) else {
+        let Some(FocrError::Partial(partial)) = partial_output(&cut, &warnings, &model) else {
             panic!("a length stop is a partial output");
         };
         assert_eq!(
@@ -6551,6 +6610,10 @@ mod tests {
                 partial.warnings.len()
             ),
             ("length", 2, 3)
+        );
+        assert_eq!(
+            (partial.model_id, partial.source_sha256.as_deref()),
+            ("unlimited-ocr-2", None)
         );
         assert_eq!(cut.run_finish_reason(), FinishReason::Length);
 
@@ -6565,7 +6628,7 @@ mod tests {
             warnings[1].message
         );
         assert_eq!(late.run_finish_reason(), FinishReason::Budget);
-        let Some(error) = partial_output(&late, &warnings) else {
+        let Some(error) = partial_output(&late, &warnings, &model) else {
             panic!("a budget stop is a partial output");
         };
         assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
@@ -6582,7 +6645,18 @@ mod tests {
         );
         let warnings = decode_warnings(&v1);
         assert_eq!(warnings[0].kind, "v1_truncated");
-        assert!(partial_output(&v1, &warnings).is_none(), "v1 stays exit 0");
+        let v1_model = ModelIdentity {
+            model_id: model_arch::UNLIMITED_OCR_V1_ID,
+            source_sha256: Some("ab".repeat(32)),
+        };
+        assert_eq!(
+            v1_model.version_tag(),
+            format!("unlimited-ocr@{}", "ab".repeat(32))
+        );
+        assert!(
+            partial_output(&v1, &warnings, &v1_model).is_none(),
+            "v1 stays exit 0"
+        );
     }
 
     /// U2-X2: the frozen `infer_multi` oracle outputs end at EOS with fewer
@@ -10703,6 +10777,7 @@ mod tests {
                 temperature: None,
                 no_repeat_ngram: Some(20),
                 ngram_window: None,
+                max_page_tokens: None,
             },
         );
         assert_eq!(p.max_length, 700);

@@ -2327,6 +2327,68 @@ fn models_lists_the_registered_archs_human_and_json() {
     assert_eq!(jout.status.code(), Some(0), "focr models --json exits 0");
     assert_eq!(v["models"][0]["id"], serde_json::json!("unlimited-ocr"));
     assert_eq!(v["models"][0]["implemented"], serde_json::json!(true));
+
+    // U2-E1: Unlimited-OCR-2's row, with nothing installed in a hermetic HOME.
+    let v2 = v["models"]
+        .as_array()
+        .expect("models")
+        .iter()
+        .find(|m| m["id"] == "unlimited-ocr-2")
+        .expect("the v2 row");
+    assert_eq!(v2["status"], "experimental");
+    assert_eq!(v2["tasks"], serde_json::json!(["ocr"]));
+    assert_eq!(
+        v2["recipe"],
+        "unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1"
+    );
+    assert_eq!(v2["installed"], false);
+    assert_eq!(v["models"][0]["installed"], false);
+    assert!(
+        v["guidance"]["unlimited-ocr-2"]
+            .as_str()
+            .is_some_and(|g| g.contains("best for documents and long documents")),
+        "{}",
+        v["guidance"]
+    );
+    let row = stdout
+        .lines()
+        .find(|l| l.starts_with("unlimited-ocr-2 "))
+        .unwrap_or_else(|| panic!("the human table lists v2:\n{stdout}"));
+    assert!(row.contains("experimental"), "{row}");
+}
+
+/// U2-E1, model-gated (`FOCR_UOCR2_SOURCE_DIR`): with v2's raw checkpoint in
+/// `FOCR_MODEL_DIR`, `focr models` reports v2 installed and v1 not, since the
+/// checkpoint answers only its own id.
+#[test]
+fn models_reports_v2_installed_from_its_raw_checkpoint() {
+    let test = "models_reports_v2_installed_from_its_raw_checkpoint";
+    let Some(dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR") else {
+        tlog!(test, "case": "skip", "event": "skip", "result": "skip",
+            "reason": "FOCR_UOCR2_SOURCE_DIR unset");
+        return;
+    };
+    let args = ["models", "--json"];
+    let mut command = hermetic_focr(&args);
+    command.env(MODEL_DIR_ENV, &dir);
+    let out = run_focr_command(command, &args);
+    let v = parse_json_line(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "focr models --json",
+    );
+    let installed = |id: &str| {
+        v["models"]
+            .as_array()
+            .expect("models")
+            .iter()
+            .find(|m| m["id"] == id)
+            .map(|m| m["installed"].clone())
+    };
+    let pass = installed("unlimited-ocr-2") == Some(true.into())
+        && installed("unlimited-ocr") == Some(false.into());
+    tlog!(test, "case": "v2_raw_checkpoint", "event": "assert",
+        "result": if pass { "pass" } else { "fail" });
+    assert!(pass, "{v}");
 }
 
 /// [C4→bd-50wo] `focr convert --quant int4` is now IMPLEMENTED (the wasm

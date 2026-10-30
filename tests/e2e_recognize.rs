@@ -1780,14 +1780,13 @@ fn v1_single_page_reports_finish_reason_when_armed() {
         if let Some(cap) = extra {
             args.extend(["--max-length", cap]);
         }
-        let out = run_focr_env(
-            &bin,
-            &args,
-            &[
-                ("FOCR_MODEL_PATH", model.display().to_string()),
-                ("FOCR_NO_RESIDENT", "1".into()),
-            ],
-        );
+        let store = unique_output_path("db");
+        let envs = [
+            ("FOCR_MODEL_PATH", model.display().to_string()),
+            ("FOCR_NO_RESIDENT", "1".into()),
+            ("FOCR_RUN_STORE", store.display().to_string()),
+        ];
+        let out = run_focr_env(&bin, &args, &envs);
         let complete = out
             .stdout
             .lines()
@@ -1797,6 +1796,27 @@ fn v1_single_page_reports_finish_reason_when_armed() {
         assert_eq!(out.code, Some(0), "{case}");
         assert_eq!(complete["finish_reason"], want, "{case}");
         assert!(complete.get("warnings").is_none(), "{case}: {complete}");
+        // U2-E1: the model that ran, and the run store's tag for it. A
+        // `.focrq` records its source digest; a raw checkpoint has none.
+        assert_eq!(complete["model_id"], "unlimited-ocr", "{case}: {complete}");
+        let tag = match complete["source_sha256"].as_str() {
+            Some(sha) => {
+                assert!(
+                    sha.len() == 64 && sha.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{case}: {sha}"
+                );
+                format!("unlimited-ocr@{sha}")
+            }
+            None => {
+                assert!(complete["source_sha256"].is_null(), "{case}: {complete}");
+                "unlimited-ocr".to_owned()
+            }
+        };
+        let runs = run_focr_env(&bin, &["runs", "--json", "--limit", "1"], &envs);
+        let runs: serde_json::Value =
+            serde_json::from_str(runs.stdout.trim()).expect("focr runs --json");
+        assert_eq!(runs["runs"][0]["model_version_tag"], tag.as_str(), "{case}");
+        let _ = std::fs::remove_file(&store);
         log_line(
             TEST,
             case,
@@ -2472,6 +2492,9 @@ fn v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed() {
     assert_eq!(out.code, Some(0), "S1: {}", out.stderr);
     assert_eq!(complete["finish_reason"], "stop", "S1: {complete}");
     assert!(complete.get("warnings").is_none(), "S1: {complete}");
+    // U2-E1: a raw checkpoint names its model and records no digest.
+    assert_eq!(complete["model_id"], "unlimited-ocr-2", "S1: {complete}");
+    assert!(complete["source_sha256"].is_null(), "S1: {complete}");
     assert!(!markdown.trim().is_empty(), "S1: empty markdown");
     assert!(
         out.stderr
@@ -2503,6 +2526,7 @@ fn v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed() {
     assert_eq!(out.code, Some(0), "S2 batch: {}", out.stderr);
     assert_eq!(batch["finish_reason"], "stop", "S2 batch: {batch}");
     assert!(batch.get("warnings").is_none(), "S2 batch: {batch}");
+    assert_eq!(batch["model_id"], "unlimited-ocr-2", "S2 batch: {batch}");
     assert_eq!(
         batch_markdown.matches("<PAGE>").count(),
         pages.len(),
