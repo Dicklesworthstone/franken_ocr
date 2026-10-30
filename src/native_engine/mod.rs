@@ -381,12 +381,14 @@ const BASE_PROMPT_TEXT: &str = "document parsing.";
 /// same text, for one page as for many (MU:1073-1080).
 const MULTI_PAGE_PROMPT_TEXT: &str = "Multi page parsing.";
 
-/// The most pages Unlimited-OCR-2 parses in one unwindowed pass by default
-/// (U2-B6): `floor((131,072 − 64) / (274 + 1,900)) = 60`, i.e. 274 prompt
-/// tokens and at most 1,900 generated tokens per page within the position
-/// limit. A denser document can still reach the limit sooner; that stop is
-/// reported, never silent. U2-C4 re-derives it from measured page lengths and
-/// U2-D1b lifts it with windowing.
+/// The most pages one Unlimited-OCR-2 pass is sized for (U2-B6):
+/// `floor((131,072 − 64) / (274 + 1,900)) = 60`, i.e. 274 prompt tokens and
+/// at most 1,900 generated tokens per page within the position limit. It
+/// caps a decode window's own pages (U2-D1b), so prompt, lookahead and
+/// output fit one window; a denser window can still reach the limit sooner,
+/// and that stop is reported, never silent. An unwindowed request
+/// ([`PageWindow::Off`]) is not held to it. U2-C4 re-derives it from
+/// measured page lengths.
 pub const UOCR2_UNWINDOWED_PAGE_LIMIT: usize = 60;
 
 /// Unlimited-OCR-2's prompt (U2-B6; MU:531-580, 1073-1082): `bos`, then per
@@ -588,6 +590,11 @@ pub struct DocumentStats {
     /// The page was read from a gundam view, which has no oracle
     /// certification for Unlimited-OCR-2 yet (U2-E1, U2-G1).
     pub gundam_view: bool,
+    /// Decode windows (U2-D1b); 0 for one pass over every page.
+    pub windows: usize,
+    /// Pages the vision tower encoded: once per page read, a lookahead
+    /// page included, since a later window reuses its encoding.
+    pub vision_encodes: usize,
 }
 
 /// One document decode `pass(retire, budget_floor, ids, observer)`, first
@@ -1058,8 +1065,10 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
         });
     }
     let (expected, got) = report.pages.map_or((1, 0), |p| (p.expected, p.bodies));
-    let place = if got == 0 {
-        format!("before page 1 of {expected}")
+    // A finish with no body is a stop before its page's prefill: the
+    // document's, or a later window's (U2-D1b).
+    let place = if got == 0 || stats.page_finish.len() > got {
+        format!("before page {} of {expected}", got + 1)
     } else {
         format!("inside page {got} of {expected}")
     };
@@ -1072,8 +1081,13 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
         FinishReason::Length => warnings.push(RunWarning {
             kind: "v2_length",
             message: format!(
-                "stopped {place}: unwindowed Unlimited-OCR-2 shares {} positions between prompt \
-                 and output",
+                "stopped {place}: {} Unlimited-OCR-2 shares {} positions between prompt and \
+                 output",
+                if stats.windows == 0 {
+                    "unwindowed"
+                } else {
+                    "each window of"
+                },
                 thousands(report.max_positions)
             ),
             recovery: warning_recovery(WarningKind::V2Length),
@@ -2142,17 +2156,19 @@ struct DocumentPages {
 }
 
 /// How a document's pages are split into decode windows (U2-E2, plan
-/// §5.10). Windowed decoding reaches documents with U2-D1b; until then a
-/// window smaller than the document, and [`PageWindow::Auto`], are refused.
+/// §5.10). Unlimited-OCR-2 decodes windows (U2-D1b); v1 has none, so it
+/// refuses a window smaller than the document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageWindow {
-    /// Windows of this many pages each. A window as large as the document
-    /// is one pass, as [`PageWindow::Off`].
+    /// Windows of this many own pages each (at most
+    /// [`UOCR2_UNWINDOWED_PAGE_LIMIT`]). A document that fits one window
+    /// decodes in one pass.
     Pages(usize),
-    /// The model's default window.
+    /// A window sized to the machine's memory (U2-D3); refused until then.
     Auto,
-    /// One pass over every page, past the model's page limit: a long
-    /// document then stops at the position limit (`finish_reason: length`).
+    /// One pass over every page, however many: an Unlimited-OCR-2 document
+    /// past [`UOCR2_UNWINDOWED_PAGE_LIMIT`] pages may then stop at the
+    /// position limit (`finish_reason: length`).
     Off,
 }
 
@@ -2170,7 +2186,9 @@ pub enum ResumePolicy {
 }
 
 /// How [`OcrModel::recognize_document`] parses a document (U2-E2, D23). The
-/// default is one pass under the model's page limit; the setters chain:
+/// default is the model's: windows of [`window::DEFAULT_PAGE_WINDOW`] pages
+/// for Unlimited-OCR-2 (one pass when the document fits one), one pass for
+/// v1. The setters chain:
 /// `DocumentOptions::default().page_window(PageWindow::Off)`. Decode tuning
 /// ([`DecodeOverrides`], `--max-page-tokens` among them) and preprocess
 /// overrides apply as for any run; a document reads base views only.
@@ -2198,13 +2216,13 @@ impl DocumentOptions {
         self
     }
 
-    /// Whether a document of `pages` pages runs under these options, and if
-    /// so whether the model's page limit applies.
+    /// How a document of `pages` source pages decodes under these options
+    /// on `model`, which decodes windows when `windowed`.
     ///
     /// # Errors
-    /// [`FocrError::Usage`] for a window, or a resume policy, that this
-    /// build cannot honor yet: refused, never ignored.
-    fn page_limit(&self, pages: usize) -> FocrResult<bool> {
+    /// [`FocrError::Usage`] for a window `model` cannot decode, or an option
+    /// this build cannot honor yet: refused, never ignored.
+    fn plan(&self, model: &str, windowed: bool, pages: usize) -> FocrResult<DocumentPlan> {
         if self.resume != ResumePolicy::Never {
             return Err(FocrError::Usage(format!(
                 "document resume ({:?}) is not yet available; parse with ResumePolicy::Never",
@@ -2212,19 +2230,44 @@ impl DocumentOptions {
             )));
         }
         match self.page_window {
-            None => Ok(true),
             Some(PageWindow::Pages(0)) => Err(FocrError::Usage(
                 "a page window needs at least one page".into(),
             )),
-            // One window over every page is an explicit unwindowed pass.
-            Some(PageWindow::Off) => Ok(false),
-            Some(PageWindow::Pages(n)) if n >= pages => Ok(false),
-            Some(window) => Err(FocrError::Usage(format!(
-                "windowed document decoding ({window:?} over {pages} pages) is not yet available; \
-                 parse without a page window, or with PageWindow::Off"
+            Some(PageWindow::Auto) => Err(FocrError::Usage(
+                "a page window sized to memory (PageWindow::Auto) is not yet available; give \
+                 a page count, or PageWindow::Off"
+                    .into(),
+            )),
+            Some(PageWindow::Off) => Ok(DocumentPlan::OnePass),
+            None if windowed => Ok(DocumentPlan::Windows(window::DEFAULT_PAGE_WINDOW)),
+            Some(PageWindow::Pages(n)) if windowed => Ok(DocumentPlan::Windows(n)),
+            None => Ok(DocumentPlan::OnePass),
+            // One window over every page is one pass.
+            Some(PageWindow::Pages(n)) if n >= pages => Ok(DocumentPlan::OnePass),
+            Some(PageWindow::Pages(n)) => Err(FocrError::Usage(format!(
+                "{model} has no windowed decoding, so it cannot read {pages} pages in windows \
+                 of {n}; parse without a page window, or with PageWindow::Off"
             ))),
         }
     }
+}
+
+/// How a document decodes ([`DocumentOptions::plan`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentPlan {
+    /// One pass over every page.
+    OnePass,
+    /// Windows of this many own pages (U2-D1b); a document that fits one
+    /// decodes in one pass.
+    Windows(usize),
+}
+
+/// What a planned document read gives back: the preprocessed pages for one
+/// pass, or the windowed document already parsed with its windows.
+#[cfg(feature = "pdf")]
+enum DocumentParse {
+    OnePass(Vec<Preprocessed>),
+    Windowed(DocumentPages, Vec<window::WindowStats>),
 }
 
 /// A parsed document (U2-E2, D23): its markdown and pages, and how the
@@ -2248,6 +2291,8 @@ pub struct DocumentResult {
     pub finish_reason: FinishReason,
     /// `<PAGE>` markers past the page count, merged into the last page.
     pub extra_markers: usize,
+    /// The decode windows, in order (U2-D1b); empty for one pass.
+    pub windows: Vec<window::WindowStats>,
     /// The source's warnings (`ignored_files`), then the decode's: the lever
     /// admission's `ignored_lever`, then the document's (`leading_text`,
     /// `v2_length`, `v2_budget`) or v1's (`v1_truncated`, `v1_page_merge`).
@@ -4390,20 +4435,26 @@ impl OcrModel {
     }
 
     /// Parse a document (U2-E2, D23): the reference `infer_multi` contract
-    /// (bd-1gv.25), the headline "Unlimited" feature. Every page joins one
-    /// cross-page prompt and one decode runs over the whole document, so
-    /// page N attends to pages 1..N−1 (OQ-13), never a concatenation of
-    /// single-page parses.
+    /// (bd-1gv.25), the headline "Unlimited" feature. Pages join one
+    /// cross-page prompt and one decode, so page N attends to the pages
+    /// before it (OQ-13), never a concatenation of single-page parses. v1
+    /// reads the whole document in one pass. Unlimited-OCR-2 reads it in
+    /// windows ([`DocumentOptions`], U2-D1b): one pass when it fits one,
+    /// otherwise each window's prompt carries its own pages and the next
+    /// window's first, and a page attends to the pages before it in its
+    /// window. A windowed document has no page limit.
     ///
     /// The pages come from `source` one at a time (U2-D0): each is
     /// rasterized, preprocessed and dropped before the next is read, with
-    /// its EXIF orientation applied as a single image's is (SPEC-020). Every
+    /// its EXIF orientation applied as a single image's is (SPEC-020); a
+    /// windowed parse reads each window's pages as the window starts. Every
     /// page reaches `on_item` before it is read; a page that did not
     /// rasterize is left out of the prompt and listed in
-    /// [`DocumentResult::skipped`] (D24). `on_page` gets each page body as
-    /// its `<PAGE>` boundary is crossed in the token stream (bd-2z0y),
-    /// with its [`PageResult`] when the model splits pages exactly; it never
-    /// changes the result.
+    /// [`DocumentResult::skipped`] (D24), and keeps its source page, so
+    /// later pages are numbered as in the source. `on_page` gets each page
+    /// body as its `<PAGE>` boundary is crossed in the token stream
+    /// (bd-2z0y), or as its window ends, with its [`PageResult`] when the
+    /// model splits pages exactly; it never changes the result.
     ///
     /// A document that stops early is a result, not an error: its
     /// `finish_reason` says why and its pages are those it completed. The
@@ -4413,9 +4464,9 @@ impl OcrModel {
     /// * [`FocrError::NotImplemented`] for a model without the
     ///   Unlimited-OCR document contract; zoo models parse pages
     ///   independently via [`Self::recognize_batch`].
-    /// * [`FocrError::Usage`] for options this build cannot honor
-    ///   ([`DocumentOptions`]), or a paged model's document over its page
-    ///   limit.
+    /// * [`FocrError::Usage`] for a window the model cannot decode (v1 has
+    ///   none) or an option this build cannot honor yet
+    ///   ([`DocumentOptions`]).
     /// * The first page's raster error when no page rasterized.
     /// * A prompt with no room to generate, or any preprocess, vision or
     ///   decode error; v1 also stops with [`FocrError::Cancelled`].
@@ -4428,42 +4479,90 @@ impl OcrModel {
         on_page: Option<PageSink<'_>>,
     ) -> FocrResult<DocumentResult> {
         multi_page_route(self.arch())?;
-        let enforce = options.page_limit(source.len())?;
-        self.check_document_pages(source.len(), enforce)?;
-        let mut pres = Vec::with_capacity(source.len());
-        let mut origins = Vec::with_capacity(source.len());
+        let plan = options.plan(self.arch().id(), self.decodes_windows(), source.len())?;
+        // The pages as they are read: each rasterized, preprocessed and its
+        // raster dropped; one that did not rasterize is skipped (D24) and
+        // keeps its source page, so no later page's numbering shifts.
+        let read = std::cell::RefCell::new(Vec::<(PageOrigin, (u32, u32))>::new());
         let mut skipped = Vec::new();
         let mut first_error: Option<FocrError> = None;
-        for item in source.by_ref() {
-            on_item(&item);
-            match item.raster {
-                Ok(img) => {
-                    pres.push(self.document_page(img)?);
-                    origins.push(PageOrigin {
-                        source_page: item.source_page,
-                        half: item.half,
-                    });
-                }
-                Err(e) => {
-                    skipped.push(crate::pdf::SkippedPage {
-                        page: item.source_page,
-                        reason: e.to_string(),
-                    });
-                    first_error.get_or_insert(e);
+        let mut pages = std::iter::from_fn(|| {
+            for item in source.by_ref() {
+                on_item(&item);
+                match item.raster {
+                    Ok(img) => {
+                        let origin = PageOrigin {
+                            source_page: item.source_page,
+                            half: item.half,
+                        };
+                        let pre = self.document_page(img);
+                        if let Ok(pre) = &pre {
+                            read.borrow_mut().push((origin, pre.original_size));
+                        }
+                        return Some(pre);
+                    }
+                    Err(e) => {
+                        skipped.push(crate::pdf::SkippedPage {
+                            page: item.source_page,
+                            reason: e.to_string(),
+                        });
+                        first_error.get_or_insert(e);
+                    }
                 }
             }
-        }
-        if pres.is_empty() {
-            return Err(first_error.unwrap_or_else(|| {
-                FocrError::InputDecode("the page source yielded no pages".into())
-            }));
-        }
-        // Split spreads can make more logical pages than source pages.
-        let enforce = options.page_limit(pres.len())?;
-        self.check_document_pages(pres.len(), enforce)?;
-        let DocumentPages { markdown, pages } = self.parse_document(pres, &origins, on_page)?;
-        // Both arms record a report; a poisoned slot leaves an EOS default.
+            None
+        });
+        let mut on_page = on_page;
+        let parsed = match plan {
+            DocumentPlan::OnePass => {
+                DocumentParse::OnePass(pages.by_ref().collect::<FocrResult<Vec<_>>>()?)
+            }
+            DocumentPlan::Windows(window) => {
+                let sink = on_page.as_mut().map(|sink| &mut **sink as PageSink<'_>);
+                self.parse_windowed(&mut pages, window, &read, sink)?
+            }
+        };
+        let (DocumentPages { markdown, pages }, windows) = match parsed {
+            DocumentParse::OnePass(pres) => {
+                if pres.is_empty() {
+                    return Err(first_error.unwrap_or_else(|| {
+                        FocrError::InputDecode("the page source yielded no pages".into())
+                    }));
+                }
+                // Split spreads can make more logical pages than source pages.
+                options.plan(self.arch().id(), self.decodes_windows(), pres.len())?;
+                let origins: Vec<PageOrigin> = read.borrow().iter().map(|(o, _)| *o).collect();
+                (self.parse_document(pres, &origins, on_page)?, Vec::new())
+            }
+            DocumentParse::Windowed(pages, windows) => {
+                // A stopped document left pages unread; it still expected them.
+                let unread = source.unread();
+                if unread > 0
+                    && let Ok(mut slot) = self.last_decode.lock()
+                    && let Some(bodies) = slot.as_mut().and_then(|r| r.pages.as_mut())
+                {
+                    bodies.expected += unread;
+                }
+                (pages, windows)
+            }
+        };
+        // Every parse records a report; a poisoned slot leaves an EOS default.
         let report = self.last_decode.lock().ok().and_then(|slot| slot.clone());
+        let pages_read = read.borrow().len();
+        timing_log(&format!(
+            "document: {pages_read} pages read, {} skipped, {} windows, {} vision encodes, {} \
+             fallback recomputes",
+            skipped.len(),
+            windows.len(),
+            report
+                .as_ref()
+                .and_then(|r| r.document.as_ref())
+                .map_or(pages_read, |stats| stats.vision_encodes),
+            windows
+                .iter()
+                .filter(|w| w.fallback_reason.is_some())
+                .count(),
+        ));
         let mut warnings = source.warnings();
         warnings.extend(report.as_ref().map(decode_warnings).unwrap_or_default());
         Ok(DocumentResult {
@@ -4481,9 +4580,72 @@ impl OcrModel {
                 .as_ref()
                 .and_then(|r| r.document.as_ref())
                 .map_or(0, |stats| stats.extra_markers),
+            windows,
             warnings,
             model: self.identity(),
         })
+    }
+
+    /// A document in windows of `window` own pages (U2-D1b): the windowed
+    /// decode over `pages` as they stream in ([`Self::decode_document_windowed`]),
+    /// or the pages back for one pass when they fit one window. `read` holds
+    /// each page read so far, its origin and raster size; each window's pages
+    /// stream to `on_page` as the window ends, their boxes in their own
+    /// pixels.
+    ///
+    /// # Errors
+    /// Any page, vision or decode error.
+    #[cfg(feature = "pdf")]
+    fn parse_windowed(
+        &self,
+        pages: &mut dyn Iterator<Item = FocrResult<Preprocessed>>,
+        window: usize,
+        read: &std::cell::RefCell<Vec<(PageOrigin, (u32, u32))>>,
+        mut on_page: Option<PageSink<'_>>,
+    ) -> FocrResult<DocumentParse> {
+        let opts = window::WindowedOptions {
+            window,
+            ..window::WindowedOptions::default()
+        };
+        let model_id = self.arch().id();
+        let mut results: Vec<PageResult> = Vec::new();
+        let mut sink = |w: &window::WindowStats, own: window::WindowPages<'_>| {
+            let read = read.borrow();
+            for (k, body) in own.bodies.iter().enumerate() {
+                let run = w.pages.start + k;
+                let (origin, size) = read[run];
+                let page = PageResult {
+                    window: Some(w.index),
+                    tokens: own.tokens.get(k).copied(),
+                    finish: own.finish.get(k).copied(),
+                    ..PageResult::read(run + 1, body, size, origin, model_id)
+                };
+                if let Some(sink) = on_page.as_deref_mut() {
+                    sink(&StreamedPage {
+                        index: run + 1,
+                        body: body.trim(),
+                        page: Some(&page),
+                    });
+                }
+                results.push(page);
+            }
+        };
+        let _admission = forward_admission().acquire();
+        Ok(
+            match self.decode_document_windowed(pages, &opts, Some(&mut sink))? {
+                window::Windowing::Fits(pres) => DocumentParse::OnePass(pres),
+                window::Windowing::Windowed(doc) => {
+                    let markdown = postprocess::join_page_texts(results.iter().map(|p| &p.text));
+                    DocumentParse::Windowed(
+                        DocumentPages {
+                            markdown,
+                            pages: results,
+                        },
+                        doc.windows,
+                    )
+                }
+            },
+        )
     }
 
     /// One document page's preprocess: v1's Base-640 squash, or a paged
@@ -4504,30 +4666,6 @@ impl OcrModel {
         } else {
             preprocess::preprocess_dynamic_squash(img, MULTI_PAGE_BASE_SIZE)
         }
-    }
-
-    /// Refuse a paged model's unwindowed document over
-    /// [`UOCR2_UNWINDOWED_PAGE_LIMIT`] pages before any image is read, unless
-    /// `enforce` is off (an explicit unwindowed request, which then relies on
-    /// the reported position stop). Other models pass.
-    ///
-    /// # Errors
-    /// [`FocrError::Usage`] (exit 2) naming the limit and the remedy.
-    fn check_document_pages(&self, pages: usize, enforce: bool) -> FocrResult<()> {
-        if !enforce
-            || pages <= UOCR2_UNWINDOWED_PAGE_LIMIT
-            || self.arch().decode_contract().pages.is_none()
-        {
-            return Ok(());
-        }
-        Err(FocrError::Usage(format!(
-            "{} parses at most {UOCR2_UNWINDOWED_PAGE_LIMIT} pages in one pass (its {} \
-             position limit); this document has {pages}. Select at most \
-             {UOCR2_UNWINDOWED_PAGE_LIMIT} pages with `--pages`, or parse pages independently \
-             (omit `--multi-page`)",
-            self.arch().id(),
-            thousands(sampler::UOCR2_MAX_POSITIONS),
-        )))
     }
 
     /// A document's parse (bd-1gv.25): per-page vision, ONE fused cross-page
@@ -4821,6 +4959,7 @@ impl OcrModel {
         stats.gundam_view = pres
             .iter()
             .any(|p| matches!(p.mode, preprocess::PreprocessMode::Gundam { .. }));
+        stats.vision_encodes = pres.len();
         let finish = stats.page_finish.clone();
         timing_log(&format!(
             "document {} pages: {} tokens, finish {}, pages {:?}, forced {}, hf-id-0 {}, \
@@ -9252,11 +9391,13 @@ mod tests {
     }
 
     /// U2-B6: a v2 model gets past routing on every inference entry point and
-    /// reads its input, as v1 does over the same empty weights. A document
-    /// above [`UOCR2_UNWINDOWED_PAGE_LIMIT`] is refused with exit 2 before
-    /// any page is read; the loop's limit enforcement turned off admits it.
+    /// reads its input, as v1 does over the same empty weights. U2-D1b: a
+    /// document above [`UOCR2_UNWINDOWED_PAGE_LIMIT`] is no longer refused;
+    /// it decodes in windows, its pages read as they stream, so the decode
+    /// meets its (empty) weights after the first window and its lookahead
+    /// page, and not a page later.
     #[test]
-    fn a_v2_model_routes_every_entry_point_and_refuses_oversized_documents_first() {
+    fn a_v2_model_routes_every_entry_point_and_windows_long_documents() {
         let v2 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V2_ID).expect("v2 registered");
         let model = OcrModel::assemble(
             PathBuf::from("<route-test>"),
@@ -9288,55 +9429,40 @@ mod tests {
         reads_input(document(&mut files(1), &options).expect_err("document"));
 
         let over = UOCR2_UNWINDOWED_PAGE_LIMIT + 1;
-        let too_long = |error: FocrError| {
-            assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
-            assert_eq!(error.exit_code(), 2);
-            let message = error.to_string();
-            assert!(
-                message.contains(&format!(
-                    "at most {UOCR2_UNWINDOWED_PAGE_LIMIT} pages in one pass"
-                )) && message.contains(&format!("this document has {over}"))
-                    && message.contains("--pages"),
-                "{message}"
-            );
-        };
-        // Missing paths: reading any of them would be an input error instead.
-        too_long(document(&mut files(over), &options).expect_err("over the limit"));
-        let mut source = rasters(over);
-        too_long(
-            model
-                .recognize_document(
-                    &mut source,
-                    &options,
-                    &mut |_| panic!("no page is read"),
-                    Some(&mut |_: &StreamedPage<'_>| panic!("no page streams")),
-                )
-                .expect_err("over the limit, in memory"),
-        );
-        assert_eq!(source.page_map().len(), 0, "refused before any raster");
-        // An explicit unwindowed request reads past the limit (its pages
-        // then fail to read, which proves the limit let them through).
-        for window in [PageWindow::Off, PageWindow::Pages(over)] {
-            let unwindowed = options.page_window(window);
-            reads_input(document(&mut files(over), &unwindowed).expect_err("read"));
-        }
-        model
-            .check_document_pages(UOCR2_UNWINDOWED_PAGE_LIMIT, true)
-            .expect("the limit itself is admitted");
-        model
-            .check_document_pages(over, false)
-            .expect("an explicit unwindowed request bypasses the limit");
-        let unlimited = model_arch::default_arch();
-        let v1_model = OcrModel::assemble(
-            PathBuf::from("<route-test>"),
-            SidecarBundle::default(),
-            unlimited,
-            Weights::default(),
+        // Pages that do not read are skipped, whatever the window, and a
+        // document with none is the first one's input error.
+        for window in [
             None,
+            Some(PageWindow::Off),
+            Some(PageWindow::Pages(3)),
+            Some(PageWindow::Pages(over)),
+        ] {
+            let options = DocumentOptions {
+                page_window: window,
+                ..options
+            };
+            reads_input(document(&mut files(over), &options).expect_err("unread pages"));
+        }
+        let mut source = rasters(over);
+        let error = model
+            .recognize_document(
+                &mut source,
+                &options,
+                &mut |_| {},
+                Some(&mut |_: &StreamedPage<'_>| panic!("no page decodes")),
+            )
+            .expect_err("no weights");
+        assert!(!matches!(error, FocrError::Usage(_)), "{error:?}");
+        let own = window::own_pages_per_window(
+            window::DEFAULT_PAGE_WINDOW,
+            window::PER_PAGE_EST_BASE,
+            UOCR2_UNWINDOWED_PAGE_LIMIT,
         );
-        v1_model
-            .check_document_pages(over, true)
-            .expect("v1 has no page limit");
+        assert_eq!(
+            source.page_map().len(),
+            own + 1,
+            "pages read as they stream"
+        );
 
         let v1 = OcrModel::assemble(
             PathBuf::from("<route-test>"),
@@ -9356,26 +9482,59 @@ mod tests {
         ));
     }
 
-    /// U2-E2: a document option this build cannot honor yet (a window
-    /// smaller than the document, before U2-D1b; resume, before U2-D4) is
+    /// U2-E2, U2-D1b: how each document option plans on a windowed model
+    /// (v2) and on one without windows (v1). What a model cannot decode (a
+    /// v1 window smaller than the document) or this build cannot honor yet
+    /// (a memory-sized window, before U2-D3; resume, before U2-D4) is
     /// refused before any page is read, never ignored.
     #[test]
-    fn document_options_refuse_what_this_build_cannot_honor() {
-        let refused = |options: DocumentOptions, pages: usize, says: &str| {
-            let error = options.page_limit(pages).expect_err(says);
+    fn document_options_plan_what_the_model_decodes_and_refuse_the_rest() {
+        let v1 = model_arch::UNLIMITED_OCR_V1_ID;
+        let refused = |options: DocumentOptions, windowed: bool, pages: usize, says: &str| {
+            let error = options.plan(v1, windowed, pages).expect_err(says);
             assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
             assert!(error.to_string().contains(says), "{error}");
         };
         let window = |page_window| DocumentOptions::default().page_window(page_window);
-        assert_eq!(DocumentOptions::default().page_limit(500).ok(), Some(true));
-        assert_eq!(window(PageWindow::Off).page_limit(500).ok(), Some(false));
-        assert_eq!(window(PageWindow::Pages(3)).page_limit(3).ok(), Some(false));
-        refused(window(PageWindow::Pages(0)), 3, "at least one page");
-        refused(window(PageWindow::Pages(2)), 3, "not yet available");
-        refused(window(PageWindow::Auto), 3, "not yet available");
-        for resume in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
-            refused(DocumentOptions::default().resume(resume), 1, "resume");
+        let plan = |options: DocumentOptions, windowed: bool, pages: usize| {
+            options.plan(v1, windowed, pages).expect("planned")
+        };
+        let default = DocumentOptions::default();
+        assert_eq!(
+            plan(default, true, 500),
+            DocumentPlan::Windows(window::DEFAULT_PAGE_WINDOW)
+        );
+        assert_eq!(plan(default, false, 500), DocumentPlan::OnePass);
+        for windowed in [true, false] {
+            assert_eq!(
+                plan(window(PageWindow::Off), windowed, 500),
+                DocumentPlan::OnePass
+            );
+            refused(
+                window(PageWindow::Pages(0)),
+                windowed,
+                3,
+                "at least one page",
+            );
+            refused(window(PageWindow::Auto), windowed, 3, "not yet available");
+            for resume in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
+                refused(default.resume(resume), windowed, 1, "resume");
+            }
         }
+        assert_eq!(
+            plan(window(PageWindow::Pages(2)), true, 3),
+            DocumentPlan::Windows(2)
+        );
+        assert_eq!(
+            plan(window(PageWindow::Pages(3)), false, 3),
+            DocumentPlan::OnePass
+        );
+        refused(
+            window(PageWindow::Pages(2)),
+            false,
+            3,
+            "has no windowed decoding",
+        );
         assert_eq!(
             DocumentOptions::default().resume(ResumePolicy::Never),
             DocumentOptions::default()
@@ -10338,10 +10497,13 @@ mod tests {
                 .map_err(|e| FocrError::Other(anyhow::anyhow!("{}: {e}", path.display())))?;
             model.document_page(img)
         });
-        let mut sink = |_: &window::WindowStats, own: &[String]| bodies.push(own.to_vec());
+        let mut sink = |_: &window::WindowStats, own: window::WindowPages<'_>| {
+            bodies.push(own.bodies.to_vec())
+        };
         model
-            .decode_document_windowed(paths.len(), &mut pages, opts, Some(&mut sink))
+            .decode_document_windowed(&mut pages, opts, Some(&mut sink))
             .expect("the windowed decode runs")
+            .into_windowed()
             .expect("the document is windowed")
     }
 
@@ -10550,16 +10712,37 @@ mod tests {
                 let [only] = windows.as_slice() else {
                     panic!("{tag}: an unsplit run is one window");
                 };
-                let pages = only["pages"].as_array().expect("pages").len();
+                let names: Vec<&str> = only["pages"]
+                    .as_array()
+                    .expect("pages")
+                    .iter()
+                    .map(|p| p.as_str().expect("a page"))
+                    .collect();
+                let Some(paths) = v2_corpus_pages(test, started, &tag, &names) else {
+                    continue;
+                };
                 let opts = window::WindowedOptions {
                     window: width,
                     precision: Some(DocumentPrecision::CachedF32),
                     ..window::WindowedOptions::default()
                 };
-                let unsplit = model
-                    .decode_document_windowed(pages, &mut std::iter::empty(), &opts, None)
-                    .expect("planning runs");
-                assert!(unsplit.is_none(), "{tag}: the oracle split no windows");
+                let mut pages = paths.iter().map(|path| {
+                    let img = image::open(path).map_err(|e| {
+                        FocrError::Other(anyhow::anyhow!("{}: {e}", path.display()))
+                    })?;
+                    model.document_page(img)
+                });
+                match model
+                    .decode_document_windowed(&mut pages, &opts, None)
+                    .expect("planning runs")
+                {
+                    window::Windowing::Fits(pres) => {
+                        assert_eq!(pres.len(), names.len(), "{tag}: every page comes back");
+                    }
+                    window::Windowing::Windowed(_) => {
+                        panic!("{tag}: the oracle split no windows")
+                    }
+                }
                 continue;
             }
             // The document's pages: each window's own pages, in order.

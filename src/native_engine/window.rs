@@ -27,10 +27,10 @@ use web_time::Instant;
 
 use super::tensor::Mat;
 use super::{
-    DecodeParams, DocumentDecode, DocumentDecoder, DocumentLoop, DocumentPass, DocumentPrecision,
-    DocumentStats, FinishReason, MULTI_PAGE_PROMPT_TEXT, OcrModel, PageFinish,
-    UOCR2_UNWINDOWED_PAGE_LIMIT, connector, decode_with_retire_fallback, decoder, document_guard,
-    paged_prompt, postprocess, sampler, srswa, timing_log,
+    DecodeParams, DecodeReport, DocumentDecode, DocumentDecoder, DocumentLoop, DocumentPass,
+    DocumentPrecision, DocumentStats, FinishReason, LengthCap, MULTI_PAGE_PROMPT_TEXT, OcrModel,
+    PageBodies, PageFinish, UOCR2_UNWINDOWED_PAGE_LIMIT, connector, decode_with_retire_fallback,
+    decoder, document_guard, lever_policy, paged_prompt, postprocess, sampler, srswa, timing_log,
 };
 use crate::error::{FocrError, FocrResult};
 use crate::preprocess::Preprocessed;
@@ -134,6 +134,38 @@ pub fn plan_windows(
         })
         .collect();
     Some(spans)
+}
+
+/// Window `index` of a document read as its pages stream in (U2-D1b), whose
+/// length is not known up front: a page that fails to rasterize is found
+/// only when it is read, and the plan counts decodable pages only (D24).
+/// Starting at page `lo` with `held` of its pages in hand (a carried
+/// lookahead), the window pulls pages until it owns `own` or the stream
+/// ends, then one more as its lookahead. `pull(page)` takes page `page`
+/// (global, 0-based) in, or returns `false` once the stream has ended. Over a
+/// stream of `n` pages the spans are [`plan_windows`]'s for `n`.
+///
+/// # Errors
+/// `pull`'s.
+pub fn stream_span(
+    index: usize,
+    lo: usize,
+    own: usize,
+    held: usize,
+    pull: &mut dyn FnMut(usize) -> FocrResult<bool>,
+) -> FocrResult<WindowSpan> {
+    let mut have = held;
+    while have < own && pull(lo + have)? {
+        have += 1;
+    }
+    let hi = lo + have;
+    let lookahead = have == own && pull(hi)?;
+    Ok(WindowSpan {
+        index,
+        lo,
+        hi,
+        lookahead,
+    })
 }
 
 // ── Prompt layout and the tail plan (§5.10.3–5.10.4) ────────────────────────
@@ -664,8 +696,8 @@ pub struct WindowStats {
 pub struct WindowedDocument {
     /// One body per page reached, in page order.
     pub pages: postprocess::TokenPages,
-    /// `stop`; `length` when a window stopped at its position limit; or
-    /// `budget`, which ends the document with the pages so far.
+    /// `stop`; or `length` (a window's position limit), `budget` or
+    /// `cancelled`, each of which ends the document with the pages so far.
     pub finish_reason: FinishReason,
     /// The windows' facts and counters, summed (`peak_kv_bytes`: the most
     /// any window held).
@@ -677,8 +709,20 @@ pub struct WindowedDocument {
     pub window_ids: Vec<Vec<u32>>,
 }
 
-/// Gets each window's record and its own pages' bodies as it ends.
-pub type WindowSink<'a> = &'a mut dyn FnMut(&WindowStats, &[String]);
+/// A window's own pages as it ends, in page order: their bodies, and per
+/// body its generated ids and how it ended.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowPages<'a> {
+    /// The bodies ([`postprocess::TokenPages::bodies`]).
+    pub bodies: &'a [String],
+    /// Generated ids per body, its `<PAGE>` excluded.
+    pub tokens: &'a [usize],
+    /// How each body ended ([`DocumentStats::page_finish`]).
+    pub finish: &'a [PageFinish],
+}
+
+/// Gets each window's record and its own pages as it ends.
+pub type WindowSink<'a> = &'a mut dyn FnMut(&WindowStats, WindowPages<'_>);
 
 /// How a window starts.
 enum WindowStart<'s> {
@@ -700,49 +744,82 @@ struct WindowRun<'r> {
     blocks: &'r [Mat],
 }
 
+/// What [`OcrModel::decode_document_windowed`] made of a document.
+#[derive(Debug)]
+pub enum Windowing {
+    /// The document fits one window, so it decodes unwindowed (U2-B6), as
+    /// the wheel never splits a document that fits (`doc_split.py:150-156`):
+    /// its pages, in order, with no vision run yet.
+    Fits(Vec<Preprocessed>),
+    /// The windowed decode.
+    Windowed(Box<WindowedDocument>),
+}
+
+impl Windowing {
+    /// The windowed decode, or `None` for a document that fits one window.
+    #[must_use]
+    pub fn into_windowed(self) -> Option<WindowedDocument> {
+        match self {
+            Self::Windowed(doc) => Some(*doc),
+            Self::Fits(_) => None,
+        }
+    }
+}
+
 impl OcrModel {
-    /// Unlimited-OCR-2's windowed document decode (U2-D1a) over `n_pages`
-    /// pages that `pages` yields in order, or `None` when the document fits
-    /// one window (then the caller decodes it unwindowed, U2-B6). Windows
-    /// run one after another; each takes its pages' vision as it goes, the
-    /// first carried over from the previous window's lookahead, so vision
-    /// runs once per page. `on_window` gets each window's record and its own
-    /// pages' bodies as it ends. A spent budget stops the document with the
-    /// pages so far (`budget`); nothing done is discarded.
+    /// Whether this model's documents decode in windows: a guarded `<PAGE>`
+    /// contract (Unlimited-OCR-2).
+    #[must_use]
+    pub(crate) fn decodes_windows(&self) -> bool {
+        self.arch()
+            .decode_contract()
+            .pages
+            .is_some_and(|paging| paging.guard && paging.marker_id == PAGE)
+    }
+
+    /// Unlimited-OCR-2's windowed document decode (U2-D1a, U2-D1b) over the
+    /// pages `pages` yields in order, read as they stream: the document's
+    /// length is never needed up front. Its first own + 1 pages decide
+    /// whether it fits one window ([`Windowing::Fits`], before any weight is
+    /// touched). Otherwise windows run one after another ([`stream_span`]);
+    /// each takes its pages' vision as it reads them, the first carried over
+    /// from the previous window's lookahead, so vision runs once per page and
+    /// a window's pages are dropped once encoded. `on_window` gets each
+    /// window's record and its own pages' bodies as it ends. A window that
+    /// stops (its position limit, a spent budget, a cancel) ends the document
+    /// with the pages so far; nothing done is discarded. The run's report
+    /// stays on the model ([`OcrModel::take_last_decode`]).
     ///
     /// # Errors
     /// A model without a guarded page contract, `window = 0`,
     /// `FOCR_DECODE_STATELESS` (a reused window has no embeddings for its
-    /// copied rows), a source that ends early, or any vision or decode error.
+    /// copied rows), or any page, vision or decode error.
     pub fn decode_document_windowed(
         &self,
-        n_pages: usize,
         pages: &mut dyn Iterator<Item = FocrResult<Preprocessed>>,
         opts: &WindowedOptions,
         mut on_window: Option<WindowSink<'_>>,
-    ) -> FocrResult<Option<WindowedDocument>> {
-        match self.arch().decode_contract().pages {
-            Some(paging) if paging.guard && paging.marker_id == PAGE => {}
-            _ => {
-                return Err(FocrError::Other(anyhow::anyhow!(
-                    "{} has no guarded <PAGE> contract, so no windowed decode",
-                    self.arch().id()
-                )));
-            }
+    ) -> FocrResult<Windowing> {
+        if !self.decodes_windows() {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "{} has no guarded <PAGE> contract, so no windowed decode",
+                self.arch().id()
+            )));
         }
         if opts.window == 0 {
             return Err(FocrError::Usage(
                 "a page window must own at least one page".into(),
             ));
         }
-        let Some(plan) = plan_windows(
-            n_pages,
-            opts.window,
-            PER_PAGE_EST_BASE,
-            UOCR2_UNWINDOWED_PAGE_LIMIT,
-        ) else {
-            return Ok(None);
-        };
+        let own = own_pages_per_window(opts.window, PER_PAGE_EST_BASE, UOCR2_UNWINDOWED_PAGE_LIMIT);
+        // A document that fits one window has at most `own` pages.
+        let mut head = Vec::with_capacity(own + 1);
+        while head.len() <= own {
+            match pages.next() {
+                Some(pre) => head.push(pre?),
+                None => return Ok(Windowing::Fits(head)),
+            }
+        }
         let precision = match opts.precision {
             Some(precision) => precision,
             None => DocumentPrecision::from_env()?,
@@ -759,15 +836,16 @@ impl OcrModel {
                 )));
             }
         };
-        let params = self.document_params(n_pages);
+        let params = self.document_params(head.len());
         let tok = self.tokenizer()?;
         let instruction = tok.encode(MULTI_PAGE_PROMPT_TEXT)?;
         timing_log(&format!(
-            "windowed document {n_pages} pages: {} windows of {} own pages, precision {}",
-            plan.len(),
-            plan[0].own(),
+            "windowed document: windows of {own} own pages, precision {}",
             precision.name()
         ));
+        // The head's pages first, then the rest of the stream.
+        let mut head = head.into_iter();
+        let mut next_page = || head.next().map(Ok).or_else(|| pages.next());
         let mut carried: Option<Mat> = None;
         let mut retained: Option<Retained> = None;
         let mut doc = WindowedDocument {
@@ -779,14 +857,32 @@ impl OcrModel {
             },
             finish_reason: FinishReason::Stop,
             stats: DocumentStats::default(),
-            windows: Vec::with_capacity(plan.len()),
-            window_ids: Vec::with_capacity(plan.len()),
+            windows: Vec::new(),
+            window_ids: Vec::new(),
         };
         // The cooperative budget (D11): `FOCR_STAGE_BUDGET_FORWARD_MS` per
         // page, times the window's prompt pages, from the window's start.
         let page_budget = crate::forward_stage_budget();
-        for span in plan {
+        let mut lo = 0;
+        for index in 0.. {
             let t0 = Instant::now();
+            // Vision: the window's prompt pages as they are read, its first
+            // carried over; each page's preprocess is dropped once encoded.
+            let mut blocks: Vec<Mat> = carried.take().into_iter().collect();
+            let held = blocks.len();
+            let span = stream_span(index, lo, own, held, &mut |page| match next_page() {
+                Some(pre) => {
+                    blocks.push(self.page_block(&pre?, page)?);
+                    Ok(true)
+                }
+                None => Ok(false),
+            })?;
+            if span.own() == 0 {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "window {index} has no page: the stream ended at page {lo}"
+                )));
+            }
+            doc.stats.vision_encodes += blocks.len() - held;
             let deadline = if opts.budget_spent_at == Some(span.index) {
                 Some(t0)
             } else {
@@ -795,18 +891,6 @@ impl OcrModel {
                     t0.checked_add(per_page.checked_mul(pages)?)
                 })
             };
-            // Vision: the window's prompt pages, its first carried over.
-            let mut blocks: Vec<Mat> = carried.take().into_iter().collect();
-            while blocks.len() < span.prompt_pages() {
-                let page = span.lo + blocks.len();
-                let pre = pages.next().ok_or_else(|| {
-                    FocrError::Other(anyhow::anyhow!(
-                        "the page source ended before page {} of {n_pages}",
-                        page + 1
-                    ))
-                })??;
-                blocks.push(self.page_block(&pre, page)?);
-            }
             let counts: Vec<usize> = blocks.iter().map(|b| b.rows).collect();
             let (full_ids, _) = paged_prompt(tok.bos_id(), PAGE, IMAGE, &counts, &instruction);
             let room = params.max_positions.saturating_sub(full_ids.len());
@@ -874,7 +958,12 @@ impl OcrModel {
                     elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
                 };
                 if let Some(f) = on_window.as_deref_mut() {
-                    f(&stats, &[]);
+                    let none = WindowPages {
+                        bodies: &[],
+                        tokens: &[],
+                        finish: &[],
+                    };
+                    f(&stats, none);
                 }
                 doc.stats.page_finish.push(PageFinish::Budget);
                 doc.windows.push(stats);
@@ -960,7 +1049,12 @@ impl OcrModel {
                 t0.elapsed().as_secs_f64(),
             ));
             if let Some(f) = on_window.as_deref_mut() {
-                f(&stats, &split.bodies);
+                let own = WindowPages {
+                    bodies: &split.bodies,
+                    tokens: &split.tokens,
+                    finish: &decode.stats.page_finish,
+                };
+                f(&stats, own);
             }
             let window_stats = decode.stats;
             let pages_out = &mut doc.pages;
@@ -977,19 +1071,60 @@ impl OcrModel {
             total.retire_fallbacks += window_stats.retire_fallbacks;
             doc.window_ids.push(decode.ids);
             doc.windows.push(stats);
-            match decode.finish_reason {
-                stop @ (FinishReason::Budget | FinishReason::Cancelled) => {
-                    doc.finish_reason = stop;
-                    break;
-                }
-                FinishReason::Length => doc.finish_reason = FinishReason::Length,
-                FinishReason::Stop => {}
+            // A stop inside a window ends the document with its completed
+            // pages (plan §9.2); a later window would leave a gap of pages.
+            if decode.finish_reason != FinishReason::Stop {
+                doc.finish_reason = decode.finish_reason;
+                break;
             }
+            // Only the last window has no lookahead.
+            if !span.lookahead {
+                break;
+            }
+            lo = span.hi;
         }
         doc.stats.page_tokens.clone_from(&doc.pages.tokens);
         doc.stats.leading_text = doc.pages.leading_text;
         doc.stats.extra_markers = doc.pages.extra_markers;
-        Ok(Some(doc))
+        doc.stats.windows = doc.windows.len();
+        self.record_windowed(&doc, &params);
+        Ok(Windowing::Windowed(Box::new(doc)))
+    }
+
+    /// The windowed run's [`DecodeReport`], as a one-pass document leaves
+    /// one: its ids are each window's generated ids in order, without the
+    /// forced prefixes, and the pages it expected are those it read (each
+    /// encoded once). A caller whose stream holds more pages adds them.
+    fn record_windowed(&self, doc: &WindowedDocument, params: &DecodeParams) {
+        let Ok(mut slot) = self.last_decode.lock() else {
+            return;
+        };
+        let (decodes, length_stops) = slot
+            .as_ref()
+            .map_or((0, 0), |prior| (prior.decodes, prior.length_stops));
+        let ids = doc
+            .windows
+            .iter()
+            .zip(&doc.window_ids)
+            .flat_map(|(w, ids)| ids.get(w.forced_tokens..).unwrap_or_default())
+            .copied()
+            .collect();
+        let stopped = doc.finish_reason != FinishReason::Stop;
+        *slot = Some(DecodeReport {
+            ids,
+            finish_reason: doc.finish_reason,
+            cap: (doc.finish_reason == FinishReason::Length).then_some(LengthCap::Positions),
+            pages: Some(PageBodies {
+                expected: doc.stats.vision_encodes,
+                bodies: doc.pages.bodies.len(),
+            }),
+            max_length: params.max_length,
+            max_positions: params.max_positions,
+            decodes: decodes + 1,
+            length_stops: length_stops + usize::from(stopped),
+            document: Some(doc.stats.clone()),
+            admission_warnings: lever_policy::admit_from_process(self.arch()).warnings,
+        });
     }
 
     /// One window's decode pass: start it (its full prompt, or the splice),
@@ -1272,6 +1407,52 @@ mod tests {
                     next = w.hi;
                 }
                 assert_eq!(next, pages);
+            }
+        }
+    }
+
+    /// U2-D1b: windows found as the pages stream in are the up-front plan's,
+    /// and no page is pulled twice or past the end of the stream.
+    #[test]
+    fn streamed_windows_are_the_up_front_plan() {
+        for pages in 1..=40 {
+            for window in 1..=12 {
+                let own = own_pages_per_window(window, PER_PAGE_EST_BASE, 60);
+                let mut pulled = 0;
+                let mut ended = false;
+                let mut pull = |page: usize| -> FocrResult<bool> {
+                    assert!(!ended, "pulled again after the stream ended");
+                    assert_eq!(page, pulled, "pages are pulled in order, once each");
+                    if pulled == pages {
+                        ended = true;
+                        return Ok(false);
+                    }
+                    pulled += 1;
+                    Ok(true)
+                };
+                let mut spans = Vec::new();
+                let (mut lo, mut held) = (0, 0);
+                loop {
+                    let span = stream_span(spans.len(), lo, own, held, &mut pull).unwrap();
+                    spans.push(span);
+                    if !span.lookahead {
+                        break;
+                    }
+                    (lo, held) = (span.hi, 1);
+                }
+                match plan_windows(pages, window, PER_PAGE_EST_BASE, 60) {
+                    Some(plan) => assert_eq!(spans, plan, "{pages} pages at W={window}"),
+                    None => assert_eq!(
+                        spans,
+                        [WindowSpan {
+                            index: 0,
+                            lo: 0,
+                            hi: pages,
+                            lookahead: false
+                        }],
+                        "{pages} pages at W={window} fit one window"
+                    ),
+                }
             }
         }
     }

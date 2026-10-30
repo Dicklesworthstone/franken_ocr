@@ -274,6 +274,13 @@ impl PageSource {
         self.selected.len()
     }
 
+    /// Pages the walk has yet to yield: the source pages it has not reached
+    /// (a spread counted once) and a held right half.
+    #[must_use]
+    pub fn unread(&self) -> usize {
+        self.selected.len() - self.next + usize::from(self.held.is_some())
+    }
+
     /// Whether the walk reads no page (never true of a constructed source
     /// with its full selection).
     #[must_use]
