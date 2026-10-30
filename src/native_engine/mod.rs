@@ -822,6 +822,8 @@ pub enum WarningKind {
     IgnoredFiles,
     /// Unlimited-OCR-2 read a page in the uncertified gundam mode (U2-E1).
     UncertifiedCropMode,
+    /// The run mode's default model is not installed, so v1 served (D25).
+    PullHint,
 }
 
 /// Every machine-stable `warnings[].kind` a run can report, in the robot
@@ -836,6 +838,7 @@ pub const RUN_WARNING_KINDS: &[&str] = &[
     "leading_text",
     "ignored_files",
     "uncertified_crop_mode",
+    "pull_hint",
 ];
 
 /// The one actionable next step for each [`WarningKind`]: the single source
@@ -869,6 +872,10 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
         WarningKind::UncertifiedCropMode => {
             "use `--crop-mode base` (the default) for certified output; check gundam output \
              against the page"
+        }
+        WarningKind::PullHint => {
+            "install the default with `focr pull <model_id>` (this warning's `model_id`), or \
+             choose a model with `--model`"
         }
     }
 }
@@ -1564,8 +1571,8 @@ pub(crate) fn timing_log(msg: &str) {
 }
 
 /// Build the single-image greedy decode params, honoring [`MAX_NEW_TOKENS_ENV`]
-/// and then the CLI [`DecodeOverrides`] (an explicit CLI flag outranks the env).
-fn decode_params_from_env() -> DecodeParams {
+/// and then the CLI's `overrides` (an explicit CLI flag outranks the env).
+fn decode_params_from_env(overrides: DecodeOverrides) -> DecodeParams {
     let mut p = DecodeParams::single_image();
     if let Some(raw) = std::env::var_os(MAX_NEW_TOKENS_ENV)
         && let Some(s) = raw.to_str()
@@ -1577,24 +1584,23 @@ fn decode_params_from_env() -> DecodeParams {
     if let Ok(Some(n)) = test_max_positions() {
         p.max_positions = *n;
     }
-    apply_decode_overrides(&mut p, decode_overrides());
+    apply_decode_overrides(&mut p, overrides);
     p
 }
 
-/// [`decode_params_from_env`] for `arch`. A paged model (Unlimited-OCR-2)
+/// [`decode_params_from_env`] for `arch` under `overrides` (the CLI's,
+/// [`decode_overrides`], at model load). A paged model (Unlimited-OCR-2)
 /// takes its own position limit ([`sampler::UOCR2_MAX_POSITIONS`]) unless
-/// [`TEST_MAX_POSITIONS_ENV`] lowers it, its contract's per-page cap, and
-/// the entmax domain [`srswa::ENTMAX_ENV`] names (validated at admission,
-/// [`admit_for_inference`]).
-fn decode_params_for(arch: &dyn model_arch::ModelArch) -> DecodeParams {
-    let mut p = decode_params_from_env();
+/// [`TEST_MAX_POSITIONS_ENV`] lowers it, its contract's per-page cap unless
+/// `--max-page-tokens` gives one, and the entmax domain [`srswa::ENTMAX_ENV`]
+/// names (validated at admission, [`admit_for_inference`]).
+fn decode_params_for(arch: &dyn model_arch::ModelArch, overrides: DecodeOverrides) -> DecodeParams {
+    let mut p = decode_params_from_env(overrides);
     if let Some(pages) = arch.decode_contract().pages {
         if !matches!(test_max_positions(), Ok(Some(_))) {
             p.max_positions = sampler::UOCR2_MAX_POSITIONS;
         }
-        p.max_page_tokens = decode_overrides()
-            .max_page_tokens
-            .unwrap_or(pages.max_page_tokens);
+        p.max_page_tokens = overrides.max_page_tokens.unwrap_or(pages.max_page_tokens);
         if let Ok(domain) = srswa::entmax_domain() {
             p.entmax_domain = *domain;
         }
@@ -2849,11 +2855,12 @@ pub fn load_if_policed(spec: &Path) -> FocrResult<Option<Arc<OcrModel>>> {
 }
 
 /// Whether the resident daemon may serve the model at `path` (U2-A7). A
-/// header the probe cannot read leaves the decision to the daemon's own
-/// load, as before.
+/// header the bounded probe refuses (a newer format, an unknown census) runs
+/// inline, which reports the same error, rather than starting a daemon that
+/// can never load the model and then idles for its full period.
 #[must_use]
 pub fn resident_daemon_serves(path: &Path) -> bool {
-    validate_model_header_file(path).map_or(true, lever_policy::resident_daemon_serves)
+    validate_model_header_file(path).is_ok_and(lever_policy::resident_daemon_serves)
 }
 
 /// Whether `arch` pins anything about its `tokenizer.json` sidecar.
@@ -3377,7 +3384,7 @@ impl OcrModel {
             sidecars,
             arch,
             weights,
-            decode_params: decode_params_for(arch),
+            decode_params: decode_params_for(arch, decode_overrides()),
             decoder_cache_i8: FallibleOnce::new(),
             decoder_cache: FallibleOnce::new(),
             decoder_cache_f32: FallibleOnce::new(),
@@ -6759,7 +6766,7 @@ mod tests {
         if std::env::var_os(TEST_MAX_POSITIONS_ENV).is_none() {
             assert!(validate_test_max_positions().is_ok());
             assert_eq!(
-                decode_params_from_env().max_positions,
+                decode_params_from_env(DecodeOverrides::default()).max_positions,
                 MAX_POSITION_EMBEDDINGS
             );
         }
@@ -10784,6 +10791,51 @@ mod tests {
         assert_eq!(p.temperature.to_bits(), base.temperature.to_bits());
         assert_eq!(p.no_repeat_ngram_size, 20);
         assert_eq!(p.ngram_window, base.ngram_window);
+    }
+
+    /// U2-E1: Unlimited-OCR-2's decode params take an explicit
+    /// `--no-repeat-ngram 0` (the ban off, D10) and `--max-page-tokens`, and
+    /// keep the contract's 20,000 per-page cap without one. v1 has no pages.
+    #[test]
+    fn explicit_overrides_reach_the_v2_decode_params() {
+        let v2 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V2_ID).expect("v2 registered");
+        let defaults = decode_params_for(v2, DecodeOverrides::default());
+        assert_eq!(
+            defaults.max_page_tokens,
+            sampler::UOCR2_DEFAULT_MAX_PAGE_TOKENS
+        );
+        let p = decode_params_for(
+            v2,
+            DecodeOverrides {
+                no_repeat_ngram: Some(0),
+                max_page_tokens: Some(0),
+                ..DecodeOverrides::default()
+            },
+        );
+        assert_eq!((p.no_repeat_ngram_size, p.max_page_tokens), (0, 0));
+        let p = decode_params_for(
+            v2,
+            DecodeOverrides {
+                max_page_tokens: Some(512),
+                ..DecodeOverrides::default()
+            },
+        );
+        assert_eq!(p.max_page_tokens, 512);
+        assert_eq!(p.no_repeat_ngram_size, defaults.no_repeat_ngram_size);
+
+        let v1 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V1_ID).expect("v1 registered");
+        let p = decode_params_for(
+            v1,
+            DecodeOverrides {
+                max_page_tokens: Some(512),
+                ..DecodeOverrides::default()
+            },
+        );
+        assert_eq!(
+            p.max_page_tokens,
+            DecodeParams::single_image().max_page_tokens,
+            "a model without pages ignores the page cap"
+        );
     }
 
     /// The connector structural geometry the driver passes is the base-1024 16×16

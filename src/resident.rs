@@ -885,17 +885,6 @@ fn handle_connection(
         }
     }
 
-    // A model with a lever policy (Unlimited-OCR-2) runs inline until the
-    // protocol carries its flags (bd-fuh2, U2-A7); the client falls back.
-    if !crate::native_engine::resident_daemon_serves(model_root) {
-        refuse(
-            &mut stream,
-            "model",
-            "the resident daemon does not serve this model; run inline",
-        );
-        return;
-    }
-
     // The daemon inherits its spawner's environment; a client whose
     // inference-steering env differs must run inline instead (env cannot be
     // re-applied to a live process at arbitrary points).
@@ -904,6 +893,18 @@ fn handle_connection(
             &mut stream,
             "env",
             "inference environment differs from the resident daemon's",
+        );
+        return;
+    }
+
+    // A model with a lever policy (Unlimited-OCR-2), or one whose header the
+    // bounded probe refuses, runs inline until the protocol carries its flags
+    // (bd-fuh2, U2-A7); the client falls back.
+    if !crate::native_engine::resident_daemon_serves(model_root) {
+        refuse(
+            &mut stream,
+            "model",
+            "the resident daemon does not serve this model; run inline",
         );
         return;
     }

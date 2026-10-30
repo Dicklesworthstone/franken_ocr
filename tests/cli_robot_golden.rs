@@ -67,6 +67,11 @@ use franken_ocr::quant::focrq::{FocrqBuilder, WriteDType};
 const FORCE_TEST_ERROR_ENV: &str = "FOCR_TEST_FORCE_ERROR";
 const MODEL_DIR_ENV: &str = "FOCR_MODEL_DIR";
 const RUN_STORE_ENV: &str = "FOCR_RUN_STORE";
+/// No golden here tests the resident daemon, and a daemon one `focr` child
+/// starts outlives it by its idle period, holding open any pipe it inherited.
+/// On macOS std sets `FD_CLOEXEC` after `pipe()`, so a sibling test's
+/// stdout pipe can leak into it and stall that test until the daemon exits.
+const NO_RESIDENT_ENV: &str = "FOCR_NO_RESIDENT";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Structured NDJSON test logging (docs/conformance/GOLDEN.md §6; the shape mirrors
@@ -256,6 +261,7 @@ fn hermetic_focr(args: &[&str]) -> Command {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env_remove(MODEL_DIR_ENV)
+        .env(NO_RESIDENT_ENV, "1")
         .env(RUN_STORE_ENV, fresh_run_store_path())
         .env("HOME", hermetic_home())
         .env("LOCALAPPDATA", hermetic_home())
@@ -278,6 +284,7 @@ fn run_focr_with_model_path(args: &[&str], model_path: &Path) -> Output {
         .args(args)
         .env("FOCR_MODEL_PATH", model_path.as_os_str())
         .env_remove(MODEL_DIR_ENV)
+        .env(NO_RESIDENT_ENV, "1")
         .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove("FOCR_INT8_AUTOVEC")
@@ -291,6 +298,7 @@ fn run_focr_with_model_dir(args: &[&str], model_dir: &Path) -> Output {
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env(MODEL_DIR_ENV, model_dir.as_os_str())
+        .env(NO_RESIDENT_ENV, "1")
         .env(RUN_STORE_ENV, fresh_run_store_path())
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove("FOCR_INT8_AUTOVEC")
@@ -1642,6 +1650,47 @@ fn ocr_robot_missing_model_stream_matches_exit_code() {
     );
 }
 
+/// A model whose bounded header this binary refuses is never handed to the
+/// resident daemon: with resident enabled the run still fails inline (exit 7)
+/// and its state directory stays empty, so no daemon idles on a model it can
+/// never load.
+#[test]
+fn a_refused_model_starts_no_resident_daemon() {
+    let test = "a_refused_model_starts_no_resident_daemon";
+    let model = write_future_focrq();
+    let model_arg = model.to_string_lossy().into_owned();
+    let resident_dir = fresh_run_store_path().with_extension("resident");
+    let args = [
+        "ocr",
+        "/some/document.png",
+        "--robot",
+        "--model",
+        &model_arg,
+    ];
+    let mut command = hermetic_focr(&args);
+    command
+        .env_remove(NO_RESIDENT_ENV)
+        .env("FOCR_RESIDENT_DIR", &resident_dir);
+    let out = run_focr_command(command, &args);
+    let entries = std::fs::read_dir(&resident_dir).map_or(0, Iterator::count);
+    let pass = out.status.code() == Some(7) && entries == 0;
+    tlog!(test, "case": "future_focrq_resident_enabled", "event": "assert",
+        "exit_code": out.status.code(), "resident_entries": entries,
+        "result": if pass { "pass" } else { "fail" });
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(
+        entries,
+        0,
+        "no daemon state under {}",
+        resident_dir.display()
+    );
+}
+
 /// [R10] A recognized but too-new `.focrq` must preserve FormatMismatch through
 /// the real robot process path, with exit status and `run_error.code` both equal
 /// to the frozen public code 7.
@@ -1893,6 +1942,29 @@ fn ocr_help_documents_pdf_input() {
     );
 }
 
+/// U2-E1: an unknown `--crop-mode` value, or a negative `--max-page-tokens`,
+/// is a usage error (exit 2) before any model work.
+#[test]
+fn invalid_crop_mode_and_page_cap_values_exit_2() {
+    let test = "invalid_crop_mode_and_page_cap_values_exit_2";
+    for (case, flag, value) in [
+        ("crop_mode", "--crop-mode", "tiles"),
+        ("max_page_tokens", "--max-page-tokens", "-1"),
+    ] {
+        let args = ["ocr", "/nonexistent/page.png", flag, value];
+        let out = run_focr(&args);
+        let code = out.status.code();
+        tlog!(test, "case": case, "event": "assert", "exit_code": code,
+            "result": if code == Some(2) { "pass" } else { "fail" });
+        assert_eq!(
+            code,
+            Some(2),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// `focr ocr --help` must expose the Phase-1 request parameters from the pinned
 /// reference `infer(...)` signature, even though the body is still a stub.
 #[test]
@@ -1908,6 +1980,7 @@ fn ocr_help_lists_reference_infer_args() {
         "--temperature",
         "--no-repeat-ngram",
         "--ngram-window",
+        "--max-page-tokens",
         "--json",
         "--output",
         "--extract-figures",
@@ -2357,38 +2430,86 @@ fn models_lists_the_registered_archs_human_and_json() {
     assert!(row.contains("experimental"), "{row}");
 }
 
-/// U2-E1, model-gated (`FOCR_UOCR2_SOURCE_DIR`): with v2's raw checkpoint in
-/// `FOCR_MODEL_DIR`, `focr models` reports v2 installed and v1 not, since the
-/// checkpoint answers only its own id.
-#[test]
-fn models_reports_v2_installed_from_its_raw_checkpoint() {
-    let test = "models_reports_v2_installed_from_its_raw_checkpoint";
-    let Some(dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR") else {
-        tlog!(test, "case": "skip", "event": "skip", "result": "skip",
-            "reason": "FOCR_UOCR2_SOURCE_DIR unset");
-        return;
+/// `(v1 installed, v2 installed)` as `focr models --json` reports them with
+/// `FOCR_MODEL_DIR` set to `model_dir`, and the human table's v2 row.
+fn models_installed_in(model_dir: &std::ffi::OsStr) -> ((bool, bool), String) {
+    let installed = |args: &[&str]| {
+        let mut command = hermetic_focr(args);
+        command.env(MODEL_DIR_ENV, model_dir);
+        run_focr_command(command, args)
     };
-    let args = ["models", "--json"];
-    let mut command = hermetic_focr(&args);
-    command.env(MODEL_DIR_ENV, &dir);
-    let out = run_focr_command(command, &args);
+    let out = installed(&["models", "--json"]);
     let v = parse_json_line(
         String::from_utf8_lossy(&out.stdout).trim(),
         "focr models --json",
     );
-    let installed = |id: &str| {
+    let flag = |id: &str| {
         v["models"]
             .as_array()
             .expect("models")
             .iter()
             .find(|m| m["id"] == id)
-            .map(|m| m["installed"].clone())
+            .and_then(|m| m["installed"].as_bool())
+            .unwrap_or_else(|| panic!("{id} has a boolean `installed`: {v}"))
     };
-    let pass = installed("unlimited-ocr-2") == Some(true.into())
-        && installed("unlimited-ocr") == Some(false.into());
-    tlog!(test, "case": "v2_raw_checkpoint", "event": "assert",
-        "result": if pass { "pass" } else { "fail" });
-    assert!(pass, "{v}");
+    let table = String::from_utf8_lossy(&installed(&["models"]).stdout).into_owned();
+    let row = table
+        .lines()
+        .find(|l| l.starts_with("unlimited-ocr-2 "))
+        .unwrap_or_else(|| panic!("the table lists v2:\n{table}"))
+        .to_owned();
+    ((flag("unlimited-ocr"), flag("unlimited-ocr-2")), row)
+}
+
+/// U2-E1, model-gated: `focr models` reports which of v1 and v2 is installed,
+/// each artifact answering only its own id. v2 comes from its raw checkpoint
+/// (`FOCR_UOCR2_SOURCE_DIR`); v1 is whatever this test's own environment
+/// resolves `unlimited-ocr` to, linked alone into a temp dir. (Nothing
+/// installed is the hermetic `models_lists_the_registered_archs_human_and_json`.)
+#[test]
+fn models_reports_which_unlimited_ocr_generations_are_installed() {
+    let test = "models_reports_which_unlimited_ocr_generations_are_installed";
+    let Some(v2_dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR") else {
+        tlog!(test, "case": "skip", "event": "skip", "result": "skip",
+            "reason": "FOCR_UOCR2_SOURCE_DIR unset");
+        return;
+    };
+    let ((v1, v2), row) = models_installed_in(&v2_dir);
+    tlog!(test, "case": "v2_only", "event": "assert", "v1": v1, "v2": v2,
+        "result": if (v1, v2) == (false, true) { "pass" } else { "fail" });
+    assert_eq!((v1, v2), (false, true), "v2 only");
+    assert!(row.contains(" yes "), "v2 row shows LOCAL yes: {row}");
+
+    #[cfg(unix)]
+    {
+        use franken_ocr::native_engine::{OcrModel, model_id_at};
+        let Some(v1_artifact) = OcrModel::resolve_model(Path::new("unlimited-ocr"))
+            .ok()
+            .filter(|path| model_id_at(path) == Some("unlimited-ocr") && path.is_file())
+        else {
+            tlog!(test, "case": "v1", "event": "skip", "result": "skip",
+                "reason": "no v1 .focrq resolves in this environment");
+            return;
+        };
+        let v1_dir = fresh_run_store_path().with_extension("v1models");
+        std::fs::create_dir_all(&v1_dir).expect("v1 model dir");
+        std::os::unix::fs::symlink(
+            &v1_artifact,
+            v1_dir.join(v1_artifact.file_name().expect("artifact file name")),
+        )
+        .expect("link the v1 artifact");
+        let ((v1, v2), _) = models_installed_in(v1_dir.as_os_str());
+        tlog!(test, "case": "v1_only", "event": "assert", "v1": v1, "v2": v2,
+            "result": if (v1, v2) == (true, false) { "pass" } else { "fail" });
+        assert_eq!((v1, v2), (true, false), "v1 only");
+        let both = std::env::join_paths([v1_dir.as_os_str(), v2_dir.as_os_str()])
+            .expect("joinable model dirs");
+        let ((v1, v2), _) = models_installed_in(&both);
+        tlog!(test, "case": "both", "event": "assert", "v1": v1, "v2": v2,
+            "result": if (v1, v2) == (true, true) { "pass" } else { "fail" });
+        assert_eq!((v1, v2), (true, true), "both");
+        let _ = std::fs::remove_dir_all(&v1_dir);
+    }
 }
 
 /// [C4→bd-50wo] `focr convert --quant int4` is now IMPLEMENTED (the wasm

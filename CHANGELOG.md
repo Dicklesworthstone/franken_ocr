@@ -322,8 +322,42 @@ sections as they land.
     pass over one.
   - `FOCR_TIMING=1` logs a `pagesource` row per page: rasterize time, size and
     bytes, or the skip reason.
+- **CLI and robot basics for Unlimited-OCR-2** (bead U2-E1).
+  - `--model unlimited-ocr-2` (any model id) searches the model directories
+    for that model only. A directory of that name in the working directory no
+    longer shadows it, and an artifact of another model under that name exits
+    3 naming both.
+  - Every tuning flag (`--crop-mode`, `--max-length`, `--temperature`,
+    `--no-repeat-ngram`, `--ngram-window`, `--base-size`, `--image-size`)
+    reaches the model only when given, so an explicit value that equals v1's
+    default still reaches a model whose default differs. v1 runs are unchanged.
+  - `--max-page-tokens N` caps the tokens Unlimited-OCR-2 generates per page
+    (default 20,000; `0` lifts only this cap). Other models ignore it.
+  - `--crop-mode gundam` on an Unlimited-OCR-2 page adds an
+    `uncertified_crop_mode` warning. An Unlimited-OCR-2 `--multi-page`
+    document refuses gundam (exit 2), since it reads every page as a base view.
+  - `run_complete`, a partial `run_error`, `--json`, `-o *.json` and
+    `ocr-batch --multi-page --json` carry `model_id` and `source_sha256`: the
+    model that ran, and the source digest a `.focrq` records (`null` for a raw
+    checkpoint, whose load hashes nothing). The run store's
+    `model_version_tag` is now `<model_id>@<source_sha256>`, or `unknown` when
+    no model loaded. It used to hold the `--model` path or `default`.
+  - One mode-default table (single page, PDF, directory, `--multi-page`,
+    `ocr-batch`, `ocr-batch --multi-page`, bare `focr pull`) chooses the model
+    when neither `--model` nor `FOCR_MODEL_PATH` names one. Every entry is v1.
+    A default that is not installed leaves v1 serving with one `pull_hint`
+    warning; that branch waits for a default to change. The first-run
+    download offer names the model it would fetch.
+  - `focr models` lists `unlimited-ocr-2` as `experimental`, with its `recipe`,
+    an `installed` field (a LOCAL column in the table) and the note "best for
+    documents and long documents".
 
 ### Fixed
+
+- The resident daemon is no longer started for a model whose header this
+  binary refuses (a newer format, an unknown checkpoint). The run fails inline
+  with the same error, instead of leaving a daemon that can never load the
+  model idling for 10 minutes.
 
 - A PDF page stored as FlateDecode samples is inflated into one buffer of its
   declared size. The buffer used to grow by doubling, and on macOS the freed

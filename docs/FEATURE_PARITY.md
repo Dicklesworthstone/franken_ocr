@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **66** | **194** |
-| `present` | 115 † | 52 | 167 |
+| Total enumerated rows | **128** | **73** | **201** |
+| `present` | 115 † | 59 | 174 |
 | `partial` | 7 † | 11 | 18 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -259,7 +259,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr ocr-batch` (load-once multi-image throughput) | §7.2 | SHOULD | partial | SURF | bd-1azu | spine + batched-parity tests green; NO CLI golden yet (an untested surface never rounds up) |
 | `focr convert <st> -o <.focrq> [--arch][--quant]` | §7.2 | MUST | present | SURF | bd-1es.6 | byte-parity vs published artifact re-proven 2026-07-06 (sha d8c5fcf2…) |
 | `focr pull [model] [--quant]` (manifest + verify) | §7.2 | MUST | present | SURF | bd-3u6x | verified vs HF; native Windows proven (bd-15ow); zoo artifact publication user-gated (bd-av64.8) |
-| `focr models` (zoo discovery: id, tasks, status) | §7.2 | MUST | present | SURF | bd-3jo6.1.13 | CLI shipped + goldens; A13 docs/runbook half still open |
+| `focr models` (zoo discovery: id, tasks, status) | §7.2 | MUST | present | SURF | bd-3jo6.1.13 | CLI shipped + goldens; A13 docs/runbook half still open; U2-E1 adds the `unlimited-ocr-2` row (status from `maturity()`, `recipe`, `installed`/LOCAL, guidance "best for documents and long documents") |
 | `focr robot schema` (self-describing contract) | §7.2 | MUST | present | SURF | bd-wp8.2 | versioned; frozen fixture |
 | `focr robot health` (model/arch/threads diagnostics) | §7.2 | MUST | present | SURF | bd-223.3 | incl `threads` budget field (bd-223.2) |
 | `focr robot backends` (effective dense route + hardware tiers + USL pool sizing) | §7.2 | MUST | present | SURF | bd-2mo.2 | separates effective ordinary-dense route from hardware IsaTier; goldens |
@@ -272,6 +272,11 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Exit codes 0..8 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests (8 = `low_yield`, GH #15; 5 also covers a document that stopped early, U2-B6) |
 | Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | present | SURF | bd-223.7 | OnceLock; FOCR_THREADS physical-core budget (bd-223.2) |
 | Model resolution (no network at runtime) + header sniff | §7.5 | MUST | present | SURF | bd-223.7 | default auto-resolves pulled int8 (bd-3u6x); dotfile-safe shard globs |
+| Model ids as `--model` (`unlimited-ocr-2`): resolved only to that model, never shadowed by a CWD path | §7.5 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | a registry id searches the model dirs only and refuses an artifact of another model (exit 3 naming both); `cli_robot_golden` CWD-shadow golden + resolver unit tests |
+| Mode-default table (D25): `--model` > `FOCR_MODEL_PATH` > the mode default > v1, `pull_hint` when a default is missing | §7.5 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | one table keyed by single page, PDF, directory, `--multi-page`, `ocr-batch`, `ocr-batch --multi-page` and bare `focr pull` (also the first-run offer); every entry v1, so the hint branch is dormant; precedence matrix and v2-default-table unit tests |
+| `--max-page-tokens N` (Unlimited-OCR-2 per-page cap; default 20,000, `0` lifts it) | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | forwarded to the decode overrides and the resident wire; other models ignore it; negative exits 2 |
+| Explicit tuning flags always forwarded (`--crop-mode base`, `--no-repeat-ngram 35`, `--max-length 32768`) | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | each is `None` unless given, so a model whose defaults differ from v1's still receives an explicit value; v1 behavior unchanged |
+| `--crop-mode gundam` on Unlimited-OCR-2: page warns `uncertified_crop_mode`; `--multi-page` document refuses it (exit 2) | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | the paged document reads every page as a base view; invalid values exit 2 (golden) |
 | `--version` carries Baidu MIT attribution | §11 | MUST | present | SURF | bd-223.14 | license compliance |
 | `pdf` input (native scanned fast path) | §7.7 | SHOULD | partial | SURF | bd-0a7.4 | **moved from `excluded`**: scanned-PDF native path shipped v0.2.0 (lopdf, decompress-bomb bounded bd-2zpu); vector-page rasterization deferred |
 | Directory input (`focr ocr <dir>`: page images as one document, natural order) + lazy page source | §7.7 | SHOULD | present | SURF | bd-uocr2-epic-cgux.23 | `page_source::PageSource` reads PDF, directory and image-list pages one at a time; `--pages`/`--split-spreads`/`--multi-page` apply as to a PDF; `e2e_recognize::directory_input_is_a_document_and_keeps_its_refusals_without_a_model` + the model-gated `v1_directory_input_matches_the_image_list_when_armed`; memory gate `tests/page_source_memory.rs` (Flate/JPEG/PNG walks flat vs 546 MiB eager); watchdog `multi_page_page_source_completes_within_budget` |
@@ -297,6 +302,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `ignored_lever` warning kind + `warning_kinds` in `robot schema` | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.8 | additive (schema v1); Unlimited-OCR-2's pre-load lever admission prints it on stderr at load, and its run carries it in `run_complete`/`--json` `warnings[]` (U2-B6) |
 | `ignored_files` warning kind (a directory's non-image files) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.23 | additive (schema v1); `{kind, message, recovery, count, examples}` once per run on stderr, `run_complete` and `--json`; frozen in `robot_schema_v1.json` `warning_kinds` |
 | Partial document output: exit 5 `run_error` with `finish_reason`, `pages_out`, `warnings[]` (`v2_length`, `v2_budget`, `leading_text`) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.15 | additive (schema v1); an Unlimited-OCR-2 document stopped by its position limit or forward budget writes its pages first and emits no `run_complete`; `robot::partial_output_run_error_carries_its_pages_and_warnings` + the model-gated `v2_cli_writes_a_stopped_document_then_exits_5_when_armed` |
+| `model_id` + `source_sha256` on `run_complete`, a partial `run_error`, `--json`, `-o *.json` and `ocr-batch --multi-page --json`; run store `model_version_tag = <model_id>@<source_sha256>` | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | additive (schema v1); the model that ran (resident replies carry it too); `source_sha256` is the digest a `.focrq` records, `null` for a raw checkpoint (raw loads hash nothing), and nothing hashes the artifact per run; model-gated v1/v2 e2e asserts + run-store tag |
+| `uncertified_crop_mode` and `pull_hint` warning kinds | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.29 | additive (schema v1); `pull_hint` `{model_id, mode}` prints once before the decode and rides `run_complete`/`--json`; dormant while every mode default is v1 |
 
 ## 14. Parity gates & gauntlet machinery (plan §8.2, §8.5)
 

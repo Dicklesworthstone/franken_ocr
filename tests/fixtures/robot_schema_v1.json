@@ -241,6 +241,7 @@
     "v2_budget",
     "leading_text",
     "ignored_files",
-    "uncertified_crop_mode"
+    "uncertified_crop_mode",
+    "pull_hint"
   ]
 }

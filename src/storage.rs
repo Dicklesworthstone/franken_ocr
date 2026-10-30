@@ -49,8 +49,9 @@ pub struct RunRecord {
     pub mode: String,
     /// The precision actually run (`int8`, `f32`, `unknown`).
     pub quant: String,
-    /// The model provenance tag (artifact `model_id` + source sha when
-    /// known; `unknown` otherwise — populated from the truth pack).
+    /// The model provenance tag: `<model_id>@<source_sha256>` for the model
+    /// that ran, the bare `model_id` when its artifact records no digest (a
+    /// raw checkpoint), `unknown` when no model loaded.
     pub model_version_tag: String,
     /// The process exit code the run mapped to.
     pub exit_code: i64,

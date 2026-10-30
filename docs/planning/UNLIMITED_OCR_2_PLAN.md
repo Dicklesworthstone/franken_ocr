@@ -160,7 +160,7 @@ default-policy decision in §10 follows from that.
 | **Multi-page users** (`--multi-page`, 5–50 pages) | One cross-page pass whose prompt (111 tokens per page) and output share 32,768 positions (≈29 dense pages). Weaker cross-page structure. Every raster is held in RAM. `--json` returns `pages: []`. | Markedly better cross-page text and tables (MPDocBench +22.7). A real per-page `pages[]`, layout boxes and figures. No practical length limit and bounded memory. When v1 hits its 32K budget, the error names `focr pull unlimited-ocr-2`. |
 | **Book and archive digitizers** (100s–1000s of pages) | Not possible | **New capability:** windowed parsing on CPU with bounded memory, streamed page by page, resumable after a crash or Ctrl-C. Inputs: scanned PDFs (JPEG/CCITT/Flate pages) or a directory of page images. JBIG2/JPX/vector pages are **skipped with a `page` `skipped` event**, dropped from the prompt and kept in the source-page map, so numbering never shifts. Expect hours per 1,000 pages on CPU (estimate, §8.4). |
 | **Rust embedders** | Five `recognize_multi_page*` variants (whole document, blocking) | One `recognize_document(source, &opts, sink)` with streaming, windowing and resume. The old variants are removed with a minor-version bump and a migration table (AGENTS.md: no compat shims). |
-| **Agents (robot mode)** | `run_start`, `run_complete`/`run_error`, and a `page` event whose `page` mixes source page and emission index. The schema lists event kinds only, so no field can be validated (`stage` is advertised but has no emitter). | `robot schema` gains field-level `event_fields` (U2-X2, M0). On v2 runs, `page` gains `source_page`, `window`, `tokens`, `finish` and `model_id` (additive); v1 `page` events are unchanged. A new `window` event. `run_complete` gains `model_id`, `artifact_sha256`, `pages_out`, `windows`, `extra_markers`, `finish_reason` and `warnings[]`; a partial-output `run_error` carries the same partial fields. `robot triage` recommends v2 for long documents. The schema stays v1 (additive). |
+| **Agents (robot mode)** | `run_start`, `run_complete`/`run_error`, and a `page` event whose `page` mixes source page and emission index. The schema lists event kinds only, so no field can be validated (`stage` is advertised but has no emitter). | `robot schema` gains field-level `event_fields` (U2-X2, M0). On v2 runs, `page` gains `source_page`, `window`, `tokens`, `finish` and `model_id` (additive); v1 `page` events are unchanged. A new `window` event. `run_complete` gains `model_id`, `source_sha256`, `pages_out`, `windows`, `extra_markers`, `finish_reason` and `warnings[]`; a partial-output `run_error` carries the same partial fields. `robot triage` recommends v2 for long documents. The schema stays v1 (additive). |
 | **Holders of v1 artifacts** | `unlimited-ocr.v0.7.0.int8.focrq` | Keeps working, byte-identically, throughout this plan (T3 gate). No forced downloads; v1 stays pullable. |
 
 ### 3.2 Principles that follow
@@ -581,9 +581,14 @@ name two artifacts.
 - Precedence: `--model` > `FOCR_MODEL_PATH` > the mode default (§10) > v1.
 - If the mode default is not installed, v1 serves the run and prints a one-line pull hint. The hint
   goes to stderr, plus a `run_complete.warnings[]` entry of kind `pull_hint` (§9.2).
-- JSON output and `run_complete` carry `model_id` and `artifact_sha256`. The run store records both
-  in its existing `model_version_tag` column as `<model_id>@<artifact_sha256>`, with no schema change.
-  Today the CLI fills that column with the `--model` path or "default" (`cli.rs:1300-1304`).
+- JSON output and `run_complete` carry `model_id` and `source_sha256`. The run store records both
+  in its existing `model_version_tag` column as `<model_id>@<source_sha256>`, with no schema change.
+  Before U2-E1 the CLI filled that column with the `--model` path or "default".
+- The digest is the `source_sha256` a `.focrq` records in its fixed prefix, `null` for a raw
+  checkpoint. (This plan first called it `artifact_sha256`; U2-E1 renamed it, because hashing the
+  artifact file on every run would cost seconds for a multi-GB file and raw loads hash nothing by
+  design. A field named `artifact_sha256` would invite comparison with the artifact file's hash,
+  which it is not.)
 
 *Why:* "v2 when installed" would otherwise make pipeline output depend on cache state invisibly.
 
@@ -1294,7 +1299,7 @@ Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a
 | DISC-U2-8 | guard lag | none | can lag one step under overlap scheduling | None; SGLang comparisons tolerate it |
 | DISC-U2-9 | non-blank text before the first `<PAGE>` (leading head) | `_uocr_save_results` drops it (`MU:1210`, `split('<PAGE>')[1:]`) | a recomputed window keeps it as body 0 with front-anchored ownership, which shifts pages and drops the last one (`doc_split.py:251-255`) | Prepend it to the first own page's body with `warnings[{kind:"leading_text"}]`, unwindowed and windowed alike (U2-B6, U2-D1a) |
 | DISC-U2-10 | EXIF orientation | ignored: `Image.open(f).convert('RGB')` (`MU:1070`) | ignored: `smart_rgb_conversion = False` (`base_processor.py:215`), so a plain `convert("RGB")` | Applied, as for v1 (the shared decoder, `src/preprocess/mod.rs` `decode_path`). Only an image with a non-identity Orientation tag differs, and the oracle corpus has none (U2-B7) |
-| DISC-U2-11 | FFN/expert weight storage in the default decoder | f32 parity oracle over the bf16 checkpoint | bf16 | The shipping cache keeps the 2,148 FFN/expert matrices per-channel int8 (the fixed recipe); attention, router, norms and `lm_head` stay f32. Its greedy ids leave the f32 oracle's at a near-tie, where the all-f32 cache (`FOCR_DECODE_F32`, otherwise the same ops) keeps the oracle's token: S1 page_0014 at step 47 (the oracle's token 0.214 below the int8-FFN pick), page_0590 at step 32 (0.156), S2 at step 44 (0.156), S3 p9_p14 at step 73 (0.065); page_0009 is exact. No layer routes differently at any of them (U2-C2). U2-C4 measures the impact at L5 and files the entry |
+| DISC-U2-11 | FFN/expert weight storage in the default decoder | f32 parity oracle over the bf16 checkpoint | bf16 | The shipping cache keeps the 2,148 FFN/expert matrices per-channel int8 (the fixed recipe); attention, router, norms and `lm_head` stay f32. Its greedy ids leave the f32 oracle's at a near-tie, where the all-f32 cache (`FOCR_DECODE_F32`, otherwise the same ops) keeps the oracle's token: S1 page_0014 at step 47 (the oracle's token 0.214 below the int8-FFN pick), page_0590 at step 32 (0.156), S2 at step 44 (0.156), S3 p9_p14 at step 73 (0.065); page_0009 is exact. On the long lane the f32 cache is exact over S3-p10 (6,272 ids) and S3-p20 (16,880 ids), with block retirement on and off, while the int8-FFN path leaves at S3-p10 step 203 (0.017) and S3-p20 step 118 (0.056). It still ends at `stop` with one body per page, 6,277 and 17,165 ids long. No layer routes differently at any of them (U2-C2). U2-C4 measures the impact at L5 and files the entry |
 | DISC-U2-12 | page state of a reused window's last prompt row when no text is spliced (the text KV allocation failed) | n/a (no windows) | the first decode step's carry is written into that row's slot (`_seed_continuation`, `W/session/uocr_doc_reuse.py:490-497`), so its image page reads −1 | The reused-window seed (`DecodePageState::reused_window`) carries the step and the row keeps its page. Both stacks read a row's page only through its 32-row block's (min, max), which skips −1, so they differ only when that row opens its block (rewritten prompt length ≡ 1 mod 32). franken_ocr's KV is never pool-allocated, so only the `marker_only_splice` test hook reaches the path; `w2-n5-markeronly-t12` (prompt 956 rows) is token-exact (U2-D1a) |
 
 **Filing.** `scripts/check_ledgers.py:310` matches only `^## DISC-\d+:`, so a `## DISC-U2-k:` heading
@@ -2074,7 +2079,7 @@ Decoded v2 events also gain `tokens`, `finish:"marker"|"eos"|"page_cap"|"length"
  prefill_tokens, generated_tokens, kv_bytes_peak, rss_bytes_peak, elapsed_ms, eta_ms}
 ```
 
-**`run_complete` additions:** `model_id`, `artifact_sha256`, `pages_out`, `pages_skipped`, `windows`,
+**`run_complete` additions:** `model_id`, `source_sha256`, `pages_out`, `pages_skipped`, `windows`,
 `extra_markers` (U2-D5 adds `pages_out`, `pages_skipped`, `windows` and `extra_markers`),
 `finish_reason` and `warnings[]` (U2-X2), and `resumed_from` (owned by U2-D4). The library mirror is
 U2-E2's `DocumentResult`, which gains `warnings: Vec<Warning>` with the same `{kind, message, recovery,
@@ -2176,7 +2181,7 @@ let doc = engine.recognize_document(
   U2-B6's page limit enforced; after it, W=10 for N > W. `Some(PageWindow::Off)` is the explicit
   unwindowed request that bypasses the limit (U2-B6's `enforce_page_limit = false`).
 - **Result.** `DocumentResult { pages_out, pages_skipped, windows, extra_markers, finish_reason,
-  warnings, resumed_from, model_id, artifact_sha256 }`. `warnings: Vec<Warning>` carries U2-X2's
+  warnings, resumed_from, model_id, source_sha256 }`. `warnings: Vec<Warning>` carries U2-X2's
   `{kind, message, recovery, …}` entries, so library-side kinds (`leading_text`, `v2_length`,
   `v1_page_merge`, `resume_recompute`, `ignored_files`) reach the CLI and library users.
 - It replaces the five `recognize_multi_page*` wrappers (`lib.rs:703-802`), with a minor-version bump
@@ -2269,7 +2274,7 @@ let doc = engine.recognize_document(
 
 **Model resolution (D25):** `--model` > `FOCR_MODEL_PATH` > the mode default above > v1. A pull hint
 is printed when the mode default is missing. JSON output and `run_complete` carry `model_id` and
-`artifact_sha256`.
+`source_sha256`.
 
 **Multi-page gate (E5a; all required).**
 1. C4 green on the int8 artifact.

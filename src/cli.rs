@@ -203,10 +203,12 @@ pub struct OcrBatchArgs {
     /// and reused across all of them (load-once batch throughput).
     #[arg(required = true)]
     pub images: Vec<PathBuf>,
-    /// Model artifact path. Default (unset) = the FAST plain-text OCR model
-    /// (unlimited-ocr). Pass a `got-ocr2.int8.focrq` for SPECIALIZED structured
-    /// output — math (LaTeX), tables, charts, molecular, geometry, sheet music
-    /// (heavier per page). `focr pull got-ocr2` first; see `focr models`.
+    /// Model artifact path or model id. Default (unset) = the FAST plain-text
+    /// OCR model (unlimited-ocr). Pass a `got-ocr2.int8.focrq` for SPECIALIZED
+    /// structured output — math (LaTeX), tables, charts, molecular, geometry,
+    /// sheet music (heavier per page). `focr pull got-ocr2` first. With
+    /// `--multi-page`, `unlimited-ocr-2` (experimental) reads long documents;
+    /// see `focr models`.
     #[arg(long)]
     pub model: Option<PathBuf>,
     /// Emit machine-readable JSON (one object per image + a final summary).
@@ -239,8 +241,8 @@ pub struct ModelsArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct PullArgs {
-    /// Model id to fetch (e.g. `got-ocr2`). Defaults to the manifest's primary
-    /// model (`unlimited-ocr`).
+    /// Model id to fetch (e.g. `got-ocr2`). Defaults to the default model
+    /// (`unlimited-ocr`).
     pub model: Option<String>,
     /// Quant tag to fetch (defaults to `int8`; available tags vary by model).
     #[arg(long, default_value = dist::DEFAULT_QUANT)]
@@ -267,7 +269,13 @@ pub struct OcrRequestArgs {
     /// images (read in natural order, `p2` before `p10`, as one document;
     /// other files are left out with an `ignored_files` warning).
     pub image: PathBuf,
-    /// Explicit model artifact path for diagnostics and model-gated runs.
+    /// The model to run: a model id (`unlimited-ocr`, `unlimited-ocr-2`, …)
+    /// found in the model directories, or an artifact path. Default: the
+    /// mode's default, unlimited-ocr for every mode today. unlimited-ocr-2 is
+    /// Baidu's experimental long-document successor: use it for documents and
+    /// long documents (a PDF or directory, with `--multi-page`). Single pages
+    /// work with either. unlimited-ocr stays the default until unlimited-ocr-2
+    /// passes its accuracy gates; see `focr models`.
     #[arg(long)]
     pub model: Option<PathBuf>,
     /// Global-view edge length. Default: the model's (1024, the reference
@@ -279,13 +287,16 @@ pub struct OcrRequestArgs {
     /// (640, the reference `infer(..., image_size=640)`).
     #[arg(long)]
     pub image_size: Option<i64>,
-    /// Vision preprocessing mode (unlimited-ocr only — got-ocr2 always uses its
-    /// own fixed squash-1024 preprocess). `base` (the default) is the certified
-    /// single 1024-pixel global view — the mode every oracle cert and golden
-    /// was produced under, and what the engine has always actually run.
-    /// `gundam` selects the reference dynamic-resolution tiling (a 1024 global
-    /// view plus 640 local tiles); its connector path is unit-tested but has no
-    /// e2e oracle certification yet. (Until bd-1e9n this flag was parsed and
+    /// Vision preprocessing mode (unlimited-ocr and unlimited-ocr-2 — got-ocr2
+    /// always uses its own fixed squash-1024 preprocess). `base` (the default)
+    /// is the certified single 1024-pixel global view — the mode every oracle
+    /// cert and golden was produced under, and what the engine has always
+    /// actually run. `gundam` selects the reference dynamic-resolution tiling
+    /// (a 1024 global view plus 640 local tiles); its connector path is
+    /// unit-tested but has no e2e oracle certification yet. An unlimited-ocr-2
+    /// page read in gundam mode carries an `uncertified_crop_mode` warning, and
+    /// an unlimited-ocr-2 `--multi-page` document refuses gundam (it reads
+    /// every page as a base view). (Until bd-1e9n this flag was parsed and
     /// silently dropped with a `gundam` default label the engine never honored;
     /// the default now states the real, certified behavior.)
     #[arg(long, value_enum)]
@@ -1401,7 +1412,7 @@ fn run_ocr_inner(
     robot_mode: bool,
     ran: &mut Option<native_engine::ModelIdentity>,
 ) -> FocrResult<()> {
-    let request = args.to_request()?;
+    let mut request = args.to_request()?;
     // GOT-OCR2 `--format` (.mmd) mode and the decode tuning flags (`--max-length`,
     // `--temperature`, `--no-repeat-ngram`, `--ngram-window`) are threaded to the
     // leaf via process-globals (the shared OcrEngine/OcrModel signatures stay
@@ -1462,18 +1473,26 @@ fn run_ocr_inner(
                 .into(),
         ));
     }
+    // The mode default (D25): an installed non-v1 default names the model; a
+    // missing one leaves v1 serving with a pull hint.
+    let mode = RunMode::of_ocr(&request, is_document);
+    let pull_hint = apply_mode_default(&mut request.model, mode, &MODE_DEFAULTS);
     // A document's pages, opened once here so a bad `--pages` spec or a
     // directory without page images fails before the model loads. Files a
-    // directory leaves out are reported now, and again on `run_complete`.
+    // directory leaves out are reported now, and again on `run_complete`,
+    // after the pull hint.
     let source = is_document
         .then(|| open_page_source(&request))
         .transpose()?;
-    let source_warnings = source
-        .as_ref()
-        .map(PageSource::warnings)
-        .unwrap_or_default();
+    let mut early_warnings: Vec<native_engine::RunWarning> = pull_hint.into_iter().collect();
+    early_warnings.extend(
+        source
+            .as_ref()
+            .map(PageSource::warnings)
+            .unwrap_or_default(),
+    );
     if !robot_mode {
-        source_warnings.iter().for_each(print_run_warning);
+        early_warnings.iter().for_each(print_run_warning);
     }
     // A resident run decodes in the daemon, which reports its finish_reason
     // (U2-X2) and model (U2-E1) in the reply; inline runs leave both on this
@@ -1571,7 +1590,7 @@ fn run_ocr_inner(
         .or(resident_finish);
     let model = resident_model.or_else(|| engine.loaded_model_identity());
     ran.clone_from(&model);
-    let mut run_warnings = source_warnings;
+    let mut run_warnings = early_warnings;
     run_warnings.extend(
         decode_report
             .as_ref()
@@ -1746,12 +1765,20 @@ fn merge_run_warnings(value: &mut serde_json::Value, warnings: &[native_engine::
 
 /// The human stderr line per decode warning (U2-X2).
 fn print_run_warnings(warnings: &[native_engine::RunWarning]) {
-    // The model's admission printed its `ignored_lever` warnings at load, and
-    // the page source its `ignored_files` warning when it opened.
     warnings
         .iter()
-        .filter(|w| !matches!(w.kind, "ignored_lever" | "ignored_files"))
+        .filter(|w| !printed_early(w))
         .for_each(print_run_warning);
+}
+
+/// Whether `warning` reached stderr before the decode: the model's admission
+/// prints its `ignored_lever` warnings at load, and the run its `pull_hint`
+/// and the page source its `ignored_files` warning before the model loads.
+fn printed_early(warning: &native_engine::RunWarning) -> bool {
+    matches!(
+        warning.kind,
+        "ignored_lever" | "ignored_files" | "pull_hint"
+    )
 }
 
 /// One run warning's human stderr line.
@@ -1810,6 +1837,186 @@ fn music_meta_to_json(meta: &native_engine::MusicPageMeta) -> serde_json::Value 
         .collect();
     entries.sort_by_key(|(index, _)| *index);
     serde_json::Value::Array(entries.into_iter().map(|(_, v)| v).collect())
+}
+
+/// How a run reads its input, the key of the mode-default table (D25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    /// `focr ocr <image>`.
+    SinglePage,
+    /// `focr ocr <pdf>`, page by page.
+    PdfDocument,
+    /// `focr ocr <dir>`, page by page.
+    DirectoryDocument,
+    /// `focr ocr <pdf|dir> --multi-page`.
+    MultiPage,
+    /// `focr ocr-batch`.
+    Batch,
+    /// `focr ocr-batch --multi-page`.
+    BatchMultiPage,
+    /// `focr pull` without a model, and the first-run download offer.
+    Pull,
+}
+
+impl RunMode {
+    /// The mode of a `focr ocr` run.
+    fn of_ocr(request: &OcrRequest, is_document: bool) -> Self {
+        if !is_document {
+            Self::SinglePage
+        } else if request.multi_page {
+            Self::MultiPage
+        } else if request.image.is_dir() {
+            Self::DirectoryDocument
+        } else {
+            Self::PdfDocument
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SinglePage => "single-page",
+            Self::PdfDocument => "pdf",
+            Self::DirectoryDocument => "directory",
+            Self::MultiPage => "multi-page",
+            Self::Batch => "ocr-batch",
+            Self::BatchMultiPage => "ocr-batch --multi-page",
+            Self::Pull => "pull",
+        }
+    }
+}
+
+/// The model each mode runs when neither `--model` nor `FOCR_MODEL_PATH`
+/// names one (D25). Every entry is Unlimited-OCR v1 until a default gate
+/// passes; U2-E5a and U2-E5b only edit this table.
+const MODE_DEFAULTS: [(RunMode, &str); 7] = [
+    (
+        RunMode::SinglePage,
+        native_engine::model_arch::UNLIMITED_OCR_V1_ID,
+    ),
+    (
+        RunMode::PdfDocument,
+        native_engine::model_arch::UNLIMITED_OCR_V1_ID,
+    ),
+    (
+        RunMode::DirectoryDocument,
+        native_engine::model_arch::UNLIMITED_OCR_V1_ID,
+    ),
+    (
+        RunMode::MultiPage,
+        native_engine::model_arch::UNLIMITED_OCR_V1_ID,
+    ),
+    (
+        RunMode::Batch,
+        native_engine::model_arch::UNLIMITED_OCR_V1_ID,
+    ),
+    (
+        RunMode::BatchMultiPage,
+        native_engine::model_arch::UNLIMITED_OCR_V1_ID,
+    ),
+    (
+        RunMode::Pull,
+        native_engine::model_arch::UNLIMITED_OCR_V1_ID,
+    ),
+];
+
+/// `table`'s model for `mode`; v1 when the table has no entry.
+fn mode_default(table: &[(RunMode, &'static str)], mode: RunMode) -> &'static str {
+    table
+        .iter()
+        .find(|(entry, _)| *entry == mode)
+        .map_or(native_engine::model_arch::UNLIMITED_OCR_V1_ID, |(_, id)| id)
+}
+
+/// Where a run's model comes from (D25): `--model` > `FOCR_MODEL_PATH` >
+/// the mode default > v1.
+#[derive(Debug, PartialEq, Eq)]
+enum ModelChoice {
+    /// `--model` or `FOCR_MODEL_PATH` names the model; resolution is unchanged.
+    Named,
+    /// The mode default is v1: the engine's own default resolution.
+    V1Default,
+    /// The mode default, installed: the run resolves its registry id.
+    ModeDefault(&'static str),
+    /// The mode default is not installed, so v1 serves with a pull hint.
+    MissingDefault(&'static str),
+}
+
+/// Choose a run's model. `named` is whether `--model` or `FOCR_MODEL_PATH`
+/// gave one; `installed` is asked only about a non-v1 default.
+fn choose_model(
+    named: bool,
+    default_id: &'static str,
+    installed: impl FnOnce(&str) -> bool,
+) -> ModelChoice {
+    if named {
+        ModelChoice::Named
+    } else if default_id == native_engine::model_arch::UNLIMITED_OCR_V1_ID {
+        ModelChoice::V1Default
+    } else if installed(default_id) {
+        ModelChoice::ModeDefault(default_id)
+    } else {
+        ModelChoice::MissingDefault(default_id)
+    }
+}
+
+/// Whether the model `id` names is installed: the registry id resolves, and
+/// the bounded header probe finds that model there.
+fn model_installed(id: &str) -> bool {
+    native_engine::model_id_at(Path::new(id)) == Some(id)
+}
+
+/// Whether `FOCR_MODEL_PATH` names the run's model, exactly as
+/// [`OcrEngine::model_path`] reads it.
+fn model_path_env_set() -> bool {
+    std::env::var_os(crate::MODEL_PATH_ENV).is_some()
+}
+
+/// Apply the mode default to `model` (D25): an installed non-v1 default
+/// becomes the run's model; a missing one leaves v1 serving and returns the
+/// `pull_hint` warning to report once.
+fn apply_mode_default(
+    model: &mut Option<PathBuf>,
+    mode: RunMode,
+    table: &[(RunMode, &'static str)],
+) -> Option<native_engine::RunWarning> {
+    let named = model.is_some() || model_path_env_set();
+    match choose_model(named, mode_default(table, mode), model_installed) {
+        ModelChoice::Named | ModelChoice::V1Default => None,
+        ModelChoice::ModeDefault(id) => {
+            *model = Some(PathBuf::from(id));
+            None
+        }
+        ModelChoice::MissingDefault(id) => Some(pull_hint(mode, id)),
+    }
+}
+
+/// The `pull_hint` warning for a mode whose default `id` is not installed.
+fn pull_hint(mode: RunMode, id: &'static str) -> native_engine::RunWarning {
+    let mut fields = serde_json::Map::new();
+    fields.insert("model_id".into(), id.into());
+    fields.insert("mode".into(), mode.as_str().into());
+    native_engine::RunWarning {
+        kind: "pull_hint",
+        message: format!(
+            "the {} default is {id}, which is not installed; {} served this run (`focr pull \
+             {id}` installs it)",
+            mode.as_str(),
+            native_engine::model_arch::UNLIMITED_OCR_V1_ID
+        ),
+        recovery: native_engine::warning_recovery(native_engine::WarningKind::PullHint),
+        fields,
+    }
+}
+
+/// The model the first-run download offer names (D25): the bare-`focr pull`
+/// default, when `manifest` carries a compatible pull of it.
+fn first_run_offer(
+    table: &[(RunMode, &'static str)],
+    manifest: &dist::Manifest,
+) -> Option<&'static str> {
+    let id = mode_default(table, RunMode::Pull);
+    let available = !pull_availability(Some(manifest), id).compatible.is_empty();
+    available.then_some(id)
 }
 
 /// Try to serve an eligible single-image recognition from the resident
@@ -2363,7 +2570,17 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         });
     }
     let engine = OcrEngine::new()?;
-    let model = args.model.clone();
+    let mut model = args.model.clone();
+    // The mode default (D25), its pull hint reported once.
+    let mode = if args.multi_page {
+        RunMode::BatchMultiPage
+    } else {
+        RunMode::Batch
+    };
+    let pull_hint = apply_mode_default(&mut model, mode, &MODE_DEFAULTS);
+    if let Some(hint) = &pull_hint {
+        print_run_warning(hint);
+    }
     let count = args.images.len();
     let total = std::time::Instant::now();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(count);
@@ -2387,17 +2604,18 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         }?;
         let elapsed = total.elapsed().as_secs_f64();
         let report = engine.take_last_decode_report();
-        let model = engine.loaded_model_identity();
-        let run_warnings = report
-            .as_ref()
-            .map(native_engine::decode_warnings)
-            .unwrap_or_default();
+        let ran = engine.loaded_model_identity();
+        let mut run_warnings: Vec<native_engine::RunWarning> = pull_hint.into_iter().collect();
+        run_warnings.extend(
+            report
+                .as_ref()
+                .map(native_engine::decode_warnings)
+                .unwrap_or_default(),
+        );
         let partial = report
             .as_ref()
-            .zip(model.as_ref())
-            .and_then(|(report, model)| {
-                native_engine::partial_output(report, &run_warnings, model)
-            });
+            .zip(ran.as_ref())
+            .and_then(|(report, ran)| native_engine::partial_output(report, &run_warnings, ran));
         print_run_warnings(&run_warnings);
         if args.json {
             let mut value = serde_json::json!({
@@ -2412,8 +2630,8 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
                 value["finish_reason"] = report.run_finish_reason().as_str().into();
             }
             merge_run_warnings(&mut value, &run_warnings);
-            if let Some(model) = &model {
-                model.merge_into(&mut value);
+            if let Some(ran) = &ran {
+                ran.merge_into(&mut value);
             }
             emit(&value);
         } else {
@@ -2872,12 +3090,6 @@ fn model_arch_json(a: &dyn crate::model_arch::ModelArch) -> serde_json::Value {
     })
 }
 
-/// Whether `arch`'s own artifact is installed: its registry id resolves, and
-/// the bounded header probe finds that model there (U2-E1).
-fn model_installed(arch: &dyn crate::model_arch::ModelArch) -> bool {
-    native_engine::model_id_at(Path::new(arch.id())) == Some(arch.id())
-}
-
 #[derive(Debug, Default)]
 struct PullAvailability {
     in_manifest: bool,
@@ -2929,7 +3141,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             .iter()
             .map(|a| {
                 let mut j = model_arch_json(*a);
-                j["installed"] = model_installed(*a).into();
+                j["installed"] = model_installed(a.id()).into();
                 let pull = pull_availability(Some(&manifest), a.id());
                 j["pull"] = serde_json::json!({
                     "in_manifest": pull.in_manifest,
@@ -2992,7 +3204,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 a.id(),
                 status,
                 pull,
-                if model_installed(*a) { "yes" } else { "-" },
+                if model_installed(a.id()) { "yes" } else { "-" },
                 a.display_name(),
                 tasks
             );
@@ -3333,16 +3545,17 @@ fn with_pull_hint(msg: &str) -> String {
 fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
     use std::io::Write as _;
     let source = dist::resolve_manifest_source(None);
-    if source == dist::DEFAULT_MANIFEST_SOURCE {
-        let manifest = dist::builtin_manifest()?;
-        let availability = pull_availability(Some(&manifest), &manifest.model);
-        if availability.compatible.is_empty() {
-            return Ok(None);
+    // The bare-`focr pull` default (D25); the embedded manifest is checked
+    // for a compatible pull of it first, another manifest at pull time.
+    let model = if source == dist::DEFAULT_MANIFEST_SOURCE {
+        match first_run_offer(&MODE_DEFAULTS, &dist::builtin_manifest()?) {
+            Some(model) => model,
+            None => return Ok(None),
         }
-    }
-    eprint!(
-        "focr: model not found. Download compatible weights from the configured manifest now? [y/N] "
-    );
+    } else {
+        mode_default(&MODE_DEFAULTS, RunMode::Pull)
+    };
+    eprint!("focr: model not found. Download {model} from the configured manifest now? [y/N] ");
     std::io::stderr().flush().ok();
     let mut answer = String::new();
     std::io::stdin()
@@ -3351,7 +3564,7 @@ fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
     if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         return Ok(None);
     }
-    let outcome = dist::pull(None, dist::DEFAULT_QUANT, &source, false, |line| {
+    let outcome = dist::pull(Some(model), dist::DEFAULT_QUANT, &source, false, |line| {
         eprintln!("focr pull: {line}");
     })?;
     Ok(Some(outcome))
@@ -3361,7 +3574,11 @@ fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
 fn run_pull(args: &PullArgs) -> FocrResult<()> {
     let source = dist::resolve_manifest_source(args.manifest.as_deref());
     let outcome = dist::pull(
-        args.model.as_deref(),
+        Some(
+            args.model
+                .as_deref()
+                .unwrap_or_else(|| mode_default(&MODE_DEFAULTS, RunMode::Pull)),
+        ),
         &args.quant,
         &source,
         args.json,
@@ -3560,6 +3777,156 @@ fn exit_code_byte(err: &FocrError) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const V1: &str = native_engine::model_arch::UNLIMITED_OCR_V1_ID;
+    const V2: &str = native_engine::model_arch::UNLIMITED_OCR_V2_ID;
+    const MODES: [RunMode; 7] = [
+        RunMode::SinglePage,
+        RunMode::PdfDocument,
+        RunMode::DirectoryDocument,
+        RunMode::MultiPage,
+        RunMode::Batch,
+        RunMode::BatchMultiPage,
+        RunMode::Pull,
+    ];
+
+    /// A test-only table with v2 as every mode's default (D25, plan R6).
+    fn v2_table() -> [(RunMode, &'static str); 7] {
+        MODES.map(|mode| (mode, V2))
+    }
+
+    /// D25: the shipped table has one entry per mode, every one v1.
+    #[test]
+    fn the_shipped_mode_table_defaults_every_mode_to_v1() {
+        for mode in MODES {
+            let entries = MODE_DEFAULTS.iter().filter(|(m, _)| *m == mode).count();
+            assert_eq!(entries, 1, "{mode:?}");
+            assert_eq!(mode_default(&MODE_DEFAULTS, mode), V1, "{mode:?}");
+        }
+    }
+
+    /// D25: a `focr ocr` run's mode follows its input and `--multi-page`.
+    #[test]
+    fn an_ocr_run_mode_follows_its_input() {
+        let mode = |argv: &[&str], is_document: bool| {
+            let cli = Cli::try_parse_from(argv).expect("ocr parses");
+            let Command::Ocr(args) = cli.command else {
+                unreachable!("expected ocr command");
+            };
+            RunMode::of_ocr(&args.to_request().expect("request builds"), is_document)
+        };
+        let dir = std::env::temp_dir().display().to_string();
+        assert_eq!(
+            mode(&["focr", "ocr", "scan.png"], false),
+            RunMode::SinglePage
+        );
+        assert_eq!(
+            mode(&["focr", "ocr", "doc.pdf"], true),
+            RunMode::PdfDocument
+        );
+        assert_eq!(
+            mode(&["focr", "ocr", &dir], true),
+            RunMode::DirectoryDocument
+        );
+        assert_eq!(
+            mode(&["focr", "ocr", "doc.pdf", "--multi-page"], true),
+            RunMode::MultiPage
+        );
+    }
+
+    /// D25 precedence: `--model`/`FOCR_MODEL_PATH` > the mode default > v1,
+    /// over the shipped table and a v2-default one, with the default
+    /// installed or not. Only a non-v1 default is probed.
+    #[test]
+    fn model_choice_follows_the_precedence_matrix() {
+        for table in [MODE_DEFAULTS, v2_table()] {
+            for mode in MODES {
+                let default_id = mode_default(&table, mode);
+                for named in [true, false] {
+                    for installed in [true, false] {
+                        let mut probed = false;
+                        let choice = choose_model(named, default_id, |id| {
+                            probed = true;
+                            assert_eq!(id, default_id);
+                            installed
+                        });
+                        let want = match (named, default_id == V1, installed) {
+                            (true, ..) => ModelChoice::Named,
+                            (false, true, _) => ModelChoice::V1Default,
+                            (false, false, true) => ModelChoice::ModeDefault(default_id),
+                            (false, false, false) => ModelChoice::MissingDefault(default_id),
+                        };
+                        assert_eq!(choice, want, "{mode:?} named={named} installed={installed}");
+                        assert_eq!(probed, !named && default_id != V1, "{mode:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// D25: a missing default's `pull_hint` names the model and mode, and it
+    /// prints once: before the decode, never again with the run's warnings.
+    #[test]
+    fn a_pull_hint_names_the_missing_default_and_prints_once() {
+        let hint = pull_hint(RunMode::PdfDocument, V2);
+        assert_eq!(hint.kind, "pull_hint");
+        assert!(native_engine::RUN_WARNING_KINDS.contains(&hint.kind));
+        let json = hint.to_json();
+        assert_eq!(json["model_id"], V2);
+        assert_eq!(json["mode"], "pdf");
+        assert!(
+            hint.message
+                .contains("unlimited-ocr-2, which is not installed")
+                && hint.message.contains("`focr pull unlimited-ocr-2`"),
+            "{}",
+            hint.message
+        );
+        assert_eq!(
+            hint.recovery,
+            native_engine::warning_recovery(native_engine::WarningKind::PullHint)
+        );
+        assert!(printed_early(&hint));
+    }
+
+    /// D25: the first-run offer names the bare-`focr pull` default, and only
+    /// when the manifest carries a compatible pull of it.
+    #[test]
+    fn the_first_run_offer_names_the_table_default() {
+        let builtin = dist::builtin_manifest().expect("embedded manifest parses");
+        assert_eq!(first_run_offer(&MODE_DEFAULTS, &builtin), Some(V1));
+        assert_eq!(
+            first_run_offer(&v2_table(), &builtin),
+            pull_availability(Some(&builtin), V2)
+                .compatible
+                .first()
+                .map(|_| V2)
+        );
+
+        let entry = |recipe: &str| dist::ModelEntry {
+            license_notice: builtin.license_notice.clone(),
+            quants: [(
+                "int8".to_owned(),
+                dist::QuantEntry {
+                    recipe: recipe.to_owned(),
+                    focrq: builtin.quants["int8"].focrq.clone(),
+                },
+            )]
+            .into(),
+            tokenizer: builtin.tokenizer.clone(),
+            sidecars: Vec::new(),
+        };
+        let mut local = builtin.clone();
+        local.models.insert(
+            V2.to_owned(),
+            entry(crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID),
+        );
+        assert_eq!(first_run_offer(&v2_table(), &local), Some(V2));
+        assert_eq!(first_run_offer(&MODE_DEFAULTS, &local), Some(V1));
+        local
+            .models
+            .insert(V2.to_owned(), entry("some-other-recipe-v1"));
+        assert_eq!(first_run_offer(&v2_table(), &local), None);
+    }
 
     #[test]
     fn every_error_variant_maps_to_process_exit_byte_from_error_contract() {
