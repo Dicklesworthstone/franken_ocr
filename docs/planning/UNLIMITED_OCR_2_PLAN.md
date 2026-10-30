@@ -342,17 +342,19 @@ is a separate lossy lever.**
   - A page stopped by the **per-page cap** reports `finish: "page_cap"`, and the run continues.
   - A page interrupted by the **position limit** reports `finish: "length"`. The run reports
     `finish_reason: "length"` on its `run_error` and exits 5, with the completed pages written (§9.2).
-  - **Pre-windowing page limit.** Until U2-D1b windows longer documents, the default unwindowed path
-    refuses a v2 document above the page limit up front, with exit 2.
+  - **Page limit.** U2-B6 refused a v2 document above the page limit up front, with exit 2, until
+    windows existed. U2-D1b lifted the refusal: the default (`DocumentOptions.page_window: None`)
+    reads a document of more than W = 10 pages in windows, so no length is refused. The limit now
+    caps a window's own pages (`own = min(⌊(131,072 − 65) / 274⌋, W, limit)`), so prompt, lookahead
+    and output fit one window's positions.
     - U2-B6 starts the limit at 60 pages: `floor((131,072 − 64) / (274 + 1,900))`.
     - U2-C4 re-derives it from the measured distribution, as the largest N with
       `64 + 274·N + (N − 1)·p90 + p99 ≤ 131,072`, where p90 and p99 are generated tokens per page. Using
       per-page p99 for every page would be far too strict: page_0590 alone emits ~4,033 tokens.
     - An explicit unwindowed request (`Some(PageWindow::Off)`, or `--page-window off` once U2-D5
-      lands) bypasses the refusal and relies on the exit-5 position stop. The library default
-      (`DocumentOptions.page_window: None`, U2-E2 owns `PageWindow`) keeps the refusal, so default
-      and explicit `Off` stay distinguishable. U2-B6 implements the bypass as an `enforce_page_limit`
-      parameter of its document loop, which U2-D2b's S5 comparison sets directly.
+      lands) reads every page in one pass, however many, and relies on the exit-5 position stop.
+    - A window that stops (its position limit, the budget, a cancel) ends the document with its
+      completed pages; a later window would leave a gap of unread pages mid-document.
     - Tests use "limit + 1 pages", never a literal.
 - U2-C4 records the per-page generated-token distribution, and the cap default is revisited on that
   evidence. A runaway page costs minutes of CPU.
@@ -1803,7 +1805,7 @@ U2-E4 before publishing.
 | **Re-prefill ≡ incremental** on the conservative cached path (both §5.8 preconditions), retirement on and off (retired ≡ unretired); stateless-vs-cached agreement is L4's gate (§7.2), with its DISC escape | C2 |
 | Planner partition/lookahead/budget (own pages ≤ the page limit); splice copies equal their sources; reused-window seed and replayed page state equal the §5.10.4 table; one-page variant; stitching ownership, leading-text prepend (DISC-U2-9) and no leading-blank drop; fallbacks injected through a test hook | D1a |
 | Windowed pipeline: one vision encode per page (fallback recomputes counted separately); rasters dropped after their window; documents of page limit + 1 pages run windowed instead of being refused | D1b |
-| An unwindowed v2 document of page limit + 1 pages is refused with exit 2 by default (an explicit `Some(PageWindow::Off)` bypasses it); a position-limit stop writes the completed pages and ends in `run_error` with `finish_reason: "length"` and exit 5, never silent truncation | B6 |
+| A position-limit stop writes the completed pages and ends in `run_error` with `finish_reason: "length"` and exit 5, never silent truncation (B6's up-front refusal of page limit + 1 pages was lifted by D1b) | B6 |
 | v1 multi-page reports what happened: `v1_truncated` at the clamp (via `FOCR_TEST_MAX_POSITIONS`), `v1_page_merge` on every recorded fixture (p9_p14 gives 1 body for 2 pages), a synthetic exactly-N string gives no warning; exit 0 and v1 text unchanged; every emitted robot event validates against `event_fields` | X2 |
 | Added-token splitting is idempotent; `<PAGE>` round-trips; fuzz over interleavings | A4 |
 | UTF-8-safe incremental decode across split CJK characters and page boundaries | X1 |
@@ -1891,9 +1893,8 @@ and (p) use synthetic artifacts and always run.
 - (k) CJK streaming across a split character;
 - (l) v1 honest reporting (U2-X2, reaching the clamp through `FOCR_TEST_MAX_POSITIONS`) plus the
   v1→v2 pull hint (U2-E4);
-- (m′) the U2-B6 pre-windowing limit: a document of page limit + 1 pages is refused with exit 2. Added
-  only while U2-D1b is open; U2-D1b deletes it when it lifts the limit, and T1b's (m″) owns the
-  replacement;
+- (m′) withdrawn: U2-D1b lifted the U2-B6 pre-windowing limit before U2-T1a's script existed, so the
+  script never adds it; T1b's (m″) owns the windowed scenario;
 - (p) health, doctor and triage (added by U2-E7);
 - (r) `ocr-batch --model unlimited-ocr-2` over 3 images, and with `--multi-page` over one 3-page
   document. Outputs equal the solo v2 runs.
@@ -2210,9 +2211,9 @@ let doc = engine.recognize_document(
 ```
 - The call is synchronous and blocking; the runtime is owned internally.
 - **Page window.** `DocumentOptions.page_window` is `Option<PageWindow>`, and U2-E2 owns the
-  `PageWindow::{N, Auto, Off}` enum. `None` is the default policy: until U2-D1b lands, unwindowed with
-  U2-B6's page limit enforced; after it, W=10 for N > W. `Some(PageWindow::Off)` is the explicit
-  unwindowed request that bypasses the limit (U2-B6's `enforce_page_limit = false`).
+  `PageWindow::{N, Auto, Off}` enum. `None` is the default policy: W=10 for N > W since U2-D1b (before
+  it, unwindowed with U2-B6's page limit enforced). `Some(PageWindow::Off)` is the explicit
+  unwindowed request, one pass however many pages.
 - **Result.** `DocumentResult { pages_out, pages_skipped, windows, extra_markers, finish_reason,
   warnings, resumed_from, model_id, source_sha256 }`. `warnings: Vec<Warning>` carries U2-X2's
   `{kind, message, recovery, …}` entries, so library-side kinds (`leading_text`, `v2_length`,
@@ -2251,9 +2252,10 @@ holds the migration table. Where it departs from the sketch above:
   exactly), because v1's bodies can merge pages and have none. `on_item` sees every page before it is
   read, a skipped one included.
 - **Result.** `DocumentResult { markdown, pages, pages_out, skipped, finish_reason, extra_markers,
-  warnings, model }`. `skipped` lists the pages (with reasons), not a count; `model` is
-  `ModelIdentity { model_id, source_sha256 }`. `windows` and `resumed_from` arrive with U2-D1b and
-  U2-D4.
+  windows, warnings, model }`. `skipped` lists the pages (with reasons), not a count; `model` is
+  `ModelIdentity { model_id, source_sha256 }`. `windows` (U2-D1b) is one `WindowStats` per decode
+  window, empty for one pass, and each windowed `PageResult` names its `window`. `resumed_from`
+  arrives with U2-D4.
 - **Cancellation.** Ctrl+C or `request_shutdown()` stops Unlimited-OCR-2's document loop at its next
   step with `finish_reason: cancelled`; the CLI writes the pages, then exits 6. v1 still fails with
   `Cancelled`.
@@ -2703,8 +2705,10 @@ tree first. The material corrections:
   (a), (b) and (d). U2-D1a now sets a pinned set, and retirement is suspended on guard-forced steps.
   The regression case is W=8 window 0, marker row 1919.
 - **Never truncate silently (D11).**
-  - U2-B6 refuses unwindowed v2 documents over 60 pages with exit 2 until U2-D1b.
-  - A position-limit stop gives `finish_reason: "length"` and exit 5.
+  - U2-B6 refused unwindowed v2 documents over 60 pages with exit 2; U2-D1b lifted that by
+    windowing them.
+  - A position-limit stop gives `finish_reason: "length"` and exit 5; inside a window it ends the
+    document with its completed pages.
   - Cancellation exits 6.
   - U2-E4 also surfaces v1's existing silent clamp (`mod.rs:2778-2785`).
 - **Splits.**

@@ -222,14 +222,15 @@ pub struct OcrBatchArgs {
     #[arg(long)]
     pub experimental_full_int8: bool,
     /// Treat the images as ONE multi-page document (the Unlimited-OCR
-    /// `infer_multi` contract): a single cross-page pass where page N can
-    /// reference pages 1..N-1, emitting one markdown with `<PAGE>` separators.
+    /// `infer_multi` contract): a cross-page parse where page N can reference
+    /// the pages before it, emitting one markdown with `<PAGE>` separators.
     /// Without this flag each image is parsed independently. Unlimited-OCR
-    /// only; v1 has 32,768 positions shared by prompt and output (≈29 dense
-    /// pages); longer documents stop early and report `finish_reason: length`
-    /// with a `v1_truncated` warning. unlimited-ocr-2 (experimental) takes up
-    /// to 60 pages per pass; a document that stops early prints its pages,
-    /// then exits 5.
+    /// only; v1 reads the document in one pass over 32,768 positions shared
+    /// by prompt and output (≈29 dense pages); longer documents stop early
+    /// and report `finish_reason: length` with a `v1_truncated` warning.
+    /// unlimited-ocr-2 (experimental) reads it in windows of 10 pages, where
+    /// a page sees the pages before it in its window, so any length fits; a
+    /// document that stops early prints its pages, then exits 5.
     #[arg(long)]
     pub multi_page: bool,
 }
@@ -362,16 +363,18 @@ pub struct OcrRequestArgs {
     /// unsplit.
     #[arg(long)]
     pub split_spreads: bool,
-    /// ONE cross-page pass over the whole document (PDF and directory inputs
+    /// A cross-page parse of the whole document (PDF and directory inputs
     /// only; the Unlimited-OCR `infer_multi` contract): page N can reference
-    /// pages 1..N-1, output is one markdown with `<PAGE>` separators. Pages
-    /// are read one at a time, so a long document never holds every raster.
-    /// Composes with `--pages`. v1 has 32,768 positions shared by prompt and output
-    /// (≈29 dense pages); longer documents stop early and report
-    /// `finish_reason: length` with a `v1_truncated` warning. unlimited-ocr-2
-    /// (experimental) takes up to 60 pages per pass; a document that stops
-    /// early writes its pages, then exits 5. Without this flag each page is
-    /// parsed independently.
+    /// the pages before it, output is one markdown with `<PAGE>` separators.
+    /// Pages are read as the parse needs them, so a long document never
+    /// holds every raster. Composes with `--pages`. v1 reads the document in
+    /// one pass over 32,768 positions shared by prompt and output (≈29 dense
+    /// pages); longer documents stop early and report `finish_reason: length`
+    /// with a `v1_truncated` warning. unlimited-ocr-2 (experimental) reads it
+    /// in windows of 10 pages, where a page sees the pages before it in its
+    /// window, so any length fits; a document that stops early writes its
+    /// pages, then exits 5. Without this flag each page is parsed
+    /// independently.
     #[arg(long)]
     pub multi_page: bool,
     /// Disable the resident warm-model daemon for this run (env analog:
@@ -2277,25 +2280,28 @@ struct DocumentRecognition {
     pages: DocumentPageList,
 }
 
-/// `--multi-page` (bd-2z0y): ONE cross-page pass over the selected pages of a
+/// `--multi-page` (bd-2z0y): a cross-page parse of the selected pages of a
 /// PDF or a directory of page images (the Unlimited-OCR `infer_multi`
-/// contract, bd-1gv.25) — page N attends to pages 1..N−1; the output is one
-/// markdown with `<PAGE>` separators. The JSON `pages` are the pages the pass
-/// read (U2-E3): every page for a model that splits pages exactly, and for
-/// v1 only when its text holds one body per page; otherwise `pages: []`,
-/// which the run's `v1_page_merge` warning explains.
+/// contract, bd-1gv.25) — page N attends to the pages before it; the output
+/// is one markdown with `<PAGE>` separators. v1 reads the document in one
+/// pass; Unlimited-OCR-2 reads it in windows of 10 pages (U2-D1b), one pass
+/// when it fits one. The JSON `pages` are the pages the parse read (U2-E3):
+/// every page for a model that splits pages exactly, and for v1 only when
+/// its text holds one body per page; otherwise `pages: []`, which the run's
+/// `v1_page_merge` warning explains.
 ///
 /// The pages are read lazily (U2-D0): the forward stage rasterizes each one,
 /// preprocesses it and drops the raster before reading the next, so a long
-/// book never holds every raster. A page that fails to RASTER is skipped with
-/// the same surfaced page event as the per-page path (the pass runs over the
+/// book never holds every raster (a windowed parse reads each window's pages
+/// as the window starts). A page that fails to RASTER is skipped with the
+/// same surfaced page event as the per-page path (the parse runs over the
 /// pages that rendered); decode errors are whole-document by construction.
 ///
 /// With `figures` (a page-splitting model's run only), each page with figure
-/// boxes is rasterized again ([`PageSource::fetch`]) after the pass, which
-/// encodes every page before it decodes, so it holds no raster when a page
-/// completes. Its figures are cropped, written as `page{N}[l|r]_figure_{M}`
-/// and referenced from its markdown, once, outside the retryable pass.
+/// boxes is rasterized again ([`PageSource::fetch`]) after the parse, when
+/// no other raster is held. Its figures are cropped, written as
+/// `page{N}[l|r]_figure_{M}` and referenced from its markdown, once, outside
+/// the retryable parse.
 fn recognize_document_multi_page(
     engine: &OcrEngine,
     request: &OcrRequest,
@@ -2318,7 +2324,9 @@ fn recognize_document_multi_page(
         let (page_count, selected) = (source.source_len(), source.len());
         // Human-mode progress (GH #2), two bars in turn: `raster` while the
         // pages are read, then `ocr` over the pages that rendered while the
-        // document decodes. Stderr-only; self-disabled off-TTY.
+        // document decodes (a windowed parse alternates them window by window
+        // until its last page is read; window progress is U2-D5's).
+        // Stderr-only; self-disabled off-TTY.
         let decode_bar =
             std::sync::Arc::new(progress::Progress::new("ocr", selected, show_progress));
         let raster_bar = progress::Progress::new("raster", selected, show_progress);
@@ -2734,10 +2742,11 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     )?;
 
     if args.multi_page {
-        // ONE cross-page document pass (bd-1gv.25): page N attends to pages
-        // 1..N-1; output is one assembled markdown with <PAGE> separators.
-        // An image that does not decode is left out of the pass and reported
-        // (D24); the run fails only when none decodes.
+        // A cross-page document parse (bd-1gv.25): page N attends to the
+        // pages before it (in its window, for Unlimited-OCR-2, U2-D1b);
+        // output is one assembled markdown with <PAGE> separators. An image
+        // that does not decode is left out of the parse and reported (D24);
+        // the run fails only when none decodes.
         let model_path = model.clone().unwrap_or_else(OcrEngine::model_path);
         let document = engine.recognize_document(
             &model_path,
@@ -2797,9 +2806,18 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         } else {
             println!("{markdown}");
             let read = count - document.skipped.len();
-            eprintln!(
-                "[focr] multi-page: {read} of {count} pages in one cross-page pass, {elapsed:.2}s"
-            );
+            let parse = match document.windows.len() {
+                0 => "one cross-page pass".to_string(),
+                windows => format!(
+                    "{windows} windows ({} recomputed)",
+                    document
+                        .windows
+                        .iter()
+                        .filter(|w| w.fallback_reason.is_some())
+                        .count()
+                ),
+            };
+            eprintln!("[focr] multi-page: {read} of {count} pages in {parse}, {elapsed:.2}s");
         }
         // The pages are out; a v2 document that stopped early fails with
         // exit 5 (U2-B6).
@@ -3328,7 +3346,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "models": models,
             "guidance": {
                 "unlimited-ocr": "default runtime; FAST plain-text OCR; `focr pull` installs the conservative exact-recipe int8 artifact",
-                "unlimited-ocr-2": "experimental; best for documents and long documents: Baidu's long-document successor (SR-SWA); runs from its raw checkpoint (`--model unlimited-ocr-2` once it is in a model directory, or `--model <dir>`) on single pages and on documents of up to 60 pages (`--multi-page`), not yet certified against the reference — use unlimited-ocr for production",
+                "unlimited-ocr-2": "experimental; best for documents and long documents: Baidu's long-document successor (SR-SWA); runs from its raw checkpoint (`--model unlimited-ocr-2` once it is in a model directory, or `--model <dir>`) on single pages and on documents of any length (`--multi-page`, in windows of 10 pages), not yet certified against the reference — use unlimited-ocr for production",
                 "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text; shorthand: `focr ocr --task formula|tables|chart|molecular|geometry|music` (implies `--format`)"
             },
         }));

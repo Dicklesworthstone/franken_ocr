@@ -742,17 +742,20 @@ impl OcrEngine {
     }
 
     /// Parse a document (U2-E2, D23; the reference `infer_multi` contract,
-    /// bd-1gv.25): one cross-page pass where page N attends to pages 1..N−1
-    /// (OQ-13), returning one [`DocumentResult`]. This is not
+    /// bd-1gv.25): a cross-page parse where page N attends to the pages
+    /// before it (OQ-13), returning one [`DocumentResult`]. v1 reads the
+    /// document in one pass; Unlimited-OCR-2 reads it in windows
+    /// ([`DocumentOptions`], U2-D1b). This is not
     /// [`OcrEngine::recognize_batch`] (independent pages): use it when the
     /// pages form one document whose later pages refer to earlier ones.
     ///
     /// The pages are rasterized one at a time on the forward stage's thread,
-    /// each dropped once preprocessed (U2-D0). `on_item` sees every page
-    /// before it is read, a skipped one included; `on_page`, when given,
-    /// gets each [`StreamedPage`] as its `<PAGE>` boundary is crossed in the
-    /// token stream (bd-2z0y). Both are boxed and `Send` because the pass
-    /// runs on the blocking pool.
+    /// each dropped once preprocessed (U2-D0); a windowed parse reads each
+    /// window's pages as the window starts. `on_item` sees every page before
+    /// it is read, a skipped one included; `on_page`, when given, gets each
+    /// [`StreamedPage`] as its `<PAGE>` boundary is crossed in the token
+    /// stream (bd-2z0y), or as its window ends. Both are boxed and `Send`
+    /// because the parse runs on the blocking pool.
     ///
     /// A document that stops early (the position limit, the stage budget or
     /// a cancel) is a result with that `finish_reason` and the pages it
