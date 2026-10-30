@@ -4119,7 +4119,9 @@ impl OcrModel {
         let (image_w, image_h) = Self::image_dims(&pre);
         if self.arch().decode_contract().pages.is_some() {
             // Unlimited-OCR-2: a document of one page; its body is the text.
-            let split = self.decode_document(std::slice::from_ref(&pre), None)?.split;
+            let split = self
+                .decode_document(std::slice::from_ref(&pre), None)?
+                .split;
             progress::emit("postprocess", 0, 0);
             let body = split.bodies.into_iter().next().unwrap_or_default();
             return Ok((body, image_w, image_h));
@@ -4333,7 +4335,9 @@ impl OcrModel {
             pres.push(self.document_page(preprocess::decode_path(path)?)?);
         }
         let origins = list_origins(pres.len());
-        Ok(self.recognize_multi_page_pres(pres, &origins, None)?.markdown)
+        Ok(self
+            .recognize_multi_page_pres(pres, &origins, None)?
+            .markdown)
     }
 
     /// One document page's preprocess: v1's Base-640 squash, or a paged
@@ -4401,7 +4405,9 @@ impl OcrModel {
             pres.push(self.document_page(img)?);
         }
         let origins = list_origins(pres.len());
-        Ok(self.recognize_multi_page_pres(pres, &origins, None)?.markdown)
+        Ok(self
+            .recognize_multi_page_pres(pres, &origins, None)?
+            .markdown)
     }
 
     /// [`Self::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING sink
@@ -7129,9 +7135,7 @@ mod tests {
                 model_id: model_arch::UNLIMITED_OCR_V1_ID,
             };
             assert!(
-                frame
-                    .text_pages(&postprocess::strip_eos(&raw))
-                    .is_empty(),
+                frame.text_pages(&postprocess::strip_eos(&raw)).is_empty(),
                 "{name}"
             );
         }
@@ -7152,7 +7156,15 @@ mod tests {
             let pages = frame.text_pages(text);
             let summary: Vec<_> = pages
                 .iter()
-                .map(|p| (p.run_index, p.source_page, p.text.as_str(), p.tokens, p.finish))
+                .map(|p| {
+                    (
+                        p.run_index,
+                        p.source_page,
+                        p.text.as_str(),
+                        p.tokens,
+                        p.finish,
+                    )
+                })
                 .collect();
             assert_eq!(
                 summary,
@@ -7201,9 +7213,7 @@ mod tests {
         let decoded = DecodedDocument {
             split: postprocess::split_pages_by_token(&t, &ids, PAGE, 3).unwrap(),
             finish: vec![PageFinish::Marker, PageFinish::PageCap, PageFinish::Marker],
-            elapsed: [5, 6, 7]
-                .map(std::time::Duration::from_millis)
-                .to_vec(),
+            elapsed: [5, 6, 7].map(std::time::Duration::from_millis).to_vec(),
         };
         let origins = [
             PageOrigin {
@@ -10538,7 +10548,8 @@ mod tests {
     }
 
     /// The longest oracle generation the L4 rung also decodes on the stateless
-    /// f32 path: S1 page_0009 and page_0014, about a quarter hour together.
+    /// f32 path: S1 page_0009 (50 ids, 6.6 minutes in `release-perf`) and
+    /// page_0014 (256 ids, 31 minutes).
     const V2_L4_STATELESS_MAX_IDS: usize = 256;
 
     /// The decode levers U2-A7 left to U2-C2, with their values where set: a
