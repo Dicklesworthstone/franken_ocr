@@ -1904,15 +1904,16 @@ fn run_focr_only(bin: &Path, args: &[&str], envs: &[(&str, String)]) -> CliOut {
     }
 }
 
-/// U2-A7: through the CLI, an Unlimited-OCR-2 checkpoint is refused with exit
-/// 2 before its weights load. An armed unsupported lever is named; an ignored
-/// lever is a one-line stderr warning; with no lever, the message says v2 is
-/// registered but not implemented. The resident daemon is never spawned.
+/// U2-A7, U2-B6: through the CLI, an Unlimited-OCR-2 checkpoint's levers are
+/// judged before anything else is read. An armed unsupported lever is named
+/// and refused with exit 2; an ignored lever is a one-line stderr warning.
+/// An admitted run reaches the tokenizer sidecar check next, which refuses
+/// the stand-in's foreign sidecar with exit 7 — still before a weight byte
+/// is read. The resident daemon is never spawned.
 #[test]
-fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
-    const TEST: &str = "cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever";
-    const NOT_IMPLEMENTED: &str =
-        "unlimited-ocr-2 is registered but not yet implemented in this build";
+fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
+    const TEST: &str = "cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights";
+    const FOREIGN_SIDECAR: &str = "tokenizer.json has sha256";
     let Some(bin) = focr_bin() else {
         log_success(
             TEST,
@@ -1929,6 +1930,9 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
     let resident_dir = dir.join("resident");
     std::fs::create_dir_all(&resident_dir).expect("create temp dirs");
     let model = write_sparse_v2_stand_in(&dir);
+    // A foreign sidecar: an admitted run stops at its check (exit 7), so the
+    // sparse payload is never decoded.
+    std::fs::write(dir.join("tokenizer.json"), "{}").expect("foreign sidecar");
     let model = model.display().to_string();
     let image = write_tiny_png();
     let image = image.display().to_string();
@@ -2029,7 +2033,7 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
                 .iter()
                 .find(|v| v["event"] == "run_error")
                 .unwrap_or_else(|| panic!("{case}: no run_error: {}", out.stdout));
-            assert_eq!(error["code"], 2, "{case}: {error}");
+            assert_eq!(error["code"], out.code.unwrap_or(-1), "{case}: {error}");
             error["message"].as_str().unwrap_or_default().to_owned()
         } else {
             out.stderr.clone()
@@ -2039,13 +2043,14 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
             .lines()
             .filter(|l| l.starts_with("[focr] warning: FOCR_"))
             .collect();
-        let mut pass = out.code == Some(2) && warning_lines.len() == warned.len();
+        let mut pass = warning_lines.len() == warned.len();
         match refused {
             Some(lever) => {
-                pass &= message.contains(&format!("{lever} is not supported for unlimited-ocr-2"))
-                    && !message.contains(NOT_IMPLEMENTED);
+                pass &= out.code == Some(2)
+                    && message.contains(&format!("{lever} is not supported for unlimited-ocr-2"))
+                    && !message.contains(FOREIGN_SIDECAR);
             }
-            None => pass &= message.contains(NOT_IMPLEMENTED),
+            None => pass &= out.code == Some(7) && message.contains(FOREIGN_SIDECAR),
         }
         for lever in warned {
             pass &= warning_lines
@@ -2057,7 +2062,7 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
             serde_json::json!({
                 "schema_version": 1, "ts": 0.0, "test": TEST, "case": case, "run_seq": 0,
                 "event": "assert", "result": if pass { "pass" } else { "fail" },
-                "assertion": "v2 refused exit 2 before weights; levers named or warned",
+                "assertion": "levers named (exit 2) or warned, then the sidecar (exit 7), before weights",
                 "pass": pass, "arch": "unlimited-ocr-2", "args": args, "levers": levers,
                 "expected_refused": refused, "expected_warned": warned,
                 "exit_code": out.code, "message": message.trim(),
@@ -2069,6 +2074,47 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
             pass,
             "{case}: exit {:?}\nstdout:\n{}\nstderr:\n{}",
             out.code, out.stdout, out.stderr
+        );
+    }
+    // D21: an unknown `FOCR_SRSWA_ENTMAX` is refused at admission (exit 2),
+    // before the sidecar; a known one is admitted, labelled experimental, and
+    // stops at the sidecar (exit 7).
+    for (value, code) in [("bogus", 2), ("all", 7)] {
+        let args = ["ocr", image.as_str(), "--model", model.as_str()];
+        let envs: Vec<(&str, String)> = vec![
+            ("FOCR_RESIDENT_DIR", resident_dir.display().to_string()),
+            ("FOCR_RESIDENT_IDLE_SECS", "2".into()),
+            ("FOCR_MMAP", "1".into()),
+            ("FOCR_SRSWA_ENTMAX", value.to_owned()),
+        ];
+        let out = run_focr_only(&bin, &args, &envs);
+        let refused = out.stderr.contains(&format!(
+            "FOCR_SRSWA_ENTMAX={value:?} is not an entmax domain"
+        ));
+        let labelled = out
+            .stderr
+            .contains("[focr] note: unlimited-ocr-2 is experimental");
+        let sidecar = out.stderr.contains(FOREIGN_SIDECAR);
+        let pass = out.code == Some(code)
+            && if code == 2 {
+                refused && !labelled && !sidecar
+            } else {
+                !refused && labelled && sidecar
+            };
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema_version": 1, "ts": 0.0, "test": TEST, "case": format!("entmax_{value}"),
+                "run_seq": 0, "event": "assert", "result": if pass { "pass" } else { "fail" },
+                "assertion": "an unknown entmax domain exits 2 at admission; a known one is admitted",
+                "pass": pass, "arch": "unlimited-ocr-2", "exit_code": out.code,
+                "expected_exit_code": code, "message": out.stderr.trim(),
+            })
+        );
+        assert!(
+            pass,
+            "entmax {value}: exit {:?}\nstderr:\n{}",
+            out.code, out.stderr
         );
     }
     let spawned: Vec<_> = std::fs::read_dir(&resident_dir)
@@ -2116,8 +2162,9 @@ fn cli_refuses_unlimited_ocr_2_before_weights_naming_each_lever() {
 /// U2-C3's loader gate through the CLI (model-gated: the converted v2
 /// `.focrq` supplies a census-exact header). Each case is a sparse copy of the
 /// real header, untouched or with one field tampered, behind a payload that is
-/// never read. The untouched copy passes the gate and reaches U2-A7's exit-2
-/// refusal; a wrong recipe id (v1's, or the wasm int4 one), a quantized router
+/// never read. The untouched copy passes the gate and reaches the lever
+/// admission, where an armed refused lever stops it with exit 2; a wrong
+/// recipe id (v1's, or the wasm int4 one), a quantized router
 /// tensor, or a non-convention `source_sha256` is refused with exit 7 naming
 /// the field or tensor. Both `--model <file>` and short-name resolution
 /// (`--model unlimited-ocr-2` under `FOCR_MODEL_DIR`) take the same gate.
@@ -2177,7 +2224,7 @@ fn cli_holds_v2_focrq_to_its_recipe_by_path_and_by_short_name() {
             "untouched",
             |_, _| {},
             2,
-            vec!["unlimited-ocr-2 is registered but not yet implemented".into()],
+            vec!["FOCR_PREFILL_CHUNK is not supported for unlimited-ocr-2".into()],
         ),
         (
             "v1_recipe_id",
@@ -2249,12 +2296,16 @@ fn cli_holds_v2_focrq_to_its_recipe_by_path_and_by_short_name() {
         drop(out);
 
         let file_spec = path.display().to_string();
+        // An armed refused lever stops the untouched copy at admission (exit
+        // 2), right after the gate, so its sparse payload is never decoded;
+        // a tampered copy is refused by the gate first (exit 7).
+        let lever = ("FOCR_PREFILL_CHUNK", "64".to_owned());
         for (route, spec, envs) in [
-            ("path", file_spec.as_str(), vec![]),
+            ("path", file_spec.as_str(), vec![lever.clone()]),
             (
                 "short_name",
                 "unlimited-ocr-2",
-                vec![("FOCR_MODEL_DIR", dir.display().to_string())],
+                vec![lever.clone(), ("FOCR_MODEL_DIR", dir.display().to_string())],
             ),
         ] {
             let args = ["ocr", image.as_str(), "--model", spec];
@@ -2285,4 +2336,559 @@ fn cli_holds_v2_focrq_to_its_recipe_by_path_and_by_short_name() {
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// U2-B6: Unlimited-OCR-2 through the CLI, model-gated on its raw checkpoint
+// (`FOCR_UOCR2_SOURCE_DIR`) and the corpus pages of S1/S2. Exact token parity
+// is U2-C2's; these runs check routing, page counts, partial output and exits.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// The raw v2 checkpoint, the binary and S2's pages (p9, p14, p19), or `None`
+/// (skip-with-SUCCESS).
+fn v2_inputs(test: &str) -> Option<(PathBuf, PathBuf, Vec<PathBuf>)> {
+    let Some(model) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR")
+        .map(PathBuf::from)
+        .filter(|dir| dir.is_dir())
+    else {
+        log_line(
+            test,
+            "gate",
+            "skip",
+            "skip_no_model",
+            "reason=\"FOCR_UOCR2_SOURCE_DIR unset\"",
+        );
+        log_success(
+            test,
+            "gate",
+            "model-gated: set FOCR_UOCR2_SOURCE_DIR to the raw Unlimited-OCR-2 checkpoint",
+        );
+        return None;
+    };
+    let Some(bin) = focr_bin() else {
+        log_success(test, "gate", "no built focr binary");
+        return None;
+    };
+    let Some(pages) = corpus_pages(&["page_0009.png", "page_0014.png", "page_0019.png"]) else {
+        log_line(
+            test,
+            "gate",
+            "skip",
+            "skip_no_model",
+            "reason=\"corpus pages absent\"",
+        );
+        log_success(
+            test,
+            "gate",
+            "set FOCR_CORPUS_DIR to the 20-page corpus pages dir",
+        );
+        return None;
+    };
+    Some((model, bin, pages))
+}
+
+/// `focr args --model <v2 dir>`, without the resident daemon or any inherited
+/// `FOCR_*` variable but `envs`.
+fn run_v2(bin: &Path, model: &Path, args: &[&str], envs: &[(&str, String)]) -> CliOut {
+    let model = model.display().to_string();
+    let mut args = args.to_vec();
+    args.extend(["--model", model.as_str()]);
+    let mut envs = envs.to_vec();
+    envs.push(("FOCR_NO_RESIDENT", "1".into()));
+    run_focr_only(bin, &args, &envs)
+}
+
+/// The JSON lines of `stdout`.
+fn json_lines(stdout: &str) -> Vec<serde_json::Value> {
+    stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect()
+}
+
+/// A PDF whose pages each hold one PNG's RGB pixels as a lossless
+/// (FlateDecode) image, so its raster equals the PNG's.
+fn pdf_of_pages(pages: &[PathBuf]) -> PathBuf {
+    use lopdf::{Object, Stream, dictionary};
+    let mut doc = lopdf::Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut kids: Vec<Object> = Vec::new();
+    for page in pages {
+        let rgb = image::open(page).expect("corpus page decodes").to_rgb8();
+        let (w, h) = rgb.dimensions();
+        let mut stream = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => i64::from(w),
+                "Height" => i64::from(h),
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            rgb.into_raw(),
+        );
+        stream.compress().expect("compress the page image");
+        let image_id = doc.add_object(stream);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image_id } },
+            "MediaBox" => vec![0.into(), 0.into(), i64::from(w).into(), i64::from(h).into()],
+        });
+        kids.push(page_id.into());
+    }
+    let count = i64::try_from(pages.len()).expect("page count fits");
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    let path = unique_output_path("pdf");
+    doc.save(&path).expect("save the page PDF");
+    path
+}
+
+/// U2-B6 acceptance: one page through `focr ocr`, and a three-page document
+/// through both multi-page entry points (`ocr-batch --multi-page` over the
+/// images, `ocr <pdf> --multi-page` over a PDF of the same pixels), decode
+/// to completion with one body per page. The two documents are the same
+/// decode, so their markdown is identical.
+#[test]
+fn v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed() {
+    const TEST: &str = "v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed";
+    let Some((model, bin, pages)) = v2_inputs(TEST) else {
+        return;
+    };
+    let page_args: Vec<String> = pages.iter().map(|p| p.display().to_string()).collect();
+
+    let started = Instant::now();
+    let out = run_v2(&bin, &model, &["ocr", "--robot", &page_args[0]], &[]);
+    let complete = json_lines(&out.stdout)
+        .into_iter()
+        .find(|v| v["event"] == "run_complete")
+        .unwrap_or_else(|| panic!("S1: no run_complete:\n{}\n{}", out.stdout, out.stderr));
+    let markdown = complete["markdown"].as_str().unwrap_or_default();
+    assert_eq!(out.code, Some(0), "S1: {}", out.stderr);
+    assert_eq!(complete["finish_reason"], "stop", "S1: {complete}");
+    assert!(complete.get("warnings").is_none(), "S1: {complete}");
+    assert!(!markdown.trim().is_empty(), "S1: empty markdown");
+    assert!(
+        out.stderr
+            .contains("[focr] note: unlimited-ocr-2 is experimental"),
+        "S1: not labelled experimental:\n{}",
+        out.stderr
+    );
+    log_line(
+        TEST,
+        "S1",
+        "result",
+        "pass",
+        &format!(
+            "finish_reason=stop chars={} exit_code=0 wall_s={:.1}",
+            markdown.chars().count(),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+
+    let started = Instant::now();
+    let mut args = vec!["ocr-batch", "--multi-page", "--json"];
+    args.extend(page_args.iter().map(String::as_str));
+    let out = run_v2(&bin, &model, &args, &[]);
+    let batch = json_lines(&out.stdout)
+        .into_iter()
+        .find(|v| v["command"] == "batch.multi_page")
+        .unwrap_or_else(|| panic!("S2 batch: no result:\n{}\n{}", out.stdout, out.stderr));
+    let batch_markdown = batch["markdown"].as_str().unwrap_or_default().to_owned();
+    assert_eq!(out.code, Some(0), "S2 batch: {}", out.stderr);
+    assert_eq!(batch["finish_reason"], "stop", "S2 batch: {batch}");
+    assert!(batch.get("warnings").is_none(), "S2 batch: {batch}");
+    assert_eq!(
+        batch_markdown.matches("<PAGE>").count(),
+        pages.len(),
+        "S2 batch: one body per page:\n{batch_markdown}"
+    );
+    log_line(
+        TEST,
+        "S2_batch",
+        "result",
+        "pass",
+        &format!(
+            "pages=3 bodies=3 finish_reason=stop exit_code=0 wall_s={:.1}",
+            started.elapsed().as_secs_f64()
+        ),
+    );
+
+    let started = Instant::now();
+    let pdf = pdf_of_pages(&pages);
+    let pdf_arg = pdf.display().to_string();
+    let out = run_v2(
+        &bin,
+        &model,
+        &["ocr", &pdf_arg, "--multi-page", "--json"],
+        &[],
+    );
+    let _ = std::fs::remove_file(&pdf);
+    let value = json_lines(&out.stdout)
+        .into_iter()
+        .find(|v| v.get("markdown").is_some())
+        .unwrap_or_else(|| panic!("S2 pdf: no result:\n{}\n{}", out.stdout, out.stderr));
+    assert_eq!(out.code, Some(0), "S2 pdf: {}", out.stderr);
+    assert_eq!(
+        value["markdown"].as_str().unwrap_or_default(),
+        batch_markdown,
+        "S2: the PDF and the image list are the same document"
+    );
+    log_line(
+        TEST,
+        "S2_pdf",
+        "result",
+        "pass",
+        &format!(
+            "pages=3 bodies=3 equals_batch=true exit_code=0 wall_s={:.1}",
+            started.elapsed().as_secs_f64()
+        ),
+    );
+}
+
+/// U2-B6: a document that stops early writes the pages it produced, then
+/// exits 5. At the position limit (`FOCR_TEST_MAX_POSITIONS`, 60 positions
+/// past S2's prompt) the PDF run writes two bodies to `-o`, and its robot
+/// stream ends with a `run_error` carrying `finish_reason: length`,
+/// `pages_out` and a `v2_length` warning, with no `run_complete`. With the
+/// forward budget spent (`FOCR_STAGE_BUDGET_FORWARD_MS=1`) the image-list
+/// run prints its (empty) document with `finish_reason: budget`, then exits 5.
+#[test]
+fn v2_cli_writes_a_stopped_document_then_exits_5_when_armed() {
+    const TEST: &str = "v2_cli_writes_a_stopped_document_then_exits_5_when_armed";
+    let Some((model, bin, pages)) = v2_inputs(TEST) else {
+        return;
+    };
+    let page_args: Vec<String> = pages.iter().map(|p| p.display().to_string()).collect();
+    let mut batch_args = vec!["ocr-batch", "--multi-page", "--json"];
+    batch_args.extend(page_args.iter().map(String::as_str));
+
+    // Probe the prompt length: a 1-position limit refuses with it.
+    let probe = run_v2(
+        &bin,
+        &model,
+        &batch_args,
+        &[("FOCR_TEST_MAX_POSITIONS", "1".into())],
+    );
+    let prompt_len: usize = probe
+        .stderr
+        .split("prompt is ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.replace(',', "").parse().ok())
+        .unwrap_or_else(|| panic!("no prompt length in the refusal: {}", probe.stderr));
+
+    let started = Instant::now();
+    let pdf = pdf_of_pages(&pages);
+    let pdf_arg = pdf.display().to_string();
+    let output = unique_output_path("md");
+    let output_arg = output.display().to_string();
+    let limit = prompt_len + 60;
+    let out = run_v2(
+        &bin,
+        &model,
+        &[
+            "ocr",
+            &pdf_arg,
+            "--multi-page",
+            "--robot",
+            "-o",
+            &output_arg,
+        ],
+        &[("FOCR_TEST_MAX_POSITIONS", limit.to_string())],
+    );
+    let _ = std::fs::remove_file(&pdf);
+    let written = std::fs::read_to_string(&output).unwrap_or_default();
+    let _ = std::fs::remove_file(&output);
+    let events = json_lines(&out.stdout);
+    assert_eq!(out.code, Some(5), "length: {}", out.stderr);
+    assert!(
+        events.iter().all(|v| v["event"] != "run_complete"),
+        "length: a partial run never completes: {}",
+        out.stdout
+    );
+    let last = events.last().expect("robot events");
+    assert_eq!(last["event"], "run_error", "length: {last}");
+    assert_eq!(last["code"], 5, "length: {last}");
+    assert_eq!(last["finish_reason"], "length", "length: {last}");
+    assert_eq!(last["pages_out"], 2, "length: {last}");
+    assert!(
+        warning_kinds(last).contains(&"v2_length".to_owned()),
+        "length: {last}"
+    );
+    assert_eq!(
+        written.matches("<PAGE>").count(),
+        2,
+        "length: the produced bodies are written:\n{written}"
+    );
+    log_line(
+        TEST,
+        "position_limit",
+        "result",
+        "pass",
+        &format!(
+            "prompt_len={prompt_len} limit={limit} pages_out=2 finish_reason=length \
+             warning_kinds={:?} exit_code=5 wall_s={:.1}",
+            warning_kinds(last),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+
+    let started = Instant::now();
+    let out = run_v2(
+        &bin,
+        &model,
+        &batch_args,
+        &[("FOCR_STAGE_BUDGET_FORWARD_MS", "1".into())],
+    );
+    let batch = json_lines(&out.stdout)
+        .into_iter()
+        .find(|v| v["command"] == "batch.multi_page")
+        .unwrap_or_else(|| panic!("budget: no result:\n{}\n{}", out.stdout, out.stderr));
+    assert_eq!(out.code, Some(5), "budget: {}", out.stderr);
+    assert_eq!(batch["finish_reason"], "budget", "budget: {batch}");
+    assert!(
+        warning_kinds(&batch).contains(&"v2_budget".to_owned()),
+        "budget: {batch}"
+    );
+    assert!(
+        out.stderr
+            .contains("stopped early (budget) after 0 of 3 page bodies"),
+        "budget: {}",
+        out.stderr
+    );
+    log_line(
+        TEST,
+        "budget",
+        "result",
+        "pass",
+        &format!(
+            "pages_out=0 finish_reason=budget warning_kinds={:?} exit_code=5 wall_s={:.1}",
+            warning_kinds(&batch),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// U2-D0: a directory of page images is a document. Its pages are read lazily
+// through the page source, in natural order; files that are not page images
+// are left out with one `ignored_files` warning.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// A fresh directory holding `pages` (tiny PNGs) and `strays` (text files).
+fn page_dir(tag: &str, pages: &[&str], strays: &[&str]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("focr_e2e_pages_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create page dir");
+    for name in pages {
+        std::fs::write(dir.join(name), tiny_png(4, 4)).expect("write page");
+    }
+    for name in strays {
+        std::fs::write(dir.join(name), "not a page").expect("write stray file");
+    }
+    dir
+}
+
+/// Always on (no weights): `focr ocr <dir>` reads the directory as a
+/// document, reports its stray file once, and keeps every refusal a PDF has.
+#[test]
+fn directory_input_is_a_document_and_keeps_its_refusals_without_a_model() {
+    const TEST: &str = "directory_input_is_a_document_and_keeps_its_refusals_without_a_model";
+    let Some(bin) = focr_bin() else {
+        log_success(TEST, "gate", "no built focr binary");
+        return;
+    };
+    let dir = page_dir("refusals", &["p1.png", "p2.png"], &["notes.txt"]);
+    let dir_arg = dir.display().to_string();
+    let absent = "/nonexistent-model.focrq";
+    let envs = [("FOCR_NO_RESIDENT", "1".to_string())];
+
+    // Accepted as a document: the stray file is reported when the source
+    // opens, then the absent model ends the run (exit 3).
+    for (case, extra) in [("per_page", &[][..]), ("multi_page", &["--multi-page"][..])] {
+        let mut args = vec!["ocr", dir_arg.as_str(), "--model", absent];
+        args.extend_from_slice(extra);
+        let out = run_focr_only(&bin, &args, &envs);
+        assert_eq!(out.code, Some(3), "{case}: {}", out.stderr);
+        assert_eq!(
+            out.stderr.matches("are not page images").count(),
+            1,
+            "{case}: one ignored_files warning:\n{}",
+            out.stderr
+        );
+        assert!(out.stderr.contains("notes.txt"), "{case}: {}", out.stderr);
+        log_line(
+            TEST,
+            case,
+            "result",
+            "pass",
+            "exit_code=3 ignored_files_warnings=1",
+        );
+    }
+
+    // `--pages` counts the directory's images.
+    let out = run_focr_only(
+        &bin,
+        &["ocr", &dir_arg, "--pages", "3", "--model", absent],
+        &envs,
+    );
+    assert_eq!(out.code, Some(2), "pages: {}", out.stderr);
+    assert!(
+        out.stderr.contains("this document has 2 page(s)"),
+        "pages: {}",
+        out.stderr
+    );
+    log_line(TEST, "pages_out_of_range", "result", "pass", "exit_code=2");
+
+    // `--multi-page` still refuses `--extract-figures` on a directory.
+    let output = dir.join("out.md").display().to_string();
+    let out = run_focr_only(
+        &bin,
+        &[
+            "ocr",
+            &dir_arg,
+            "--multi-page",
+            "--extract-figures",
+            "-o",
+            &output,
+            "--model",
+            absent,
+        ],
+        &envs,
+    );
+    assert_eq!(out.code, Some(2), "figures: {}", out.stderr);
+    assert!(
+        out.stderr.contains("does not compose"),
+        "figures: {}",
+        out.stderr
+    );
+    log_line(TEST, "multi_page_figures", "result", "pass", "exit_code=2");
+
+    // A single image is still not a document.
+    let png = write_tiny_png();
+    let png_arg = png.display().to_string();
+    let out = run_focr_only(
+        &bin,
+        &["ocr", &png_arg, "--multi-page", "--model", absent],
+        &envs,
+    );
+    let _ = std::fs::remove_file(&png);
+    assert_eq!(out.code, Some(2), "image: {}", out.stderr);
+    assert!(
+        out.stderr.contains("ocr-batch --multi-page"),
+        "image: {}",
+        out.stderr
+    );
+    log_line(TEST, "image_multi_page", "result", "pass", "exit_code=2");
+
+    // A directory without a page image is an input error (exit 4).
+    let empty = page_dir("empty", &[], &["notes.txt"]);
+    let empty_arg = empty.display().to_string();
+    let out = run_focr_only(&bin, &["ocr", &empty_arg, "--model", absent], &envs);
+    assert_eq!(out.code, Some(4), "empty: {}", out.stderr);
+    assert!(
+        out.stderr.contains("has no page images"),
+        "empty: {}",
+        out.stderr
+    );
+    log_line(TEST, "no_page_images", "result", "pass", "exit_code=4");
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&empty);
+}
+
+/// v1, armed: a directory read through the page source is the same document
+/// as the image list. Its pages are named so natural order and byte order
+/// disagree (`page_9` before `page_10`). The `--multi-page` pass equals
+/// `ocr-batch --multi-page` over the same files, and both runs report the
+/// stray file once on `run_complete` / `--json`; the per-page pass numbers
+/// its pages by source page.
+#[test]
+fn v1_directory_input_matches_the_image_list_when_armed() {
+    const TEST: &str = "v1_directory_input_matches_the_image_list_when_armed";
+    let Some((model, bin, pages)) = x2_inputs(TEST) else {
+        return;
+    };
+    let dir = page_dir("v1_document", &[], &["notes.txt"]);
+    std::fs::copy(&pages[0], dir.join("page_9.png")).expect("copy page 9");
+    std::fs::copy(&pages[1], dir.join("page_10.png")).expect("copy page 14");
+    let dir_arg = dir.display().to_string();
+    let envs = [
+        ("FOCR_MODEL_PATH", model.display().to_string()),
+        ("FOCR_NO_RESIDENT", "1".to_string()),
+    ];
+
+    let started = Instant::now();
+    let (batch_out, batch) = batch_multi_page(&bin, &model, &pages[..2], &[]);
+    let batch = batch.unwrap_or_else(|| panic!("batch: no result:\n{}", batch_out.stderr));
+    assert_eq!(batch_out.code, Some(0), "batch: {}", batch_out.stderr);
+    let out = run_focr_env(&bin, &["ocr", &dir_arg, "--multi-page", "--robot"], &envs);
+    let complete = json_lines(&out.stdout)
+        .into_iter()
+        .find(|v| v["event"] == "run_complete")
+        .unwrap_or_else(|| {
+            panic!(
+                "multi-page: no run_complete:\n{}\n{}",
+                out.stdout, out.stderr
+            )
+        });
+    assert_eq!(out.code, Some(0), "multi-page: {}", out.stderr);
+    assert_eq!(
+        complete["markdown"], batch["markdown"],
+        "the directory and the image list are the same document"
+    );
+    let ignored: Vec<&serde_json::Value> = complete["warnings"]
+        .as_array()
+        .map(|a| a.iter().filter(|w| w["kind"] == "ignored_files").collect())
+        .unwrap_or_default();
+    assert_eq!(ignored.len(), 1, "multi-page: {complete}");
+    assert_eq!(ignored[0]["count"], 1, "multi-page: {complete}");
+    assert_eq!(
+        ignored[0]["examples"],
+        serde_json::json!(["notes.txt"]),
+        "multi-page: {complete}"
+    );
+    log_line(
+        TEST,
+        "multi_page",
+        "result",
+        "pass",
+        &format!(
+            "equals_batch=true ignored_files=1 exit_code=0 wall_s={:.1}",
+            started.elapsed().as_secs_f64()
+        ),
+    );
+
+    let started = Instant::now();
+    let out = run_focr_env(&bin, &["ocr", &dir_arg, "--json"], &envs);
+    let value = json_lines(&out.stdout)
+        .into_iter()
+        .find(|v| v.get("pages").is_some())
+        .unwrap_or_else(|| panic!("per-page: no result:\n{}\n{}", out.stdout, out.stderr));
+    assert_eq!(out.code, Some(0), "per-page: {}", out.stderr);
+    let numbers: Vec<u64> = value["pages"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|p| p["page"].as_u64()).collect())
+        .unwrap_or_default();
+    assert_eq!(numbers, vec![1, 2], "per-page: {value}");
+    assert!(
+        warning_kinds(&value).contains(&"ignored_files".to_owned()),
+        "per-page: {value}"
+    );
+    log_line(
+        TEST,
+        "per_page",
+        "result",
+        "pass",
+        &format!(
+            "pages=[1,2] ignored_files=1 exit_code=0 wall_s={:.1}",
+            started.elapsed().as_secs_f64()
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

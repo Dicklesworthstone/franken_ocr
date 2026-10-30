@@ -79,6 +79,14 @@
     {
       "name": "FOCR_TEST_MAX_POSITIONS",
       "summary": "TEST-ONLY: lower the position budget prompt and output share (1..=32768; a larger value exits 2) so tests reach the multi-page clamp on small documents"
+    },
+    {
+      "name": "FOCR_SRSWA_ENTMAX",
+      "summary": "unlimited-ocr-2 router entmax domain: `topm` (default, HF parity) or `all` (SGLang); another value exits 2"
+    },
+    {
+      "name": "FOCR_SRSWA_RETIRE",
+      "summary": "0/off disables unlimited-ocr-2 KV block retirement (a kill switch; output is identical)"
     }
   ],
   "event_fields": {
@@ -198,7 +206,7 @@
     },
     {
       "code": 5,
-      "meaning": "budget or timeout was exceeded",
+      "meaning": "a budget, timeout or position limit was exceeded (a document that stopped early writes its completed pages first)",
       "name": "timeout"
     },
     {
@@ -219,11 +227,15 @@
   ],
   "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "schema_version": 1,
-  "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`",
+  "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out` and `warnings` when a document stopped early (exit 5, no `run_complete`)",
   "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
   "warning_kinds": [
     "v1_truncated",
     "v1_page_merge",
-    "ignored_lever"
+    "ignored_lever",
+    "v2_length",
+    "v2_budget",
+    "leading_text",
+    "ignored_files"
   ]
 }

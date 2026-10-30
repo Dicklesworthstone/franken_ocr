@@ -607,6 +607,174 @@ fn erf_f64(x: f64) -> f64 {
     sign * y
 }
 
+// ── §5.2 BUILD: antialiased bicubic resize (position-table glue) ───────────
+
+/// Antialiased bicubic resize of a channel-last `[ih, iw, dim]` grid to
+/// `[oh, ow, dim]`: torch's CPU `F.interpolate(mode="bicubic", antialias=True,
+/// align_corners=False)` (`_upsample_bicubic2d_aa`). Both DeepEncoder towers use
+/// it to fit their learned absolute position tables to the runtime patch grid
+/// (`get_abs_pos_sam`, `get_abs_pos`). A 640 view (v1's multi-page squash, a
+/// gundam tile) needs SAM 64→40 and CLIP 16→10.
+///
+/// Separable, as in torch: the width pass runs first, then the height pass, and
+/// a pass is skipped when its size is unchanged. Each output sums its
+/// [`bicubic_aa_taps`] in tap order with fused multiply-adds, which is what
+/// torch's compiled `output += t * wts` contracts to. Measured bit-identical to
+/// torch 2.13 on the real 64→40 SAM and 16→10 CLIP tables (bd-p8hu).
+pub fn resize_bicubic_aa(
+    src: &[f32],
+    ih: usize,
+    iw: usize,
+    dim: usize,
+    oh: usize,
+    ow: usize,
+) -> FocrResult<Vec<f32>> {
+    const CONTEXT: &str = "resize_bicubic_aa";
+    if ih == 0 || iw == 0 || dim == 0 || oh == 0 || ow == 0 {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{CONTEXT}: source ({ih},{iw}), target ({oh},{ow}) and dim {dim} must be non-zero"
+        )));
+    }
+    let src_len = checked_product(CONTEXT, &[ih, iw, dim])?;
+    if src.len() != src_len {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "{CONTEXT}: source len {} != ih*iw*dim {ih}*{iw}*{dim} ({src_len})",
+            src.len()
+        )));
+    }
+    let row_len = checked_product(CONTEXT, &[ow, dim])?;
+    checked_product(CONTEXT, &[ih, row_len])?;
+    checked_product(CONTEXT, &[oh, row_len])?;
+
+    let width_resized;
+    let rows = if ow == iw {
+        src
+    } else {
+        width_resized = resample_axis_bicubic_aa(src, ih, iw, dim, ow);
+        width_resized.as_slice()
+    };
+    Ok(if oh == ih {
+        rows.to_vec()
+    } else {
+        resample_axis_bicubic_aa(rows, 1, ih, row_len, oh)
+    })
+}
+
+/// The product of `dims`, or an error naming `context` when it overflows.
+fn checked_product(context: &str, dims: &[usize]) -> FocrResult<usize> {
+    dims.iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .ok_or_else(|| {
+            FocrError::Other(anyhow::anyhow!(
+                "{context}: shape product {dims:?} overflows usize"
+            ))
+        })
+}
+
+/// One output sample's taps along an axis: the first source index and the
+/// normalized weights of the consecutive sources from there.
+#[derive(Debug)]
+struct AaTaps {
+    start: usize,
+    weights: Vec<f32>,
+}
+
+/// Torch's antialiased-bicubic taps for resizing an axis of `n_in` samples to
+/// `n_out` (`_compute_indices_min_size_weights_aa`, align_corners=False).
+///
+/// When shrinking, the Keys kernel ([`bicubic_aa_filter`]) is stretched by the
+/// scale `n_in/n_out`, which widens its support from 2 source samples on each
+/// side to `2·scale`; the weights are then normalized to sum to 1. The
+/// precision follows torch's float kernel step by step: the centre and the
+/// filter argument are formed in f64 and rounded to f32, the support bounds
+/// truncate toward zero like its `int64_t` casts, and the sum is plain f32.
+/// That reproduces its weights bitwise.
+fn bicubic_aa_taps(n_in: usize, n_out: usize) -> Vec<AaTaps> {
+    let scale = n_in as f32 / n_out as f32;
+    let (support, invscale) = if scale >= 1.0 {
+        (2.0 * scale, (1.0 / f64::from(scale)) as f32)
+    } else {
+        (2.0, 1.0)
+    };
+    let max_taps = support.ceil() as i64 * 2 + 1;
+    (0..n_out)
+        .map(|i| {
+            let center = (f64::from(scale) * (i as f64 + 0.5)) as f32;
+            let start = ((f64::from(center - support) + 0.5) as i64).max(0);
+            let end = ((f64::from(center + support) + 0.5) as i64).min(n_in as i64);
+            let len = (end - start).clamp(0, max_taps);
+            let mut weights: Vec<f32> = (start..start + len)
+                .map(|j| {
+                    let arg = (f64::from(j as f32 - center) + 0.5) * f64::from(invscale);
+                    bicubic_aa_filter(arg as f32)
+                })
+                .collect();
+            let total = weights.iter().fold(0.0f32, |acc, &w| acc + w);
+            if total != 0.0 {
+                for w in &mut weights {
+                    *w /= total;
+                }
+            }
+            AaTaps {
+                start: start as usize,
+                weights,
+            }
+        })
+        .collect()
+}
+
+/// Torch's antialias cubic filter (`HelperInterpCubic::aa_filter`, the Keys
+/// kernel with `a = -0.5`), its polynomials evaluated with the FMAs torch's
+/// compiled kernel contracts them to.
+fn bicubic_aa_filter(x: f32) -> f32 {
+    const A: f32 = -0.5;
+    let x = x.abs();
+    if x < 1.0 {
+        ((A + 2.0).mul_add(x, -(A + 3.0)) * x).mul_add(x, 1.0)
+    } else if x < 2.0 {
+        A.mul_add(x, -5.0 * A)
+            .mul_add(x, 8.0 * A)
+            .mul_add(x, -4.0 * A)
+    } else {
+        0.0
+    }
+}
+
+/// Resample the middle axis of a row-major `[outer, n_in, inner]` array to
+/// `n_out` samples with [`bicubic_aa_taps`], accumulating each output in tap
+/// order with fused multiply-adds (the inner loops run over contiguous
+/// `inner` rows, so LLVM vectorizes them).
+fn resample_axis_bicubic_aa(
+    src: &[f32],
+    outer: usize,
+    n_in: usize,
+    inner: usize,
+    n_out: usize,
+) -> Vec<f32> {
+    let taps = bicubic_aa_taps(n_in, n_out);
+    let mut out = vec![0.0f32; outer * n_out * inner];
+    for (src_block, out_block) in src
+        .chunks_exact(n_in * inner)
+        .zip(out.chunks_exact_mut(n_out * inner))
+    {
+        for (tap, dst) in taps.iter().zip(out_block.chunks_exact_mut(inner)) {
+            for (j, &w) in tap.weights.iter().enumerate() {
+                let row = &src_block[(tap.start + j) * inner..][..inner];
+                if j == 0 {
+                    for (d, &s) in dst.iter_mut().zip(row) {
+                        *d = s * w;
+                    }
+                } else {
+                    for (d, &s) in dst.iter_mut().zip(row) {
+                        *d = s.mul_add(w, *d);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,5 +1203,144 @@ mod tests {
         // weight/bias length mismatch
         let mut x2 = vec![0.0f32; 2 * 6 * 6];
         assert!(group_norm(&mut x2, 2, 6, 6, 3, 1e-5, &w[..4], &b, false).is_err());
+    }
+
+    // ── antialiased bicubic resize vs torch 2.13 (bd-p8hu) ─────────────────
+    //
+    // The expected values below were produced by torch's
+    // `F.interpolate(mode="bicubic", antialias=True, align_corners=False)` on
+    // CPU (the U2-C1 probe `aa_test_vectors.py`), so they pin the bitwise
+    // reproduction rather than a tolerance.
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|v| v.to_bits()).collect()
+    }
+
+    #[test]
+    fn bicubic_aa_taps_match_torch_on_the_sam_64_to_40_resize() {
+        let taps = bicubic_aa_taps(64, 40);
+        assert_eq!(taps.len(), 40);
+        // Row 0 is clipped at the left border: four taps, renormalized.
+        assert_eq!(taps[0].start, 0);
+        assert_eq!(
+            bits(&taps[0].weights),
+            bits(&[0.611_380_93, 0.429_091_78, -0.018_212_724, -0.022_259_997])
+        );
+        // Row 17 is interior: the support 2·1.6 spans six source samples.
+        assert_eq!(taps[17].start, 25);
+        assert_eq!(
+            bits(&taps[17].weights),
+            bits(&[
+                -0.034_223_188,
+                0.024_600_342,
+                0.509_622_9,
+                0.509_622_9,
+                0.024_600_342,
+                -0.034_223_188,
+            ])
+        );
+    }
+
+    #[test]
+    fn resize_bicubic_aa_shrink_matches_torch_bitwise() -> FocrResult<()> {
+        // A 5×5 ramp with a spike at (2, 3), shrunk to 3×3.
+        let src = [
+            -2.0,
+            -1.63,
+            -1.26,
+            -0.89,
+            -0.52,
+            -0.149_999_98,
+            0.220_000_03,
+            0.590_000_15,
+            0.960_000_04,
+            1.329_999_9,
+            1.7,
+            2.070_000_2,
+            2.44,
+            9.5,
+            3.180_000_3,
+            3.550_000_2,
+            3.92,
+            4.29,
+            4.66,
+            5.03,
+            5.4,
+            5.77,
+            6.140_000_3,
+            6.51,
+            6.88,
+        ];
+        let want = [
+            -1.214_461_2,
+            -0.605_384_4,
+            0.003_692_302_6,
+            1.711_245_3,
+            3.398_815_6,
+            4.784_407_6,
+            4.876_307,
+            5.485_383_5,
+            6.094_460_5,
+        ];
+        let got = resize_bicubic_aa(&src, 5, 5, 1, 3, 3)?;
+        assert_eq!(bits(&got), bits(&want));
+        Ok(())
+    }
+
+    #[test]
+    fn resize_bicubic_aa_mixed_grow_and_shrink_matches_torch_bitwise() -> FocrResult<()> {
+        // Channel-last 3×3×2 grown to 4 rows and shrunk to 2 columns: checks
+        // the channel layout, the upsampling taps, and the width-then-height
+        // order together.
+        let src = [
+            1.0, -2.0, 0.5, 4.0, 3.0, 0.25, -1.5, 2.0, 7.0, -3.0, 0.0, 1.0, 2.5, 0.5, -0.75, 6.0,
+            4.0, -1.0,
+        ];
+        let want = [
+            0.670_887,
+            0.258_364_02,
+            2.069_332_4,
+            1.928_514_6,
+            1.411_494_9,
+            -0.033_856_93,
+            2.575_616_6,
+            0.137_403_92,
+            1.609_888_3,
+            1.054_905_3,
+            2.620_989,
+            0.078_508_59,
+            1.141_691_9,
+            2.842_091_8,
+            2.177_005,
+            1.788_751,
+        ];
+        let got = resize_bicubic_aa(&src, 3, 3, 2, 4, 2)?;
+        assert_eq!(bits(&got), bits(&want));
+        Ok(())
+    }
+
+    #[test]
+    fn resize_bicubic_aa_keeps_unchanged_sizes_and_constants() -> FocrResult<()> {
+        let src: Vec<f32> = (0..12).map(|i| i as f32 * 0.5).collect();
+        assert_eq!(resize_bicubic_aa(&src, 2, 3, 2, 2, 3)?, src);
+        // Normalized taps preserve a constant field in both directions.
+        let constant = vec![7.25f32; 16 * 16 * 3];
+        for (oh, ow) in [(10, 10), (23, 9)] {
+            let out = resize_bicubic_aa(&constant, 16, 16, 3, oh, ow)?;
+            assert_eq!(out.len(), oh * ow * 3);
+            assert!(out.iter().all(|v| (v - 7.25).abs() < 1e-5), "{oh}x{ow}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resize_bicubic_aa_rejects_bad_geometry_without_panic() {
+        assert_err_contains(resize_bicubic_aa(&[1.0; 3], 2, 2, 1, 1, 1), "source len");
+        assert_err_contains(resize_bicubic_aa(&[], 0, 2, 1, 1, 1), "must be non-zero");
+        assert_err_contains(resize_bicubic_aa(&[], 2, 2, 1, 0, 1), "must be non-zero");
+        assert_err_contains(
+            resize_bicubic_aa(&[], usize::MAX, 2, 1, 1, 1),
+            "overflows usize",
+        );
     }
 }

@@ -106,6 +106,11 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
         ),
         lever("FOCR_BATCH_VISION", Ignored(UNDER_SPINE)),
         lever("FOCR_CALIB_OUT", AllowListed("calibration tooling")),
+        lever("FOCR_CORPUS_DIR", AllowListed("model-gated corpus tests")),
+        lever(
+            "FOCR_DECODE_F32",
+            Supported("the all-f32 cached decode is a v2 parity path (U2-C2)"),
+        ),
         lever(
             "FOCR_DECODE_INT8",
             Refuse(
@@ -117,6 +122,7 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             "FOCR_DECODE_STATELESS",
             Supported("the stateless f32 decode is a v2 path (U2-B5)"),
         ),
+        lever("FOCR_E2E_LONG", AllowListed("long model-gated tests")),
         lever(
             "FOCR_FORCE_ARCH",
             Supported("SIMD tier override; each tier matches its scalar fallback"),
@@ -246,6 +252,13 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
         lever(
             "FOCR_SRSWA_DENSE",
             Supported("the dense SR-SWA attention is bit-identical to the gathered one"),
+        ),
+        lever(
+            "FOCR_SRSWA_ENTMAX",
+            Supported(
+                "the router's entmax domain: HF's top-M window (default) or SGLang's \
+                 all candidates (D21, DISC-U2-1)",
+            ),
         ),
         lever(
             "FOCR_SRSWA_RETIRE",
@@ -403,8 +416,8 @@ pub(crate) fn admit(arch: &dyn ModelArch, inputs: &LeverInputs<'_>) -> Admission
         )))
     } else if !arch.implemented() {
         Err(FocrError::Usage(format!(
-            "{model} is registered but not yet implemented in this build (U2-B6); \
-             use unlimited-ocr meanwhile"
+            "{model} is registered but not yet implemented in this build; use unlimited-ocr \
+             meanwhile"
         )))
     } else {
         Ok(())
@@ -588,9 +601,9 @@ mod tests {
     enum Expect {
         /// Exit 2 naming the lever.
         Refused,
-        /// The implemented=false refusal, and one `ignored_lever` warning.
+        /// Admitted, with one `ignored_lever` warning.
         Ignored,
-        /// The implemented=false refusal, no warning.
+        /// Admitted, no warning.
         Silent,
     }
 
@@ -639,11 +652,13 @@ mod tests {
         ("FOCR_PROFILE_DECODE", "0", Expect::Silent),
         ("FOCR_QUANT", "int8", Expect::Silent),
         ("FOCR_DECODE_STATELESS", "1", Expect::Silent),
+        ("FOCR_DECODE_F32", "1", Expect::Silent),
         ("FOCR_STAGE_BUDGET_FORWARD_MS", "0", Expect::Silent),
         ("FOCR_UNLIMITED_VISION_CACHE", "0", Expect::Silent),
         ("FOCR_MMAP", "1", Expect::Silent),
         ("FOCR_SRSWA_RETIRE", "0", Expect::Silent),
         ("FOCR_SRSWA_DENSE", "1", Expect::Silent),
+        ("FOCR_SRSWA_ENTMAX", "all", Expect::Silent),
         ("FOCR_CALIB_OUT", "/tmp/calib", Expect::Silent),
         ("FOCR_SAM_ATTN_PROBE_RUNS", "3", Expect::Silent),
         ("FOCR_TEST_MAX_POSITIONS", "100", Expect::Silent),
@@ -652,42 +667,33 @@ mod tests {
         ("FOCR_GOT_FORMAT", "1", Expect::Silent),
     ];
 
-    const NOT_IMPLEMENTED: &str =
-        "unlimited-ocr-2 is registered but not yet implemented in this build";
-
     fn observed(name: &str, admission: &Admission) -> Expect {
-        let message = admission
-            .verdict
-            .as_ref()
-            .err()
-            .map(ToString::to_string)
-            .unwrap_or_default();
         let warned: Vec<&RunWarning> = admission
             .warnings
             .iter()
             .filter(|warning| warning.fields.get("env").and_then(|v| v.as_str()) == Some(name))
             .collect();
-        if message.contains(&format!("{name} is not supported for unlimited-ocr-2"))
-            && !message.contains(NOT_IMPLEMENTED)
-            && warned.is_empty()
-        {
-            Expect::Refused
-        } else if message.contains(NOT_IMPLEMENTED) && !message.contains(name) && warned.len() == 1
-        {
-            assert_eq!(warned[0].kind, "ignored_lever");
-            assert!(warned[0].message.contains(name), "{}", warned[0].message);
-            Expect::Ignored
-        } else if message.contains(NOT_IMPLEMENTED)
-            && !message.contains(name)
-            && admission.warnings.is_empty()
-        {
-            Expect::Silent
-        } else {
-            panic!("{name}: unclassifiable admission {admission:?}")
+        match &admission.verdict {
+            Err(error)
+                if error
+                    .to_string()
+                    .contains(&format!("{name} is not supported for unlimited-ocr-2"))
+                    && warned.is_empty() =>
+            {
+                Expect::Refused
+            }
+            Ok(()) if warned.len() == 1 && admission.warnings.len() == 1 => {
+                assert_eq!(warned[0].kind, "ignored_lever");
+                assert!(warned[0].message.contains(name), "{}", warned[0].message);
+                Expect::Ignored
+            }
+            Ok(()) if admission.warnings.is_empty() => Expect::Silent,
+            _ => panic!("{name}: unclassifiable admission {admission:?}"),
         }
     }
 
-    /// The matrix (U2-A7): each lever alone, against v2 before B6.
+    /// The matrix (U2-A7): each lever alone, against v2 (Experimental since
+    /// U2-B6, so only a refused lever stops the run).
     #[test]
     fn v2_lever_matrix_refuses_ignores_or_admits_each_lever_before_load() {
         let test = "v2_lever_matrix_refuses_ignores_or_admits_each_lever_before_load";
@@ -710,9 +716,10 @@ mod tests {
                 }),
             );
             assert_eq!(got, expect, "{name}={value:?}: {admission:?}");
-            let error = error.expect("v2 is refused before B6 either way");
-            assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
-            assert_eq!(error.exit_code(), 2);
+            if let Some(error) = error {
+                assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
+                assert_eq!(error.exit_code(), 2);
+            }
         }
     }
 
@@ -804,12 +811,16 @@ mod tests {
         assert_eq!(several.warnings.len(), 1, "the ignored lever still warns");
     }
 
-    /// v2 once implemented (U2-B6): the table still refuses and warns, and
-    /// an unarmed environment is admitted.
+    /// v2 (Experimental since U2-B6) is admitted in an unarmed environment.
+    /// A policed model that is still Planned is refused after its levers are
+    /// judged: an armed refused lever is named, and ignored levers still warn.
     #[test]
-    fn an_implemented_v2_is_admitted_unless_a_lever_refuses() {
-        struct ImplementedV2;
-        impl ModelArch for ImplementedV2 {
+    fn a_planned_policed_model_is_refused_after_its_levers() {
+        let real = admit_with(v2(), &[("FOCR_THREADS", "4")], false);
+        assert!(real.verdict.is_ok() && real.warnings.is_empty(), "{real:?}");
+
+        struct PlannedV2;
+        impl ModelArch for PlannedV2 {
             fn id(&self) -> &'static str {
                 v2().id()
             }
@@ -837,8 +848,8 @@ mod tests {
             fn tasks(&self) -> &'static [model_arch::Task] {
                 v2().tasks()
             }
-            fn implemented(&self) -> bool {
-                true
+            fn maturity(&self) -> model_arch::Maturity {
+                model_arch::Maturity::Planned
             }
             fn required_quant_recipe(&self, quant: &str) -> Option<&'static str> {
                 v2().required_quant_recipe(quant)
@@ -847,21 +858,28 @@ mod tests {
                 v2().unlimited_variant()
             }
         }
-        let clean = admit_with(&ImplementedV2, &[("FOCR_THREADS", "4")], false);
+        const NOT_IMPLEMENTED: &str =
+            "unlimited-ocr-2 is registered but not yet implemented in this build";
+        let clean = admit_with(&PlannedV2, &[("FOCR_THREADS", "4")], false);
         assert!(
-            clean.verdict.is_ok() && clean.warnings.is_empty(),
+            matches!(clean.verdict, Err(FocrError::Usage(ref m)) if m.contains(NOT_IMPLEMENTED)),
             "{clean:?}"
         );
-        let ignored = admit_with(&ImplementedV2, &[("FOCR_QKV_FUSED", "0")], false);
-        assert!(ignored.verdict.is_ok(), "{ignored:?}");
+        assert!(clean.warnings.is_empty(), "{clean:?}");
+        let ignored = admit_with(&PlannedV2, &[("FOCR_QKV_FUSED", "0")], false);
+        assert!(
+            matches!(ignored.verdict, Err(FocrError::Usage(ref m)) if m.contains(NOT_IMPLEMENTED)),
+            "{ignored:?}"
+        );
         assert_eq!(ignored.warnings.len(), 1);
         let json = ignored.warnings[0].to_json();
         assert_eq!(json["kind"], "ignored_lever");
         assert_eq!(json["env"], "FOCR_QKV_FUSED");
         assert!(super::super::RUN_WARNING_KINDS.contains(&"ignored_lever"));
-        let refused = admit_with(&ImplementedV2, &[("FOCR_LMHEAD_SHARD", "")], false);
+        let refused = admit_with(&PlannedV2, &[("FOCR_LMHEAD_SHARD", "")], false);
         assert!(
-            matches!(refused.verdict, Err(FocrError::Usage(ref m)) if m.contains("FOCR_LMHEAD_SHARD")),
+            matches!(refused.verdict, Err(FocrError::Usage(ref m))
+                if m.contains("FOCR_LMHEAD_SHARD") && !m.contains(NOT_IMPLEMENTED)),
             "{refused:?}"
         );
     }

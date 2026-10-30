@@ -110,6 +110,66 @@ pub struct DecodeContract {
     pub no_repeat_ngram_size: usize,
     /// Sliding window for the no-repeat n-gram processor.
     pub ngram_window: usize,
+    /// The ids the n-gram ban reads.
+    pub ngram_domain: NgramDomain,
+    /// How one decode carries several pages, for a model whose prompt and
+    /// output mark them with a token; `None` otherwise (v1's multi-page
+    /// output is split on the marker's text, in postprocess).
+    pub pages: Option<PageContract>,
+}
+
+/// The ids a no-repeat n-gram ban reads (D10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NgramDomain {
+    /// The prompt and the generated ids: v1's live sampler.
+    PromptAndGenerated,
+    /// The generated ids only: Unlimited-OCR-2 (vLLM's processor,
+    /// `modeling_unlimitedocr.py:608-622`).
+    Generated,
+}
+
+/// A paged decode contract (U2-B6): one `<PAGE>` token opens each page in the
+/// prompt, and the output must carry one per page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageContract {
+    /// The page-marker token id.
+    pub marker_id: u32,
+    /// Whether the page-count guard runs ([`super::sampler::PageGuard`]).
+    pub guard: bool,
+    /// The guard's default per-page token cap; `0` means none.
+    pub max_page_tokens: usize,
+    /// How the output is split into pages.
+    pub split: PageSplit,
+}
+
+/// How decoded output is split into pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PageSplit {
+    /// On the marker's token id in the generated ids (D20).
+    TokenId,
+}
+
+/// How far along an architecture is (`focr models` shows it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Maturity {
+    /// Registered as a roadmap target; every inference path refuses it.
+    Planned,
+    /// Runs, with a caveat: not yet certified against its reference.
+    Experimental,
+    /// Runs and is certified.
+    Ready,
+}
+
+impl Maturity {
+    /// The `focr models` status word.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Planned => "planned",
+            Self::Experimental => "experimental",
+            Self::Ready => "ready",
+        }
+    }
 }
 
 /// The quantization policy (doctrine #2): which tensor groups are int8 vs kept
@@ -246,9 +306,13 @@ pub trait ModelArch: Send + Sync {
     fn decode_contract(&self) -> DecodeContract;
     /// The tasks this model serves (the CLI routes these to this arch).
     fn tasks(&self) -> &'static [Task];
-    /// Whether this arch's forward is implemented TODAY (vs a planned zoo target
-    /// the registry merely describes). Only Unlimited-OCR is `true` so far.
-    fn implemented(&self) -> bool;
+    /// How far along this arch is.
+    fn maturity(&self) -> Maturity;
+    /// Whether this arch's forward runs TODAY (vs a planned zoo target the
+    /// registry merely describes): every maturity but [`Maturity::Planned`].
+    fn implemented(&self) -> bool {
+        self.maturity() != Maturity::Planned
+    }
     /// Whether `lm_head.weight` is a tied byte-alias of `model.embed_tokens.weight`
     /// and should therefore be **omitted** from the `.focrq` (the loader reuses the
     /// stored embedding for the output projection). `false` (the default) means the
@@ -368,13 +432,15 @@ impl ModelArch for UnlimitedOcr {
             eos_token_id: 1,
             no_repeat_ngram_size: 35,
             ngram_window: 128,
+            ngram_domain: NgramDomain::PromptAndGenerated,
+            pages: None,
         }
     }
     fn tasks(&self) -> &'static [Task] {
         &[Task::Ocr]
     }
-    fn implemented(&self) -> bool {
-        true
+    fn maturity(&self) -> Maturity {
+        Maturity::Ready
     }
     fn required_quant_recipe(&self, quant: &str) -> Option<&'static str> {
         (quant == "int8").then_some(crate::quant::convert::UNLIMITED_OCR_INT8_RECIPE_ID)
@@ -398,8 +464,9 @@ static UNLIMITED_OCR: UnlimitedOcr = UnlimitedOcr;
 
 /// Baidu Unlimited-OCR-2: v1's vision tower and MoE decoder with SR-SWA
 /// attention and page2d RoPE. Registered so its checkpoints and artifacts are
-/// identified, census-checked and reported; `implemented()` stays false until
-/// its forward lands (U2-B6), and every inference path refuses it (U2-A7).
+/// identified, census-checked and reported. [`Maturity::Experimental`] since
+/// its document loop landed (U2-B6): it runs single pages and unwindowed
+/// documents; U2-C4 certifies it `Ready`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnlimitedOcr2;
 
@@ -427,21 +494,29 @@ impl ModelArch for UnlimitedOcr2 {
         TokenizerKind::DeepSeekBpe
     }
     fn decode_contract(&self) -> DecodeContract {
-        // The skeleton (plan D10): greedy, EOS 1, n-gram 35 over a 128 window
-        // for a single page. U2-B6 adds the document window, the page guard and
-        // the per-page cap.
+        // Plan D10/D11/D20: greedy, EOS 1, n-gram 35 over the generated ids
+        // (a 128 window for one page; the document loop widens it to 1024),
+        // and the page contract: `<PAGE>` per page, the page-count guard with
+        // its 20,000-token per-page cap, output split on the marker's id.
         DecodeContract {
             temperature: 0.0,
             eos_token_id: crate::tokenizer::special::EOS,
             no_repeat_ngram_size: 35,
             ngram_window: 128,
+            ngram_domain: NgramDomain::Generated,
+            pages: Some(PageContract {
+                marker_id: crate::tokenizer::special::PAGE,
+                guard: true,
+                max_page_tokens: super::sampler::UOCR2_DEFAULT_MAX_PAGE_TOKENS,
+                split: PageSplit::TokenId,
+            }),
         }
     }
     fn tasks(&self) -> &'static [Task] {
         &[Task::Ocr]
     }
-    fn implemented(&self) -> bool {
-        false
+    fn maturity(&self) -> Maturity {
+        Maturity::Experimental
     }
     fn required_quant_recipe(&self, quant: &str) -> Option<&'static str> {
         (quant == "int8").then_some(crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID)
@@ -506,9 +581,9 @@ pub struct PlannedArch {
     lm_head_stored_int8: bool,
     /// The token-embedding tensor name; see [`ModelArch::embed_tokens_name`].
     embed_tokens_name: &'static str,
-    /// Whether this arch's forward RUNS today (`focr models` "ready"). GOT-OCR2 does
-    /// (its full pipeline + KV-cache decode ship); the rest are still descriptors.
-    implemented: bool,
+    /// How far along this arch is (`focr models` status). GOT-OCR2 and the
+    /// other shipped zoo models are ready; the rest are still descriptors.
+    maturity: Maturity,
     /// `(manifest quant, recipe)` pairs for the published artifacts; see
     /// [`ModelArch::required_quant_recipe`].
     quant_recipes: &'static [(&'static str, &'static str)],
@@ -521,6 +596,8 @@ const PLACEHOLDER_CONTRACT: DecodeContract = DecodeContract {
     eos_token_id: 0,
     no_repeat_ngram_size: 0,
     ngram_window: 0,
+    ngram_domain: NgramDomain::PromptAndGenerated,
+    pages: None,
 };
 
 impl ModelArch for PlannedArch {
@@ -551,8 +628,8 @@ impl ModelArch for PlannedArch {
     fn tasks(&self) -> &'static [Task] {
         self.tasks
     }
-    fn implemented(&self) -> bool {
-        self.implemented
+    fn maturity(&self) -> Maturity {
+        self.maturity
     }
     fn tie_word_embeddings(&self) -> bool {
         self.tie_word_embeddings
@@ -596,6 +673,8 @@ static GOT_OCR2: PlannedArch = PlannedArch {
         eos_token_id: 151_643,
         no_repeat_ngram_size: 20,
         ngram_window: 0,
+        ngram_domain: NgramDomain::PromptAndGenerated,
+        pages: None,
     },
     tasks: &[
         Task::Ocr,
@@ -612,7 +691,7 @@ static GOT_OCR2: PlannedArch = PlannedArch {
     decoder_layers_prefix: "model.layers.", // Qwen2 LM at the model top (spec §13a)
     lm_head_stored_int8: true,              // moot — tied lm_head is omitted entirely
     embed_tokens_name: "model.embed_tokens.weight",
-    implemented: true, // full pipeline + KV-cache decode ship (B1-B9,B11); focr ocr runs it
+    maturity: Maturity::Ready, // full pipeline + KV-cache decode ship (B1-B9,B11); focr ocr runs it
     quant_recipes: &[("int8", GOT_OCR2_INT8_RECIPE)],
 };
 // SmolVLM2-500M — censused (docs/zoo/smolvlm2-spec.md, bd-3jo6.3.1): SigLIP-B/16@512²
@@ -635,6 +714,8 @@ static SMOLVLM2: PlannedArch = PlannedArch {
         eos_token_id: 49_279,
         no_repeat_ngram_size: 0,
         ngram_window: 0,
+        ngram_domain: NgramDomain::PromptAndGenerated,
+        pages: None,
     },
     tasks: &[Task::Describe, Task::Vqa],
     // Censused UNTIED (top-level `tie_word_embeddings: false`; lm_head vs
@@ -649,7 +730,7 @@ static SMOLVLM2: PlannedArch = PlannedArch {
     // C1-C9 shipped: convert (C2), decoder (C5), tokenizer (C6), SigLIP +
     // pixel-shuffle connector (C3/C4, cert cos 1.0), prompt/preprocess (C7,
     // L0b maxabs 0.0 + L0c id-exact), `--task describe` routing (C9).
-    implemented: true,
+    maturity: Maturity::Ready,
     quant_recipes: &[("int8", SMOLVLM2_INT8_RECIPE)],
 };
 static ONECHART: PlannedArch = PlannedArch {
@@ -672,6 +753,8 @@ static ONECHART: PlannedArch = PlannedArch {
         eos_token_id: 2,
         no_repeat_ngram_size: 0,
         ngram_window: 0,
+        ngram_domain: NgramDomain::PromptAndGenerated,
+        pages: None,
     },
     tasks: &[Task::Chart],
     // §4: `lm_head.weight` and `model.decoder.embed_tokens.weight` are stored
@@ -687,7 +770,7 @@ static ONECHART: PlannedArch = PlannedArch {
     // D1-D9 shipped: convert (D2), tokenizer (D9), vision (D3), OPT decoder
     // both paths (D4), number head + self-verify + recognize (D5),
     // `--task chart-data` routing (D7).
-    implemented: true,
+    maturity: Maturity::Ready,
     quant_recipes: &[("int8", ONECHART_INT8_RECIPE)],
 };
 static TROMR: PlannedArch = PlannedArch {
@@ -706,6 +789,8 @@ static TROMR: PlannedArch = PlannedArch {
         eos_token_id: 2,
         no_repeat_ngram_size: 0,
         ngram_window: 0,
+        ngram_domain: NgramDomain::PromptAndGenerated,
+        pages: None,
     },
     tasks: &[Task::Music],
     // §12: NO `lm_head.weight` at all — FOUR untied per-stream heads
@@ -726,7 +811,7 @@ static TROMR: PlannedArch = PlannedArch {
     embed_tokens_name: "decoder.net.rhythm_emb.emb.weight",
     // E2-E7+E9 shipped: convert (E2), tokenizer (E6), encoder cos 1.0 (E3),
     // decoder token-exact (E4), merge+MusicXML (E7), `--task music` routing.
-    implemented: true,
+    maturity: Maturity::Ready,
     quant_recipes: &[("int8", TROMR_INT8_RECIPE), ("f32", TROMR_F32_RECIPE)],
 };
 static TROCR: PlannedArch = PlannedArch {
@@ -744,7 +829,7 @@ static TROCR: PlannedArch = PlannedArch {
     decoder_layers_prefix: "model.layers.", // placeholder until censused (sub-epic F)
     lm_head_stored_int8: true,  // placeholder until censused (sub-epic F)
     embed_tokens_name: "model.embed_tokens.weight",
-    implemented: false,
+    maturity: Maturity::Planned,
     quant_recipes: &[],
 };
 static PIX2TEX: PlannedArch = PlannedArch {
@@ -762,7 +847,7 @@ static PIX2TEX: PlannedArch = PlannedArch {
     decoder_layers_prefix: "model.layers.", // placeholder until censused (sub-epic F)
     lm_head_stored_int8: true,  // placeholder until censused (sub-epic F)
     embed_tokens_name: "model.embed_tokens.weight",
-    implemented: false,
+    maturity: Maturity::Planned,
     quant_recipes: &[],
 };
 
@@ -873,12 +958,26 @@ mod tests {
         implemented.sort_unstable();
         assert_eq!(
             implemented,
-            ["got-ocr2", "onechart", "smolvlm2", "tromr", "unlimited-ocr"]
+            [
+                "got-ocr2",
+                "onechart",
+                "smolvlm2",
+                "tromr",
+                "unlimited-ocr",
+                UNLIMITED_OCR_V2_ID
+            ]
         );
-        // The remaining models are present but NOT yet implemented (descriptors).
-        for id in [UNLIMITED_OCR_V2_ID, "trocr", "pix2tex"] {
-            let a = arch_by_id(id).unwrap_or_else(|| unreachable!("planned arch {id} registered"));
-            assert!(!a.implemented(), "{id} is planned, not implemented");
+        // U2-B6: every model that ran before v2 is Ready, v2 is Experimental,
+        // and the remaining descriptors are Planned; `implemented()` is
+        // exactly "not Planned" for each.
+        for a in archs {
+            let want = match a.id() {
+                UNLIMITED_OCR_V2_ID => Maturity::Experimental,
+                "trocr" | "pix2tex" => Maturity::Planned,
+                _ => Maturity::Ready,
+            };
+            assert_eq!(a.maturity(), want, "{}", a.id());
+            assert_eq!(a.implemented(), want != Maturity::Planned, "{}", a.id());
         }
         // Every registered id is unique (a registry invariant the zoo relies on).
         let mut ids: Vec<&str> = archs.iter().map(|a| a.id()).collect();
@@ -979,9 +1078,14 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_ocr_2_is_registered_with_its_capabilities_and_unimplemented() {
+    fn unlimited_ocr_2_is_registered_with_its_capabilities_and_experimental() {
         let v2 = arch_by_id(UNLIMITED_OCR_V2_ID).expect("unlimited-ocr-2 registered");
-        assert!(!v2.implemented(), "no forward until U2-B6");
+        assert_eq!(
+            v2.maturity(),
+            Maturity::Experimental,
+            "U2-C4 certifies Ready"
+        );
+        assert!(v2.implemented(), "the U2-B6 document loop runs it");
         assert_eq!(v2.display_name(), "Baidu Unlimited-OCR-2");
         assert_eq!(v2.vision_encoder(), VisionEncoder::SamClip);
         assert_eq!(v2.decoder(), Decoder::DeepSeekV2MoeSrSwa);

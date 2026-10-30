@@ -25,7 +25,16 @@
       "moe_expert",
       "dense_mlp",
       "lm_head",
-      "kv_cache"
+      "kv_cache",
+      "page2d_rope",
+      "srswa_router",
+      "srswa_attn",
+      "srswa_kbar",
+      "srswa_retire",
+      "splice",
+      "window",
+      "pagesource",
+      "checkpoint"
     ],
     "dtype": ["f32", "bf16", "i8", "i4", "u8"],
     "simd_tier": ["smmla", "sdot", "vnni512", "vnni256", "amx", "avx2", "scalar", "none"],
@@ -37,7 +46,13 @@
       "teds",
       "formula_cdm",
       "argmax_match",
-      "token_exact"
+      "token_exact",
+      "selection_exact",
+      "routing_mismatches",
+      "bias_max_abs",
+      "page_count_equal",
+      "edit_distance",
+      "bootstrap_bound"
     ]
   },
   "required_by_event": {

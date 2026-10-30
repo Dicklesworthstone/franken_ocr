@@ -218,6 +218,19 @@ impl Progress {
         g.done = (g.done + 1).min(g.total);
     }
 
+    /// Change the item count once it is known: a lazily read document learns
+    /// how many pages it will decode only after its skipped pages are out.
+    /// No redraw, as [`Self::complete_item`].
+    pub fn set_total(&self, total: usize) {
+        let Some(inner) = &self.inner else { return };
+        if inner.finished.load(Ordering::Acquire) {
+            return;
+        }
+        let mut g = lock(&inner.state);
+        g.total = total;
+        g.done = g.done.min(total);
+    }
+
     /// Temporarily clear the line (state kept) so the caller can print other
     /// output — e.g. `ocr-batch` writing a result block — without the bar
     /// visually fused to it. The next `start_item` restores the bar.
@@ -662,6 +675,34 @@ mod tests {
     #[test]
     fn zero_total_constructs_disabled() {
         assert!(!Progress::new("ocr", 0, true).is_enabled());
+    }
+
+    #[test]
+    fn set_total_rescales_the_bar_and_its_page_sink() {
+        let _global = TEST_GLOBAL_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (bar, shared, renderer) = test_bar(5);
+        bar.complete_item();
+        bar.complete_item();
+        bar.complete_item();
+        // Two of five pages were skipped: the decode covers three.
+        bar.set_total(3);
+        let (done, total) = {
+            let g = lock(&shared.state);
+            (g.done, g.total)
+        };
+        assert_eq!((done, total), (3, 3));
+        bar.set_total(2);
+        assert_eq!(lock(&shared.state).done, 2, "done never exceeds total");
+        let mut sink = bar.page_sink();
+        sink(1, "body");
+        assert_eq!(lock(&shared.state).current, "page 1/2");
+        bar.finish();
+        bar.set_total(9);
+        assert_eq!(lock(&shared.state).total, 2, "a finished bar is frozen");
+        drop(bar);
+        renderer.join().expect("renderer exits");
     }
 
     #[test]

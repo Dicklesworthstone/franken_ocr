@@ -99,6 +99,15 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
         "TEST-ONLY: lower the position budget prompt and output share (1..=32768; a larger \
          value exits 2) so tests reach the multi-page clamp on small documents",
     ),
+    (
+        "FOCR_SRSWA_ENTMAX",
+        "unlimited-ocr-2 router entmax domain: `topm` (default, HF parity) or `all` (SGLang); \
+         another value exits 2",
+    ),
+    (
+        "FOCR_SRSWA_RETIRE",
+        "0/off disables unlimited-ocr-2 KV block retirement (a kill switch; output is identical)",
+    ),
 ];
 
 /// Required and optional fields per event kind, so a consumer can validate an
@@ -167,7 +176,7 @@ pub fn robot_schema() -> Value {
             "doctor": "focr doctor --json",
         },
         "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
-        "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`"
+        "status": "live — run_start/run_complete (carries `markdown` and `finish_reason`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out` and `warnings` when a document stopped early (exit 5, no `run_complete`)"
     })
 }
 
@@ -208,7 +217,7 @@ pub fn run_complete_event(markdown: &str) -> Value {
 /// runs, so existing consumers and goldens are unaffected and
 /// [`ROBOT_SCHEMA_VERSION`] is unchanged.
 ///
-/// U2-X2 adds `finish_reason` (`stop` | `length`) whenever the decode
+/// U2-X2 adds `finish_reason` (`stop` | `length` | `budget`) whenever the decode
 /// recorded one, and `warnings` (`{kind, message, recovery, ...}`) only when
 /// non-empty, so a healthy run differs from before only by `finish_reason`.
 pub fn run_complete_event_assessed(
@@ -241,7 +250,7 @@ pub fn run_complete_event_assessed(
 /// is read directly from [`FocrError::exit_code`] so robot consumers and process
 /// supervisors observe the same stable contract.
 pub fn run_error_event(err: &FocrError) -> Value {
-    json!({
+    let mut event = json!({
         "schema_version": ROBOT_SCHEMA_VERSION,
         "event": "run_error",
         "error_kind": err.kind(),
@@ -250,7 +259,16 @@ pub fn run_error_event(err: &FocrError) -> Value {
         // One actionable next step, machine-consumable without parsing prose
         // (additive field; schema stays v1).
         "recovery": err.remediation(),
-    })
+    });
+    // A partial-output run (U2-B6): the pages it wrote and why it stopped.
+    if let FocrError::Partial(partial) = err {
+        event["finish_reason"] = partial.finish_reason.into();
+        event["pages_out"] = partial.pages_out.into();
+        if !partial.warnings.is_empty() {
+            event["warnings"] = partial.warnings.clone().into();
+        }
+    }
+    event
 }
 
 /// Build a robot-mode `page` event recording that one document page was SKIPPED
@@ -401,6 +419,45 @@ mod tests {
             assert_eq!(event["error_kind"], err.kind());
             assert_eq!(event["code"], err.exit_code());
             assert_eq!(event["message"], err.to_string());
+            for field in ["finish_reason", "pages_out", "warnings"] {
+                assert!(event.get(field).is_none(), "{field} only on partial output");
+            }
+        }
+    }
+
+    /// U2-B6: a partial-output `run_error` carries exit 5 and its additive
+    /// fields, each declared optional in `event_fields`.
+    #[test]
+    fn partial_output_run_error_carries_its_pages_and_warnings() {
+        let warning = json!({"kind": "v2_length", "message": "m", "recovery": "r",
+                             "expected": 3, "got": 2});
+        let err = FocrError::Partial(Box::new(crate::error::PartialOutput {
+            finish_reason: "length",
+            pages_out: 2,
+            warnings: vec![warning.clone()],
+            message: "stopped in page 2 of 3".into(),
+        }));
+        let event = run_error_event(&err);
+        assert_eq!(event["code"], 5);
+        assert_eq!(event["error_kind"], "timeout");
+        assert_eq!(event["finish_reason"], "length");
+        assert_eq!(event["pages_out"], 2);
+        assert_eq!(event["warnings"], json!([warning]));
+        assert!(
+            event["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("stopped in page 2 of 3")),
+            "{event}"
+        );
+        let fields = event_fields();
+        let spec = &fields["run_error"];
+        for key in event.as_object().expect("an object").keys() {
+            let declared = [&spec["required"], &spec["optional"]]
+                .iter()
+                .filter_map(|list| list.as_array())
+                .flatten()
+                .any(|name| name == key);
+            assert!(declared, "{key} is declared for run_error");
         }
     }
 

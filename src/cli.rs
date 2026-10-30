@@ -15,6 +15,7 @@
 //! points at its own thin shim that just calls [`cli_main`]. See AGENTS.md
 //! doctrine #9.
 
+use crate::page_source::{Half, PageItem, PageSource};
 use crate::{
     FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine, dist,
     native_engine, pdf, progress, quant, robot, simd,
@@ -229,7 +230,9 @@ pub struct OcrBatchArgs {
     /// Without this flag each image is parsed independently. Unlimited-OCR
     /// only; v1 has 32,768 positions shared by prompt and output (≈29 dense
     /// pages); longer documents stop early and report `finish_reason: length`
-    /// with a `v1_truncated` warning.
+    /// with a `v1_truncated` warning. unlimited-ocr-2 (experimental) takes up
+    /// to 60 pages per pass; a document that stops early prints its pages,
+    /// then exits 5.
     #[arg(long)]
     pub multi_page: bool,
 }
@@ -266,8 +269,10 @@ pub struct RobotRunArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct OcrRequestArgs {
-    /// Input document path — an image (PNG/JPG/…) or a PDF (each page is
-    /// rasterized natively and OCR'd as one document).
+    /// Input document path — an image (PNG/JPG/…), a PDF (each page is
+    /// rasterized natively and OCR'd as one document), or a directory of page
+    /// images (read in natural order, `p2` before `p10`, as one document;
+    /// other files are left out with an `ignored_files` warning).
     pub image: PathBuf,
     /// Explicit model artifact path for diagnostics and model-gated runs.
     #[arg(long)]
@@ -332,26 +337,30 @@ pub struct OcrRequestArgs {
     /// Requires `--task describe`.
     #[arg(long)]
     pub question: Option<String>,
-    /// PDF page selection: a comma list of 1-based pages and inclusive
-    /// ranges ("3", "3-7", "1,5-9,218"). PDF inputs only — on an image
+    /// Page selection: a comma list of 1-based pages and inclusive ranges
+    /// ("3", "3-7", "1,5-9,218"). PDF and directory inputs only — on an image
     /// input this is a usage error. Out-of-range pages error naming the
     /// document's page count; pages run in source order, deduplicated.
     #[arg(long)]
     pub pages: Option<String>,
-    /// Split two-page book spreads (PDF inputs only): when a rasterized page
-    /// is much wider than tall AND a near-blank vertical gutter sits near the
-    /// center, OCR the left and right halves as separate logical pages
-    /// (labelled `"half": "left"|"right"` in JSON / robot page events). Off
-    /// by default; a page with no detectable gutter passes through unsplit.
+    /// Split two-page book spreads (PDF and directory inputs only): when a
+    /// page is much wider than tall AND a near-blank vertical gutter sits
+    /// near the center, OCR the left and right halves as separate logical
+    /// pages (labelled `"half": "left"|"right"` in JSON / robot page events).
+    /// Off by default; a page with no detectable gutter passes through
+    /// unsplit.
     #[arg(long)]
     pub split_spreads: bool,
-    /// ONE cross-page pass over the whole document (PDF inputs only; the
-    /// Unlimited-OCR `infer_multi` contract): page N can reference pages
-    /// 1..N-1, output is one markdown with `<PAGE>` separators. Composes
-    /// with `--pages`. v1 has 32,768 positions shared by prompt and output
+    /// ONE cross-page pass over the whole document (PDF and directory inputs
+    /// only; the Unlimited-OCR `infer_multi` contract): page N can reference
+    /// pages 1..N-1, output is one markdown with `<PAGE>` separators. Pages
+    /// are read one at a time, so a long document never holds every raster.
+    /// Composes with `--pages`. v1 has 32,768 positions shared by prompt and output
     /// (≈29 dense pages); longer documents stop early and report
-    /// `finish_reason: length` with a `v1_truncated` warning. Without this
-    /// flag each page is parsed independently.
+    /// `finish_reason: length` with a `v1_truncated` warning. unlimited-ocr-2
+    /// (experimental) takes up to 60 pages per pass; a document that stops
+    /// early writes its pages, then exits 5. Without this flag each page is
+    /// parsed independently.
     #[arg(long)]
     pub multi_page: bool,
     /// Disable the resident warm-model daemon for this run (env analog:
@@ -934,26 +943,27 @@ pub fn run(cli: Cli) -> FocrResult<()> {
     }
 }
 
-/// The result of one OCR run — a single image or a multi-page PDF — unified so the
-/// output layer (markdown vs JSON-with-boxes, file vs stdout) is written once,
-/// identically, regardless of which input path produced it.
+/// The result of one OCR run — a single image, or a multi-page PDF or directory
+/// of page images — unified so the output layer (markdown vs JSON-with-boxes,
+/// file vs stdout) is written once, identically, regardless of which input path
+/// produced it.
 enum Recognition {
     Single(native_engine::RecognizedDocument),
-    Pdf(PdfRecognition),
+    Document(DocumentRecognition),
 }
 
 impl Recognition {
-    /// The rendered markdown document (PDF pages already joined by blank lines).
+    /// The rendered markdown document (pages already joined by blank lines).
     fn markdown(&self) -> &str {
         match self {
             Recognition::Single(doc) => &doc.markdown,
-            Recognition::Pdf(pdf) => &pdf.markdown,
+            Recognition::Document(document) => &document.markdown,
         }
     }
 
     /// The structured JSON form. Always carries `schema_version` + `markdown`; a
-    /// single image adds a top-level `layout` array, a PDF adds a `pages` array of
-    /// `{page, layout}`. Every `layout` is a list of `{label, boxes}`, and each box
+    /// single image adds a top-level `layout` array, a document adds a `pages`
+    /// array of `{page, layout}`. Every `layout` is a list of `{label, boxes}`, and each box
     /// is `[x1, y1, x2, y2]` in source-image pixels (top-left origin). When figures
     /// were extracted, a top-level `figures` array of `{label, page, bbox, path}`
     /// is appended (each `path` is the saved file, also referenced from the
@@ -965,8 +975,8 @@ impl Recognition {
                 "markdown": doc.markdown,
                 "layout": layout_to_json(&doc.layout),
             }),
-            Recognition::Pdf(pdf) => {
-                let pages: Vec<serde_json::Value> = pdf
+            Recognition::Document(document) => {
+                let pages: Vec<serde_json::Value> = document
                     .pages
                     .iter()
                     .map(|p| {
@@ -984,7 +994,7 @@ impl Recognition {
                     .collect();
                 serde_json::json!({
                     "schema_version": robot::ROBOT_SCHEMA_VERSION,
-                    "markdown": pdf.markdown,
+                    "markdown": document.markdown,
                     "pages": pages,
                 })
             }
@@ -1379,24 +1389,28 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     let figure_plan = FigurePlan::resolve(&args)?;
 
     let engine = OcrEngine::new()?;
-    // A `.pdf` (or `%PDF-`-magic) input rasterizes each page and OCRs them as one
-    // document; everything else is a single decoded image. Both funnel through
-    // `recognize_with_autodownload` so model resolution + the first-run download
-    // offer behave identically. Both recognize WITH layout so the JSON output can
-    // carry bounding boxes — the layout parse is negligible next to the forward
-    // pass, and markdown-only consumers simply ignore it. With `--extract-figures`
-    // the figure-aware variants additionally crop the `![](images/…)` regions out
-    // of the source and rewrite the markdown references to the saved files.
-    let is_pdf = pdf::looks_like_pdf(&request.image);
-    // Human-mode progress (GH #2): a stderr-only bar for the long per-page PDF
-    // drivers. NEVER in robot/`--json` mode — those stdout contracts are
-    // machine-consumed — and `progress::Progress` additionally self-disables
-    // when stderr is not an interactive TTY, so piped runs are byte-identical.
+    // A `.pdf` (or `%PDF-`-magic) input or a directory of page images is a
+    // document: its pages are read one at a time from a [`PageSource`] and
+    // OCR'd as one document (U2-D0). Everything else is a single decoded image.
+    // Both funnel through `recognize_with_autodownload` so model resolution +
+    // the first-run download offer behave identically. Both recognize WITH
+    // layout so the JSON output can carry bounding boxes — the layout parse is
+    // negligible next to the forward pass, and markdown-only consumers simply
+    // ignore it. With `--extract-figures` the figure-aware variants additionally
+    // crop the `![](images/…)` regions out of the source and rewrite the
+    // markdown references to the saved files.
+    let is_document = pdf::looks_like_pdf(&request.image) || request.image.is_dir();
+    // Human-mode progress (GH #2): a stderr-only bar for the long per-page
+    // document drivers. NEVER in robot/`--json` mode — those stdout contracts
+    // are machine-consumed — and `progress::Progress` additionally
+    // self-disables when stderr is not an interactive TTY, so piped runs are
+    // byte-identical.
     let show_progress = !robot_mode && !args.json;
-    if !is_pdf && (request.pages.is_some() || request.split_spreads || request.multi_page) {
+    if !is_document && (request.pages.is_some() || request.split_spreads || request.multi_page) {
         return Err(FocrError::Usage(format!(
-            "--pages/--split-spreads/--multi-page operate on PDF pages, but {} is not a PDF \
-             (for an image list, use `focr ocr-batch --multi-page`)",
+            "--pages/--split-spreads/--multi-page operate on the pages of a PDF or of a \
+             directory of page images, but {} is neither (for an image list, use `focr \
+             ocr-batch --multi-page`)",
             request.image.display()
         )));
     }
@@ -1416,16 +1430,35 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
                 .into(),
         ));
     }
+    // A document's pages, opened once here so a bad `--pages` spec or a
+    // directory without page images fails before the model loads. Files a
+    // directory leaves out are reported now, and again on `run_complete`.
+    let source = is_document
+        .then(|| open_page_source(&request))
+        .transpose()?;
+    let source_warnings = source
+        .as_ref()
+        .map(PageSource::warnings)
+        .unwrap_or_default();
+    if !robot_mode {
+        source_warnings.iter().for_each(print_run_warning);
+    }
     // A resident run decodes in the daemon, which reports its finish_reason
     // in the reply (U2-X2); inline runs leave it on this engine's model.
     let mut resident_finish: Option<native_engine::FinishReason> = None;
-    let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, is_pdf) {
-        (Some(plan), true) => {
-            let (pdf_rec, figs) =
-                recognize_pdf_with_figures(&engine, &request, robot_mode, show_progress, plan)?;
-            (Recognition::Pdf(pdf_rec), figs)
+    let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, source) {
+        (Some(plan), Some(source)) => {
+            let (pages, figs) = recognize_document_pages_with_figures(
+                &engine,
+                &request,
+                source,
+                robot_mode,
+                show_progress,
+                plan,
+            )?;
+            (Recognition::Document(pages), figs)
         }
-        (Some(plan), false) => {
+        (Some(plan), None) => {
             let (mut doc, raw) =
                 recognize_with_autodownload(&request, robot_mode, |model| match model {
                     Some(m) => engine.recognize_with_figures_model(m, &request.image),
@@ -1435,20 +1468,27 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
             doc.markdown = writer.process_page(1, &doc.markdown, raw)?;
             (Recognition::Single(doc), writer.into_written())
         }
-        (None, true) if request.multi_page => (
-            Recognition::Pdf(recognize_pdf_multi_page(
+        (None, Some(source)) if request.multi_page => (
+            Recognition::Document(recognize_document_multi_page(
                 &engine,
                 &request,
+                source,
                 robot_mode,
                 show_progress,
             )?),
             Vec::new(),
         ),
-        (None, true) => (
-            Recognition::Pdf(recognize_pdf(&engine, &request, robot_mode, show_progress)?),
+        (None, Some(source)) => (
+            Recognition::Document(recognize_document_pages(
+                &engine,
+                &request,
+                source,
+                robot_mode,
+                show_progress,
+            )?),
             Vec::new(),
         ),
-        (None, false) => {
+        (None, None) => {
             // Tall-capture routing (GH #15): a single pass over an
             // extreme-aspect image squashes glyphs below legibility and
             // returns near-empty markdown with exit 0. Route such images
@@ -1486,17 +1526,26 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     };
 
     // How the run's decodes ended (U2-X2): the run-level finish_reason and
-    // the v1 multi-page truncation / page-merge warnings. Absent when the
-    // model's arm records no decode report (the zoo models).
+    // the v1 multi-page truncation / page-merge warnings, after the input's
+    // own warnings. Absent when the model's arm records no decode report (the
+    // zoo models).
     let decode_report = engine.take_last_decode_report();
     let finish_reason = decode_report
         .as_ref()
         .map(native_engine::DecodeReport::run_finish_reason)
         .or(resident_finish);
-    let run_warnings = decode_report
+    let mut run_warnings = source_warnings;
+    run_warnings.extend(
+        decode_report
+            .as_ref()
+            .map(native_engine::decode_warnings)
+            .unwrap_or_default(),
+    );
+    // An Unlimited-OCR-2 document that stopped at its position limit or
+    // stage budget writes what it produced below, then exits 5 (U2-B6).
+    let partial = decode_report
         .as_ref()
-        .map(native_engine::decode_warnings)
-        .unwrap_or_default();
+        .and_then(|report| native_engine::partial_output(report, &run_warnings));
     if !robot_mode {
         print_run_warnings(&run_warnings);
     }
@@ -1543,7 +1592,7 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // and with --fail-on-low-yield fail BEFORE any output is written so a
     // gating pipeline never records the run as good. Judged only for the
     // plain document-OCR task — a VQA answer is legitimately short.
-    let low_yield = if is_pdf || args.request.task != OcrTask::Ocr {
+    let low_yield = if is_document || args.request.task != OcrTask::Ocr {
         None
     } else {
         image::image_dimensions(&request.image)
@@ -1592,13 +1641,16 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     if robot_mode {
         // The terminal success event carries the recognized markdown so a machine
         // consumer actually receives the OCR result on the NDJSON stream (the
-        // human / `--json` modes print it below instead).
-        emit(&robot::run_complete_event_assessed(
-            markdown,
-            low_yield.as_ref(),
-            finish_reason,
-            &run_warnings,
-        ));
+        // human / `--json` modes print it below instead). A partial run ends
+        // on its `run_error` instead, never after a `run_complete`.
+        if partial.is_none() {
+            emit(&robot::run_complete_event_assessed(
+                markdown,
+                low_yield.as_ref(),
+                finish_reason,
+                &run_warnings,
+            ));
+        }
     } else if let Some(path) = args.output.as_deref() {
         // Result already went to the file; don't also echo it to stdout. Confirm
         // on stderr so stdout stays empty/clean for any wrapping pipeline.
@@ -1623,7 +1675,8 @@ fn run_ocr_inner(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     } else {
         println!("{markdown}");
     }
-    Ok(())
+    // The pages are out; a partial run now fails with exit 5.
+    partial.map_or(Ok(()), Err)
 }
 
 /// Merge the run's decode warnings (U2-X2) into a `--json` value's
@@ -1648,9 +1701,17 @@ fn merge_run_warnings(value: &mut serde_json::Value, warnings: &[native_engine::
 
 /// The human stderr line per decode warning (U2-X2).
 fn print_run_warnings(warnings: &[native_engine::RunWarning]) {
-    for warning in warnings {
-        eprintln!("[focr] warning: {} — {}", warning.message, warning.recovery);
-    }
+    // The model's admission printed its `ignored_lever` warnings at load, and
+    // the page source its `ignored_files` warning when it opened.
+    warnings
+        .iter()
+        .filter(|w| !matches!(w.kind, "ignored_lever" | "ignored_files"))
+        .for_each(print_run_warning);
+}
+
+/// One run warning's human stderr line.
+fn print_run_warning(warning: &native_engine::RunWarning) {
+    eprintln!("[focr] warning: {} — {}", warning.message, warning.recovery);
 }
 
 /// The `--json` `staves` array for a music run (bd-av64.2): one entry per
@@ -1820,51 +1881,63 @@ fn recognize_tall_capture(
     })
 }
 
-/// Parse a `--pages` spec ("3", "3-7", "1,5-9,218"; 1-based, inclusive
-/// ranges) against a document's page count into 0-based indices, in source
-/// order, deduplicated (bd-av64.11). `None` ⇒ every page.
-///
-/// The grammar itself lives in [`pdf::select_pages`] so the CLI, the library,
-/// the iOS app, and the browser playground cannot drift apart on what
-/// `--pages 3,5-9` means — they did, before it was shared.
+/// The page source of a document input (a PDF or a directory of page
+/// images), narrowed to `--pages` (the grammar of [`pdf::select_pages`],
+/// shared with the library, the iOS app and the browser playground) and
+/// splitting spreads under `--split-spreads` (bd-av64.11).
 ///
 /// # Errors
-/// [`FocrError::Usage`] on an empty/garbled spec, a zero page (pages are
-/// 1-based), a reversed range, or a page past `page_count` (the error names
-/// the document's page count).
-fn parse_page_spec(spec: Option<&str>, page_count: usize) -> FocrResult<Vec<usize>> {
-    pdf::select_pages(spec, page_count)
+/// The source's open error, or [`FocrError::Usage`] for a bad `--pages`
+/// spec (naming the document's page count).
+fn open_page_source(request: &OcrRequest) -> FocrResult<PageSource> {
+    Ok(PageSource::open(&request.image)?
+        .select(request.pages.as_deref())?
+        .split_spreads(request.split_spreads))
 }
 
-/// The logical pages of one rasterized PDF page: the page itself, or its
-/// (left, right) halves when `--split-spreads` finds a book spread
-/// (bd-av64.11). The split decision is logged under FOCR_TIMING.
-fn logical_pages(
-    image: image::DynamicImage,
-    split_spreads: bool,
-    source_page: usize,
-) -> Vec<(image::DynamicImage, Option<&'static str>)> {
-    if split_spreads {
-        if let Some((left, right, gutter_x)) = pdf::split_spread(&image) {
-            crate::native_engine::timing_log(&format!(
-                "pdf page {source_page}: spread split at x={gutter_x} ({}x{})",
-                image.width(),
-                image.height()
-            ));
-            return vec![(left, Some("left")), (right, Some("right"))];
-        }
-        crate::native_engine::timing_log(&format!(
-            "pdf page {source_page}: no spread detected ({}x{}), unsplit",
-            image.width(),
-            image.height()
-        ));
+/// The page source for one recognition attempt: the one opened up front, or
+/// a fresh one when a first-run download retries the attempt, since the
+/// first attempt consumed its own.
+fn attempt_source(
+    opened: &std::cell::Cell<Option<PageSource>>,
+    request: &OcrRequest,
+) -> FocrResult<PageSource> {
+    match opened.take() {
+        Some(source) => Ok(source),
+        None => open_page_source(request),
     }
-    vec![(image, None)]
 }
 
-/// One successfully-OCR'd PDF page's structured layout (for the JSON output).
-struct PdfPageLayout {
-    /// 1-based page number in the source PDF.
+/// How a skipped page is named on stderr: "PDF page 3", or "page 3" of a
+/// directory.
+fn page_noun(request: &OcrRequest) -> &'static str {
+    if request.image.is_dir() {
+        "page"
+    } else {
+        "PDF page"
+    }
+}
+
+/// Surface a skipped page where the caller reads: a robot `page` event with
+/// `status: "skipped"`, else a human stderr line that does not tear `bar`.
+fn report_skipped_page(
+    robot_mode: bool,
+    bar: &progress::Progress,
+    noun: &str,
+    page: usize,
+    err: &FocrError,
+) {
+    if robot_mode {
+        emit(&robot::page_skipped_event(page, err));
+    } else {
+        bar.note(&format!("[focr] {noun} {page} skipped: {err}"));
+    }
+}
+
+/// One successfully-OCR'd document page's structured layout (for the JSON
+/// output).
+struct DocumentPageLayout {
+    /// 1-based page number in the source document.
     page: usize,
     /// `Some("left"|"right")` when this entry is one half of a split spread.
     half: Option<&'static str>,
@@ -1872,120 +1945,108 @@ struct PdfPageLayout {
     layout: Vec<crate::native_engine::LayoutSpan>,
 }
 
-/// A recognized PDF: the concatenated markdown plus per-page layout for the pages
-/// that decoded (skipped pages are absent from `pages`, as from the markdown).
-struct PdfRecognition {
+/// A recognized document: the concatenated markdown plus per-page layout for
+/// the pages that decoded (skipped pages are absent from `pages`, as from the
+/// markdown).
+struct DocumentRecognition {
     markdown: String,
-    pages: Vec<PdfPageLayout>,
+    pages: Vec<DocumentPageLayout>,
 }
 
-/// `--multi-page` (bd-2z0y): rasterize the selected PDF pages and run ONE
-/// cross-page pass over the whole document (the Unlimited-OCR `infer_multi`
+/// `--multi-page` (bd-2z0y): ONE cross-page pass over the selected pages of a
+/// PDF or a directory of page images (the Unlimited-OCR `infer_multi`
 /// contract, bd-1gv.25) — page N attends to pages 1..N−1; the output is one
 /// markdown with `<PAGE>` separators. Per-page bbox layout is not produced in
 /// this mode (the reference emits document-level markdown), so `pages` is
-/// empty in the JSON. A page that fails to RASTER is skipped with the same
-/// surfaced page event as the per-page path (the pass runs over the pages
-/// that rendered); decode errors are whole-document by construction.
-fn recognize_pdf_multi_page(
+/// empty in the JSON.
+///
+/// The pages are read lazily (U2-D0): the forward stage rasterizes each one,
+/// preprocesses it and drops the raster before reading the next, so a long
+/// book never holds every raster. A page that fails to RASTER is skipped with
+/// the same surfaced page event as the per-page path (the pass runs over the
+/// pages that rendered); decode errors are whole-document by construction.
+fn recognize_document_multi_page(
     engine: &OcrEngine,
     request: &OcrRequest,
+    source: PageSource,
     robot_mode: bool,
     show_progress: bool,
-) -> FocrResult<PdfRecognition> {
-    let pages = pdf::PdfPages::open(&request.image)?;
-    let page_count = pages.len();
-    let selected = parse_page_spec(request.pages.as_deref(), page_count)?;
-    let mut images: Vec<image::DynamicImage> = Vec::new();
-    let mut first_error: Option<FocrError> = None;
-    // Rasterization progress (GH #2): a long book spends real time here before
-    // the decode pass even starts. Stderr-only; self-disabled off-TTY.
-    let raster_bar = progress::Progress::new("raster", selected.len(), show_progress);
-    for idx in selected {
-        raster_bar.start_item(format!("page {}/{page_count}", idx + 1));
-        match pages.render(idx) {
-            Ok(image) => images.push(image),
-            Err(e) => {
-                if robot_mode {
-                    emit(&robot::page_skipped_event(idx + 1, &e));
-                } else {
-                    raster_bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
-                }
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-        }
-        raster_bar.complete_item();
-    }
-    raster_bar.finish();
-    if images.is_empty() {
-        return Err(first_error.unwrap_or_else(|| {
-            FocrError::Other(anyhow::anyhow!(
-                "recognize_pdf_multi_page: no pages selected from {}",
-                request.image.display()
-            ))
-        }));
-    }
+) -> FocrResult<DocumentRecognition> {
+    let opened = std::cell::Cell::new(Some(source));
+    let noun = page_noun(request);
     let markdown = recognize_with_autodownload(request, robot_mode, |model| {
-        let imgs = images.clone();
+        let source = attempt_source(&opened, request)?;
+        let model_path = model
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(OcrEngine::model_path);
+        let (page_count, selected) = (source.source_len(), source.len());
+        // Human-mode progress (GH #2), two bars in turn: `raster` while the
+        // pages are read, then `ocr` over the pages that rendered while the
+        // document decodes. Stderr-only; self-disabled off-TTY.
+        let decode_bar =
+            std::sync::Arc::new(progress::Progress::new("ocr", selected, show_progress));
+        let raster_bar = progress::Progress::new("raster", selected, show_progress);
+        let on_item: Box<dyn FnMut(&PageItem) + Send> = {
+            let decode_bar = std::sync::Arc::clone(&decode_bar);
+            let (mut walked, mut rendered) = (0usize, 0usize);
+            Box::new(move |item: &PageItem| {
+                raster_bar.start_item(format!("page {}/{page_count}", item.source_page));
+                match &item.raster {
+                    Ok(_) => rendered += 1,
+                    Err(e) => {
+                        report_skipped_page(robot_mode, &raster_bar, noun, item.source_page, e)
+                    }
+                }
+                if item.half != Some(Half::Left) {
+                    raster_bar.complete_item();
+                    walked += 1;
+                }
+                if walked == selected {
+                    raster_bar.finish();
+                    decode_bar.set_total(rendered);
+                    if rendered > 0 {
+                        decode_bar.start_item(format!("page 1/{rendered}"));
+                    }
+                }
+            })
+        };
         // Robot mode streams a `page` event per crossed <PAGE> boundary
         // (bd-2z0y); the terminal run_complete still carries the assembled
-        // markdown. The default-model arm resolves the same path an explicit
-        // model would, so both arms stream.
-        if robot_mode {
-            let sink = Box::new(|page: usize, body: &str| {
+        // markdown. A human TTY advances the decode bar instead; off-TTY (or
+        // FOCR_NO_PROGRESS) the pass streams nothing, and its markdown is the
+        // same either way.
+        let on_page: Option<crate::PageSink> = if robot_mode {
+            Some(Box::new(|page: usize, body: &str| {
                 emit(&robot::page_decoded_event(page, body));
-            });
-            let model_path = model
-                .map(std::path::Path::to_path_buf)
-                .unwrap_or_else(OcrEngine::model_path);
-            engine.recognize_multi_page_dynamic_streaming_with_model(&model_path, imgs, sink)
+            }))
+        } else if decode_bar.is_enabled() {
+            Some(decode_bar.page_sink())
         } else {
-            // Human-mode progress (GH #2) rides the SAME proven streaming
-            // driver robot mode uses (identical assembled markdown, bd-2z0y);
-            // the sink just advances a stderr bar per crossed <PAGE> boundary.
-            // Off-TTY (or FOCR_NO_PROGRESS) the bar is disabled and the run
-            // takes the original non-streaming arms, byte-for-byte.
-            let bar = progress::Progress::new("ocr", imgs.len(), show_progress);
-            if bar.is_enabled() {
-                bar.start_item(format!("page 1/{}", imgs.len()));
-                let model_path = model
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(OcrEngine::model_path);
-                let sink = bar.page_sink();
-                let out = engine.recognize_multi_page_dynamic_streaming_with_model(
-                    &model_path,
-                    imgs,
-                    sink,
-                );
-                if out.is_ok() {
-                    bar.finish();
-                } else {
-                    bar.retire();
-                }
-                out
-            } else {
-                match model {
-                    Some(m) => engine.recognize_multi_page_dynamic_with_model(m, imgs),
-                    None => engine.recognize_multi_page_dynamic(imgs),
-                }
-            }
+            None
+        };
+        let out =
+            engine.recognize_multi_page_source_with_model(&model_path, source, on_item, on_page);
+        if out.is_ok() {
+            decode_bar.finish();
+        } else {
+            decode_bar.retire();
         }
+        out
     })?;
-    Ok(PdfRecognition {
+    Ok(DocumentRecognition {
         markdown,
         pages: Vec::new(),
     })
 }
 
-/// Recognize every page of a PDF, concatenating the per-page markdown into one
-/// document (successful pages joined by a blank line) and collecting each decoded
-/// page's layout spans for the JSON output.
+/// Recognize every page of a PDF or a directory of page images, concatenating
+/// the per-page markdown into one document (successful pages joined by a blank
+/// line) and collecting each decoded page's layout spans for the JSON output.
 ///
-/// Each page is rasterized in-memory by [`pdf`] and fed through the identical OCR
-/// pipeline a PNG takes — no out-of-band `pdftoppm`. Pages render lazily, one at a
-/// time, so a long book never holds every raster at once.
+/// Each page is read from the [`PageSource`] — a PDF page rasterized in-memory
+/// by [`pdf`], no out-of-band `pdftoppm` — and fed through the identical OCR
+/// pipeline a PNG takes. Pages render lazily, one at a time, so a long book
+/// never holds every raster at once.
 ///
 /// **Per-page resilience (mirrors the `ocr-batch` path):** a page that cannot be
 /// rendered or recognized — an unsupported codec (`JPXDecode`/`JBIG2Decode`), a
@@ -2004,158 +2065,140 @@ fn recognize_pdf_multi_page(
 ///
 /// If NOT ONE page decodes, the first per-page failure is surfaced as a clean
 /// error instead of an empty document.
-fn recognize_pdf(
+fn recognize_document_pages(
     engine: &OcrEngine,
     request: &OcrRequest,
+    source: PageSource,
     robot_mode: bool,
     show_progress: bool,
-) -> FocrResult<PdfRecognition> {
-    let pages = pdf::PdfPages::open(&request.image)?;
-    let page_count = pages.len();
+) -> FocrResult<DocumentRecognition> {
+    let opened = std::cell::Cell::new(Some(source));
+    let noun = page_noun(request);
     recognize_with_autodownload(request, robot_mode, |model| {
-        let selected = parse_page_spec(request.pages.as_deref(), page_count)?;
+        let mut source = attempt_source(&opened, request)?;
+        let page_count = source.source_len();
         // Per-page progress bar (GH #2): stderr-only, never in robot/--json
         // mode, self-disabled off-TTY (see `progress`). Built per ATTEMPT so a
         // ModelNotFound retires it without waiting; the autodownload wrapper
         // synchronizes the terminal line before its first-run prompt renders.
-        let bar = progress::Progress::new("ocr", selected.len(), show_progress);
+        let bar = progress::Progress::new("ocr", source.len(), show_progress);
         let mut document = String::new();
-        let mut page_layouts: Vec<PdfPageLayout> = Vec::new();
+        let mut page_layouts: Vec<DocumentPageLayout> = Vec::new();
         let mut ok_pages = 0usize;
         let mut first_error: Option<FocrError> = None;
-        for idx in selected {
-            bar.start_item(format!("page {}/{page_count}", idx + 1));
-            let halves = match pages.render(idx) {
-                Ok(image) => logical_pages(image, request.split_spreads, idx + 1),
-                Err(e) => {
-                    // A raster failure skips the SOURCE page (both halves).
-                    if robot_mode {
-                        emit(&robot::page_skipped_event(idx + 1, &e));
-                    } else {
-                        bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
+        for item in source.by_ref() {
+            // A spread's two halves share one bar step.
+            if item.half != Some(Half::Right) {
+                bar.start_item(format!("page {}/{page_count}", item.source_page));
+            }
+            // A raster failure skips the SOURCE page (both halves of a spread).
+            let page = item.raster.and_then(|image| match model {
+                Some(m) => engine.recognize_dynamic_with_layout_model(m, image),
+                None => engine.recognize_dynamic_with_layout(image),
+            });
+            match page {
+                Ok(doc) => {
+                    if ok_pages > 0 {
+                        document.push_str("\n\n");
                     }
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
-                    bar.complete_item();
-                    continue;
+                    document.push_str(doc.markdown.trim_end());
+                    page_layouts.push(DocumentPageLayout {
+                        page: item.source_page,
+                        half: item.half.map(Half::as_str),
+                        layout: doc.layout,
+                    });
+                    ok_pages += 1;
                 }
-            };
-            for (image, half) in halves {
-                let page = match model {
-                    Some(m) => engine.recognize_dynamic_with_layout_model(m, image),
-                    None => engine.recognize_dynamic_with_layout(image),
-                };
-                match page {
-                    Ok(doc) => {
-                        if ok_pages > 0 {
-                            document.push_str("\n\n");
-                        }
-                        document.push_str(doc.markdown.trim_end());
-                        page_layouts.push(PdfPageLayout {
-                            page: idx + 1,
-                            half,
-                            layout: doc.layout,
-                        });
-                        ok_pages += 1;
-                    }
-                    // Whole-run conditions are never per-page — abort immediately:
-                    // a missing model (so the caller can offer the download + retry),
-                    // a Ctrl+C / cooperative cancel, or a bad/incompatible model file
-                    // (every page would fail it identically). Swallowing any of these
-                    // per-page would lose the signal and waste compute on doomed pages.
-                    Err(
-                        e @ (FocrError::ModelNotFound(_)
-                        | FocrError::Cancelled
-                        | FocrError::FormatMismatch(_)),
-                    ) => return Err(e),
-                    // Isolate every other per-page failure: skip it, keeping the rest
-                    // of the document, but SURFACE the skip on whichever stream the
-                    // caller is reading — a structured `page` NDJSON event in robot
-                    // mode (so a machine consumer can tell the document is missing
-                    // pages), else a human stderr warning.
-                    Err(e) => {
-                        if robot_mode {
-                            emit(&robot::page_skipped_event(idx + 1, &e));
-                        } else {
-                            bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
-                        }
-                        if first_error.is_none() {
-                            first_error = Some(e);
-                        }
-                    }
+                // Whole-run conditions are never per-page — abort immediately:
+                // a missing model (so the caller can offer the download + retry),
+                // a Ctrl+C / cooperative cancel, or a bad/incompatible model file
+                // (every page would fail it identically). Swallowing any of these
+                // per-page would lose the signal and waste compute on doomed pages.
+                Err(
+                    e @ (FocrError::ModelNotFound(_)
+                    | FocrError::Cancelled
+                    | FocrError::FormatMismatch(_)),
+                ) => return Err(e),
+                // Isolate every other per-page failure: skip it, keeping the rest
+                // of the document, but SURFACE the skip on whichever stream the
+                // caller is reading — a structured `page` NDJSON event in robot
+                // mode (so a machine consumer can tell the document is missing
+                // pages), else a human stderr warning.
+                Err(e) => {
+                    report_skipped_page(robot_mode, &bar, noun, item.source_page, &e);
+                    first_error.get_or_insert(e);
                 }
             }
-            bar.complete_item();
+            if item.half != Some(Half::Left) {
+                bar.complete_item();
+            }
         }
         bar.finish();
         if ok_pages == 0 {
-            // PdfPages::open guarantees >=1 page, and ModelNotFound returns early,
-            // so first_error is always Some here; fall back defensively.
+            // A source has >=1 page, and ModelNotFound returns early, so
+            // first_error is always Some here; fall back defensively.
             return Err(first_error.unwrap_or_else(|| {
                 FocrError::InputDecode(format!(
-                    "PDF {} produced no decodable pages",
+                    "{} produced no decodable pages",
                     request.image.display()
                 ))
             }));
         }
-        Ok(PdfRecognition {
+        Ok(DocumentRecognition {
             markdown: document,
             pages: page_layouts,
         })
     })
 }
 
-/// [`recognize_pdf`] + figure extraction — the `--extract-figures` PDF path. Same
-/// per-page resilience and whole-run abort rules, but each page is recognized WITH
-/// its figure crops. The recognition pass is retryable (first-run model download),
-/// so it does NO file I/O — it only collects each decodable page's number, doc, and
-/// crops; the figures are written ONCE afterward and every page's markdown
-/// references are rewritten to the saved files (page-namespaced so per-page
-/// `images/0.jpg` tokens never collide across pages).
-fn recognize_pdf_with_figures(
+/// [`recognize_document_pages`] + figure extraction — the `--extract-figures`
+/// document path. Same per-page resilience and whole-run abort rules, but each
+/// page is recognized WITH its figure crops. The recognition pass is retryable
+/// (first-run model download), so it does NO file I/O — it only collects each
+/// decodable page's number, doc, and crops; the figures are written ONCE
+/// afterward and every page's markdown references are rewritten to the saved
+/// files (page-namespaced so per-page `images/0.jpg` tokens never collide
+/// across pages).
+fn recognize_document_pages_with_figures(
     engine: &OcrEngine,
     request: &OcrRequest,
+    source: PageSource,
     robot_mode: bool,
     show_progress: bool,
     plan: &FigurePlan,
-) -> FocrResult<(PdfRecognition, Vec<WrittenFigure>)> {
+) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>)> {
     type OkPage = (
         usize,
         native_engine::RecognizedDocument,
         Vec<native_engine::ExtractedFigure>,
     );
-    let pages = pdf::PdfPages::open(&request.image)?;
-    let page_count = pages.len();
+    let opened = std::cell::Cell::new(Some(source));
+    let noun = page_noun(request);
     let ok_pages: Vec<OkPage> = recognize_with_autodownload(request, robot_mode, |model| {
-        let selected = parse_page_spec(request.pages.as_deref(), page_count)?;
-        // Same per-page progress bar as `recognize_pdf` (GH #2): stderr-only,
-        // disabled in robot mode and off-TTY, per-attempt lifetime.
-        let bar = progress::Progress::new("ocr", selected.len(), show_progress);
+        let mut source = attempt_source(&opened, request)?;
+        let page_count = source.source_len();
+        // Same per-page progress bar as `recognize_document_pages` (GH #2):
+        // stderr-only, disabled in robot mode and off-TTY, per-attempt lifetime.
+        // `--split-spreads` is refused with figures, so every item is a page.
+        let bar = progress::Progress::new("ocr", source.len(), show_progress);
         let mut out: Vec<OkPage> = Vec::new();
         let mut first_error: Option<FocrError> = None;
-        for idx in selected {
-            bar.start_item(format!("page {}/{page_count}", idx + 1));
-            let page = pages.render(idx).and_then(|image| match model {
+        for item in source.by_ref() {
+            bar.start_item(format!("page {}/{page_count}", item.source_page));
+            let page = item.raster.and_then(|image| match model {
                 Some(m) => engine.recognize_dynamic_with_figures_model(m, image),
                 None => engine.recognize_dynamic_with_figures(image),
             });
             match page {
-                Ok((doc, figs)) => out.push((idx + 1, doc, figs)),
+                Ok((doc, figs)) => out.push((item.source_page, doc, figs)),
                 Err(
                     e @ (FocrError::ModelNotFound(_)
                     | FocrError::Cancelled
                     | FocrError::FormatMismatch(_)),
                 ) => return Err(e),
                 Err(e) => {
-                    if robot_mode {
-                        emit(&robot::page_skipped_event(idx + 1, &e));
-                    } else {
-                        bar.note(&format!("[focr] PDF page {} skipped: {e}", idx + 1));
-                    }
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                    }
+                    report_skipped_page(robot_mode, &bar, noun, item.source_page, &e);
+                    first_error.get_or_insert(e);
                 }
             }
             bar.complete_item();
@@ -2164,7 +2207,7 @@ fn recognize_pdf_with_figures(
         if out.is_empty() {
             return Err(first_error.unwrap_or_else(|| {
                 FocrError::InputDecode(format!(
-                    "PDF {} produced no decodable pages",
+                    "{} produced no decodable pages",
                     request.image.display()
                 ))
             }));
@@ -2173,24 +2216,25 @@ fn recognize_pdf_with_figures(
     })?;
 
     // Write pass — runs ONCE: write each page's figures and rewrite its markdown,
-    // then concatenate exactly as `recognize_pdf` does (trim_end + blank-line join).
+    // then concatenate exactly as `recognize_document_pages` does (trim_end +
+    // blank-line join).
     let mut writer = plan.writer();
     let mut document = String::new();
-    let mut page_layouts: Vec<PdfPageLayout> = Vec::new();
+    let mut page_layouts: Vec<DocumentPageLayout> = Vec::new();
     for (i, (page_no, doc, figs)) in ok_pages.into_iter().enumerate() {
         let md = writer.process_page(page_no, &doc.markdown, figs)?;
         if i > 0 {
             document.push_str("\n\n");
         }
         document.push_str(md.trim_end());
-        page_layouts.push(PdfPageLayout {
+        page_layouts.push(DocumentPageLayout {
             page: page_no,
             half: None,
             layout: doc.layout,
         });
     }
     Ok((
-        PdfRecognition {
+        DocumentRecognition {
             markdown: document,
             pages: page_layouts,
         },
@@ -2302,6 +2346,9 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             .as_ref()
             .map(native_engine::decode_warnings)
             .unwrap_or_default();
+        let partial = report
+            .as_ref()
+            .and_then(|report| native_engine::partial_output(report, &run_warnings));
         print_run_warnings(&run_warnings);
         if args.json {
             let mut value = serde_json::json!({
@@ -2321,7 +2368,9 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             println!("{markdown}");
             eprintln!("[focr] multi-page: {count} pages in one cross-page pass, {elapsed:.2}s");
         }
-        return Ok(());
+        // The pages are out; a v2 document that stopped early fails with
+        // exit 5 (U2-B6).
+        return partial.map_or(Ok(()), Err);
     }
 
     if native_engine::batch_scheduler::spine_enabled() {
@@ -2760,7 +2809,7 @@ fn model_arch_json(a: &dyn crate::model_arch::ModelArch) -> serde_json::Value {
         "id": a.id(),
         "display_name": a.display_name(),
         "implemented": a.implemented(),
-        "status": if a.implemented() { "ready" } else { "planned" },
+        "status": a.maturity().as_str(),
         "tasks": a.tasks().iter().map(|t| task_name(*t)).collect::<Vec<_>>(),
         "vision_encoder": format!("{:?}", a.vision_encoder()),
         "decoder": format!("{:?}", a.decoder()),
@@ -2844,7 +2893,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "models": models,
             "guidance": {
                 "unlimited-ocr": "default runtime; FAST plain-text OCR; `focr pull` installs the conservative exact-recipe int8 artifact",
-                "unlimited-ocr-2": "planned: Baidu's long-document successor (SR-SWA); its raw checkpoint is identified and census-checked, but this build runs no forward for it — use unlimited-ocr",
+                "unlimited-ocr-2": "experimental: Baidu's long-document successor (SR-SWA); runs from its raw checkpoint (`--model <dir>`) on single pages and on documents of up to 60 pages (`--multi-page`), not yet certified against the reference — use unlimited-ocr for production",
                 "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text; shorthand: `focr ocr --task formula|tables|chart|molecular|geometry|music` (implies `--format`)"
             },
         }));
@@ -2852,7 +2901,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         // TASKS last: its width varies per model (GOT-OCR2 serves seven), so a
         // fixed-width column would misalign — keep it trailing.
         println!(
-            "{:<16}  {:<8}  {:<12}  {:<22}  TASKS",
+            "{:<16}  {:<12}  {:<12}  {:<22}  TASKS",
             "ID", "STATUS", "PULL", "MODEL"
         );
         for a in archs {
@@ -2862,7 +2911,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 .map(|t| task_name(*t))
                 .collect::<Vec<_>>()
                 .join(",");
-            let status = if a.implemented() { "ready" } else { "planned" };
+            let status = a.maturity().as_str();
             let availability = pull_availability(Some(&manifest), a.id());
             let pull = if !availability.compatible.is_empty() {
                 availability
@@ -2879,7 +2928,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
                 "-".to_owned()
             };
             println!(
-                "{:<16}  {:<8}  {:<12}  {:<22}  {}",
+                "{:<16}  {:<12}  {:<12}  {:<22}  {}",
                 a.id(),
                 status,
                 pull,
@@ -3989,33 +4038,29 @@ mod tests {
 
     #[test]
     fn page_spec_parses_and_rejects() {
+        // The `--pages` grammar the CLI hands its page source.
+        let parse = pdf::select_pages;
         // None => every page.
-        assert_eq!(parse_page_spec(None, 3).unwrap(), vec![0, 1, 2]);
-        assert_eq!(parse_page_spec(Some("3"), 218).unwrap(), vec![2]);
+        assert_eq!(parse(None, 3).unwrap(), vec![0, 1, 2]);
+        assert_eq!(parse(Some("3"), 218).unwrap(), vec![2]);
+        assert_eq!(parse(Some("3-7"), 10).unwrap(), vec![2, 3, 4, 5, 6]);
         assert_eq!(
-            parse_page_spec(Some("3-7"), 10).unwrap(),
-            vec![2, 3, 4, 5, 6]
-        );
-        assert_eq!(
-            parse_page_spec(Some("1,5-9,218"), 218).unwrap(),
+            parse(Some("1,5-9,218"), 218).unwrap(),
             vec![0, 4, 5, 6, 7, 8, 217]
         );
         // Overlap/duplicates dedupe; output is source-ordered.
-        assert_eq!(
-            parse_page_spec(Some("5-7,6,1"), 10).unwrap(),
-            vec![0, 4, 5, 6]
-        );
+        assert_eq!(parse(Some("5-7,6,1"), 10).unwrap(), vec![0, 4, 5, 6]);
         // Round-trip property: rendering the indices back as 1-based pages
         // and reparsing is a fixed point.
-        let idx = parse_page_spec(Some("2,4-6"), 9).unwrap();
+        let idx = parse(Some("2,4-6"), 9).unwrap();
         let rendered = idx
             .iter()
             .map(|i| (i + 1).to_string())
             .collect::<Vec<_>>()
             .join(",");
-        assert_eq!(parse_page_spec(Some(&rendered), 9).unwrap(), idx);
+        assert_eq!(parse(Some(&rendered), 9).unwrap(), idx);
         for bad in ["", " ", ",", "0", "abc", "3-2", "1-", "-4", "300"] {
-            let err = parse_page_spec(Some(bad), 218).unwrap_err();
+            let err = parse(Some(bad), 218).unwrap_err();
             assert!(
                 matches!(err, FocrError::Usage(_)),
                 "{bad:?} must be a usage error, got {err:?}"
@@ -4027,12 +4072,55 @@ mod tests {
         }
     }
 
+    /// U2-D0: a first-run download re-runs the recognition attempt, and the
+    /// retry must read the whole selection again from a fresh page source,
+    /// never resume the one the failed attempt consumed.
+    #[test]
+    fn a_retried_attempt_reopens_the_page_source_and_reads_the_same_pages() {
+        let dir = std::env::temp_dir().join(format!("focr_cli_retry_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for (n, width) in [(1u32, 30u32), (2, 40), (3, 50)] {
+            image::RgbImage::from_pixel(width, 60, image::Rgb([200, 100, 50]))
+                .save(dir.join(format!("p{n}.png")))
+                .expect("write page");
+        }
+        let request = ocr_args_with(|a| {
+            a.request.image = dir.clone();
+            a.request.pages = Some("3,1".into());
+        })
+        .to_request()
+        .expect("request");
+        let walk = |source: PageSource| -> Vec<(usize, Vec<u8>)> {
+            source
+                .map(|item| {
+                    let raster = item.raster.expect("page rasterizes");
+                    (item.source_page, raster.as_bytes().to_vec())
+                })
+                .collect()
+        };
+        let expected = walk(open_page_source(&request).expect("open"));
+        assert_eq!(
+            expected.iter().map(|(page, _)| *page).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+
+        let opened = std::cell::Cell::new(Some(open_page_source(&request).expect("open")));
+        // The first attempt reads one page, then fails (a missing model).
+        let mut first = attempt_source(&opened, &request).expect("first attempt");
+        assert_eq!(first.next().map(|item| item.source_page), Some(1));
+        drop(first);
+        // The retry gets a fresh source and reads the same pages.
+        let retry = attempt_source(&opened, &request).expect("retry");
+        assert_eq!(walk(retry), expected);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn pdf_json_carries_per_page_layout_with_one_based_page_numbers() {
-        let rec = Recognition::Pdf(PdfRecognition {
+        let rec = Recognition::Document(DocumentRecognition {
             markdown: "p1\n\np2".to_string(),
             pages: vec![
-                PdfPageLayout {
+                DocumentPageLayout {
                     page: 1,
                     half: None,
                     layout: vec![native_engine::LayoutSpan {
@@ -4040,7 +4128,7 @@ mod tests {
                         boxes: vec![[0, 0, 5, 5]],
                     }],
                 },
-                PdfPageLayout {
+                DocumentPageLayout {
                     page: 2,
                     half: None,
                     layout: vec![],
@@ -4288,15 +4376,20 @@ mod tests {
         assert!(j["license"].as_str().unwrap_or_default().contains("Baidu"));
     }
 
-    /// Every runtime-ready arch has committed distribution provenance and at
-    /// least one exact-recipe pull. Recipe mismatches remain independently
-    /// fail-closed in the distribution layer.
+    /// Every ready arch has committed distribution provenance and at least one
+    /// exact-recipe pull; a planned one is unpublished. An experimental arch
+    /// may run from a local conversion before it is published. Recipe
+    /// mismatches remain independently fail-closed in the distribution layer.
     #[test]
     fn ready_archs_have_honest_committed_pull_status() {
+        use crate::model_arch::Maturity;
         let m = crate::dist::builtin_manifest().expect("embedded manifest parses");
         for a in crate::model_arch::registry() {
             let pull = pull_availability(Some(&m), a.id());
-            if a.implemented() {
+            if a.maturity() == Maturity::Experimental {
+                continue;
+            }
+            if a.maturity() == Maturity::Ready {
                 assert!(
                     pull.in_manifest,
                     "{} is runtime-ready but has no manifest entry — publish its \

@@ -63,7 +63,8 @@ pub const EXIT_CODE_TABLE: &[ExitCodeSpec] = &[
     ExitCodeSpec {
         code: EXIT_TIMEOUT,
         name: "timeout",
-        meaning: "budget or timeout was exceeded",
+        meaning: "a budget, timeout or position limit was exceeded (a document that stopped \
+                  early writes its completed pages first)",
     },
     ExitCodeSpec {
         code: EXIT_CANCELLED,
@@ -82,6 +83,20 @@ pub const EXIT_CODE_TABLE: &[ExitCodeSpec] = &[
                   --fail-on-low-yield was set",
     },
 ];
+
+/// What a run that stopped early wrote before failing (U2-B6): the additive
+/// `finish_reason`, `pages_out` and `warnings` of its robot `run_error`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PartialOutput {
+    /// `length` (the position limit) or `budget` (the stage budget).
+    pub finish_reason: &'static str,
+    /// Page bodies written, the interrupted page's included.
+    pub pages_out: usize,
+    /// The run's warnings, each a `{kind, message, recovery, ...}` object.
+    pub warnings: Vec<serde_json::Value>,
+    /// The human summary.
+    pub message: String,
+}
 
 /// Top-level error. Each variant maps to a stable exit code via
 /// [`FocrError::exit_code`].
@@ -102,6 +117,13 @@ pub enum FocrError {
     /// A per-stage / per-page budget or deadline was exceeded.
     #[error("budget/timeout exceeded: {0}")]
     Timeout(String),
+
+    /// A document run stopped early, at the position limit or its
+    /// cooperative stage budget, after writing the pages it produced (U2-B6).
+    /// Exit 5, like [`FocrError::Timeout`]; the robot `run_error` carries the
+    /// [`PartialOutput`] fields.
+    #[error("budget/timeout exceeded: {}", .0.message)]
+    Partial(Box<PartialOutput>),
 
     /// Cancelled (Ctrl+C / cooperative cancellation).
     #[error("cancelled")]
@@ -134,7 +156,7 @@ impl FocrError {
             FocrError::Usage(_) => EXIT_USAGE,
             FocrError::ModelNotFound(_) => EXIT_MODEL_NOT_FOUND,
             FocrError::InputDecode(_) => EXIT_INPUT_DECODE,
-            FocrError::Timeout(_) => EXIT_TIMEOUT,
+            FocrError::Timeout(_) | FocrError::Partial(_) => EXIT_TIMEOUT,
             FocrError::Cancelled => EXIT_CANCELLED,
             FocrError::FormatMismatch(_) => EXIT_FORMAT_MISMATCH,
             FocrError::LowYield(_) => EXIT_LOW_YIELD,
@@ -166,6 +188,14 @@ impl FocrError {
                 "raise the stage budget with FOCR_STAGE_BUDGET_FORWARD_MS (0 = unlimited), cap \
                  generation with --max-length, or check for memory pressure/swapping"
             }
+            FocrError::Partial(partial) if partial.finish_reason == "budget" => {
+                "the completed pages were written; raise the stage budget with \
+                 FOCR_STAGE_BUDGET_FORWARD_MS (0 = unlimited), or select fewer pages with `--pages`"
+            }
+            FocrError::Partial(_) => {
+                "the completed pages were written; split the document with `--pages`, or parse \
+                 pages independently (omit `--multi-page`)"
+            }
             FocrError::Cancelled => {
                 "the run was interrupted (Ctrl+C / cooperative shutdown); re-run to continue"
             }
@@ -196,7 +226,7 @@ impl FocrError {
             FocrError::Usage(_) => "usage",
             FocrError::ModelNotFound(_) => "model_not_found",
             FocrError::InputDecode(_) => "input_decode",
-            FocrError::Timeout(_) => "timeout",
+            FocrError::Timeout(_) | FocrError::Partial(_) => "timeout",
             FocrError::Cancelled => "cancelled",
             FocrError::FormatMismatch(_) => "format_mismatch",
             FocrError::LowYield(_) => "low_yield",
@@ -223,6 +253,14 @@ mod tests {
             EXIT_INPUT_DECODE
         );
         assert_eq!(FocrError::Timeout("x".into()).exit_code(), EXIT_TIMEOUT);
+        let partial = FocrError::Partial(Box::new(PartialOutput {
+            finish_reason: "length",
+            pages_out: 2,
+            warnings: Vec::new(),
+            message: "x".into(),
+        }));
+        assert_eq!(partial.exit_code(), EXIT_TIMEOUT);
+        assert_eq!(partial.kind(), "timeout");
         assert_eq!(FocrError::Cancelled.exit_code(), EXIT_CANCELLED);
         assert_eq!(
             FocrError::FormatMismatch("x".into()).exit_code(),

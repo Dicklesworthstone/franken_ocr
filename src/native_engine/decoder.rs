@@ -743,7 +743,7 @@ pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
     // RoPE table shared across all 12 layers.
     let positions: Vec<usize> = (0..seq).collect();
     let rope = RopeTable::build(&positions, config::HEAD_DIM, config::ROPE_THETA);
-    forward_layers(weights, inputs_embeds, &rope, |_, _, q, k, v| {
+    forward_layers(weights, inputs_embeds, &rope, |_, _, _, q, k, v| {
         prefill_attention(q, k, v, config::NUM_ATTENTION_HEADS, config::HEAD_DIM)
     })
 }
@@ -752,8 +752,8 @@ pub fn forward(weights: &Weights, inputs_embeds: &Mat) -> FocrResult<Mat> {
 /// from `coords` and SR-SWA attention routed by each layer's Token Sieve
 /// router, whose weights are read from `weights` per layer like the rest.
 /// `coords` describes the rows of `inputs_embeds` in an unwindowed run (page
-/// base 0). This is the stateless all-f32 path of the f32 oracle rungs
-/// (U2-C1/C2).
+/// base 0); `domain` is the router's entmax (D21). This is the stateless
+/// all-f32 path of the f32 oracle rungs (U2-C1/C2).
 ///
 /// # Errors
 /// As [`forward`], or if `coords` does not describe one row per embedding.
@@ -761,26 +761,77 @@ pub fn forward_srswa(
     weights: &Weights,
     inputs_embeds: &Mat,
     coords: &srswa::PageCoords,
+    domain: srswa::EntmaxDomain,
 ) -> FocrResult<Mat> {
+    forward_srswa_observed(weights, inputs_embeds, coords, domain, |_| {})
+}
+
+/// One layer of [`forward_srswa_observed`], borrowed from the forward: what
+/// U2-C1's parity rungs compare with the f32 oracle's per-layer dumps.
+#[derive(Debug, Clone, Copy)]
+pub struct SrSwaLayerTrace<'a> {
+    /// The decoder layer.
+    pub layer: usize,
+    /// The layer's input, `[seq, hidden]`; layer 0's is `inputs_embeds`.
+    pub hidden_in: &'a Mat,
+    /// The router's index queries, `[seq, HEAD_DIM]`, post-norm, post-RoPE.
+    pub iq: &'a Mat,
+    /// The router's index keys, `[seq, HEAD_DIM]`, post-norm, post-RoPE.
+    pub ik: &'a Mat,
+    /// Each row's remote blocks and biases, as the attention read them.
+    pub selections: &'a [srswa::BlockSelection],
+    /// The attention context, `o_proj`'s input, `[seq, heads × head_dim]`.
+    pub context: &'a Mat,
+}
+
+/// [`forward_srswa`], handing each layer's [`SrSwaLayerTrace`] to `observe`
+/// once the layer's attention has run. The trace only borrows values the
+/// forward computes anyway, so a no-op `observe` (which [`forward_srswa`]
+/// passes) adds no work.
+///
+/// # Errors
+/// As [`forward_srswa`].
+pub fn forward_srswa_observed<O>(
+    weights: &Weights,
+    inputs_embeds: &Mat,
+    coords: &srswa::PageCoords,
+    domain: srswa::EntmaxDomain,
+    mut observe: O,
+) -> FocrResult<Mat>
+where
+    O: FnMut(SrSwaLayerTrace<'_>),
+{
     check_embeds("decoder::forward_srswa", inputs_embeds)?;
     check_coords("decoder::forward_srswa", inputs_embeds, coords)?;
     let rope = coords.rope_table(0);
     let positions: Vec<usize> = (0..inputs_embeds.rows).collect();
     let params = srswa::RouterParams::uocr2();
     let dense = srswa::dense_enabled();
-    forward_layers(weights, inputs_embeds, &rope, |layer, normed, q, k, v| {
-        let w = srswa::SrSwaLayerWeights::load(weights, layer)?;
-        let (sel, _) = srswa::prefill_selections(
-            normed,
-            &w,
-            &rope,
-            coords,
-            &params,
-            srswa::EntmaxDomain::TopM,
-        )?;
-        let kv = srswa::HeadMajorKv::from_rows(k, v)?;
-        srswa::attend_with(q, &positions, &sel, &kv, dense)
-    })
+    forward_layers(
+        weights,
+        inputs_embeds,
+        &rope,
+        |layer, hidden_in, normed, q, k, v| {
+            let w = srswa::SrSwaLayerWeights::load(weights, layer)?;
+            let (iq, ik) = srswa::project(normed, &w, &rope)?;
+            let selections: Vec<srswa::BlockSelection> =
+                srswa::prefill_routes(&iq, &ik, coords, &w.head_cls, &params, domain)?
+                    .into_iter()
+                    .map(srswa::BlockSelection::from)
+                    .collect();
+            let kv = srswa::HeadMajorKv::from_rows(k, v)?;
+            let context = srswa::attend_with(q, &positions, &selections, &kv, dense)?;
+            observe(SrSwaLayerTrace {
+                layer,
+                hidden_in,
+                iq: &iq,
+                ik: &ik,
+                selections: &selections,
+                context: &context,
+            });
+            Ok(context)
+        },
+    )
 }
 
 /// `inputs_embeds` is a well-formed `[seq, hidden]` matrix.
@@ -809,8 +860,9 @@ fn check_coords(context: &str, inputs_embeds: &Mat, coords: &srswa::PageCoords) 
 }
 
 /// The 12 decoder layers of the stateless [`forward`] over `inputs_embeds`
-/// with RoPE table `rope`. `attend(layer, normed, q, k, v)` is the layer's
-/// attention ([`layer_forward`]'s `attn_context`).
+/// with RoPE table `rope`. `attend(layer, hidden_in, normed, q, k, v)` is the
+/// layer's attention ([`layer_forward`]'s `attn_context`); `hidden_in` is the
+/// layer's input, which only an observer reads.
 fn forward_layers<A>(
     weights: &Weights,
     inputs_embeds: &Mat,
@@ -818,7 +870,7 @@ fn forward_layers<A>(
     mut attend: A,
 ) -> FocrResult<Mat>
 where
-    A: FnMut(usize, &Mat, &Mat, &Mat, &Mat) -> FocrResult<Mat>,
+    A: FnMut(usize, &Mat, &Mat, &Mat, &Mat, &Mat) -> FocrResult<Mat>,
 {
     let hidden = config::HIDDEN_SIZE;
     let qkv_dim = checked_shape_mul(
@@ -860,7 +912,7 @@ where
             hidden,
             qkv_dim,
             eps,
-            |normed, q, k, v| attend(layer, normed, q, k, v),
+            |normed, q, k, v| attend(layer, &x, normed, q, k, v),
             |normed| {
                 if layer < config::FIRST_K_DENSE_REPLACE {
                     moe::dense_forward(weights, normed)
@@ -947,6 +999,25 @@ impl DecoderWeightCache {
     /// # Errors
     /// [`FocrError::FormatMismatch`] if any expected tensor is absent/mis-shaped.
     pub fn build(weights: &Weights) -> FocrResult<Self> {
+        Self::build_with(weights, quant_ffn_loaded)
+    }
+
+    /// The all-f32 cache: [`Self::build`] with the FFN/expert projections
+    /// widened to f32 instead of quantized. Its prefill and decode are the
+    /// stateless forward's math with the KV kept, so a document decodes in
+    /// linear time at f32 precision (the parity path of U2-C2).
+    ///
+    /// # Errors
+    /// As [`Self::build`], or [`FocrError::FormatMismatch`] for a quantized
+    /// artifact ([`f32_ffn_loaded`]).
+    pub fn build_f32(weights: &Weights) -> FocrResult<Self> {
+        Self::build_with(weights, f32_ffn_loaded)
+    }
+
+    fn build_with(
+        weights: &Weights,
+        ffn: fn(&Weights, &str, usize) -> FocrResult<QLinear>,
+    ) -> FocrResult<Self> {
         let mut layers = Vec::with_capacity(config::NUM_HIDDEN_LAYERS);
         for layer in 0..config::NUM_HIDDEN_LAYERS {
             let prefix = format!("model.layers.{layer}");
@@ -964,16 +1035,17 @@ impl DecoderWeightCache {
             let o_proj = weights
                 .mat(&format!("{prefix}.self_attn.o_proj.weight"))?
                 .data;
-            // FFN/expert projections go through `quant_ffn_loaded`: qint8 (or
-            // bf16 quantized at load) exactly as before, or PACKED int4 kept
-            // packed when the wasm experts-int4 artifact provides it (bd-4l71).
+            // FFN/expert projections go through `ffn`: `quant_ffn_loaded`
+            // keeps qint8 (or quantizes bf16 at load) exactly as before, or
+            // keeps PACKED int4 packed when the wasm experts-int4 artifact
+            // provides it (bd-4l71); `f32_ffn_loaded` widens them to f32.
             let mlp = if layer < config::FIRST_K_DENSE_REPLACE {
                 let p = format!("{prefix}.mlp");
                 let inter = moe::config::DENSE_INTERMEDIATE_SIZE;
                 CachedMlpI8::Dense {
-                    gate: quant_ffn_loaded(weights, &format!("{p}.gate_proj.weight"), inter)?,
-                    up: quant_ffn_loaded(weights, &format!("{p}.up_proj.weight"), inter)?,
-                    down: quant_ffn_loaded(
+                    gate: ffn(weights, &format!("{p}.gate_proj.weight"), inter)?,
+                    up: ffn(weights, &format!("{p}.up_proj.weight"), inter)?,
+                    down: ffn(
                         weights,
                         &format!("{p}.down_proj.weight"),
                         config::HIDDEN_SIZE,
@@ -986,17 +1058,9 @@ impl DecoderWeightCache {
                 let mut experts = Vec::with_capacity(moe::config::N_ROUTED_EXPERTS);
                 for e in 0..moe::config::N_ROUTED_EXPERTS {
                     experts.push([
-                        quant_ffn_loaded(
-                            weights,
-                            &format!("{p}.experts.{e}.gate_proj.weight"),
-                            inter,
-                        )?,
-                        quant_ffn_loaded(
-                            weights,
-                            &format!("{p}.experts.{e}.up_proj.weight"),
-                            inter,
-                        )?,
-                        quant_ffn_loaded(
+                        ffn(weights, &format!("{p}.experts.{e}.gate_proj.weight"), inter)?,
+                        ffn(weights, &format!("{p}.experts.{e}.up_proj.weight"), inter)?,
+                        ffn(
                             weights,
                             &format!("{p}.experts.{e}.down_proj.weight"),
                             config::HIDDEN_SIZE,
@@ -1005,17 +1069,17 @@ impl DecoderWeightCache {
                 }
                 let shared_inter = moe::config::SHARED_INTERMEDIATE_SIZE;
                 let shared = [
-                    quant_ffn_loaded(
+                    ffn(
                         weights,
                         &format!("{p}.shared_experts.gate_proj.weight"),
                         shared_inter,
                     )?,
-                    quant_ffn_loaded(
+                    ffn(
                         weights,
                         &format!("{p}.shared_experts.up_proj.weight"),
                         shared_inter,
                     )?,
-                    quant_ffn_loaded(
+                    ffn(
                         weights,
                         &format!("{p}.shared_experts.down_proj.weight"),
                         config::HIDDEN_SIZE,
@@ -1053,9 +1117,20 @@ impl DecoderWeightCache {
     /// # Errors
     /// As [`Self::build`], or if a router tensor is absent or mis-shaped.
     pub fn build_srswa(weights: &Weights) -> FocrResult<Self> {
-        let mut cache = Self::build(weights)?;
-        cache.router = Some(srswa::SrSwaLayerWeights::load_all(weights)?);
-        Ok(cache)
+        Self::build(weights)?.with_router(weights)
+    }
+
+    /// [`Self::build_f32`] plus the router: Unlimited-OCR-2's all-f32 cache.
+    ///
+    /// # Errors
+    /// As [`Self::build_f32`] and [`Self::build_srswa`].
+    pub fn build_srswa_f32(weights: &Weights) -> FocrResult<Self> {
+        Self::build_f32(weights)?.with_router(weights)
+    }
+
+    fn with_router(mut self, weights: &Weights) -> FocrResult<Self> {
+        self.router = Some(srswa::SrSwaLayerWeights::load_all(weights)?);
+        Ok(self)
     }
 
     /// The router weights, for a cache built by [`Self::build_srswa`].
@@ -1238,6 +1313,65 @@ pub fn lm_head_cached(wc: &DecoderWeightCache, hidden: &Mat) -> FocrResult<Mat> 
         prof::add(&prof::LMHEAD_NS, t.elapsed().as_nanos() as u64);
     }
     Ok(Mat::from_vec(1, config::VOCAB_SIZE, logits))
+}
+
+/// One side of a decode step for [`decode_trace_diff`]: its raw `lm_head`
+/// logits and, when known, each layer's selected remote blocks.
+#[derive(Debug, Clone, Copy)]
+pub struct StepSide<'a> {
+    /// Names the side in the report.
+    pub label: &'a str,
+    /// The step's `[vocab]` logits.
+    pub logits: &'a [f32],
+    /// Per layer, the selected blocks, ascending; an empty slice when unknown
+    /// (an empty layer entry means the row read no remote block).
+    pub routes: &'a [Vec<u32>],
+}
+
+/// U2-C2's decode-trace diff, for the first token mismatch of a parity run:
+/// the step, its page and how far into the page it is, each side's top-5
+/// logits, and every layer's routing on both sides, layers whose selections
+/// differ marked `≠`.
+#[must_use]
+pub fn decode_trace_diff(
+    step: usize,
+    page: usize,
+    page_len: usize,
+    a: StepSide<'_>,
+    b: StepSide<'_>,
+) -> String {
+    use std::fmt::Write as _;
+    let top5 = |logits: &[f32]| {
+        let mut ids: Vec<usize> = (0..logits.len()).collect();
+        ids.sort_unstable_by(|&i, &j| logits[j].total_cmp(&logits[i]).then(i.cmp(&j)));
+        ids.truncate(5);
+        ids.iter()
+            .map(|&i| format!("{i}:{:.4}", logits[i]))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut out = format!("decode step {step} (page {page}, {page_len} ids into it)\n");
+    for side in [a, b] {
+        let _ = writeln!(out, "  top-5 {}: {}", side.label, top5(side.logits));
+    }
+    for layer in 0..a.routes.len().max(b.routes.len()) {
+        let (ra, rb) = (a.routes.get(layer), b.routes.get(layer));
+        let mark = if ra.is_some() && rb.is_some() && ra != rb {
+            "≠"
+        } else {
+            " "
+        };
+        let show = |r: Option<&Vec<u32>>| r.map_or_else(|| "?".to_string(), |r| format!("{r:?}"));
+        let _ = writeln!(
+            out,
+            "  {mark} L{layer:02} {}: {}  {}: {}",
+            a.label,
+            show(ra),
+            b.label,
+            show(rb)
+        );
+    }
+    out
 }
 
 // ── Chunked prefill (FOCR_PREFILL_CHUNK, bd-1azu.9) ──────────────────────────
@@ -1527,7 +1661,8 @@ pub fn prefill_with_cache_chunked(
 /// every prompt row from an empty cache, stores the rows' K, V and index
 /// keys, and attends through that cache. Returns the final hidden `[seq,
 /// hidden]` and the state [`decode_step_with_cache_srswa`] continues from.
-/// `coords` describes the prompt rows of an unwindowed run (page base 0).
+/// `coords` describes the prompt rows of an unwindowed run (page base 0);
+/// `domain` is the router's entmax (D21) for the prefill and every step.
 ///
 /// # Errors
 /// As [`prefill_with_cache`]; if `wc` holds no router ([`DecoderWeightCache::
@@ -1537,6 +1672,33 @@ pub fn prefill_with_cache_srswa(
     wc: &DecoderWeightCache,
     inputs_embeds: &Mat,
     coords: &srswa::PageCoords,
+    domain: srswa::EntmaxDomain,
+) -> FocrResult<(Mat, srswa::SrSwaState)> {
+    prefill_srswa(wc, inputs_embeds, coords, domain, None)
+}
+
+/// [`prefill_with_cache_srswa`] with the state's routing trace
+/// ([`srswa::SrSwaTrace`]) on from the prefill through every decode step:
+/// U2-C2's routing rungs, re-prefill relation and trace diff read it.
+///
+/// # Errors
+/// As [`prefill_with_cache_srswa`].
+pub fn prefill_with_cache_srswa_traced(
+    wc: &DecoderWeightCache,
+    inputs_embeds: &Mat,
+    coords: &srswa::PageCoords,
+    domain: srswa::EntmaxDomain,
+) -> FocrResult<(Mat, srswa::SrSwaState)> {
+    let trace = srswa::SrSwaTrace::new(config::NUM_HIDDEN_LAYERS);
+    prefill_srswa(wc, inputs_embeds, coords, domain, Some(trace))
+}
+
+fn prefill_srswa(
+    wc: &DecoderWeightCache,
+    inputs_embeds: &Mat,
+    coords: &srswa::PageCoords,
+    domain: srswa::EntmaxDomain,
+    trace: Option<srswa::SrSwaTrace>,
 ) -> FocrResult<(Mat, srswa::SrSwaState)> {
     if prefill_chunk_size().is_some() {
         return Err(FocrError::Usage(format!(
@@ -1548,6 +1710,8 @@ pub fn prefill_with_cache_srswa(
     check_coords("decoder::prefill_with_cache_srswa", inputs_embeds, coords)?;
     let router = wc.router()?;
     let mut state = srswa::SrSwaState::new(router, coords, 0)?;
+    state.domain = domain;
+    state.trace = trace;
     let rope = coords.rope_table(0);
     let x = prefill_layers(wc, inputs_embeds, &rope, |layer, normed, q, k, v| {
         let rows = srswa::LayerRows { normed, q, k, v };
@@ -1654,16 +1818,19 @@ pub fn decode_step_with_cache(
 /// (whose embedding is `token_embed`) through the page state for its page2d
 /// RoPE and query page, then runs each layer's SR-SWA decode attention
 /// ([`srswa::SrSwaState::decode_layer`]) over the caches that
-/// [`prefill_with_cache_srswa`] seeded.
+/// [`prefill_with_cache_srswa`] seeded. `forced_step` says the page-count
+/// guard forces the token this row predicts ([`srswa::DecodeStep::forced`]).
 ///
 /// # Errors
 /// As [`decode_step_with_cache`], or if `wc` holds no router or `state` has
-/// the wrong layer count.
+/// the wrong layer count; [`srswa::retire_fallback`] recovers the retirement
+/// detector's event.
 pub fn decode_step_with_cache_srswa(
     wc: &DecoderWeightCache,
     state: &mut srswa::SrSwaState,
     token_id: u32,
     token_embed: &Mat,
+    forced_step: bool,
 ) -> FocrResult<Mat> {
     check_token_embed("decoder::decode_step_with_cache_srswa", token_embed)?;
     let router = wc.router()?;
@@ -1674,7 +1841,8 @@ pub fn decode_step_with_cache_srswa(
             config::NUM_HIDDEN_LAYERS
         )));
     }
-    let step = state.feed(token_id);
+    let mut step = state.feed(token_id);
+    step.forced = forced_step;
     decode_layers(wc, token_embed, &step.rope, |layer, normed, q, k, v| {
         let rows = srswa::LayerRows { normed, q, k, v };
         state.decode_layer(layer, &router[layer], rows, &step)
@@ -2029,9 +2197,10 @@ fn gemv_i8_serial(xq: &[i8], a_scale: f32, qw: &QInt8) -> Vec<f32> {
     y
 }
 
-/// One SwiGLU expert, fully SERIAL (the input is quantized ONCE and reused for
-/// gate+up). The serial twin of [`expert_gemv_i8`] for cross-expert
-/// parallelism; dispatches per-tensor between the int8 and packed-int4 arms.
+/// One SwiGLU expert, fully SERIAL (a quantized arm quantizes the input ONCE
+/// for gate+up). The serial twin of [`expert_gemv_i8`] for cross-expert
+/// parallelism; dispatches per-tensor between the int8, packed-int4 and f32
+/// arms.
 fn expert_gemv_i8_serial(
     x: &[f32],
     gate: &QLinear,
@@ -2042,9 +2211,9 @@ fn expert_gemv_i8_serial(
     if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
         calib::record_row(&quant_calib::ffn_in_key(layer, unit), x);
     }
-    let (xq, a_scale) = quantize_row_i8(x);
-    let g = gemv_q_serial(&xq, a_scale, gate);
-    let u = gemv_q_serial(&xq, a_scale, up);
+    let input = ActRow::new(x);
+    let g = gemv_q_serial(&input, gate);
+    let u = gemv_q_serial(&input, up);
     let inter = gate.n();
     let mut act = vec![0.0f32; inter];
     for i in 0..inter {
@@ -2053,8 +2222,7 @@ fn expert_gemv_i8_serial(
     if let Some((layer, unit)) = calib.filter(|_| calib::enabled()) {
         calib::record_row(&quant_calib::down_in_key(layer, unit), &act);
     }
-    let (aq, a_scale2) = quantize_row_i8(&act);
-    gemv_q_serial(&aq, a_scale2, down)
+    gemv_q_serial(&ActRow::new(&act), down)
 }
 
 /// Quantize an exact `[out, in_]` row-major f32 weight to per-output-channel
@@ -2133,11 +2301,12 @@ pub(crate) fn quant_oc_loaded(weights: &Weights, name: &str, out: usize) -> Focr
 // contract. Conservative artifacts (qint8 or bf16 FFN tensors) take the
 // existing [`QInt8`] arm byte-for-byte unchanged.
 
-/// A quantized decoder FFN/expert GEMM weight: per-output-channel int8 (the
-/// conservative recipe / quantize-at-load path) or per-group PACKED int4 (the
-/// wasm experts-int4 artifact). The MLP caches hold this so the same
-/// prefill/decode drivers consume both storages; which arm a tensor takes is
-/// decided once at cache build by [`quant_ffn_loaded`].
+/// A decoder FFN/expert GEMM weight: per-output-channel int8 (the
+/// conservative recipe / quantize-at-load path), per-group PACKED int4 (the
+/// wasm experts-int4 artifact), or unquantized f32 (the all-f32 parity cache,
+/// [`DecoderWeightCache::build_f32`]). The MLP caches hold this so the same
+/// prefill/decode drivers consume every storage; which arm a tensor takes is
+/// decided once at cache build by [`quant_ffn_loaded`] or [`f32_ffn_loaded`].
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum QLinear {
     /// Per-output-channel symmetric int8 (`[n, k]` + `n` scales).
@@ -2145,6 +2314,10 @@ pub(crate) enum QLinear {
     /// Group-quantized packed int4 (`[n, k/2]` nibbles + `n*(k/group)` scales),
     /// consumed packed by [`simd::int4::igemm_s4s8_packed`].
     I4(QInt4),
+    /// Unquantized f32, stored transposed once as `[k, n]`: the operand
+    /// [`nn::matmul`] takes, so `x · wt` is [`moe`]'s `linear_no_bias` (the
+    /// stateless forward's FFN) without its per-call transpose.
+    F32(Mat),
 }
 
 impl QLinear {
@@ -2153,6 +2326,7 @@ impl QLinear {
         match self {
             QLinear::I8(q) => q.n,
             QLinear::I4(q) => q.n,
+            QLinear::F32(wt) => wt.cols,
         }
     }
 
@@ -2163,8 +2337,59 @@ impl QLinear {
         match self {
             QLinear::I8(q) => q.k,
             QLinear::I4(q) => q.k,
+            QLinear::F32(wt) => wt.rows,
         }
     }
+}
+
+/// Resolve a decoder FFN/expert tensor `name` to the unquantized
+/// [`QLinear::F32`] arm: widened to f32 and transposed once.
+///
+/// # Errors
+/// [`FocrError::FormatMismatch`] if `name` is absent, mis-shaped, its
+/// output-row count disagrees with `out`, or it is stored quantized. f32 math
+/// over int8 or int4 weights would be neither the shipping path nor the
+/// reference, so a quantized artifact is refused rather than widened.
+pub(crate) fn f32_ffn_loaded(weights: &Weights, name: &str, out: usize) -> FocrResult<QLinear> {
+    let record = weights.record(name).ok_or_else(|| {
+        FocrError::FormatMismatch(format!("tensor {name:?} not found in weights directory"))
+    })?;
+    if !matches!(record.dtype, DType::F32 | DType::F16 | DType::BF16) {
+        return Err(FocrError::FormatMismatch(format!(
+            "the all-f32 decoder needs the checkpoint's own FFN weights, but {name:?} is \
+             stored as {:?}; load the raw checkpoint instead of a quantized artifact",
+            record.dtype
+        )));
+    }
+    let [rows, in_] = record.shape.as_slice() else {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has rank {}; expected 2 ([out, in])",
+            record.shape.len()
+        )));
+    };
+    if *rows != out {
+        return Err(FocrError::FormatMismatch(format!(
+            "tensor {name:?} has {rows} output rows; expected {out}"
+        )));
+    }
+    let w = weights.mat(name)?;
+    let in_ = *in_;
+    let mut wt = vec![0.0f32; w.data.len()];
+    for i in 0..in_ {
+        for (o, slot) in wt[i * out..(i + 1) * out].iter_mut().enumerate() {
+            *slot = w.data[o * in_ + i];
+        }
+    }
+    Ok(QLinear::F32(Mat::from_vec(in_, out, wt)))
+}
+
+/// `x · wt` for an f32 arm: one activation row (`[1, k]`) through
+/// [`nn::matmul`].
+fn gemv_f32(x: &[f32], wt: &Mat) -> Vec<f32> {
+    let row = Mat::from_vec(1, x.len(), x.to_vec());
+    nn::matmul(&row, wt)
+        .expect("an f32 cache weight's contraction width is the activation's")
+        .data
 }
 
 /// Resolve a decoder FFN/expert tensor `name` to a [`QLinear`]:
@@ -2257,20 +2482,49 @@ fn gemv_i4_serial(xq: &[i8], a_scale: f32, q: &QInt4) -> Vec<f32> {
 
 /// Storage-dispatching m=1 GEMV over a [`QLinear`] (fresh activation quantize):
 /// the int8 arm is exactly [`gemv_i8`], the int4 arm consumes packed nibbles
-/// via [`gemv_i4`].
+/// via [`gemv_i4`], and the f32 arm is [`gemv_f32`].
 fn gemv_q(x: &[f32], w: &QLinear) -> Vec<f32> {
     match w {
         QLinear::I8(q) => gemv_i8(x, q),
         QLinear::I4(q) => gemv_i4(x, q),
+        QLinear::F32(wt) => gemv_f32(x, wt),
     }
 }
 
-/// Storage-dispatching SERIAL m=1 GEMV from a pre-quantized activation row —
-/// the [`QLinear`] twin of [`gemv_i8_serial`] / [`gemv_i4_serial`].
-fn gemv_q_serial(xq: &[i8], a_scale: f32, w: &QLinear) -> Vec<f32> {
+/// One activation row for several SERIAL GEMVs: the quantized arms share one
+/// int8 quantize of it, made on first use, and the f32 arm reads it as is.
+struct ActRow<'a> {
+    x: &'a [f32],
+    quantized: std::cell::OnceCell<(Vec<i8>, f32)>,
+}
+
+impl<'a> ActRow<'a> {
+    fn new(x: &'a [f32]) -> Self {
+        Self {
+            x,
+            quantized: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn quantized(&self) -> (&[i8], f32) {
+        let (xq, a_scale) = self.quantized.get_or_init(|| quantize_row_i8(self.x));
+        (xq, *a_scale)
+    }
+}
+
+/// Storage-dispatching SERIAL m=1 GEMV — the [`QLinear`] twin of
+/// [`gemv_i8_serial`] / [`gemv_i4_serial`]; the f32 arm is [`gemv_f32`].
+fn gemv_q_serial(act: &ActRow<'_>, w: &QLinear) -> Vec<f32> {
     match w {
-        QLinear::I8(q) => gemv_i8_serial(xq, a_scale, q),
-        QLinear::I4(q) => gemv_i4_serial(xq, a_scale, q),
+        QLinear::I8(q) => {
+            let (xq, a_scale) = act.quantized();
+            gemv_i8_serial(xq, a_scale, q)
+        }
+        QLinear::I4(q) => {
+            let (xq, a_scale) = act.quantized();
+            gemv_i4_serial(xq, a_scale, q)
+        }
+        QLinear::F32(wt) => gemv_f32(act.x, wt),
     }
 }
 
@@ -2316,14 +2570,16 @@ fn linear_int4_dynamic(x: &Mat, q: &QInt4) -> FocrResult<Mat> {
 
 /// Storage-dispatching prefill linear over a [`QLinear`]: the int8 arm is
 /// exactly [`nn::linear_int8_dynamic`] (no bias — the decoder FFN projections
-/// carry none), the int4 arm is [`linear_int4_dynamic`].
+/// carry none), the int4 arm is [`linear_int4_dynamic`], and the f32 arm is
+/// [`nn::matmul`] over the transposed weight.
 ///
 /// # Errors
-/// Shape mismatches from either arm.
+/// Shape mismatches from any arm.
 fn linear_q_dynamic(x: &Mat, w: &QLinear) -> FocrResult<Mat> {
     match w {
         QLinear::I8(q) => nn::linear_int8_dynamic(x, q, None),
         QLinear::I4(q) => linear_int4_dynamic(x, q),
+        QLinear::F32(wt) => nn::matmul(x, wt),
     }
 }
 
@@ -4454,6 +4710,98 @@ mod tests {
         );
     }
 
+    /// The all-f32 arm (U2-C2): [`f32_ffn_loaded`] widens and transposes a
+    /// checkpoint tensor, refuses a quantized one, and an expert over it
+    /// computes BIT-EXACTLY [`moe::expert_mlp`], the stateless forward's f32
+    /// MLP, through the prefill driver, the decode GEMV and the serial GEMV.
+    #[test]
+    fn f32_ffn_arm_is_the_stateless_expert_bit_for_bit() {
+        let (hidden, inter) = (48usize, 40usize);
+        let weight = |rows: usize, cols: usize, seed: f32| -> Vec<f32> {
+            (0..rows * cols)
+                .map(|i| ((i as f32 + seed) * 0.37).sin() * 0.2)
+                .collect()
+        };
+        let (gate_w, up_w, down_w) = (
+            weight(inter, hidden, 1.0),
+            weight(inter, hidden, 2.0),
+            weight(hidden, inter, 3.0),
+        );
+        let le = |values: &[f32]| values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut builder = quant_oc_fixture_builder();
+        for (name, rows, cols, values) in [
+            ("gate", inter, hidden, &gate_w),
+            ("up", inter, hidden, &up_w),
+            ("down", hidden, inter, &down_w),
+        ] {
+            builder
+                .add_tensor(
+                    name,
+                    crate::quant::focrq::WriteDType::F32,
+                    vec![rows, cols],
+                    le(values),
+                )
+                .expect("valid synthetic F32 matrix");
+        }
+        builder
+            .add_quantized(
+                "w8",
+                crate::quant::focrq::WriteDType::QInt8PerChan,
+                vec![3, 2],
+                vec![0; 6],
+                vec![0; 3 * std::mem::size_of::<f32>()],
+                0,
+                0,
+            )
+            .expect("valid synthetic QInt8 record");
+        let weights = Weights::from_bytes(builder.build()).expect("synthetic artifact loads");
+
+        let gate = f32_ffn_loaded(&weights, "gate", inter).expect("gate loads");
+        let up = f32_ffn_loaded(&weights, "up", inter).expect("up loads");
+        let down = f32_ffn_loaded(&weights, "down", hidden).expect("down loads");
+        assert_eq!((gate.n(), gate.k()), (inter, hidden));
+        let QLinear::F32(wt) = &gate else {
+            panic!("an F32 record must take the f32 arm");
+        };
+        assert_eq!(
+            wt.data[3 * inter + 5],
+            gate_w[5 * hidden + 3],
+            "stored [k, n]"
+        );
+
+        let err = f32_ffn_loaded(&weights, "w8", 3).expect_err("a quantized tensor is refused");
+        assert!(
+            format!("{err}").contains("load the raw checkpoint"),
+            "{err}"
+        );
+        let err = f32_ffn_loaded(&weights, "gate", inter + 1).expect_err("row mismatch fails");
+        assert!(format!("{err}").contains("output rows; expected"), "{err}");
+
+        let reference = moe::MlpWeights {
+            gate_proj: &gate_w,
+            up_proj: &up_w,
+            down_proj: &down_w,
+            hidden,
+            intermediate: inter,
+        };
+        let bits = |values: &[f32]| values.iter().map(|f| f.to_bits()).collect::<Vec<u32>>();
+        let rows = Mat::from_vec(
+            3,
+            hidden,
+            (0..3 * hidden).map(|i| (i as f32 * 0.29).cos()).collect(),
+        );
+        let want = moe::expert_mlp(&rows, &reference).expect("f32 reference runs");
+        let got = expert_mlp_q(&rows, &gate, &up, &down, None).expect("f32 prefill runs");
+        assert_eq!(bits(&got.data), bits(&want.data), "prefill driver");
+
+        let row = Mat::from_vec(1, hidden, rows.row(1).to_vec());
+        let want = moe::expert_mlp(&row, &reference).expect("f32 reference runs");
+        let decode = expert_gemv_i8(row.row(0), &gate, &up, &down, None);
+        assert_eq!(bits(&decode), bits(&want.data), "decode GEMV");
+        let serial = expert_gemv_i8_serial(row.row(0), &gate, &up, &down, None);
+        assert_eq!(bits(&serial), bits(&want.data), "serial GEMV");
+    }
+
     /// Decoder-level plumbing over a synthetic [`Weights`]: a dense
     /// [`CachedMlpI8`] built from artifact int4 tensors decodes BIT-EXACTLY to
     /// the same expert computed over directly constructed packed weights.
@@ -5567,7 +5915,7 @@ mod tests {
         let embeds = Mat::zeros(ids.len(), config::HIDDEN_SIZE);
         let short = Mat::zeros(ids.len() - 1, config::HIDDEN_SIZE);
         let refused = |input: &Mat, want: &str| {
-            let error = prefill_with_cache_srswa(&v1, input, &coords)
+            let error = prefill_with_cache_srswa(&v1, input, &coords, srswa::EntmaxDomain::TopM)
                 .expect_err("refused")
                 .to_string();
             assert!(error.contains(want), "{error}");
@@ -5576,7 +5924,8 @@ mod tests {
         refused(&embeds, "no SR-SWA router");
         refused(&Mat::zeros(ids.len(), 8), "!= hidden");
         let w = Weights::default();
-        let stateless = forward_srswa(&w, &short, &coords).expect_err("refused");
+        let stateless =
+            forward_srswa(&w, &short, &coords, srswa::EntmaxDomain::TopM).expect_err("refused");
         assert!(
             stateless.to_string().contains("page coordinates"),
             "{stateless}"
@@ -5584,7 +5933,7 @@ mod tests {
         // Stateless reads its weights per layer: a missing tensor is a clean
         // FormatMismatch.
         assert!(matches!(
-            forward_srswa(&w, &embeds, &coords),
+            forward_srswa(&w, &embeds, &coords, srswa::EntmaxDomain::TopM),
             Err(FocrError::FormatMismatch(_))
         ));
         assert!(v1.router().is_err());

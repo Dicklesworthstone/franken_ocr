@@ -500,8 +500,22 @@ pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
     // The reference's `[1:]` drops the leading chunk; keep it as page 0 when
     // the model skipped the opening marker and it carries text (GH #17).
     let leading = chunks.next().filter(|c| !c.trim().is_empty());
+    Ok(join_pages(leading.into_iter().chain(chunks), num_pages))
+}
+
+/// [`finalize_multi`]'s assembly over page bodies already split: each body
+/// `.trim()`-ed and postprocessed with prefix `page_{n}_` (bodies at index
+/// `>= num_pages` passed through), rejoined as `"<PAGE>\n" +
+/// "\n<PAGE>\n".join(pages)`. Unlimited-OCR-2's bodies come from
+/// [`split_pages_by_token`].
+#[must_use]
+pub fn finalize_pages<S: AsRef<str>>(bodies: &[S], num_pages: usize) -> String {
+    join_pages(bodies.iter().map(AsRef::as_ref), num_pages)
+}
+
+fn join_pages<'a>(bodies: impl Iterator<Item = &'a str>, num_pages: usize) -> String {
     let mut processed = Vec::new();
-    for (page_idx, page) in leading.into_iter().chain(chunks).enumerate() {
+    for (page_idx, page) in bodies.enumerate() {
         let page = page.trim();
         if page_idx >= num_pages {
             processed.push(page.to_string());
@@ -511,7 +525,151 @@ pub fn finalize_multi(decoded: &str, num_pages: usize) -> FocrResult<String> {
         processed.push(assemble_page(page, &prefix));
     }
     let body = processed.join("\n<PAGE>\n");
-    Ok(format!("<PAGE>\n{body}"))
+    format!("<PAGE>\n{body}")
+}
+
+/// Unlimited-OCR-2's output split into pages by token id (U2-B6, D20).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenPages {
+    /// Raw body text per page the output reached, at most the page count.
+    pub bodies: Vec<String>,
+    /// Generated ids per body, its opening marker excluded.
+    pub tokens: Vec<usize>,
+    /// Non-blank text preceded the first marker and was prepended to body 1.
+    pub leading_text: bool,
+    /// Markers past the page count (DISC-U2-3).
+    pub extra_markers: usize,
+}
+
+/// Split Unlimited-OCR-2's generated `ids` into page bodies on the marker
+/// token id (D20), for a document of `pages` pages.
+///
+/// Each marker opens a page: body k is the text between the k-th and the
+/// (k+1)-th markers, each decoded on its own with the UTF-8-safe
+/// [`StreamDecoder`](crate::tokenizer::StreamDecoder), so a character split
+/// just before a marker ends its body as U+FFFD, as HF's per-segment decode
+/// does. Text before the first marker (a head) is prepended to body 1 and
+/// flagged `leading_text` when non-blank (DISC-U2-9); HF drops it. Markers
+/// past `pages` are counted in `extra_markers` (DISC-U2-3); what follows them
+/// (nothing under the page-count guard, which then forces EOS) joins the last
+/// body, so a complete decode yields exactly `pages` bodies.
+///
+/// # Errors
+/// An id the tokenizer does not know ([`StreamDecoder::push`](crate::tokenizer::StreamDecoder::push)).
+pub fn split_pages_by_token(
+    tok: &crate::tokenizer::Tokenizer,
+    ids: &[u32],
+    marker: u32,
+    pages: usize,
+) -> FocrResult<TokenPages> {
+    let mut decoder = crate::tokenizer::StreamDecoder::new();
+    // Segment 0 is the head; segment k >= 1 follows the k-th marker.
+    let mut segments = vec![(String::new(), 0usize)];
+    for &id in ids {
+        let (text, count) = segments.last_mut().expect("never empty");
+        if id == marker {
+            decoder.flush(text);
+            segments.push((String::new(), 0));
+        } else {
+            decoder.push(tok, id, text)?;
+            *count += 1;
+        }
+    }
+    decoder.flush(&mut segments.last_mut().expect("never empty").0);
+    let (head, head_tokens) = segments.remove(0);
+    let extra_markers = segments.len().saturating_sub(pages);
+    if segments.len() > pages.max(1) {
+        let extras = segments.split_off(pages.max(1));
+        let last = segments.last_mut().expect("pages.max(1) >= 1");
+        for (text, count) in extras {
+            if !text.trim().is_empty() {
+                last.0.push('\n');
+                last.0.push_str(&text);
+            }
+            last.1 += count;
+        }
+    }
+    let leading_text = !head.trim().is_empty();
+    match segments.first_mut() {
+        Some(first) => {
+            if leading_text {
+                first.0.insert_str(0, &head);
+            }
+            first.1 += head_tokens;
+        }
+        None if leading_text || head_tokens > 0 => segments.push((head, head_tokens)),
+        None => {}
+    }
+    let (bodies, tokens) = segments.into_iter().unzip();
+    Ok(TokenPages {
+        bodies,
+        tokens,
+        leading_text,
+        extra_markers,
+    })
+}
+
+/// [`PageStream`] for Unlimited-OCR-2 (U2-B6): fed the generated ids one at a
+/// time, it emits each page's `.trim()`-ed body, 1-based, once the next
+/// marker arrives or the decode ends, under [`split_pages_by_token`]'s rule:
+/// a non-blank head joins page 1, and nothing past the page count is emitted
+/// (the guard ends the decode there). So its bodies are the split's, trimmed.
+#[derive(Debug)]
+pub struct TokenPageStream<'t> {
+    tok: &'t crate::tokenizer::Tokenizer,
+    marker: u32,
+    pages: usize,
+    decoder: crate::tokenizer::StreamDecoder,
+    current: String,
+    markers: usize,
+    emitted: usize,
+}
+
+impl<'t> TokenPageStream<'t> {
+    /// A stream over a `pages`-page document whose pages `marker` opens.
+    #[must_use]
+    pub fn new(tok: &'t crate::tokenizer::Tokenizer, marker: u32, pages: usize) -> Self {
+        Self {
+            tok,
+            marker,
+            pages,
+            decoder: crate::tokenizer::StreamDecoder::new(),
+            current: String::new(),
+            markers: 0,
+            emitted: 0,
+        }
+    }
+
+    /// Take the next generated id; emit the page it completes, if any. An id
+    /// the tokenizer does not know adds no text (the terminal split reports
+    /// it).
+    pub fn push(&mut self, id: u32, mut on_page: impl FnMut(usize, &str)) {
+        if id != self.marker {
+            let _ = self.decoder.push(self.tok, id, &mut self.current);
+            return;
+        }
+        self.decoder.flush(&mut self.current);
+        self.markers += 1;
+        if self.markers == 1 {
+            // The head joins page 1 when it has text.
+            if self.current.trim().is_empty() {
+                self.current.clear();
+            }
+        } else if self.emitted < self.pages {
+            self.emitted += 1;
+            on_page(self.emitted, self.current.trim());
+            self.current.clear();
+        }
+    }
+
+    /// End of decode: emit the page in flight.
+    pub fn finish(mut self, mut on_page: impl FnMut(usize, &str)) {
+        self.decoder.flush(&mut self.current);
+        let started = self.markers > 0 || !self.current.trim().is_empty();
+        if started && self.emitted < self.pages.max(1) {
+            on_page(self.emitted + 1, self.current.trim());
+        }
+    }
 }
 
 /// The page bodies a multi-page decode carries under [`finalize_multi`]'s
@@ -979,6 +1137,128 @@ mod tests {
         assert!(!md.contains("<|ref|>title"));
         // page 1 passthrough: its ref span text is preserved verbatim
         assert!(md.contains("<|ref|>x<|/ref|>"));
+    }
+
+    /// U2-B6's D20 split on a synthetic byte-level stream: a CJK character cut
+    /// by a marker, an extra trailing marker, and a leading non-blank head.
+    #[test]
+    fn split_pages_by_token_keeps_n_bodies_and_reports_head_and_extras() {
+        use crate::tokenizer::special::PAGE;
+        use crate::tokenizer::tests::{byte_id, byte_tokenizer};
+        let t = byte_tokenizer();
+        let text = |s: &str| s.bytes().map(byte_id).collect::<Vec<_>>();
+        let zhong = "中".as_bytes();
+        let ids = [
+            text("hi "),
+            vec![PAGE],
+            text("one "),
+            vec![byte_id(zhong[0]), byte_id(zhong[1])],
+            vec![PAGE],
+            text("two"),
+            vec![PAGE],
+        ]
+        .concat();
+        let split = split_pages_by_token(&t, &ids, PAGE, 2).unwrap();
+        assert_eq!(
+            split.bodies,
+            ["hi one \u{FFFD}", "two"],
+            "the head joins body 1; the cut character ends it as U+FFFD"
+        );
+        assert_eq!(split.tokens, [3 + 4 + 2, 3]);
+        assert!(split.leading_text);
+        assert_eq!(split.extra_markers, 1, "the empty trailing body is dropped");
+
+        // The same stream rendered: two pages, the v1 multi-page shape.
+        let md = finalize_pages(&split.bodies, 2);
+        assert_eq!(md, "<PAGE>\nhi one \u{FFFD}\n<PAGE>\ntwo");
+        // finalize_multi over the text form gives the same for marker-led text.
+        assert_eq!(
+            finalize_multi("<PAGE>a\n<PAGE>b", 2).unwrap(),
+            finalize_pages(&["a", "b"], 2)
+        );
+
+        // A marker-led, blank-headed decode: no warning, exactly N bodies.
+        let ids = [text("\n"), vec![PAGE], text("x"), vec![PAGE], text("y")].concat();
+        let split = split_pages_by_token(&t, &ids, PAGE, 2).unwrap();
+        assert_eq!(split.bodies, ["x", "y"]);
+        assert_eq!(
+            split.tokens,
+            [2, 1],
+            "the blank head's token counts toward page 1"
+        );
+        assert!(!split.leading_text);
+        assert_eq!(split.extra_markers, 0);
+
+        // Text after an extra marker is kept on the last page, never dropped.
+        let ids = [vec![PAGE], text("a"), vec![PAGE], text("z")].concat();
+        let split = split_pages_by_token(&t, &ids, PAGE, 1).unwrap();
+        assert_eq!(split.bodies, ["a\nz"]);
+        assert_eq!(split.extra_markers, 1);
+
+        // A decode stopped before its first marker still yields page 1.
+        let split = split_pages_by_token(&t, &text("abc"), PAGE, 3).unwrap();
+        assert_eq!(split.bodies, ["abc"]);
+        assert!(split.leading_text);
+        // Nothing generated: no bodies.
+        assert!(
+            split_pages_by_token(&t, &[], PAGE, 3)
+                .unwrap()
+                .bodies
+                .is_empty()
+        );
+        // An unknown id is an error.
+        assert!(split_pages_by_token(&t, &[7], PAGE, 1).is_err());
+    }
+
+    /// The streamed v2 page events are the split's bodies, trimmed, on every
+    /// guard-shaped stream: up to one extra marker, which ends the decode.
+    #[test]
+    fn token_page_stream_emits_the_split_bodies() {
+        use crate::tokenizer::special::PAGE;
+        use crate::tokenizer::tests::{byte_id, byte_tokenizer};
+        let t = byte_tokenizer();
+        let alphabet: Vec<u32> = [b'a', b' ', b'\n', 0xE4, 0xB8, 0xAD]
+            .into_iter()
+            .map(byte_id)
+            .collect();
+        let mut state = 0x005e_edb6_u64;
+        let mut next = |n: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % n
+        };
+        for _ in 0..2000 {
+            let pages = 1 + next(4) as usize;
+            let mut ids = Vec::new();
+            let mut markers = 0;
+            for _ in 0..next(40) {
+                if next(6) == 0 && markers <= pages {
+                    ids.push(PAGE);
+                    markers += 1;
+                    if markers > pages {
+                        break;
+                    }
+                } else {
+                    ids.push(alphabet[next(alphabet.len() as u64) as usize]);
+                }
+            }
+            let split = split_pages_by_token(&t, &ids, PAGE, pages).unwrap();
+            let mut stream = TokenPageStream::new(&t, PAGE, pages);
+            let mut got: Vec<(usize, String)> = Vec::new();
+            for &id in &ids {
+                stream.push(id, |k, body| got.push((k, body.to_string())));
+            }
+            stream.finish(|k, body| got.push((k, body.to_string())));
+            let want: Vec<(usize, String)> = split
+                .bodies
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| markers > 0 || !b.trim().is_empty())
+                .map(|(i, b)| (i + 1, b.trim().to_string()))
+                .collect();
+            assert_eq!(got, want, "{pages} pages: {ids:?}");
+        }
     }
 
     #[test]

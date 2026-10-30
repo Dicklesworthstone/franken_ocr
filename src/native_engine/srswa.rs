@@ -854,6 +854,32 @@ pub enum EntmaxDomain {
     AllCandidates,
 }
 
+/// Selects the router's [`EntmaxDomain`]: `topm` (the default) or `all`.
+pub const ENTMAX_ENV: &str = "FOCR_SRSWA_ENTMAX";
+
+/// The [`EntmaxDomain`] an [`ENTMAX_ENV`] value names: unset, empty or
+/// `topm` is [`EntmaxDomain::TopM`], `all` is [`EntmaxDomain::AllCandidates`]
+/// (case and surrounding space ignored).
+///
+/// # Errors
+/// Any other value, with a message naming the accepted ones.
+pub fn entmax_domain_for(value: Option<&str>) -> Result<EntmaxDomain, String> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        None | Some("" | "topm") => Ok(EntmaxDomain::TopM),
+        Some("all") => Ok(EntmaxDomain::AllCandidates),
+        Some(other) => Err(format!(
+            "{ENTMAX_ENV}={other:?} is not an entmax domain; use `topm` (the default) or `all`"
+        )),
+    }
+}
+
+/// [`ENTMAX_ENV`], read once per process.
+pub fn entmax_domain() -> &'static Result<EntmaxDomain, String> {
+    use std::sync::OnceLock;
+    static DOMAIN: OnceLock<Result<EntmaxDomain, String>> = OnceLock::new();
+    DOMAIN.get_or_init(|| entmax_domain_for(std::env::var(ENTMAX_ENV).ok().as_deref()))
+}
+
 /// One query's read set.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Route {
@@ -1436,26 +1462,6 @@ pub fn attend_with(
     }
 }
 
-/// One layer's prefill routing (U2-B5): the router's index queries and keys
-/// for the rows of `normed` (the `input_layernorm` output), then each row's
-/// selection from an empty cache ([`prefill_routes`]). Returns the
-/// selections and the index keys, which the cache stores.
-///
-/// # Errors
-/// As [`project`] and [`prefill_routes`].
-pub fn prefill_selections(
-    normed: &Mat,
-    w: &SrSwaLayerWeights,
-    rope: &RopeTable,
-    coords: &PageCoords,
-    p: &RouterParams,
-    domain: EntmaxDomain,
-) -> FocrResult<(Vec<BlockSelection>, Mat)> {
-    let (iq, ik) = project(normed, w, rope)?;
-    let routes = prefill_routes(&iq, &ik, coords, &w.head_cls, p, domain)?;
-    Ok((routes.into_iter().map(BlockSelection::from).collect(), ik))
-}
-
 /// One layer's attention inputs for a run of rows (U2-B5): the
 /// `input_layernorm` output, which the router reads, and the main attention's
 /// RoPE'd queries and keys and its values.
@@ -1479,6 +1485,11 @@ pub struct DecodeStep {
     pub rope: RopeTable,
     /// Its query page, −1 when there is none.
     pub query_page: i32,
+    /// The page-count guard forces the token this row's hidden state
+    /// predicts, so its attention cannot change the output: the retirement
+    /// detector stands down and retirement pauses (U2-B4). [`SrSwaState::feed`]
+    /// sets it false; the decode loop sets it from the guard.
+    pub forced: bool,
 }
 
 /// One v2 sequence's attention state between decode steps (U2-B5): each
@@ -1496,13 +1507,83 @@ pub struct SrSwaState {
     pub domain: EntmaxDomain,
     /// Whether attention runs [`attend_dense`].
     pub dense: bool,
+    /// The routing a parity test reads back (U2-C2), when on. Off by default.
+    pub trace: Option<SrSwaTrace>,
+}
+
+/// What a traced [`SrSwaState`] keeps of its routing (U2-C2): the routing
+/// rungs compare it with the f32 oracle's, the re-prefill metamorphic
+/// relation compares an incremental step with a fresh prefill, and the trace
+/// diff prints it at a token mismatch.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SrSwaTrace {
+    /// Per layer, the prefill's last row's route.
+    pub prefill_last: Vec<Option<Route>>,
+    /// Per layer, the prefill rows [`window_pad_sensitive`] flags.
+    pub pad_sensitive: Vec<Vec<usize>>,
+    /// Per layer, the latest decode step's route.
+    pub decode: Vec<Option<DecodeRoute>>,
+}
+
+impl SrSwaTrace {
+    /// An empty trace for `layers` layers.
+    #[must_use]
+    pub fn new(layers: usize) -> Self {
+        Self {
+            prefill_last: vec![None; layers],
+            pad_sensitive: vec![Vec::new(); layers],
+            decode: vec![None; layers],
+        }
+    }
+
+    /// Record one layer's prefill routing from its index queries and keys.
+    fn record_prefill(
+        &mut self,
+        layer: usize,
+        (iq, ik): (&Mat, &Mat),
+        coords: &PageCoords,
+        head_cls: &[f32],
+        p: &RouterParams,
+        last: Option<&Route>,
+    ) {
+        let sums = summaries(ik, head_cls);
+        let blocks = BlockPages::build(&coords.img_page);
+        self.pad_sensitive[layer] = (0..iq.rows)
+            .filter(|&r| {
+                let sc = scores(iq.row(r), r, &sums);
+                let allow = page_gate_prefill(&blocks, coords.query_page[r]);
+                let cand = candidates(&sc, Some(&allow));
+                window_pad_sensitive(&entmax_inputs(&sc, &cand, p), &cand)
+            })
+            .collect();
+        self.prefill_last[layer] = last.cloned();
+    }
+}
+
+/// Whether a row's route can depend on the router window M alone (plan §5.8).
+/// A window wider than the row's own blocks adds non-candidate pads at
+/// [`ENTMAX_NEG`]. They stay out of the entmax support and rank below every
+/// candidate when the best candidate input is at least `ENTMAX_NEG + 2` and
+/// none is at or below `ENTMAX_NEG`; a row without candidates reads no remote
+/// block in any window. A prefill sets every row's M from its whole length,
+/// and a decode step from its own position, so only a flagged row can route
+/// differently in a re-prefill than it did incrementally.
+#[must_use]
+pub fn window_pad_sensitive(x: &[f32], cand: &[bool]) -> bool {
+    let mut inputs = x.iter().zip(cand).filter(|&(_, &c)| c).map(|(&v, _)| v);
+    let Some(first) = inputs.next() else {
+        return false;
+    };
+    let (lo, hi) = inputs.fold((first, first), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    hi < ENTMAX_NEG + 2.0 || lo <= ENTMAX_NEG
 }
 
 impl SrSwaState {
     /// Empty caches for a sequence whose prompt has `coords`, with the
     /// parity defaults ([`RouterParams::uocr2`], [`EntmaxDomain::TopM`]) and
-    /// [`dense_enabled`]. Block retirement stays off: it is safe only under
-    /// the page-count guard, which U2-B6 adds.
+    /// [`dense_enabled`]. Block retirement starts off: it is safe only under
+    /// the page-count guard, and the decode loop turns it on
+    /// ([`Self::set_retire`]).
     ///
     /// # Errors
     /// As [`SrSwaLayerCache::new`].
@@ -1520,18 +1601,20 @@ impl SrSwaState {
             params: RouterParams::uocr2(),
             domain: EntmaxDomain::TopM,
             dense: dense_enabled(),
+            trace: None,
         })
     }
 
-    /// One layer's prompt prefill into its empty cache: route every row
-    /// ([`prefill_selections`]), store the rows' K, V and index keys with
-    /// their image pages, and attend through the cache. `rope` is `coords`'
-    /// page2d table, already applied to `rows.q`/`rows.k`.
+    /// One layer's prompt prefill into its empty cache: the router's index
+    /// queries and keys ([`project`]), every row's route from an empty cache
+    /// ([`prefill_routes`], recorded when tracing), the rows' K, V and index
+    /// keys stored with their image pages, and attention through the cache.
+    /// `rope` is `coords`' page2d table, already applied to `rows.q`/`rows.k`.
     ///
     /// # Errors
     /// [`FocrError::Other`] if the layer's cache is not empty (an extend over
-    /// cached rows is a reused window, U2-D2a), or as [`prefill_selections`]
-    /// and [`attend`].
+    /// cached rows is a reused window, U2-D2a), or as [`project`],
+    /// [`prefill_routes`] and [`attend`].
     pub fn prefill_layer(
         &mut self,
         layer: usize,
@@ -1546,12 +1629,40 @@ impl SrSwaState {
                 self.layers[layer].rows()
             )));
         }
-        let (sel, ik) =
-            prefill_selections(rows.normed, w, rope, coords, &self.params, self.domain)?;
+        let (iq, ik) = project(rows.normed, w, rope)?;
+        let routes = prefill_routes(&iq, &ik, coords, &w.head_cls, &self.params, self.domain)?;
+        if let Some(trace) = &mut self.trace {
+            let p = &self.params;
+            trace.record_prefill(layer, (&iq, &ik), coords, &w.head_cls, p, routes.last());
+        }
+        let sel: Vec<BlockSelection> = routes.into_iter().map(BlockSelection::from).collect();
         let cache = &mut self.layers[layer];
         cache.append(rows.k, rows.v, &ik, &coords.img_page)?;
         let positions: Vec<usize> = (0..rows.q.rows).collect();
         attend_with(rows.q, &positions, &sel, &*cache, self.dense)
+    }
+
+    /// Turn block retirement on or off in every layer (U2-B6). Pass
+    /// [`retire_enabled`] only while the page-count guard runs; attention that
+    /// runs dense reads every row, so it keeps retirement off.
+    pub fn set_retire(&mut self, retire: bool) {
+        let on = retire && !self.dense;
+        for cache in &mut self.layers {
+            cache.retire = on;
+        }
+    }
+
+    /// Retired blocks across the layers.
+    #[must_use]
+    pub fn dead_blocks(&self) -> usize {
+        self.layers.iter().map(SrSwaLayerCache::dead_blocks).sum()
+    }
+
+    /// The layers' peak resident KV bytes, summed. The layers grow and retire
+    /// in step, so this is the sequence's peak.
+    #[must_use]
+    pub fn peak_bytes(&self) -> usize {
+        self.layers.iter().map(SrSwaLayerCache::peak_bytes).sum()
     }
 
     /// Advance the page state over the fed token `id` and return its row's
@@ -1561,17 +1672,20 @@ impl SrSwaState {
         DecodeStep {
             rope: page2d_rope_table(&[coord.tok_pos], &[coord.rope_page]),
             query_page: coord.query_page,
+            forced: false,
         }
     }
 
     /// One decode step's attention in `layer` for the single row `rows` at
     /// `step` ([`Self::feed`]): index the row, append its K, V and index key
-    /// (a generated row, so no image page), route it from the cache, and
-    /// attend.
+    /// (a generated row, so no image page), route it from the cache, attend,
+    /// then retire the blocks dead at this row
+    /// ([`SrSwaLayerCache::retire_dead_blocks`]).
     ///
     /// # Errors
-    /// [`FocrError::Other`] on a shape mismatch or when the retirement
-    /// detector fires (impossible while retirement is off).
+    /// [`FocrError::Other`] on a shape mismatch, or wrapping the
+    /// [`RetireFallback`] (recoverable with [`retire_fallback`]) when the
+    /// retirement detector fires, which is impossible while retirement is off.
     pub fn decode_layer(
         &mut self,
         layer: usize,
@@ -1583,16 +1697,39 @@ impl SrSwaState {
         let cache = &mut self.layers[layer];
         cache.append(rows.k, rows.v, &ik, &[-1])?;
         let route = cache
-            .decode_route(iq.row(0), step.query_page, &self.params, self.domain, false)
-            .map_err(|e| FocrError::Other(anyhow::anyhow!("layer {layer}: {e}")))?;
+            .decode_route(
+                iq.row(0),
+                step.query_page,
+                &self.params,
+                self.domain,
+                step.forced,
+            )
+            .map_err(|e| {
+                FocrError::Other(anyhow::Error::new(e).context(format!("layer {layer}")))
+            })?;
+        if let Some(trace) = &mut self.trace {
+            trace.decode[layer] = Some(route.clone());
+        }
         let q_pos = cache.rows() - 1;
-        attend_with(
+        let out = attend_with(
             rows.q,
             &[q_pos],
             &[BlockSelection::from(route.route)],
             &*cache,
             self.dense,
-        )
+        )?;
+        cache.retire_dead_blocks(step.query_page, q_pos, step.forced)?;
+        Ok(out)
+    }
+}
+
+/// The [`RetireFallback`] behind a decode error, if the retirement detector
+/// raised it ([`SrSwaState::decode_layer`]).
+#[must_use]
+pub fn retire_fallback(error: &FocrError) -> Option<&RetireFallback> {
+    match error {
+        FocrError::Other(e) => e.downcast_ref::<RetireFallback>(),
+        _ => None,
     }
 }
 
@@ -1710,13 +1847,18 @@ impl std::fmt::Display for RetireFallback {
 
 impl std::error::Error for RetireFallback {}
 
-/// A decode query's route, and whether its row was open.
+/// A decode query's route, whether its row was open, and the score row and
+/// Page Gate it was routed from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DecodeRoute {
     /// The read set and biases.
     pub route: Route,
     /// `Some` for an open row.
     pub open: Option<OpenRow>,
+    /// Every block's score, [`SCORE_NEG`] where it is not remote or retired.
+    pub scores: Vec<f32>,
+    /// The Page Gate.
+    pub allow: Vec<bool>,
 }
 
 /// Whether a decode row on page `qp` is open, from the prompt's bmin/bmax and
@@ -2000,6 +2142,8 @@ impl SrSwaLayerCache {
         Ok(DecodeRoute {
             route: route(&sc, Some(&allow), p, domain),
             open,
+            scores: sc,
+            allow,
         })
     }
 
@@ -3035,6 +3179,29 @@ mod tests {
             assert!(
                 r.bias.iter().any(|&b| (b - r.bias[0]).abs() > 1e-3),
                 "{domain:?}"
+            );
+        }
+    }
+
+    /// D21: `FOCR_SRSWA_ENTMAX` names the domain; anything else is refused
+    /// with the accepted values, never read as the default.
+    #[test]
+    fn the_entmax_domain_env_names_a_domain_or_is_refused() {
+        for (value, domain) in [
+            (None, EntmaxDomain::TopM),
+            (Some(""), EntmaxDomain::TopM),
+            (Some("topm"), EntmaxDomain::TopM),
+            (Some(" TopM "), EntmaxDomain::TopM),
+            (Some("all"), EntmaxDomain::AllCandidates),
+            (Some("ALL"), EntmaxDomain::AllCandidates),
+        ] {
+            assert_eq!(entmax_domain_for(value), Ok(domain), "{value:?}");
+        }
+        for value in ["1", "top-m", "sglang", "all candidates"] {
+            let why = entmax_domain_for(Some(value)).expect_err(value);
+            assert!(
+                why.contains(ENTMAX_ENV) && why.contains("`topm`") && why.contains("`all`"),
+                "{why}"
             );
         }
     }
@@ -4113,6 +4280,23 @@ mod tests {
         }
     }
 
+    /// One layer's routing in a single prefill, composed independently of
+    /// [`SrSwaState::prefill_layer`]: the index projections, then each row's
+    /// selection from an empty cache. Returns the selections and the index
+    /// keys, which the cache stores.
+    fn prefill_selections(
+        normed: &Mat,
+        w: &SrSwaLayerWeights,
+        rope: &RopeTable,
+        coords: &PageCoords,
+        p: &RouterParams,
+        domain: EntmaxDomain,
+    ) -> FocrResult<(Vec<BlockSelection>, Mat)> {
+        let (iq, ik) = project(normed, w, rope)?;
+        let routes = prefill_routes(&iq, &ik, coords, &w.head_cls, p, domain)?;
+        Ok((routes.into_iter().map(BlockSelection::from).collect(), ik))
+    }
+
     fn state_decode_equals_a_reprefill(pages: &[usize], seed: u64) {
         let mut rng = Lcg(seed);
         let hidden = 64;
@@ -4169,6 +4353,11 @@ mod tests {
         assert!(!state.dense, "FOCR_SRSWA_DENSE is unset in tests");
         let mut dense = state.clone();
         dense.dense = true;
+        // U2-B6's wiring: retirement on through the state; dense attention
+        // keeps it off.
+        let mut retired = state.clone();
+        retired.set_retire(true);
+        dense.set_retire(true);
         let span = |m: &Mat, r: Range<usize>| row_range(m, r);
         let (pn, pq, pk, pv) = (
             span(&normed, 0..n),
@@ -4183,7 +4372,7 @@ mod tests {
             v: &pv,
         };
         let prompt_rope = pc.rope_table(0);
-        for st in [&mut state, &mut dense] {
+        for st in [&mut state, &mut dense, &mut retired] {
             let got = st
                 .prefill_layer(0, &w, prompt_rows, &prompt_rope, &pc)
                 .unwrap();
@@ -4212,7 +4401,7 @@ mod tests {
                 k: &rk,
                 v: &rv,
             };
-            for st in [&mut state, &mut dense] {
+            for st in [&mut state, &mut dense, &mut retired] {
                 let step = st.feed(id);
                 assert_eq!(step.query_page, coords.query_page[r], "row {r} query page");
                 let at = r * HEAD_DIM..(r + 1) * HEAD_DIM;
@@ -4226,12 +4415,19 @@ mod tests {
                 assert_eq!(
                     bits(&out.data),
                     bits(want.row(r)),
-                    "row {r} (token {id}), dense {}",
-                    st.dense
+                    "row {r} (token {id}), dense {}, dead {}",
+                    st.dense,
+                    st.dead_blocks()
                 );
             }
         }
         assert_eq!(state.layers[0].rows(), s);
+        assert_eq!(state.dead_blocks() + dense.dead_blocks(), 0);
+        assert!(
+            retired.dead_blocks() > 0,
+            "{pages:?}: retirement freed nothing"
+        );
+        assert!(retired.peak_bytes() <= state.peak_bytes());
     }
 
     #[test]

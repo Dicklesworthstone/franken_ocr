@@ -15,7 +15,7 @@
       "token_count": 98,
       "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
       "focr_version": "0.9.1",
-      "git_revision": "934c1e4e6f41+dirty",
+      "git_revision": "dab3fc6d0a20+dirty",
       "threads": 36
     },
     "page_0014": {
@@ -27,7 +27,7 @@
       "token_count": 495,
       "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
       "focr_version": "0.9.1",
-      "git_revision": "934c1e4e6f41+dirty",
+      "git_revision": "dab3fc6d0a20+dirty",
       "threads": 36
     },
     "p9_p14": {
@@ -37,10 +37,10 @@
         "page_0009.png": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
         "page_0014.png": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2"
       },
-      "token_count": 432,
+      "token_count": 90,
       "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
       "focr_version": "0.9.1",
-      "git_revision": "934c1e4e6f41+dirty",
+      "git_revision": "dab3fc6d0a20+dirty",
       "threads": 36
     },
     "page_0590": {
@@ -52,7 +52,7 @@
       "token_count": 4033,
       "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
       "focr_version": "0.9.1",
-      "git_revision": "934c1e4e6f41+dirty",
+      "git_revision": "dab3fc6d0a20+dirty",
       "threads": 36
     },
     "p10": {
@@ -70,10 +70,10 @@
         "page_0108.png": "7a808477b32e565daa998b644c842394d416bd5177bc7c392bfb29b8b94589eb",
         "page_0126.png": "c7a368051bc12557d7dd34eb9a92c56d48f1afa19a2bc963f97a912d0a9d7ed0"
       },
-      "token_count": 30310,
+      "token_count": 6435,
       "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
       "focr_version": "0.9.1",
-      "git_revision": "934c1e4e6f41+dirty",
+      "git_revision": "dab3fc6d0a20+dirty",
       "threads": 36
     },
     "p20": {
@@ -104,7 +104,7 @@
       "token_count": 30543,
       "artifact_sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592",
       "focr_version": "0.9.1",
-      "git_revision": "934c1e4e6f41+dirty",
+      "git_revision": "dab3fc6d0a20+dirty",
       "threads": 36
     }
   }

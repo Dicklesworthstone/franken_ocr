@@ -75,6 +75,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use franken_ocr::page_source::PageSource;
+use franken_ocr::preprocess::preprocess_dynamic_squash;
 use franken_ocr::{
     FocrError, MODEL_PATH_ENV, OcrEngine, kernel_pool_width, stream_pages, thread_budget,
 };
@@ -447,6 +449,190 @@ fn many_sequential_pages_complete_within_budget() {
                     ),
                 );
             }
+        }
+    }
+}
+
+// ───────────────────────────── scenario 1c: the lazy page source ─────────────────────────────
+
+/// Pages per pool thread in the page-source scenario. Its pages are real work
+/// (a rasterization and the 640 preprocess, about 0.1 s each in an
+/// unoptimized build), so they cannot scale like scenario 1's microsecond
+/// pages: at 24× the pool a 64-core debug run would outlast the budget
+/// without any hang.
+const SOURCE_PAGES_PER_THREAD: usize = 4;
+
+/// Bounds on that count. The floor keeps pages ≫ pool on a small host. The
+/// ceiling keeps the heavy pass inside v1's 32,768 positions (about 110
+/// prompt positions per 640 page) and a debug walk near 25 s.
+const SOURCE_PAGES: std::ops::RangeInclusive<usize> = 64..=256;
+
+fn source_pages_for(pool: usize) -> usize {
+    (pool * SOURCE_PAGES_PER_THREAD).clamp(*SOURCE_PAGES.start(), *SOURCE_PAGES.end())
+}
+
+/// A PDF of `pages` small lossless (FlateDecode) RGB pages, each its own shade.
+fn synthetic_pdf(pages: usize) -> PathBuf {
+    use lopdf::{Object, Stream, dictionary};
+    let (w, h) = (48u32, 64u32);
+    let mut doc = lopdf::Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut kids: Vec<Object> = Vec::new();
+    for n in 0..pages {
+        let shade = u8::try_from(n % 200).expect("fits") + 40;
+        let raw: Vec<u8> = (0..w * h)
+            .flat_map(|i| [shade, u8::try_from(i % 251).expect("fits"), 255 - shade])
+            .collect();
+        let mut stream = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => i64::from(w),
+                "Height" => i64::from(h),
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+            },
+            raw,
+        );
+        stream.compress().expect("compress the page image");
+        let image_id = doc.add_object(stream);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => image_id } },
+            "MediaBox" => vec![0.into(), 0.into(), i64::from(w).into(), i64::from(h).into()],
+        });
+        kids.push(page_id.into());
+    }
+    let count = i64::try_from(pages).expect("page count fits");
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => count }),
+    );
+    let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog_id);
+    let path = std::env::temp_dir().join(format!(
+        "focr_watchdog_pages_{}_{pages}.pdf",
+        std::process::id()
+    ));
+    doc.save(&path).expect("save the synthetic PDF");
+    path
+}
+
+/// U2-D0: a v1 `--multi-page` document read through a [`PageSource`]. The
+/// forward stage rasterizes each page, preprocesses it and drops the raster,
+/// between forwards and under no lock; with pages ≫ pool the walk must
+/// finish inside the watchdog budget.
+///
+/// Without weights, the engine's source-driven entry must return the clean
+/// `ModelNotFound` before it reads a page, and the walk itself — rasterize,
+/// then the multi-page 640 preprocess, page after page on the worker — runs
+/// under the watchdog. With `FOCR_MODEL_PATH` the real cross-page pass runs
+/// over the same pages.
+#[test]
+fn multi_page_page_source_completes_within_budget() {
+    let case = "multi_page_page_source";
+    let pool = detected_pool();
+    let heavy = heavy_model_path();
+    let pages = source_pages_for(pool);
+    let budget = match heavy {
+        Some(_) => WATCHDOG_BUDGET_HEAVY,
+        None => WATCHDOG_BUDGET,
+    };
+    let pdf = synthetic_pdf(pages);
+    log_line(
+        case,
+        "setup",
+        "pass",
+        &format!(
+            r#""pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{},"mode":"{}","pdf":{}"#,
+            budget.as_secs(),
+            if heavy.is_some() {
+                "heavy_forward"
+            } else {
+                "no_weights_orchestration"
+            },
+            json_str(&pdf.display().to_string()),
+        ),
+    );
+
+    let pdf_for_worker = pdf.clone();
+    let model = heavy.clone().unwrap_or_else(|| PathBuf::from(ABSENT_MODEL));
+    let outcome = run_with_watchdog(budget, move || {
+        let engine = OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
+        let source = PageSource::pdf(&pdf_for_worker).expect("open the synthetic PDF");
+        let seen = Arc::new(AtomicUsize::new(0));
+        let on_item = {
+            let seen = Arc::clone(&seen);
+            Box::new(move |_: &franken_ocr::page_source::PageItem| {
+                seen.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        let pass = engine
+            .recognize_multi_page_source_with_model(&model, source, on_item, None)
+            .map(|markdown| markdown.len())
+            .map_err(|e| e.kind());
+        // The walk itself: every page rasterized, preprocessed, dropped.
+        let (mut walked, mut preprocessed) = (0usize, 0usize);
+        for item in PageSource::pdf(&pdf_for_worker).expect("reopen the synthetic PDF") {
+            walked += 1;
+            if let Ok(image) = item.raster {
+                let _pre =
+                    preprocess_dynamic_squash(image, 640).expect("the 640 multi-page preprocess");
+                preprocessed += 1;
+            }
+        }
+        (pass, seen.load(Ordering::Relaxed), walked, preprocessed)
+    });
+    let _ = std::fs::remove_file(&pdf);
+
+    match outcome {
+        Watch::TimedOut => {
+            log_line(
+                case,
+                "error",
+                "fail",
+                &format!(
+                    r#""diag":{{"error_kind":"DEADLOCK_SUSPECTED","focr_exit_code":5,"message":"page-source walk did not complete within watchdog budget"}},"pool":{pool},"pages_issued":{pages},"timeout_budget_secs":{}"#,
+                    budget.as_secs(),
+                ),
+            );
+            panic!(
+                "DEADLOCK SUSPECTED: the {pages}-page page-source walk (pool={pool}) did NOT \
+                 complete within the {}s watchdog budget — rasterization nested under a lock \
+                 or a non-sequential page loop hangs exactly here",
+                budget.as_secs()
+            );
+        }
+        Watch::Finished { payload, elapsed } => {
+            let (pass, items_seen, walked, preprocessed) = payload;
+            assert_eq!(walked, pages, "every page walked");
+            assert_eq!(preprocessed, pages, "every synthetic page rasterizes");
+            match heavy {
+                Some(_) => assert_eq!(
+                    items_seen, pages,
+                    "the real pass read every page through the source: {pass:?}"
+                ),
+                None => {
+                    assert_eq!(
+                        pass,
+                        Err("model_not_found"),
+                        "an absent model is a clean ModelNotFound"
+                    );
+                    assert_eq!(items_seen, 0, "no page is read before the model loads");
+                }
+            }
+            log_line(
+                case,
+                "result",
+                "pass",
+                &format!(
+                    r#""elapsed_us":{},"pool":{pool},"pages_issued":{pages},"walked":{walked},"preprocessed":{preprocessed},"engine_items_seen":{items_seen},"pass":{},"timeout_budget_secs":{}"#,
+                    elapsed.as_micros(),
+                    json_str(&format!("{pass:?}")),
+                    budget.as_secs(),
+                ),
+            );
         }
     }
 }

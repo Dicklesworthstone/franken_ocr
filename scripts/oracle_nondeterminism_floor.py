@@ -858,6 +858,16 @@ def _uocr2_layer_delta(np: Any, a: Any, b: Any) -> dict[str, float]:
     return {"max_abs": diff, "max_rel": diff / scale if scale > 0 else 0.0}
 
 
+# The router's "not remote" score (`_SCORE_NEG`, MD); remote entries are above half of it.
+UOCR2_SCORE_NEG = -1.0e9
+
+
+def _uocr2_selected_sets(topi: Any, valid: Any) -> list[frozenset[int]]:
+    """Each row's selected blocks: its first-K slots that are candidates. The
+    order of the slots is not part of the selection."""
+    return [frozenset(int(b) for b, v in zip(t, m) if v) for t, m in zip(topi, valid)]
+
+
 def _uocr2_compare_fixture(np: Any, run_dirs: list[Path], fixture: str) -> dict[str, Any]:
     refs, acts = [], []
     for run_dir in run_dirs:
@@ -893,20 +903,48 @@ def _uocr2_compare_fixture(np: Any, run_dirs: list[Path], fixture: str) -> dict[
     layers = []
     for layer in range(n_layers):
         entry: dict[str, Any] = {"layer": layer}
-        for stage in ("hidden_in", "attn_out"):
-            base = load(0, f"prefill.L{layer:02d}.{stage}")
+
+        def stage_of(i: int, name: str) -> Any:
+            return load(i, f"prefill.L{layer:02d}.{name}")
+
+        for stage in ("hidden_in", "iq", "ik", "kbar", "attn_pre_o", "attn_out"):
+            base = stage_of(0, stage)
             worst = {"max_abs": 0.0, "max_rel": 0.0}
             for i in range(1, len(runs)):
-                d = _uocr2_layer_delta(np, base, load(i, f"prefill.L{layer:02d}.{stage}"))
+                d = _uocr2_layer_delta(np, base, stage_of(i, stage))
                 worst = {k: max(worst[k], d[k]) for k in worst}
             entry[stage] = worst
-        topi0 = load(0, f"prefill.L{layer:02d}.topi")
-        valid0 = load(0, f"prefill.L{layer:02d}.valid")
-        differing = np.zeros(topi0.shape[0], dtype=bool)
+        # Scores on the entries every run marks remote; the prior on the rows
+        # whose top-M window holds the same blocks in every run.
+        scores0 = stage_of(0, "scores")
+        window0 = [frozenset(r.tolist()) for r in stage_of(0, "topm_idx")]
+        prior0 = stage_of(0, "prior")
+        scores = {"max_abs": 0.0, "max_rel": 0.0}
+        prior = {"max_abs": 0.0, "max_rel": 0.0}
         for i in range(1, len(runs)):
-            differing |= np.any(topi0 != load(i, f"prefill.L{layer:02d}.topi"), axis=-1)
-            differing |= np.any(valid0 != load(i, f"prefill.L{layer:02d}.valid"), axis=-1)
+            scores_i = stage_of(i, "scores")
+            remote = (scores0 > UOCR2_SCORE_NEG * 0.5) & (scores_i > UOCR2_SCORE_NEG * 0.5)
+            d = _uocr2_layer_delta(np, scores0[remote], scores_i[remote])
+            scores = {k: max(scores[k], d[k]) for k in scores}
+            same = np.array([a == frozenset(b.tolist()) for a, b in zip(window0, stage_of(i, "topm_idx"))], dtype=bool)
+            d = _uocr2_layer_delta(np, prior0[same], stage_of(i, "prior")[same])
+            prior = {k: max(prior[k], d[k]) for k in prior}
+        entry["scores"] = scores
+        entry["prior"] = prior
+        topi0 = stage_of(0, "topi")
+        valid0 = stage_of(0, "valid")
+        sets0 = _uocr2_selected_sets(topi0, valid0)
+        differing = np.zeros(topi0.shape[0], dtype=bool)
+        set_differing = np.zeros(topi0.shape[0], dtype=bool)
+        for i in range(1, len(runs)):
+            topi_i, valid_i = stage_of(i, "topi"), stage_of(i, "valid")
+            differing |= np.any(topi0 != topi_i, axis=-1)
+            differing |= np.any(valid0 != valid_i, axis=-1)
+            set_differing |= np.array([a != b for a, b in zip(sets0, _uocr2_selected_sets(topi_i, valid_i))], dtype=bool)
+        # Rows whose topi/valid arrays differ, slot order included, and the
+        # subset whose selected block sets differ.
         entry["routing_rows_differing"] = int(differing.sum())
+        entry["routing_set_rows_differing"] = int(set_differing.sum())
         layers.append(entry)
     final0 = load(0, "prefill.final_hidden")
     final = {"max_abs": 0.0, "max_rel": 0.0}
@@ -959,6 +997,7 @@ def _uocr2_floor(groups: list[str], out: Path) -> int:
                         "logit_spread_in_prefix": env["logit_spread_in_prefix"],
                         "max_hidden_rel": max(l["hidden_in"]["max_rel"] for l in cmp["layers"]),
                         "routing_rows_differing": sum(l["routing_rows_differing"] for l in cmp["layers"]),
+                        "routing_set_rows_differing": sum(l["routing_set_rows_differing"] for l in cmp["layers"]),
                     }
                 ),
                 flush=True,
@@ -975,7 +1014,14 @@ def _uocr2_floor(groups: list[str], out: Path) -> int:
             },
             "max_final_hidden": {k: max(c["final_hidden"][k] for c in per_fixture.values()) for k in ("max_abs", "max_rel")},
             "routing_rows_differing": sum(l["routing_rows_differing"] for c in per_fixture.values() for l in c["layers"]),
+            "routing_set_rows_differing": sum(
+                l["routing_set_rows_differing"] for c in per_fixture.values() for l in c["layers"]
+            ),
         }
+        for stage in ("iq", "ik", "kbar", "scores", "prior", "attn_pre_o"):
+            summary[f"max_{stage}"] = {
+                k: max(l[stage][k] for c in per_fixture.values() for l in c["layers"]) for k in ("max_abs", "max_rel")
+            }
         result["groups"][name] = {"run_dirs": [str(d) for d in run_dirs], "summary": summary, "fixtures": per_fixture}
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=1) + "\n")

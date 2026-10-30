@@ -4,7 +4,8 @@
 //! Fused tower ([SPEC-048]): CLIP embeddings take the SAM `x3` output as
 //! `patch_embeds` (the CLIP patch-embed Conv2d is bypassed); the learned class
 //! token is prepended; absolute position embeddings are added via `get_abs_pos`
-//! (bicubic-interpolated to the runtime token length, CLS row passed through).
+//! (resized to the runtime token length with torch's antialiased bicubic, CLS
+//! row passed through).
 //!
 //! Each `NoTPTransformerBlock` ([SPEC-049], `deepencoder.py:392-396`):
 //! ```text
@@ -20,9 +21,9 @@
 //! layernorm_epsilon=1e-5, pre_layernorm_epsilon=1e-5.
 //!
 //! All kernel calls funnel through [`crate::native_engine::nn`] (the frankentorch
-//! facade). The bias-add after each `Linear`, the qkv head split / SDPA repack,
-//! and the bicubic abs-pos interpolation are not facade ops, so they are
-//! implemented inline here (see `facade_gaps`).
+//! facade), the abs-pos resize included ([`nn::resize_bicubic_aa`]). The
+//! bias-add after each `Linear` and the qkv head split / SDPA repack are not
+//! facade ops, so they are implemented inline here (see `facade_gaps`).
 
 use super::nn;
 use super::tensor::Mat;
@@ -1153,9 +1154,9 @@ fn prepend_class_token(class_embedding: &[f32], patches: &Mat) -> FocrResult<Mat
 /// `table` is `[num_positions, dim]`: row 0 is the CLS position, rows `1..` are
 /// a `src×src` patch grid (`src = round(sqrt(num_positions - 1))`). The runtime
 /// patch grid is `tgt×tgt` (`tgt = round(sqrt(seq - 1))`). When `src == tgt` the
-/// table is returned as-is; otherwise the patch rows are bicubically
-/// interpolated from `src×src` to `tgt×tgt`, the CLS row passing through
-/// unchanged.
+/// table is returned as-is; otherwise the patch rows are resized from `src×src`
+/// to `tgt×tgt` with torch's antialiased bicubic ([`nn::resize_bicubic_aa`]),
+/// the CLS row passing through unchanged.
 fn abs_pos_for_len(table: &[f32], num_positions: usize, dim: usize, seq: usize) -> FocrResult<Mat> {
     let expected_table_len = checked_shape_mul(
         "vision_clip abs_pos",
@@ -1205,95 +1206,12 @@ fn abs_pos_for_len(table: &[f32], num_positions: usize, dim: usize, seq: usize) 
         return Ok(Mat::from_vec(seq, dim, out));
     }
 
-    // Bicubic interpolation per channel from src×src -> tgt×tgt. Source patch
-    // grid begins at table row 1 (row 0 is CLS).
-    let patch = &table[dim..]; // [src*src, dim]
-    interpolate_bicubic_into(patch, src, src, &mut out[dim..], tgt, tgt, dim);
+    // Resize the src×src patch grid (table rows 1.., row 0 is CLS) to tgt×tgt
+    // with torch's antialiased bicubic, as `get_abs_pos` does (a 640 view:
+    // 16→10).
+    let resized = nn::resize_bicubic_aa(&table[dim..], src, src, dim, tgt, tgt)?;
+    out[dim..].copy_from_slice(&resized);
     Ok(Mat::from_vec(seq, dim, out))
-}
-
-/// Bicubic resize of a `[ih*iw, dim]` row-major grid into a `[oh*ow, dim]`
-/// destination, `align_corners=False` (PyTorch `F.interpolate` convention).
-///
-/// Implemented inline because the facade has no spatial-resize op (see
-/// `facade_gaps`). The cubic convolution uses the Keys kernel with `a = -0.75`
-/// (PyTorch's default). NOTE: PyTorch additionally enables `antialias=True` for
-/// the CLIP pos-embed path; the antialias prefilter is a measured-parity lever
-/// deferred to the parity bead (bd-1gv.9.1) — this non-antialiased bicubic is
-/// the identity path when `src == tgt`, which is the deployed CLIP-L/14-224 case
-/// (16×16 patch grid both sides), so it never actually fires in the shipped
-/// config and exists for completeness / non-224 grids.
-fn interpolate_bicubic_into(
-    src: &[f32],
-    ih: usize,
-    iw: usize,
-    dst: &mut [f32],
-    oh: usize,
-    ow: usize,
-    dim: usize,
-) {
-    let scale_h = ih as f32 / oh as f32;
-    let scale_w = iw as f32 / ow as f32;
-    for oy in 0..oh {
-        // align_corners=False source coordinate.
-        let sy = (oy as f32 + 0.5) * scale_h - 0.5;
-        let iy = sy.floor();
-        let fy = sy - iy;
-        let iy = iy as isize;
-        let wy = cubic_weights(fy);
-        for ox in 0..ow {
-            let sx = (ox as f32 + 0.5) * scale_w - 0.5;
-            let ix = sx.floor();
-            let fx = sx - ix;
-            let ix = ix as isize;
-            let wx = cubic_weights(fx);
-            for c in 0..dim {
-                let mut acc = 0.0f32;
-                for (m, &wym) in wy.iter().enumerate() {
-                    let yy = clamp_index(iy - 1 + m as isize, ih);
-                    for (n, &wxn) in wx.iter().enumerate() {
-                        let xx = clamp_index(ix - 1 + n as isize, iw);
-                        acc += wym * wxn * src[(yy * iw + xx) * dim + c];
-                    }
-                }
-                dst[(oy * ow + ox) * dim + c] = acc;
-            }
-        }
-    }
-}
-
-/// Keys bicubic convolution weights for fractional offset `t ∈ [0,1)`, `a=-0.75`.
-fn cubic_weights(t: f32) -> [f32; 4] {
-    let a = -0.75f32;
-    // Distances from the four neighbours at offsets -1,0,1,2 relative to floor.
-    let w0 = cubic_kernel(a, 1.0 + t);
-    let w1 = cubic_kernel(a, t);
-    let w2 = cubic_kernel(a, 1.0 - t);
-    let w3 = cubic_kernel(a, 2.0 - t);
-    [w0, w1, w2, w3]
-}
-
-/// The cubic convolution kernel value at distance `x` (≥0) with parameter `a`.
-fn cubic_kernel(a: f32, x: f32) -> f32 {
-    let x = x.abs();
-    if x <= 1.0 {
-        ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
-    } else if x < 2.0 {
-        (((x - 5.0) * x + 8.0) * x - 4.0) * a
-    } else {
-        0.0
-    }
-}
-
-/// Clamp `i` into `[0, n)` (edge replication, matching `F.interpolate` borders).
-fn clamp_index(i: isize, n: usize) -> usize {
-    if i < 0 {
-        0
-    } else if i as usize >= n {
-        n - 1
-    } else {
-        i as usize
-    }
 }
 
 /// Integer square root (largest `r` with `r*r <= v`).
@@ -1892,27 +1810,6 @@ mod tests {
 
         let table = vec![0.0f32; 2];
         assert_err_contains(abs_pos_for_len(&table, 1, 2, 0), "non-zero");
-    }
-
-    // ── bicubic kernel sanity ──────────────────────────────────────────────
-
-    #[test]
-    fn cubic_weights_partition_of_unity() {
-        for &t in &[0.0f32, 0.25, 0.5, 0.75, 0.999] {
-            let w = cubic_weights(t);
-            let s: f32 = w.iter().sum();
-            assert!((s - 1.0).abs() < 1e-5, "weights sum {s} != 1 at t={t}");
-        }
-    }
-
-    #[test]
-    fn cubic_weights_at_zero_is_unit_impulse() {
-        // t=0 -> sample sits on a source pixel; weights = [0,1,0,0].
-        let w = cubic_weights(0.0);
-        assert!((w[0]).abs() < 1e-6);
-        assert!((w[1] - 1.0).abs() < 1e-6);
-        assert!((w[2]).abs() < 1e-6);
-        assert!((w[3]).abs() < 1e-6);
     }
 
     // ── attention shape & residual structure ───────────────────────────────

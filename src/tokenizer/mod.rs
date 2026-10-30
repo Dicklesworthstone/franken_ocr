@@ -918,7 +918,7 @@ pub(super) fn utf8_char_len(lead: u8) -> usize {
 const UNICODE_TABLE_REGEN: () = ();
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A tiny synthetic `tokenizer.json` (no real 9.9 MB file). The base vocab
@@ -1257,13 +1257,15 @@ mod tests {
         sym
     }
 
-    fn byte_id(b: u8) -> u32 {
+    /// The synthetic byte tokenizer's id for byte `b` (also used by the
+    /// postprocess page-split tests).
+    pub(crate) fn byte_id(b: u8) -> u32 {
         1000 + u32::from(b)
     }
 
     /// A synthetic byte-level tokenizer: every byte as its own token (id 1000 +
     /// byte), the [`MULTI`] tokens, and the added tokens `<image>` and `<PAGE>`.
-    fn byte_tokenizer() -> Tokenizer {
+    pub(crate) fn byte_tokenizer() -> Tokenizer {
         byte_tokenizer_with(&[(special::IMAGE, "<image>", true), (PAGE, "<PAGE>", false)])
     }
 

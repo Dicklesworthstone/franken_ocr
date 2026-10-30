@@ -340,8 +340,9 @@ fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, 
             // check. Only a sole FlateDecode is inflated under this cap directly
             // (see `decompressed_stream`); LZW/ASCII85/chains keep lopdf's decoder.
             let cap = expected_sample_cap(width, height, bpc, color_space);
+            let sized = expected_sample_bytes(width, height, bpc, color_space);
             let sole_flate = !chained && terminal == "FlateDecode";
-            let samples = decompressed_stream(doc, img.id, img.content, sole_flate, cap)?;
+            let samples = decompressed_stream(doc, img.id, img.content, sole_flate, cap, sized)?;
             // /Indexed samples are palette indices, not color components: expand
             // them through the palette in the color-space array (GH#4 — lopdf's
             // `color_space` keeps only the array's first name, so the base +
@@ -368,12 +369,16 @@ fn decode_image_xobject(doc: &Document, img: &PdfImage) -> Result<DynamicImage, 
 /// most `cap + 1` bytes. Everything else (LZW, ASCII85, filter chains, or a
 /// `/Predictor > 1` that needs un-applying) falls back to `decompressed_content`;
 /// those paths keep lopdf's residual unbounded-inflate risk.
+///
+/// `sized` is the byte count the declared dimensions decode to
+/// ([`expected_sample_bytes`]); the bounded path allocates it up front.
 fn decompressed_stream(
     doc: &Document,
     id: ObjectId,
     raw: &[u8],
     sole_flate: bool,
     cap: u64,
+    sized: u64,
 ) -> Result<Vec<u8>, String> {
     let stream = doc
         .get_object(id)
@@ -385,7 +390,7 @@ fn decompressed_stream(
     // `?` still propagates a cap overrun (the bomb signal) before the `let Some`.
     if sole_flate
         && stream_predictor(stream) <= 1
-        && let Some(out) = bounded_inflate(raw, cap)?
+        && let Some(out) = bounded_inflate(raw, cap, sized)?
     {
         return Ok(out);
     }
@@ -420,9 +425,16 @@ fn stream_predictor(stream: &lopdf::Stream) -> i64 {
 /// — when `raw` is not valid standalone zlib, so the caller can fall back to lopdf's
 /// framing-tolerant decoder; a clean inflate that overruns `cap` is the bomb signal
 /// and is the only `Err`.
-fn bounded_inflate(raw: &[u8], cap: u64) -> Result<Option<Vec<u8>>, String> {
+///
+/// The output starts at `sized` bytes (at most `cap`), the size a well-formed
+/// stream inflates to. On an exact fit `read_to_end` probes for the end instead
+/// of doubling, so the raster is one allocation. A buffer grown by doubling
+/// leaves its freed blocks in the macOS allocator: walking 100 Flate pages
+/// grew the process footprint by about one raster per page, though no raster
+/// was kept (U2-D0).
+fn bounded_inflate(raw: &[u8], cap: u64, sized: u64) -> Result<Option<Vec<u8>>, String> {
     use std::io::Read;
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(usize::try_from(sized.min(cap)).unwrap_or(0));
     if flate2::read::ZlibDecoder::new(raw)
         .take(cap.saturating_add(1))
         .read_to_end(&mut out)
@@ -468,6 +480,23 @@ fn expected_sample_cap(width: u32, height: u32, bpc: i64, color_space: &str) -> 
         .saturating_mul(comps)
         .saturating_mul(bytes_per_comp)
         .saturating_mul(4)
+}
+
+/// The bytes a well-formed image of these dimensions decodes to: `height` rows
+/// of `ceil(width × components × bpc / 8)` bytes. A color space whose component
+/// count is not known here gives 0 (no size to plan for).
+fn expected_sample_bytes(width: u32, height: u32, bpc: i64, color_space: &str) -> u64 {
+    let comps: u64 = match color_space {
+        "DeviceGray" | "CalGray" | "Indexed" | "I" => 1,
+        "DeviceRGB" | "CalRGB" => 3,
+        "DeviceCMYK" => 4,
+        _ => return 0,
+    };
+    let row = u64::from(width)
+        .saturating_mul(comps)
+        .saturating_mul(bpc.clamp(1, 16) as u64)
+        .div_ceil(8);
+    row.saturating_mul(u64::from(height))
 }
 
 /// Build a [`DynamicImage`] from raw component samples.
@@ -1095,7 +1124,7 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // ── page selection ─────────────────────────────────────────────────────
@@ -1186,7 +1215,7 @@ mod tests {
         assert_eq!(outcome.duration(), std::time::Duration::from_millis(30));
     }
 
-    fn synth_page(w: u32, h: u32, text_cols: &[(u32, u32)]) -> DynamicImage {
+    pub(crate) fn synth_page(w: u32, h: u32, text_cols: &[(u32, u32)]) -> DynamicImage {
         // White canvas with black "text block" columns [x0, x1).
         let mut img = image::GrayImage::from_pixel(w, h, image::Luma([255u8]));
         for &(x0, x1) in text_cols {
@@ -1341,7 +1370,7 @@ mod tests {
     /// carry none. An image-free page is exactly the "born-digital vector page"
     /// the renderer refuses, so this builds a document with real skips in it
     /// without needing a JPEG-2000 fixture.
-    fn build_multi_page_pdf(pages_spec: &[Option<lopdf::Stream>]) -> std::path::PathBuf {
+    pub(crate) fn build_multi_page_pdf(pages_spec: &[Option<lopdf::Stream>]) -> std::path::PathBuf {
         use lopdf::{Object, dictionary};
 
         let mut doc = lopdf::Document::with_version("1.5");
@@ -1391,7 +1420,7 @@ mod tests {
     }
 
     /// A small JPEG image XObject, the "this page is a scan" case.
-    fn jpeg_xobject() -> lopdf::Stream {
+    pub(crate) fn jpeg_xobject() -> lopdf::Stream {
         use image::{ImageBuffer, Rgb};
         use lopdf::{Stream, dictionary};
         use std::io::Cursor;
@@ -1861,22 +1890,46 @@ mod tests {
 
         // Inflates within the cap → Ok(Some(bytes)).
         let small = zlib_of(1000);
-        let out = bounded_inflate(&small, 4096)
+        let out = bounded_inflate(&small, 4096, 0)
             .expect("no error")
             .expect("inflated");
         assert_eq!(out.len(), 1000);
 
+        // Sized to the stream, the output is one allocation of exactly that size.
+        let out = bounded_inflate(&small, 4096, 1000)
+            .expect("no error")
+            .expect("inflated");
+        assert_eq!((out.len(), out.capacity()), (1000, 1000));
+
         // A ~1000:1 "zip bomb" that inflates far past the cap → Err (the bomb signal),
         // having allocated at most cap + 1 bytes rather than the full inflation.
+        // A size hint past the cap is held to the cap.
         let bomb = zlib_of(1_000_000);
-        let err = bounded_inflate(&bomb, 4096).expect_err("bomb must be rejected");
+        let err = bounded_inflate(&bomb, 4096, u64::MAX).expect_err("bomb must be rejected");
         assert!(err.contains("cap"), "got: {err}");
 
         // Not standalone zlib → Ok(None) so the caller falls back to lopdf.
         assert!(
-            bounded_inflate(b"not a zlib stream", 4096)
+            bounded_inflate(b"not a zlib stream", 4096, 0)
                 .expect("no error")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn expected_sample_bytes_counts_packed_rows() {
+        assert_eq!(
+            expected_sample_bytes(1200, 1600, 8, "DeviceRGB"),
+            1200 * 1600 * 3
+        );
+        assert_eq!(
+            expected_sample_bytes(1200, 1600, 16, "DeviceGray"),
+            1200 * 1600 * 2
+        );
+        // Sub-byte rows round up per row: 10 one-bit pixels take 2 bytes.
+        assert_eq!(expected_sample_bytes(10, 3, 1, "DeviceGray"), 2 * 3);
+        assert_eq!(expected_sample_bytes(5, 2, 4, "Indexed"), 3 * 2);
+        // An unknown component count plans nothing.
+        assert_eq!(expected_sample_bytes(64, 64, 8, "Separation"), 0);
     }
 }

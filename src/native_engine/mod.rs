@@ -291,6 +291,9 @@ pub struct OcrModel {
     /// Lazily-built conservative recipe cache: int8 FFN/expert weights with
     /// high-precision attention and `lm_head`. Reused across every page.
     decoder_cache: FallibleOnce<decoder::DecoderWeightCache>,
+    /// Lazily-built all-f32 cache ([`DECODE_F32_ENV`]): Unlimited-OCR-2's
+    /// parity path. Built only when a document asks for it.
+    decoder_cache_f32: FallibleOnce<decoder::DecoderWeightCache>,
     /// Lazily-hydrated, then reused CLIP tower weights (bd-av64.10). Hydration
     /// widens ~300 M bf16 params to f32 and pre-transposes every linear into
     /// GEMM layout (~0.6 s, ~1.2 GB resident — the same residency the batched
@@ -373,8 +376,44 @@ const BASE_PROMPT_TEXT: &str = "document parsing.";
 
 /// Reference `infer_multi` task prompt (`'<image>Multi page parsing.'`,
 /// `modeling_unlimitedocr.py:1139` — the single `<image>` position carries ALL
-/// pages' token blocks; bd-1gv.25).
+/// pages' token blocks; bd-1gv.25). Unlimited-OCR-2's prompt ends with the
+/// same text, for one page as for many (MU:1073-1080).
 const MULTI_PAGE_PROMPT_TEXT: &str = "Multi page parsing.";
+
+/// The most pages Unlimited-OCR-2 parses in one unwindowed pass by default
+/// (U2-B6): `floor((131,072 − 64) / (274 + 1,900)) = 60`, i.e. 274 prompt
+/// tokens and at most 1,900 generated tokens per page within the position
+/// limit. A denser document can still reach the limit sooner; that stop is
+/// reported, never silent. U2-C4 re-derives it from measured page lengths and
+/// U2-D1b lifts it with windowing.
+pub const UOCR2_UNWINDOWED_PAGE_LIMIT: usize = 60;
+
+/// Unlimited-OCR-2's prompt (U2-B6; MU:531-580, 1073-1082): `bos`, then per
+/// page its `marker` and `image_tokens[p]` image slots, then the task `text`
+/// ids. Always this form, even for one page: no chat template and no caller
+/// `<image>` placeholders. The mask is `true` exactly at the image slots.
+fn paged_prompt(
+    bos: u32,
+    marker: u32,
+    image: u32,
+    image_tokens: &[usize],
+    text: &[u32],
+) -> (Vec<u32>, Vec<bool>) {
+    let total = 1 + image_tokens.iter().map(|n| n + 1).sum::<usize>() + text.len();
+    let mut ids = Vec::with_capacity(total);
+    let mut mask = Vec::with_capacity(total);
+    ids.push(bos);
+    mask.push(false);
+    for &n in image_tokens {
+        ids.push(marker);
+        mask.push(false);
+        ids.extend(std::iter::repeat_n(image, n));
+        mask.extend(std::iter::repeat_n(true, n));
+    }
+    ids.extend_from_slice(text);
+    mask.extend(std::iter::repeat_n(false, text.len()));
+    (ids, mask)
+}
 /// Reference `infer_multi` global-view edge (`image_size=640`, NOT the
 /// single-image 1024): every page is resized+padded to 640² Base mode, so the
 /// per-page placeholder block is `(10+1)·10 + 1 = 111` tokens (OQ-18).
@@ -428,6 +467,9 @@ pub enum FinishReason {
     Stop,
     /// A token or position limit stopped it first.
     Length,
+    /// An Unlimited-OCR-2 document's cooperative stage budget ran out
+    /// (`FOCR_STAGE_BUDGET_FORWARD_MS`, U2-B6).
+    Budget,
 }
 
 impl FinishReason {
@@ -437,6 +479,7 @@ impl FinishReason {
         match self {
             Self::Stop => "stop",
             Self::Length => "length",
+            Self::Budget => "budget",
         }
     }
 }
@@ -475,17 +518,237 @@ pub struct DecodeReport {
     pub decodes: usize,
     /// How many of those decodes stopped at a limit.
     pub length_stops: usize,
+    /// An Unlimited-OCR-2 document decode's per-page facts and counters.
+    pub document: Option<DocumentStats>,
+    /// The `ignored_lever` warnings the model's lever policy raised for this
+    /// run's environment (U2-A7), carried into the run's `warnings[]`.
+    pub admission_warnings: Vec<RunWarning>,
+}
+
+/// How one Unlimited-OCR-2 page body ended (U2-B6): its `finish`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageFinish {
+    /// The model opened the next page.
+    Marker,
+    /// The model ended the document.
+    Eos,
+    /// The per-page cap forced the next `<PAGE>`, or EOS on the last page.
+    PageCap,
+    /// The position limit stopped decoding inside this page.
+    Length,
+    /// The cooperative stage budget stopped decoding inside this page.
+    Budget,
+}
+
+impl PageFinish {
+    /// The robot/`--json` spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Marker => "marker",
+            Self::Eos => "eos",
+            Self::PageCap => "page_cap",
+            Self::Length => "length",
+            Self::Budget => "budget",
+        }
+    }
+}
+
+/// An Unlimited-OCR-2 document decode's per-page facts and counters (U2-B6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DocumentStats {
+    /// Per page the output reached, how its body ended.
+    pub page_finish: Vec<PageFinish>,
+    /// Generated ids per page body ([`postprocess::TokenPages::tokens`]).
+    pub page_tokens: Vec<usize>,
+    /// Non-blank text preceded the first `<PAGE>` and joined page 1
+    /// (DISC-U2-9).
+    pub leading_text: bool,
+    /// `<PAGE>` markers past the page count (DISC-U2-3).
+    pub extra_markers: usize,
+    /// Steps the page-count guard restricted to one token.
+    pub forced_steps: usize,
+    /// Forced steps where the n-gram had banned the forced token, so HF
+    /// would have emitted id 0 (DISC-U2-2).
+    pub hf_all_neg_inf_steps: usize,
+    /// KV blocks retired (U2-B4).
+    pub retired_blocks: usize,
+    /// Peak resident KV bytes, summed over the layers.
+    pub peak_kv_bytes: usize,
+    /// Reruns without retirement after the retirement detector fired.
+    pub retire_fallbacks: usize,
+}
+
+/// One document decode `pass(retire, budget_floor, ids, observer)`, first
+/// with block retirement as `retire`. If retirement's detector fires
+/// ([`srswa::retire_fallback`]), the pass runs again without retirement,
+/// which is deterministic: the observer sees each id once, the rerun must
+/// repeat every id the first pass emitted, and `retire_fallbacks` counts it
+/// (U2-B4, U2-B6). Any other error ends the decode.
+fn decode_with_retire_fallback(
+    retire: bool,
+    mut observer: Option<&mut dyn FnMut(u32)>,
+    mut pass: impl FnMut(
+        bool,
+        usize,
+        &mut Vec<u32>,
+        Option<&mut dyn FnMut(u32)>,
+    ) -> FocrResult<DocumentDecode>,
+) -> FocrResult<DocumentDecode> {
+    let mut first = Vec::new();
+    let error = match pass(
+        retire,
+        0,
+        &mut first,
+        observer.as_deref_mut().map(|f| f as &mut dyn FnMut(u32)),
+    ) {
+        Err(error) if srswa::retire_fallback(&error).is_some() => error,
+        done => return done,
+    };
+    timing_log(&format!(
+        "retire_fallback at step {}: {error:#}; decoding again without retirement",
+        first.len()
+    ));
+    let mut seen = 0usize;
+    let mut replay = |id: u32| {
+        seen += 1;
+        if seen > first.len()
+            && let Some(f) = observer.as_deref_mut()
+        {
+            f(id);
+        }
+    };
+    let mut ids = Vec::new();
+    // The rerun checks the budget only past the ids already observed, so it
+    // never ends inside what was streamed.
+    let mut decode = pass(false, first.len(), &mut ids, Some(&mut replay))?;
+    if !decode.ids.starts_with(&first) {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "the unretired rerun departs from the retired run before its detector fired \
+             (step {}): block retirement changed the output",
+            first.len()
+        )));
+    }
+    decode.stats.retire_fallbacks = 1;
+    Ok(decode)
+}
+
+/// How one pass of an Unlimited-OCR-2 document decode runs (U2-B6).
+#[derive(Debug, Clone, Copy)]
+struct DocumentPass {
+    /// Which decoder runs the pass.
+    precision: DocumentPrecision,
+    /// Block retirement on (it also needs the page guard).
+    retire: bool,
+    /// The cooperative stage budget's deadline.
+    deadline: Option<Instant>,
+    /// Ids the pass emits before it checks the deadline: a rerun first
+    /// repeats the ids its observer has already seen.
+    budget_floor: usize,
+}
+
+/// The page-count guard of a document decode over `pages` pages marked by
+/// `marker` (0 turns it off): the per-page cap is `max_page_tokens` (when
+/// > 0) within `max_length`, which in a document applies per page (D11).
+fn document_guard(pages: usize, marker: u32, params: &DecodeParams) -> sampler::PageGuard {
+    let page_cap = if params.max_page_tokens > 0 {
+        params.max_page_tokens.min(params.max_length)
+    } else {
+        params.max_length
+    };
+    sampler::PageGuard::new(pages, marker, params.eos_token_id, page_cap)
+}
+
+/// The decoder an Unlimited-OCR-2 document pass runs on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentPrecision {
+    /// The shipping cache: int8 FFN/experts, f32 attention, router and
+    /// `lm_head`.
+    Mixed,
+    /// [`DECODE_F32_ENV`]: the all-f32 cache.
+    CachedF32,
+    /// [`DECODE_STATELESS_ENV`]: the whole grown sequence re-run every step
+    /// on the all-f32 path, O(n²).
+    Stateless,
+}
+
+impl DocumentPrecision {
+    /// The decoder the environment asks for.
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] when both variables are set: each picks the
+    /// decoder.
+    fn from_env() -> FocrResult<Self> {
+        match (
+            std::env::var_os(DECODE_STATELESS_ENV).is_some(),
+            std::env::var_os(DECODE_F32_ENV).is_some(),
+        ) {
+            (true, true) => Err(FocrError::Usage(format!(
+                "{DECODE_STATELESS_ENV} and {DECODE_F32_ENV} each pick the decoder; set one"
+            ))),
+            (true, false) => Ok(Self::Stateless),
+            (false, true) => Ok(Self::CachedF32),
+            (false, false) => Ok(Self::Mixed),
+        }
+    }
+
+    /// The `precision` timing row's value.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Mixed => "focr-mixed-ffn-int8",
+            Self::CachedF32 => "f32-cached",
+            Self::Stateless => "f32-stateless",
+        }
+    }
+}
+
+/// The engine bound's margin over a cooperative document budget `budget`
+/// (U2-B6): the document loop checks its budget once per decode step, but
+/// vision and prefill run unbroken, so the engine's stage timeout waits this
+/// much longer before it discards the run. 30 s, or a quarter of the budget.
+pub(crate) fn document_budget_grace(budget: std::time::Duration) -> std::time::Duration {
+    (budget / 4).max(std::time::Duration::from_secs(30))
+}
+
+/// The model state an Unlimited-OCR-2 document decode advances (U2-B6).
+enum DocumentDecoder<'w> {
+    /// The conservative cached path: the SR-SWA caches and the last row.
+    Cached {
+        wc: &'w decoder::DecoderWeightCache,
+        state: srswa::SrSwaState,
+        hidden: Mat,
+    },
+    /// `FOCR_DECODE_STATELESS`: the grown sequence, re-run whole every step
+    /// on the all-f32 path, routed by `domain`.
+    Stateless {
+        embeds: Mat,
+        ids: Vec<u32>,
+        domain: srswa::EntmaxDomain,
+    },
+}
+
+/// One Unlimited-OCR-2 document decode ([`OcrModel::generate_document`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocumentDecode {
+    /// The generated ids; EOS is never appended (MU:1176-1178).
+    ids: Vec<u32>,
+    /// EOS, or the position limit.
+    finish_reason: FinishReason,
+    /// The decode's facts; `page_tokens`, `leading_text` and
+    /// `extra_markers` are filled by the split.
+    stats: DocumentStats,
 }
 
 impl DecodeReport {
     /// The run-level `finish_reason`: `length` when any decode since the last
-    /// take stopped at a limit.
+    /// take stopped at a limit, or `budget` when the last one ran out of its
+    /// stage budget (which ends the run).
     #[must_use]
     pub fn run_finish_reason(&self) -> FinishReason {
-        if self.length_stops > 0 {
-            FinishReason::Length
-        } else {
-            FinishReason::Stop
+        match (self.length_stops, self.finish_reason) {
+            (0, _) => FinishReason::Stop,
+            (_, FinishReason::Budget) => FinishReason::Budget,
+            _ => FinishReason::Length,
         }
     }
 }
@@ -513,11 +776,28 @@ pub enum WarningKind {
     PromptTooLong,
     /// A `FOCR_*` lever that reaches no path of the loaded model (U2-A7).
     IgnoredLever,
+    /// An Unlimited-OCR-2 document stopped at its position limit (U2-B6).
+    V2Length,
+    /// An Unlimited-OCR-2 document ran out of its stage budget (U2-B6).
+    V2Budget,
+    /// Text before the first generated `<PAGE>` joined page 1 (DISC-U2-9).
+    LeadingText,
+    /// A directory input held files that are not page images (U2-D0).
+    IgnoredFiles,
 }
 
 /// Every machine-stable `warnings[].kind` a run can report, in the robot
-/// schema's `warning_kinds` (U2-A7 registers `ignored_lever`).
-pub const RUN_WARNING_KINDS: &[&str] = &["v1_truncated", "v1_page_merge", "ignored_lever"];
+/// schema's `warning_kinds` (U2-A7 registers `ignored_lever`, U2-B6 the
+/// Unlimited-OCR-2 document kinds, U2-D0 `ignored_files`).
+pub const RUN_WARNING_KINDS: &[&str] = &[
+    "v1_truncated",
+    "v1_page_merge",
+    "ignored_lever",
+    "v2_length",
+    "v2_budget",
+    "leading_text",
+    "ignored_files",
+];
 
 /// The one actionable next step for each [`WarningKind`]: the single source
 /// U2-E4 extends with `focr pull unlimited-ocr-2` once v2 is published.
@@ -532,12 +812,27 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
             "parse pages independently (omit `--multi-page`) when page boundaries matter"
         }
         WarningKind::IgnoredLever => "unset it for this model's runs",
+        WarningKind::V2Length => {
+            "the completed pages were written; split the document with `--pages`, or parse \
+             pages independently (omit `--multi-page`)"
+        }
+        WarningKind::V2Budget => {
+            "the completed pages were written; raise FOCR_STAGE_BUDGET_FORWARD_MS (0 = \
+             unlimited), or select fewer pages with `--pages`"
+        }
+        WarningKind::LeadingText => {
+            "check the start of page 1: the model wrote text before its first page marker"
+        }
+        WarningKind::IgnoredFiles => {
+            "only page images are read (PNG, JPEG, TIFF, WebP, BMP, GIF, PNM); convert any of \
+             these files that belong to the document"
+        }
     }
 }
 
 /// One `warnings[]` entry: `{kind, message, recovery, ...kind-specific
 /// fields}` on `run_complete`, in `--json` and on stderr (U2-X2).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunWarning {
     /// Machine-stable kind (`v1_truncated`, `v1_page_merge`).
     pub kind: &'static str,
@@ -575,12 +870,24 @@ fn thousands(n: usize) -> String {
     out
 }
 
+/// A run's warnings from its last decode report: the model admission's
+/// `ignored_lever` warnings first, then an Unlimited-OCR-2 document's
+/// ([`document_warnings`]) or a v1 decode's ([`v1_page_warnings`]).
+#[must_use]
+pub fn decode_warnings(report: &DecodeReport) -> Vec<RunWarning> {
+    let mut warnings = report.admission_warnings.clone();
+    warnings.extend(match &report.document {
+        Some(stats) => document_warnings(report, stats),
+        None => v1_page_warnings(report),
+    });
+    warnings
+}
+
 /// The warnings a v1 decode earns (U2-X2): only multi-page decodes with fewer
 /// page bodies than pages warn. A length stop is a truncation, named by the
 /// limit that bound it; an EOS stop is a page merge. Single-page decodes
 /// report only their `finish_reason`.
-#[must_use]
-pub fn decode_warnings(report: &DecodeReport) -> Vec<RunWarning> {
+fn v1_page_warnings(report: &DecodeReport) -> Vec<RunWarning> {
     let Some(PageBodies { expected, bodies }) = report.pages else {
         return Vec::new();
     };
@@ -631,8 +938,79 @@ pub fn decode_warnings(report: &DecodeReport) -> Vec<RunWarning> {
             recovery: warning_recovery(WarningKind::V1PageMerge),
             fields,
         },
+        // Only Unlimited-OCR-2's document loop checks a budget, and its
+        // reports take `document_warnings`.
+        (FinishReason::Budget, _) => return Vec::new(),
     };
     vec![warning]
+}
+
+/// An Unlimited-OCR-2 document decode's warnings (U2-B6), never v1's: the
+/// head before the first `<PAGE>` joined to page 1 (DISC-U2-9), and a stop
+/// at the position limit or the stage budget, with the page bodies produced.
+fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWarning> {
+    let mut warnings = Vec::new();
+    if stats.leading_text {
+        warnings.push(RunWarning {
+            kind: "leading_text",
+            message: "text the model wrote before its first <PAGE> was joined to page 1".into(),
+            recovery: warning_recovery(WarningKind::LeadingText),
+            fields: serde_json::Map::new(),
+        });
+    }
+    let (expected, got) = report.pages.map_or((1, 0), |p| (p.expected, p.bodies));
+    let place = if got == 0 {
+        format!("before page 1 of {expected}")
+    } else {
+        format!("inside page {got} of {expected}")
+    };
+    let mut fields = serde_json::Map::new();
+    fields.insert("expected".into(), expected.into());
+    fields.insert("got".into(), got.into());
+    match report.finish_reason {
+        FinishReason::Stop => {}
+        FinishReason::Length => warnings.push(RunWarning {
+            kind: "v2_length",
+            message: format!(
+                "stopped {place}: unwindowed Unlimited-OCR-2 shares {} positions between prompt \
+                 and output",
+                thousands(report.max_positions)
+            ),
+            recovery: warning_recovery(WarningKind::V2Length),
+            fields,
+        }),
+        FinishReason::Budget => warnings.push(RunWarning {
+            kind: "v2_budget",
+            message: format!("stopped {place}: the forward stage budget ran out"),
+            recovery: warning_recovery(WarningKind::V2Budget),
+            fields,
+        }),
+    }
+    warnings
+}
+
+/// The partial-output error (exit 5) for a run whose Unlimited-OCR-2 decode
+/// stopped at its position limit or stage budget, carrying `warnings` (the
+/// run's, in order); `None` for every other run (U2-B6). The CLI returns it
+/// after writing the pages, so a short document never exits 0.
+#[must_use]
+pub fn partial_output(report: &DecodeReport, warnings: &[RunWarning]) -> Option<FocrError> {
+    report.document.as_ref()?;
+    let finish = report.run_finish_reason();
+    if finish == FinishReason::Stop {
+        return None;
+    }
+    let (expected, pages_out) = report.pages.map_or((1, 0), |p| (p.expected, p.bodies));
+    Some(FocrError::Partial(Box::new(crate::error::PartialOutput {
+        finish_reason: finish.as_str(),
+        pages_out,
+        warnings: warnings.iter().map(RunWarning::to_json).collect(),
+        message: format!(
+            "the document stopped early ({}) after {pages_out} of {expected} page bodies; the \
+             pages produced were written",
+            finish.as_str()
+        ),
+    })))
 }
 
 /// Streaming sink for completed multi-page bodies (bd-2z0y): called with the
@@ -652,6 +1030,12 @@ const MAX_NEW_TOKENS_ENV: &str = "FOCR_MAX_NEW_TOKENS";
 /// oracle: the cached path must emit the same tokens for the first 128 steps (the
 /// R-SWA ring window, before any generated-tail eviction).
 const DECODE_STATELESS_ENV: &str = "FOCR_DECODE_STATELESS";
+
+/// Decode an Unlimited-OCR-2 document on the all-f32 cache
+/// ([`decoder::DecoderWeightCache::build_srswa_f32`]): the stateless path's
+/// math with the KV kept, in linear time (U2-C2). Present ⇒ f32. It needs the
+/// raw checkpoint, and it excludes [`DECODE_STATELESS_ENV`].
+const DECODE_F32_ENV: &str = "FOCR_DECODE_F32";
 
 /// Default-on cache for the immutable Unlimited-OCR SAM/projector bundles.
 /// Falsy values restore the original per-page hydration wrappers for diagnosis
@@ -1079,6 +1463,25 @@ fn decode_params_from_env() -> DecodeParams {
         p.max_positions = *n;
     }
     apply_decode_overrides(&mut p, decode_overrides());
+    p
+}
+
+/// [`decode_params_from_env`] for `arch`. A paged model (Unlimited-OCR-2)
+/// takes its own position limit ([`sampler::UOCR2_MAX_POSITIONS`]) unless
+/// [`TEST_MAX_POSITIONS_ENV`] lowers it, its contract's per-page cap, and
+/// the entmax domain [`srswa::ENTMAX_ENV`] names (validated at admission,
+/// [`admit_for_inference`]).
+fn decode_params_for(arch: &dyn model_arch::ModelArch) -> DecodeParams {
+    let mut p = decode_params_from_env();
+    if let Some(pages) = arch.decode_contract().pages {
+        if !matches!(test_max_positions(), Ok(Some(_))) {
+            p.max_positions = sampler::UOCR2_MAX_POSITIONS;
+        }
+        p.max_page_tokens = pages.max_page_tokens;
+        if let Ok(domain) = srswa::entmax_domain() {
+            p.entmax_domain = *domain;
+        }
+    }
     p
 }
 
@@ -2184,13 +2587,30 @@ fn admit_for_inference(arch: &'static dyn model_arch::ModelArch) -> FocrResult<(
             warning.message, warning.recovery
         ));
     }
-    admission.verdict
+    admission.verdict?;
+    // A paged model routes by `FOCR_SRSWA_ENTMAX`: an unknown value is a
+    // usage error before a weight byte is read, so the decode params can
+    // rely on it ([`decode_params_for`]).
+    if arch.decode_contract().pages.is_some() {
+        srswa::entmax_domain()
+            .as_ref()
+            .map_err(|why| FocrError::Usage(why.clone()))?;
+    }
+    if arch.maturity() == model_arch::Maturity::Experimental {
+        crate::progress::stderr_message(format_args!(
+            "[focr] note: {} is experimental: not yet certified against its reference",
+            arch.id()
+        ));
+    }
+    Ok(())
 }
 
 /// The forward a model's single-image entry points run (U2-A7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ForwardRoute {
     UnlimitedV1,
+    /// Unlimited-OCR-2's document loop over one page (U2-B6).
+    UnlimitedV2,
     GotOcr2,
     SmolVlm2,
     OneChart,
@@ -2207,13 +2627,11 @@ fn forward_route(arch: &dyn model_arch::ModelArch) -> FocrResult<ForwardRoute> {
         (Decoder::DeepSeekV2MoeRswa, Some(UnlimitedVariant::V1Rswa)) => {
             Some(ForwardRoute::UnlimitedV1)
         }
-        // The SR-SWA decoder exists (U2-B5); the prompt and decode contract
-        // that drive it from an image do not yet.
+        // Unlimited-OCR-2 reads one page through its document loop (U2-B6),
+        // never v1's R-SWA forward; refused while it is planned.
         (Decoder::DeepSeekV2MoeSrSwa, Some(UnlimitedVariant::V2SrSwa)) => {
-            return Err(FocrError::NotImplemented(format!(
-                "{} has no forward in this build (U2-B6); it never runs v1's R-SWA forward",
-                arch.id()
-            )));
+            OcrModel::ensure_arch_implemented(arch)?;
+            Some(ForwardRoute::UnlimitedV2)
         }
         (Decoder::Qwen2Dense, None) if arch.id() == "got-ocr2" => Some(ForwardRoute::GotOcr2),
         (Decoder::LlamaDense, None) if arch.id() == "smolvlm2" => Some(ForwardRoute::SmolVlm2),
@@ -2239,17 +2657,15 @@ fn forward_route(arch: &dyn model_arch::ModelArch) -> FocrResult<ForwardRoute> {
     )))
 }
 
-/// Admit `arch` to multi-page cross-page parsing (`infer_multi`): only v1
-/// enters v1's 640-squash R-SWA multi-page loop. v2 waits for its own
-/// document loop (U2-B6); the zoo parses pages independently.
+/// Admit `arch` to multi-page cross-page parsing (`infer_multi`): v1 enters
+/// v1's 640-squash R-SWA multi-page loop and v2 its own document loop
+/// ([`OcrModel::decode_document`], U2-B6), each once implemented; the zoo
+/// parses pages independently.
 fn multi_page_route(arch: &dyn model_arch::ModelArch) -> FocrResult<()> {
     match arch.unlimited_variant() {
-        Some(model_arch::UnlimitedVariant::V1Rswa) => OcrModel::ensure_arch_implemented(arch),
-        Some(model_arch::UnlimitedVariant::V2SrSwa) => Err(FocrError::NotImplemented(format!(
-            "{} multi-page parsing runs its own document loop, which this build does not have \
-             (U2-B6); it never runs v1's multi-page loop",
-            arch.id()
-        ))),
+        Some(model_arch::UnlimitedVariant::V1Rswa | model_arch::UnlimitedVariant::V2SrSwa) => {
+            OcrModel::ensure_arch_implemented(arch)
+        }
         None => Err(FocrError::NotImplemented(format!(
             "multi-page cross-page parsing (infer_multi) is the Unlimited-OCR contract; model \
              {:?} parses pages independently (use the plain multi-input/batch path)",
@@ -2792,9 +3208,10 @@ impl OcrModel {
             sidecars,
             arch,
             weights,
-            decode_params: decode_params_from_env(),
+            decode_params: decode_params_for(arch),
             decoder_cache_i8: FallibleOnce::new(),
             decoder_cache: FallibleOnce::new(),
+            decoder_cache_f32: FallibleOnce::new(),
             clip_cache: FallibleOnce::new(),
             unlimited_vision: FallibleOnce::new(),
             got_statics: FallibleOnce::new(),
@@ -2867,7 +3284,7 @@ impl OcrModel {
             ForwardRoute::Tromr => {
                 return self.forward_tromr(&preprocess::decode_path(image_path)?);
             }
-            ForwardRoute::UnlimitedV1 => {}
+            ForwardRoute::UnlimitedV1 | ForwardRoute::UnlimitedV2 => {}
         }
         let t = Instant::now();
         // ── 1. preprocess (decode file → normalize → tile) ───────────────────
@@ -2898,7 +3315,7 @@ impl OcrModel {
             ForwardRoute::SmolVlm2 => return self.forward_smolvlm2(&img),
             ForwardRoute::OneChart => return self.forward_onechart(&img),
             ForwardRoute::Tromr => return self.forward_tromr(&img),
-            ForwardRoute::UnlimitedV1 => {}
+            ForwardRoute::UnlimitedV1 | ForwardRoute::UnlimitedV2 => {}
         }
         let t = Instant::now();
         progress::emit("preprocess", 0, 0);
@@ -3165,6 +3582,13 @@ impl OcrModel {
         // mis-running the Unlimited-OCR pipeline on foreign weights.
         Self::ensure_arch_implemented(self.arch())?;
         let (image_w, image_h) = Self::image_dims(&pre);
+        if self.arch().decode_contract().pages.is_some() {
+            // Unlimited-OCR-2: a document of one page; its body is the text.
+            let split = self.decode_document(std::slice::from_ref(&pre), None)?;
+            progress::emit("postprocess", 0, 0);
+            let body = split.bodies.into_iter().next().unwrap_or_default();
+            return Ok((body, image_w, image_h));
+        }
 
         // ── vision tower (SAM⊕CLIP -> bridge projector 2048->1280) ───────────
         let tv = Instant::now();
@@ -3390,18 +3814,56 @@ impl OcrModel {
             )));
         }
         multi_page_route(self.arch())?;
+        self.check_document_pages(image_paths.len(), true)?;
 
-        // ── per-page Base-640 preprocess (multi-page forces no-crop, §2.4) ──
+        // ── per-page preprocess (multi-page forces no-crop, §2.4) ───────────
+        // `infer_multi` loads each page with `load_image`, which applies its
+        // EXIF orientation (SPEC-020, MU:27-34 via `load_pil_images`).
         let mut pres = Vec::with_capacity(image_paths.len());
         for path in image_paths {
-            let img = image::open(path)
-                .map_err(|e| FocrError::InputDecode(format!("{}: {e}", path.display())))?;
-            pres.push(preprocess::preprocess_dynamic_squash(
-                img,
-                MULTI_PAGE_BASE_SIZE,
-            )?);
+            pres.push(self.document_page(preprocess::decode_path(path)?)?);
         }
         self.recognize_multi_page_pres(pres, None)
+    }
+
+    /// One document page's preprocess: v1's Base-640 squash, or a paged
+    /// model's base letterbox (Unlimited-OCR-2 reads a document page like a
+    /// single page, never squashed; U2-B7).
+    fn document_page(&self, img: image::DynamicImage) -> FocrResult<Preprocessed> {
+        if self.arch().decode_contract().pages.is_some() {
+            let base_size = preprocess_mode().base_size();
+            preprocess::preprocess_dynamic(
+                img,
+                preprocess::PreprocessMode::Base { base_size },
+                preprocess_profile(self.arch()),
+            )
+        } else {
+            preprocess::preprocess_dynamic_squash(img, MULTI_PAGE_BASE_SIZE)
+        }
+    }
+
+    /// Refuse a paged model's unwindowed document over
+    /// [`UOCR2_UNWINDOWED_PAGE_LIMIT`] pages before any image is read, unless
+    /// `enforce` is off (an explicit unwindowed request, which then relies on
+    /// the reported position stop). Other models pass.
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] (exit 2) naming the limit and the remedy.
+    fn check_document_pages(&self, pages: usize, enforce: bool) -> FocrResult<()> {
+        if !enforce
+            || pages <= UOCR2_UNWINDOWED_PAGE_LIMIT
+            || self.arch().decode_contract().pages.is_none()
+        {
+            return Ok(());
+        }
+        Err(FocrError::Usage(format!(
+            "{} parses at most {UOCR2_UNWINDOWED_PAGE_LIMIT} pages in one pass (its {} \
+             position limit); this document has {pages}. Select at most \
+             {UOCR2_UNWINDOWED_PAGE_LIMIT} pages with `--pages`, or parse pages independently \
+             (omit `--multi-page`)",
+            self.arch().id(),
+            thousands(sampler::UOCR2_MAX_POSITIONS),
+        )))
     }
 
     /// [`Self::recognize_multi_page`] over in-memory images — the PDF path's
@@ -3419,12 +3881,10 @@ impl OcrModel {
             )));
         }
         multi_page_route(self.arch())?;
+        self.check_document_pages(images.len(), true)?;
         let mut pres = Vec::with_capacity(images.len());
         for img in images {
-            pres.push(preprocess::preprocess_dynamic_squash(
-                img,
-                MULTI_PAGE_BASE_SIZE,
-            )?);
+            pres.push(self.document_page(img)?);
         }
         self.recognize_multi_page_pres(pres, None)
     }
@@ -3449,14 +3909,53 @@ impl OcrModel {
             )));
         }
         multi_page_route(self.arch())?;
+        self.check_document_pages(images.len(), true)?;
         let mut pres = Vec::with_capacity(images.len());
         for img in images {
-            pres.push(preprocess::preprocess_dynamic_squash(
-                img,
-                MULTI_PAGE_BASE_SIZE,
-            )?);
+            pres.push(self.document_page(img)?);
         }
         self.recognize_multi_page_pres(pres, Some(on_page))
+    }
+
+    /// [`Self::recognize_multi_page`] over a lazy
+    /// [`crate::page_source::PageSource`] (U2-D0): each page is rasterized,
+    /// preprocessed and dropped before the next is read, so the pass holds
+    /// one raster at a time, never the whole document. Every page reaches
+    /// `on_item` before it is read; a page that did not rasterize is left out
+    /// of the prompt. `on_page` streams page bodies as
+    /// [`Self::recognize_multi_page_dynamic_streaming`] does.
+    ///
+    /// # Errors
+    /// As [`Self::recognize_multi_page`]; when no page rasterized, the first
+    /// page's raster error.
+    #[cfg(feature = "pdf")]
+    pub fn recognize_multi_page_source(
+        &self,
+        source: &mut crate::page_source::PageSource,
+        on_item: &mut dyn FnMut(&crate::page_source::PageItem),
+        on_page: Option<PageSink<'_>>,
+    ) -> FocrResult<String> {
+        multi_page_route(self.arch())?;
+        self.check_document_pages(source.len(), true)?;
+        let mut pres = Vec::with_capacity(source.len());
+        let mut first_error: Option<FocrError> = None;
+        for item in source.by_ref() {
+            on_item(&item);
+            match item.raster {
+                Ok(img) => pres.push(self.document_page(img)?),
+                Err(e) => {
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if pres.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                FocrError::InputDecode("the page source yielded no pages".into())
+            }));
+        }
+        // Split spreads can make more logical pages than source pages.
+        self.check_document_pages(pres.len(), true)?;
+        self.recognize_multi_page_pres(pres, on_page)
     }
 
     /// The shared multi-page core (bd-1gv.25): per-page vision, ONE fused
@@ -3468,6 +3967,10 @@ impl OcrModel {
         on_page: Option<PageSink<'_>>,
     ) -> FocrResult<String> {
         let _admission = forward_admission().acquire();
+        if self.arch().decode_contract().pages.is_some() {
+            let split = self.decode_document(&pres, on_page)?;
+            return Ok(postprocess::finalize_pages(&split.bodies, pres.len()));
+        }
         // ── vision tower per page, sequential (§6.5: one live forward) ──────
         let tv = Instant::now();
         let mut globals: Vec<Mat> = Vec::with_capacity(pres.len());
@@ -3586,6 +4089,435 @@ impl OcrModel {
             });
         }
         postprocess::finalize_multi(&decoded, pres.len())
+    }
+
+    /// Unlimited-OCR-2's document parse (U2-B6) up to the page split: the
+    /// paged prompt over `pres` ([`Self::document_inputs`]), one guarded
+    /// decode ([`Self::generate_document`]), and its ids split into one body
+    /// per page by token id ([`postprocess::split_pages_by_token`]). One
+    /// page is a document of one. Records the [`DecodeReport`] with its
+    /// [`DocumentStats`]; `on_page` gets each page's body as the page ends
+    /// ([`postprocess::TokenPageStream`]). The caller holds the forward
+    /// admission.
+    ///
+    /// # Errors
+    /// A model without a page contract, a prompt that leaves no position to
+    /// generate, or any vision, decode or split error.
+    fn decode_document(
+        &self,
+        pres: &[Preprocessed],
+        on_page: Option<PageSink<'_>>,
+    ) -> FocrResult<postprocess::TokenPages> {
+        let Some(paging) = self.arch().decode_contract().pages else {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "{} has no page contract, so no document loop",
+                self.arch().id()
+            )));
+        };
+        // The cooperative budget (U2-B6, D11): the per-page forward budget
+        // times the page count, from here, checked once per decode step.
+        let deadline = crate::forward_stage_budget().and_then(|per_page| {
+            let pages = u32::try_from(pres.len().max(1)).unwrap_or(u32::MAX);
+            Instant::now().checked_add(per_page.checked_mul(pages)?)
+        });
+        let params = self.document_params(pres.len());
+        // The layout alone fixes the prompt length: refuse before any weight.
+        let (layout, _) = self.build_prompt_multi(pres)?;
+        if layout.len() + 1 > params.max_positions {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "the {}-page prompt is {} tokens, over the {} position limit with no room to \
+                 generate; {}",
+                pres.len(),
+                thousands(layout.len()),
+                thousands(params.max_positions),
+                warning_recovery(WarningKind::PromptTooLong),
+            )));
+        }
+        let (inputs_embeds, prompt_ids) = self.document_inputs(pres)?;
+        let tok = self.tokenizer()?;
+        let decode = match on_page {
+            None => self.generate_document(&inputs_embeds, &prompt_ids, &params, deadline, None)?,
+            Some(on_page) => {
+                let mut stream =
+                    postprocess::TokenPageStream::new(tok, paging.marker_id, pres.len());
+                let mut observer = |id: u32| stream.push(id, &mut *on_page);
+                let decode = self.generate_document(
+                    &inputs_embeds,
+                    &prompt_ids,
+                    &params,
+                    deadline,
+                    Some(&mut observer),
+                )?;
+                stream.finish(&mut *on_page);
+                decode
+            }
+        };
+        let split =
+            postprocess::split_pages_by_token(tok, &decode.ids, paging.marker_id, pres.len())?;
+        let mut stats = decode.stats;
+        stats.page_tokens.clone_from(&split.tokens);
+        stats.leading_text = split.leading_text;
+        stats.extra_markers = split.extra_markers;
+        timing_log(&format!(
+            "document {} pages: {} tokens, finish {}, pages {:?}, forced {}, hf-id-0 {}, \
+             retired {} blocks, peak kv {} bytes, retire fallbacks {}",
+            pres.len(),
+            decode.ids.len(),
+            decode.finish_reason.as_str(),
+            stats
+                .page_finish
+                .iter()
+                .map(|f| f.as_str())
+                .collect::<Vec<_>>(),
+            stats.forced_steps,
+            stats.hf_all_neg_inf_steps,
+            stats.retired_blocks,
+            stats.peak_kv_bytes,
+            stats.retire_fallbacks,
+        ));
+        if let Ok(mut slot) = self.last_decode.lock() {
+            let (decodes, length_stops) = slot
+                .as_ref()
+                .map_or((0, 0), |prior| (prior.decodes, prior.length_stops));
+            let length = decode.finish_reason == FinishReason::Length;
+            let stopped = decode.finish_reason != FinishReason::Stop;
+            *slot = Some(DecodeReport {
+                ids: decode.ids,
+                finish_reason: decode.finish_reason,
+                cap: length.then_some(LengthCap::Positions),
+                pages: Some(PageBodies {
+                    expected: pres.len(),
+                    bodies: split.bodies.len(),
+                }),
+                max_length: params.max_length,
+                max_positions: params.max_positions,
+                decodes: decodes + 1,
+                length_stops: length_stops + usize::from(stopped),
+                document: Some(stats),
+                admission_warnings: lever_policy::admit_from_process(self.arch()).warnings,
+            });
+        }
+        Ok(split)
+    }
+
+    /// Unlimited-OCR-2's prompt ids and `inputs_embeds` over `pres` (U2-B6):
+    /// the paged prompt ([`paged_prompt`]) with each page's vision block
+    /// scattered into its image slots. One page may be a gundam view; a
+    /// document's pages are base views (MU:1110-1124).
+    ///
+    /// # Errors
+    /// An empty page list, a tiled page in a document, or any vision or
+    /// connector error.
+    fn document_inputs(&self, pres: &[Preprocessed]) -> FocrResult<(Mat, Vec<u32>)> {
+        let tv = Instant::now();
+        if let [pre] = pres {
+            let features = self.vision_tower(pre)?;
+            timing_log(&format!("vision_tower {:.2}s", tv.elapsed().as_secs_f64()));
+            return self.build_inputs_embeds(pre, &features);
+        }
+        let Some(first) = pres.first() else {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "a document needs at least one page"
+            )));
+        };
+        let mut globals = Vec::with_capacity(pres.len());
+        for (i, pre) in pres.iter().enumerate() {
+            let mut features = self.vision_tower(pre)?;
+            if pre.crop_grid.is_tiled() || features.len() != 1 {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "document page {} is not one base view ({} vision blocks)",
+                    i + 1,
+                    features.len()
+                )));
+            }
+            globals.push(features.remove(0));
+        }
+        timing_log(&format!(
+            "document.vision ({} pages) {:.2}s",
+            pres.len(),
+            tv.elapsed().as_secs_f64()
+        ));
+        let (prompt_ids, images_seq_mask) = self.build_prompt_multi(pres)?;
+        let mut inputs_embeds = self.embed_prompt(&prompt_ids)?;
+        connector::fuse_no_crop(
+            &self.weights,
+            &mut inputs_embeds,
+            &globals,
+            Self::global_grid_h(first),
+            Self::global_grid_w(first),
+            &Self::image_newline(&self.weights)?,
+            &Self::view_seperator(&self.weights)?,
+            &images_seq_mask,
+        )?;
+        Ok((inputs_embeds, prompt_ids))
+    }
+
+    /// The decode params of an Unlimited-OCR-2 document of `pages` pages: the
+    /// engine's, with the n-gram window 128 for one page and 1024 for more
+    /// (D10) unless `--ngram-window` set one (`0` then means 100,
+    /// [`sampler::uocr2_ngram_window`]).
+    fn document_params(&self, pages: usize) -> DecodeParams {
+        let default_window = if pages > 1 {
+            sampler::NGRAM_WINDOW_MULTI
+        } else {
+            sampler::NGRAM_WINDOW_SINGLE
+        };
+        DecodeParams {
+            ngram_window: decode_overrides().ngram_window.unwrap_or(default_window),
+            ..self.decode_params.clone()
+        }
+    }
+
+    /// Unlimited-OCR-2's document decode (U2-B6; MU:1124-1200) over the paged
+    /// prompt `prompt_ids`, whose rows are `inputs_embeds`.
+    ///
+    /// Prefill once; then per step `lm_head` on the last row, the
+    /// generated-only n-gram ban and the page-count guard with forced tokens
+    /// authoritative ([`sampler::decode_step_guarded`], DISC-U2-2), and the
+    /// greedy argmax. EOS ends the decode without joining the ids; the
+    /// position limit (`pos + 1 >= max_positions`) ends it as `length`. The
+    /// per-page cap is `max_page_tokens` (when > 0) within `max_length`, which
+    /// in a document applies per page, never to the whole output (D11).
+    ///
+    /// While the guard runs, block retirement (U2-B4) frees dead KV blocks
+    /// each step unless [`srswa::RETIRE_ENV`] turns it off. If its detector
+    /// fires, the document is decoded again without retirement, which is
+    /// deterministic: the rerun repeats every id the observer already saw,
+    /// which it does not see twice, and `retire_fallbacks` counts the rerun.
+    ///
+    /// # Errors
+    /// Any decode error, or a rerun that departs from the ids before the
+    /// detector fired.
+    fn generate_document(
+        &self,
+        inputs_embeds: &Mat,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        deadline: Option<Instant>,
+        observer: Option<&mut dyn FnMut(u32)>,
+    ) -> FocrResult<DocumentDecode> {
+        let precision = DocumentPrecision::from_env()?;
+        decode_with_retire_fallback(
+            srswa::retire_enabled(),
+            observer,
+            |retire, budget_floor, ids, observer| {
+                let pass = DocumentPass {
+                    precision,
+                    retire,
+                    deadline,
+                    budget_floor,
+                };
+                self.generate_document_once(inputs_embeds, prompt_ids, params, pass, ids, observer)
+            },
+        )
+    }
+
+    /// Whether this model's forward checks `FOCR_STAGE_BUDGET_FORWARD_MS`
+    /// itself and stops with its completed pages (Unlimited-OCR-2's document
+    /// loop, U2-B6), so the engine's stage timeout is only a backstop.
+    pub(crate) fn checks_forward_budget(&self) -> bool {
+        self.arch().decode_contract().pages.is_some()
+    }
+
+    /// The next token's `[1, vocab]` logits from a document decode's state.
+    fn document_logits(&self, decoder_state: &DocumentDecoder<'_>) -> FocrResult<Mat> {
+        match decoder_state {
+            DocumentDecoder::Cached { wc, hidden, .. } => decoder::lm_head_cached(wc, hidden),
+            DocumentDecoder::Stateless {
+                embeds,
+                ids,
+                domain,
+            } => {
+                let coords = srswa::PageCoords::build(ids)?;
+                let h = decoder::forward_srswa(&self.weights, embeds, &coords, *domain)?;
+                decoder::lm_head(&self.weights, &Self::last_hidden_row(&h)?)
+            }
+        }
+    }
+
+    /// One pass of [`Self::generate_document`], with block retirement on when
+    /// `pass.retire` (and the guard runs). `ids` holds the generated ids so
+    /// far, also when an error ends the pass. Past `pass.deadline` (and its
+    /// floor) the pass ends as [`FinishReason::Budget`].
+    fn generate_document_once(
+        &self,
+        inputs_embeds: &Mat,
+        prompt_ids: &[u32],
+        params: &DecodeParams,
+        pass: DocumentPass,
+        ids: &mut Vec<u32>,
+        mut observer: Option<&mut dyn FnMut(u32)>,
+    ) -> FocrResult<DocumentDecode> {
+        let Some(paging) = self.arch().decode_contract().pages else {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "{} has no page contract",
+                self.arch().id()
+            )));
+        };
+        let pages = prompt_ids
+            .iter()
+            .filter(|&&id| id == paging.marker_id)
+            .count();
+        let prompt_len = prompt_ids.len();
+        let table = self.embed_table()?;
+        let hidden_dim = inputs_embeds.cols;
+        let mut guard = document_guard(
+            if paging.guard { pages } else { 0 },
+            paging.marker_id,
+            params,
+        );
+        // Past the deadline, once `generated` ids reach the pass's floor.
+        let budget_spent = |generated: usize| {
+            generated >= pass.budget_floor && pass.deadline.is_some_and(|d| Instant::now() >= d)
+        };
+        ids.clear();
+        // A budget already spent (by vision) skips the decoder cache and the
+        // prefill: the document stops before its first id.
+        if budget_spent(0) {
+            timing_log("forward stage budget ran out before the prefill");
+            return Ok(DocumentDecode {
+                ids: Vec::new(),
+                finish_reason: FinishReason::Budget,
+                stats: DocumentStats {
+                    page_finish: vec![PageFinish::Budget],
+                    ..DocumentStats::default()
+                },
+            });
+        }
+
+        // Prefill: a cached path (the conservative cache, or the all-f32 one),
+        // or the all-f32 re-forward of the whole grown sequence every step
+        // (O(n²), the parity oracle).
+        let tp = Instant::now();
+        progress::emit("prefill", 0, prompt_len as u64);
+        timing_log(&format!("precision {}", pass.precision.name()));
+        let mut decoder_state = if pass.precision == DocumentPrecision::Stateless {
+            DocumentDecoder::Stateless {
+                embeds: inputs_embeds.clone(),
+                ids: prompt_ids.to_vec(),
+                domain: params.entmax_domain,
+            }
+        } else {
+            let wc = if pass.precision == DocumentPrecision::CachedF32 {
+                self.decoder_cache_f32()?
+            } else {
+                self.decoder_cache()?
+            };
+            let coords = srswa::PageCoords::build(prompt_ids)?;
+            let (hidden, mut state) = decoder::prefill_with_cache_srswa(
+                wc,
+                inputs_embeds,
+                &coords,
+                params.entmax_domain,
+            )?;
+            state.set_retire(pass.retire && guard.enabled());
+            DocumentDecoder::Cached {
+                wc,
+                state,
+                hidden: Self::last_hidden_row(&hidden)?,
+            }
+        };
+        let mut logits = self.document_logits(&decoder_state)?;
+        progress::emit("prefill", prompt_len as u64, prompt_len as u64);
+        timing_log(&format!(
+            "prefill {:.2}s ({prompt_len} tokens)",
+            tp.elapsed().as_secs_f64()
+        ));
+        let room = params.max_positions.saturating_sub(prompt_len);
+        let mut stats = DocumentStats::default();
+        let mut finish_reason = FinishReason::Length;
+        let td = Instant::now();
+        loop {
+            crate::cancel_checkpoint()?;
+            if budget_spent(ids.len()) {
+                if stats.page_finish.len() < pages.max(1) {
+                    stats.page_finish.push(PageFinish::Budget);
+                }
+                finish_reason = FinishReason::Budget;
+                timing_log(&format!(
+                    "forward stage budget ran out after {} generated tokens",
+                    ids.len()
+                ));
+                break;
+            }
+            let at_cap = guard.at_cap();
+            let step = sampler::decode_step_guarded(&logits, ids, &guard, params)?;
+            stats.forced_steps += usize::from(step.forced);
+            stats.hf_all_neg_inf_steps += usize::from(step.hf_all_neg_inf);
+            if step.is_eos {
+                if stats.page_finish.len() < pages.max(1) {
+                    stats.page_finish.push(if at_cap {
+                        PageFinish::PageCap
+                    } else {
+                        PageFinish::Eos
+                    });
+                }
+                finish_reason = FinishReason::Stop;
+                break;
+            }
+            let id = step.token_id;
+            if id as usize >= table.rows() {
+                return Err(FocrError::Other(anyhow::anyhow!(
+                    "decoded token id {id} outside the embed vocab {}",
+                    table.rows()
+                )));
+            }
+            ids.push(id);
+            guard.observe(id);
+            // A marker after the first closes the page before it.
+            if id == paging.marker_id && guard.markers() >= 2 && stats.page_finish.len() < pages {
+                stats.page_finish.push(if at_cap {
+                    PageFinish::PageCap
+                } else {
+                    PageFinish::Marker
+                });
+            }
+            progress::emit("decode", ids.len() as u64, room as u64);
+            if let Some(f) = observer.as_deref_mut() {
+                f(id);
+            }
+            // MU:1183-1185: the row just emitted sits at prompt_len + len − 1.
+            if prompt_len + ids.len() >= params.max_positions {
+                if stats.page_finish.len() < pages.max(1) {
+                    stats.page_finish.push(PageFinish::Length);
+                }
+                break;
+            }
+            let row = table.row_f32(id as usize);
+            match &mut decoder_state {
+                DocumentDecoder::Cached { wc, state, hidden } => {
+                    let row = Mat::from_vec(1, hidden_dim, row);
+                    let forced_next = matches!(guard.verdict(), sampler::GuardVerdict::Force(_));
+                    let h =
+                        decoder::decode_step_with_cache_srswa(wc, state, id, &row, forced_next)?;
+                    *hidden = Self::last_hidden_row(&h)?;
+                }
+                DocumentDecoder::Stateless {
+                    embeds, ids: grown, ..
+                } => {
+                    let mut data = std::mem::take(&mut embeds.data);
+                    data.extend(row);
+                    *embeds = Mat::from_vec(embeds.rows + 1, hidden_dim, data);
+                    grown.push(id);
+                }
+            }
+            logits = self.document_logits(&decoder_state)?;
+        }
+        if let DocumentDecoder::Cached { state, .. } = &decoder_state {
+            stats.retired_blocks = state.dead_blocks();
+            stats.peak_kv_bytes = state.peak_bytes();
+        }
+        timing_log(&format!(
+            "decode {:.2}s ({} tokens, {:.3}s/tok)",
+            td.elapsed().as_secs_f64(),
+            ids.len(),
+            td.elapsed().as_secs_f64() / (ids.len().max(1) as f64)
+        ));
+        Ok(DocumentDecode {
+            ids: ids.clone(),
+            finish_reason,
+            stats,
+        })
     }
 
     #[must_use]
@@ -3910,6 +4842,30 @@ impl OcrModel {
                     decoder::DecoderWeightCache::build(&self.weights)
                 }
             })
+    }
+
+    /// Unlimited-OCR-2's all-f32 cache ([`DECODE_F32_ENV`]), built once.
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] for another model; otherwise as
+    /// [`decoder::DecoderWeightCache::build_srswa_f32`], which refuses a
+    /// quantized artifact.
+    fn decoder_cache_f32(&self) -> FocrResult<&decoder::DecoderWeightCache> {
+        if self.arch().unlimited_variant() != Some(model_arch::UnlimitedVariant::V2SrSwa) {
+            return Err(FocrError::Usage(format!(
+                "{DECODE_F32_ENV} decodes Unlimited-OCR-2 documents; {} has no all-f32 cache",
+                self.arch().id()
+            )));
+        }
+        self.decoder_cache_f32.get_or_try_init(|| {
+            let t = Instant::now();
+            let built = decoder::DecoderWeightCache::build_srswa_f32(&self.weights)?;
+            timing_log(&format!(
+                "decoder f32 cache {:.2}s",
+                t.elapsed().as_secs_f64()
+            ));
+            Ok(built)
+        })
     }
 
     /// The lazily-hydrated CLIP tower weights (bd-av64.10), built once per
@@ -4541,6 +5497,8 @@ impl OcrModel {
                 max_positions: params.max_positions,
                 decodes: decodes + 1,
                 length_stops: length_stops + usize::from(!stopped),
+                document: None,
+                admission_warnings: Vec::new(),
             });
         }
         Ok(generated)
@@ -5163,6 +6121,10 @@ impl OcrModel {
     /// # Errors
     /// Propagates [`Self::tokenizer`] (the BPE load) or `encode` failures.
     fn build_prompt(&self, pre: &Preprocessed) -> FocrResult<(Vec<u32>, Vec<bool>)> {
+        if self.arch().decode_contract().pages.is_some() {
+            // A paged model reads one page through its document prompt.
+            return self.build_prompt_multi(std::slice::from_ref(pre));
+        }
         let tok = self.tokenizer()?;
         let n_image = pre.placeholder_token_count();
         let text = tok.encode(BASE_PROMPT_TEXT)?;
@@ -5188,9 +6150,25 @@ impl OcrModel {
     /// `<image>` position, each block already carrying its own trailing
     /// separator token (the `+ 1` in the per-page census, identical in shape
     /// to the single-image 273-slot block, just at base 640 ⇒ 111 slots).
+    ///
+    /// A paged model (Unlimited-OCR-2) instead opens every page's block with
+    /// its marker ([`paged_prompt`]), for one page as for many.
     fn build_prompt_multi(&self, pres: &[Preprocessed]) -> FocrResult<(Vec<u32>, Vec<bool>)> {
         let tok = self.tokenizer()?;
         let text = tok.encode(MULTI_PAGE_PROMPT_TEXT)?;
+        if let Some(pages) = self.arch().decode_contract().pages {
+            let blocks: Vec<usize> = pres
+                .iter()
+                .map(Preprocessed::placeholder_token_count)
+                .collect();
+            return Ok(paged_prompt(
+                tok.bos_id(),
+                pages.marker_id,
+                tok.image_id(),
+                &blocks,
+                &text,
+            ));
+        }
         let n_image: usize = pres.iter().map(Preprocessed::placeholder_token_count).sum();
         let total = 1 + n_image + text.len();
         let mut ids = Vec::with_capacity(total);
@@ -5271,7 +6249,108 @@ mod tests {
             max_positions: MAX_POSITION_EMBEDDINGS,
             decodes: 1,
             length_stops: usize::from(finish_reason == FinishReason::Length),
+            document: None,
+            admission_warnings: Vec::new(),
         }
+    }
+
+    /// U2-B6: an Unlimited-OCR-2 document report earns v2's warnings, never
+    /// v1's: the admission's ignored levers first, then `leading_text`, then
+    /// `v2_length` or `v2_budget` with the bodies produced. Only a stopped
+    /// document is a partial output (exit 5); a v1 length stop stays exit 0.
+    #[test]
+    fn document_reports_warn_in_v2_terms_and_only_a_stopped_one_is_partial() {
+        let lever = RunWarning {
+            kind: "ignored_lever",
+            message: "FOCR_QKV_FUSED has no effect".into(),
+            recovery: warning_recovery(WarningKind::IgnoredLever),
+            fields: serde_json::Map::new(),
+        };
+        let report =
+            |finish_reason: FinishReason, bodies: usize, leading_text: bool| DecodeReport {
+                ids: Vec::new(),
+                finish_reason,
+                cap: (finish_reason == FinishReason::Length).then_some(LengthCap::Positions),
+                pages: Some(PageBodies {
+                    expected: 3,
+                    bodies,
+                }),
+                max_length: 32_768,
+                max_positions: sampler::UOCR2_MAX_POSITIONS,
+                decodes: 1,
+                length_stops: usize::from(finish_reason != FinishReason::Stop),
+                document: Some(DocumentStats {
+                    leading_text,
+                    ..DocumentStats::default()
+                }),
+                admission_warnings: vec![lever.clone()],
+            };
+
+        let done = report(FinishReason::Stop, 3, false);
+        let warnings = decode_warnings(&done);
+        assert_eq!(warnings, std::slice::from_ref(&lever));
+        assert!(partial_output(&done, &warnings).is_none());
+
+        let cut = report(FinishReason::Length, 2, true);
+        let warnings = decode_warnings(&cut);
+        let kinds: Vec<&str> = warnings.iter().map(|w| w.kind).collect();
+        assert_eq!(kinds, ["ignored_lever", "leading_text", "v2_length"]);
+        assert!(kinds.iter().all(|kind| RUN_WARNING_KINDS.contains(kind)));
+        let json = warnings[2].to_json();
+        assert_eq!(
+            (json["expected"].as_u64(), json["got"].as_u64()),
+            (Some(3), Some(2))
+        );
+        assert!(
+            warnings[2]
+                .message
+                .starts_with("stopped inside page 2 of 3")
+                && warnings[2].message.contains("131,072"),
+            "{}",
+            warnings[2].message
+        );
+        let Some(FocrError::Partial(partial)) = partial_output(&cut, &warnings) else {
+            panic!("a length stop is a partial output");
+        };
+        assert_eq!(
+            (
+                partial.finish_reason,
+                partial.pages_out,
+                partial.warnings.len()
+            ),
+            ("length", 2, 3)
+        );
+        assert_eq!(cut.run_finish_reason(), FinishReason::Length);
+
+        let late = report(FinishReason::Budget, 0, false);
+        let warnings = decode_warnings(&late);
+        assert_eq!(warnings[1].kind, "v2_budget");
+        assert!(
+            warnings[1]
+                .message
+                .starts_with("stopped before page 1 of 3"),
+            "{}",
+            warnings[1].message
+        );
+        assert_eq!(late.run_finish_reason(), FinishReason::Budget);
+        let Some(error) = partial_output(&late, &warnings) else {
+            panic!("a budget stop is a partial output");
+        };
+        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+        let FocrError::Partial(partial) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!((partial.finish_reason, partial.pages_out), ("budget", 0));
+
+        let v1 = multi_page_report(
+            FinishReason::Length,
+            Some(LengthCap::Positions),
+            3,
+            "<PAGE>\na\n<PAGE>\nb",
+        );
+        let warnings = decode_warnings(&v1);
+        assert_eq!(warnings[0].kind, "v1_truncated");
+        assert!(partial_output(&v1, &warnings).is_none(), "v1 stays exit 0");
     }
 
     /// U2-X2: the frozen `infer_multi` oracle outputs end at EOS with fewer
@@ -6874,13 +7953,14 @@ mod tests {
         }
     }
 
-    /// U2-A7: a census-exact v2 checkpoint is identified, then refused (exit
-    /// 2) before its tokenizer sidecar is judged or a weight byte is read;
-    /// the resident daemon never serves it.
+    /// U2-A7, U2-B6: a census-exact v2 checkpoint is identified; an armed
+    /// refused lever refuses it (exit 2) before its tokenizer sidecar is
+    /// judged or a weight byte is read. Admitted, a foreign sidecar still
+    /// refuses it before the weights. The resident daemon never serves it.
     #[cfg(unix)]
     #[test]
-    fn v2_is_refused_after_identification_before_its_sidecar_and_weights() {
-        let test = "v2_is_refused_after_identification_before_its_sidecar_and_weights";
+    fn v2_admission_and_sidecar_come_before_its_weights() {
+        let test = "v2_admission_and_sidecar_come_before_its_weights";
         let started = std::time::Instant::now();
         let dir = temp_model_dir("v2_admission").join("checkpoint");
         std::fs::create_dir_all(&dir).expect("checkpoint dir");
@@ -6892,14 +7972,26 @@ mod tests {
         // A foreign sidecar would refuse the open; the admission comes first.
         // The hook panics rather than let a regression read 6.7 GB of zeros.
         std::fs::write(dir.join("tokenizer.json"), SIDECAR_JSON).expect("foreign sidecar");
-        let error =
-            load_weights_from_resolved_model_after_validation(&index, admit_for_inference, || {
-                panic!("v2 weights must not be read past the admission")
-            })
-            .expect_err("v2 is refused");
+        let armed = |arch: &'static dyn model_arch::ModelArch| {
+            lever_policy::admit(
+                arch,
+                &lever_policy::LeverInputs {
+                    var: &|name| (name == "FOCR_PREFILL_CHUNK").then(|| "64".to_owned()),
+                    full_int8_forced: false,
+                },
+            )
+            .verdict
+        };
+        let error = load_weights_from_resolved_model_after_validation(&index, armed, || {
+            panic!("v2 weights must not be read past the admission")
+        })
+        .expect_err("v2 is refused");
         let message = error.to_string();
         assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
-        assert!(message.contains("unlimited-ocr-2"), "{message}");
+        assert!(
+            message.contains("FOCR_PREFILL_CHUNK is not supported for unlimited-ocr-2"),
+            "{message}"
+        );
         assert!(
             !message.contains("tokenizer"),
             "the sidecar was not judged: {message}"
@@ -6915,12 +8007,17 @@ mod tests {
         .to_string();
         assert!(sidecar.contains("tokenizer.json"), "{sidecar}");
 
-        // The public entry refuses the same way, exit 2.
+        // The public entry takes the same order: the process environment's
+        // admission, then the sidecar (exit 7), never the weights.
         let Err(public) = OcrModel::load(&dir) else {
-            panic!("OcrModel::load refuses v2");
+            panic!("OcrModel::load refuses the foreign sidecar");
         };
-        assert_eq!(public.exit_code(), 2, "{public}");
-        assert!(public.to_string().contains("unlimited-ocr-2"), "{public}");
+        if lever_policy::admit_from_process(arch).verdict.is_ok() {
+            assert_eq!(public.exit_code(), 7, "{public}");
+            assert!(public.to_string().contains("tokenizer.json"), "{public}");
+        } else {
+            assert_eq!(public.exit_code(), 2, "{public}");
+        }
         assert!(!resident_daemon_serves(&index));
         v2_gated_line(
             test,
@@ -6929,9 +8026,10 @@ mod tests {
             "assert",
             "pass",
             serde_json::json!({
-                "assertion": "identified as v2, refused exit 2 before sidecar and weights",
+                "assertion": "identified as v2; admission, then sidecar, before weights",
                 "pass": true, "exit_code": public.exit_code(), "message": message,
-                "weights_touched": false, "resident_daemon_serves": false,
+                "sidecar_message": sidecar, "weights_touched": false,
+                "resident_daemon_serves": false,
             }),
         );
 
@@ -6982,8 +8080,12 @@ mod tests {
         fn tasks(&self) -> &'static [model_arch::Task] {
             &[model_arch::Task::Ocr]
         }
-        fn implemented(&self) -> bool {
-            self.implemented
+        fn maturity(&self) -> model_arch::Maturity {
+            if self.implemented {
+                model_arch::Maturity::Ready
+            } else {
+                model_arch::Maturity::Planned
+            }
         }
         fn required_quant_recipe(&self, _quant: &str) -> Option<&'static str> {
             None
@@ -7007,10 +8109,8 @@ mod tests {
                     multi.expect("v1 multi-page routes");
                 }
                 model_arch::UNLIMITED_OCR_V2_ID => {
-                    let single = single.expect_err("v2 has no forward yet").to_string();
-                    assert!(single.contains("U2-B6") && single.contains("never runs v1"));
-                    let multi = multi.expect_err("v2 has no document loop yet").to_string();
-                    assert!(multi.contains("U2-B6") && multi.contains("never runs v1"));
+                    assert_eq!(single.expect("v2 routes"), ForwardRoute::UnlimitedV2);
+                    multi.expect("v2 runs its own document loop");
                 }
                 id => {
                     let expected = match id {
@@ -7063,12 +8163,36 @@ mod tests {
                 assert!(error.contains(expected), "{error}");
             }
         }
+
+        // v2's pairing reaches its own loop only while implemented.
+        for implemented in [false, true] {
+            let arch = RouteArch {
+                decoder: Decoder::DeepSeekV2MoeSrSwa,
+                variant: Some(UnlimitedVariant::V2SrSwa),
+                implemented,
+            };
+            match (forward_route(&arch), multi_page_route(&arch)) {
+                (Ok(single), Ok(())) if implemented => {
+                    assert_eq!(single, ForwardRoute::UnlimitedV2);
+                }
+                (Err(single), Err(multi)) if !implemented => {
+                    assert!(
+                        single.to_string().contains("not yet implemented"),
+                        "{single}"
+                    );
+                    assert!(multi.to_string().contains("not yet implemented"), "{multi}");
+                }
+                other => panic!("implemented={implemented}: {other:?}"),
+            }
+        }
     }
 
-    /// U2-A7: a v2 model refuses each inference entry point at routing, before
-    /// any image is read; v1 over the same empty weights gets past routing.
+    /// U2-B6: a v2 model gets past routing on every inference entry point and
+    /// reads its input, as v1 does over the same empty weights. A document
+    /// above [`UOCR2_UNWINDOWED_PAGE_LIMIT`] is refused with exit 2 before
+    /// any page is read; the loop's limit enforcement turned off admits it.
     #[test]
-    fn a_v2_model_refuses_every_entry_point_before_reading_its_input() {
+    fn a_v2_model_routes_every_entry_point_and_refuses_oversized_documents_first() {
         let v2 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V2_ID).expect("v2 registered");
         let model = OcrModel::assemble(
             PathBuf::from("<route-test>"),
@@ -7079,37 +8203,68 @@ mod tests {
         );
         let missing = Path::new("/nonexistent/franken_ocr_route_test_page.png");
         let image = || image::DynamicImage::new_rgb8(4, 4);
-        let no_forward = |error: FocrError| {
-            assert!(matches!(error, FocrError::NotImplemented(_)), "{error:?}");
-            assert!(error.to_string().contains("U2-B6"), "{error}");
+        let reads_input = |error: FocrError| {
+            assert!(matches!(error, FocrError::InputDecode(_)), "{error:?}");
         };
-        no_forward(model.forward(missing).expect_err("forward"));
-        no_forward(model.forward_dynamic(image()).expect_err("forward_dynamic"));
-        no_forward(model.recognize(missing).expect_err("recognize"));
+        reads_input(model.forward(missing).expect_err("forward"));
+        reads_input(model.recognize(missing).expect_err("recognize"));
         for result in model.recognize_batch(&[missing, missing]) {
-            no_forward(result.expect_err("recognize_batch"));
+            reads_input(result.expect_err("recognize_batch"));
         }
-        let no_loop = |error: FocrError| {
-            assert!(matches!(error, FocrError::NotImplemented(_)), "{error:?}");
-            assert!(error.to_string().contains("U2-B6"), "{error}");
-        };
-        no_loop(
+        reads_input(
             model
                 .recognize_multi_page(&[missing])
                 .expect_err("multi-page"),
         );
-        no_loop(
+
+        let over = UOCR2_UNWINDOWED_PAGE_LIMIT + 1;
+        let too_long = |error: FocrError| {
+            assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
+            assert_eq!(error.exit_code(), 2);
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!(
+                    "at most {UOCR2_UNWINDOWED_PAGE_LIMIT} pages in one pass"
+                )) && message.contains(&format!("this document has {over}"))
+                    && message.contains("--pages"),
+                "{message}"
+            );
+        };
+        // Missing paths: reading any of them would be an input error instead.
+        too_long(
             model
-                .recognize_multi_page_dynamic(vec![image()])
-                .expect_err("multi-page dynamic"),
+                .recognize_multi_page(&vec![missing; over])
+                .expect_err("over the limit"),
         );
-        no_loop(
+        too_long(
             model
-                .recognize_multi_page_dynamic_streaming(vec![image()], &mut |_, _| {
+                .recognize_multi_page_dynamic(vec![image(); over])
+                .expect_err("over the limit, dynamic"),
+        );
+        too_long(
+            model
+                .recognize_multi_page_dynamic_streaming(vec![image(); over], &mut |_, _| {
                     panic!("no page streams")
                 })
-                .expect_err("multi-page streaming"),
+                .expect_err("over the limit, streaming"),
         );
+        model
+            .check_document_pages(UOCR2_UNWINDOWED_PAGE_LIMIT, true)
+            .expect("the limit itself is admitted");
+        model
+            .check_document_pages(over, false)
+            .expect("an explicit unwindowed request bypasses the limit");
+        let unlimited = model_arch::default_arch();
+        let v1_model = OcrModel::assemble(
+            PathBuf::from("<route-test>"),
+            SidecarBundle::default(),
+            unlimited,
+            Weights::default(),
+            None,
+        );
+        v1_model
+            .check_document_pages(over, true)
+            .expect("v1 has no page limit");
 
         let v1 = OcrModel::assemble(
             PathBuf::from("<route-test>"),
@@ -7356,54 +8511,1148 @@ mod tests {
         ))
     }
 
-    /// A v2-shaped prompt over `pages`: BOS; per page `<PAGE>` and the page's
-    /// 273-slot visual block; then the instruction. The blocks come from v2's
-    /// preprocessing (U2-B7) and v1's connector (the vision tensors are
-    /// byte-identical), and the instruction is v1's (v2's prompt is U2-B6), so
-    /// this is the decoder's input shape, not v2's exact prompt.
-    fn v2_decoder_prompt(model: &OcrModel, pages: &[PathBuf]) -> (Mat, Vec<u32>) {
-        use crate::tokenizer::special;
-        let table = model.embed_table().expect("embed table");
-        let hidden = table.cols();
-        let (mut ids, mut data) = (Vec::new(), Vec::new());
-        let mut instruction = None;
-        for (i, page) in pages.iter().enumerate() {
-            let pre = preprocess::preprocess_image(
-                page,
-                preprocess_mode(),
-                preprocess_profile(model.arch()),
+    /// U2-B6: the retirement fallback. A synthetic pass whose detector fires
+    /// on its third id with retirement on runs again without it; the
+    /// observer sees each id once, in order, and the decode counts one
+    /// fallback. A pass without retirement, or one that ends on another
+    /// error, runs once; a rerun that departs from the first pass's ids is an
+    /// error.
+    #[test]
+    fn retire_fallback_reruns_the_document_unretired_once() {
+        use crate::tokenizer::special::PAGE;
+        let fired = || {
+            FocrError::Other(
+                anyhow::Error::new(srswa::RetireFallback {
+                    q_pos: 700,
+                    query_page: 1,
+                    open: srswa::OpenRow::NoRemoteAllowed,
+                    dead_blocks: 4,
+                })
+                .context("layer 3"),
             )
-            .expect("preprocess");
-            let features = model.vision_tower(&pre).expect("vision tower");
-            let (embeds, page_ids) = model
-                .build_inputs_embeds(&pre, &features)
-                .expect("connector");
-            // v1's prompt: BOS, the visual block, the instruction.
-            let images = page_ids[1..]
+        };
+        assert!(
+            srswa::retire_fallback(&fired()).is_some(),
+            "through context"
+        );
+        let ids = [PAGE, 10, 11, PAGE, 12];
+        // Emits `ids` first and `rerun` after; with retirement on, the
+        // detector fires after `fire_at` ids; `cancel` ends a pass early.
+        let run = |retire: bool, fire_at: Option<usize>, rerun: &[u32], cancel: bool| {
+            let mut calls = Vec::new();
+            let mut seen = Vec::new();
+            let mut observer = |id: u32| seen.push(id);
+            let result = decode_with_retire_fallback(
+                retire,
+                Some(&mut observer),
+                |retire, floor, out, mut obs| {
+                    calls.push((retire, floor));
+                    out.clear();
+                    let emit = if calls.len() == 1 { &ids[..] } else { rerun };
+                    for (k, &id) in emit.iter().enumerate() {
+                        out.push(id);
+                        if let Some(f) = obs.as_deref_mut() {
+                            f(id);
+                        }
+                        if retire && fire_at == Some(k + 1) {
+                            return Err(fired());
+                        }
+                        if cancel && k == 1 {
+                            return Err(FocrError::Cancelled);
+                        }
+                    }
+                    Ok(DocumentDecode {
+                        ids: out.clone(),
+                        finish_reason: FinishReason::Stop,
+                        stats: DocumentStats::default(),
+                    })
+                },
+            );
+            (result, calls, seen)
+        };
+
+        let (result, calls, seen) = run(true, Some(3), &ids, false);
+        let decode = result.expect("the rerun completes");
+        assert_eq!(decode.ids, ids);
+        // (retire, budget floor): the rerun keeps its budget off until it
+        // passes the 3 ids already observed.
+        assert_eq!(calls, [(true, 0), (false, 3)]);
+        assert_eq!(seen, ids, "each id observed once, in order");
+        assert_eq!(decode.stats.retire_fallbacks, 1);
+
+        let (result, calls, seen) = run(false, Some(3), &ids, false);
+        assert_eq!(result.expect("never fires").stats.retire_fallbacks, 0);
+        assert_eq!((calls, seen), (vec![(false, 0)], ids.to_vec()));
+
+        let (result, calls, _) = run(true, None, &ids, true);
+        assert!(matches!(result, Err(FocrError::Cancelled)));
+        assert_eq!(calls, [(true, 0)], "no rerun on another error");
+
+        let (result, calls, seen) = run(true, Some(3), &[PAGE, 10, 99, PAGE, 12], false);
+        let message = result.expect_err("a departing rerun").to_string();
+        assert!(
+            message.contains("departs") && message.contains("step 3"),
+            "{message}"
+        );
+        assert_eq!(calls, [(true, 0), (false, 3)]);
+        assert_eq!(
+            seen,
+            [PAGE, 10, 11, PAGE, 12],
+            "the departure is reported, not streamed"
+        );
+    }
+
+    /// U2-B6's L0 prompt check against the U2-A6 oracle: [`paged_prompt`]
+    /// over v2's real image-block counts and the committed tokenizer golden's
+    /// ids for "Multi page parsing." reproduces every fixture's prompt, by
+    /// length and by `prompt_token_ids_sha256`. The block counts come from
+    /// the engine's own v2 preprocess of blank pages the oracle's size: a base
+    /// page and a gundam page (whose 2×3 grid adds 630 slots).
+    #[test]
+    fn paged_prompt_reproduces_the_v2_oracle_prompts() {
+        use crate::tokenizer::special;
+        use sha2::Digest as _;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let read = |rel: &str| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(root.join(rel)).unwrap()).unwrap()
+        };
+        let golden = read("tokenizer_baidu/expected_uocr2.json");
+        let one_page = golden["fixtures"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["text"] == "<PAGE><image>Multi page parsing.")
+            .expect("the one-page prompt is in the golden");
+        let ids: Vec<u32> = one_page["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| u32::try_from(id.as_u64().unwrap()).unwrap())
+            .collect();
+        assert_eq!(ids[..2], [special::PAGE, special::IMAGE]);
+        let text = &ids[2..];
+
+        let oracle = read("uocr2_oracle/ORACLE.json");
+        let block = |mode: preprocess::PreprocessMode, (w, h): (u32, u32)| {
+            let page = image::DynamicImage::new_rgb8(w, h);
+            preprocess::preprocess_dynamic(page, mode, preprocess::PreprocessProfile::V2)
+                .unwrap()
+                .placeholder_token_count()
+        };
+        let mut blocks = std::collections::BTreeMap::new();
+        let fixtures = oracle["fixtures"].as_object().unwrap();
+        assert_eq!(fixtures.len(), 9);
+        for (name, f) in fixtures {
+            let mode = match f["mode"].as_str().unwrap() {
+                "base" => preprocess::PreprocessMode::Base { base_size: 1024 },
+                "gundam" => preprocess::PreprocessMode::Gundam {
+                    base_size: 1024,
+                    tile_size: 640,
+                },
+                other => panic!("{name}: mode {other}"),
+            };
+            let counts: Vec<usize> = f["pages"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .take_while(|&&t| t == special::IMAGE)
-                .count();
-            assert_eq!(images, 273, "a base-1024 page");
-            let block = 1..1 + images;
-            if i == 0 {
-                ids.push(page_ids[0]);
-                data.extend_from_slice(embeds.row(0));
-            }
-            ids.push(special::PAGE);
-            data.extend(table.row_f32(special::PAGE as usize));
-            ids.extend_from_slice(&page_ids[block.clone()]);
-            data.extend_from_slice(&embeds.data[block.start * hidden..block.end * hidden]);
-            instruction.get_or_insert_with(|| {
-                (
-                    page_ids[block.end..].to_vec(),
-                    embeds.data[block.end * hidden..].to_vec(),
-                )
-            });
+                .map(|p| {
+                    let size = |k: &str| u32::try_from(p[k].as_u64().unwrap()).unwrap();
+                    let key = (f["mode"].to_string(), size("width"), size("height"));
+                    *blocks
+                        .entry(key)
+                        .or_insert_with(|| block(mode, (size("width"), size("height"))))
+                })
+                .collect();
+            let (prompt, mask) = paged_prompt(0, special::PAGE, special::IMAGE, &counts, text);
+            assert_eq!(
+                prompt.len() as u64,
+                f["prompt_token_count"].as_u64().unwrap(),
+                "{name}"
+            );
+            let json = serde_json::to_string(&prompt).unwrap();
+            let sha: String = sha2::Sha256::digest(json.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            assert_eq!(sha, f["prompt_token_ids_sha256"], "{name}");
+            assert_eq!(
+                mask.iter().filter(|&&m| m).count(),
+                counts.iter().sum::<usize>(),
+                "{name}"
+            );
+            assert!(
+                mask.iter()
+                    .zip(&prompt)
+                    .all(|(&m, &id)| m == (id == special::IMAGE))
+            );
         }
-        let (tail_ids, tail_rows) = instruction.expect("at least one page");
-        ids.extend(tail_ids);
-        data.extend(tail_rows);
-        (Mat::from_vec(ids.len(), hidden, data), ids)
+        assert_eq!(
+            blocks.values().copied().collect::<Vec<_>>(),
+            [273, 273 + 630],
+            "base, then gundam"
+        );
+    }
+
+    /// Model-gated (U2-B6): the real v2 checkpoint's document loop on two
+    /// U2-A6 fixtures, S1 page_0009 (one page) and S3 p9_p14 (two pages,
+    /// streamed), over the corpus pages (`FOCR_CORPUS_DIR`, default
+    /// `~/.cache/franken_ocr/corpus/pages`). Asserts the contract: one body
+    /// per page, EOS, `marker`… then `eos` per page, the streamed bodies equal
+    /// to the split's, no DISC-U2-2 step, no retirement fallback. Token
+    /// agreement with the f32 oracle is logged as information: this is the
+    /// conservative int8-FFN path, and U2-C2 gates parity.
+    #[test]
+    fn real_v2_document_loop_decodes_oracle_fixtures() {
+        use crate::tokenizer::special;
+        let test = "real_v2_document_loop_decodes_oracle_fixtures";
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        for (fixture, pages, stream) in [
+            ("S1-page_0009", &["page_0009.png"][..], false),
+            ("S3-p9_p14", &["page_0009.png", "page_0014.png"][..], true),
+        ] {
+            let Some(paths) = v2_corpus_pages(test, started, fixture, pages) else {
+                continue;
+            };
+            let pres: Vec<Preprocessed> = paths
+                .iter()
+                .map(|p| {
+                    let img = image::open(p).expect("page decodes");
+                    model.document_page(img).expect("preprocess")
+                })
+                .collect();
+            let t = std::time::Instant::now();
+            let mut events: Vec<(usize, String)> = Vec::new();
+            let mut sink = |k: usize, body: &str| events.push((k, body.to_string()));
+            let split = model
+                .decode_document(&pres, stream.then_some(&mut sink as PageSink<'_>))
+                .expect("the document decodes");
+            let report = model.take_last_decode().expect("a decode report");
+            let stats = report.document.clone().expect("document stats");
+            let n = pages.len();
+            let oracle = v2_oracle_ids(fixture);
+            let agree = report
+                .ids
+                .iter()
+                .zip(&oracle)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let near = |ids: &[u32]| ids[agree.min(ids.len())..(agree + 8).min(ids.len())].to_vec();
+            // The evidence goes out before any assert, so a failing or capped
+            // run still reports what it decoded.
+            v2_gated_line(
+                test,
+                started,
+                fixture,
+                "decode",
+                "info",
+                serde_json::json!({
+                    "pages_expected": n, "pages_produced": split.bodies.len(),
+                    "finish_reason": report.finish_reason.as_str(),
+                    "tokens": report.ids.len(), "oracle_tokens": oracle.len(),
+                    "info_agreeing_prefix": agree,
+                    "info_exact": report.ids == oracle,
+                    "info_ours_at_divergence": near(&report.ids),
+                    "info_oracle_at_divergence": near(&oracle),
+                    "page_tokens": stats.page_tokens,
+                    "page_finish": stats.page_finish.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+                    "extra_markers": stats.extra_markers,
+                    "leading_text": stats.leading_text,
+                    "forced_steps": stats.forced_steps,
+                    "disc_u2_2_steps": stats.hf_all_neg_inf_steps,
+                    "retired_blocks": stats.retired_blocks,
+                    "peak_kv_bytes": stats.peak_kv_bytes,
+                    "retire_fallbacks": stats.retire_fallbacks,
+                    "wall_s": t.elapsed().as_secs_f64(),
+                }),
+            );
+            assert_eq!(report.finish_reason, FinishReason::Stop, "{fixture}");
+            assert_eq!(split.bodies.len(), n, "{fixture}");
+            assert_eq!(
+                report.ids.iter().filter(|&&id| id == special::PAGE).count(),
+                n,
+                "{fixture}: one marker per page"
+            );
+            let mut want = vec![PageFinish::Marker; n - 1];
+            want.push(PageFinish::Eos);
+            assert_eq!(stats.page_finish, want, "{fixture}");
+            assert_eq!(stats.hf_all_neg_inf_steps, 0, "{fixture}: DISC-U2-2");
+            assert_eq!(stats.retire_fallbacks, 0, "{fixture}");
+            assert_eq!(
+                stats.page_tokens.iter().sum::<usize>() + n,
+                report.ids.len()
+            );
+            if stream {
+                let split_bodies: Vec<(usize, String)> = split
+                    .bodies
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| (i + 1, b.trim().to_string()))
+                    .collect();
+                assert_eq!(events, split_bodies, "{fixture}: streamed pages");
+            }
+            v2_gated_line(
+                test,
+                started,
+                fixture,
+                "assert",
+                "pass",
+                serde_json::json!({}),
+            );
+        }
+    }
+
+    /// Model-gated (U2-B6): teacher-forced along the f32 oracle's S3 p9_p14
+    /// ids, the stateless f32 path ([`OcrModel::document_logits`] over the
+    /// grown sequence, then [`sampler::decode_step_guarded`]) picks the
+    /// oracle's token at probe steps on both pages: the first step, both
+    /// markers and the rows after them, the cached path's first divergence
+    /// (step 73), deep in page 2, and the final EOS. That pins the document
+    /// wiring (page coordinates over generated markers, the guard, the
+    /// generated-only n-gram) apart from the int8 FFN. The cached path is
+    /// teacher-forced over every step too; its disagreements and their logit
+    /// gaps are logged for U2-C2, which owns L4.
+    #[test]
+    fn real_v2_teacher_forced_f32_follows_the_oracle_across_pages() {
+        use crate::tokenizer::special;
+        let test = "real_v2_teacher_forced_f32_follows_the_oracle_across_pages";
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let fixture = "S3-p9_p14";
+        let Some(paths) =
+            v2_corpus_pages(test, started, fixture, &["page_0009.png", "page_0014.png"])
+        else {
+            return;
+        };
+        let (embeds, prompt) = v2_decoder_prompt(&model, &paths);
+        let oracle = v2_oracle_ids(fixture);
+        let params = model.document_params(2);
+        let table = model.embed_table().expect("embed table");
+        let guard_after = |t: usize| {
+            let mut guard = sampler::PageGuard::new(
+                2,
+                special::PAGE,
+                params.eos_token_id,
+                params.max_page_tokens.min(params.max_length),
+            );
+            for &id in &oracle[..t] {
+                guard.observe(id);
+            }
+            guard
+        };
+        // `None` is EOS, the step after the last id.
+        let pick = |logits: &Mat, t: usize| {
+            let step = sampler::decode_step_guarded(logits, &oracle[..t], &guard_after(t), &params)
+                .expect("a guarded step");
+            (!step.is_eos).then_some(step.token_id)
+        };
+        // How far the oracle's token sits below the row's best logit.
+        let gap = |logits: &Mat, want: Option<u32>| {
+            let id = want.unwrap_or(params.eos_token_id) as usize;
+            let best = logits
+                .data
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            best - logits.data[id]
+        };
+        let markers: Vec<usize> = oracle
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| (id == special::PAGE).then_some(i))
+            .collect();
+        assert_eq!(markers.len(), 2, "the oracle marks both pages");
+        let mut probes = vec![
+            0,
+            markers[1],
+            markers[1] + 1,
+            73,
+            74,
+            (markers[1] + oracle.len()) / 2,
+            oracle.len() - 1,
+            oracle.len(),
+        ];
+        probes.sort_unstable();
+        probes.dedup();
+        let mut f32_misses = Vec::new();
+        for t in probes {
+            let tp = std::time::Instant::now();
+            let mut data = embeds.data.clone();
+            for &id in &oracle[..t] {
+                data.extend(table.row_f32(id as usize));
+            }
+            let mut ids = prompt.clone();
+            ids.extend_from_slice(&oracle[..t]);
+            let grown = Mat::from_vec(embeds.rows + t, embeds.cols, data);
+            let logits = model
+                .document_logits(&DocumentDecoder::Stateless {
+                    embeds: grown,
+                    ids,
+                    domain: srswa::EntmaxDomain::TopM,
+                })
+                .expect("f32 logits");
+            let want = oracle.get(t).copied();
+            let got = pick(&logits, t);
+            v2_gated_line(
+                test,
+                started,
+                fixture,
+                "f32_probe",
+                if got == want { "pass" } else { "fail" },
+                serde_json::json!({
+                    "step": t, "want": want, "got": got,
+                    "oracle_gap": gap(&logits, want), "wall_s": tp.elapsed().as_secs_f64(),
+                }),
+            );
+            if got != want {
+                f32_misses.push((t, want, got));
+            }
+        }
+
+        // The cached path, teacher-forced over every step (information).
+        let wc = model.decoder_cache().expect("decoder cache");
+        let coords = srswa::PageCoords::build(&prompt).expect("page coords");
+        let (hidden, state) =
+            decoder::prefill_with_cache_srswa(wc, &embeds, &coords, srswa::EntmaxDomain::TopM)
+                .expect("prefill");
+        let mut cached = DocumentDecoder::Cached {
+            wc,
+            state,
+            hidden: OcrModel::last_hidden_row(&hidden).expect("last row"),
+        };
+        let mut cached_misses = Vec::new();
+        for t in 0..=oracle.len() {
+            let logits = model.document_logits(&cached).expect("cached logits");
+            let want = oracle.get(t).copied();
+            let got = pick(&logits, t);
+            if got != want {
+                cached_misses.push(serde_json::json!({
+                    "step": t, "want": want, "got": got, "oracle_gap": gap(&logits, want),
+                }));
+            }
+            let Some(id) = want else { break };
+            let DocumentDecoder::Cached { wc, state, hidden } = &mut cached else {
+                unreachable!("built cached")
+            };
+            let forced = matches!(
+                guard_after(t + 1).verdict(),
+                sampler::GuardVerdict::Force(_)
+            );
+            let row = Mat::from_vec(1, embeds.cols, table.row_f32(id as usize));
+            let h = decoder::decode_step_with_cache_srswa(wc, state, id, &row, forced)
+                .expect("cached step");
+            *hidden = OcrModel::last_hidden_row(&h).expect("last row");
+        }
+        v2_gated_line(
+            test,
+            started,
+            fixture,
+            "cached_teacher_forced",
+            "info",
+            serde_json::json!({
+                "steps": oracle.len() + 1, "disagreements": cached_misses.len(),
+                "first": cached_misses.iter().take(16).collect::<Vec<_>>(),
+            }),
+        );
+        assert!(
+            f32_misses.is_empty(),
+            "the f32 path departs from the oracle (step, want, got): {f32_misses:?}"
+        );
+    }
+
+    /// Model-gated (U2-B6): the document loop's limits on S2 p9_p14_p19
+    /// (three pages). A per-page cap of 50 (`--max-length 50`, per page in
+    /// v2) gives three bodies of at most 50 ids, `page_cap` exactly where a
+    /// body reached 50; block retirement on and off give the same ids. A
+    /// position limit 60 rows past the prompt stops as `length` inside a
+    /// page. A spent budget stops as `budget` before the first id.
+    #[test]
+    fn real_v2_document_limits_stop_where_the_contract_says() {
+        use crate::tokenizer::special::PAGE;
+        let test = "real_v2_document_limits_stop_where_the_contract_says";
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let fixture = "S2-p9_p14_p19";
+        let pages = ["page_0009.png", "page_0014.png", "page_0019.png"];
+        let Some(paths) = v2_corpus_pages(test, started, fixture, &pages) else {
+            return;
+        };
+        let (embeds, prompt) = v2_decoder_prompt(&model, &paths);
+        let tok = model.tokenizer().expect("tokenizer");
+        let base = model.document_params(pages.len());
+        let run = |params: &DecodeParams, retire: bool, deadline: Option<Instant>| {
+            let pass = DocumentPass {
+                precision: DocumentPrecision::Mixed,
+                retire,
+                deadline,
+                budget_floor: 0,
+            };
+            let mut ids = Vec::new();
+            let decode = model
+                .generate_document_once(&embeds, &prompt, params, pass, &mut ids, None)
+                .expect("the pass decodes");
+            let split = postprocess::split_pages_by_token(tok, &decode.ids, PAGE, pages.len())
+                .expect("the split");
+            (decode, split)
+        };
+        let finishes = |decode: &DocumentDecode| -> Vec<&'static str> {
+            decode
+                .stats
+                .page_finish
+                .iter()
+                .map(|f| f.as_str())
+                .collect()
+        };
+
+        let capped = DecodeParams {
+            max_length: 50,
+            ..base.clone()
+        };
+        let t = Instant::now();
+        let (retired, split) = run(&capped, true, None);
+        let (plain, _) = run(&capped, false, None);
+        v2_gated_line(
+            test,
+            started,
+            "page_cap_50",
+            "decode",
+            "info",
+            serde_json::json!({
+                "pages_expected": pages.len(), "pages_produced": split.bodies.len(),
+                "finish_reason": retired.finish_reason.as_str(), "page_tokens": split.tokens,
+                "page_finish": finishes(&retired), "forced_steps": retired.stats.forced_steps,
+                "disc_u2_2_steps": retired.stats.hf_all_neg_inf_steps,
+                "retired_blocks": retired.stats.retired_blocks,
+                "peak_kv_bytes": retired.stats.peak_kv_bytes,
+                "unretired_peak_kv_bytes": plain.stats.peak_kv_bytes,
+                "wall_s": t.elapsed().as_secs_f64(),
+            }),
+        );
+        assert_eq!(retired.finish_reason, FinishReason::Stop);
+        assert_eq!(split.bodies.len(), pages.len());
+        assert_eq!(retired.stats.page_finish.len(), pages.len());
+        for (k, (&tokens, finish)) in split
+            .tokens
+            .iter()
+            .zip(&retired.stats.page_finish)
+            .enumerate()
+        {
+            assert!(tokens <= 50, "page {}: {tokens} ids", k + 1);
+            assert_eq!(
+                *finish == PageFinish::PageCap,
+                tokens == 50,
+                "page {}: {finish:?} after {tokens} ids",
+                k + 1
+            );
+        }
+        assert!(
+            retired.stats.page_finish.contains(&PageFinish::PageCap),
+            "the cap bound at least one page"
+        );
+        assert_eq!(retired.stats.hf_all_neg_inf_steps, 0, "DISC-U2-2");
+        assert_eq!(plain.ids, retired.ids, "retired ≡ unretired");
+        assert_eq!(plain.stats.retired_blocks, 0);
+
+        let positions = DecodeParams {
+            max_positions: prompt.len() + 60,
+            ..base.clone()
+        };
+        let (stopped, split) = run(&positions, true, None);
+        v2_gated_line(
+            test,
+            started,
+            "position_limit",
+            "decode",
+            "info",
+            serde_json::json!({
+                "max_positions": positions.max_positions, "tokens": stopped.ids.len(),
+                "pages_produced": split.bodies.len(), "page_tokens": split.tokens,
+                "finish_reason": stopped.finish_reason.as_str(),
+                "page_finish": finishes(&stopped),
+            }),
+        );
+        assert_eq!(stopped.finish_reason, FinishReason::Length);
+        assert_eq!(stopped.ids.len(), 60, "pos + 1 reached the limit");
+        assert_eq!(stopped.stats.page_finish.last(), Some(&PageFinish::Length));
+        assert_eq!(stopped.stats.page_finish.len(), split.bodies.len());
+        assert!(split.bodies.len() < pages.len());
+
+        let (spent, split) = run(&base, true, Some(Instant::now()));
+        v2_gated_line(
+            test,
+            started,
+            "budget_spent",
+            "decode",
+            "info",
+            serde_json::json!({
+                "tokens": spent.ids.len(), "pages_produced": split.bodies.len(),
+                "finish_reason": spent.finish_reason.as_str(), "page_finish": finishes(&spent),
+            }),
+        );
+        assert_eq!(spent.finish_reason, FinishReason::Budget);
+        assert!(spent.ids.is_empty());
+        assert_eq!(spent.stats.page_finish, [PageFinish::Budget]);
+        assert!(split.bodies.is_empty());
+        v2_gated_line(
+            test,
+            started,
+            fixture,
+            "assert",
+            "pass",
+            serde_json::json!({}),
+        );
+    }
+
+    /// Model-gated (D21): on S1 (one page) the HF top-M entmax and SGLang's
+    /// all-candidates entmax decode the same ids, and both equal the oracle.
+    #[test]
+    fn real_v2_entmax_domains_decode_s1_alike() {
+        let test = "real_v2_entmax_domains_decode_s1_alike";
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let fixture = "S1-page_0009";
+        let Some(paths) = v2_corpus_pages(test, started, fixture, &["page_0009.png"]) else {
+            return;
+        };
+        let oracle = v2_oracle_ids(fixture);
+        let (embeds, prompt) = v2_decoder_prompt(&model, &paths);
+        let decode = |domain: srswa::EntmaxDomain| {
+            let params = DecodeParams {
+                entmax_domain: domain,
+                ..model.document_params(1)
+            };
+            let pass = DocumentPass {
+                precision: DocumentPrecision::Mixed,
+                retire: true,
+                deadline: None,
+                budget_floor: 0,
+            };
+            let t = Instant::now();
+            let mut ids = Vec::new();
+            let decode = model
+                .generate_document_once(&embeds, &prompt, &params, pass, &mut ids, None)
+                .expect("the pass decodes");
+            (decode, t.elapsed().as_secs_f64())
+        };
+        let (topm, topm_s) = decode(srswa::EntmaxDomain::TopM);
+        let (all, all_s) = decode(srswa::EntmaxDomain::AllCandidates);
+        let first_diff = topm.ids.iter().zip(&all.ids).position(|(a, b)| a != b);
+        v2_gated_line(
+            test,
+            started,
+            fixture,
+            "decode",
+            "info",
+            serde_json::json!({
+                "topm_tokens": topm.ids.len(), "all_tokens": all.ids.len(),
+                "oracle_tokens": oracle.len(), "first_diff": first_diff,
+                "topm_finish": topm.finish_reason.as_str(),
+                "all_finish": all.finish_reason.as_str(),
+                "topm_wall_s": topm_s, "all_wall_s": all_s,
+            }),
+        );
+        assert_eq!(all.ids, topm.ids, "D21: the domains agree on S1");
+        assert_eq!(topm.ids, oracle, "the top-M decode is the oracle's");
+        v2_gated_line(
+            test,
+            started,
+            fixture,
+            "assert",
+            "pass",
+            serde_json::json!({}),
+        );
+    }
+
+    /// U2-C2 L4 on the one-page S1 fixtures ([`v2_l4`]).
+    #[test]
+    fn real_v2_l4_s1_pages_decode_the_oracle_ids() {
+        v2_l4(
+            "real_v2_l4_s1_pages_decode_the_oracle_ids",
+            &["S1-page_0009", "S1-page_0014", "S1-page_0590"],
+        );
+    }
+
+    /// U2-C2 L4 on the short documents, S2 and S3 p9_p14 ([`v2_l4`]).
+    #[test]
+    fn real_v2_l4_documents_decode_the_oracle_ids() {
+        v2_l4(
+            "real_v2_l4_documents_decode_the_oracle_ids",
+            &["S2-p9_p14_p19", "S3-p9_p14"],
+        );
+    }
+
+    /// U2-C2 L4 on the long documents, S3 p10 and p20 (6,272 and 16,880
+    /// ids, [`v2_l4`]): `FOCR_E2E_LONG` arms it, any value but empty or `0`
+    /// (the token-golden gate's rule).
+    #[test]
+    fn real_v2_l4_long_documents_decode_the_oracle_ids() {
+        let test = "real_v2_l4_long_documents_decode_the_oracle_ids";
+        let long = matches!(
+            std::env::var("FOCR_E2E_LONG").ok().as_deref(),
+            Some(v) if !v.is_empty() && v != "0"
+        );
+        if !long {
+            v2_gated_line(
+                test,
+                std::time::Instant::now(),
+                "S3-p10,S3-p20",
+                "skip",
+                "skip",
+                serde_json::json!({"reason": "FOCR_E2E_LONG unset or 0"}),
+            );
+            return;
+        }
+        v2_l4(test, &["S3-p10", "S3-p20"]);
+    }
+
+    /// The longest oracle generation the L4 rung also decodes on the stateless
+    /// f32 path: S1 page_0009 and page_0014, about a quarter hour together.
+    const V2_L4_STATELESS_MAX_IDS: usize = 256;
+
+    /// The levers U2-A7 refuses until U2-C2, with their values where set: a
+    /// lever's re-certification is the L4 rung run with it armed.
+    fn v2_armed_levers() -> serde_json::Value {
+        [
+            "FOCR_FUSE_SWIGLU",
+            "FOCR_INT8_AUTOVEC",
+            "FOCR_LMHEAD_SHARD",
+            "FOCR_LMHEAD_SHARD_TILES",
+            "FOCR_MOE_SCORE_ORDER",
+            "FOCR_SOFTMAX_COPY",
+        ]
+        .into_iter()
+        .filter_map(|name| {
+            std::env::var(name)
+                .ok()
+                .map(|value| (name.to_string(), serde_json::Value::String(value)))
+        })
+        .collect::<serde_json::Map<_, _>>()
+        .into()
+    }
+
+    /// The sha256 of `ids` as a compact JSON array: the U2-A6 oracle's
+    /// `token_ids_sha256`.
+    fn v2_ids_sha256(ids: &[u32]) -> String {
+        use sha2::Digest as _;
+        let json = serde_json::to_string(ids).expect("ids serialize");
+        sha2::Sha256::digest(json.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// The logits at step `ids.len()` of a document teacher-forced along
+    /// `ids` on cache `wc`, and each layer's read set there: a traced
+    /// prefill, then one step per id, flagged forced exactly as the document
+    /// loop flags it. Retirement stays off.
+    fn v2_replay(
+        model: &OcrModel,
+        wc: &decoder::DecoderWeightCache,
+        (embeds, prompt): (&Mat, &[u32]),
+        ids: &[u32],
+        params: &DecodeParams,
+    ) -> (Mat, Vec<Vec<u32>>) {
+        use crate::tokenizer::special::PAGE;
+        let pages = prompt.iter().filter(|&&id| id == PAGE).count();
+        let mut guard = document_guard(pages, PAGE, params);
+        let table = model.embed_table().expect("embed table");
+        let coords = srswa::PageCoords::build(prompt).expect("page coords");
+        let (hidden, mut state) =
+            decoder::prefill_with_cache_srswa_traced(wc, embeds, &coords, params.entmax_domain)
+                .expect("traced prefill");
+        let mut hidden = OcrModel::last_hidden_row(&hidden).expect("last row");
+        let mut routes: Vec<Vec<u32>> = state
+            .trace
+            .as_ref()
+            .expect("traced")
+            .prefill_last
+            .iter()
+            .map(|r| r.as_ref().map_or_else(Vec::new, |r| r.blocks.clone()))
+            .collect();
+        for &id in ids {
+            guard.observe(id);
+            let forced = matches!(guard.verdict(), sampler::GuardVerdict::Force(_));
+            let row = Mat::from_vec(1, embeds.cols, table.row_f32(id as usize));
+            let h = decoder::decode_step_with_cache_srswa(wc, &mut state, id, &row, forced)
+                .expect("replayed step");
+            hidden = OcrModel::last_hidden_row(&h).expect("last row");
+            routes = state
+                .trace
+                .as_ref()
+                .expect("traced")
+                .decode
+                .iter()
+                .map(|r| r.as_ref().map_or_else(Vec::new, |r| r.route.blocks.clone()))
+                .collect();
+        }
+        let logits = decoder::lm_head_cached(wc, &hidden).expect("lm_head");
+        (logits, routes)
+    }
+
+    /// U2-C2 L4 (plan §7.2) on the U2-A6 fixtures `fixtures`: each document
+    /// through the real document loop on both cached paths, the all-f32 one
+    /// and the shipping int8-FFN one, block retirement on and off, and on the
+    /// stateless f32 path for a generation of at most
+    /// [`V2_L4_STATELESS_MAX_IDS`] ids.
+    ///
+    /// - The f32 paths give the oracle's ids exactly. At a departure the
+    ///   trace diff (f32 against int8-FFN, replayed along the oracle's ids)
+    ///   is in the failure.
+    /// - Retired ≡ unretired, on both cached paths.
+    /// - Every run keeps the cross-page invariants: a body per page in page
+    ///   order (exactly N markers, none extra, so the DISC-U2-7 reset is never
+    ///   reached), EOS only on the last page, a body empty only where the
+    ///   oracle's is, no DISC-U2-2 step, no retirement fallback.
+    /// - The int8-FFN path is held to the oracle with the bead's escape. Its
+    ///   cache shares every op with the f32 one but the FFN/expert storage,
+    ///   and the f32 path follows the oracle, so a departure is the int8 FFN
+    ///   quant effect; it is logged `xfail` with its trace diff for U2-C4.
+    ///
+    /// Lever re-certification (U2-A7) is this rung run with one lever armed;
+    /// the armed levers are in every line.
+    fn v2_l4(test: &str, fixtures: &[&str]) {
+        use crate::tokenizer::special::PAGE;
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let meta: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/uocr2_oracle/ORACLE.json"),
+            )
+            .expect("ORACLE.json"),
+        )
+        .expect("ORACLE.json parses");
+        let tok = model.tokenizer().expect("tokenizer");
+        let levers = v2_armed_levers();
+        for &fixture in fixtures {
+            let entry = &meta["fixtures"][fixture];
+            assert_eq!(entry["mode"], "base", "{fixture}: the L4 lanes are base");
+            let pages: Vec<&str> = entry["pages"]
+                .as_array()
+                .expect("pages")
+                .iter()
+                .map(|p| p["name"].as_str().expect("page name"))
+                .collect();
+            let Some(paths) = v2_corpus_pages(test, started, fixture, &pages) else {
+                continue;
+            };
+            let (embeds, prompt) = v2_decoder_prompt(&model, &paths);
+            assert_eq!(
+                Some(prompt.len() as u64),
+                entry["prompt_token_count"].as_u64(),
+                "{fixture}: prompt rows"
+            );
+            let n = pages.len();
+            let params = model.document_params(n);
+            let oracle = v2_oracle_ids(fixture);
+            assert_eq!(
+                v2_ids_sha256(&oracle),
+                entry["token_ids_sha256"]
+                    .as_str()
+                    .expect("token_ids_sha256"),
+                "{fixture}: the committed ids are the oracle's"
+            );
+            let oracle_split =
+                postprocess::split_pages_by_token(tok, &oracle, PAGE, n).expect("oracle split");
+            let mut decoded: Vec<(DocumentPrecision, Vec<u32>)> = Vec::new();
+            for precision in [
+                DocumentPrecision::Stateless,
+                DocumentPrecision::CachedF32,
+                DocumentPrecision::Mixed,
+            ] {
+                // The stateless path re-runs the grown sequence every step,
+                // O(n²): it decodes the short fixtures itself, and the f32
+                // cache stands in for it on the rest. It has no cache to
+                // retire.
+                let retires: &[bool] = match precision {
+                    DocumentPrecision::Stateless if oracle.len() > V2_L4_STATELESS_MAX_IDS => {
+                        continue;
+                    }
+                    DocumentPrecision::Stateless => &[false],
+                    _ => &[true, false],
+                };
+                let mut by_retire = Vec::new();
+                for &retire in retires {
+                    let pass = DocumentPass {
+                        precision,
+                        retire,
+                        deadline: None,
+                        budget_floor: 0,
+                    };
+                    let t = Instant::now();
+                    let mut ids = Vec::new();
+                    let decode = model
+                        .generate_document_once(&embeds, &prompt, &params, pass, &mut ids, None)
+                        .expect("the pass decodes");
+                    let wall = t.elapsed().as_secs_f64();
+                    let split = postprocess::split_pages_by_token(tok, &decode.ids, PAGE, n)
+                        .expect("the split");
+                    let first_mismatch = decode
+                        .ids
+                        .iter()
+                        .zip(&oracle)
+                        .position(|(a, b)| a != b)
+                        .or_else(|| {
+                            (decode.ids.len() != oracle.len())
+                                .then_some(oracle.len().min(decode.ids.len()))
+                        });
+                    // The DISC-U2-7 reset fires on a fed `<PAGE>` past the
+                    // page count: every id but a final one is fed.
+                    let fed = &decode.ids[..decode.ids.len().saturating_sub(1)];
+                    let disc_u2_7 = fed
+                        .iter()
+                        .filter(|&&id| id == PAGE)
+                        .count()
+                        .saturating_sub(n);
+                    let exact = first_mismatch.is_none();
+                    let result = match (exact, precision) {
+                        (true, _) => "pass",
+                        (false, DocumentPrecision::Mixed) => "xfail",
+                        (false, _) => "fail",
+                    };
+                    v2_gated_line(
+                        test,
+                        started,
+                        fixture,
+                        "parity",
+                        result,
+                        serde_json::json!({
+                            "rung": "L4", "path": precision.name(), "retire": retire,
+                            "levers": levers, "tokens": decode.ids.len(),
+                            "oracle_tokens": oracle.len(),
+                            "first_mismatch_step": first_mismatch,
+                            "ids_sha256": v2_ids_sha256(&decode.ids),
+                            "oracle_sha256": entry["token_ids_sha256"],
+                            "finish_reason": decode.finish_reason.as_str(),
+                            "page_tokens": split.tokens,
+                            "page_finish": decode.stats.page_finish.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
+                            "extra_markers": split.extra_markers,
+                            "disc_u2_7_steps": disc_u2_7,
+                            "disc_u2_2_steps": decode.stats.hf_all_neg_inf_steps,
+                            "leading_text": split.leading_text,
+                            "forced_steps": decode.stats.forced_steps,
+                            "retired_blocks": decode.stats.retired_blocks,
+                            "peak_kv_bytes": decode.stats.peak_kv_bytes,
+                            "retire_fallbacks": decode.stats.retire_fallbacks,
+                            "wall_s": wall,
+                            "ms_per_token": 1e3 * wall / decode.ids.len().max(1) as f64,
+                        }),
+                    );
+                    let path = precision.name();
+                    assert_eq!(decode.finish_reason, FinishReason::Stop, "{fixture} {path}");
+                    assert_eq!(split.bodies.len(), n, "{fixture} {path}: a body per page");
+                    let mut want = vec![PageFinish::Marker; n - 1];
+                    want.push(PageFinish::Eos);
+                    assert_eq!(
+                        decode.stats.page_finish, want,
+                        "{fixture} {path}: EOS only on the last page"
+                    );
+                    assert_eq!(split.extra_markers, 0, "{fixture} {path}: DISC-U2-3");
+                    assert_eq!(disc_u2_7, 0, "{fixture} {path}: DISC-U2-7");
+                    assert_eq!(
+                        decode.stats.hf_all_neg_inf_steps, 0,
+                        "{fixture} {path}: DISC-U2-2"
+                    );
+                    assert_eq!(decode.stats.retire_fallbacks, 0, "{fixture} {path}");
+                    assert!(!split.leading_text, "{fixture} {path}: DISC-U2-9");
+                    for (k, (ours, theirs)) in
+                        split.bodies.iter().zip(&oracle_split.bodies).enumerate()
+                    {
+                        assert_eq!(
+                            ours.trim().is_empty(),
+                            theirs.trim().is_empty(),
+                            "{fixture} {path}: page {} body emptiness",
+                            k + 1
+                        );
+                    }
+                    by_retire.push((decode.ids, first_mismatch));
+                }
+                if let [(retired, _), (unretired, _)] = by_retire.as_slice() {
+                    assert_eq!(
+                        retired,
+                        unretired,
+                        "{fixture} {}: retired ≡ unretired",
+                        precision.name()
+                    );
+                }
+                let (ids, first_mismatch) = by_retire.swap_remove(0);
+                if let Some(step) = first_mismatch {
+                    // The trace diff: both caches replayed along the oracle's
+                    // ids to the departure.
+                    let prefix = &oracle[..step];
+                    let (f32_logits, f32_routes) = v2_replay(
+                        &model,
+                        model.decoder_cache_f32().expect("f32 cache"),
+                        (&embeds, &prompt),
+                        prefix,
+                        &params,
+                    );
+                    let (mixed_logits, mixed_routes) = v2_replay(
+                        &model,
+                        model.decoder_cache().expect("mixed cache"),
+                        (&embeds, &prompt),
+                        prefix,
+                        &params,
+                    );
+                    let page = prefix.iter().filter(|&&id| id == PAGE).count();
+                    let page_len = prefix.iter().rev().take_while(|&&id| id != PAGE).count();
+                    let diff = decoder::decode_trace_diff(
+                        step,
+                        page,
+                        page_len,
+                        decoder::StepSide {
+                            label: "f32",
+                            logits: &f32_logits.data,
+                            routes: &f32_routes,
+                        },
+                        decoder::StepSide {
+                            label: "int8-ffn",
+                            logits: &mixed_logits.data,
+                            routes: &mixed_routes,
+                        },
+                    );
+                    // `None` is EOS. The pick is the loop's: n-gram ban,
+                    // guard, greedy argmax.
+                    let want = oracle.get(step).copied();
+                    let mut guard = document_guard(n, PAGE, &params);
+                    for &id in prefix {
+                        guard.observe(id);
+                    }
+                    let pick = |logits: &Mat| {
+                        let s = sampler::decode_step_guarded(logits, prefix, &guard, &params)
+                            .expect("a guarded step");
+                        (!s.is_eos).then_some(s.token_id)
+                    };
+                    let gap = |logits: &Mat| {
+                        let best = logits
+                            .data
+                            .iter()
+                            .copied()
+                            .fold(f32::NEG_INFINITY, f32::max);
+                        best - logits.data[want.unwrap_or(params.eos_token_id) as usize]
+                    };
+                    let routes_differ: Vec<usize> = (0..f32_routes.len())
+                        .filter(|&l| {
+                            f32_routes[l] != mixed_routes.get(l).cloned().unwrap_or_default()
+                        })
+                        .collect();
+                    v2_gated_line(
+                        test,
+                        started,
+                        fixture,
+                        "trace_diff",
+                        "info",
+                        serde_json::json!({
+                            "path": precision.name(), "step": step, "page": page,
+                            "page_len": page_len, "oracle_id": want,
+                            "f32_pick": pick(&f32_logits), "int8_ffn_pick": pick(&mixed_logits),
+                            "f32_oracle_gap": gap(&f32_logits),
+                            "int8_ffn_oracle_gap": gap(&mixed_logits),
+                            "layers_routing_differently": routes_differ,
+                            "diff": diff,
+                        }),
+                    );
+                    assert_eq!(
+                        precision,
+                        DocumentPrecision::Mixed,
+                        "{fixture}: the f32 path departs from the oracle\n{diff}"
+                    );
+                    assert_eq!(
+                        pick(&f32_logits),
+                        want,
+                        "{fixture}: at the int8-FFN departure the f32 path must pick the \
+                         oracle's token\n{diff}"
+                    );
+                }
+                decoded.push((precision, ids));
+            }
+            v2_gated_line(
+                test,
+                started,
+                fixture,
+                "assert",
+                "pass",
+                serde_json::json!({
+                    "levers": levers,
+                    "paths_exact": decoded.iter().filter(|(_, ids)| *ids == oracle).map(|(p, _)| p.name()).collect::<Vec<_>>(),
+                }),
+            );
+        }
+    }
+
+    /// The U2-A6 oracle's generated ids for `fixture` (EOS not included).
+    fn v2_oracle_ids(fixture: &str) -> Vec<u32> {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/uocr2_oracle")
+            .join(format!("{fixture}.ids.txt"));
+        std::fs::read_to_string(path)
+            .expect("oracle ids")
+            .lines()
+            .filter(|l| !l.starts_with('#'))
+            .flat_map(str::split_whitespace)
+            .map(|t| t.parse().expect("an id"))
+            .collect()
+    }
+
+    /// `pages` in the corpus (`FOCR_CORPUS_DIR`, default
+    /// `~/.cache/franken_ocr/corpus/pages`), or `None`, logged as a skip,
+    /// when one is absent.
+    fn v2_corpus_pages(
+        test: &str,
+        started: std::time::Instant,
+        fixture: &str,
+        pages: &[&str],
+    ) -> Option<Vec<PathBuf>> {
+        let corpus = std::env::var_os("FOCR_CORPUS_DIR").map_or_else(
+            || {
+                PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                    .join(".cache/franken_ocr/corpus/pages")
+            },
+            PathBuf::from,
+        );
+        let paths: Vec<PathBuf> = pages.iter().map(|p| corpus.join(p)).collect();
+        if let Some(missing) = paths.iter().find(|p| !p.is_file()) {
+            v2_gated_line(
+                test,
+                started,
+                fixture,
+                "skip",
+                "skip_no_model",
+                serde_json::json!({"reason": format!("{} absent", missing.display())}),
+            );
+            return None;
+        }
+        Some(paths)
+    }
+
+    /// v2's prompt over `pages` through the engine (U2-B6): each page's base
+    /// letterbox ([`OcrModel::document_page`]), the paged prompt and the
+    /// vision blocks ([`OcrModel::document_inputs`]).
+    fn v2_decoder_prompt(model: &OcrModel, pages: &[PathBuf]) -> (Mat, Vec<u32>) {
+        let pres: Vec<Preprocessed> = pages
+            .iter()
+            .map(|page| {
+                let img = image::open(page).expect("page decodes");
+                model.document_page(img).expect("preprocess")
+            })
+            .collect();
+        let (embeds, ids) = model.document_inputs(&pres).expect("document inputs");
+        let pages_in_prompt = ids
+            .iter()
+            .filter(|&&id| id == crate::tokenizer::special::PAGE)
+            .count();
+        assert_eq!(pages_in_prompt, pages.len());
+        (embeds, ids)
     }
 
     /// Greedy argmax, lowest id on ties.
@@ -7456,7 +9705,8 @@ mod tests {
 
         let coords = srswa::PageCoords::build(&ids).expect("v2 page coordinates");
         let (hidden, mut state) =
-            decoder::prefill_with_cache_srswa(wc, &embeds, &coords).expect("cached prefill");
+            decoder::prefill_with_cache_srswa(wc, &embeds, &coords, srswa::EntmaxDomain::TopM)
+                .expect("cached prefill");
         let mut logits =
             decoder::lm_head_cached(wc, &OcrModel::last_hidden_row(&hidden).expect("last row"))
                 .expect("lm_head");
@@ -7469,7 +9719,7 @@ mod tests {
                 break;
             }
             let row = Mat::from_vec(1, table.cols(), table.row_f32(id as usize));
-            let h = decoder::decode_step_with_cache_srswa(wc, &mut state, id, &row)
+            let h = decoder::decode_step_with_cache_srswa(wc, &mut state, id, &row, false)
                 .expect("cached decode step");
             logits = decoder::lm_head_cached(wc, &h).expect("lm_head");
         }
@@ -7489,7 +9739,8 @@ mod tests {
         for step in 0..=STEPS {
             let coords = srswa::PageCoords::build(&grown_ids).expect("coordinates");
             let h =
-                decoder::forward_srswa(&model.weights, &grown, &coords).expect("stateless forward");
+                decoder::forward_srswa(&model.weights, &grown, &coords, srswa::EntmaxDomain::TopM)
+                    .expect("stateless forward");
             let logits = decoder::lm_head(
                 &model.weights,
                 &OcrModel::last_hidden_row(&h).expect("last row"),
@@ -7550,7 +9801,8 @@ mod tests {
         let last_logits = |embeds: &Mat, ids: &[u32]| {
             let coords = srswa::PageCoords::build(ids).expect("coordinates");
             let (h, state) =
-                decoder::prefill_with_cache_srswa(wc, embeds, &coords).expect("cached prefill");
+                decoder::prefill_with_cache_srswa(wc, embeds, &coords, srswa::EntmaxDomain::TopM)
+                    .expect("cached prefill");
             let logits =
                 decoder::lm_head_cached(wc, &OcrModel::last_hidden_row(&h).expect("last row"))
                     .expect("lm_head");
@@ -7567,7 +9819,7 @@ mod tests {
                 "a re-prefill would read it as an image"
             );
             let row = Mat::from_vec(1, table.cols(), table.row_f32(id as usize));
-            let h = decoder::decode_step_with_cache_srswa(wc, &mut state, id, &row)
+            let h = decoder::decode_step_with_cache_srswa(wc, &mut state, id, &row, false)
                 .expect("cached decode step");
             logits = decoder::lm_head_cached(wc, &h).expect("lm_head");
             grown_ids.push(id);
@@ -8029,13 +10281,15 @@ mod tests {
                     eos_token_id: 0,
                     no_repeat_ngram_size: 0,
                     ngram_window: 0,
+                    ngram_domain: model_arch::NgramDomain::PromptAndGenerated,
+                    pages: None,
                 }
             }
             fn tasks(&self) -> &'static [Task] {
                 &[Task::Ocr]
             }
-            fn implemented(&self) -> bool {
-                false
+            fn maturity(&self) -> model_arch::Maturity {
+                model_arch::Maturity::Planned
             }
             fn required_quant_recipe(&self, _quant: &str) -> Option<&'static str> {
                 None
@@ -8147,8 +10401,8 @@ mod tests {
         fn tasks(&self) -> &'static [model_arch::Task] {
             &[model_arch::Task::Ocr]
         }
-        fn implemented(&self) -> bool {
-            false
+        fn maturity(&self) -> model_arch::Maturity {
+            model_arch::Maturity::Planned
         }
         fn required_quant_recipe(&self, _quant: &str) -> Option<&'static str> {
             None

@@ -31,6 +31,8 @@ pub mod doctor;
 pub mod error;
 pub mod native_engine;
 #[cfg(feature = "pdf")]
+pub mod page_source;
+#[cfg(feature = "pdf")]
 pub mod pdf;
 pub mod preprocess;
 pub mod progress;
@@ -97,6 +99,14 @@ pub const DEFAULT_MODEL_PATH: &str = "models/unlimited-ocr.focrq";
 
 #[cfg(feature = "native")]
 const DEFAULT_FORWARD_STAGE_BUDGET_MS: u64 = 10 * 60 * 1000;
+
+/// The per-input forward stage budget (`FOCR_STAGE_BUDGET_FORWARD_MS`), read
+/// by the engine's stage timeout and by Unlimited-OCR-2's document loop,
+/// which checks it cooperatively (U2-B6). `None` disables it.
+#[cfg(feature = "native")]
+pub(crate) fn forward_stage_budget() -> Option<Duration> {
+    OcrEngine::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS)
+}
 
 /// The OCR engine handle.
 ///
@@ -505,11 +515,9 @@ impl OcrEngine {
         // One owned runtime; the per-page forward is the only blocking work and
         // is driven sequentially on the runtime blocking pool, never inline on
         // the async polling thread (no nested runtime, no concurrent forwards).
-        self.run_blocking_stage_with_budget(
-            "forward",
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize(&image_path),
-        )
+        self.run_blocking_stage_with_budget("forward", Self::forward_budget(&model, 1), move || {
+            model.recognize(&image_path)
+        })
     }
 
     /// Recognize an already-decoded in-memory [`image::DynamicImage`], returning
@@ -539,11 +547,9 @@ impl OcrEngine {
         image: image::DynamicImage,
     ) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
-        self.run_blocking_stage_with_budget(
-            "forward",
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_dynamic(image),
-        )
+        self.run_blocking_stage_with_budget("forward", Self::forward_budget(&model, 1), move || {
+            model.recognize_dynamic(image)
+        })
     }
 
     /// Recognize a single document image, returning the markdown AND the
@@ -567,11 +573,9 @@ impl OcrEngine {
     ) -> FocrResult<RecognizedDocument> {
         let model = self.model_at(model_path)?;
         let image_path = image_path.to_path_buf();
-        self.run_blocking_stage_with_budget(
-            "forward",
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_with_layout(&image_path),
-        )
+        self.run_blocking_stage_with_budget("forward", Self::forward_budget(&model, 1), move || {
+            model.recognize_with_layout(&image_path)
+        })
     }
 
     /// Recognize an in-memory [`image::DynamicImage`], returning the markdown AND
@@ -597,11 +601,9 @@ impl OcrEngine {
         image: image::DynamicImage,
     ) -> FocrResult<RecognizedDocument> {
         let model = self.model_at(model_path)?;
-        self.run_blocking_stage_with_budget(
-            "forward",
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_dynamic_with_layout(image),
-        )
+        self.run_blocking_stage_with_budget("forward", Self::forward_budget(&model, 1), move || {
+            model.recognize_dynamic_with_layout(image)
+        })
     }
 
     /// Recognize a single document image, returning the markdown + layout AND the
@@ -629,11 +631,9 @@ impl OcrEngine {
     ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
         let model = self.model_at(model_path)?;
         let image_path = image_path.to_path_buf();
-        self.run_blocking_stage_with_budget(
-            "forward",
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_with_figures(&image_path),
-        )
+        self.run_blocking_stage_with_budget("forward", Self::forward_budget(&model, 1), move || {
+            model.recognize_with_figures(&image_path)
+        })
     }
 
     /// Recognize an in-memory [`image::DynamicImage`], returning the markdown +
@@ -659,11 +659,9 @@ impl OcrEngine {
         image: image::DynamicImage,
     ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>)> {
         let model = self.model_at(model_path)?;
-        self.run_blocking_stage_with_budget(
-            "forward",
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS),
-            move || model.recognize_dynamic_with_figures(image),
-        )
+        self.run_blocking_stage_with_budget("forward", Self::forward_budget(&model, 1), move || {
+            model.recognize_dynamic_with_figures(image)
+        })
     }
 
     /// Recognize a batch of document images in one load-once pass, returning one
@@ -702,13 +700,7 @@ impl OcrEngine {
     ) -> FocrResult<Vec<FocrResult<String>>> {
         let model = self.model_at(model_path)?;
         let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
-        let count = u32::try_from(owned.len().max(1)).unwrap_or(u32::MAX);
-        let budget =
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
-                per_image
-                    .checked_mul(count)
-                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
-            });
+        let budget = Self::forward_budget(&model, owned.len());
         self.run_blocking_stage_with_budget("forward-batch", budget, move || {
             let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
             Ok(model.recognize_batch(&refs))
@@ -747,13 +739,7 @@ impl OcrEngine {
     ) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
         let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
-        let count = u32::try_from(owned.len().max(1)).unwrap_or(u32::MAX);
-        let budget =
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
-                per_image
-                    .checked_mul(count)
-                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
-            });
+        let budget = Self::forward_budget(&model, owned.len());
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
             let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
             model.recognize_multi_page(&refs)
@@ -782,13 +768,7 @@ impl OcrEngine {
         images: Vec<image::DynamicImage>,
     ) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
-        let count = u32::try_from(images.len().max(1)).unwrap_or(u32::MAX);
-        let budget =
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
-                per_image
-                    .checked_mul(count)
-                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
-            });
+        let budget = Self::forward_budget(&model, images.len());
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
             model.recognize_multi_page_dynamic(images)
         })
@@ -809,15 +789,57 @@ impl OcrEngine {
         mut on_page: PageSink,
     ) -> FocrResult<String> {
         let model = self.model_at(model_path)?;
-        let count = u32::try_from(images.len().max(1)).unwrap_or(u32::MAX);
-        let budget =
-            Self::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS).map(|per_image| {
-                per_image
-                    .checked_mul(count)
-                    .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2))
-            });
+        let budget = Self::forward_budget(&model, images.len());
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
             model.recognize_multi_page_dynamic_streaming(images, &mut *on_page)
+        })
+    }
+
+    /// [`OcrEngine::recognize_multi_page`] over a lazy
+    /// [`page_source::PageSource`] (U2-D0): the pages are rasterized one at a
+    /// time on the forward stage's thread, each dropped once preprocessed.
+    /// `on_item` sees every page before it is read, a skipped one included;
+    /// `on_page`, when given, streams page bodies as
+    /// [`OcrEngine::recognize_multi_page_dynamic_streaming_with_model`] does.
+    ///
+    /// The source is consumed: a caller that retries (a first-run download)
+    /// opens a fresh one.
+    ///
+    /// # Errors
+    /// As [`crate::native_engine::OcrModel::recognize_multi_page_source`].
+    #[cfg(feature = "pdf")]
+    pub fn recognize_multi_page_source_with_model(
+        &self,
+        model_path: &Path,
+        mut source: page_source::PageSource,
+        mut on_item: Box<dyn FnMut(&page_source::PageItem) + Send>,
+        on_page: Option<PageSink>,
+    ) -> FocrResult<String> {
+        let model = self.model_at(model_path)?;
+        let budget = Self::forward_budget(&model, source.len());
+        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || match on_page {
+            Some(mut sink) => {
+                model.recognize_multi_page_source(&mut source, &mut *on_item, Some(&mut *sink))
+            }
+            None => model.recognize_multi_page_source(&mut source, &mut *on_item, None),
+        })
+    }
+
+    /// The forward stage's wall-clock bound for `count` inputs to `model`: the
+    /// per-input budget times the count. A model whose document loop checks
+    /// the same budget cooperatively (Unlimited-OCR-2, U2-B6) stops itself
+    /// first and keeps its completed pages, so its bound here adds
+    /// [`native_engine::document_budget_grace`] and stays a hang backstop.
+    fn forward_budget(model: &OcrModel, count: usize) -> Option<Duration> {
+        let per_input = forward_stage_budget()?;
+        let count = u32::try_from(count.max(1)).unwrap_or(u32::MAX);
+        let budget = per_input
+            .checked_mul(count)
+            .unwrap_or_else(|| Duration::from_secs(u64::MAX / 2));
+        Some(if model.checks_forward_budget() {
+            budget.saturating_add(native_engine::document_budget_grace(budget))
+        } else {
+            budget
         })
     }
 

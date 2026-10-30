@@ -39,8 +39,7 @@ fixture** (`_meta` blocks) — this file is the index, not the authority.
 | `ladder_scorecard/scorecard_{armed,unarmed}.json` | [R→C] | `scripts/ladder_scorecard.sh` folding the parity ladder's own NDJSON (armed: M4 host, 2026-07-06, f32 safetensors + `fixtures/native_f32` oracle set — all six gates green, L4 token-exact 1.0, L5 CER 0.0; unarmed: the skip-honest shape, `skipped_no_model:true`) | Rerun the script armed/unarmed; a changed scorecard is a reviewed parity change |
 | `cjk_stream/page_{1,2}.png` | [R→C] | `scripts/gen_cjk_stream_fixture.py` (Pillow, `/System/Library/Fonts/Hiragino Sans GB.ttc`; the script refuses a font missing any glyph): two 1024² pages of Chinese text mixing single-token characters with ones the v1 byte-level BPE splits, for `multi_page_streaming_survives_split_cjk_characters_when_armed` (U2-X1) | `python3 -I scripts/gen_cjk_stream_fixture.py --font "/System/Library/Fonts/Hiragino Sans GB.ttc" --out tests/fixtures/cjk_stream` |
 | `uocr2_v1_goldens/` | [R→C] | `tests/uocr2_goldens.rs` on the pinned v1 conservative int8 artifact (size + sha256, inputs, token counts, git revision and threads in `CAPTURE.json`): generated token ids, final markdown and projected robot `page` events for the fast cases (`page_0009`, `page_0014`, `p9_p14`, its streamed twin) and the long ones (`page_0590`, `p10`, `p20`) (U2-T3) | `UPDATE_GOLDENS=1 FOCR_E2E_LONG=1 scripts/token_golden_gate.sh`, only with a reviewed reason (`docs/conformance/GOLDEN.md` §4a) |
-
-| `uocr2_oracle/` | [R→C] | `scripts/gen_reference_fixtures_uocr2.py`: Baidu's HF Unlimited-OCR-2 (`5632329a`) in f32 on CPU, on the v2 reference stack (`docs/truth-pack/PINNED_SOURCES.md`), with explicit `no_repeat_ngram_size=35`, `ngram_window` 128 (single page) or 1024 (multi-page), `max_page_tokens=20000` and the page guard (U2-A6). Contents: `<fixture>.ids.txt` and `<fixture>.md` for S1 (`page_0590`, `page_0009`, `page_0014`, base), S2 (`page_0009`, `page_0014`, `page_0019`, base), S3 (the `multi_page/` p9_p14, p10 and p20 page lists, base) and S4 (`page_0590` and `page_0009`, gundam, 2×3 tiles); `ORACLE.json` (input sha256s, params, counters, provenance); `FLOOR.json` (the nondeterminism floor and the bf16 ledger). `scripts/check_oracle_provenance.py` validates all of it | Each run below writes `<out>/<dtype>/<tag>/`; `--commit-dir` is passed only to the f32 t12 run. `P=<venv>/bin/python -I`, `G="scripts/gen_reference_fixtures_uocr2.py --model-dir <hf snapshot> --corpus ~/.cache/franken_ocr/corpus/pages --out $FOCR_FIXTURES_DIR/uocr2_oracle --sets S1,S2,S4,S3"`: `$P $G --dtype f32 --threads 12 --tag t12 --commit-dir tests/fixtures/uocr2_oracle`; `$P $G --dtype f32 --threads 4 --tag t4`. The repeat and the bf16 runs skip S3-p10/p20 (bf16 on CPU is several times slower), with `O="--only S1-page_0590,S1-page_0009,S1-page_0014,S2-p9_p14_p19,S4-page_0590-gundam,S4-page_0009-gundam,S3-p9_p14"`: `$P $G $O --dtype f32 --threads 12 --tag t12r`; `$P $G $O --dtype bf16 --threads 12 --tag t12`; `$P $G $O --dtype bf16 --threads 4 --tag t4`. Then `$P scripts/oracle_nondeterminism_floor.py --uocr2-group f32=<f32/t12>,<f32/t4> --uocr2-group f32_rerun=<f32/t12>,<f32/t12r> --uocr2-group bf16=<bf16/t12>,<bf16/t4> --uocr2-group ledger=<f32/t12>,<bf16/t12>` (the `f32` group must cover every committed fixture) |
+| `uocr2_oracle/` | [R→C] | `scripts/gen_reference_fixtures_uocr2.py`: Baidu's HF Unlimited-OCR-2 (`5632329a`) in f32 on CPU, on the v2 reference stack (`docs/truth-pack/PINNED_SOURCES.md`), with explicit `no_repeat_ngram_size=35`, `ngram_window` 128 (single page) or 1024 (multi-page), `max_page_tokens=20000` and the page guard (U2-A6). Contents: `<fixture>.ids.txt` and `<fixture>.md` for S1 (`page_0590`, `page_0009`, `page_0014`, base), S2 (`page_0009`, `page_0014`, `page_0019`, base), S3 (the `multi_page/` p9_p14, p10 and p20 page lists, base) and S4 (`page_0590` and `page_0009`, gundam, 2×3 tiles); `ORACLE.json` (input sha256s, params, counters, provenance); `FLOOR.json` (the nondeterminism floor and the bf16 ledger; per layer it covers the hidden states, attention outputs and router stages (`iq`, `ik`, `kbar`, scores, prior), and counts the rows whose selected block set changes (`routing_set_rows_differing`) separately from rows whose slots are only reordered). `scripts/check_oracle_provenance.py` validates all of it | Each run below writes `<out>/<dtype>/<tag>/`; `--commit-dir` is passed only to the f32 t12 run. `P=<venv>/bin/python -I`, `G="scripts/gen_reference_fixtures_uocr2.py --model-dir <hf snapshot> --corpus ~/.cache/franken_ocr/corpus/pages --out $FOCR_FIXTURES_DIR/uocr2_oracle --sets S1,S2,S4,S3"`: `$P $G --dtype f32 --threads 12 --tag t12 --commit-dir tests/fixtures/uocr2_oracle`; `$P $G --dtype f32 --threads 4 --tag t4`. The repeat and the bf16 runs skip S3-p10/p20 (bf16 on CPU is several times slower), with `O="--only S1-page_0590,S1-page_0009,S1-page_0014,S2-p9_p14_p19,S4-page_0590-gundam,S4-page_0009-gundam,S3-p9_p14"`: `$P $G $O --dtype f32 --threads 12 --tag t12r`; `$P $G $O --dtype bf16 --threads 12 --tag t12`; `$P $G $O --dtype bf16 --threads 4 --tag t4`. Then `$P scripts/oracle_nondeterminism_floor.py --uocr2-group f32=<f32/t12>,<f32/t4> --uocr2-group f32_rerun=<f32/t12>,<f32/t12r> --uocr2-group bf16=<bf16/t12>,<bf16/t4> --uocr2-group ledger=<f32/t12>,<bf16/t12>` (the `f32` group must cover every committed fixture) |
 
 ## The weights-gated fixture families (NOT in this tree)
 
@@ -70,3 +69,32 @@ absent — committed here would be multi-GB:
    pinned stack; the commit message cites the script and why.
 3. A new fixture family MUST be added to `MANIFEST.toml` (the validator fails
    otherwise) and to this catalogue.
+
+## Windowed SGLang oracle runs (U2-D2a; dumps NOT in this tree)
+
+`scripts/gen_reference_fixtures_uocr2.py --windowed W` serves one base-mode document
+the way the pinned SGLang wheel (`sglang-0.5.20.dev10+g8d62f5fb9c`, sha256
+`a3f3e2c9…c2ba70d`) does with `SGLANG_UOCR_DOC_BASE_PAGE_WINDOW=W` and the README
+server settings (per-page cap 20,000, one lookahead page with KV reuse, ctx 131,072),
+on Baidu's HF reference (`5632329a`) in f32 on CPU. It commits nothing, so there is no
+`MANIFEST.toml` entry. Each run writes `<out>/<tag>/run.json` (plan, substitutions,
+per-window summary, document text, checks, provenance) and
+`<out>/<tag>/w<bi>/window.json` plus `rows.*.npy` (per KV row: ids, origin, source row,
+query page, coordinate bucket, tok_pos, RoPE page, frame bucket, page-state slots).
+
+The 2026-10-30 set used script sha256 `5edc7645…627780e92` on git `dab3fc6`+dirty (macOS arm64),
+with `P=<venv>/bin/python -I` and
+`G="scripts/gen_reference_fixtures_uocr2.py --model-dir <hf snapshot> --corpus ~/.cache/franken_ocr/corpus/pages --out <dump root>"`.
+Wall times are `/usr/bin/time` real, model load included:
+
+* `$P scripts/gen_reference_fixtures_uocr2.py --self-test --windowed 2` (model-free; under 1 s)
+* `$P $G --windowed 3 --doc S2-p9_p14_p19 --windowed-check degenerate,extend --threads 12 --tag degenerate-s2-w3-t12` (249 s)
+* `$P $G --windowed 2 --doc S3-p10:7 --threads 12 --tag w2-n7-t12` (291 s)
+* `$P $G --windowed 3 --doc S3-p10:7 --threads 12 --tag w3-n7-t12` (215 s)
+* `$P $G --windowed 2 --doc S3-p10:7 --threads 12 --force-fallback 1:pool_too_small --force-fallback 2:no_text --force-fallback 3:no_entry --windowed-check recompute --tag w2-n7-recompute-t12` (364 s)
+* `$P $G --windowed 2 --doc S3-p10:7 --threads 12 --tag w2-n7-t12r` (264 s)
+* `$P $G --windowed 2 --doc S3-p10:7 --threads 4 --tag w2-n7-t4` (234 s)
+* `$P $G --windowed 2 --doc S3-p10:5 --threads 12 --force-fallback 1:splice_alloc_failed --tag w2-n5-markeronly-t12` (126 s)
+* `$P scripts/gen_reference_fixtures_uocr2.py --windowed-compare <dump root>/w2-n7-t12,<dump root>/w2-n7-t12r,<dump root>/w2-n7-t4` (model-free; under 1 s)
+
+The dump root was a session scratch directory, so rerun the commands to regenerate the dumps.

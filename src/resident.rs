@@ -1168,9 +1168,9 @@ mod tests {
     }
 
     /// U2-A7: a daemon keyed to an Unlimited-OCR-2 checkpoint refuses
-    /// transport-shaped, before building an engine; the client falls back
-    /// inline, where the pre-load check refuses with exit 2. (The client's
-    /// own skip is pinned by the e2e CLI matrix: no daemon state appears.)
+    /// transport-shaped, before building an engine; the client runs it
+    /// inline. (The client's own skip is pinned by the e2e CLI matrix: no
+    /// daemon state appears.)
     #[test]
     fn daemon_refuses_unlimited_ocr_2_transport_shaped() {
         use std::io::{BufRead, BufReader};

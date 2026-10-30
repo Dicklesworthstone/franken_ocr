@@ -3,7 +3,8 @@
 //! global attention at [2,5,8,11], image size 1024 ([SPEC-017]).
 //!
 //! Real fp32 forward. Patch-embed Conv2d k16s16 -> 64x64 tokens (width 768);
-//! learned `pos_embed` (1,64,64,768) bicubic-interpolated to the runtime grid;
+//! learned `pos_embed` (1,64,64,768) resized to the runtime grid with torch's
+//! antialiased bicubic;
 //! 12 [`Block`]s with window attention (`window=14`, OQ-15) except global at
 //! `[2,5,8,11]`; decomposed relative-position bias added to the SDPA logits; the
 //! neck (Conv2d 768->256 k1 -> LayerNorm2d -> Conv2d 256->256 k3 p1 ->
@@ -793,7 +794,7 @@ fn forward_core_views<'w>(
         // [gh*gw, dim] (spatial-major rows) for the transformer (NHWC flat).
         let mut x = nchw_to_nhwc_rows(&conv_out, dim, gh, gw);
 
-        // ── abs pos-embed (added once before the blocks; bicubic if needed).
+        // ── abs pos-embed (added once before the blocks; resized if needed).
         let pos = abs_pos(&w.pos_embed, w.pos_grid_h, w.pos_grid_w, dim, gh, gw)?;
         for (xv, pv) in x.data.iter_mut().zip(pos.iter()) {
             *xv += *pv;
@@ -1991,12 +1992,13 @@ fn transpose_contiguous_stores(m: &[f32], rows: usize, cols: usize) -> Vec<f32> 
     out
 }
 
-// ── absolute position embedding (bicubic interp, [SPEC-042]) ───────────────
+// ── absolute position embedding (antialiased bicubic, [SPEC-042]) ──────────
 
 /// Build the abs pos-embed contribution for a `[gh, gw, dim]` grid from the
-/// learned `[src_h, src_w, dim]` table, bicubic-interpolating if the runtime
-/// grid differs (matches `get_abs_pos_sam`). Returns NHWC token-row order
-/// `[gh*gw, dim]` flattened.
+/// learned `[src_h, src_w, dim]` table. When the runtime grid differs (a 640
+/// view, 64→40) the table is resized like `get_abs_pos_sam`, with
+/// torch's antialiased bicubic ([`nn::resize_bicubic_aa`]). Returns NHWC
+/// token-row order `[gh*gw, dim]` flattened.
 fn abs_pos(
     pos: &[f32],
     src_h: usize,
@@ -2021,102 +2023,11 @@ fn abs_pos(
             dim
         )));
     }
-    let tgt_hw = checked_shape_mul("vision_sam abs_pos", gh, gw, "gh*gw")?;
-    let out_len = checked_shape_mul("vision_sam abs_pos", tgt_hw, dim, "gh*gw*dim")?;
     if src_h == gh && src_w == gw {
         return Ok(pos.to_vec()); // already [gh*gw, dim] NHWC rows
     }
-    // Interpolate per-channel over the spatial grid (bicubic, align_corners=
-    // False). pos is [src_h, src_w, dim] (channel-last); we resample each
-    // channel independently into [gh, gw].
-    let mut out = vec![0.0f32; out_len];
-    let scale_y = src_h as f32 / gh as f32;
-    let scale_x = src_w as f32 / gw as f32;
-    for oy in 0..gh {
-        let sy = (oy as f32 + 0.5) * scale_y - 0.5;
-        for ox in 0..gw {
-            let sx = (ox as f32 + 0.5) * scale_x - 0.5;
-            let dst = (oy * gw + ox) * dim;
-            for c in 0..dim {
-                out[dst + c] = bicubic_sample(pos, src_h, src_w, dim, c, sy, sx);
-            }
-        }
-    }
-    Ok(out)
-}
-
-/// Bicubic sample of channel `c` from a `[src_h, src_w, dim]` channel-last
-/// table at fractional `(sy, sx)` using the Catmull-Rom-ish cubic convolution
-/// kernel (`a = -0.75`, PyTorch default), edge-clamped.
-fn bicubic_sample(
-    pos: &[f32],
-    src_h: usize,
-    src_w: usize,
-    dim: usize,
-    c: usize,
-    sy: f32,
-    sx: f32,
-) -> f32 {
-    let iy = sy.floor();
-    let ix = sx.floor();
-    let fy = sy - iy;
-    let fx = sx - ix;
-    let wy = cubic_weights(fy);
-    let wx = cubic_weights(fx);
-    let mut acc = 0.0f32;
-    // indexed loop: spatial kernel offset
-    #[allow(clippy::needless_range_loop)]
-    for m in 0..4 {
-        let yy = clamp_idx(iy as isize - 1 + m as isize, src_h);
-        // indexed loop: spatial kernel offset
-        #[allow(clippy::needless_range_loop)]
-        for n in 0..4 {
-            let xx = clamp_idx(ix as isize - 1 + n as isize, src_w);
-            let val = pos[(yy * src_w + xx) * dim + c];
-            acc += val * wy[m] * wx[n];
-        }
-    }
-    acc
-}
-
-/// Cubic-convolution weights for the 4-tap stencil around fractional `t` in
-/// `[0,1)` with `a = -0.75` (PyTorch `mode="bicubic"`).
-fn cubic_weights(t: f32) -> [f32; 4] {
-    let a = -0.75f32;
-    // distances of the four samples (indices -1,0,1,2) from t.
-    let d0 = 1.0 + t;
-    let d1 = t;
-    let d2 = 1.0 - t;
-    let d3 = 2.0 - t;
-    [
-        cubic_k(d0, a),
-        cubic_k(d1, a),
-        cubic_k(d2, a),
-        cubic_k(d3, a),
-    ]
-}
-
-/// Keys cubic kernel `W(x)` with parameter `a`.
-fn cubic_k(x: f32, a: f32) -> f32 {
-    let x = x.abs();
-    if x <= 1.0 {
-        (a + 2.0) * x * x * x - (a + 3.0) * x * x + 1.0
-    } else if x < 2.0 {
-        a * x * x * x - 5.0 * a * x * x + 8.0 * a * x - 4.0 * a
-    } else {
-        0.0
-    }
-}
-
-/// Clamp an index to `[0, n-1]`.
-fn clamp_idx(i: isize, n: usize) -> usize {
-    if i < 0 {
-        0
-    } else if i as usize >= n {
-        n - 1
-    } else {
-        i as usize
-    }
+    // pos is [src_h, src_w, dim] (channel-last), the layout the resize takes.
+    nn::resize_bicubic_aa(pos, src_h, src_w, dim, gh, gw)
 }
 
 /// Synthetic-tower construction shared by this module's tests and by the
@@ -2552,16 +2463,6 @@ mod tests {
             conv_apply(&identity_conv1(1), &input, 1, 1, usize::MAX / 2 + 1, 1),
             "2*pad",
         );
-    }
-
-    #[test]
-    fn cubic_weights_sum_to_one() {
-        // The cubic-convolution kernel taps sum to 1 for any fractional t.
-        for &t in &[0.0f32, 0.25, 0.5, 0.75, 0.99] {
-            let w = cubic_weights(t);
-            let s: f32 = w.iter().sum();
-            assert!((s - 1.0).abs() < 1e-5, "t={t} sum={s}");
-        }
     }
 
     #[test]

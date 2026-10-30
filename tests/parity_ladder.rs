@@ -29,6 +29,8 @@
 
 #[path = "support/parity_harness.rs"]
 mod parity_harness;
+#[path = "support/uocr2.rs"]
+mod uocr2;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,6 +42,7 @@ use parity_harness::{
     TensorSpec, cosine, establish_floor, max_abs_diff, scrub_volatile, sha256_hex, ulp_compare,
 };
 use serde_json::{Value, json};
+use uocr2::{load_uocr2_source, uocr2_inputs_embeds};
 
 // The subject (engine) side of the ladder. These are the SAME public kernels the
 // off-repo example dumps (`examples/full_vision_dump.rs`, `examples/decoder_dump.rs`)
@@ -418,6 +421,8 @@ fn golden_decode_params(golden: &ReferenceGolden) -> Result<DecodeParams, String
         no_repeat_ngram_size: field("no_repeat_ngram_size")? as usize,
         ngram_window: field("ngram_window")? as usize,
         max_positions: sampler::DEFAULT_MAX_POSITIONS,
+        max_page_tokens: sampler::UOCR2_DEFAULT_MAX_PAGE_TOKENS,
+        entmax_domain: franken_ocr::native_engine::srswa::EntmaxDomain::TopM,
     })
 }
 
@@ -1214,6 +1219,344 @@ fn l0_preprocess_exact() {
     }
 }
 
+// ── Unlimited-OCR-2 lane (U2-B7, U2-C1) ─────────────────────────────────────
+
+/// The U2-A6 f32 oracle the v2 rungs compare against: the run's dump directory
+/// (`FOCR_UOCR2_FIXTURES_DIR`, `<oracle root>/f32/t12`), laid out as
+/// `<fixture>_reference.json` plus `activations/<fixture>/<stage>.npy`, and the
+/// committed `tests/fixtures/uocr2_oracle/ORACLE.json` naming each fixture's
+/// pages and parameters.
+struct Uocr2Oracle {
+    dumps: PathBuf,
+    fixtures: serde_json::Map<String, Value>,
+}
+
+impl Uocr2Oracle {
+    /// The oracle, or `None` after a skip line when the dumps are not named.
+    fn from_env(log: &mut Logger) -> Option<Self> {
+        let Some(dumps) = std::env::var_os("FOCR_UOCR2_FIXTURES_DIR").map(PathBuf::from) else {
+            log.skip_no_model(
+                "FOCR_UOCR2_FIXTURES_DIR unset: point it at the U2-A6 dump directory \
+                 (<oracle root>/f32/t12)",
+            );
+            return None;
+        };
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/uocr2_oracle/ORACLE.json"
+        );
+        let oracle: Value = serde_json::from_slice(&std::fs::read(path).expect("ORACLE.json"))
+            .expect("ORACLE.json parses");
+        let fixtures = oracle["fixtures"]
+            .as_object()
+            .expect("ORACLE.json fixtures")
+            .clone();
+        Some(Self { dumps, fixtures })
+    }
+
+    fn npy(&self, fixture: &str, stage: &str) -> Vec<u8> {
+        let path = self
+            .dumps
+            .join("activations")
+            .join(fixture)
+            .join(format!("{stage}.npy"));
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn f32s(&self, fixture: &str, stage: &str) -> (Vec<usize>, Vec<f32>) {
+        parity_harness::read_npy_f32(&self.npy(fixture, stage))
+            .unwrap_or_else(|e| panic!("{fixture} {stage}: {e}"))
+    }
+
+    fn i32s(&self, fixture: &str, stage: &str) -> (Vec<usize>, Vec<i32>) {
+        parity_harness::read_npy_i32(&self.npy(fixture, stage))
+            .unwrap_or_else(|e| panic!("{fixture} {stage}: {e}"))
+    }
+
+    fn u8s(&self, fixture: &str, stage: &str) -> (Vec<usize>, Vec<u8>) {
+        parity_harness::read_npy_u8(&self.npy(fixture, stage))
+            .unwrap_or_else(|e| panic!("{fixture} {stage}: {e}"))
+    }
+
+    /// `<fixture>_reference.json`.
+    fn reference(&self, fixture: &str) -> Value {
+        let path = self.dumps.join(format!("{fixture}_reference.json"));
+        serde_json::from_slice(&std::fs::read(&path).expect("reference json"))
+            .expect("reference json parses")
+    }
+
+    /// The sha256 of one dumped stage's file, from the reference's manifest.
+    fn stage_sha256(reference: &Value, stage: &str) -> String {
+        reference["activations"][stage]["file_sha256"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no file_sha256 for {stage}"))
+            .to_string()
+    }
+
+    /// The dumped prompt ids, which must be the reference's `prompt_token_ids`.
+    fn prompt_ids(&self, fixture: &str, reference: &Value) -> Vec<u32> {
+        let ids: Vec<u32> = self
+            .i32s(fixture, "prompt_ids")
+            .1
+            .into_iter()
+            .map(|id| u32::try_from(id).expect("a token id"))
+            .collect();
+        let listed: Vec<u32> = reference["prompt_token_ids"]
+            .as_array()
+            .expect("prompt_token_ids")
+            .iter()
+            .map(|id| id.as_u64().expect("a token id") as u32)
+            .collect();
+        assert_eq!(ids, listed, "{fixture}: prompt_ids.npy vs prompt_token_ids");
+        ids
+    }
+
+    /// The fixture's corpus pages (`FOCR_CORPUS_DIR`, default
+    /// `~/.cache/franken_ocr/corpus/pages`), or `None` after a skip line when
+    /// any page of any fixture is absent.
+    fn page_paths(&self, log: &mut Logger) -> Option<BTreeMap<String, Vec<PathBuf>>> {
+        let corpus = std::env::var_os("FOCR_CORPUS_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(".cache/franken_ocr/corpus/pages"))
+            })
+            .expect("FOCR_CORPUS_DIR or HOME is set");
+        let mut paths = BTreeMap::new();
+        for (fixture, entry) in &self.fixtures {
+            let pages: Vec<PathBuf> = entry["pages"]
+                .as_array()
+                .expect("fixture pages")
+                .iter()
+                .map(|page| corpus.join(page["name"].as_str().expect("page name")))
+                .collect();
+            if let Some(missing) = pages.iter().find(|path| !path.is_file()) {
+                log.skip_no_model(&format!(
+                    "corpus page {} absent (set FOCR_CORPUS_DIR)",
+                    missing.display()
+                ));
+                return None;
+            }
+            paths.insert(fixture.clone(), pages);
+        }
+        Some(paths)
+    }
+
+    /// Page `index` of `fixture`, held to its sha256 in `ORACLE.json`.
+    fn page_bytes(&self, fixture: &str, index: usize, path: &Path) -> Vec<u8> {
+        let bytes = std::fs::read(path).expect("corpus page reads");
+        assert_eq!(
+            sha256_hex(&bytes),
+            self.fixtures[fixture]["pages"][index]["sha256"]
+                .as_str()
+                .expect("page sha256"),
+            "{fixture}: {} is not the page the oracle read",
+            path.display()
+        );
+        bytes
+    }
+
+    fn gundam(&self, fixture: &str) -> bool {
+        self.fixtures[fixture]["params"]["crop_mode"].as_bool() == Some(true)
+    }
+}
+
+/// The first element whose bits differ, as `(index, ours, oracle)`.
+fn first_bit_mismatch(got: &[f32], want: &[f32]) -> Option<(usize, f32, f32)> {
+    got.iter()
+        .zip(want)
+        .position(|(a, b)| a.to_bits() != b.to_bits())
+        .map(|i| (i, got[i], want[i]))
+}
+
+/// Running ULP statistics of one table compare: elements compared, elements
+/// whose bits differ, and the worst [`parity_harness::ulp_compare`] report.
+#[derive(Default)]
+struct UlpTally {
+    compared: usize,
+    differing: usize,
+    max_ulp: u32,
+    max_abs_diff: f64,
+}
+
+impl UlpTally {
+    /// Add `ours` against `oracle` under the transcendental budget; `where_`
+    /// names the table in a failure message.
+    fn add(&mut self, ours: &[f32], oracle: &[f32], where_: &str) {
+        let report = ulp_compare(ours, oracle, OpFamily::Transcendental);
+        assert!(
+            report.pass,
+            "{where_}: {} ulp at {} (ours {}, oracle {}), budget {}",
+            report.max_ulp,
+            report.worst_index,
+            ours[report.worst_index],
+            oracle[report.worst_index],
+            report.budget_ulp
+        );
+        self.compared += ours.len();
+        self.differing += ours
+            .iter()
+            .zip(oracle)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        self.max_ulp = self.max_ulp.max(report.max_ulp);
+        self.max_abs_diff = self.max_abs_diff.max(report.max_abs_diff);
+    }
+}
+
+/// U2-C1 L1: native page2d coordinates equal the U2-A6 f32 oracle's exactly,
+/// and their RoPE tables agree within the per-op transcendental ULP budget
+/// (METHODOLOGY §1.3, 8 ulp), on every fixture.
+/// - Prefill: `PageCoords::build` over the dumped prompt ids against
+///   `prefill.coords_tok` / `prefill.coords_page`, and its table against both
+///   the main attention's and the router's `cos`/`sin`.
+/// - Decode: a `DecodePageState` fed the reference's generated ids against the
+///   coordinates and tables of every kept decode step, page breaks included
+///   (U2-B1's hand-over).
+///
+/// The tables are not compared bit for bit: torch's CPU `cos`/`sin` are
+/// vectorized approximations accurate to 1 ulp, and Rust's are not the same
+/// functions. The angles are the same f32 products, so a frequency off by an
+/// ulp would put rows thousands of tokens in by far more than the budget.
+/// Model-free. Skips with success when the dumps are absent.
+#[test]
+fn uocr2_l1_page2d_coordinates_and_rope_match_the_oracle() {
+    use franken_ocr::native_engine::srswa;
+    let mut log = Logger::new("uocr2_L1_page2d", "uocr2_oracle");
+    log.setup(0);
+    let t0 = Instant::now();
+    let Some(oracle) = Uocr2Oracle::from_env(&mut log) else {
+        return;
+    };
+    let mut decode_steps = 0usize;
+    for fixture in oracle.fixtures.keys() {
+        let reference = oracle.reference(fixture);
+        let ids = oracle.prompt_ids(fixture, &reference);
+        let coords = srswa::PageCoords::build(&ids).expect("v2 page coordinates");
+        let tok: Vec<i32> = coords.tok_pos.iter().map(|&t| t as i32).collect();
+        // The oracle dumps the page coordinate before the rotary folds it
+        // mod 2: unwindowed, that is the bucket. The fold shows in the tables.
+        let page: Vec<i32> = coords.bucket.iter().map(|&b| b as i32).collect();
+        assert_eq!(
+            tok,
+            oracle.i32s(fixture, "prefill.coords_tok").1,
+            "{fixture}: prefill token positions"
+        );
+        assert_eq!(
+            page,
+            oracle.i32s(fixture, "prefill.coords_page").1,
+            "{fixture}: prefill page coordinates"
+        );
+        let rope = coords.rope_table(0);
+        let mut tables = UlpTally::default();
+        for (stage, ours) in [
+            ("prefill.main_cos", &rope.cos),
+            ("prefill.main_sin", &rope.sin),
+            ("prefill.router_cos", &rope.cos),
+            ("prefill.router_sin", &rope.sin),
+        ] {
+            let (shape, want) = oracle.f32s(fixture, stage);
+            assert_eq!(shape, [ids.len(), srswa::HEAD_DIM], "{fixture} {stage}");
+            tables.add(ours, &want, &format!("{fixture} {stage}"));
+        }
+
+        // Step k ≥ 1 is the decode forward of generated token k − 1.
+        let generated: Vec<u32> = reference["token_ids"]
+            .as_array()
+            .expect("token_ids")
+            .iter()
+            .map(|id| id.as_u64().expect("a token id") as u32)
+            .collect();
+        let steps = oracle.i32s(fixture, "decode.index").1;
+        let (dtok, dpage) = (
+            oracle.i32s(fixture, "decode.coords_tok").1,
+            oracle.i32s(fixture, "decode.coords_page").1,
+        );
+        let (dcos, dsin) = (
+            oracle.f32s(fixture, "decode.main_cos").1,
+            oracle.f32s(fixture, "decode.main_sin").1,
+        );
+        assert_eq!(
+            dtok.len(),
+            steps.len(),
+            "{fixture}: one coordinate per step"
+        );
+        let mut state = srswa::DecodePageState::after_prompt(&coords, 0);
+        let fed: Vec<srswa::DecodeCoord> = generated
+            .iter()
+            .take(*steps.last().expect("kept decode steps") as usize)
+            .map(|&id| state.feed(id))
+            .collect();
+        let width = srswa::HEAD_DIM;
+        for (j, &step) in steps.iter().enumerate() {
+            let c = fed[step as usize - 1];
+            assert_eq!(
+                (c.tok_pos as i32, c.bucket as i32),
+                (dtok[j], dpage[j]),
+                "{fixture} decode step {step} (token position, page bucket)"
+            );
+            let table = srswa::page2d_rope_table(&[c.tok_pos], &[c.rope_page]);
+            let span = j * width..(j + 1) * width;
+            tables.add(
+                &table.cos,
+                &dcos[span.clone()],
+                &format!("{fixture} decode step {step} cos"),
+            );
+            tables.add(
+                &table.sin,
+                &dsin[span],
+                &format!("{fixture} decode step {step} sin"),
+            );
+        }
+        let page_breaks = generated[..fed.len()]
+            .iter()
+            .filter(|&&id| id == special::PAGE)
+            .count();
+        decode_steps += steps.len();
+        log.parity(
+            "L1",
+            "max_abs_diff",
+            0.0,
+            0.0,
+            fixture,
+            &Uocr2Oracle::stage_sha256(&reference, "prefill.coords_tok"),
+            json!({
+                "seam": "page2d coordinates (prefill rows, kept decode steps)",
+                "exact": true,
+                "prefill_rows": ids.len(),
+                "decode_steps_compared": steps.len(),
+                "generated_page_breaks_fed": page_breaks,
+            }),
+            true,
+        );
+        let budget = parity_harness::ulp_table(OpFamily::Transcendental);
+        log.parity(
+            "L1",
+            "max_abs_diff",
+            tables.max_abs_diff,
+            f64::from(budget) * f64::from(f32::EPSILON),
+            fixture,
+            &Uocr2Oracle::stage_sha256(&reference, "prefill.main_cos"),
+            json!({
+                "seam": "page2d RoPE cos/sin (prefill main/router, kept decode steps)",
+                "tolerance_rule": "per-op transcendental ULP budget (METHODOLOGY §1.3); \
+                                   tolerance is that budget at |x| = 1",
+                "ulp_budget": budget,
+                "max_ulp": tables.max_ulp,
+                "elements_compared": tables.compared,
+                "elements_differing": tables.differing,
+                "oracle_floor": "t12 vs t4 tables are bit-identical",
+            }),
+            true,
+        );
+    }
+    log.assertion(
+        "every fixture's prefill and kept decode steps compared",
+        decode_steps > 0,
+    );
+    log.result("pass", t0.elapsed().as_micros());
+}
+
 /// U2-B7 L0, EXACT: Unlimited-OCR-2 preprocessing equals the U2-A6 f32 oracle
 /// bit for bit on every committed fixture: S1 and S3 (base), S2 (multi-page
 /// base) and S4 (gundam). Checked per fixture:
@@ -1233,94 +1576,41 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
     let mut log = Logger::new("uocr2_L0_preprocess", "uocr2_oracle");
     log.setup(0);
     let t0 = Instant::now();
-    let Some(dumps) = std::env::var_os("FOCR_UOCR2_FIXTURES_DIR").map(PathBuf::from) else {
-        log.skip_no_model(
-            "FOCR_UOCR2_FIXTURES_DIR unset: point it at the U2-A6 dump directory \
-             (<oracle root>/f32/t12)",
-        );
+    let Some(oracle) = Uocr2Oracle::from_env(&mut log) else {
         return;
     };
-    let corpus = std::env::var_os("FOCR_CORPUS_DIR")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME")
-                .map(|home| PathBuf::from(home).join(".cache/franken_ocr/corpus/pages"))
-        })
-        .expect("FOCR_CORPUS_DIR or HOME is set");
-    let oracle_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/uocr2_oracle/ORACLE.json"
-    );
-    let oracle: Value = serde_json::from_slice(&std::fs::read(oracle_path).expect("ORACLE.json"))
-        .expect("ORACLE.json parses");
-    let fixtures = oracle["fixtures"]
-        .as_object()
-        .expect("ORACLE.json fixtures");
-    let npy = |fixture: &str, stage: &str| -> Vec<u8> {
-        let path = dumps
-            .join("activations")
-            .join(fixture)
-            .join(format!("{stage}.npy"));
-        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-    };
-    let first_mismatch = |got: &[f32], want: &[f32]| -> Option<(usize, f32, f32)> {
-        got.iter()
-            .zip(want)
-            .position(|(a, b)| a.to_bits() != b.to_bits())
-            .map(|i| (i, got[i], want[i]))
-    };
-
-    let page_path = |page: &Value| corpus.join(page["name"].as_str().expect("page name"));
-    let missing = fixtures
-        .values()
-        .flat_map(|entry| entry["pages"].as_array().expect("fixture pages"))
-        .map(page_path)
-        .find(|path| !path.is_file());
-    if let Some(missing) = missing {
-        log.skip_no_model(&format!(
-            "corpus page {} absent (set FOCR_CORPUS_DIR)",
-            missing.display()
-        ));
+    let Some(all_pages) = oracle.page_paths(&mut log) else {
         return;
-    }
+    };
 
     let mut ran = 0usize;
-    for (fixture, entry) in fixtures {
+    for (fixture, entry) in &oracle.fixtures {
         let pages = entry["pages"].as_array().expect("fixture pages");
-        let page_paths: Vec<PathBuf> = pages.iter().map(page_path).collect();
-        let gundam = entry["params"]["crop_mode"].as_bool() == Some(true);
+        let page_paths = &all_pages[fixture];
+        let gundam = oracle.gundam(fixture);
         let mode = if gundam {
             preprocess::PreprocessMode::gundam()
         } else {
             preprocess::PreprocessMode::base()
         };
-        let (ori_shape, ori) =
-            parity_harness::read_npy_f32(&npy(fixture, "images_ori")).expect("images_ori");
+        let (ori_shape, ori) = oracle.f32s(fixture, "images_ori");
         assert_eq!(
             ori_shape,
             [pages.len(), 3, 1024, 1024],
             "{fixture} images_ori"
         );
-        let (_, spatial) = parity_harness::read_npy_i32(&npy(fixture, "images_spatial_crop"))
-            .expect("images_spatial_crop");
-        let (_, seq_mask) =
-            parity_harness::read_npy_u8(&npy(fixture, "images_seq_mask")).expect("images_seq_mask");
+        let (_, spatial) = oracle.i32s(fixture, "images_spatial_crop");
+        let (_, seq_mask) = oracle.u8s(fixture, "images_seq_mask");
         let view = 3 * 1024 * 1024;
         let mut tiles = Vec::new();
         let mut placeholders = 0usize;
-        for (index, (page, path)) in pages.iter().zip(&page_paths).enumerate() {
-            let bytes = std::fs::read(path).expect("corpus page reads");
-            assert_eq!(
-                sha256_hex(&bytes),
-                page["sha256"].as_str().expect("page sha256"),
-                "{fixture}: {} is not the page the oracle read",
-                path.display()
-            );
+        for (index, path) in page_paths.iter().enumerate() {
+            let bytes = oracle.page_bytes(fixture, index, path);
             let pre = preprocess::preprocess_bytes(&bytes, mode, preprocess::PreprocessProfile::V2)
                 .expect("v2 preprocess");
             let want = &ori[index * view..(index + 1) * view];
             assert_eq!(
-                first_mismatch(&pre.global.pixels.data, want),
+                first_bit_mismatch(&pre.global.pixels.data, want),
                 None,
                 "{fixture} page {index}: global view (index, ours, oracle)"
             );
@@ -1341,12 +1631,11 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
             );
         }
         if gundam {
-            let (crop_shape, crop) =
-                parity_harness::read_npy_f32(&npy(fixture, "images_crop")).expect("images_crop");
+            let (crop_shape, crop) = oracle.f32s(fixture, "images_crop");
             assert_eq!(crop_shape[1..], [3, 640, 640], "{fixture} images_crop");
             assert_eq!(tiles.len(), crop.len(), "{fixture}: tile count");
             assert_eq!(
-                first_mismatch(&tiles, &crop),
+                first_bit_mismatch(&tiles, &crop),
                 None,
                 "{fixture}: tiles (index, ours, oracle)"
             );
@@ -1355,20 +1644,16 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
         }
         let image_rows = seq_mask.iter().filter(|&&m| m == 1).count();
         assert_eq!(placeholders, image_rows, "{fixture}: placeholder count");
-        let reference_path = dumps.join(format!("{fixture}_reference.json"));
-        let reference: Value =
-            serde_json::from_slice(&std::fs::read(&reference_path).expect("reference json"))
-                .expect("reference json parses");
+        let reference = oracle.reference(fixture);
         ran += 1;
+        // Every view compared bit for bit above, so the largest difference is 0.
         log.parity(
             "L0",
-            "mismatched_elements",
+            "max_abs_diff",
             0.0,
             0.0,
             fixture,
-            reference["activations"]["images_ori"]["file_sha256"]
-                .as_str()
-                .unwrap_or_default(),
+            &Uocr2Oracle::stage_sha256(&reference, "images_ori"),
             json!({
                 "seam": "v2 preprocess (letterbox / gundam tiles -> normalized views)",
                 "pages": pages.len(),
@@ -1380,8 +1665,1188 @@ fn uocr2_l0_preprocess_is_bit_exact_against_the_oracle() {
             true,
         );
     }
-    assert_eq!(ran, fixtures.len(), "every ORACLE.json fixture compared");
+    assert_eq!(
+        ran,
+        oracle.fixtures.len(),
+        "every ORACLE.json fixture compared"
+    );
     log.result("pass", t0.elapsed().as_micros());
+}
+
+/// Subject-vs-oracle agreement of one float stage: the f64 cosine, and the
+/// largest difference, absolute and relative to the oracle's largest magnitude
+/// (the U2-A6 floor's normwise `max_rel`). For a stage compared row by row it
+/// also names the prompt row that holds the largest difference, which places a
+/// localized divergence (one row's flipped choice) that the normwise numbers
+/// only hint at.
+#[derive(Clone, Copy, Debug)]
+struct FloatAgreement {
+    cosine: f64,
+    max_abs: f64,
+    max_rel: f64,
+    max_abs_row: Option<usize>,
+}
+
+impl FloatAgreement {
+    fn of(ours: &[f32], oracle: &[f32]) -> Self {
+        assert_eq!(ours.len(), oracle.len(), "float agreement: lengths");
+        let max_abs = max_abs_diff(ours, oracle);
+        let scale = oracle
+            .iter()
+            .fold(0.0f64, |m, &x| m.max(f64::from(x).abs()));
+        Self {
+            cosine: cosine(ours, oracle),
+            max_abs,
+            max_rel: if scale > 0.0 { max_abs / scale } else { 0.0 },
+            max_abs_row: None,
+        }
+    }
+
+    /// [`Self::of`] over rows `rows` of `m` against the oracle's dump of those
+    /// rows.
+    fn of_rows(m: &Mat, rows: &[usize], oracle: &[f32]) -> Self {
+        let ours = mat_rows(m, rows);
+        let worst = ours
+            .iter()
+            .zip(oracle)
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).abs())
+            .enumerate()
+            .fold(
+                (0, 0.0f64),
+                |best, (i, d)| if d > best.1 { (i, d) } else { best },
+            )
+            .0;
+        Self {
+            max_abs_row: rows.get(worst / m.cols.max(1)).copied(),
+            ..Self::of(&ours, oracle)
+        }
+    }
+}
+
+/// Rows `rows` of `m`, concatenated.
+fn mat_rows(m: &Mat, rows: &[usize]) -> Vec<f32> {
+    rows.iter()
+        .flat_map(|&r| m.row(r).iter().copied())
+        .collect()
+}
+
+/// The query class of prefill row `row` for the routing report (U2-C1): BOS,
+/// a `<PAGE>` marker, an image row or an instruction row, suffixed `/fallback`
+/// when the row's own page offers it no remote block.
+fn uocr2_query_class(ids: &[u32], last_img: usize, row: usize, fallback: bool) -> String {
+    let base = if row == 0 {
+        "bos"
+    } else if ids[row] == special::PAGE {
+        "page_marker"
+    } else if row <= last_img {
+        "image"
+    } else {
+        "instruction"
+    };
+    if fallback {
+        format!("{base}/fallback")
+    } else {
+        base.to_string()
+    }
+}
+
+/// One prefill row whose native selection differs from the oracle's, with
+/// U2-C1's routing-margin diagnostics. Margins are in score units: the gap
+/// between the K'-th and (K'+1)-th entries of each side's top-M window, the
+/// largest oracle-score gap between a block only one side selected and a block
+/// only the other did, and this row's own largest score difference. The row's
+/// noise shows whether a flip rides on ordinary drift or on a row that already
+/// diverged upstream (an earlier near-tie, such as an MoE expert choice).
+#[derive(Debug)]
+struct RouteMismatch {
+    row: usize,
+    class: String,
+    ours: Vec<u32>,
+    oracle: Vec<u32>,
+    ours_margin: f32,
+    oracle_margin: f32,
+    swap_gap: f32,
+    row_score_noise: f32,
+    ours_support: usize,
+    oracle_support: usize,
+}
+
+/// The K'-th minus the (K'+1)-th value of a descending top-M window, in score
+/// units; infinite when the window has no (K'+1)-th entry.
+fn boundary_margin(window: &[f32], read_slots: usize, idx_scale: f32) -> f32 {
+    if window.len() > read_slots {
+        (window[read_slots - 1] - window[read_slots]) / idx_scale
+    } else {
+        f32::INFINITY
+    }
+}
+
+/// The committed U2-A6 `FLOOR.json`.
+/// The committed U2-A6 oracle nondeterminism floor (`FLOOR.json`).
+fn read_uocr2_floor() -> Value {
+    serde_json::from_slice(
+        &std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/uocr2_oracle/FLOOR.json"
+        ))
+        .expect("FLOOR.json"),
+    )
+    .expect("FLOOR.json parses")
+}
+
+/// The U2-A6 f32 floor of one stage of one fixture's layer, from the committed
+/// `FLOOR.json` (`None` for a stage the floor does not record).
+fn uocr2_floor(floor: &Value, fixture: &str, layer: Option<usize>, stage: &str) -> Option<Value> {
+    let fixture = &floor["groups"]["f32"]["fixtures"][fixture];
+    let entry = match layer {
+        Some(layer) => &fixture["layers"][layer][stage],
+        None => &fixture[stage],
+    };
+    (!entry.is_null()).then(|| entry.clone())
+}
+
+/// U2-C1 L1/L2: the native v2 prefill against the U2-A6 f32 oracle, layer by
+/// layer, on every fixture (S1–S3 as the bead requires, and S4's single-page
+/// gundam prompt, whose 28 own-page blocks make top-K bind).
+///
+/// The subject is the stateless all-f32 path, `decoder::forward_srswa_observed`
+/// over the raw BF16 checkpoint widened to f32. Its input is native: v2
+/// preprocessing, the vision tower and the connector over the oracle's prompt
+/// ids. Checked per layer:
+/// - **floats** (`cosine` ≥ the f32 per-op bar, with `max_abs` / `max_rel`
+///   against the oracle's own t12-vs-t4 floor): `hidden_in`, the router's
+///   `iq`/`ik`, `kbar`, the block scores, the entmax prior, the attention
+///   context and `o_proj` output; then `final_hidden`;
+/// - **exact**: which blocks are remote, the Page Gate (`cand`), the fallback
+///   flag, and that the router's stage functions replayed on the trace's
+///   `iq`/`ik` reproduce the forward's selections and biases bit for bit;
+/// - **teacher-forced selection**: the router over the oracle's own scores
+///   selects the oracle's blocks, except where torch's `topk` met an exact tie
+///   at the K'-th slot;
+/// - **chained selection**: native routes against the oracle's, each mismatch
+///   logged with layer, row, query class, both margins, both entmax supports
+///   and both selections. Since the router is exact on identical scores, a
+///   mismatch can come only from score noise; one whose swapped blocks sit
+///   farther apart than twice the layer's measured score noise fails.
+///
+/// Gated on `FOCR_UOCR2_FIXTURES_DIR`, `FOCR_UOCR2_SOURCE_DIR` (the raw
+/// checkpoint directory) and the corpus pages; skips with success without them.
+#[test]
+fn uocr2_l1_l2_prefill_matches_the_f32_oracle() {
+    use franken_ocr::native_engine::{nn, srswa};
+    let mut log = Logger::new("uocr2_L1_L2_prefill", "uocr2_oracle");
+    log.setup(0);
+    let t0 = Instant::now();
+    let Some(oracle) = Uocr2Oracle::from_env(&mut log) else {
+        return;
+    };
+    let Some(source) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) else {
+        log.skip_no_model("FOCR_UOCR2_SOURCE_DIR unset: point it at the raw v2 checkpoint");
+        return;
+    };
+    let Some(all_pages) = oracle.page_paths(&mut log) else {
+        return;
+    };
+    let floor = read_uocr2_floor();
+    let _heavy = heavy_rung_guard();
+    let w = load_uocr2_source(&source);
+    let params = srswa::RouterParams::uocr2();
+    let hidden = decoder::config::HIDDEN_SIZE;
+    let qkv_dim = decoder::config::NUM_ATTENTION_HEADS * decoder::config::HEAD_DIM;
+    let mut failures: Vec<String> = Vec::new();
+    let mut chained_total = 0usize;
+    let mut fallback_total = 0usize;
+
+    for (fixture, pages) in &all_pages {
+        let tf = Instant::now();
+        let reference = oracle.reference(fixture);
+        let ids = oracle.prompt_ids(fixture, &reference);
+        let mode = if oracle.gundam(fixture) {
+            preprocess::PreprocessMode::gundam()
+        } else {
+            preprocess::PreprocessMode::base()
+        };
+        let pres: Vec<preprocess::Preprocessed> = pages
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let bytes = oracle.page_bytes(fixture, index, path);
+                preprocess::preprocess_bytes(&bytes, mode, preprocess::PreprocessProfile::V2)
+                    .expect("v2 preprocess")
+            })
+            .collect();
+        let embeds = uocr2_inputs_embeds(&w, &ids, &pres);
+        let rows: Vec<usize> = oracle
+            .i32s(fixture, "prefill.rows")
+            .1
+            .into_iter()
+            .map(|r| r as usize)
+            .collect();
+        let coords = srswa::PageCoords::build(&ids).expect("v2 page coordinates");
+        let blocks = srswa::BlockPages::build(&coords.img_page);
+        let sha = |stage: &str| Uocr2Oracle::stage_sha256(&reference, stage);
+        let mut fallback_rows = 0usize;
+
+        let mut on_layer = |t: decoder::SrSwaLayerTrace<'_>| {
+            let layer = t.layer;
+            let stage = |name: &str| format!("prefill.L{layer:02}.{name}");
+            let f32s = |name: &str| oracle.f32s(fixture, &stage(name)).1;
+            let i32s = |name: &str| oracle.i32s(fixture, &stage(name)).1;
+            let u8s = |name: &str| oracle.u8s(fixture, &stage(name)).1;
+            let mut floats: Vec<(&str, &str, FloatAgreement)> = vec![
+                (
+                    "L2",
+                    "hidden_in",
+                    FloatAgreement::of_rows(t.hidden_in, &rows, &f32s("hidden_in")),
+                ),
+                (
+                    "L1",
+                    "iq",
+                    FloatAgreement::of_rows(t.iq, &rows, &f32s("iq")),
+                ),
+                ("L1", "ik", FloatAgreement::of(&t.ik.data, &f32s("ik"))),
+            ];
+            let router = srswa::SrSwaLayerWeights::load(&w, layer).expect("router weights");
+            let sums = srswa::summaries(t.ik, &router.head_cls);
+            floats.push(("L1", "kbar", FloatAgreement::of(&sums.kbar, &f32s("kbar"))));
+            let nblk = sums.valid.len();
+            let window = params.window(nblk);
+            // The oracle's `topi`/`bias`/`valid` hold the window's first K' slots.
+            let k = params.read_slots(window);
+            let read_slots = k;
+            let (o_scores, o_cand, o_fallback) = (f32s("scores"), u8s("cand"), u8s("fallback"));
+            let (o_topm_x, o_topm_idx, o_prior) = (f32s("topm_x"), i32s("topm_idx"), f32s("prior"));
+            let (o_topi, o_bias, o_valid) = (i32s("topi"), f32s("bias"), u8s("valid"));
+            assert_eq!(
+                o_scores.len(),
+                rows.len() * nblk,
+                "{fixture} L{layer}: block count"
+            );
+            assert_eq!(
+                o_topm_x.len(),
+                rows.len() * window,
+                "{fixture} L{layer}: window"
+            );
+            assert_eq!(
+                o_topi.len(),
+                rows.len() * k,
+                "{fixture} L{layer}: read slots"
+            );
+
+            let (mut our_remote, mut oracle_remote) = (Vec::new(), Vec::new());
+            let (mut our_prior, mut oracle_prior) = (Vec::new(), Vec::new());
+            let mut gate_mismatches = Vec::new();
+            let mut replica_mismatches = 0usize;
+            let (mut tf_mismatches, mut tf_exact_ties, mut tf_x_bits) = (0usize, 0usize, 0usize);
+            let (mut tf_prior_max, mut tf_bias_max, mut bias_max) = (0.0f64, 0.0f64, 0.0f64);
+            let mut mismatches: Vec<RouteMismatch> = Vec::new();
+            let mut by_class: BTreeMap<String, usize> = BTreeMap::new();
+            let mut layer_fallback = 0usize;
+            for (i, &r) in rows.iter().enumerate() {
+                let span = i * nblk..(i + 1) * nblk;
+                let o_sc = &o_scores[span.clone()];
+                let sc = srswa::scores(t.iq.row(r), r, &sums);
+                let remote: Vec<bool> = sc.iter().map(|&s| s > srswa::SCORE_NEG * 0.5).collect();
+                let o_remote: Vec<bool> =
+                    o_sc.iter().map(|&s| s > srswa::SCORE_NEG * 0.5).collect();
+                let allow = srswa::page_gate_prefill(&blocks, coords.query_page[r]);
+                let o_allow: Vec<bool> = o_cand[span].iter().map(|&c| c == 1).collect();
+                let fallback =
+                    !remote.iter().zip(&allow).any(|(&a, &b)| a && b) && remote.contains(&true);
+                if remote != o_remote || allow != o_allow || fallback != (o_fallback[i] == 1) {
+                    gate_mismatches.push(r);
+                    continue;
+                }
+                layer_fallback += usize::from(fallback);
+                *by_class
+                    .entry(uocr2_query_class(&ids, coords.last_img, r, fallback))
+                    .or_default() += 1;
+                for c in (0..nblk).filter(|&c| remote[c]) {
+                    our_remote.push(sc[c]);
+                    oracle_remote.push(o_sc[c]);
+                }
+
+                // The router's stages on the trace, which must be the forward's.
+                let cand = srswa::candidates(&sc, Some(&allow));
+                let x = srswa::entmax_inputs(&sc, &cand, &params);
+                let top = srswa::entmax15_topm(&x, window);
+                let route = srswa::select_bias(&top, &cand, &params);
+                let traced = &t.selections[r];
+                if route.blocks != traced.blocks()
+                    || route
+                        .bias
+                        .iter()
+                        .map(|b| b.to_bits())
+                        .ne(traced.bias().iter().map(|b| b.to_bits()))
+                {
+                    replica_mismatches += 1;
+                }
+
+                // The oracle's selection: its first K slots that are candidates.
+                let wspan = i * window..(i + 1) * window;
+                let kspan = i * k..(i + 1) * k;
+                let mut o_sel: Vec<(u32, f32)> = o_topi[kspan.clone()]
+                    .iter()
+                    .zip(&o_valid[kspan.clone()])
+                    .zip(&o_bias[kspan])
+                    .filter(|&((_, &v), _)| v == 1)
+                    .map(|((&b, _), &bias)| (b as u32, bias))
+                    .collect();
+                o_sel.sort_unstable_by_key(|&(b, _)| b);
+                let o_blocks: Vec<u32> = o_sel.iter().map(|&(b, _)| b).collect();
+                let o_window: Vec<u32> = o_topm_idx[wspan.clone()]
+                    .iter()
+                    .map(|&b| b as u32)
+                    .collect();
+
+                // Teacher-forced: the router over the oracle's scores.
+                let o_cand_used = srswa::candidates(o_sc, Some(&allow));
+                let o_x = srswa::entmax_inputs(o_sc, &o_cand_used, &params);
+                let o_top = srswa::entmax15_topm(&o_x, window);
+                let o_route = srswa::select_bias(&o_top, &o_cand_used, &params);
+                tf_x_bits += o_top
+                    .slots
+                    .iter()
+                    .zip(&o_topm_x[wspan.clone()])
+                    .filter(|((v, _), o)| v.to_bits() != o.to_bits())
+                    .count();
+                for (a, b) in o_top.prior.iter().zip(&o_prior[wspan.clone()]) {
+                    tf_prior_max = tf_prior_max.max(f64::from((a - b).abs()));
+                }
+                if o_route.blocks == o_blocks {
+                    for (a, (_, b)) in o_route.bias.iter().zip(&o_sel) {
+                        tf_bias_max = tf_bias_max.max(f64::from((a - b).abs()));
+                    }
+                } else if o_top.slots.len() > read_slots
+                    && o_top.slots[read_slots - 1].0.to_bits()
+                        == o_top.slots[read_slots].0.to_bits()
+                {
+                    tf_exact_ties += 1;
+                } else {
+                    tf_mismatches += 1;
+                    failures.push(format!(
+                        "{fixture} L{layer} row {r}: teacher-forced selection {:?} != oracle {:?}",
+                        o_route.blocks, o_blocks
+                    ));
+                }
+
+                // Chained: the native selection against the oracle's.
+                let mut ours_window: Vec<u32> = top.slots.iter().map(|&(_, b)| b).collect();
+                let mut sorted_o_window = o_window.clone();
+                ours_window.sort_unstable();
+                sorted_o_window.sort_unstable();
+                if ours_window == sorted_o_window {
+                    our_prior.extend_from_slice(&top.prior);
+                    oracle_prior.extend_from_slice(&o_prior[wspan.clone()]);
+                }
+                if route.blocks == o_blocks {
+                    for (a, (_, b)) in route.bias.iter().zip(&o_sel) {
+                        bias_max = bias_max.max(f64::from((a - b).abs()));
+                    }
+                } else {
+                    let only_ours = route.blocks.iter().filter(|b| !o_blocks.contains(b));
+                    let only_oracle: Vec<&u32> = o_blocks
+                        .iter()
+                        .filter(|b| !route.blocks.contains(b))
+                        .collect();
+                    let swap_gap = only_ours
+                        .flat_map(|&a| {
+                            only_oracle
+                                .iter()
+                                .map(move |&&b| (o_sc[a as usize] - o_sc[b as usize]).abs())
+                        })
+                        .fold(0.0f32, f32::max);
+                    let row_score_noise = (0..nblk)
+                        .filter(|&c| remote[c])
+                        .map(|c| (sc[c] - o_sc[c]).abs())
+                        .fold(0.0f32, f32::max);
+                    let x_window: Vec<f32> = top.slots.iter().map(|&(v, _)| v).collect();
+                    mismatches.push(RouteMismatch {
+                        row: r,
+                        class: uocr2_query_class(&ids, coords.last_img, r, fallback),
+                        ours: route.blocks.clone(),
+                        oracle: o_blocks,
+                        ours_margin: boundary_margin(&x_window, read_slots, params.idx_scale),
+                        oracle_margin: boundary_margin(
+                            &o_topm_x[wspan.clone()],
+                            read_slots,
+                            params.idx_scale,
+                        ),
+                        swap_gap,
+                        row_score_noise,
+                        ours_support: top.support,
+                        oracle_support: o_prior[wspan].iter().filter(|&&p| p > 0.0).count(),
+                    });
+                }
+            }
+            let score_noise = max_abs_diff(&our_remote, &oracle_remote);
+            floats.push((
+                "L1",
+                "scores",
+                FloatAgreement::of(&our_remote, &oracle_remote),
+            ));
+            floats.push(("L1", "prior", FloatAgreement::of(&our_prior, &oracle_prior)));
+            floats.push((
+                "L2",
+                "attn_pre_o",
+                FloatAgreement::of_rows(t.context, &rows, &f32s("attn_pre_o")),
+            ));
+            let o_proj = w
+                .mat(&format!("model.layers.{layer}.self_attn.o_proj.weight"))
+                .expect("o_proj");
+            let attn_out = decoder::attn_output_proj(t.context, &o_proj.data, hidden, qkv_dim)
+                .expect("o_proj");
+            floats.push((
+                "L2",
+                "attn_out",
+                FloatAgreement::of_rows(&attn_out, &rows, &f32s("attn_out")),
+            ));
+
+            if !gate_mismatches.is_empty() {
+                failures.push(format!(
+                    "{fixture} L{layer}: remote set / Page Gate / fallback differ on rows {:?}",
+                    &gate_mismatches[..gate_mismatches.len().min(8)]
+                ));
+            }
+            if replica_mismatches > 0 {
+                failures.push(format!(
+                    "{fixture} L{layer}: {replica_mismatches} rows' replayed routes differ from \
+                     the forward's"
+                ));
+            }
+            if tf_x_bits > 0 {
+                failures.push(format!(
+                    "{fixture} L{layer}: {tf_x_bits} teacher-forced entmax inputs differ in bits"
+                ));
+            }
+            for (gate, name, agreement) in &floats {
+                let pass = agreement.cosine >= COSINE_F32_THRESHOLD;
+                if !pass {
+                    failures.push(format!(
+                        "{fixture} L{layer} {name}: cosine {} < {COSINE_F32_THRESHOLD}",
+                        agreement.cosine
+                    ));
+                }
+                let mut extra = serde_json::Map::new();
+                for (key, value) in [
+                    ("gate", json!(gate)),
+                    ("metric", json!("cosine")),
+                    ("value", json!(agreement.cosine)),
+                    ("tolerance", json!(COSINE_F32_THRESHOLD)),
+                    ("oracle_fixture", json!(fixture)),
+                    ("oracle_sha256", json!(sha(&stage(name)))),
+                    (
+                        "nondeterminism_envelope",
+                        json!({
+                            "stage": name,
+                            "max_abs": agreement.max_abs,
+                            "max_rel": agreement.max_rel,
+                            "max_abs_row": agreement.max_abs_row,
+                            "oracle_floor_t12_vs_t4": uocr2_floor(&floor, fixture, Some(layer), name),
+                        }),
+                    ),
+                    ("pass", json!(pass)),
+                    ("layer_idx", json!(layer)),
+                    ("rows_compared", json!(rows.len())),
+                ] {
+                    extra.insert(key.into(), value);
+                }
+                log.emit("parity", if pass { "pass" } else { "fail" }, extra);
+            }
+
+            let tie_flips = mismatches
+                .iter()
+                .filter(|m| f64::from(m.swap_gap) <= 2.0 * score_noise)
+                .count();
+            for m in &mismatches {
+                if f64::from(m.swap_gap) > 2.0 * score_noise {
+                    failures.push(format!(
+                        "{fixture} L{layer}: a selection mismatch outside the score noise \
+                         ({score_noise:e}): {m:?}"
+                    ));
+                }
+            }
+            let mut by_class_mismatch: BTreeMap<&str, usize> = BTreeMap::new();
+            for m in &mismatches {
+                *by_class_mismatch.entry(m.class.as_str()).or_default() += 1;
+            }
+            let pass = gate_mismatches.is_empty()
+                && replica_mismatches == 0
+                && tf_mismatches == 0
+                && tie_flips == mismatches.len();
+            let mut extra = serde_json::Map::new();
+            for (key, value) in [
+                ("gate", json!("L2")),
+                ("metric", json!("routing_mismatches")),
+                ("value", json!(mismatches.len())),
+                ("tolerance", json!(0)),
+                ("oracle_fixture", json!(fixture)),
+                ("oracle_sha256", json!(sha(&stage("topi")))),
+                (
+                    "nondeterminism_envelope",
+                    json!({
+                        "rule": "a mismatch is a tie-flip when the oracle scores of the blocks \
+                                 only one side selected differ by at most twice the layer's \
+                                 measured score noise; the router itself is exact on the \
+                                 oracle's scores (teacher-forced)",
+                        "score_noise_max_abs": score_noise,
+                        "tie_flips": tie_flips,
+                        "oracle_self_flips_t12_vs_t4": uocr2_floor(&floor, fixture, Some(layer), "routing_rows_differing"),
+                        "mismatches": mismatches.iter().map(|m| json!({
+                            "row": m.row, "class": m.class, "ours": m.ours, "oracle": m.oracle,
+                            "ours_margin": m.ours_margin, "oracle_margin": m.oracle_margin,
+                            "swap_gap": m.swap_gap, "row_score_noise": m.row_score_noise,
+                            "ours_support": m.ours_support,
+                            "oracle_support": m.oracle_support,
+                        })).collect::<Vec<_>>(),
+                        "teacher_forced_mismatches": tf_mismatches,
+                        "teacher_forced_exact_ties": tf_exact_ties,
+                        "teacher_forced_prior_max_abs": tf_prior_max,
+                        "teacher_forced_bias_max_abs": tf_bias_max,
+                        "replica_mismatches": replica_mismatches,
+                        "gate_mismatches": gate_mismatches.len(),
+                        "bias_max_abs": bias_max,
+                    }),
+                ),
+                ("pass", json!(pass)),
+                ("layer_idx", json!(layer)),
+                ("rows_compared", json!(rows.len())),
+                ("fallback_rows", json!(layer_fallback)),
+                ("rows_by_class", json!(by_class)),
+                ("mismatches_by_class", json!(by_class_mismatch)),
+            ] {
+                extra.insert(key.into(), value);
+            }
+            log.emit("parity", if pass { "pass" } else { "fail" }, extra);
+            chained_total += mismatches.len();
+            fallback_rows = fallback_rows.max(layer_fallback);
+        };
+        // Layer 0's `hidden_in` line is the embedding check: vision, connector
+        // and `embed_tokens` against the oracle's merged `inputs_embeds`.
+        let out = decoder::forward_srswa_observed(
+            &w,
+            &embeds,
+            &coords,
+            srswa::EntmaxDomain::TopM,
+            &mut on_layer,
+        )
+        .expect("v2 stateless forward");
+        let final_norm = w.vec("model.norm.weight").expect("model.norm");
+        let final_hidden = nn::rms_norm(&out, Some(&final_norm), decoder::config::RMS_NORM_EPS)
+            .expect("final norm");
+        let agreement = FloatAgreement::of_rows(
+            &final_hidden,
+            &rows,
+            &oracle.f32s(fixture, "prefill.final_hidden").1,
+        );
+        let pass = agreement.cosine >= COSINE_F32_THRESHOLD;
+        if !pass {
+            failures.push(format!(
+                "{fixture} final_hidden: cosine {} < {COSINE_F32_THRESHOLD}",
+                agreement.cosine
+            ));
+        }
+        log.parity(
+            "L2",
+            "cosine",
+            agreement.cosine,
+            COSINE_F32_THRESHOLD,
+            fixture,
+            &sha("prefill.final_hidden"),
+            json!({
+                "stage": "final_hidden",
+                "max_abs": agreement.max_abs,
+                "max_rel": agreement.max_rel,
+                "max_abs_row": agreement.max_abs_row,
+                "oracle_floor_t12_vs_t4": uocr2_floor(&floor, fixture, None, "final_hidden"),
+                "rows_compared": rows.len(),
+                "prompt_rows": ids.len(),
+                "fallback_rows_per_layer": fallback_rows,
+                "elapsed_s": tf.elapsed().as_secs_f64(),
+            }),
+            pass,
+        );
+        fallback_total += fallback_rows;
+    }
+
+    log.assertion(
+        "fallback queries were exercised (counted per fixture above)",
+        fallback_total > 0,
+    );
+    let pass = failures.is_empty() && fallback_total > 0;
+    log.result(if pass { "pass" } else { "fail" }, t0.elapsed().as_micros());
+    assert!(
+        pass,
+        "U2-C1 L1/L2 failed ({} chained routing mismatches in all; see the log):\n{}",
+        chained_total,
+        failures.join("\n")
+    );
+}
+
+/// One decode step's selection that differs from the oracle's, with U2-C1's
+/// margin diagnostics (see [`RouteMismatch`]).
+#[derive(Debug)]
+struct DecodeRouteMismatch {
+    step: usize,
+    ours: Vec<u32>,
+    oracle: Vec<u32>,
+    ours_margin: f32,
+    oracle_margin: f32,
+    swap_gap: f32,
+    row_score_noise: f32,
+}
+
+/// The oracle's read set at one dumped row: the candidates among its first
+/// `k` `topi` slots, sorted by block, each with its bias.
+fn oracle_selection(topi: &[i32], valid: &[u8], bias: &[f32], k: usize) -> Vec<(u32, f32)> {
+    let mut sel: Vec<(u32, f32)> = topi[..k]
+        .iter()
+        .zip(&valid[..k])
+        .zip(&bias[..k])
+        .filter(|&((_, &v), _)| v == 1)
+        .map(|((&b, _), &bias)| (b as u32, bias))
+        .collect();
+    sel.sort_unstable_by_key(|&(b, _)| b);
+    sel
+}
+
+/// U2-C2 L3 and decode-step routing (plan §7.2): the native v2 decode,
+/// teacher-forced along each fixture's oracle ids, against the U2-A6 f32
+/// oracle at its kept steps (0–63 and ±8 around every generated `<PAGE>`).
+///
+/// The subject is the all-f32 cached path (`DecoderWeightCache::
+/// build_srswa_f32` over the raw BF16 checkpoint widened to f32): the
+/// stateless forward's math with the KV kept. The stateless path itself
+/// (`forward_srswa` over the grown sequence, O(n²) over a document) is run at
+/// sampled kept steps where the prompt plus ids fit in 4,096 rows: steps 0, 1
+/// and 63, and the step after each generated `<PAGE>`. Checked:
+/// - **L3:** each kept step's logits, cosine ≥ the f32 bar (U2-C1's rule; the
+///   oracle's own t12-vs-t4 logit spread is logged beside `max_abs`), and each
+///   kept decode step's final hidden;
+/// - **tokens:** every step's raw argmax against `all_steps.raw_argmax`; at
+///   the first disagreement, the trace diff is logged, and a disagreement
+///   must be a tie-flip (our gap between the two ids within twice the logits'
+///   max abs against the oracle). Generated-token exactness is L4's;
+/// - **routing**, every kept decode step and layer: the remote set, the Page
+///   Gate and the fallback flag exactly; the selection, where a mismatch must
+///   be a tie-flip (the swapped blocks' oracle scores within twice the
+///   layer's measured score noise); the biases' max abs difference is logged;
+/// - **stateless ≡ cached** at the sampled steps: cosine, max abs, argmax.
+///
+/// Gated like U2-C1's rung; `FOCR_E2E_LONG` (any value but empty or `0`)
+/// adds S3-p10 and S3-p20.
+#[test]
+fn uocr2_l3_decode_steps_match_the_f32_oracle() {
+    use franken_ocr::native_engine::srswa;
+    const STATELESS_ROWS: usize = 4096;
+    let mut log = Logger::new("uocr2_L3_decode", "uocr2_oracle");
+    log.setup(0);
+    let t0 = Instant::now();
+    let Some(oracle) = Uocr2Oracle::from_env(&mut log) else {
+        return;
+    };
+    let Some(source) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) else {
+        log.skip_no_model("FOCR_UOCR2_SOURCE_DIR unset: point it at the raw v2 checkpoint");
+        return;
+    };
+    let Some(all_pages) = oracle.page_paths(&mut log) else {
+        return;
+    };
+    let long = matches!(
+        std::env::var("FOCR_E2E_LONG").ok().as_deref(),
+        Some(v) if !v.is_empty() && v != "0"
+    );
+    let floor = read_uocr2_floor();
+    let _heavy = heavy_rung_guard();
+    let w = load_uocr2_source(&source);
+    let tc = Instant::now();
+    let wc = decoder::DecoderWeightCache::build_srswa_f32(&w).expect("the all-f32 cache builds");
+    log.emit(
+        "setup",
+        "pass",
+        serde_json::Map::from_iter([(
+            "f32_cache_build_s".to_string(),
+            json!(tc.elapsed().as_secs_f64()),
+        )]),
+    );
+    let table = w.mat("model.embed_tokens.weight").expect("embed table");
+    let final_norm = w.vec("model.norm.weight").expect("model.norm");
+    let eps = decoder::config::RMS_NORM_EPS;
+    let params = srswa::RouterParams::uocr2();
+    let argmax = |logits: &[f32]| argmax_rows(logits, logits.len())[0];
+    let mut failures: Vec<String> = Vec::new();
+
+    for (fixture, pages) in &all_pages {
+        if !long && matches!(fixture.as_str(), "S3-p10" | "S3-p20") {
+            log.emit(
+                "skip",
+                "skip",
+                serde_json::Map::from_iter([
+                    ("oracle_fixture".to_string(), json!(fixture)),
+                    ("reason".to_string(), json!("FOCR_E2E_LONG unset or 0")),
+                ]),
+            );
+            continue;
+        }
+        let tf = Instant::now();
+        let reference = oracle.reference(fixture);
+        let ids = oracle.prompt_ids(fixture, &reference);
+        let generated: Vec<u32> = reference["token_ids"]
+            .as_array()
+            .expect("token_ids")
+            .iter()
+            .map(|id| id.as_u64().expect("a token id") as u32)
+            .collect();
+        let mode = if oracle.gundam(fixture) {
+            preprocess::PreprocessMode::gundam()
+        } else {
+            preprocess::PreprocessMode::base()
+        };
+        let pres: Vec<preprocess::Preprocessed> = pages
+            .iter()
+            .enumerate()
+            .map(|(index, path)| {
+                let bytes = oracle.page_bytes(fixture, index, path);
+                preprocess::preprocess_bytes(&bytes, mode, preprocess::PreprocessProfile::V2)
+                    .expect("v2 preprocess")
+            })
+            .collect();
+        let embeds = uocr2_inputs_embeds(&w, &ids, &pres);
+        let coords = srswa::PageCoords::build(&ids).expect("v2 page coordinates");
+        let sha = |stage: &str| Uocr2Oracle::stage_sha256(&reference, stage);
+        let as_usize = |v: Vec<i32>| -> Vec<usize> { v.into_iter().map(|x| x as usize).collect() };
+
+        let kept = as_usize(oracle.i32s(fixture, "steps.index").1);
+        let (logit_shape, oracle_logits) = oracle.f32s(fixture, "steps.logits");
+        let vocab = logit_shape[1];
+        let raw_argmax = as_usize(oracle.i32s(fixture, "all_steps.raw_argmax").1);
+        assert_eq!(
+            raw_argmax.len(),
+            generated.len() + 1,
+            "{fixture}: one raw argmax per step, EOS included"
+        );
+        let decode_index = as_usize(oracle.i32s(fixture, "decode.index").1);
+        let decode_nblk = as_usize(oracle.i32s(fixture, "decode.nblk").1);
+        let decode_k = as_usize(oracle.i32s(fixture, "decode.k").1);
+        let (_, decode_final) = oracle.f32s(fixture, "decode.final_hidden");
+        let hidden = decoder::config::HIDDEN_SIZE;
+        // Per layer: (topi, valid, bias, scores, cand, fallback, topm_x) with
+        // their row widths.
+        struct LayerDump {
+            topi: Vec<i32>,
+            valid: Vec<u8>,
+            bias: Vec<f32>,
+            k_width: usize,
+            scores: Vec<f32>,
+            cand: Vec<u8>,
+            n_width: usize,
+            fallback: Vec<u8>,
+            topm_x: Vec<f32>,
+            m_width: usize,
+        }
+        let dumps: Vec<LayerDump> = (0..decoder::config::NUM_HIDDEN_LAYERS)
+            .map(|layer| {
+                let stage = |name: &str| format!("decode.L{layer:02}.{name}");
+                let (tshape, topi) = oracle.i32s(fixture, &stage("topi"));
+                let (sshape, scores) = oracle.f32s(fixture, &stage("scores"));
+                let (mshape, topm_x) = oracle.f32s(fixture, &stage("topm_x"));
+                LayerDump {
+                    topi,
+                    valid: oracle.u8s(fixture, &stage("valid")).1,
+                    bias: oracle.f32s(fixture, &stage("bias")).1,
+                    k_width: tshape[1],
+                    scores,
+                    cand: oracle.u8s(fixture, &stage("cand")).1,
+                    n_width: sshape[1],
+                    fallback: oracle.u8s(fixture, &stage("fallback")).1,
+                    topm_x,
+                    m_width: mshape[1],
+                }
+            })
+            .collect();
+        let oracle_routes = |j: usize| -> Vec<Vec<u32>> {
+            dumps
+                .iter()
+                .map(|d| {
+                    let span = j * d.k_width..(j + 1) * d.k_width;
+                    oracle_selection(
+                        &d.topi[span.clone()],
+                        &d.valid[span.clone()],
+                        &d.bias[span],
+                        decode_k[j],
+                    )
+                    .into_iter()
+                    .map(|(b, _)| b)
+                    .collect()
+                })
+                .collect()
+        };
+        let stateless_steps: Vec<usize> = kept
+            .iter()
+            .copied()
+            .filter(|&k| {
+                (k <= 1 || k == 63 || generated[k - 1] == special::PAGE)
+                    && ids.len() + k <= STATELESS_ROWS
+            })
+            .collect();
+
+        let (prefill_hidden, mut state) = decoder::prefill_with_cache_srswa_traced(
+            &wc,
+            &embeds,
+            &coords,
+            srswa::EntmaxDomain::TopM,
+        )
+        .expect("traced f32 prefill");
+        let mut last = Mat::from_vec(
+            1,
+            hidden,
+            prefill_hidden.row(prefill_hidden.rows - 1).to_vec(),
+        );
+        let mut logits_min_cos = 1.0f64;
+        let mut logits_max_abs = 0.0f64;
+        let mut final_min_cos = 1.0f64;
+        // (step, our logit gap from our pick down to the oracle's)
+        let mut argmax_misses: Vec<(usize, f32)> = Vec::new();
+        let mut stateless_lines: Vec<Value> = Vec::new();
+        // Per layer: selection mismatches, score noise and bias error.
+        let mut layer_mismatches: Vec<Vec<DecodeRouteMismatch>> =
+            (0..dumps.len()).map(|_| Vec::new()).collect();
+        let mut layer_noise = vec![0.0f32; dumps.len()];
+        let mut layer_bias_max = vec![0.0f32; dumps.len()];
+        let mut gate_mismatches: Vec<String> = Vec::new();
+        let mut fallback_steps = 0usize;
+        let mut routing_rows = 0usize;
+        let td = Instant::now();
+
+        for step in 0..=generated.len() {
+            if step > 0 {
+                let id = generated[step - 1];
+                let row = Mat::from_vec(1, hidden, table.row(id as usize).to_vec());
+                last = decoder::decode_step_with_cache_srswa(&wc, &mut state, id, &row, false)
+                    .expect("f32 decode step");
+            }
+            let logits = decoder::lm_head_cached(&wc, &last).expect("lm_head");
+            let ours_argmax = argmax(&logits.data);
+            let kept_at = kept.iter().position(|&s| s == step);
+            let trace = state.trace.as_ref().expect("traced");
+            let our_routes: Vec<Vec<u32>> = if step == 0 {
+                trace
+                    .prefill_last
+                    .iter()
+                    .map(|r| r.as_ref().map_or_else(Vec::new, |r| r.blocks.clone()))
+                    .collect()
+            } else {
+                trace
+                    .decode
+                    .iter()
+                    .map(|r| r.as_ref().map_or_else(Vec::new, |r| r.route.blocks.clone()))
+                    .collect()
+            };
+            if ours_argmax != raw_argmax[step] {
+                let gap = logits.data[ours_argmax] - logits.data[raw_argmax[step]];
+                if argmax_misses.is_empty() {
+                    let page = generated[..step]
+                        .iter()
+                        .filter(|&&id| id == special::PAGE)
+                        .count();
+                    let page_len = generated[..step]
+                        .iter()
+                        .rev()
+                        .take_while(|&&id| id != special::PAGE)
+                        .count();
+                    let (o_logits, o_routes) = match kept_at {
+                        Some(i) => (
+                            &oracle_logits[i * vocab..(i + 1) * vocab],
+                            decode_index
+                                .iter()
+                                .position(|&s| s == step)
+                                .map_or_else(Vec::new, oracle_routes),
+                        ),
+                        None => (&[][..], Vec::new()),
+                    };
+                    let diff = decoder::decode_trace_diff(
+                        step,
+                        page,
+                        page_len,
+                        decoder::StepSide {
+                            label: "ours",
+                            logits: &logits.data,
+                            routes: &our_routes,
+                        },
+                        decoder::StepSide {
+                            label: "oracle",
+                            logits: o_logits,
+                            routes: &o_routes,
+                        },
+                    );
+                    log.emit(
+                        "parity",
+                        "fail",
+                        serde_json::Map::from_iter([
+                            ("gate".to_string(), json!("L3")),
+                            ("metric".to_string(), json!("first_raw_argmax_mismatch")),
+                            ("oracle_fixture".to_string(), json!(fixture)),
+                            ("step".to_string(), json!(step)),
+                            ("ours".to_string(), json!(ours_argmax)),
+                            ("oracle".to_string(), json!(raw_argmax[step])),
+                            ("ours_gap".to_string(), json!(gap)),
+                            ("diff".to_string(), json!(diff)),
+                        ]),
+                    );
+                }
+                argmax_misses.push((step, gap));
+            }
+            let Some(i) = kept_at else {
+                continue;
+            };
+
+            // L3: the step's logits, and a decode step's final hidden.
+            let agreement =
+                FloatAgreement::of(&logits.data, &oracle_logits[i * vocab..(i + 1) * vocab]);
+            logits_min_cos = logits_min_cos.min(agreement.cosine);
+            logits_max_abs = logits_max_abs.max(agreement.max_abs);
+            if agreement.cosine < COSINE_F32_THRESHOLD {
+                failures.push(format!(
+                    "{fixture} step {step} logits: cosine {} < {COSINE_F32_THRESHOLD}",
+                    agreement.cosine
+                ));
+            }
+            if stateless_steps.contains(&step) {
+                let ts = Instant::now();
+                let mut grown_ids = ids.clone();
+                grown_ids.extend_from_slice(&generated[..step]);
+                let mut data = embeds.data.clone();
+                for &id in &generated[..step] {
+                    data.extend_from_slice(table.row(id as usize));
+                }
+                let grown = Mat::from_vec(grown_ids.len(), hidden, data);
+                let grown_coords = srswa::PageCoords::build(&grown_ids).expect("grown coordinates");
+                let h =
+                    decoder::forward_srswa(&w, &grown, &grown_coords, srswa::EntmaxDomain::TopM)
+                        .expect("stateless forward");
+                let row = Mat::from_vec(1, hidden, h.row(h.rows - 1).to_vec());
+                let stateless = decoder::lm_head(&w, &row).expect("stateless lm_head");
+                let vs_oracle =
+                    FloatAgreement::of(&stateless.data, &oracle_logits[i * vocab..(i + 1) * vocab]);
+                let vs_cached = FloatAgreement::of(&stateless.data, &logits.data);
+                let stateless_argmax = argmax(&stateless.data);
+                let same_argmax = stateless_argmax == ours_argmax;
+                // A different pick must be a tie within the two paths' gap.
+                let tie = (stateless.data[stateless_argmax] - stateless.data[ours_argmax]) as f64
+                    <= 2.0 * vs_cached.max_abs;
+                if vs_oracle.cosine < COSINE_F32_THRESHOLD || !(same_argmax || tie) {
+                    failures.push(format!(
+                        "{fixture} step {step}: stateless cosine {} vs the oracle, argmax \
+                         {stateless_argmax} against the cached path's {ours_argmax}",
+                        vs_oracle.cosine
+                    ));
+                }
+                stateless_lines.push(json!({
+                    "step": step, "rows": grown_ids.len(),
+                    "cosine_vs_oracle": vs_oracle.cosine, "max_abs_vs_oracle": vs_oracle.max_abs,
+                    "cosine_vs_cached": vs_cached.cosine, "max_abs_vs_cached": vs_cached.max_abs,
+                    "same_argmax": same_argmax, "wall_s": ts.elapsed().as_secs_f64(),
+                }));
+            }
+            let Some(j) = decode_index.iter().position(|&s| s == step) else {
+                continue;
+            };
+            let normed = franken_ocr::native_engine::nn::rms_norm(&last, Some(&final_norm), eps)
+                .expect("final norm");
+            let fh = FloatAgreement::of(&normed.data, &decode_final[j * hidden..(j + 1) * hidden]);
+            final_min_cos = final_min_cos.min(fh.cosine);
+            if fh.cosine < COSINE_F32_THRESHOLD {
+                failures.push(format!(
+                    "{fixture} step {step} final hidden: cosine {} < {COSINE_F32_THRESHOLD}",
+                    fh.cosine
+                ));
+            }
+
+            // Routing, every layer.
+            routing_rows += 1;
+            for (layer, d) in dumps.iter().enumerate() {
+                let ours = trace.decode[layer].as_ref().expect("a traced decode route");
+                let nblk = ours.scores.len();
+                if nblk != decode_nblk[j] {
+                    gate_mismatches.push(format!(
+                        "L{layer} step {step}: nblk {nblk} vs {}",
+                        decode_nblk[j]
+                    ));
+                    continue;
+                }
+                let o_sc = &d.scores[j * d.n_width..j * d.n_width + nblk];
+                let o_cand: Vec<bool> = d.cand[j * d.n_width..j * d.n_width + nblk]
+                    .iter()
+                    .map(|&c| c == 1)
+                    .collect();
+                let remote: Vec<bool> = ours
+                    .scores
+                    .iter()
+                    .map(|&s| s > srswa::SCORE_NEG * 0.5)
+                    .collect();
+                let o_remote: Vec<bool> =
+                    o_sc.iter().map(|&s| s > srswa::SCORE_NEG * 0.5).collect();
+                let fallback = !remote.iter().zip(&ours.allow).any(|(&a, &b)| a && b)
+                    && remote.contains(&true);
+                fallback_steps += usize::from(fallback);
+                if remote != o_remote || ours.allow != o_cand || fallback != (d.fallback[j] == 1) {
+                    gate_mismatches.push(format!("L{layer} step {step}: remote/gate/fallback"));
+                    continue;
+                }
+                for c in (0..nblk).filter(|&c| remote[c]) {
+                    layer_noise[layer] = layer_noise[layer].max((ours.scores[c] - o_sc[c]).abs());
+                }
+                let kspan = j * d.k_width..(j + 1) * d.k_width;
+                let o_sel = oracle_selection(
+                    &d.topi[kspan.clone()],
+                    &d.valid[kspan.clone()],
+                    &d.bias[kspan],
+                    decode_k[j],
+                );
+                let o_blocks: Vec<u32> = o_sel.iter().map(|&(b, _)| b).collect();
+                if ours.route.blocks == o_blocks {
+                    for (a, (_, b)) in ours.route.bias.iter().zip(&o_sel) {
+                        layer_bias_max[layer] = layer_bias_max[layer].max((a - b).abs());
+                    }
+                    continue;
+                }
+                let only_oracle: Vec<u32> = o_blocks
+                    .iter()
+                    .copied()
+                    .filter(|b| !ours.route.blocks.contains(b))
+                    .collect();
+                let swap_gap = ours
+                    .route
+                    .blocks
+                    .iter()
+                    .filter(|b| !o_blocks.contains(b))
+                    .flat_map(|&a| {
+                        only_oracle
+                            .iter()
+                            .map(move |&b| (o_sc[a as usize] - o_sc[b as usize]).abs())
+                    })
+                    .fold(0.0f32, f32::max);
+                let cand = srswa::candidates(&ours.scores, Some(&ours.allow));
+                let x = srswa::entmax_inputs(&ours.scores, &cand, &params);
+                let window = params.window(nblk);
+                let top = srswa::entmax15_topm(&x, window);
+                let x_window: Vec<f32> = top.slots.iter().map(|&(v, _)| v).collect();
+                let read_slots = params.read_slots(window);
+                let mspan = j * d.m_width..j * d.m_width + window.min(d.m_width);
+                layer_mismatches[layer].push(DecodeRouteMismatch {
+                    step,
+                    ours: ours.route.blocks.clone(),
+                    oracle: o_blocks,
+                    ours_margin: boundary_margin(&x_window, read_slots, params.idx_scale),
+                    oracle_margin: boundary_margin(&d.topm_x[mspan], read_slots, params.idx_scale),
+                    swap_gap,
+                    row_score_noise: (0..nblk)
+                        .filter(|&c| remote[c])
+                        .map(|c| (ours.scores[c] - o_sc[c]).abs())
+                        .fold(0.0f32, f32::max),
+                });
+            }
+        }
+
+        // Each layer's selection mismatches, judged by its measured noise.
+        let mut chained = 0usize;
+        for (layer, mismatches) in layer_mismatches.iter().enumerate() {
+            let noise = layer_noise[layer];
+            let tie_flips = mismatches
+                .iter()
+                .filter(|m| m.swap_gap <= 2.0 * noise)
+                .count();
+            for m in mismatches.iter().filter(|m| m.swap_gap > 2.0 * noise) {
+                failures.push(format!(
+                    "{fixture} L{layer}: a decode selection mismatch outside the score noise \
+                     ({noise:e}): {m:?}"
+                ));
+            }
+            chained += mismatches.len();
+            log.parity(
+                "L3",
+                "decode_routing_mismatches",
+                mismatches.len() as f64,
+                0.0,
+                fixture,
+                &sha(&format!("decode.L{layer:02}.topi")),
+                json!({
+                    "rule": "a mismatch is a tie-flip when the oracle scores of the blocks only \
+                             one side selected differ by at most twice the layer's measured \
+                             score noise over the kept decode steps (U2-C1's rule)",
+                    "layer_idx": layer,
+                    "rows_compared": routing_rows,
+                    "score_noise_max_abs": noise,
+                    "tie_flips": tie_flips,
+                    "bias_max_abs": layer_bias_max[layer],
+                    "mismatches": mismatches.iter().map(|m| json!({
+                        "step": m.step, "ours": m.ours, "oracle": m.oracle,
+                        "ours_margin": m.ours_margin, "oracle_margin": m.oracle_margin,
+                        "swap_gap": m.swap_gap, "row_score_noise": m.row_score_noise,
+                    })).collect::<Vec<_>>(),
+                }),
+                tie_flips == mismatches.len(),
+            );
+        }
+        if !gate_mismatches.is_empty() {
+            failures.push(format!(
+                "{fixture}: decode remote set / Page Gate / fallback differ: {:?}",
+                &gate_mismatches[..gate_mismatches.len().min(8)]
+            ));
+        }
+        // A raw-argmax miss is a tie-flip when our gap between the two ids is
+        // within twice the logit noise measured against the oracle (U2-C1's
+        // rule, on the kept steps' max abs).
+        let logit_noise = logits_max_abs as f32;
+        let outside: Vec<(usize, f32)> = argmax_misses
+            .iter()
+            .copied()
+            .filter(|&(_, gap)| gap > 2.0 * logit_noise)
+            .collect();
+        if !outside.is_empty() {
+            failures.push(format!(
+                "{fixture}: raw argmax differs from the oracle's outside the logit noise \
+                 ({logit_noise:e}) at {} of {} steps, first (step, gap) {:?}",
+                outside.len(),
+                generated.len() + 1,
+                &outside[..outside.len().min(8)]
+            ));
+        }
+        let pass = logits_min_cos >= COSINE_F32_THRESHOLD && outside.is_empty();
+        log.parity(
+            "L3",
+            "cosine",
+            logits_min_cos,
+            COSINE_F32_THRESHOLD,
+            fixture,
+            &sha("steps.logits"),
+            json!({
+                "stage": "logits", "path": "f32-cached",
+                "kept_steps": kept.len(), "steps": generated.len() + 1,
+                "max_abs": logits_max_abs,
+                "oracle_floor_t12_vs_t4": uocr2_floor(&floor, fixture, None, "envelope")
+                    .map(|e| e["logit_spread_overall"].clone()),
+                "final_hidden_min_cosine": final_min_cos,
+                "raw_argmax_mismatches": argmax_misses,
+                "raw_argmax_tie_flips": argmax_misses.len() - outside.len(),
+                "decode_routing_rows": routing_rows,
+                "decode_routing_mismatches": chained,
+                "decode_fallback_rows": fallback_steps,
+                "stateless": stateless_lines,
+                "decode_s": td.elapsed().as_secs_f64(),
+                "elapsed_s": tf.elapsed().as_secs_f64(),
+            }),
+            pass,
+        );
+    }
+
+    let pass = failures.is_empty();
+    log.result(if pass { "pass" } else { "fail" }, t0.elapsed().as_micros());
+    assert!(
+        pass,
+        "U2-C2 L3 failed (see the log):\n{}",
+        failures.join("\n")
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2063,27 +3528,30 @@ fn l4_token_exact_prefix() {
 /// Both sides are normalized through the SAME `postprocess::finalize_multi`
 /// (the oracle fixture is the RAW model text with its `<|det|>` spans; ours
 /// is already finalized), then:
-///   * the deterministic PLATE block must match exactly (containment) — this
-///     is the region the two precisions agree on byte-for-byte, so any
+///   * the deterministic PLATE block must match exactly (containment) — the
+///     region the two precisions agree on byte-for-byte, so any
 ///     preprocess/prompt/census/decode-wiring regression breaks it loudly
 ///     (it caught the pad-vs-squash and CatmullRom-kernel bugs already);
 ///   * aggregate CER over the oracle-length prefix stays within the
 ///     documented budget (the bf16-oracle vs f32-subject greedy tail fork —
-///     see DISCREPANCIES.md — bounds it well away from 1.0 but far from 0).
+///     see DISCREPANCIES.md DISC-004).
 ///
 /// Model + corpus gated: skip-with-SUCCESS unless `FOCR_MODEL_PATH` resolves
 /// AND `FOCR_CORPUS_DIR` holds both pages. Run WITHOUT `FOCR_DECODE_INT8`
 /// (the budget is calibrated on the f32 subject).
 #[test]
 fn l5_multi_page_matches_infer_multi_oracle() {
-    // MEASURED 2026-07-07 armed: CER 0.1791 (the plate region byte-exact; the
-    // budget absorbs the post-plate bf16-vs-f32 greedy fork — DISC-004).
+    // MEASURED 2026-10-30 armed: CER 0.0522, the three plate lines exact, and
+    // the subject stops near the oracle's EOS. Before the antialiased
+    // position-table resize (bd-p8hu) it was 0.1791 and the subject rambled on
+    // past the plate (DISC-004).
     run_l5_multi(
         "p9_p14",
         "tests/fixtures/multi_page/p9_p14_raw.md",
         "tests/fixtures/multi_page/p9_p14_meta.json",
         &["page_0009.png", "page_0014.png"],
-        0.25,
+        3,
+        0.10,
         None,
     );
 }
@@ -2091,9 +3559,16 @@ fn l5_multi_page_matches_infer_multi_oracle() {
 /// The 10-page LONG-HORIZON leg (bd-1465): the oracle decodes 7117 tokens /
 /// 9 `<PAGE>` markers of real dense-page prose; the subject is CAPPED just
 /// past the oracle's token count (a capped run's tokens are a true prefix of
-/// the full run's — the uncapped subject runs to the 32K position cap where
-/// the oracle EOSes, the same DISC-004 trajectory class stretched over ten
-/// pages; §2.5 expects graceful degradation, not equality).
+/// the full run's; the subject EOSes at 6435 on its own, so the cap only
+/// bounds a regression). §2.5 expects graceful degradation, not equality.
+///
+/// The plate here is the reference's first TWO content lines. The third
+/// ("PRINTED BY … LIMITED,") is a measured near-tie in this ten-page
+/// context: torch's own f32 run of the reference model prefers `' L'` over
+/// `' LIMITED'` by 0.50 logits, then holds three continuations within 0.08
+/// (LUTHER / LONDON / LUNDER), and bf16 under torch 2.13 reads "LONDON,".
+/// No f32 subject can be held to the bf16 reference's pick there (DISC-004).
+/// The 2-page leg keeps the full three-line plate.
 #[test]
 fn l5_multi_page_10p_long_horizon() {
     run_l5_multi(
@@ -2112,22 +3587,25 @@ fn l5_multi_page_10p_long_horizon() {
             "page_0108.png",
             "page_0126.png",
         ],
+        2,
         L5_MULTI_10P_BUDGET,
         Some(7600),
     );
 }
 
 /// 10-page CER budget — see [`l5_multi_page_10p_long_horizon`]. MEASURED
-/// 2026-07-07 armed: 0.4045 (plate exact; markers 8-vs-9; the DISC-004
-/// trajectory fork compounds across pages — §2.5 graceful degradation:
-/// 2-page 0.179 → 10-page 0.405). Budget = measured + headroom.
-const L5_MULTI_10P_BUDGET: f64 = 0.50;
+/// 2026-10-30 armed: 0.3186 (two-line plate exact; markers 8-vs-9; the
+/// DISC-004 trajectory fork compounds across pages — §2.5 graceful
+/// degradation: 2-page 0.052 → 10-page 0.319). Budget = measured + headroom,
+/// below the 0.4045 measured before the antialiased resize (bd-p8hu).
+const L5_MULTI_10P_BUDGET: f64 = 0.40;
 
 fn run_l5_multi(
     case: &str,
     raw_fixture: &str,
     meta_fixture: &str,
     page_names: &[&str],
+    plate_lines: usize,
     cer_budget: f64,
     subject_token_cap: Option<usize>,
 ) {
@@ -2154,14 +3632,18 @@ fn run_l5_multi(
     );
     let finalized_ref = postprocess::finalize_multi(&raw, page_names.len())
         .expect("finalize_multi over the oracle raw");
-    // The deterministic plate anchor = the finalized reference's first three
-    // content lines (LONDON / PRINTED BY … / STAMFORD …).
+    // The deterministic plate anchor = the finalized reference's first
+    // `plate_lines` content lines (LONDON / PRINTED BY … / STAMFORD …): the
+    // prefix both precisions agree on for this document.
     let plate: Vec<&str> = finalized_ref
         .lines()
         .filter(|l| !l.trim().is_empty() && !l.contains(postprocess::PAGE_MARKER))
-        .take(3)
+        .take(plate_lines)
         .collect();
-    log.assertion("plate anchor extracted (3 lines)", plate.len() == 3);
+    log.assertion(
+        &format!("plate anchor extracted ({plate_lines} lines)"),
+        plate.len() == plate_lines,
+    );
 
     let corpus = std::env::var_os("FOCR_CORPUS_DIR").map(PathBuf::from);
     let pages: Option<Vec<PathBuf>> = corpus.as_ref().and_then(|dir| {

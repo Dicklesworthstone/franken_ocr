@@ -93,9 +93,10 @@ enum Kind {
     Single(&'static str),
     /// One cross-page pass over a `tests/fixtures/multi_page` fixture's pages.
     Multi(&'static str),
-    /// The same pass through the streaming driver, capturing robot `page`
-    /// events. Streaming is observational, so its ids and markdown must equal
-    /// the named fixture case's goldens (never rewritten from this case).
+    /// The same pass through the CLI's driver — the pages read lazily from a
+    /// `PageSource` (U2-D0), streaming robot `page` events. Streaming is
+    /// observational, so its ids and markdown must equal the named fixture
+    /// case's goldens (never rewritten from this case).
     Stream(&'static str),
 }
 
@@ -334,14 +335,24 @@ fn run_case(model: &OcrModel, case: &Case, pages: &[PathBuf]) -> Result<Observed
             model.recognize_multi_page(&refs)
         }
         Kind::Stream(_) => {
-            let mut images = Vec::with_capacity(pages.len());
-            for page in pages {
-                images.push(image::open(page).map_err(|e| format!("{}: {e}", page.display()))?);
-            }
+            let mut source = franken_ocr::page_source::PageSource::images(pages.to_vec())
+                .map_err(|e| format!("open the page source: {e}"))?;
+            let mut skipped = Vec::new();
             let mut seen = Vec::new();
-            let out = model.recognize_multi_page_dynamic_streaming(images, &mut |page, body| {
-                seen.push(franken_ocr::robot::page_decoded_event(page, body));
-            });
+            let out = model.recognize_multi_page_source(
+                &mut source,
+                &mut |item: &franken_ocr::page_source::PageItem| {
+                    if let Err(e) = &item.raster {
+                        skipped.push(format!("page {}: {e}", item.source_page));
+                    }
+                },
+                Some(&mut |page: usize, body: &str| {
+                    seen.push(franken_ocr::robot::page_decoded_event(page, body));
+                }),
+            );
+            if !skipped.is_empty() {
+                return Err(format!("corpus pages failed to decode: {skipped:?}"));
+            }
             events = Some(seen);
             out
         }

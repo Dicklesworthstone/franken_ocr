@@ -108,10 +108,31 @@ pub struct DecodeParams {
     /// documents (U2-X2).
     #[doc(hidden)]
     pub max_positions: usize,
+    /// Unlimited-OCR-2's per-page token cap ([`PageGuard`], D11): after this
+    /// many tokens since the last generated `<PAGE>`, the guard forces the
+    /// next marker, or EOS on the last page. `0` disables the cap. v1 has no
+    /// page guard and ignores it.
+    pub max_page_tokens: usize,
+    /// Unlimited-OCR-2's router entmax domain (D21, `FOCR_SRSWA_ENTMAX`):
+    /// the HF top-M window by default. v1 has no router and ignores it.
+    pub entmax_domain: super::srswa::EntmaxDomain,
 }
 
 /// v1's `max_position_embeddings` ([SPEC-101]).
 pub const DEFAULT_MAX_POSITIONS: usize = 32_768;
+
+/// Unlimited-OCR-2's default per-page token cap (`max_page_tokens=20000`,
+/// `modeling_unlimitedocr.py:1043`; SGLang's `SGLANG_UOCR_MAX_PAGE_TOKENS`).
+pub const UOCR2_DEFAULT_MAX_PAGE_TOKENS: usize = 20_000;
+
+/// Unlimited-OCR-2's position limit (`max_length=131072`,
+/// `modeling_unlimitedocr.py:1040`): decoding stops once `pos + 1` reaches it.
+pub const UOCR2_MAX_POSITIONS: usize = 131_072;
+
+/// v2's n-gram lookback when a caller asks for window `0`: HF `infer` maps a
+/// non-positive `ngram_window` to 100 (`modeling_unlimitedocr.py:1092`).
+/// v1's `0` instead means the whole history (HF's built-in processor).
+pub const UOCR2_NGRAM_WINDOW_FOR_ZERO: usize = 100;
 
 impl Default for DecodeParams {
     fn default() -> Self {
@@ -122,6 +143,8 @@ impl Default for DecodeParams {
             no_repeat_ngram_size: DEFAULT_NO_REPEAT_NGRAM_SIZE,
             ngram_window: NGRAM_WINDOW_SINGLE,
             max_positions: DEFAULT_MAX_POSITIONS,
+            max_page_tokens: UOCR2_DEFAULT_MAX_PAGE_TOKENS,
+            entmax_domain: super::srswa::EntmaxDomain::TopM,
         }
     }
 }
@@ -879,6 +902,227 @@ pub fn batched_decode_step(
         .into_iter()
         .map(|token_id| DecodeOutput::new(token_id, params))
         .collect())
+}
+
+// ── Unlimited-OCR-2 decode contract (U2-B6) ─────────────────────────────────
+//
+// v2 decodes a whole document in one pass under two processors, applied in the
+// reference's order (`_uocr_generate`, MU:1168-1173): the no-repeat n-gram ban
+// over the GENERATED ids only (vLLM's `NoRepeatNGramLogitsProcessor`,
+// MU:608-622), then the page-count guard (vLLM's `_PageCountGuard`,
+// MU:583-605). One deliberate deviation (DISC-U2-2): when the guard allows a
+// single token, that token is emitted even if the n-gram banned it. HF would
+// then argmax an all-`-inf` row and emit id 0.
+
+/// What the page-count guard allows at one step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuardVerdict {
+    /// No constraint (the guard is off, or every page has its marker).
+    Free,
+    /// EOS is banned: fewer markers than pages so far.
+    BanEos,
+    /// Only this token may be emitted: EOS once the output has more markers
+    /// than pages, or at the per-page cap the next `<PAGE>` (EOS on the last
+    /// page).
+    Force(u32),
+}
+
+/// v2's page-count guard (MU:583-605): the output must carry exactly one
+/// `<PAGE>` per prompt page. EOS is banned until it does, a page that reaches
+/// `max_page_tokens` is closed by force, and a marker past the page count is
+/// followed by a forced EOS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageGuard {
+    expected: usize,
+    page_id: u32,
+    eos_id: u32,
+    max_page_tokens: usize,
+    markers: usize,
+    page_len: usize,
+}
+
+impl PageGuard {
+    /// A guard for a prompt with `expected` `<PAGE>` markers (`page_id`).
+    /// `expected == 0` turns it off (MU:585); `max_page_tokens == 0` turns off
+    /// only the per-page cap.
+    #[must_use]
+    pub fn new(expected: usize, page_id: u32, eos_id: u32, max_page_tokens: usize) -> Self {
+        Self {
+            expected,
+            page_id,
+            eos_id,
+            max_page_tokens,
+            markers: 0,
+            page_len: 0,
+        }
+    }
+
+    /// Whether the guard constrains anything (the prompt has a `<PAGE>`).
+    #[must_use]
+    pub fn enabled(&self) -> bool {
+        self.expected > 0
+    }
+
+    /// Account for one generated token. A marker resets the page length; any
+    /// other token extends it. Before the first marker the length counts from
+    /// the start of generation (MU:589-595).
+    pub fn observe(&mut self, id: u32) {
+        if id == self.page_id {
+            self.markers += 1;
+            self.page_len = 0;
+        } else {
+            self.page_len += 1;
+        }
+    }
+
+    /// `<PAGE>` markers generated so far.
+    #[must_use]
+    pub fn markers(&self) -> usize {
+        self.markers
+    }
+
+    /// Tokens since the last generated marker, the marker excluded.
+    #[must_use]
+    pub fn page_len(&self) -> usize {
+        self.page_len
+    }
+
+    /// Whether the per-page cap forces the next step: the page has reached
+    /// `max_page_tokens` and no extra marker came first.
+    #[must_use]
+    pub fn at_cap(&self) -> bool {
+        self.expected > 0
+            && self.markers <= self.expected
+            && self.max_page_tokens > 0
+            && self.page_len >= self.max_page_tokens
+    }
+
+    /// What the next step may emit (MU:597-604, in the reference's order).
+    #[must_use]
+    pub fn verdict(&self) -> GuardVerdict {
+        if self.expected == 0 {
+            GuardVerdict::Free
+        } else if self.markers > self.expected {
+            GuardVerdict::Force(self.eos_id)
+        } else if self.at_cap() {
+            GuardVerdict::Force(if self.markers < self.expected {
+                self.page_id
+            } else {
+                self.eos_id
+            })
+        } else if self.markers < self.expected {
+            GuardVerdict::BanEos
+        } else {
+            GuardVerdict::Free
+        }
+    }
+}
+
+/// v2's n-gram lookback for a requested `window`: `0` takes HF `infer`'s
+/// meaning ([`UOCR2_NGRAM_WINDOW_FOR_ZERO`]), never v1's whole history.
+#[must_use]
+pub fn uocr2_ngram_window(window: usize) -> usize {
+    if window == 0 {
+        UOCR2_NGRAM_WINDOW_FOR_ZERO
+    } else {
+        window
+    }
+}
+
+/// One guarded greedy step's outcome ([`decode_step_guarded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuardedStep {
+    /// The chosen id.
+    pub token_id: u32,
+    /// Whether it is EOS (the loop stops without emitting it).
+    pub is_eos: bool,
+    /// The guard allowed only this token. Block retirement is suspended on
+    /// such steps (U2-B4).
+    pub forced: bool,
+    /// HF would have emitted id 0 here instead: the guard forced a token the
+    /// n-gram had banned, so the reference argmaxes an all-`-inf` row
+    /// (DISC-U2-2).
+    pub hf_all_neg_inf: bool,
+}
+
+/// One Unlimited-OCR-2 greedy step over the `[1, vocab]` `logits` (U2-B6).
+///
+/// `generated` holds the generated ids only, never the prompt (D10). The
+/// n-gram ban uses `params.no_repeat_ngram_size` over
+/// [`uocr2_ngram_window`]`(params.ngram_window)`, then `guard` applies:
+/// [`GuardVerdict::BanEos`] masks EOS, and [`GuardVerdict::Force`] returns its
+/// token outright (forced tokens are authoritative, DISC-U2-2). Greedy argmax
+/// takes the lowest id on ties.
+///
+/// # Errors
+/// [`FocrError::Other`] if `logits` is not one non-empty row or a forced id
+/// is outside it; [`FocrError::NotImplemented`] for `temperature > 0`.
+pub fn decode_step_guarded(
+    logits: &Mat,
+    generated: &[u32],
+    guard: &PageGuard,
+    params: &DecodeParams,
+) -> FocrResult<GuardedStep> {
+    if logits.rows != 1 || logits.cols == 0 || logits.data.len() != logits.cols {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "sampler::decode_step_guarded expects one non-empty [1, vocab] logits row, got \
+             [{}, {}] with {} values",
+            logits.rows,
+            logits.cols,
+            logits.data.len()
+        )));
+    }
+    if !params.is_greedy() {
+        return Err(FocrError::NotImplemented(
+            "native_engine::sampler::decode_step_guarded — temperature>0 sampling is outside \
+             the greedy fp32 spine"
+                .into(),
+        ));
+    }
+    let row = logits.row(0);
+    let window = uocr2_ngram_window(params.ngram_window);
+    let verdict = guard.verdict();
+    if let GuardVerdict::Force(id) = verdict {
+        if id as usize >= row.len() {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "sampler::decode_step_guarded: forced id {id} outside the {}-wide logits row",
+                row.len()
+            )));
+        }
+        let mut banned = false;
+        for_each_sliding_window_ngram_ban(
+            generated,
+            params.no_repeat_ngram_size,
+            window,
+            &[],
+            row.len(),
+            |bi| banned |= bi == id as usize,
+        );
+        return Ok(GuardedStep {
+            token_id: id,
+            is_eos: id == params.eos_token_id,
+            forced: true,
+            hf_all_neg_inf: banned,
+        });
+    }
+    let mut masked = masked_sliding_window_logits_if_needed(
+        row,
+        generated,
+        params.no_repeat_ngram_size,
+        window,
+        &[],
+    );
+    let eos = params.eos_token_id as usize;
+    if verdict == GuardVerdict::BanEos && eos < row.len() {
+        masked.get_or_insert_with(|| row.to_vec())[eos] = f32::NEG_INFINITY;
+    }
+    let token_id = argmax_row(masked.as_deref().unwrap_or(row))?;
+    Ok(GuardedStep {
+        token_id,
+        is_eos: token_id == params.eos_token_id,
+        forced: false,
+        hf_all_neg_inf: false,
+    })
 }
 
 #[cfg(test)]
@@ -2000,5 +2244,266 @@ mod spec_gate_fault_injection {
             1,
             "acceptance must stop at the first unverifiable position"
         );
+    }
+}
+
+#[cfg(test)]
+mod uocr2_guard_tests {
+    use super::*;
+
+    const PAGE: u32 = 7;
+    const EOS: u32 = 1;
+    const V: usize = 16;
+
+    /// A row whose argmax is `best` (value 10) with `second` next (9).
+    fn row(best: u32, second: u32) -> Mat {
+        let mut r = vec![0.0f32; V];
+        r[second as usize] = 9.0;
+        r[best as usize] = 10.0;
+        Mat::from_vec(1, V, r)
+    }
+
+    fn params(ngram: usize, window: usize) -> DecodeParams {
+        DecodeParams {
+            no_repeat_ngram_size: ngram,
+            ngram_window: window,
+            eos_token_id: EOS,
+            ..DecodeParams::default()
+        }
+    }
+
+    #[test]
+    fn guard_bans_eos_until_every_page_has_its_marker() {
+        let mut g = PageGuard::new(2, PAGE, EOS, 0);
+        assert_eq!(g.verdict(), GuardVerdict::BanEos);
+        g.observe(PAGE);
+        g.observe(3);
+        assert_eq!(g.verdict(), GuardVerdict::BanEos, "1 of 2 markers");
+        g.observe(PAGE);
+        assert_eq!(g.verdict(), GuardVerdict::Free, "2 of 2 markers");
+        g.observe(PAGE);
+        assert_eq!(
+            g.verdict(),
+            GuardVerdict::Force(EOS),
+            "an extra marker is followed by a forced EOS (DISC-U2-3)"
+        );
+        assert!(!g.at_cap(), "the extra-marker EOS is not the cap's");
+    }
+
+    #[test]
+    fn guard_cap_forces_the_next_marker_then_eos_on_the_last_page() {
+        let mut g = PageGuard::new(2, PAGE, EOS, 3);
+        // Before the first marker the length counts from the start.
+        for _ in 0..3 {
+            g.observe(4);
+        }
+        assert_eq!(g.page_len(), 3);
+        assert!(g.at_cap());
+        assert_eq!(g.verdict(), GuardVerdict::Force(PAGE));
+        g.observe(PAGE);
+        assert!(!g.at_cap());
+        assert_eq!(g.page_len(), 0, "a marker resets the page length");
+        assert_eq!(g.verdict(), GuardVerdict::BanEos);
+        g.observe(PAGE);
+        for _ in 0..3 {
+            g.observe(4);
+        }
+        assert_eq!(
+            g.verdict(),
+            GuardVerdict::Force(EOS),
+            "last page at the cap"
+        );
+    }
+
+    #[test]
+    fn guard_cap_zero_disables_only_the_cap_and_zero_pages_disables_all() {
+        let mut capless = PageGuard::new(1, PAGE, EOS, 0);
+        for _ in 0..100_000 {
+            capless.observe(4);
+        }
+        assert_eq!(capless.verdict(), GuardVerdict::BanEos);
+        let mut off = PageGuard::new(0, PAGE, EOS, 3);
+        assert!(!off.enabled());
+        for id in [PAGE, PAGE, 4, 4, 4, 4] {
+            off.observe(id);
+            assert_eq!(off.verdict(), GuardVerdict::Free);
+        }
+    }
+
+    #[test]
+    fn banned_eos_falls_to_the_runner_up() {
+        let g = PageGuard::new(1, PAGE, EOS, 0);
+        let s = decode_step_guarded(&row(EOS, 5), &[], &g, &params(0, 128)).unwrap();
+        assert_eq!((s.token_id, s.is_eos, s.forced), (5, false, false));
+        let free = PageGuard::new(0, PAGE, EOS, 0);
+        let s = decode_step_guarded(&row(EOS, 5), &[], &free, &params(0, 128)).unwrap();
+        assert!(s.is_eos, "without a guard EOS wins");
+    }
+
+    #[test]
+    fn forced_token_is_authoritative_over_the_ngram_ban() {
+        // The 2-gram (4, PAGE) occurred and the history ends in 4, so the
+        // n-gram bans PAGE; the page at its cap forces PAGE anyway.
+        let hist = [4, PAGE, 3, 4];
+        let mut guard = PageGuard::new(5, PAGE, EOS, 1);
+        for &id in &hist {
+            guard.observe(id);
+        }
+        assert_eq!(guard.verdict(), GuardVerdict::Force(PAGE));
+        let s = decode_step_guarded(&row(2, 3), &hist, &guard, &params(2, 128)).unwrap();
+        assert_eq!(s.token_id, PAGE, "the forced marker is emitted");
+        assert!(s.forced);
+        assert!(
+            s.hf_all_neg_inf,
+            "the 2-gram (4, PAGE) is banned, so HF would emit id 0 here"
+        );
+        // An unbanned forced token is what HF emits too.
+        let s = decode_step_guarded(&row(2, 3), &[3, 4], &guard, &params(2, 128)).unwrap();
+        assert_eq!((s.token_id, s.hf_all_neg_inf), (PAGE, false));
+    }
+
+    #[test]
+    fn ngram_reads_generated_ids_and_window_zero_means_100() {
+        let free = PageGuard::new(0, PAGE, EOS, 0);
+        // The 2-gram (3, 5) repeats 150 tokens back: v2's window 0 is 100,
+        // so 5 stays allowed; window 200 bans it.
+        let mut hist = vec![3, 5];
+        hist.extend(std::iter::repeat_n(9, 148));
+        hist.push(3);
+        let s = decode_step_guarded(&row(5, 6), &hist, &free, &params(2, 0)).unwrap();
+        assert_eq!(
+            s.token_id, 5,
+            "window 0 → 100 does not reach the old 2-gram"
+        );
+        let s = decode_step_guarded(&row(5, 6), &hist, &free, &params(2, 200)).unwrap();
+        assert_eq!(s.token_id, 6, "a 200 window bans the repeat");
+        // `--no-repeat-ngram 0` disables the ban at any window.
+        let s = decode_step_guarded(&row(5, 6), &hist, &free, &params(0, 200)).unwrap();
+        assert_eq!(s.token_id, 5, "n-gram size 0 bans nothing");
+        // v1's window 0 is the whole history.
+        let v1 = sample(&row(5, 6), &hist, &params(2, 0)).unwrap();
+        assert_eq!(v1, 6);
+    }
+
+    #[test]
+    fn ties_take_the_lowest_id_and_bad_rows_fail_closed() {
+        let free = PageGuard::new(0, PAGE, EOS, 0);
+        let flat = Mat::from_vec(1, V, vec![0.5; V]);
+        let s = decode_step_guarded(&flat, &[], &free, &params(0, 128)).unwrap();
+        assert_eq!(s.token_id, 0);
+        let empty = Mat::from_vec(1, 0, vec![]);
+        assert!(decode_step_guarded(&empty, &[], &free, &params(0, 128)).is_err());
+        // A cap that forces a marker id outside the row.
+        let mut out_of_row = PageGuard::new(1, 99, EOS, 1);
+        out_of_row.observe(4);
+        assert!(decode_step_guarded(&flat, &[4], &out_of_row, &params(0, 128)).is_err());
+    }
+
+    /// Replays every committed U2-A6 oracle output (`tests/fixtures/uocr2_oracle`)
+    /// through the guard and the generated-only n-gram scan. The step counts
+    /// where the reference banned EOS, and where its n-gram banned anything,
+    /// must come out exactly; with the real `<PAGE>` id this pins the guard's
+    /// state machine and D10's domain and window to the reference.
+    #[test]
+    fn guard_and_ngram_replay_the_v2_oracle_counters() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uocr2_oracle");
+        let oracle: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join("ORACLE.json")).unwrap()).unwrap();
+        let fixtures = oracle["fixtures"].as_object().unwrap();
+        assert_eq!(fixtures.len(), 9);
+        let page = crate::tokenizer::special::PAGE;
+        for (name, f) in fixtures {
+            let ids: Vec<u32> = std::fs::read_to_string(dir.join(format!("{name}.ids.txt")))
+                .unwrap()
+                .lines()
+                .filter(|l| !l.starts_with('#'))
+                .flat_map(str::split_whitespace)
+                .map(|t| t.parse().unwrap())
+                .collect();
+            let p = &f["params"];
+            let c = &f["counters"];
+            let count = |v: &serde_json::Value| usize::try_from(v.as_u64().unwrap()).unwrap();
+            assert_eq!(ids.len(), count(&f["token_count"]), "{name}");
+            assert_eq!(f["finish_reason"], "stop", "{name}");
+            let expected = count(&f["expected_pages"]);
+            let window = uocr2_ngram_window(count(&p["ngram_window"]));
+            let ngram = count(&p["no_repeat_ngram_size"]);
+            let mut guard = PageGuard::new(expected, page, EOS, count(&p["max_page_tokens"]));
+            let (mut eos_banned, mut ngram_steps) = (0, 0);
+            // One step per generated id, then the step that chose EOS.
+            for step in 0..=ids.len() {
+                let verdict = guard.verdict();
+                assert!(
+                    !matches!(verdict, GuardVerdict::Force(_)),
+                    "{name} step {step}: the oracle forced nothing"
+                );
+                eos_banned += usize::from(verdict == GuardVerdict::BanEos);
+                let mut any = false;
+                for_each_sliding_window_ngram_ban(
+                    &ids[..step],
+                    ngram,
+                    window,
+                    &[],
+                    VOCAB_SIZE,
+                    |_| {
+                        any = true;
+                    },
+                );
+                ngram_steps += usize::from(any);
+                if let Some(&id) = ids.get(step) {
+                    guard.observe(id);
+                } else {
+                    assert_eq!(verdict, GuardVerdict::Free, "{name}: EOS must be allowed");
+                }
+            }
+            assert_eq!(guard.markers(), count(&f["num_pages_out"]), "{name}");
+            assert_eq!(eos_banned, count(&c["guard_eos_banned_steps"]), "{name}");
+            assert_eq!(ngram_steps, count(&c["ngram_banning_steps"]), "{name}");
+        }
+    }
+
+    /// A synthetic decode under random logits: the guard's invariants hold at
+    /// every step whatever the model prefers.
+    #[test]
+    fn guarded_loop_keeps_the_page_contract_under_random_logits() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..200 {
+            let pages = 1 + (trial % 4);
+            let cap = [0, 3, 8][trial % 3];
+            let mut guard = PageGuard::new(pages, PAGE, EOS, cap);
+            let mut generated = Vec::new();
+            for _ in 0..400 {
+                let logits: Vec<f32> = (0..V).map(|_| (next() % 1000) as f32).collect();
+                let s = decode_step_guarded(
+                    &Mat::from_vec(1, V, logits),
+                    &generated,
+                    &guard,
+                    &params(3, 64),
+                )
+                .unwrap();
+                if s.is_eos {
+                    assert!(guard.markers() >= pages, "EOS before {pages} markers");
+                    break;
+                }
+                assert!(
+                    guard.markers() <= pages,
+                    "a token after an extra marker must be EOS"
+                );
+                generated.push(s.token_id);
+                guard.observe(s.token_id);
+                assert!(
+                    cap == 0 || guard.page_len() <= cap,
+                    "the cap was not enforced"
+                );
+            }
+            assert!(guard.markers() <= pages + 1);
+        }
     }
 }
