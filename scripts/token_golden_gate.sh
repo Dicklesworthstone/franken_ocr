@@ -1,11 +1,14 @@
 #!/usr/bin/env sh
 #
-# token_golden_gate.sh — the model-gated token-id golden gate (bead U2-T3).
+# token_golden_gate.sh — the model-gated token-id golden gate (bead U2-T3;
+# the unlimited-ocr-2 lane since U2-C4).
 #
 # Runs tests/uocr2_goldens.rs armed, in the optimized `release-perf` profile
 # (a debug-profile decode takes minutes per page). scripts/check.sh calls this
-# after `cargo test`, so every change re-checks v1's real outputs whenever the
-# weights are on the machine.
+# after `cargo test`, so every change re-checks each model's real outputs
+# whenever its weights are on the machine. Each lane needs its own artifact:
+# unlimited-ocr-2's opens the pinned v2 tokenizer.json beside it, as
+# `focr pull unlimited-ocr-2` installs it (models/unlimited-ocr-2/).
 #
 #   scripts/token_golden_gate.sh                     # fast subset
 #   FOCR_E2E_LONG=1 scripts/token_golden_gate.sh     # full set (decoder/loader/

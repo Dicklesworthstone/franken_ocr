@@ -127,8 +127,9 @@ if [ "$FAST" -eq 0 ]; then
   run cargo clippy --locked --all-targets -- -D warnings
 fi
 run cargo test --locked
-# Token-id golden gate (U2-T3): re-checks v1's real outputs in the optimized
-# profile whenever the weights are on this machine; SKIPs cleanly without them.
+# Token-id golden gate (U2-T3, v2 lane U2-C4): re-checks each model's real
+# outputs in the optimized profile whenever its weights are on this machine;
+# a lane SKIPs cleanly without them.
 run sh scripts/token_golden_gate.sh
 run_ubs
 

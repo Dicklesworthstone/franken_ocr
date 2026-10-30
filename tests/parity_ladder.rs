@@ -4203,7 +4203,10 @@ impl CorpusGatePaths {
         }
         let named = [
             ("FOCR_MODEL_PATH", "the v1 int8 artifact"),
-            ("FOCR_UOCR2_MODEL_PATH", "the v2 int8 artifact"),
+            (
+                "FOCR_UOCR2_MODEL_PATH",
+                "the v2 int8 artifact, in a directory holding v2's own tokenizer.json",
+            ),
             ("FOCR_UOCR2_V1_REFS_DIR", "the v1 f32 corpus references"),
             ("FOCR_UOCR2_FIXTURES_DIR", "the v2 f32 oracle (<oracle root>/f32/t12)"),
         ];
@@ -4371,7 +4374,8 @@ fn corpus_aggregate(pages: &[CorpusPage]) -> f64 {
 
 /// U2-C4's L5 corpus gate (plan §7.3, items 1–6), the documents, and the
 /// page-limit re-derivation. Armed by `FOCR_UOCR2_CORPUS_GATE=1` with
-/// `FOCR_MODEL_PATH` (v1 int8), `FOCR_UOCR2_MODEL_PATH` (v2 int8),
+/// `FOCR_MODEL_PATH` (v1 int8), `FOCR_UOCR2_MODEL_PATH` (v2 int8; the model
+/// opens the pinned `tokenizer.json` beside it, so v2 needs its own directory),
 /// `FOCR_UOCR2_V1_REFS_DIR` (v1 f32 base references) and
 /// `FOCR_UOCR2_FIXTURES_DIR` (the v2 f32 t12 oracle, `S1C-*` included);
 /// otherwise it skips with success. Run it in `release-perf` with
