@@ -337,6 +337,55 @@ witness in the corpus discharges MR-5a.
 
 ---
 
+## MR-6 — Unlimited-OCR-2 re-prefill ≡ incremental decode (U2-C2)
+
+| | |
+|---|---|
+| **Transform `T`** | Fold the first `t` generated ids into the prompt: prefill `prompt ++ ids[..t]` afresh instead of decoding them one by one. The re-prefill rebuilds the page coordinates from the whole id sequence (`PageCoords::build`: a generated `<PAGE>` takes `bucket = cum − N`, clamped at 0, and the same query-page rule). |
+| **Relation `R`** | At step `t`: the same greedy token; logits within the path's accumulation-order bound; each layer's selected remote blocks for the row equal (the biases' gap is logged), except where the window precondition below excuses it. Separately, the incremental decode with block retirement on and off gives bit-equal hidden states at every step. |
+| **Strength** | `STRICT` tokens and selections; `STRUCTURAL` logits (a documented bound); `STRICT` (bitwise) retirement. |
+| **Source backing** | Plan §5.8 (decode equals a re-prefill under the coordinate rule above); U2-B2 (the router window M is set per forward); U2-B4 (retirement frees only blocks no later row reads). |
+
+**Why the logits are bounded, not bitwise.** A prefill runs multi-row GEMMs and a
+decode step m = 1 GEMVs, which accumulate in different orders. On the shipping
+int8-FFN cache, a last-ulp difference can also flip an int8 activation rounding in
+each layer's FFN. U2-B5 set that path's bound at 10% of the largest logit, a
+wiring check (it measured 2.4% on v2 and 5.0% on v1 over 12 steps); over these
+cases U2-C2 measured up to 4.4% (S1) and 8.7% (S2). The all-f32 cache has no
+such amplifier: it measured at most 9.0e-7 of the largest logit over both cases'
+54 sampled steps, and is held to 1e-5. On that path the relation is a precision
+check.
+
+**The window precondition.** A prefill sets every row's router window
+`M = min(16, ceil(L/32))` from its full length `L`; an incremental step sets it
+from its own position. The compared row therefore has the same M on both sides,
+but below the cap the re-prefill widens the window of every earlier row, prompt
+rows included. A wider window adds non-candidate pads at the entmax input −1e4.
+These leave a row's selection and biases unchanged when its best candidate input
+is at least −1e4 + 2 and no candidate sits at or below −1e4
+(`srswa::window_pad_sensitive`). The traced re-prefill records the rows where that
+fails. A selection mismatch at layer `l` is excused (logged, not counted) only
+when the window grows and some row is flagged at a layer below `l`: a flagged
+row's output at layer `j` feeds the keys every layer above `j` routes on, and
+nothing else of the window reaches the compared row. A prompt of more than 480
+rows has M = 16 on every row, and its cases have no excuse.
+
+**Generator.** A recorded generation (`tests/fixtures/uocr2_oracle/<fixture>.ids.txt`)
+over its corpus pages: S1 `page_0014` (one page; its 279-row prompt has a 9-block
+window that the re-prefills widen) and S2 (three pages). The relation compares the
+model with itself, so the ids only need to be a valid sequence. Sampled steps:
+every 64th, the last, and ±2 around every generated `<PAGE>`. Both cached paths
+run: the shipping int8-FFN cache and the all-f32 one.
+
+**Structured log.** One line per case (`case_id` = `<path>/<fixture>`) with the
+sampled steps, the relative logit gap per step and its maximum, the largest bias
+gap, the excused selections and the retired block count; one line per violation
+(a token mismatch carries the incremental margin between the two ids); one
+summary line. MR-6 reports its own summary and is not part of the MR-1..MR-5
+rollup.
+
+---
+
 ## 6. The single most important rule of this catalog
 
 **Never assert a relation that is not entailed by the model's documented
@@ -370,6 +419,7 @@ images spanning the regimes the relations exercise:
 | Non-square page (aspect ≠ 1) | the pad-to-square + rotation interaction | MR-2, MR-3a |
 | Dimensions not a multiple of 640 | tile-geometry edge | MR-1, MR-3a |
 | 2-page constructed dependence pair | the OQ-13 witness | MR-5a |
+| Recorded Unlimited-OCR-2 generations (`tests/fixtures/uocr2_oracle`, S1 `page_0014`, S2) | valid id sequences to teacher-force | MR-6 |
 
 The **generator** is a pure-Rust transform library (`image` crate: lossless
 `rotate90/180/270`, `flip`, in-memory same-size resize, mean-gray border pad) that
@@ -381,7 +431,7 @@ stable `case_id` (e.g. `rot90_doc07`) for the structured log.
 
 ## 8. Test inventory (what `tests/metamorphic.rs` must contain)
 
-- **One `#[test]` per relation** (MR-1..MR-5), each emitting the summary NDJSON
+- **One `#[test]` per relation** (MR-1..MR-6), each emitting the summary NDJSON
   line and per-violation lines (§0).
 - **The generator** producing transformed input pairs (§7), unit-tested for the
   coordinate maps themselves (MR-2's `(x,y)→` maps and MR-3a's affine offset are
@@ -395,7 +445,9 @@ stable `case_id` (e.g. `rot90_doc07`) for the structured log.
   assertion is reintroduced is ideal, but at minimum a load-bearing comment.)
 - **Coverage line**: the suite emits a final
   `{"suite":"metamorphic","relations_total":5,"relations_run":R,"relations_gated":G}`
-  rollup so the gauntlet (plan §8.5) can account this leg.
+  rollup so the gauntlet (plan §8.5) can account this leg. It covers MR-1..MR-5;
+  MR-6 (model-gated on the raw Unlimited-OCR-2 checkpoint) emits its own summary
+  line.
 
 ## 9. Relationship to the conformance pillar (plan §8.3 / §8.5)
 
@@ -408,7 +460,8 @@ stable `case_id` (e.g. `rot90_doc07`) for the structured log.
 
 The metamorphic leg feeds the gauntlet's **conformance pillar**: each relation is
 a `ConformanceTest` (requirement level `MUST` for MR-1/MR-2/MR-3a/MR-4, `MUST`
-for the MR-5 *prohibition* and `SHOULD`/gated for MR-5a..c, `SHOULD` for MR-3b),
+for the MR-5 *prohibition* and `SHOULD`/gated for MR-5a..c, `SHOULD` for MR-3b,
+`MUST`/model-gated for MR-6 on Unlimited-OCR-2),
 contributing to the ≥0.95 MUST-coverage accounting (plan §8.6). A relation
 violation is a hard parity-cell failure — the release scorecard cannot ship with a
 red metamorphic cell (plan §8.4).

@@ -59,7 +59,7 @@ The exact-recipe artifact emits EOS on `page0590` and passes the complete 20-pag
 | **Works offline** | Once compatible weights are installed, inference never touches the network. Zoo pulls install under `~/.cache/franken_ocr/models`; the v0.7.0 default is the versioned conservative Unlimited-OCR artifact. Weight bytes are owned by default; trusted immutable deployments can opt into mmap with `FOCR_MMAP=1`. |
 | **Embeddable Rust API** | `OcrEngine` exposes synchronous, blocking calls for Markdown, structured layout, figure extraction, in-memory images, and load-once batches. |
 | **Native PDFs and figures** | Scanned PDFs are rasterized in process with pure Rust; page `/Rotate` and image-placement rotations are honored, `--pages` selects exact PDF pages, `--split-spreads` can split two-page book scans, and `--extract-figures` saves chart/photo regions beside the Markdown or JSON output. |
-| **Cross-page parsing** | `--multi-page` runs the Unlimited-OCR `infer_multi` contract over selected PDF pages or an image list, producing one document with `<PAGE>` boundaries instead of unrelated page parses. |
+| **Cross-page parsing** | `--multi-page` runs the Unlimited-OCR `infer_multi` contract over selected PDF pages, a directory of page images or an image list, producing one document with `<PAGE>` boundaries instead of unrelated page parses. |
 | **Model zoo with compatibility status** | Ready engines: Unlimited-OCR, GOT-OCR2, SmolVLM2, OneChart, and Polyphonic-TrOMR, including full-page sheet-music OMR. `focr models` reports compatible and blocked pull entries with recipe metadata. All five runtime models are pullable in v0.7.0. Planned descriptors: TrOCR and pix2tex. |
 | **Measured int8 decode path** | Historical rows show the custom int8 kernels can accelerate decoder work. The v0.7.0 exact-recipe artifact passes the hard-page termination and corpus-CER budget. Raw BF16 is only an all-high-precision native diagnostic when paired with `FOCR_DECODE_STATELESS=1`; the default cached decode applies the conservative int8 FFN/expert cache regardless of source storage. |
 | **Runtime ISA dispatch** | One binary per architecture detects every available int8 ISA tier and reports the effective ordinary dense-GEMM route separately. Apple Silicon currently defaults to measured-faster LLVM autovec while retaining forced SDOT/SMMLA proof paths; x86 selects AVX-512-VNNI, AVX-VNNI, AVX2, or scalar. |
@@ -366,6 +366,7 @@ focr ocr page.png --model /path/to/unlimited-ocr.focrq
 focr ocr eq.png --task formula --model got-ocr2.int8.focrq   # specialized task routing (see below)
 focr ocr chart.png --task chart-data --model onechart.int8.focrq
 focr ocr book.pdf --pages 3,5-9 --split-spreads -o excerpt.md
+focr ocr ./scans/ --multi-page -o book.md  # a directory of page images as one document
 ```
 
 **Output (`-o`/`--output FILE`).** Writes the result to a file instead of stdout; the
@@ -390,24 +391,36 @@ chosen by content: JPG (quality 85) for photographic regions, lossless PNG for
 line-art / charts / screenshots. Requires `-o` (or `--figures-dir` for a stdout run).
 PDFs name figures per page (`page{N}_figure_{M}`).
 
-**PDF controls.** `--pages SPEC` is for PDFs only. `SPEC` is a comma-separated
-list of 1-based pages and inclusive ranges, such as `3`, `3-7`, or
-`1,5-9,218`; selected pages run in source order with duplicates removed.
+**Directory input.** `focr ocr ./scans/` reads a directory of page images
+(`.png`, `.jpg`, `.jpeg`, `.tif`, `.tiff`, `.webp`, `.bmp`, `.gif`, `.pnm` and
+its variants) as one document, in natural order: `p2.png` comes before
+`p10.png`. Each image's EXIF orientation is applied, as for a single image.
+Hidden files and subdirectories are passed over. Any other file is left out
+and reported once as an `ignored_files` warning (on stderr, `run_complete` and
+`--json`). Everything below that applies to a PDF's pages applies to a
+directory's images.
+
+**PDF controls.** `--pages SPEC` is for PDFs and directories only. `SPEC` is a
+comma-separated list of 1-based pages and inclusive ranges, such as `3`, `3-7`,
+or `1,5-9,218`; selected pages run in source order with duplicates removed.
 Out-of-range pages are usage errors that name the document page count. Before
 OCR, the pure-Rust PDF path applies both the page `/Rotate` entry and any
 axis-aligned rotation from the content stream's image placement matrix, so scans
 stored sideways but displayed upright are normalized before OCR or spread
-splitting. `--split-spreads` is also PDF-only and off by default. It looks for
-wide raster pages with a near-blank vertical gutter near the center, then OCRs
-the left and right halves as separate logical pages; no qualifying gutter means
-the page remains unsplit.
+splitting. `--split-spreads` is also off by default and applies only to
+documents. It looks for wide raster pages with a near-blank vertical gutter
+near the center, then OCRs the left and right halves as separate logical pages;
+no qualifying gutter means the page remains unsplit. Pages are rasterized one
+at a time as the run reaches them, so a long book never holds every page image
+in memory.
 
 **Multi-page cross-page parsing (`--multi-page`).** By default every page is
 parsed independently. `--multi-page` instead runs ONE pass over the whole
 document using the Unlimited-OCR `infer_multi` contract, so page N can reference
 content on pages 1..N-1, and the output is a single Markdown document with
-`<PAGE>` separators. On `focr ocr` it is PDF-only and composes with `--pages`;
-for an image list use `focr ocr-batch page1.png page2.png --multi-page`. v1 has
+`<PAGE>` separators. On `focr ocr` it takes a PDF or a directory of page
+images and composes with `--pages`; for an image list use `focr ocr-batch
+page1.png page2.png --multi-page`. v1 has
 32,768 positions shared by prompt and output (≈29 dense pages); longer documents
 stop early and report `finish_reason: length` with a `v1_truncated` warning (a
 prompt that alone exceeds the budget fails with an actionable error). When v1
@@ -526,7 +539,7 @@ focr models --json                          # machine-readable list
 | **`smolvlm2`** | ready | Photo description and VQA through `--task describe [--question "..."]`. | `focr pull smolvlm2` installs `smolvlm2.int8.focrq` plus `tokenizer.json` in the model subdirectory. |
 | **`onechart`** | ready | Chart-to-data extraction through `--task chart-data`. | `focr pull onechart` installs `onechart.int8.focrq`, `vocab.json`, `merges.txt`, and `added_tokens.json`. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. |
 | **`tromr`** | ready | Polyphonic sheet-music OMR through `--task music`. | `focr pull tromr` installs `tromr.int8.focrq` plus the rhythm, pitch, lift, and note tokenizer tables; `focr pull tromr --quant f32` installs the bit-exact `tromr.focrq` reference artifact. Staff crops and full pages both run; bad staves are skipped with reasons when at least one staff recognizes, and over-budget systems can split at detected barlines. |
-| **`unlimited-ocr-2`** | planned | Baidu's long-document successor to the default model (sparse routed attention across pages). | Its raw checkpoint directory is identified and checked against its pinned tensor census and tokenizer, but no forward runs it yet; use `unlimited-ocr`. |
+| **`unlimited-ocr-2`** | experimental | Baidu's long-document successor to the default model (sparse routed attention across pages). | Runs from its raw checkpoint directory (`--model <dir>`) on single pages and on documents of up to 60 pages (`--multi-page`). A document that stops early at its position limit or forward budget writes its pages, then exits 5. Not yet certified against the reference, so use `unlimited-ocr` for production. |
 | **`trocr`**, **`pix2tex`** | planned | Handwriting and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
 
 `unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` only when you need format extraction (formulas, tables, charts, etc.); it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:
@@ -797,6 +810,7 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_INT8_ATTN` | Independent accuracy gate for int8 attention q/k/v/o weights. Default off. It does not select the all-int8 decoder by itself. |
 | `FOCR_INT8_LMHEAD` | Independent accuracy gate for int8 `lm_head`. Default off. It does not select the all-int8 decoder by itself. |
 | `FOCR_DECODE_STATELESS` | Force the stateless re-prefill decoder, kept as a parity oracle for the cached decode path. |
+| `FOCR_DECODE_F32` | Unlimited-OCR-2 only: decode on an all-f32 cache (FFN/expert weights widened to f32 instead of int8), the cached path that reproduces the f32 reference's ids. Needs the raw checkpoint, not a quantized artifact, and excludes `FOCR_DECODE_STATELESS`. Slower than the default and far faster than stateless. |
 | `FOCR_QKV_FUSED` | Controls fused q/k/v projection inside the experimental all-int8 decoder. Default is on within that experiment; set `0`, `off`, `false`, or `no` for its older three-call comparison path. |
 | `FOCR_BATCH_SPINE` | Arm continuous batching. For Unlimited-OCR, the current R-SWA spine requires the explicitly gated all-int8 decoder; without it, pages use the conservative sequential path. The dense zoo spine covers GOT-OCR2, SmolVLM2, and OneChart. Set `1`, `on`, or `true` to arm it. |
 | `FOCR_BATCH_SIZE` | Maximum in-flight stream count for the continuous-batch spine. Defaults to 128 when the spine is armed; blank, invalid, or `0` also use that default, and larger values are capped at 256. |

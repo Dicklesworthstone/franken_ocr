@@ -136,4 +136,9 @@ curl -sS -A "$UA" "https://huggingface.co/api/models/baidu/Unlimited-OCR-2/tree/
   through this pinning process: re-pin, re-hash, re-read the changed source, and update
   the plan §5 facts and OQ-V2 answers that cite it before any dependent bead proceeds.
 
-Checks run: 2026-10-29 (HEAD `c14071b5`, wheel/README-only delta, reviewed).
+Checks run:
+- 2026-10-29: HEAD `c14071b5`, wheel/README-only delta, reviewed.
+- 2026-10-30 (U2-C2, at M1): HEAD still `c14071b5`. The listings (28 entries each)
+  differ from the pin only in `README.md`, `.gitattributes` and the wheel (dev10
+  removed, dev13 added with LFS oid `576c71da…`, the SHA-256 above): the delta
+  already reviewed. Every model, code, tokenizer and weight file is unchanged.

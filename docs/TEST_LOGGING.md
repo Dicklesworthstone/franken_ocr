@@ -197,6 +197,18 @@ Additional required fields:
 - `lm_head`
 - `kv_cache`
 
+### Unlimited-OCR-2 Stages
+
+- `page2d_rope`: page2d coordinates and their RoPE tables
+- `srswa_router`: the Token Sieve router (scores, Page Gate, entmax, selection)
+- `srswa_attn`: SR-SWA block-sparse attention
+- `srswa_kbar`: block summaries (`kbar`)
+- `srswa_retire`: retiring a full block's index keys into its summary
+- `splice`: splicing generated rows into a document's page stream
+- `window`: a long document's page window
+- `pagesource`: the page source feeding a document run
+- `checkpoint`: a resumable document checkpoint
+
 ### Dtypes
 
 - `f32`
@@ -237,6 +249,12 @@ events. Stage lines should use the dispatched tier that actually ran.
 - `formula_cdm`
 - `argmax_match`
 - `token_exact`
+- `selection_exact`: whether two routing selections are the same block sets
+- `routing_mismatches`: rows whose selected block set differs from the oracle's
+- `bias_max_abs`: the largest bias difference over the blocks both sides select
+- `page_count_equal`: whether two runs emit the same number of pages
+- `edit_distance`: a character edit distance between two texts
+- `bootstrap_bound`: a bootstrap confidence bound on a corpus metric
 
 ## Example
 

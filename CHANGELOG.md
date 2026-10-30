@@ -158,10 +158,11 @@ sections as they land.
   - `FLOOR.json` records the reference's own noise. A repeated f32 run is
     bit-identical, and so are bf16 runs at 12 and 4 threads. f32 at 12 vs 4
     threads gives the same token ids on all nine fixtures. Its logits differ
-    by at most 4.8e-4 and its layer inputs by 2.3e-4 relative. Even so, 11
-    near-tie routing rows on the 10- and 20-page prompts pick different
-    blocks. bf16 is no oracle: its tokens leave f32's within 7–94 tokens, and
-    its routing differs on thousands of rows.
+    by at most 4.8e-4 and its layer inputs by 2.3e-4 relative. Even so, 4
+    near-tie rows on the 10- and 20-page prompts select different blocks (7
+    more only list the same blocks in another order). bf16 is no oracle: its
+    tokens leave f32's within 7–94 tokens, and its routing differs on
+    thousands of rows.
   - No fixture hit DISC-U2-2's all-(−inf) case. `check_oracle_provenance.py`
     checks the committed fixtures against the v2 pins and input hashes.
 - **Unlimited-OCR-2 int8 artifact** (bead U2-C3).
@@ -204,9 +205,129 @@ sections as they land.
     v1 allows.
   - The v2 references ignore EXIF orientation; franken_ocr applies it for
     every model (DISC-U2-10).
+- **Unlimited-OCR-2 parity ladder L1–L2** (bead U2-C1). The native f32 path is
+  compared with the f32 oracle on all nine fixtures, layer by layer.
+  - Page2d coordinates, prompt and decode steps alike, are exact, and the RoPE
+    tables are within 1 ulp (torch's vectorized cos/sin).
+  - At each layer the rung compares the layer input, the router's `iq`, `ik`,
+    `kbar`, scores and entmax prior, and the attention output before and after
+    `o_proj`. Every one is at cosine ≥ 0.9999. The worst is 0.99999992 on the
+    base pages and 0.99999946 on the gundam pages.
+  - The remote-block set, the Page Gate and the fallback flag are exact. That
+    includes 1,037 and 2,161 fallback queries per layer on the 10- and 20-page
+    documents. Run on the oracle's own scores, the router reproduces its entmax
+    inputs bit for bit and its selections.
+  - Chained, 5 rows out of 9 fixtures × 12 layers select differently, each a
+    near-tie within the measured score noise. Two are the swap the reference
+    itself makes between 12 and 4 threads. One follows an MoE expert choice
+    whose 6th and 7th scores are 4.5e-7 apart.
+  - `decoder::forward_srswa_observed` exposes each layer's input, router
+    projections, selections and attention context to a test. The production
+    forward passes a no-op observer and does the same work as before.
+  - The rung needs `FOCR_UOCR2_SOURCE_DIR`, the raw sharded checkpoint. It
+    takes about 2.5 minutes in `release-perf`.
+  - `scripts/oracle_nondeterminism_floor.py` adds the router stages, attention
+    outputs and selected-set flips to `FLOOR.json`, and every existing value is
+    unchanged.
+- **Unlimited-OCR-2 runs, experimental** (bead U2-B6). `focr ocr --model <v2
+  dir> page.png`, `focr ocr doc.pdf --multi-page` and `focr ocr-batch
+  --multi-page` decode through v2's own document loop. `focr models` lists it
+  as `experimental`, and each run prints a one-line note saying so. It is not
+  yet certified against the reference (U2-C2, U2-C4).
+  - Each `<PAGE>` the model emits opens a page. A guard holds the count: it
+    never allows more markers than pages, bans EOS before the last page, and
+    forces the next marker (or EOS) once a page reaches `max_page_tokens`
+    (20,000). In a document `--max-length` caps each page, not the whole
+    output.
+  - The n-gram ban reads only generated ids. Its window is 128 for one page and
+    1,024 for a document, and `--ngram-window 0` means 100, as in the
+    reference.
+  - Pages split on the marker's token id. Text before the first marker is
+    prepended to page 1 with a `leading_text` warning, so N pages always give N
+    bodies (DISC-U2-9).
+  - A document holds at most 60 pages in one pass. A larger one exits 2 before
+    any page is read, naming `--pages`.
+  - A document that stops early is not silently truncated. At the 131,072
+    position limit, or when `FOCR_STAGE_BUDGET_FORWARD_MS` (scaled by the page
+    count) runs out, the pages produced are written first. The run then exits 5
+    with a `run_error` carrying `finish_reason` (`length` or `budget`),
+    `pages_out` and a `v2_length` or `v2_budget` warning. Robot mode emits no
+    `run_complete` for it.
+  - Dead KV blocks are retired while the guard runs. On the three-page S2
+    document with a 50-token page cap, peak KV is 115.8 MB, against 128.2 MB
+    unretired, with identical ids. If the retirement detector fires, the
+    document is decoded again unretired. `FOCR_SRSWA_RETIRE=0` turns it off.
+  - `FOCR_SRSWA_ENTMAX=topm|all` picks the router's entmax domain: HF's top-M
+    window (the default) or SGLang's all candidates (D21). Any other value
+    exits 2.
+  - `run_complete` and `--json` now carry the admission's `ignored_lever`
+    warnings. Human stderr still prints them once, at load.
+  - Exit 5 now also covers a document that stopped early. `focr robot schema`
+    lists the new warning kinds (`v2_length`, `v2_budget`, `leading_text`) and
+    the two SR-SWA variables.
+  - On the oracle's S1 page the int8 cached decode reproduces the reference's
+    50 ids exactly. On the two-page S3 it first differs at step 73, a near-tie
+    (logit gap 0.065) that the all-f32 path resolves like the reference. That
+    gap is U2-C2's to close.
+- **Directory input, and documents read one page at a time** (bead U2-D0).
+  - `focr ocr ./pages/` reads a directory of page images as one document, in
+    natural order (`p2.png` before `p10.png`). `--pages`, `--split-spreads`
+    and `--multi-page` apply to it as to a PDF. Without `--multi-page` each
+    image is parsed on its own, in that order. Hidden files and subdirectories
+    are passed over; any other file is left out with one `ignored_files`
+    warning (`count`, `examples`) on stderr, `run_complete` and `--json`.
+  - `--multi-page` no longer rasterizes every page up front and then clones
+    the vector. The forward stage reads each page, preprocesses it and drops
+    its raster before reading the next, so a long book holds one raster at a
+    time, not every raster twice. `tests/page_source_memory.rs` walks 100
+    pages of 5.5 MiB rasters: the process footprint grows by 0.0 MiB for a
+    FlateDecode PDF, 1.0 MiB for a JPEG PDF and 0.0 MiB for a directory of
+    PNGs. Holding every raster grows it by 546 MiB.
+  - Library: `page_source::PageSource` reads a PDF, an image list or a
+    directory lazily, keeps a source-page map (skipped pages and spread halves
+    keep their numbers), and re-rasterizes a page on demand (`fetch`).
+    `OcrEngine::recognize_multi_page_source_with_model` runs a `--multi-page`
+    pass over one.
+  - `FOCR_TIMING=1` logs a `pagesource` row per page: rasterize time, size and
+    bytes, or the skip reason.
 
 ### Fixed
 
+- A PDF page stored as FlateDecode samples is inflated into one buffer of its
+  declared size. The buffer used to grow by doubling, and on macOS the freed
+  blocks stayed in the process: walking 100 such pages grew the footprint by
+  516 MiB, though no page was kept. It now grows by under 1 MiB.
+- `ocr-batch --multi-page` now applies each image's EXIF orientation, as a
+  single image always did and as the reference's `infer_multi` does
+  (`load_image` → `ImageOps.exif_transpose`, `MU:27-34`). Only an image with a
+  non-identity Orientation tag changes; the PNG corpus has none, and its token
+  goldens are unchanged.
+
+- **640-pixel views now match the reference: v1 multi-page and gundam tiles
+  in both models** (bead bd-p8hu). For a 640 view, both vision towers fit their
+  learned position tables to the smaller patch grid (SAM 64→40, CLIP 16→10).
+  These views are v1's multi-page squash and the gundam tiles of both models.
+  The reference resizes with torch's antialiased bicubic; franken_ocr used
+  plain bicubic, a different filter.
+  - The resize is now `nn::resize_bicubic_aa`, shared by both towers. It is
+    bit-identical to torch 2.13 on the real tables.
+  - Unlimited-OCR-2 gundam: the two oracle pages' merged `inputs_embeds` sat at
+    cosine 0.983 and 0.931, and every layer's block routing then differed on
+    120–300 rows. They now agree with the oracle to cosine ≥ 0.9999995 at every
+    layer.
+  - v1 `--multi-page`, character error rate against the reference's output
+    (the f32 parity rungs, DISC-004):
+    - 2 pages: 0.179 → 0.052. The int8 run now stops after 90 tokens (the
+      reference takes 103); it used to loop to 432.
+    - 10 pages: 0.405 → 0.319. The int8 run stops at 6,435 tokens (reference
+      7,117), where it used to run to 30,310.
+    - The rungs' budgets tighten to match (0.25 → 0.10 and 0.50 → 0.40). The
+      10-page rung now checks two plate lines instead of three. The third is
+      an exact bf16 logit tie in the reference model itself, which torch's own
+      f32 run resolves differently.
+    - The v1 token goldens for the three multi-page documents are recaptured.
+      The single-page goldens are unchanged.
+  - Base mode never resizes, so single-page base output is byte-identical.
 - fix: multi-page streaming no longer stops emitting page events after a split
   multi-byte character (CJK). Byte-level BPE often spells a rarer Chinese or
   Japanese character, or an emoji, as several tokens. Streaming used to re-decode

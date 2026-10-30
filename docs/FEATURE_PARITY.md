@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **63** | **191** |
-| `present` | 115 † | 49 | 164 |
+| Total enumerated rows | **128** | **66** | **194** |
+| `present` | 115 † | 52 | 167 |
 | `partial` | 7 † | 11 | 18 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -94,7 +94,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 |---|---------|------|-----|--------|--------|--------|------|-------|
 | 23 | SAM build params (768/12/12, global [2,5,8,11]) | SPEC-040 | MUST | present | L2 | vision_sam.rs | bd-1gv.5 | SAM geometry + GLOBAL_BLOCKS (vision_sam.rs:26); L1 sam_output |
 | 24 | SAM patch-embed Conv2d k16s16 → 64×64×768 | SPEC-041 | MUST | present | L1 | vision_sam.rs | bd-1gv.5 | patch_embed conv k16s16 (vision_sam.rs + nn.rs:179); L1 |
-| 25 | SAM abs pos_embed (1,64,64,768) + bicubic interp | SPEC-042 | MUST | present | L1 | vision_sam.rs | bd-1gv.4 | abs pos_embed bicubic interp (vision_sam.rs:1404); L1 |
+| 25 | SAM abs pos_embed (1,64,64,768) + antialiased bicubic resize | SPEC-042 | MUST | present | L1 | vision_sam.rs, nn.rs | bd-1gv.4, bd-p8hu | `vision_sam::abs_pos` → `nn::resize_bicubic_aa` (torch `antialias=True`, bitwise; 640 views — v1 multi-page squash, gundam tiles — SAM 64→40, CLIP 16→10); L1, v2 gundam L2 |
 | 26 | SAM window attention (window=14) | SPEC-043 | MUST | present | L2 | vision_sam.rs | bd-1gv.6 | window attention w=14 (vision_sam.rs:553,703); L1/L2 |
 | 27 | SAM global attention (blocks 2/5/8/11) | SPEC-043 | MUST | present | L2 | vision_sam.rs | bd-1gv.6 | global attention blocks 2/5/8/11 (vision_sam.rs:342); L1 |
 | 28 | SAM decomposed relative-position bias | SPEC-044 | MUST | present | L1 | vision_sam.rs | bd-1gv.6 | decomposed rel-pos bias (vision_sam.rs:867); L1 |
@@ -109,7 +109,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 |---|---------|------|-----|--------|--------|--------|------|-------|
 | 33 | CLIP build params (24/1024/16, patch 14) | SPEC-047 | MUST | present | L2 | vision_clip.rs | bd-1gv.9 | CLIP 24/1024 patch14 (vision_clip.rs:68,88); L1 clip_output |
 | 34 | CLIP embeddings take SAM features as patch_embeds (fused) | SPEC-048 | MUST | present | L1 | vision_clip.rs | bd-1gv.9 | CLIP embeddings take SAM patch_embeds (vision_clip.rs:296); L1 |
-| 35 | CLIP get_abs_pos bicubic interp branch | UNRESOLVED-3 | SHOULD | partial | L1 | vision_clip.rs | bd-1gv.4 | abs_pos_for_len implemented (vision_clip.rs:834) but the bicubic branch is a no-op at 1024 — L1 exercises only pass-through |
+| 35 | CLIP get_abs_pos bicubic interp branch | UNRESOLVED-3 | SHOULD | present | L1 | vision_clip.rs, nn.rs | bd-1gv.4, bd-p8hu | `abs_pos_for_len` (vision_clip.rs:1160) → `nn::resize_bicubic_aa`, torch's antialiased bicubic, bit-identical on the real 16→10 table (102,400/102,400). A no-op at 1024; every 640 view (v1 multi-page squash, gundam tiles) takes it. v2 gundam L1/L2: `inputs_embeds` cos 1 − 1.8e-10 |
 | 36 | CLIP 24-layer transformer (SDPA, no causal) | SPEC-049 | MUST | present | L2 | vision_clip.rs | bd-1gv.9 | 24-layer no-causal transformer (vision_clip.rs:596); L1/L2 |
 | 37 | quick_gelu `x·σ(1.702x)` | SPEC-049 | MUST | present | L1 | nn.rs | bd-1gv.9 | quick_gelu (nn.rs:517 + hand-computed test); L1 |
 | 38 | CLIP call sig `vision_model(image, sam_features)` | SPEC-050 | MUST | present | L2 | vision_clip.rs | bd-1gv.9 | vision_model(img, sam_feat) signature (vision_clip.rs:253); L1 (SPEC-050 via range) |
@@ -178,7 +178,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | 81 | other-label cleanup + `\coloneqq`/`\eqqcolon` | SPEC-115 | MUST | present | L5 | postprocess.rs | bd-1gv.23 | other-label cleanup + coloneqq normalize (postprocess.rs:373 + tests) |
 | 82 | bbox overlay drawing (result_with_boxes.jpg) | SPEC-116 | MAY | excluded | n/a | — | — | (unchanged; §16) |
 | 83 | geometry/line_type special case (geo.jpg) | SPEC-117 | MAY | excluded | n/a | — | — | (unchanged; §16) |
-| 84 | Multi-page `<PAGE>` split/rejoin | SPEC-118 | MUST | present | L5 | postprocess.rs | bd-1gv.25 | <PAGE> split/rejoin multi-page (postprocess.rs:38,489 + tests) |
+| 84 | Multi-page `<PAGE>` split/rejoin | SPEC-118 | MUST | present | L5 | postprocess.rs | bd-1gv.25 | <PAGE> split/rejoin multi-page (postprocess.rs:38,489 + tests). Unlimited-OCR-2 (U2-B6, D20) splits the generated ids on token 128827 under a page-count guard, prepending a leading head to page 1 with a `leading_text` warning (DISC-U2-9) |
 | 85 | test_compress metric (output/valid_img tokens) | SPEC-119 | MAY | excluded | n/a | — | — | (unchanged; §16) |
 
 ## 9. Op map — frankentorch facade (plan §4.3)
@@ -269,11 +269,12 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | locked atomic temp+fsync+rename, byte-identical re-export, one-way contract documented; migration + exit-7 refusal tested (bd-223.4) |
 | `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | present | SURF | bd-wp8.4 | LIVE: detect-then-fix, single-chokepoint mutation (backup-first, hash-logged), undo byte-identical, dry-run zero-blast, capabilities/robot-docs/robot-triage; 8/8 fixture roundtrips (`tests/doctor_fixtures.rs`) |
 | `focr resident-daemon` (hidden; the warm-model resident process, GH #9) | §7.2 | SHOULD | partial | SURF | bd-fuh2 | v0.8.0: loopback-TCP daemon w/ 0600 token state file, idle exit, version/artifact/env re-verification, inline fallback; unit protocol tests green (`src/resident.rs`); model-gated warm-run e2e still owed (bd-fuh2) — an untested speedup claim never rounds up |
-| Exit codes 0..8 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests (8 = `low_yield`, GH #15) |
+| Exit codes 0..8 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests (8 = `low_yield`, GH #15; 5 also covers a document that stopped early, U2-B6) |
 | Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | present | SURF | bd-223.7 | OnceLock; FOCR_THREADS physical-core budget (bd-223.2) |
 | Model resolution (no network at runtime) + header sniff | §7.5 | MUST | present | SURF | bd-223.7 | default auto-resolves pulled int8 (bd-3u6x); dotfile-safe shard globs |
 | `--version` carries Baidu MIT attribution | §11 | MUST | present | SURF | bd-223.14 | license compliance |
 | `pdf` input (native scanned fast path) | §7.7 | SHOULD | partial | SURF | bd-0a7.4 | **moved from `excluded`**: scanned-PDF native path shipped v0.2.0 (lopdf, decompress-bomb bounded bd-2zpu); vector-page rasterization deferred |
+| Directory input (`focr ocr <dir>`: page images as one document, natural order) + lazy page source | §7.7 | SHOULD | present | SURF | bd-uocr2-epic-cgux.23 | `page_source::PageSource` reads PDF, directory and image-list pages one at a time; `--pages`/`--split-spreads`/`--multi-page` apply as to a PDF; `e2e_recognize::directory_input_is_a_document_and_keeps_its_refusals_without_a_model` + the model-gated `v1_directory_input_matches_the_image_list_when_armed`; memory gate `tests/page_source_memory.rs` (Flate/JPEG/PNG walks flat vs 546 MiB eager); watchdog `multi_page_page_source_completes_within_budget` |
 | 5-target single-binary cross-platform build | §7.6 | MUST | present | SURF | bd-wp8.5 | v0.1.0–v0.3.0 released: darwin×2, linux×2, win-msvc; local cross-build runbook |
 | aarch64-windows target | §7.6 | MAY | missing | SURF | bd-3u97 | open; win-msvc x86_64 ships today |
 
@@ -293,7 +294,9 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Deterministic under fixed sampling (byte-identical) | §7.3 | MUST | present | SURF | bd-3kge | shared determinism gate + metamorphic FOCR_THREADS axis |
 | Per-kind `event_fields` (required/optional) + stream contract test | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.51 | `robot schema` carries `event_fields`; every event `cli_robot_golden` sees is validated against it |
 | `finish_reason` on `run_complete` + `warnings[]` (`v1_truncated`, `v1_page_merge`) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.51 | additive (schema v1); `warnings` only when non-empty, also in `--json` and `ocr-batch --multi-page`; v1 exit code unchanged |
-| `ignored_lever` warning kind + `warning_kinds` in `robot schema` | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.8 | additive (schema v1); Unlimited-OCR-2's pre-load lever admission prints it on stderr today; it joins `warnings[]` once v2 runs (U2-B6) |
+| `ignored_lever` warning kind + `warning_kinds` in `robot schema` | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.8 | additive (schema v1); Unlimited-OCR-2's pre-load lever admission prints it on stderr at load, and its run carries it in `run_complete`/`--json` `warnings[]` (U2-B6) |
+| `ignored_files` warning kind (a directory's non-image files) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.23 | additive (schema v1); `{kind, message, recovery, count, examples}` once per run on stderr, `run_complete` and `--json`; frozen in `robot_schema_v1.json` `warning_kinds` |
+| Partial document output: exit 5 `run_error` with `finish_reason`, `pages_out`, `warnings[]` (`v2_length`, `v2_budget`, `leading_text`) | §7.3 | MUST | present | SURF | bd-uocr2-epic-cgux.15 | additive (schema v1); an Unlimited-OCR-2 document stopped by its position limit or forward budget writes its pages first and emits no `run_complete`; `robot::partial_output_run_error_carries_its_pages_and_warnings` + the model-gated `v2_cli_writes_a_stopped_document_then_exits_5_when_armed` |
 
 ## 14. Parity gates & gauntlet machinery (plan §8.2, §8.5)
 

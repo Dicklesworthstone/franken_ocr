@@ -1276,6 +1276,7 @@ Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a
 | DISC-U2-8 | guard lag | none | can lag one step under overlap scheduling | None; SGLang comparisons tolerate it |
 | DISC-U2-9 | non-blank text before the first `<PAGE>` (leading head) | `_uocr_save_results` drops it (`MU:1210`, `split('<PAGE>')[1:]`) | a recomputed window keeps it as body 0 with front-anchored ownership, which shifts pages and drops the last one (`doc_split.py:251-255`) | Prepend it to the first own page's body with `warnings[{kind:"leading_text"}]`, unwindowed and windowed alike (U2-B6, U2-D1a) |
 | DISC-U2-10 | EXIF orientation | ignored: `Image.open(f).convert('RGB')` (`MU:1070`) | ignored: `smart_rgb_conversion = False` (`base_processor.py:215`), so a plain `convert("RGB")` | Applied, as for v1 (the shared decoder, `src/preprocess/mod.rs` `decode_path`). Only an image with a non-identity Orientation tag differs, and the oracle corpus has none (U2-B7) |
+| DISC-U2-11 | FFN/expert weight storage in the default decoder | f32 parity oracle over the bf16 checkpoint | bf16 | The shipping cache keeps the 2,148 FFN/expert matrices per-channel int8 (the fixed recipe); attention, router, norms and `lm_head` stay f32. Its greedy ids leave the f32 oracle's at a near-tie, where the all-f32 cache (`FOCR_DECODE_F32`, otherwise the same ops) keeps the oracle's token: S1 page_0014 at step 47 (the oracle's token 0.214 below the int8-FFN pick), page_0590 at step 32 (0.156), S2 at step 44 (0.156), S3 p9_p14 at step 73 (0.065); page_0009 is exact. No layer routes differently at any of them (U2-C2). U2-C4 measures the impact at L5 and files the entry |
 
 **Filing.** `scripts/check_ledgers.py:310` matches only `^## DISC-\d+:`, so a `## DISC-U2-k:` heading
 would escape the required-field, kill-switch and uniqueness checks.
@@ -2521,7 +2522,7 @@ evidence-gated defaults [uocr2,epic].
 |---|---|---|---|
 | OQ-V2-1 | SR-SWA candidate semantics | RESOLVED | §5.6.4 |
 | OQ-V2-2 | Router constants at inference | RESOLVED | §5.6 |
-| OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | OPEN: floor measured by U2-A6 (`FLOOR.json`); U2-C1 sets the tolerances | U2-A6 floor + U2-C1 |
+| OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | PARTIAL: U2-C1 set the f32 gate (every stage of every layer at cosine ≥ 0.9999; coordinates, Page Gate and teacher-forced routing exact; chained flips only within 2× the layer's score noise; measured: 5 single-row tie-flips over S1–S4). The bf16 ledger tolerance remains | U2-A6 floor + U2-C1; bf16 at U2-C4 (`docs/truth-pack/OQ_INDEX.md`) |
 | OQ-V2-4 | Does HF v2 run in f32 on CPU (dense SDPA path), and is a ported dense fallback needed? | RESOLVED (yes; no port: prefill `_forward_dense`, decode `_decode_attend`, deterministic algorithms on) | U2-A6 (`OQ_INDEX.md`) |
 | OQ-V2-5 | Are the `indexer.*` projections used at inference? | RESOLVED (no) | §5.6.7, D8 |
 | OQ-V2-6 | 1-D RoPE fallback | RESOLVED (franken builds `<PAGE>` prompts; no fallback) | §5.5 |
