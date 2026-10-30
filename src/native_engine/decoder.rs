@@ -1700,24 +1700,60 @@ fn prefill_srswa(
     domain: srswa::EntmaxDomain,
     trace: Option<srswa::SrSwaTrace>,
 ) -> FocrResult<(Mat, srswa::SrSwaState)> {
+    check_coords("decoder::prefill_with_cache_srswa", inputs_embeds, coords)?;
+    let mut state = srswa::SrSwaState::new(wc.router()?, coords, 0)?;
+    state.domain = domain;
+    state.trace = trace;
+    let x = extend_with_cache_srswa(wc, &mut state, inputs_embeds, coords)?;
+    Ok((x, state))
+}
+
+/// Prefill `inputs_embeds` as the rows after those `state` caches (U2-D1a):
+/// a window's prompt into empty caches, or a reused window's new pages after
+/// the rows it copied. `coords` describes every row, cached ones included;
+/// the new rows take its coordinates from the cached count on, RoPE'd at
+/// the state's page base ([`srswa::SrSwaState::prefill_layer`]). Returns the
+/// new rows' final hidden `[rows, hidden]`.
+///
+/// # Errors
+/// As [`prefill_with_cache_srswa`], or if `coords` does not describe the
+/// cached rows plus the new ones.
+pub fn extend_with_cache_srswa(
+    wc: &DecoderWeightCache,
+    state: &mut srswa::SrSwaState,
+    inputs_embeds: &Mat,
+    coords: &srswa::PageCoords,
+) -> FocrResult<Mat> {
     if prefill_chunk_size().is_some() {
         return Err(FocrError::Usage(format!(
             "{PREFILL_CHUNK_ENV} is not supported for unlimited-ocr-2: chunked prefill \
              assumes R-SWA attention (until U2-F2); unset it"
         )));
     }
-    check_embeds("decoder::prefill_with_cache_srswa", inputs_embeds)?;
-    check_coords("decoder::prefill_with_cache_srswa", inputs_embeds, coords)?;
+    check_embeds("decoder::extend_with_cache_srswa", inputs_embeds)?;
     let router = wc.router()?;
-    let mut state = srswa::SrSwaState::new(router, coords, 0)?;
-    state.domain = domain;
-    state.trace = trace;
-    let rope = coords.rope_table(0);
-    let x = prefill_layers(wc, inputs_embeds, &rope, |layer, normed, q, k, v| {
+    if state.layers.len() != config::NUM_HIDDEN_LAYERS {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::extend_with_cache_srswa: {} caches != {} layers",
+            state.layers.len(),
+            config::NUM_HIDDEN_LAYERS
+        )));
+    }
+    let start = state.rows();
+    if start + inputs_embeds.rows != coords.bucket.len() {
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "decoder::extend_with_cache_srswa: {start} cached and {} new rows, {} page \
+             coordinates",
+            inputs_embeds.rows,
+            coords.bucket.len()
+        )));
+    }
+    let rope_pages = coords.rope_pages(state.page.page_base());
+    let rope = srswa::page2d_rope_table(&coords.tok_pos[start..], &rope_pages[start..]);
+    prefill_layers(wc, inputs_embeds, &rope, |layer, normed, q, k, v| {
         let rows = srswa::LayerRows { normed, q, k, v };
         state.prefill_layer(layer, &router[layer], rows, &rope, coords)
-    })?;
-    Ok((x, state))
+    })
 }
 
 /// The 12 cached decoder layers of a monolithic prefill over `inputs_embeds`

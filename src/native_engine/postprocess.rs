@@ -562,21 +562,7 @@ pub fn split_pages_by_token(
     marker: u32,
     pages: usize,
 ) -> FocrResult<TokenPages> {
-    let mut decoder = crate::tokenizer::StreamDecoder::new();
-    // Segment 0 is the head; segment k >= 1 follows the k-th marker.
-    let mut segments = vec![(String::new(), 0usize)];
-    for &id in ids {
-        let (text, count) = segments.last_mut().expect("never empty");
-        if id == marker {
-            decoder.flush(text);
-            segments.push((String::new(), 0));
-        } else {
-            decoder.push(tok, id, text)?;
-            *count += 1;
-        }
-    }
-    decoder.flush(&mut segments.last_mut().expect("never empty").0);
-    let (head, head_tokens) = segments.remove(0);
+    let (head, mut segments) = token_segments(tok, ids, marker, false)?;
     let extra_markers = segments.len().saturating_sub(pages);
     if segments.len() > pages.max(1) {
         let extras = segments.split_off(pages.max(1));
@@ -589,6 +575,77 @@ pub fn split_pages_by_token(
             last.1 += count;
         }
     }
+    Ok(join_head(head, segments, extra_markers))
+}
+
+/// One Unlimited-OCR-2 window's visible `ids` split into the bodies of its
+/// `own` pages (U2-D1a; plan §5.10.8): [`split_pages_by_token`]'s split, a
+/// non-blank head joining page 1 (DISC-U2-9), except that every body past
+/// `own` is dropped, as the wheel's front-anchored ownership drops it
+/// (W/`entrypoints/openai/doc_split.py:236-257`), and no leading blank body
+/// is (DISC-U2-4). `leads_with_body`: the ids open inside page 1 (a reused
+/// window, whose opening `<PAGE>` is forced and hidden). `lookahead`: the
+/// window reads a lookahead page and ends on the marker that opens it, which
+/// is not an extra marker.
+///
+/// # Errors
+/// As [`split_pages_by_token`].
+pub fn split_window_pages(
+    tok: &crate::tokenizer::Tokenizer,
+    ids: &[u32],
+    marker: u32,
+    own: usize,
+    leads_with_body: bool,
+    lookahead: bool,
+) -> FocrResult<TokenPages> {
+    let (head, mut segments) = token_segments(tok, ids, marker, leads_with_body)?;
+    let expected_markers = own + usize::from(lookahead);
+    let extra_markers = segments.len().saturating_sub(expected_markers);
+    segments.truncate(own);
+    Ok(join_head(head, segments, extra_markers))
+}
+
+/// One page's decoded text and its id count.
+type Segment = (String, usize);
+
+/// `ids` split on `marker`: the head before the first marker, then one
+/// `(text, ids)` segment per marker, each decoded on its own with the
+/// UTF-8-safe [`StreamDecoder`](crate::tokenizer::StreamDecoder). With
+/// `leads_with_body` the ids open the first segment and the head is empty.
+fn token_segments(
+    tok: &crate::tokenizer::Tokenizer,
+    ids: &[u32],
+    marker: u32,
+    leads_with_body: bool,
+) -> FocrResult<(Segment, Vec<Segment>)> {
+    let mut decoder = crate::tokenizer::StreamDecoder::new();
+    // Segment 0 is the head; segment k >= 1 follows the k-th marker.
+    let mut segments = vec![(String::new(), 0usize)];
+    if leads_with_body {
+        segments.push((String::new(), 0));
+    }
+    for &id in ids {
+        let (text, count) = segments.last_mut().expect("never empty");
+        if id == marker {
+            decoder.flush(text);
+            segments.push((String::new(), 0));
+        } else {
+            decoder.push(tok, id, text)?;
+            *count += 1;
+        }
+    }
+    decoder.flush(&mut segments.last_mut().expect("never empty").0);
+    let head = segments.remove(0);
+    Ok((head, segments))
+}
+
+/// The bodies `segments` with a non-blank `head` prepended to the first
+/// (DISC-U2-9) and its ids counted there.
+fn join_head(
+    (head, head_tokens): Segment,
+    mut segments: Vec<Segment>,
+    extra_markers: usize,
+) -> TokenPages {
     let leading_text = !head.trim().is_empty();
     match segments.first_mut() {
         Some(first) => {
@@ -601,12 +658,12 @@ pub fn split_pages_by_token(
         None => {}
     }
     let (bodies, tokens) = segments.into_iter().unzip();
-    Ok(TokenPages {
+    TokenPages {
         bodies,
         tokens,
         leading_text,
         extra_markers,
-    })
+    }
 }
 
 /// [`PageStream`] for Unlimited-OCR-2 (U2-B6): fed the generated ids one at a
@@ -1208,6 +1265,55 @@ mod tests {
         );
         // An unknown id is an error.
         assert!(split_pages_by_token(&t, &[7], PAGE, 1).is_err());
+    }
+
+    /// U2-D1a: a window keeps exactly its own pages' bodies. A recomputed
+    /// window's non-blank head joins page 1 (DISC-U2-9); a reused window's
+    /// ids open inside page 1; the marker opening the lookahead page and
+    /// what follows are dropped without counting as extra; a blank body
+    /// stays a page (DISC-U2-4); on a last window a marker past its pages is
+    /// extra and its body dropped.
+    #[test]
+    fn split_window_pages_keeps_own_pages_only() {
+        use crate::tokenizer::special::PAGE;
+        use crate::tokenizer::tests::{byte_id, byte_tokenizer};
+        let t = byte_tokenizer();
+        let text = |s: &str| s.bytes().map(byte_id).collect::<Vec<_>>();
+        let pg = || vec![PAGE];
+
+        let ids = [
+            text("h "),
+            pg(),
+            text("a"),
+            pg(),
+            text("b"),
+            pg(),
+            text("la"),
+        ]
+        .concat();
+        let split = split_window_pages(&t, &ids, PAGE, 2, false, true).unwrap();
+        assert_eq!(split.bodies, ["h a", "b"]);
+        assert_eq!(split.tokens, [3, 1]);
+        assert!(split.leading_text);
+        assert_eq!(split.extra_markers, 0, "the lookahead's marker is the end");
+
+        let ids = [text("a"), pg(), text("b"), pg()].concat();
+        let split = split_window_pages(&t, &ids, PAGE, 2, true, true).unwrap();
+        assert_eq!(split.bodies, ["a", "b"]);
+        assert!(!split.leading_text);
+        assert_eq!(split.extra_markers, 0);
+
+        let ids = [text(" "), pg(), pg(), text("c"), pg()].concat();
+        let split = split_window_pages(&t, &ids, PAGE, 3, true, true).unwrap();
+        assert_eq!(split.bodies, [" ", "", "c"], "blank bodies keep alignment");
+
+        let ids = [pg(), text(" "), pg(), text("b"), pg(), text("z")].concat();
+        let split = split_window_pages(&t, &ids, PAGE, 2, false, false).unwrap();
+        assert_eq!(split.bodies, [" ", "b"], "no leading-blank drop");
+        assert_eq!(split.extra_markers, 1, "a last window's extra marker");
+
+        let split = split_window_pages(&t, &text("ab"), PAGE, 2, true, true).unwrap();
+        assert_eq!(split.bodies, ["ab"], "stopped inside page 1");
     }
 
     /// The streamed v2 page events are the split's bodies, trimmed, on every

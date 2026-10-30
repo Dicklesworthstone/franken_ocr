@@ -48,6 +48,7 @@ pub mod vision_clip;
 pub mod vision_sam;
 pub mod vision_siglip;
 pub mod weights;
+pub mod window;
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -596,12 +597,19 @@ fn decode_with_retire_fallback(
     ) -> FocrResult<DocumentDecode>,
 ) -> FocrResult<DocumentDecode> {
     let mut first = Vec::new();
-    let error = match pass(
-        retire,
-        0,
-        &mut first,
-        observer.as_deref_mut().map(|f| f as &mut dyn FnMut(u32)),
-    ) {
+    // The ids the observer saw: a window's forced prefix is in `first` but
+    // never observed.
+    let mut observed = 0usize;
+    let outcome = {
+        let mut counting = |id: u32| {
+            observed += 1;
+            if let Some(f) = observer.as_deref_mut() {
+                f(id);
+            }
+        };
+        pass(retire, 0, &mut first, Some(&mut counting))
+    };
+    let error = match outcome {
         Err(error) if srswa::retire_fallback(&error).is_some() => error,
         done => return done,
     };
@@ -612,7 +620,7 @@ fn decode_with_retire_fallback(
     let mut seen = 0usize;
     let mut replay = |id: u32| {
         seen += 1;
-        if seen > first.len()
+        if seen > observed
             && let Some(f) = observer.as_deref_mut()
         {
             f(id);
@@ -645,6 +653,31 @@ struct DocumentPass {
     /// Ids the pass emits before it checks the deadline: a rerun first
     /// repeats the ids its observer has already seen.
     budget_floor: usize,
+}
+
+impl DocumentPass {
+    /// Past the deadline, once `generated` ids reach the floor.
+    fn budget_spent(&self, generated: usize) -> bool {
+        generated >= self.budget_floor && self.deadline.is_some_and(|d| Instant::now() >= d)
+    }
+}
+
+/// One document decode loop's fixed inputs ([`OcrModel::document_loop`]).
+#[derive(Debug, Clone, Copy)]
+struct DocumentLoop<'p> {
+    /// The decode params.
+    params: &'p DecodeParams,
+    /// The pass it belongs to (deadline and floor).
+    pass: DocumentPass,
+    /// The `<PAGE>` id.
+    marker: u32,
+    /// Prompt rows before the generated ids.
+    prompt_len: usize,
+    /// Pages whose bodies it closes: the document's, or a window's own.
+    pages: usize,
+    /// Leading ids the caller forced and fed before the loop, hidden from
+    /// the observer (a reused window's spliced text and `<PAGE>`).
+    forced_prefix: usize,
 }
 
 /// The page-count guard of a document decode over `pages` pages marked by
@@ -4346,7 +4379,7 @@ impl OcrModel {
         params: &DecodeParams,
         pass: DocumentPass,
         ids: &mut Vec<u32>,
-        mut observer: Option<&mut dyn FnMut(u32)>,
+        observer: Option<&mut dyn FnMut(u32)>,
     ) -> FocrResult<DocumentDecode> {
         let Some(paging) = self.arch().decode_contract().pages else {
             return Err(FocrError::Other(anyhow::anyhow!(
@@ -4359,21 +4392,15 @@ impl OcrModel {
             .filter(|&&id| id == paging.marker_id)
             .count();
         let prompt_len = prompt_ids.len();
-        let table = self.embed_table()?;
-        let hidden_dim = inputs_embeds.cols;
         let mut guard = document_guard(
             if paging.guard { pages } else { 0 },
             paging.marker_id,
             params,
         );
-        // Past the deadline, once `generated` ids reach the pass's floor.
-        let budget_spent = |generated: usize| {
-            generated >= pass.budget_floor && pass.deadline.is_some_and(|d| Instant::now() >= d)
-        };
         ids.clear();
         // A budget already spent (by vision) skips the decoder cache and the
         // prefill: the document stops before its first id.
-        if budget_spent(0) {
+        if pass.budget_spent(0) {
             timing_log("forward stage budget ran out before the prefill");
             return Ok(DocumentDecode {
                 ids: Vec::new(),
@@ -4417,31 +4444,82 @@ impl OcrModel {
                 hidden: Self::last_hidden_row(&hidden)?,
             }
         };
-        let mut logits = self.document_logits(&decoder_state)?;
+        let logits = self.document_logits(&decoder_state)?;
         progress::emit("prefill", prompt_len as u64, prompt_len as u64);
         timing_log(&format!(
             "prefill {:.2}s ({prompt_len} tokens)",
             tp.elapsed().as_secs_f64()
         ));
-        let room = params.max_positions.saturating_sub(prompt_len);
+        let spec = DocumentLoop {
+            params,
+            pass,
+            marker: paging.marker_id,
+            prompt_len,
+            pages,
+            forced_prefix: 0,
+        };
+        let (finish_reason, stats) =
+            self.document_loop(spec, &mut decoder_state, logits, &mut guard, ids, observer)?;
+        Ok(DocumentDecode {
+            ids: ids.clone(),
+            finish_reason,
+            stats,
+        })
+    }
+
+    /// The decode loop of one document pass (U2-B6), or of one window
+    /// (U2-D1a), from the `logits` of the next token: per step the guarded
+    /// greedy step ([`sampler::decode_step_guarded`]), then EOS ends it, or
+    /// the id is appended to `ids`, shown to `observer`, and fed. The
+    /// position limit (the emitted row at `prompt_len + ids.len() − 1`
+    /// reaching `max_positions − 1`) ends it as `length`, and the pass's
+    /// budget as `budget`. `ids` may open with `spec.forced_prefix` ids the
+    /// caller forced and fed (a reused window's spliced text and `<PAGE>`):
+    /// they count for the n-gram, the guard and the positions, never for
+    /// the observer. Returns how it ended and its stats.
+    ///
+    /// # Errors
+    /// Any decode error, an id outside the embed table, or a cancel.
+    fn document_loop(
+        &self,
+        spec: DocumentLoop<'_>,
+        decoder_state: &mut DocumentDecoder<'_>,
+        mut logits: Mat,
+        guard: &mut sampler::PageGuard,
+        ids: &mut Vec<u32>,
+        mut observer: Option<&mut dyn FnMut(u32)>,
+    ) -> FocrResult<(FinishReason, DocumentStats)> {
+        let DocumentLoop {
+            params,
+            pass,
+            marker,
+            prompt_len,
+            pages,
+            forced_prefix,
+        } = spec;
+        let table = self.embed_table()?;
+        let hidden_dim = table.cols();
+        let room = params
+            .max_positions
+            .saturating_sub(prompt_len + forced_prefix);
         let mut stats = DocumentStats::default();
         let mut finish_reason = FinishReason::Length;
         let td = Instant::now();
         loop {
             crate::cancel_checkpoint()?;
-            if budget_spent(ids.len()) {
+            if pass.budget_spent(ids.len()) {
                 if stats.page_finish.len() < pages.max(1) {
                     stats.page_finish.push(PageFinish::Budget);
                 }
                 finish_reason = FinishReason::Budget;
                 timing_log(&format!(
                     "forward stage budget ran out after {} generated tokens",
-                    ids.len()
+                    ids.len() - forced_prefix
                 ));
                 break;
             }
             let at_cap = guard.at_cap();
-            let step = sampler::decode_step_guarded(&logits, ids, &guard, params)?;
+            let step = sampler::decode_step_guarded(&logits, ids, guard, params)?;
             stats.forced_steps += usize::from(step.forced);
             stats.hf_all_neg_inf_steps += usize::from(step.hf_all_neg_inf);
             if step.is_eos {
@@ -4465,14 +4543,14 @@ impl OcrModel {
             ids.push(id);
             guard.observe(id);
             // A marker after the first closes the page before it.
-            if id == paging.marker_id && guard.markers() >= 2 && stats.page_finish.len() < pages {
+            if id == marker && guard.markers() >= 2 && stats.page_finish.len() < pages {
                 stats.page_finish.push(if at_cap {
                     PageFinish::PageCap
                 } else {
                     PageFinish::Marker
                 });
             }
-            progress::emit("decode", ids.len() as u64, room as u64);
+            progress::emit("decode", (ids.len() - forced_prefix) as u64, room as u64);
             if let Some(f) = observer.as_deref_mut() {
                 f(id);
             }
@@ -4484,7 +4562,7 @@ impl OcrModel {
                 break;
             }
             let row = table.row_f32(id as usize);
-            match &mut decoder_state {
+            match decoder_state {
                 DocumentDecoder::Cached { wc, state, hidden } => {
                     let row = Mat::from_vec(1, hidden_dim, row);
                     let forced_next = matches!(guard.verdict(), sampler::GuardVerdict::Force(_));
@@ -4501,23 +4579,19 @@ impl OcrModel {
                     grown.push(id);
                 }
             }
-            logits = self.document_logits(&decoder_state)?;
+            logits = self.document_logits(decoder_state)?;
         }
-        if let DocumentDecoder::Cached { state, .. } = &decoder_state {
+        if let DocumentDecoder::Cached { state, .. } = decoder_state {
             stats.retired_blocks = state.dead_blocks();
             stats.peak_kv_bytes = state.peak_bytes();
         }
+        let generated = ids.len() - forced_prefix;
         timing_log(&format!(
-            "decode {:.2}s ({} tokens, {:.3}s/tok)",
+            "decode {:.2}s ({generated} tokens, {:.3}s/tok)",
             td.elapsed().as_secs_f64(),
-            ids.len(),
-            td.elapsed().as_secs_f64() / (ids.len().max(1) as f64)
+            td.elapsed().as_secs_f64() / (generated.max(1) as f64)
         ));
-        Ok(DocumentDecode {
-            ids: ids.clone(),
-            finish_reason,
-            stats,
-        })
+        Ok((finish_reason, stats))
     }
 
     #[must_use]
@@ -9211,6 +9285,342 @@ mod tests {
             return;
         }
         v2_l4(test, &["S3-p10", "S3-p20"]);
+    }
+
+    /// U2-D1a's windowed decode of the corpus `paths` at `opts` on `model`,
+    /// each page through its base letterbox. `bodies` gets each window's
+    /// own bodies as it ends.
+    fn v2_windowed(
+        model: &OcrModel,
+        paths: &[PathBuf],
+        opts: &window::WindowedOptions,
+        bodies: &mut Vec<Vec<String>>,
+    ) -> window::WindowedDocument {
+        let mut pages = paths.iter().map(|path| {
+            let img = image::open(path)
+                .map_err(|e| FocrError::Other(anyhow::anyhow!("{}: {e}", path.display())))?;
+            model.document_page(img)
+        });
+        let mut sink = |_: &window::WindowStats, own: &[String]| bodies.push(own.to_vec());
+        model
+            .decode_document_windowed(paths.len(), &mut pages, opts, Some(&mut sink))
+            .expect("the windowed decode runs")
+            .expect("the document is windowed")
+    }
+
+    /// The shared facts of a windowed run, for its gated log line.
+    fn v2_windowed_line(doc: &window::WindowedDocument) -> serde_json::Value {
+        let windows: Vec<serde_json::Value> = doc
+            .windows
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "index": w.index, "pages": [w.pages.start, w.pages.end],
+                    "lookahead": w.lookahead, "reused": w.reused,
+                    "fallback_reason": w.fallback_reason.map(window::FallbackReason::as_str),
+                    "straddle": w.straddle, "prefill_tokens": w.prefill_tokens,
+                    "copied_rows": w.copied_rows, "forced_tokens": w.forced_tokens,
+                    "generated_tokens": w.generated_tokens, "finish": w.finish.as_str(),
+                    "kv_bytes_peak": w.kv_bytes_peak, "retire_fallbacks": w.retire_fallbacks,
+                    "elapsed_ms": w.elapsed_ms,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "finish_reason": doc.finish_reason.as_str(), "bodies": doc.pages.bodies.len(),
+            "extra_markers": doc.pages.extra_markers, "leading_text": doc.pages.leading_text,
+            "retired_blocks": doc.stats.retired_blocks, "peak_kv_bytes": doc.stats.peak_kv_bytes,
+            "windows": windows,
+        })
+    }
+
+    /// U2-D1a, model-gated: a window whose budget is spent before it starts
+    /// stops the document as `budget` with the pages of the windows before
+    /// it, nothing discarded and nothing invented. Three base pages at
+    /// W = 1, the budget spent at window 1, which would have been reused.
+    #[test]
+    fn real_v2_windowed_budget_keeps_the_finished_windows() {
+        let test = "real_v2_windowed_budget_keeps_the_finished_windows";
+        let started = std::time::Instant::now();
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let names = ["page_0009.png", "page_0014.png", "page_0019.png"];
+        let Some(paths) = v2_corpus_pages(test, started, "S3-p3", &names) else {
+            return;
+        };
+        let opts = window::WindowedOptions {
+            window: 1,
+            budget_spent_at: Some(1),
+            precision: Some(DocumentPrecision::Mixed),
+            ..window::WindowedOptions::default()
+        };
+        let mut bodies = Vec::new();
+        let doc = v2_windowed(&model, &paths, &opts, &mut bodies);
+        assert_eq!(doc.finish_reason, FinishReason::Budget);
+        assert_eq!(
+            doc.windows.len(),
+            2,
+            "the document stops at the spent window"
+        );
+        assert_eq!(doc.windows[0].finish, FinishReason::Stop);
+        let spent = &doc.windows[1];
+        assert_eq!(spent.finish, FinishReason::Budget);
+        assert_eq!(
+            (spent.prefill_tokens, spent.copied_rows),
+            (0, 0),
+            "no work claimed"
+        );
+        assert_eq!((spent.forced_tokens, spent.generated_tokens), (0, 0));
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0].len(), 1, "window 0 owns one page");
+        assert!(bodies[1].is_empty(), "no body for a page never reached");
+        assert_eq!(doc.pages.bodies, bodies[0]);
+        assert!(!doc.pages.bodies[0].trim().is_empty());
+        assert!(matches!(
+            doc.stats.page_finish.as_slice(),
+            [PageFinish::Marker | PageFinish::Eos, PageFinish::Budget]
+        ));
+        v2_gated_line(
+            test,
+            started,
+            "S3-p3",
+            "windowed",
+            "pass",
+            v2_windowed_line(&doc),
+        );
+    }
+
+    /// U2-D1a, model-gated and armed by `FOCR_E2E_LONG`: 25 base pages (the
+    /// 20 corpus pages, then their first five again) at W = 10 decode as
+    /// three windows, each yielding exactly its own pages, so the document
+    /// has 25 bodies in page order. The later windows reuse their
+    /// predecessor's tail, and no window transcribes its lookahead page: the
+    /// marker that opens it is its last id.
+    #[test]
+    fn real_v2_windowed_25_pages_own_every_page_once() {
+        use crate::tokenizer::special::PAGE;
+        let test = "real_v2_windowed_25_pages_own_every_page_once";
+        let started = std::time::Instant::now();
+        let long = matches!(
+            std::env::var("FOCR_E2E_LONG").ok().as_deref(),
+            Some(v) if !v.is_empty() && v != "0"
+        );
+        if !long {
+            let why = serde_json::json!({"reason": "FOCR_E2E_LONG unset or 0"});
+            v2_gated_line(test, started, "corpus-25", "skip", "skip", why);
+            return;
+        }
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let corpus = [
+            "page_0009",
+            "page_0014",
+            "page_0019",
+            "page_0023",
+            "page_0086",
+            "page_0091",
+            "page_0105",
+            "page_0107",
+            "page_0108",
+            "page_0126",
+            "page_0136",
+            "page_0179",
+            "page_0250",
+            "page_0358",
+            "page_0400",
+            "page_0437",
+            "page_0547",
+            "page_0557",
+            "page_0590",
+            "page_0645",
+        ];
+        let names: Vec<String> = corpus
+            .iter()
+            .chain(&corpus[..5])
+            .map(|p| format!("{p}.png"))
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let Some(paths) = v2_corpus_pages(test, started, "corpus-25", &names) else {
+            return;
+        };
+        let opts = window::WindowedOptions {
+            window: window::DEFAULT_PAGE_WINDOW,
+            ..window::WindowedOptions::default()
+        };
+        let mut bodies = Vec::new();
+        let doc = v2_windowed(&model, &paths, &opts, &mut bodies);
+        let spans: Vec<(usize, usize, bool)> = doc
+            .windows
+            .iter()
+            .map(|w| (w.pages.start, w.pages.end, w.lookahead))
+            .collect();
+        assert_eq!(spans, [(0, 10, true), (10, 20, true), (20, 25, false)]);
+        assert_eq!(doc.finish_reason, FinishReason::Stop);
+        for (w, ids) in doc.windows.iter().zip(&doc.window_ids) {
+            assert_eq!(w.finish, FinishReason::Stop, "window {}", w.index);
+            assert_eq!(w.reused, w.index > 0, "window {}", w.index);
+            assert_eq!(bodies[w.index].len(), w.pages.len(), "window {}", w.index);
+            if w.lookahead {
+                // The forced `<PAGE>` opens a reused window's first page.
+                let opening = w.pages.len() + 1;
+                let markers: Vec<usize> = (0..ids.len()).filter(|&i| ids[i] == PAGE).collect();
+                assert!(markers.len() <= opening, "window {}", w.index);
+                if markers.len() == opening {
+                    assert_eq!(markers[opening - 1], ids.len() - 1, "window {}", w.index);
+                }
+            }
+        }
+        assert_eq!(doc.pages.bodies.len(), 25);
+        assert_eq!(doc.pages.bodies, bodies.concat());
+        v2_gated_line(
+            test,
+            started,
+            "corpus-25",
+            "windowed",
+            "pass",
+            v2_windowed_line(&doc),
+        );
+    }
+
+    /// U2-D1a against U2-D2a's windowed oracle, armed by
+    /// `FOCR_UOCR2_WINDOWED_ORACLE`, a dump root (`tests/fixtures/
+    /// PROVENANCE.md`, "Windowed SGLang oracle runs"): per run under it, the
+    /// same plan, fallbacks and text splices, and per window the oracle's
+    /// forced ids and generated ids exactly, on the f32 cache. The oracle's
+    /// injected reasons map onto [`window::FallbackReason`]; `pool_too_small`
+    /// is (ix), which is (vi) here.
+    #[test]
+    fn real_v2_windowed_decode_matches_the_windowed_oracle() {
+        let test = "real_v2_windowed_decode_matches_the_windowed_oracle";
+        let started = std::time::Instant::now();
+        let Some(root) = std::env::var_os("FOCR_UOCR2_WINDOWED_ORACLE").map(PathBuf::from) else {
+            let why = serde_json::json!({"reason": "FOCR_UOCR2_WINDOWED_ORACLE unset"});
+            v2_gated_line(test, started, "windowed-oracle", "skip", "skip", why);
+            return;
+        };
+        let Some(model) = v2_gated_model(test, started) else {
+            return;
+        };
+        let read = |path: PathBuf| -> serde_json::Value {
+            serde_json::from_slice(&std::fs::read(&path).expect("oracle dump"))
+                .expect("oracle dump parses")
+        };
+        let ids = |v: &serde_json::Value| -> Vec<u32> {
+            v.as_array().map_or_else(Vec::new, |a| {
+                a.iter()
+                    .map(|id| u32::try_from(id.as_u64().expect("an id")).expect("a u32 id"))
+                    .collect()
+            })
+        };
+        let mut tags: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("the dump root lists")
+            .map(|e| e.expect("an entry").path())
+            .filter(|p| p.join("run.json").is_file())
+            .collect();
+        tags.sort();
+        assert!(!tags.is_empty(), "no oracle runs under {}", root.display());
+        let mut failures = Vec::new();
+        for dir in tags {
+            let tag = dir
+                .file_name()
+                .expect("a tag")
+                .to_string_lossy()
+                .into_owned();
+            let run = read(dir.join("run.json"));
+            let width = usize::try_from(run["window"].as_u64().expect("window")).expect("W");
+            let windows: Vec<serde_json::Value> =
+                (0..run["windows"].as_array().expect("windows").len())
+                    .map(|k| read(dir.join(format!("w{k}/window.json"))))
+                    .collect();
+            // The document's pages: each window's own pages, in order.
+            let mut names: Vec<String> = Vec::new();
+            for w in &windows {
+                let lo_hi = w["lo_hi_emit"].as_array().expect("lo_hi_emit");
+                let own = lo_hi[1].as_u64().expect("hi") - lo_hi[0].as_u64().expect("lo");
+                let pages = w["pages"].as_array().expect("pages");
+                names.extend(
+                    pages[..usize::try_from(own).expect("own")]
+                        .iter()
+                        .map(|p| p.as_str().expect("a page").to_string()),
+                );
+            }
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            let Some(paths) = v2_corpus_pages(test, started, &tag, &names) else {
+                continue;
+            };
+            let mut opts = window::WindowedOptions {
+                window: width,
+                precision: Some(DocumentPrecision::CachedF32),
+                ..window::WindowedOptions::default()
+            };
+            let forced = run["forced_fallbacks"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            for (k, how) in &forced {
+                let k: usize = k.parse().expect("a window index");
+                match how["reason"].as_str().expect("a reason") {
+                    "pool_too_small" => {
+                        opts.force_fallback.push((k, window::FallbackReason::Alloc));
+                    }
+                    "no_text" => opts
+                        .force_fallback
+                        .push((k, window::FallbackReason::NoOutput)),
+                    "no_entry" => {
+                        opts.force_fallback
+                            .push((k, window::FallbackReason::NoRetained));
+                    }
+                    "splice_alloc_failed" => opts.marker_only_splice.push(k),
+                    other => panic!("{tag}: no hook for the oracle's {other}"),
+                }
+            }
+            let mut bodies = Vec::new();
+            let doc = v2_windowed(&model, &paths, &opts, &mut bodies);
+            assert_eq!(doc.windows.len(), windows.len(), "{tag}: windows");
+            let mut first_mismatch = Vec::new();
+            for ((w, ours), oracle) in doc.windows.iter().zip(&doc.window_ids).zip(&windows) {
+                let want_forced = ids(&oracle["forced_ids"]);
+                let want = ids(&oracle["generated_ids"]);
+                assert_eq!(
+                    w.reused,
+                    oracle["reused"] == true,
+                    "{tag} w{}: reused",
+                    w.index
+                );
+                let (got_forced, got) = ours.split_at(w.forced_tokens);
+                let at = got
+                    .iter()
+                    .zip(&want)
+                    .position(|(a, b)| a != b)
+                    .or_else(|| (got.len() != want.len()).then_some(got.len().min(want.len())));
+                let forced_equal = got_forced == want_forced.as_slice();
+                if at.is_some() || !forced_equal {
+                    failures.push(format!(
+                        "{tag} w{}: forced equal {forced_equal}, first generated mismatch {at:?} \
+                         of {} (oracle {})",
+                        w.index,
+                        got.len(),
+                        want.len()
+                    ));
+                }
+                first_mismatch.push(serde_json::json!({
+                    "window": w.index, "forced_equal": forced_equal, "first_mismatch": at,
+                    "tokens": got.len(), "oracle_tokens": want.len(),
+                }));
+            }
+            let mut line = v2_windowed_line(&doc);
+            line["compare"] = first_mismatch.into();
+            line["path"] = "f32-cached".into();
+            let exact = line["compare"].as_array().is_some_and(|c| {
+                c.iter()
+                    .all(|w| w["forced_equal"] == true && w["first_mismatch"].is_null())
+            });
+            let result = if exact { "pass" } else { "fail" };
+            v2_gated_line(test, started, &tag, "windowed_parity", result, line);
+        }
+        assert!(failures.is_empty(), "windowed parity: {failures:#?}");
     }
 
     /// The longest oracle generation the L4 rung also decodes on the stateless

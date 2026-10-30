@@ -921,6 +921,9 @@ pub enum GuardVerdict {
     Free,
     /// EOS is banned: fewer markers than pages so far.
     BanEos,
+    /// `<PAGE>` is banned: the last page is open and the guard bans another
+    /// marker there ([`PageGuard::ban_last_page_marker`]).
+    BanPage,
     /// Only this token may be emitted: EOS once the output has more markers
     /// than pages, or at the per-page cap the next `<PAGE>` (EOS on the last
     /// page).
@@ -939,6 +942,7 @@ pub struct PageGuard {
     max_page_tokens: usize,
     markers: usize,
     page_len: usize,
+    ban_last_page: bool,
 }
 
 impl PageGuard {
@@ -954,7 +958,20 @@ impl PageGuard {
             max_page_tokens,
             markers: 0,
             page_len: 0,
+            ban_last_page: false,
         }
+    }
+
+    /// This guard with SGLang's last-page ban (W/`sampling/
+    /// custom_logit_processor.py:256-262`): once every page has its marker,
+    /// `<PAGE>` is masked instead of left free. U2-D1a applies it to a window
+    /// that does not end on a marker (no lookahead, not reused: a recomputed
+    /// last window); HF has no such ban, so unwindowed decoding never takes
+    /// it (DISC-U2-3).
+    #[must_use]
+    pub fn ban_last_page_marker(mut self) -> Self {
+        self.ban_last_page = true;
+        self
     }
 
     /// Whether the guard constrains anything (the prompt has a `<PAGE>`).
@@ -1012,6 +1029,8 @@ impl PageGuard {
             })
         } else if self.markers < self.expected {
             GuardVerdict::BanEos
+        } else if self.ban_last_page {
+            GuardVerdict::BanPage
         } else {
             GuardVerdict::Free
         }
@@ -1050,9 +1069,10 @@ pub struct GuardedStep {
 /// `generated` holds the generated ids only, never the prompt (D10). The
 /// n-gram ban uses `params.no_repeat_ngram_size` over
 /// [`uocr2_ngram_window`]`(params.ngram_window)`, then `guard` applies:
-/// [`GuardVerdict::BanEos`] masks EOS, and [`GuardVerdict::Force`] returns its
-/// token outright (forced tokens are authoritative, DISC-U2-2). Greedy argmax
-/// takes the lowest id on ties.
+/// [`GuardVerdict::BanEos`] masks EOS, [`GuardVerdict::BanPage`] masks
+/// `<PAGE>`, and [`GuardVerdict::Force`] returns its token outright (forced
+/// tokens are authoritative, DISC-U2-2; SGLang skips the n-gram for them
+/// too). Greedy argmax takes the lowest id on ties.
 ///
 /// # Errors
 /// [`FocrError::Other`] if `logits` is not one non-empty row or a forced id
@@ -1112,9 +1132,13 @@ pub fn decode_step_guarded(
         window,
         &[],
     );
-    let eos = params.eos_token_id as usize;
-    if verdict == GuardVerdict::BanEos && eos < row.len() {
-        masked.get_or_insert_with(|| row.to_vec())[eos] = f32::NEG_INFINITY;
+    let banned = match verdict {
+        GuardVerdict::BanEos => Some(params.eos_token_id as usize),
+        GuardVerdict::BanPage => Some(guard.page_id as usize),
+        GuardVerdict::Free | GuardVerdict::Force(_) => None,
+    };
+    if let Some(id) = banned.filter(|&id| id < row.len()) {
+        masked.get_or_insert_with(|| row.to_vec())[id] = f32::NEG_INFINITY;
     }
     let token_id = argmax_row(masked.as_deref().unwrap_or(row))?;
     Ok(GuardedStep {
@@ -2288,6 +2312,39 @@ mod uocr2_guard_tests {
             "an extra marker is followed by a forced EOS (DISC-U2-3)"
         );
         assert!(!g.at_cap(), "the extra-marker EOS is not the cap's");
+    }
+
+    /// U2-D1a: SGLang's last-page ban (CLP:256-262). With every page's
+    /// marker out, `<PAGE>` is masked and EOS left free; before that EOS is
+    /// banned as without it, and an extra marker still forces EOS. The step
+    /// masks `<PAGE>` even when it is the argmax.
+    #[test]
+    fn guard_last_page_ban_masks_the_marker_once_every_page_has_one() {
+        let mut g = PageGuard::new(2, PAGE, EOS, 0).ban_last_page_marker();
+        assert_eq!(g.verdict(), GuardVerdict::BanEos);
+        g.observe(PAGE);
+        assert_eq!(g.verdict(), GuardVerdict::BanEos, "1 of 2 markers");
+        g.observe(PAGE);
+        assert_eq!(g.verdict(), GuardVerdict::BanPage, "the last page is open");
+        let p = params(0, 0);
+        let step = decode_step_guarded(&row(PAGE, 3), &[], &g, &p).unwrap();
+        assert_eq!(
+            (step.token_id, step.forced),
+            (3, false),
+            "the marker is masked"
+        );
+        let step = decode_step_guarded(&row(EOS, 3), &[], &g, &p).unwrap();
+        assert!(step.is_eos, "EOS is free on the last page");
+        let mut hf = PageGuard::new(2, PAGE, EOS, 0);
+        hf.observe(PAGE);
+        hf.observe(PAGE);
+        assert_eq!(hf.verdict(), GuardVerdict::Free, "HF has no ban");
+        let step = decode_step_guarded(&row(PAGE, 3), &[], &hf, &p).unwrap();
+        assert_eq!(step.token_id, PAGE);
+        g.observe(PAGE);
+        assert_eq!(g.verdict(), GuardVerdict::Force(EOS), "an extra marker");
+        let off = PageGuard::new(0, PAGE, EOS, 0).ban_last_page_marker();
+        assert_eq!(off.verdict(), GuardVerdict::Free, "no pages, no guard");
     }
 
     #[test]

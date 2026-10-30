@@ -319,6 +319,12 @@ impl DecodePageState {
         })
     }
 
+    /// The window's page base ([`rope_page`]).
+    #[must_use]
+    pub fn page_base(&self) -> u32 {
+        self.page_base
+    }
+
     /// Advance over the fed token `id` and return its coordinates. An extra
     /// `<PAGE>` beyond the last bucket clamps there with `tok_pos = pf_cnt[last]`
     /// (HF; SGLang keeps the running count instead, DISC-U2-7).
@@ -1064,13 +1070,31 @@ pub fn prefill_routes(
     }
     let sums = summaries(ik, head_cls);
     let blocks = BlockPages::build(&coords.img_page);
-    Ok((0..iq.rows)
+    Ok(prefill_rows_routes(
+        iq, 0, &sums, &blocks, coords, p, domain,
+    ))
+}
+
+/// The routes of prefill rows `start..start + iq.rows` (`iq` row `r` is KV
+/// position `start + r`) over the block summaries `sums` and block pages
+/// `blocks` of every row the forward holds, the earlier cached ones
+/// included: the summaries' `nblk` sets the window M of every row.
+fn prefill_rows_routes(
+    iq: &Mat,
+    start: usize,
+    sums: &BlockSummaries,
+    blocks: &BlockPages,
+    coords: &PageCoords,
+    p: &RouterParams,
+    domain: EntmaxDomain,
+) -> Vec<Route> {
+    (0..iq.rows)
         .map(|r| {
-            let sc = scores(iq.row(r), r, &sums);
-            let allow = page_gate_prefill(&blocks, coords.query_page[r]);
+            let sc = scores(iq.row(r), start + r, sums);
+            let allow = page_gate_prefill(blocks, coords.query_page[start + r]);
             route(&sc, Some(&allow), p, domain)
         })
-        .collect())
+        .collect()
 }
 
 // ── Block-sparse biased attention (U2-B3) ───────────────────────────────────
@@ -1536,22 +1560,23 @@ impl SrSwaTrace {
         }
     }
 
-    /// Record one layer's prefill routing from its index queries and keys.
+    /// Record one layer's prefill routing of rows `start..start + iq.rows`
+    /// from their index queries, routed over `sums` and `blocks`.
+    #[allow(clippy::too_many_arguments)]
     fn record_prefill(
         &mut self,
         layer: usize,
-        (iq, ik): (&Mat, &Mat),
+        iq: &Mat,
+        start: usize,
+        (sums, blocks): (&BlockSummaries, &BlockPages),
         coords: &PageCoords,
-        head_cls: &[f32],
         p: &RouterParams,
         last: Option<&Route>,
     ) {
-        let sums = summaries(ik, head_cls);
-        let blocks = BlockPages::build(&coords.img_page);
-        self.pad_sensitive[layer] = (0..iq.rows)
-            .filter(|&r| {
-                let sc = scores(iq.row(r), r, &sums);
-                let allow = page_gate_prefill(&blocks, coords.query_page[r]);
+        self.pad_sensitive[layer] = (start..start + iq.rows)
+            .filter(|&q| {
+                let sc = scores(iq.row(q - start), q, sums);
+                let allow = page_gate_prefill(blocks, coords.query_page[q]);
                 let cand = candidates(&sc, Some(&allow));
                 window_pad_sensitive(&entmax_inputs(&sc, &cand, p), &cand)
             })
@@ -1605,16 +1630,23 @@ impl SrSwaState {
         })
     }
 
-    /// One layer's prompt prefill into its empty cache: the router's index
-    /// queries and keys ([`project`]), every row's route from an empty cache
-    /// ([`prefill_routes`], recorded when tracing), the rows' K, V and index
-    /// keys stored with their image pages, and attention through the cache.
-    /// `rope` is `coords`' page2d table, already applied to `rows.q`/`rows.k`.
+    /// One layer's prefill of the rows after those its cache holds: the
+    /// prompt into an empty cache, or a reused window's new pages after the
+    /// rows it copied (U2-D1a's extend). `coords` describes every row of the
+    /// forward, cached ones included, and `rows` the new ones, `start =
+    /// cached rows` onward. The router's index queries and keys
+    /// ([`project`]); the new rows' K, V and index keys stored with their
+    /// image pages; every new row routed over all the rows' block summaries
+    /// and pages, whose `nblk` sets the window M of every row (MD:437,
+    /// 351-352; recorded when tracing); and attention through the cache.
+    /// `rope` is the new rows' page2d table, already applied to
+    /// `rows.q`/`rows.k`. From an empty cache this is [`prefill_routes`]'
+    /// routing exactly: a block's cached summary is [`summaries`]'.
     ///
     /// # Errors
-    /// [`FocrError::Other`] if the layer's cache is not empty (an extend over
-    /// cached rows is a reused window, U2-D2a), or as [`project`],
-    /// [`prefill_routes`] and [`attend`].
+    /// [`FocrError::Other`] if `coords` does not describe the cached rows
+    /// plus `rows`, or as [`project`], [`SrSwaLayerCache::append`] and
+    /// [`attend`].
     pub fn prefill_layer(
         &mut self,
         layer: usize,
@@ -1623,22 +1655,27 @@ impl SrSwaState {
         rope: &RopeTable,
         coords: &PageCoords,
     ) -> FocrResult<Mat> {
-        if self.layers[layer].rows() != 0 {
+        let start = self.layers[layer].rows();
+        if start + rows.q.rows != coords.bucket.len() {
             return Err(FocrError::Other(anyhow::anyhow!(
-                "srswa prefill: layer {layer} already caches {} rows",
-                self.layers[layer].rows()
+                "srswa prefill: layer {layer} caches {start} rows and gets {} more, but the \
+                 coordinates describe {} rows",
+                rows.q.rows,
+                coords.bucket.len()
             )));
         }
         let (iq, ik) = project(rows.normed, w, rope)?;
-        let routes = prefill_routes(&iq, &ik, coords, &w.head_cls, &self.params, self.domain)?;
+        let cache = &mut self.layers[layer];
+        cache.append(rows.k, rows.v, &ik, &coords.img_page[start..])?;
+        let blocks = BlockPages::build(&coords.img_page);
+        let (p, domain) = (&self.params, self.domain);
+        let routes = prefill_rows_routes(&iq, start, cache.summaries(), &blocks, coords, p, domain);
         if let Some(trace) = &mut self.trace {
-            let p = &self.params;
-            trace.record_prefill(layer, (&iq, &ik), coords, &w.head_cls, p, routes.last());
+            let sums = (cache.summaries(), &blocks);
+            trace.record_prefill(layer, &iq, start, sums, coords, p, routes.last());
         }
         let sel: Vec<BlockSelection> = routes.into_iter().map(BlockSelection::from).collect();
-        let cache = &mut self.layers[layer];
-        cache.append(rows.k, rows.v, &ik, &coords.img_page)?;
-        let positions: Vec<usize> = (0..rows.q.rows).collect();
+        let positions: Vec<usize> = (start..start + rows.q.rows).collect();
         attend_with(rows.q, &positions, &sel, &*cache, self.dense)
     }
 
@@ -1650,6 +1687,12 @@ impl SrSwaState {
         for cache in &mut self.layers {
             cache.retire = on;
         }
+    }
+
+    /// Rows each layer caches; the layers grow in step.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.layers.first().map_or(0, BlockKv::rows)
     }
 
     /// Retired blocks across the layers.
@@ -2235,26 +2278,22 @@ impl SrSwaLayerCache {
         Ok(())
     }
 
-    /// The rows of `ranges`, in order, in the tail format: K, V and index keys
-    /// only. Page state is replayed in the new frame (U2-B1's reused-window
-    /// seed), never copied (W/`session/uocr_doc_reuse.py:500-516`), and `k̄` is
-    /// recomputed when the rows are appended.
+    /// The rows of `ranges`, in order: K, V and index keys only, in the
+    /// layout [`Self::append`] takes. Page state is replayed in the new frame
+    /// (U2-B1's reused-window seed), never copied
+    /// (W/`session/uocr_doc_reuse.py:500-516`), and `k̄` is recomputed when
+    /// the rows are appended.
     ///
     /// # Errors
     /// [`FocrError::Other`] if a row is past the cache or retired.
-    pub fn serialize_tail(&self, ranges: &[Range<usize>]) -> FocrResult<Vec<u8>> {
+    pub fn tail_rows(&self, ranges: &[Range<usize>]) -> FocrResult<TailRows> {
         let n: usize = ranges.iter().map(ExactSizeIterator::len).sum();
-        let mut out = Vec::with_capacity(TAIL_HEADER + n * ROW_BYTES);
-        out.extend_from_slice(TAIL_MAGIC);
-        for word in [TAIL_VERSION, NUM_HEADS as u32, HEAD_DIM as u32] {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out.extend_from_slice(&(n as u64).to_le_bytes());
-        let mut put = |xs: &[f32]| {
-            for x in xs {
-                out.extend_from_slice(&x.to_le_bytes());
-            }
-        };
+        let width = NUM_HEADS * HEAD_DIM;
+        let (mut k, mut v, mut ik) = (
+            Vec::with_capacity(n * width),
+            Vec::with_capacity(n * width),
+            Vec::with_capacity(n * HEAD_DIM),
+        );
         for pos in ranges.iter().flat_map(Clone::clone) {
             let (b, o) = (pos / BLOCK_SIZE, pos % BLOCK_SIZE);
             if pos >= self.rows || !self.is_live(b) {
@@ -2268,15 +2307,67 @@ impl SrSwaLayerCache {
                 )));
             }
             let slab = self.live_slab(b);
-            for buf in [&slab.k, &slab.v] {
+            for (buf, out) in [(&slab.k, &mut k), (&slab.v, &mut v)] {
                 for h in 0..NUM_HEADS {
                     let at = h * HEAD_STRIDE + o * HEAD_DIM;
-                    put(&buf[at..at + HEAD_DIM]);
+                    out.extend_from_slice(&buf[at..at + HEAD_DIM]);
                 }
             }
-            put(&slab.ik[o * HEAD_DIM..(o + 1) * HEAD_DIM]);
+            ik.extend_from_slice(&slab.ik[o * HEAD_DIM..(o + 1) * HEAD_DIM]);
+        }
+        Ok(TailRows {
+            k: Mat::from_vec(n, width, k),
+            v: Mat::from_vec(n, width, v),
+            ik: Mat::from_vec(n, HEAD_DIM, ik),
+        })
+    }
+
+    /// [`Self::tail_rows`] in the tail format ([`deserialize_tail`]).
+    ///
+    /// # Errors
+    /// As [`Self::tail_rows`].
+    pub fn serialize_tail(&self, ranges: &[Range<usize>]) -> FocrResult<Vec<u8>> {
+        let rows = self.tail_rows(ranges)?;
+        let n = rows.rows();
+        let mut out = Vec::with_capacity(TAIL_HEADER + n * ROW_BYTES);
+        out.extend_from_slice(TAIL_MAGIC);
+        for word in [TAIL_VERSION, NUM_HEADS as u32, HEAD_DIM as u32] {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(&(n as u64).to_le_bytes());
+        for r in 0..n {
+            for xs in [rows.k.row(r), rows.v.row(r), rows.ik.row(r)] {
+                for x in xs {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+            }
         }
         Ok(out)
+    }
+}
+
+impl TailRows {
+    /// Rows `r` of these rows, as a new set.
+    #[must_use]
+    pub fn slice(&self, r: Range<usize>) -> Self {
+        let take = |m: &Mat| {
+            Mat::from_vec(
+                r.len(),
+                m.cols,
+                m.data[r.start * m.cols..r.end * m.cols].to_vec(),
+            )
+        };
+        Self {
+            k: take(&self.k),
+            v: take(&self.v),
+            ik: take(&self.ik),
+        }
+    }
+
+    /// Number of rows.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.ik.rows
     }
 }
 
@@ -4297,6 +4388,153 @@ mod tests {
         Ok((routes.into_iter().map(BlockSelection::from).collect(), ik))
     }
 
+    /// U2-D1a: a prefill of the rows after cached ones (a reused window's
+    /// extend over its copied rows) routes and attends them exactly as one
+    /// prefill of every row does: the same outputs and cache, bit for bit,
+    /// whatever the split. The cached rows are appended as copied rows are,
+    /// never prefilled, so only the new rows' routing (M from every row's
+    /// blocks, the Page Gate over every row's pages) is under test.
+    #[test]
+    fn extend_prefill_equals_one_prefill_on_the_new_rows() {
+        let mut rng = Lcg(0xD1A);
+        let hidden = 64;
+        let w = SrSwaLayerWeights::new(
+            hidden,
+            random_mat(&mut rng, HEAD_DIM, hidden, 0.3).data,
+            random_mat(&mut rng, HEAD_DIM, hidden, 0.3).data,
+            (0..HEAD_DIM).map(|_| uniform(&mut rng, 0.5, 1.5)).collect(),
+            (0..HEAD_DIM).map(|_| uniform(&mut rng, 0.5, 1.5)).collect(),
+            random_head_cls(&mut rng),
+        )
+        .unwrap();
+        // A reused window's rewritten prompt: the tail marker and a 150-row
+        // image tail, the copied lookahead page, then two new pages.
+        let mut ids = vec![PG];
+        ids.extend(std::iter::repeat_n(IMG, 150));
+        for _ in 0..3 {
+            ids.push(PG);
+            ids.extend(std::iter::repeat_n(IMG, 273));
+        }
+        let s = ids.len();
+        let coords = PageCoords::build(&ids).unwrap();
+        let width = NUM_HEADS * HEAD_DIM;
+        let normed = random_mat(&mut rng, s, hidden, 1.0);
+        let q = random_mat(&mut rng, s, width, 1.0);
+        let (k, v, _) = random_rows(&mut rng, s);
+        let page_base = 3;
+        let rope = coords.rope_table(page_base);
+        let router = std::slice::from_ref(&w);
+        let layer_rows = |r: Range<usize>| [&normed, &q, &k, &v].map(|m| row_range(m, r.clone()));
+        let [an, aq, ak, av] = layer_rows(0..s);
+        let all = LayerRows {
+            normed: &an,
+            q: &aq,
+            k: &ak,
+            v: &av,
+        };
+        let mut whole = SrSwaState::new(router, &coords, page_base).unwrap();
+        whole.trace = Some(SrSwaTrace::new(1));
+        let want = whole.prefill_layer(0, &w, all, &rope, &coords).unwrap();
+        let trace = whole.trace.take().unwrap();
+        let last = trace.prefill_last[0].as_ref().unwrap();
+        assert!(!last.blocks.is_empty(), "the last row reads remote blocks");
+        assert!(
+            whole.layers[0].nblk() > 16,
+            "the router window is capped, so M depends on the split"
+        );
+        let (_, ik) = project(&normed, &w, &rope).unwrap();
+        // 425: where a reused window's new pages start; the others land
+        // mid-page, mid-block and one row from either end.
+        for split in [1, 400, 425, 426, 600, s - 1] {
+            let mut st = SrSwaState::new(router, &coords, page_base).unwrap();
+            let copied = [&k, &v, &ik].map(|m| row_range(m, 0..split));
+            st.layers[0]
+                .append(
+                    &copied[0],
+                    &copied[1],
+                    &copied[2],
+                    &coords.img_page[..split],
+                )
+                .unwrap();
+            let [nn, nq, nk, nv] = layer_rows(split..s);
+            let new = LayerRows {
+                normed: &nn,
+                q: &nq,
+                k: &nk,
+                v: &nv,
+            };
+            let new_rope = page2d_rope_table(
+                &coords.tok_pos[split..],
+                &coords.rope_pages(page_base)[split..],
+            );
+            let got = st.prefill_layer(0, &w, new, &new_rope, &coords).unwrap();
+            assert_eq!(
+                bits(&got.data),
+                bits(&want.data[split * width..]),
+                "split {split}: the new rows' outputs"
+            );
+            let all = 0..s;
+            let every = std::slice::from_ref(&all);
+            let (a, b) = (
+                whole.layers[0].tail_rows(every).unwrap(),
+                st.layers[0].tail_rows(every).unwrap(),
+            );
+            for (x, y, what) in [(&a.k, &b.k, "K"), (&a.v, &b.v, "V"), (&a.ik, &b.ik, "ik")] {
+                assert_eq!(bits(&x.data), bits(&y.data), "split {split}: cached {what}");
+            }
+            assert_same_summaries(
+                whole.layers[0].summaries(),
+                st.layers[0].summaries(),
+                &format!("split {split}"),
+            );
+            assert_eq!(
+                (whole.layers[0].bmin(), whole.layers[0].bmax()),
+                (st.layers[0].bmin(), st.layers[0].bmax())
+            );
+        }
+    }
+
+    /// U2-D1a: [`SrSwaLayerCache::tail_rows`] reads rows back in the layout
+    /// `append` takes, bit for bit, in range order; a retired or absent row
+    /// is refused; [`TailRows::slice`] takes a sub-range.
+    #[test]
+    fn tail_rows_read_back_appended_rows() {
+        let mut rng = Lcg(0x7A11);
+        let (k, v, ik) = random_rows(&mut rng, 300);
+        let pages: Vec<i32> = (0..300).map(|r| if r < 100 { -1 } else { 0 }).collect();
+        let mut cache = SrSwaLayerCache::new(&random_head_cls(&mut rng), true).unwrap();
+        cache.append(&k, &v, &ik, &pages).unwrap();
+        let ranges = [250..260, 3..4, 100..132];
+        let got = cache.tail_rows(&ranges).unwrap();
+        assert_eq!(got.rows(), 43);
+        let mut at = 0;
+        for r in &ranges {
+            for (m, src) in [(&got.k, &k), (&got.v, &v), (&got.ik, &ik)] {
+                assert_eq!(
+                    bits(&row_range(m, at..at + r.len()).data),
+                    bits(&row_range(src, r.clone()).data)
+                );
+            }
+            at += r.len();
+        }
+        let part = got.slice(10..11);
+        assert_eq!(bits(&part.ik.data), bits(ik.row(3)));
+        assert!(
+            cache.tail_rows(std::slice::from_ref(&(299..301))).is_err(),
+            "past the cache"
+        );
+        cache.retire_dead_blocks(0, 299, false).unwrap();
+        assert!(
+            !cache.is_live(0),
+            "block 0 is imageless and dead at q = 299"
+        );
+        assert!(
+            cache.tail_rows(std::slice::from_ref(&(3..4))).is_err(),
+            "a retired row"
+        );
+        assert!(cache.tail_rows(std::slice::from_ref(&(250..251))).is_ok());
+    }
+
     fn state_decode_equals_a_reprefill(pages: &[usize], seed: u64) {
         let mut rng = Lcg(seed);
         let hidden = 64;
@@ -4381,7 +4619,8 @@ mod tests {
                 bits(&want.data[..n * width]),
                 "prompt rows"
             );
-            // A second prefill into the now-full cache is refused.
+            // Prefilling the same rows again is refused: the coordinates
+            // describe only the rows already cached.
             assert!(
                 st.prefill_layer(0, &w, prompt_rows, &prompt_rope, &pc)
                     .is_err()
