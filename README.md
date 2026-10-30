@@ -854,8 +854,8 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | 2 | Usage or CLI argument error |
 | 3 | Model artifact not found or could not be resolved |
 | 4 | Input image or page could not be decoded |
-| 5 | Budget or timeout exceeded |
-| 6 | Operation cancelled cooperatively |
+| 5 | Budget, timeout or position limit exceeded (an Unlimited-OCR-2 document writes its completed pages first) |
+| 6 | Operation cancelled cooperatively (an Unlimited-OCR-2 document writes its completed pages first) |
 | 7 | Format or version mismatch |
 
 ---

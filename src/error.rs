@@ -69,7 +69,8 @@ pub const EXIT_CODE_TABLE: &[ExitCodeSpec] = &[
     ExitCodeSpec {
         code: EXIT_CANCELLED,
         name: "cancelled",
-        meaning: "operation was cancelled cooperatively",
+        meaning: "operation was cancelled cooperatively (a document that stopped writes its \
+                  completed pages first)",
     },
     ExitCodeSpec {
         code: EXIT_FORMAT_MISMATCH,
@@ -89,7 +90,8 @@ pub const EXIT_CODE_TABLE: &[ExitCodeSpec] = &[
 /// its robot `run_error`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartialOutput {
-    /// `length` (the position limit) or `budget` (the stage budget).
+    /// `length` (the position limit), `budget` (the stage budget) or
+    /// `cancelled`.
     pub finish_reason: &'static str,
     /// Page bodies written, the interrupted page's included.
     pub pages_out: usize,
@@ -101,6 +103,14 @@ pub struct PartialOutput {
     pub source_sha256: Option<String>,
     /// The human summary.
     pub message: String,
+}
+
+impl PartialOutput {
+    /// Whether a cancel, not a limit, stopped the run (exit 6, not 5).
+    #[must_use]
+    pub fn cancelled(&self) -> bool {
+        self.finish_reason == "cancelled"
+    }
 }
 
 /// Top-level error. Each variant maps to a stable exit code via
@@ -124,10 +134,11 @@ pub enum FocrError {
     Timeout(String),
 
     /// A document run stopped early, at the position limit or its
-    /// cooperative stage budget, after writing the pages it produced (U2-B6).
-    /// Exit 5, like [`FocrError::Timeout`]; the robot `run_error` carries the
+    /// cooperative stage budget (exit 5, like [`FocrError::Timeout`]) or on
+    /// a cancel (exit 6, like [`FocrError::Cancelled`]), after writing the
+    /// pages it produced (U2-B6, U2-E2). The robot `run_error` carries the
     /// [`PartialOutput`] fields.
-    #[error("budget/timeout exceeded: {}", .0.message)]
+    #[error("{}", .0.message)]
     Partial(Box<PartialOutput>),
 
     /// Cancelled (Ctrl+C / cooperative cancellation).
@@ -161,6 +172,7 @@ impl FocrError {
             FocrError::Usage(_) => EXIT_USAGE,
             FocrError::ModelNotFound(_) => EXIT_MODEL_NOT_FOUND,
             FocrError::InputDecode(_) => EXIT_INPUT_DECODE,
+            FocrError::Partial(partial) if partial.cancelled() => EXIT_CANCELLED,
             FocrError::Timeout(_) | FocrError::Partial(_) => EXIT_TIMEOUT,
             FocrError::Cancelled => EXIT_CANCELLED,
             FocrError::FormatMismatch(_) => EXIT_FORMAT_MISMATCH,
@@ -197,6 +209,10 @@ impl FocrError {
                 "the completed pages were written; raise the stage budget with \
                  FOCR_STAGE_BUDGET_FORWARD_MS (0 = unlimited), or select fewer pages with `--pages`"
             }
+            FocrError::Partial(partial) if partial.cancelled() => {
+                "the run was interrupted after writing its completed pages; re-run (with `--pages` \
+                 for the rest) to continue"
+            }
             FocrError::Partial(_) => {
                 "the completed pages were written; split the document with `--pages`, or parse \
                  pages independently (omit `--multi-page`)"
@@ -231,6 +247,7 @@ impl FocrError {
             FocrError::Usage(_) => "usage",
             FocrError::ModelNotFound(_) => "model_not_found",
             FocrError::InputDecode(_) => "input_decode",
+            FocrError::Partial(partial) if partial.cancelled() => "cancelled",
             FocrError::Timeout(_) | FocrError::Partial(_) => "timeout",
             FocrError::Cancelled => "cancelled",
             FocrError::FormatMismatch(_) => "format_mismatch",

@@ -471,6 +471,9 @@ pub enum FinishReason {
     /// An Unlimited-OCR-2 document's cooperative stage budget ran out
     /// (`FOCR_STAGE_BUDGET_FORWARD_MS`, U2-B6).
     Budget,
+    /// Cooperative shutdown ([`crate::request_shutdown`], Ctrl+C) stopped an
+    /// Unlimited-OCR-2 document, which keeps the pages it completed (U2-E2).
+    Cancelled,
 }
 
 impl FinishReason {
@@ -481,6 +484,7 @@ impl FinishReason {
             Self::Stop => "stop",
             Self::Length => "length",
             Self::Budget => "budget",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -539,6 +543,8 @@ pub enum PageFinish {
     Length,
     /// The cooperative stage budget stopped decoding inside this page.
     Budget,
+    /// Cooperative shutdown stopped decoding inside this page.
+    Cancelled,
 }
 
 impl PageFinish {
@@ -551,6 +557,7 @@ impl PageFinish {
             Self::PageCap => "page_cap",
             Self::Length => "length",
             Self::Budget => "budget",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -742,6 +749,7 @@ impl DocumentPrecision {
 /// (U2-B6): the document loop checks its budget once per decode step, but
 /// vision and prefill run unbroken, so the engine's stage timeout waits this
 /// much longer before it discards the run. 30 s, or a quarter of the budget.
+#[cfg(feature = "native")]
 pub(crate) fn document_budget_grace(budget: std::time::Duration) -> std::time::Duration {
     (budget / 4).max(std::time::Duration::from_secs(30))
 }
@@ -777,13 +785,13 @@ struct DocumentDecode {
 
 impl DecodeReport {
     /// The run-level `finish_reason`: `length` when any decode since the last
-    /// take stopped at a limit, or `budget` when the last one ran out of its
-    /// stage budget (which ends the run).
+    /// take stopped at a limit, or `budget` / `cancelled` when the last one
+    /// ran out of its stage budget or was cancelled (which ends the run).
     #[must_use]
     pub fn run_finish_reason(&self) -> FinishReason {
         match (self.length_stops, self.finish_reason) {
             (0, _) => FinishReason::Stop,
-            (_, FinishReason::Budget) => FinishReason::Budget,
+            (_, stop @ (FinishReason::Budget | FinishReason::Cancelled)) => stop,
             _ => FinishReason::Length,
         }
     }
@@ -1019,9 +1027,9 @@ fn v1_page_warnings(report: &DecodeReport) -> Vec<RunWarning> {
             recovery: warning_recovery(WarningKind::V1PageMerge),
             fields,
         },
-        // Only Unlimited-OCR-2's document loop checks a budget, and its
-        // reports take `document_warnings`.
-        (FinishReason::Budget, _) => return Vec::new(),
+        // Only Unlimited-OCR-2's document loop checks a budget or ends on a
+        // cancel, and its reports take `document_warnings`.
+        (FinishReason::Budget | FinishReason::Cancelled, _) => return Vec::new(),
     };
     vec![warning]
 }
@@ -1059,7 +1067,8 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
     fields.insert("expected".into(), expected.into());
     fields.insert("got".into(), got.into());
     match report.finish_reason {
-        FinishReason::Stop => {}
+        // A cancel is the run's own `finish_reason`, and exit 6.
+        FinishReason::Stop | FinishReason::Cancelled => {}
         FinishReason::Length => warnings.push(RunWarning {
             kind: "v2_length",
             message: format!(
@@ -1080,11 +1089,11 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
     warnings
 }
 
-/// The partial-output error (exit 5) for a run whose Unlimited-OCR-2 decode
-/// stopped at its position limit or stage budget, carrying `warnings` (the
-/// run's, in order) and the `model` that wrote the pages; `None` for every
-/// other run (U2-B6). The CLI returns it after writing the pages, so a short
-/// document never exits 0.
+/// The partial-output error for a run whose Unlimited-OCR-2 decode stopped
+/// at its position limit or stage budget (exit 5) or on a cancel (exit 6),
+/// carrying `warnings` (the run's, in order) and the `model` that wrote the
+/// pages; `None` for every other run (U2-B6, U2-E2). The CLI returns it
+/// after writing the pages, so a short document never exits 0.
 #[must_use]
 pub fn partial_output(
     report: &DecodeReport,
@@ -2125,15 +2134,126 @@ pub struct StreamedPage<'a> {
     pub page: Option<&'a PageResult>,
 }
 
-/// A document parse: its markdown and its pages (U2-E3).
+/// A document parse's markdown and pages (U2-E3), before the run's facts.
+#[derive(Debug)]
+struct DocumentPages {
+    markdown: String,
+    pages: Vec<PageResult>,
+}
+
+/// How a document's pages are split into decode windows (U2-E2, plan
+/// §5.10). Windowed decoding reaches documents with U2-D1b; until then a
+/// window smaller than the document, and [`PageWindow::Auto`], are refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PageWindow {
+    /// Windows of this many pages each. A window as large as the document
+    /// is one pass, as [`PageWindow::Off`].
+    Pages(usize),
+    /// The model's default window.
+    Auto,
+    /// One pass over every page, past the model's page limit: a long
+    /// document then stops at the position limit (`finish_reason: length`).
+    Off,
+}
+
+/// Whether a document run resumes from its checkpoint (U2-E2). Resume
+/// arrives with U2-D4; until then only [`ResumePolicy::Never`] is admitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ResumePolicy {
+    /// Always parse from the first page.
+    #[default]
+    Never,
+    /// Resume when a checkpoint of the same document and model exists.
+    IfMatching,
+    /// Discard any checkpoint and parse from the first page.
+    Recompute,
+}
+
+/// How [`OcrModel::recognize_document`] parses a document (U2-E2, D23). The
+/// default is one pass under the model's page limit; the setters chain:
+/// `DocumentOptions::default().page_window(PageWindow::Off)`. Decode tuning
+/// ([`DecodeOverrides`], `--max-page-tokens` among them) and preprocess
+/// overrides apply as for any run; a document reads base views only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct DocumentOptions {
+    /// The decode windows; `None` is the model's default policy.
+    pub page_window: Option<PageWindow>,
+    /// Checkpoint resume.
+    pub resume: ResumePolicy,
+}
+
+impl DocumentOptions {
+    /// These options with decode windows `window`.
+    #[must_use]
+    pub fn page_window(mut self, window: PageWindow) -> Self {
+        self.page_window = Some(window);
+        self
+    }
+
+    /// These options with resume policy `resume`.
+    #[must_use]
+    pub fn resume(mut self, resume: ResumePolicy) -> Self {
+        self.resume = resume;
+        self
+    }
+
+    /// Whether a document of `pages` pages runs under these options, and if
+    /// so whether the model's page limit applies.
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] for a window, or a resume policy, that this
+    /// build cannot honor yet: refused, never ignored.
+    fn page_limit(&self, pages: usize) -> FocrResult<bool> {
+        if self.resume != ResumePolicy::Never {
+            return Err(FocrError::Usage(format!(
+                "document resume ({:?}) is not yet available; parse with ResumePolicy::Never",
+                self.resume
+            )));
+        }
+        match self.page_window {
+            None => Ok(true),
+            Some(PageWindow::Pages(0)) => Err(FocrError::Usage(
+                "a page window needs at least one page".into(),
+            )),
+            // One window over every page is an explicit unwindowed pass.
+            Some(PageWindow::Off) => Ok(false),
+            Some(PageWindow::Pages(n)) if n >= pages => Ok(false),
+            Some(window) => Err(FocrError::Usage(format!(
+                "windowed document decoding ({window:?} over {pages} pages) is not yet available; \
+                 parse without a page window, or with PageWindow::Off"
+            ))),
+        }
+    }
+}
+
+/// A parsed document (U2-E2, D23): its markdown and pages, and how the
+/// parse ended. A document that stopped early (the position limit, the
+/// stage budget or a cancel) is a result too, with the pages it completed.
+#[cfg(feature = "pdf")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DocumentPages {
+#[non_exhaustive]
+pub struct DocumentResult {
     /// The document's markdown, pages joined by `<PAGE>`.
     pub markdown: String,
-    /// One entry per page read, in run order. Empty for a v1 document
-    /// whose text did not split into one body per page (its
+    /// One entry per page read, in run order (U2-E3). Empty for a v1
+    /// document whose text did not split into one body per page (its
     /// `v1_page_merge` warning says so).
     pub pages: Vec<PageResult>,
+    /// Page bodies the model wrote, the interrupted page's included.
+    pub pages_out: usize,
+    /// Source pages that did not rasterize, left out of the prompt (D24).
+    pub skipped: Vec<crate::pdf::SkippedPage>,
+    /// How the decode ended.
+    pub finish_reason: FinishReason,
+    /// `<PAGE>` markers past the page count, merged into the last page.
+    pub extra_markers: usize,
+    /// The source's warnings (`ignored_files`), then the decode's: the lever
+    /// admission's `ignored_lever`, then the document's (`leading_text`,
+    /// `v2_length`, `v2_budget`) or v1's (`v1_truncated`, `v1_page_merge`).
+    pub warnings: Vec<RunWarning>,
+    /// The model that read the document.
+    pub model: ModelIdentity,
 }
 
 /// A recognized document: the rendered markdown body plus the structured layout
@@ -3148,17 +3268,6 @@ pub fn crop_figure_refs(
                 markdown_ref: fr.markdown_ref.clone(),
                 image,
             })
-        })
-        .collect()
-}
-
-/// The origins of a document read from `pages` images: their 1-based
-/// positions, whole.
-fn list_origins(pages: usize) -> Vec<PageOrigin> {
-    (1..=pages)
-        .map(|source_page| PageOrigin {
-            source_page,
-            half: None,
         })
         .collect()
 }
@@ -4280,64 +4389,101 @@ impl OcrModel {
         )
     }
 
-    /// Recognize a batch of document images, returning one [`FocrResult`] per
-    /// image in input order (`result[i]` ⇄ `image_paths[i]`).
+    /// Parse a document (U2-E2, D23): the reference `infer_multi` contract
+    /// (bd-1gv.25), the headline "Unlimited" feature. Every page joins one
+    /// cross-page prompt and one decode runs over the whole document, so
+    /// page N attends to pages 1..N−1 (OQ-13), never a concatenation of
+    /// single-page parses.
     ///
-    /// When the continuous-batch decode spine is armed
-    /// ([`batch_scheduler::spine_enabled`], `FOCR_BATCH_SPINE`) AND the int8 decode
-    /// path is active, every page is prefilled and then decoded TOGETHER through
-    /// the [`batch_scheduler`] — the int8 weight cache and the embed table are read
-    /// ONCE for the whole batch, and the scheduler is the single sequential driver
-    /// (Doctrine #5: the model is already an owned `Arc`, no per-step relock).
-    /// Otherwise each image falls back to the proven sequential
-    /// [`Self::recognize`].
+    /// The pages come from `source` one at a time (U2-D0): each is
+    /// rasterized, preprocessed and dropped before the next is read, with
+    /// its EXIF orientation applied as a single image's is (SPEC-020). Every
+    /// page reaches `on_item` before it is read; a page that did not
+    /// rasterize is left out of the prompt and listed in
+    /// [`DocumentResult::skipped`] (D24). `on_page` gets each page body as
+    /// its `<PAGE>` boundary is crossed in the token stream (bd-2z0y),
+    /// with its [`PageResult`] when the model splits pages exactly; it never
+    /// changes the result.
     ///
-    /// LOSSLESS: with the spine on, each page's emitted tokens are byte-for-byte
-    /// the tokens [`Self::generate_cached_i8`] produces for that page ALONE (the
-    /// batched int8 GEMMs are `M`-independent — bd-1azu.2 — and R-SWA attention is
-    /// per-stream), so the finalized markdown is sha256-identical to the spine-off
-    /// path (the bd-1azu.13 gate). The spine is the int8 throughput path; if int8
-    /// is not requested it stays on the sequential fallback so the result tracks
-    /// whatever oracle is in force.
-    /// Multi-page document orchestration (bd-1gv.25) — the reference
-    /// `infer_multi` contract, THE headline "Unlimited" feature (plan §2.1):
-    /// every page's Base-640 vision block joins ONE frozen cross-page
-    /// reference KV, then a single AR decode runs over the whole document —
-    /// page N attends to pages 1..N−1 (OQ-13: cross-page DEPENDENT, never a
-    /// concatenation of independent single-page parses).
-    ///
-    /// Returns the assembled markdown: the model emits `<PAGE>` separators
-    /// and [`postprocess::finalize_multi`] applies the reference
-    /// `save_results` per-page post-pass + rejoin.
+    /// A document that stops early is a result, not an error: its
+    /// `finish_reason` says why and its pages are those it completed. The
+    /// decode report stays on the model for [`Self::take_last_decode`].
     ///
     /// # Errors
-    /// * [`FocrError::NotImplemented`] for a non-Unlimited-OCR artifact —
-    ///   `infer_multi` is the Unlimited contract; zoo models parse pages
+    /// * [`FocrError::NotImplemented`] for a model without the
+    ///   Unlimited-OCR document contract; zoo models parse pages
     ///   independently via [`Self::recognize_batch`].
-    /// * [`FocrError::Other`] on an empty page list or when the assembled
-    ///   cross-page prefix cannot fit the 32K position budget (actionable:
-    ///   says how many tokens over and suggests splitting the document).
-    /// * Any preprocess / vision / decode error, as [`Self::recognize`].
-    pub fn recognize_multi_page(&self, image_paths: &[&Path]) -> FocrResult<String> {
-        if image_paths.is_empty() {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "recognize_multi_page: image_paths must be non-empty"
-            )));
-        }
+    /// * [`FocrError::Usage`] for options this build cannot honor
+    ///   ([`DocumentOptions`]), or a paged model's document over its page
+    ///   limit.
+    /// * The first page's raster error when no page rasterized.
+    /// * A prompt with no room to generate, or any preprocess, vision or
+    ///   decode error; v1 also stops with [`FocrError::Cancelled`].
+    #[cfg(feature = "pdf")]
+    pub fn recognize_document(
+        &self,
+        source: &mut crate::page_source::PageSource,
+        options: &DocumentOptions,
+        on_item: &mut dyn FnMut(&crate::page_source::PageItem),
+        on_page: Option<PageSink<'_>>,
+    ) -> FocrResult<DocumentResult> {
         multi_page_route(self.arch())?;
-        self.check_document_pages(image_paths.len(), true)?;
-
-        // ── per-page preprocess (multi-page forces no-crop, §2.4) ───────────
-        // `infer_multi` loads each page with `load_image`, which applies its
-        // EXIF orientation (SPEC-020, MU:27-34 via `load_pil_images`).
-        let mut pres = Vec::with_capacity(image_paths.len());
-        for path in image_paths {
-            pres.push(self.document_page(preprocess::decode_path(path)?)?);
+        let enforce = options.page_limit(source.len())?;
+        self.check_document_pages(source.len(), enforce)?;
+        let mut pres = Vec::with_capacity(source.len());
+        let mut origins = Vec::with_capacity(source.len());
+        let mut skipped = Vec::new();
+        let mut first_error: Option<FocrError> = None;
+        for item in source.by_ref() {
+            on_item(&item);
+            match item.raster {
+                Ok(img) => {
+                    pres.push(self.document_page(img)?);
+                    origins.push(PageOrigin {
+                        source_page: item.source_page,
+                        half: item.half,
+                    });
+                }
+                Err(e) => {
+                    skipped.push(crate::pdf::SkippedPage {
+                        page: item.source_page,
+                        reason: e.to_string(),
+                    });
+                    first_error.get_or_insert(e);
+                }
+            }
         }
-        let origins = list_origins(pres.len());
-        Ok(self
-            .recognize_multi_page_pres(pres, &origins, None)?
-            .markdown)
+        if pres.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                FocrError::InputDecode("the page source yielded no pages".into())
+            }));
+        }
+        // Split spreads can make more logical pages than source pages.
+        let enforce = options.page_limit(pres.len())?;
+        self.check_document_pages(pres.len(), enforce)?;
+        let DocumentPages { markdown, pages } = self.parse_document(pres, &origins, on_page)?;
+        // Both arms record a report; a poisoned slot leaves an EOS default.
+        let report = self.last_decode.lock().ok().and_then(|slot| slot.clone());
+        let mut warnings = source.warnings();
+        warnings.extend(report.as_ref().map(decode_warnings).unwrap_or_default());
+        Ok(DocumentResult {
+            markdown,
+            pages_out: report
+                .as_ref()
+                .and_then(|r| r.pages)
+                .map_or(pages.len(), |p| p.bodies),
+            pages,
+            skipped,
+            finish_reason: report
+                .as_ref()
+                .map_or(FinishReason::Stop, |r| r.finish_reason),
+            extra_markers: report
+                .as_ref()
+                .and_then(|r| r.document.as_ref())
+                .map_or(0, |stats| stats.extra_markers),
+            warnings,
+            model: self.identity(),
+        })
     }
 
     /// One document page's preprocess: v1's Base-640 squash, or a paged
@@ -4384,122 +4530,16 @@ impl OcrModel {
         )))
     }
 
-    /// [`Self::recognize_multi_page`] over in-memory images — the PDF path's
-    /// entry (pages are rasterized in-memory, never written to disk).
-    ///
-    /// # Errors
-    /// As [`Self::recognize_multi_page`].
-    pub fn recognize_multi_page_dynamic(
-        &self,
-        images: Vec<image::DynamicImage>,
-    ) -> FocrResult<String> {
-        if images.is_empty() {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "recognize_multi_page_dynamic: images must be non-empty"
-            )));
-        }
-        multi_page_route(self.arch())?;
-        self.check_document_pages(images.len(), true)?;
-        let mut pres = Vec::with_capacity(images.len());
-        for img in images {
-            pres.push(self.document_page(img)?);
-        }
-        let origins = list_origins(pres.len());
-        Ok(self
-            .recognize_multi_page_pres(pres, &origins, None)?
-            .markdown)
-    }
-
-    /// [`Self::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING sink
-    /// (bd-2z0y): `on_page(k, body)` fires as soon as page `k`'s `<PAGE>`
-    /// boundary is crossed IN the token stream (the next page's marker
-    /// arrives, or the decode ends), carrying the trimmed raw body. The
-    /// terminal return value is still the full [`postprocess::finalize_multi`]
-    /// assembly — streaming adds visibility, never changes the result.
-    ///
-    /// # Errors
-    /// As [`Self::recognize_multi_page`].
-    pub fn recognize_multi_page_dynamic_streaming(
-        &self,
-        images: Vec<image::DynamicImage>,
-        on_page: &mut dyn FnMut(&StreamedPage<'_>),
-    ) -> FocrResult<String> {
-        if images.is_empty() {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "recognize_multi_page_dynamic_streaming: images must be non-empty"
-            )));
-        }
-        multi_page_route(self.arch())?;
-        self.check_document_pages(images.len(), true)?;
-        let mut pres = Vec::with_capacity(images.len());
-        for img in images {
-            pres.push(self.document_page(img)?);
-        }
-        let origins = list_origins(pres.len());
-        Ok(self
-            .recognize_multi_page_pres(pres, &origins, Some(on_page))?
-            .markdown)
-    }
-
-    /// [`Self::recognize_multi_page`] over a lazy
-    /// [`crate::page_source::PageSource`] (U2-D0): each page is rasterized,
-    /// preprocessed and dropped before the next is read, so the pass holds
-    /// one raster at a time, never the whole document. Every page reaches
-    /// `on_item` before it is read; a page that did not rasterize is left out
-    /// of the prompt. `on_page` streams page bodies as
-    /// [`Self::recognize_multi_page_dynamic_streaming`] does. Returns the
-    /// markdown and the pages (U2-E3), each named by its source page.
-    ///
-    /// # Errors
-    /// As [`Self::recognize_multi_page`]; when no page rasterized, the first
-    /// page's raster error.
-    #[cfg(feature = "pdf")]
-    pub fn recognize_multi_page_source(
-        &self,
-        source: &mut crate::page_source::PageSource,
-        on_item: &mut dyn FnMut(&crate::page_source::PageItem),
-        on_page: Option<PageSink<'_>>,
-    ) -> FocrResult<DocumentPages> {
-        multi_page_route(self.arch())?;
-        self.check_document_pages(source.len(), true)?;
-        let mut pres = Vec::with_capacity(source.len());
-        let mut origins = Vec::with_capacity(source.len());
-        let mut first_error: Option<FocrError> = None;
-        for item in source.by_ref() {
-            on_item(&item);
-            match item.raster {
-                Ok(img) => {
-                    pres.push(self.document_page(img)?);
-                    origins.push(PageOrigin {
-                        source_page: item.source_page,
-                        half: item.half,
-                    });
-                }
-                Err(e) => {
-                    first_error.get_or_insert(e);
-                }
-            }
-        }
-        if pres.is_empty() {
-            return Err(first_error.unwrap_or_else(|| {
-                FocrError::InputDecode("the page source yielded no pages".into())
-            }));
-        }
-        // Split spreads can make more logical pages than source pages.
-        self.check_document_pages(pres.len(), true)?;
-        self.recognize_multi_page_pres(pres, &origins, on_page)
-    }
-
-    /// The shared multi-page core (bd-1gv.25): per-page vision, ONE fused
-    /// cross-page prefill, ONE decode, `finalize_multi` assembly. `on_page`
-    /// (bd-2z0y) streams each completed page body as its boundary is crossed.
+    /// A document's parse (bd-1gv.25): per-page vision, ONE fused cross-page
+    /// prefill, ONE decode, `finalize_multi` assembly. `on_page` (bd-2z0y)
+    /// streams each completed page body as its boundary is crossed.
     /// `origins[k]` is where page `k + 1` of the prompt came from.
     ///
     /// The pages (U2-E3): Unlimited-OCR-2 splits its ids into one body per
     /// page (D20), so each page it read has a [`PageResult`], streamed with
     /// its body. v1 splits text, and merges pages; its pages are read from
     /// the text only when it holds exactly one body per page.
-    fn recognize_multi_page_pres(
+    fn parse_document(
         &self,
         pres: Vec<Preprocessed>,
         origins: &[PageOrigin],
@@ -4536,7 +4576,7 @@ impl OcrModel {
             let mut feats = self.vision_tower(pre)?;
             if feats.len() != 1 {
                 return Err(FocrError::Other(anyhow::anyhow!(
-                    "recognize_multi_page: Base-mode page produced {} vision blocks; expected 1",
+                    "document: a Base-mode page produced {} vision blocks; expected 1",
                     feats.len()
                 )));
             }
@@ -4553,7 +4593,7 @@ impl OcrModel {
         let max_positions = self.decode_params.max_positions;
         if prompt_ids.len() + 1 > max_positions {
             return Err(FocrError::Other(anyhow::anyhow!(
-                "recognize_multi_page: the assembled {}-page prefix is {} tokens — over the \
+                "document: the assembled {}-page prefix is {} tokens — over the \
                  {max_positions} position budget by {} with no room to generate; {}",
                 pres.len(),
                 prompt_ids.len(),
@@ -4758,6 +4798,7 @@ impl OcrModel {
             FinishReason::Stop => PageFinish::Eos,
             FinishReason::Length => PageFinish::Length,
             FinishReason::Budget => PageFinish::Budget,
+            FinishReason::Cancelled => PageFinish::Cancelled,
         };
         stream.finish(|index, body, tokens| {
             elapsed.push(since);
@@ -4942,6 +4983,7 @@ impl OcrModel {
     /// Whether this model's forward checks `FOCR_STAGE_BUDGET_FORWARD_MS`
     /// itself and stops with its completed pages (Unlimited-OCR-2's document
     /// loop, U2-B6), so the engine's stage timeout is only a backstop.
+    #[cfg(feature = "native")]
     pub(crate) fn checks_forward_budget(&self) -> bool {
         self.arch().decode_contract().pages.is_some()
     }
@@ -5066,14 +5108,15 @@ impl OcrModel {
     /// greedy step ([`sampler::decode_step_guarded`]), then EOS ends it, or
     /// the id is appended to `ids`, shown to `observer`, and fed. The
     /// position limit (the emitted row at `prompt_len + ids.len() − 1`
-    /// reaching `max_positions − 1`) ends it as `length`, and the pass's
-    /// budget as `budget`. `ids` may open with `spec.forced_prefix` ids the
-    /// caller forced and fed (a reused window's spliced text and `<PAGE>`):
-    /// they count for the n-gram, the guard and the positions, never for
-    /// the observer. Returns how it ended and its stats.
+    /// reaching `max_positions − 1`) ends it as `length`, the pass's budget
+    /// as `budget`, and a cooperative shutdown as `cancelled`. `ids` may
+    /// open with `spec.forced_prefix` ids the caller forced and fed (a
+    /// reused window's spliced text and `<PAGE>`): they count for the
+    /// n-gram, the guard and the positions, never for the observer. Returns
+    /// how it ended and its stats.
     ///
     /// # Errors
-    /// Any decode error, an id outside the embed table, or a cancel.
+    /// Any decode error, or an id outside the embed table.
     fn document_loop(
         &self,
         spec: DocumentLoop<'_>,
@@ -5100,7 +5143,19 @@ impl OcrModel {
         let mut finish_reason = FinishReason::Length;
         let td = Instant::now();
         loop {
-            crate::cancel_checkpoint()?;
+            // A cancel ends the document as a stop, keeping the pages done
+            // (U2-E2); like the budget, a rerun first repeats what was seen.
+            if crate::shutdown_requested() && ids.len() >= pass.budget_floor {
+                if stats.page_finish.len() < pages.max(1) {
+                    stats.page_finish.push(PageFinish::Cancelled);
+                }
+                finish_reason = FinishReason::Cancelled;
+                timing_log(&format!(
+                    "cancelled after {} generated tokens",
+                    ids.len() - forced_prefix
+                ));
+                break;
+            }
             if pass.budget_spent(ids.len()) {
                 if stats.page_finish.len() < pages.max(1) {
                     stats.page_finish.push(PageFinish::Budget);
@@ -5188,6 +5243,25 @@ impl OcrModel {
         Ok((finish_reason, stats))
     }
 
+    /// Recognize a batch of document images, returning one [`FocrResult`] per
+    /// image in input order (`result[i]` ⇄ `image_paths[i]`).
+    ///
+    /// When the continuous-batch decode spine is armed
+    /// ([`batch_scheduler::spine_enabled`], `FOCR_BATCH_SPINE`) AND the int8 decode
+    /// path is active, every page is prefilled and then decoded TOGETHER through
+    /// the [`batch_scheduler`] — the int8 weight cache and the embed table are read
+    /// ONCE for the whole batch, and the scheduler is the single sequential driver
+    /// (Doctrine #5: the model is already an owned `Arc`, no per-step relock).
+    /// Otherwise each image falls back to the proven sequential
+    /// [`Self::recognize`].
+    ///
+    /// LOSSLESS: with the spine on, each page's emitted tokens are byte-for-byte
+    /// the tokens [`Self::generate_cached_i8`] produces for that page ALONE (the
+    /// batched int8 GEMMs are `M`-independent — bd-1azu.2 — and R-SWA attention is
+    /// per-stream), so the finalized markdown is sha256-identical to the spine-off
+    /// path (the bd-1azu.13 gate). The spine is the int8 throughput path; if int8
+    /// is not requested it stays on the sequential fallback so the result tracks
+    /// whatever oracle is in force.
     #[must_use]
     pub fn recognize_batch(&self, image_paths: &[&Path]) -> Vec<FocrResult<String>> {
         // The spine reproduces the int8 R-SWA cached decode (`generate_cached_i8`),
@@ -6898,7 +6972,17 @@ pub(crate) fn write_sparse_v2_stand_in(dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A multi-page report as `recognize_multi_page` records it.
+    /// The origins of a document of `pages` whole pages, numbered from 1.
+    fn list_origins(pages: usize) -> Vec<PageOrigin> {
+        (1..=pages)
+            .map(|source_page| PageOrigin {
+                source_page,
+                half: None,
+            })
+            .collect()
+    }
+
+    /// A multi-page report as v1's document parse records it.
     fn multi_page_report(
         finish_reason: FinishReason,
         cap: Option<LengthCap>,
@@ -9189,11 +9273,17 @@ mod tests {
         for result in model.recognize_batch(&[missing, missing]) {
             reads_input(result.expect_err("recognize_batch"));
         }
-        reads_input(
-            model
-                .recognize_multi_page(&[missing])
-                .expect_err("multi-page"),
-        );
+        let options = DocumentOptions::default();
+        let document = |source: &mut crate::page_source::PageSource, options: &DocumentOptions| {
+            model.recognize_document(source, options, &mut |_| {}, None)
+        };
+        let files = |count: usize| {
+            crate::page_source::PageSource::images(vec![missing.to_path_buf(); count])
+                .expect("a source")
+        };
+        let rasters =
+            |count: usize| crate::page_source::PageSource::rasters(vec![image(); count]).unwrap();
+        reads_input(document(&mut files(1), &options).expect_err("document"));
 
         let over = UOCR2_UNWINDOWED_PAGE_LIMIT + 1;
         let too_long = |error: FocrError| {
@@ -9209,24 +9299,25 @@ mod tests {
             );
         };
         // Missing paths: reading any of them would be an input error instead.
+        too_long(document(&mut files(over), &options).expect_err("over the limit"));
+        let mut source = rasters(over);
         too_long(
             model
-                .recognize_multi_page(&vec![missing; over])
-                .expect_err("over the limit"),
-        );
-        too_long(
-            model
-                .recognize_multi_page_dynamic(vec![image(); over])
-                .expect_err("over the limit, dynamic"),
-        );
-        too_long(
-            model
-                .recognize_multi_page_dynamic_streaming(
-                    vec![image(); over],
-                    &mut |_: &StreamedPage<'_>| panic!("no page streams"),
+                .recognize_document(
+                    &mut source,
+                    &options,
+                    &mut |_| panic!("no page is read"),
+                    Some(&mut |_: &StreamedPage<'_>| panic!("no page streams")),
                 )
-                .expect_err("over the limit, streaming"),
+                .expect_err("over the limit, in memory"),
         );
+        assert_eq!(source.page_map().len(), 0, "refused before any raster");
+        // An explicit unwindowed request reads past the limit (its pages
+        // then fail to read, which proves the limit let them through).
+        for window in [PageWindow::Off, PageWindow::Pages(over)] {
+            let unwindowed = options.page_window(window);
+            reads_input(document(&mut files(over), &unwindowed).expect_err("read"));
+        }
         model
             .check_document_pages(UOCR2_UNWINDOWED_PAGE_LIMIT, true)
             .expect("the limit itself is admitted");
@@ -9256,10 +9347,37 @@ mod tests {
             v1.forward(missing),
             Err(FocrError::InputDecode(_))
         ));
+        let mut source = files(1);
         assert!(matches!(
-            v1.recognize_multi_page(&[missing]),
+            v1.recognize_document(&mut source, &options, &mut |_| {}, None),
             Err(FocrError::InputDecode(_))
         ));
+    }
+
+    /// U2-E2: a document option this build cannot honor yet (a window
+    /// smaller than the document, before U2-D1b; resume, before U2-D4) is
+    /// refused before any page is read, never ignored.
+    #[test]
+    fn document_options_refuse_what_this_build_cannot_honor() {
+        let refused = |options: DocumentOptions, pages: usize, says: &str| {
+            let error = options.page_limit(pages).expect_err(says);
+            assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
+            assert!(error.to_string().contains(says), "{error}");
+        };
+        let window = |page_window| DocumentOptions::default().page_window(page_window);
+        assert_eq!(DocumentOptions::default().page_limit(500).ok(), Some(true));
+        assert_eq!(window(PageWindow::Off).page_limit(500).ok(), Some(false));
+        assert_eq!(window(PageWindow::Pages(3)).page_limit(3).ok(), Some(false));
+        refused(window(PageWindow::Pages(0)), 3, "at least one page");
+        refused(window(PageWindow::Pages(2)), 3, "not yet available");
+        refused(window(PageWindow::Auto), 3, "not yet available");
+        for resume in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
+            refused(DocumentOptions::default().resume(resume), 1, "resume");
+        }
+        assert_eq!(
+            DocumentOptions::default().resume(ResumePolicy::Never),
+            DocumentOptions::default()
+        );
     }
 
     /// One NDJSON log line of a model-gated v2 test (`scripts/check_test_logs.py`).

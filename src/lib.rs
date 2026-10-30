@@ -50,12 +50,14 @@ pub mod tokenizer;
 #[cfg(feature = "native")]
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
+#[cfg(feature = "pdf")]
+pub use native_engine::DocumentResult;
 /// Multi-model architecture descriptors + registry (the "model zoo" foundation,
 /// epic bd-3jo6 / A1). Additive metadata layer; the live forward is unchanged.
 pub use native_engine::model_arch;
 pub use native_engine::{
-    DocumentPages, ExtractedFigure, Half, LayoutSpan, PageFinish, PageOrigin, PageResult,
-    RecognizedDocument, StreamedPage,
+    DocumentOptions, ExtractedFigure, Half, LayoutSpan, PageFinish, PageOrigin, PageResult,
+    PageWindow, RecognizedDocument, ResumePolicy, StreamedPage,
 };
 
 #[cfg(feature = "native")]
@@ -100,15 +102,33 @@ pub const FOCR_MODEL_LICENSE_NOTICE: &str =
 /// native path's clean [`FocrError::ModelNotFound`].
 pub const DEFAULT_MODEL_PATH: &str = "models/unlimited-ocr.focrq";
 
-#[cfg(feature = "native")]
 const DEFAULT_FORWARD_STAGE_BUDGET_MS: u64 = 10 * 60 * 1000;
 
 /// The per-input forward stage budget (`FOCR_STAGE_BUDGET_FORWARD_MS`), read
 /// by the engine's stage timeout and by Unlimited-OCR-2's document loop,
-/// which checks it cooperatively (U2-B6). `None` disables it.
-#[cfg(feature = "native")]
-pub(crate) fn forward_stage_budget() -> Option<Duration> {
-    OcrEngine::stage_budget("FORWARD", DEFAULT_FORWARD_STAGE_BUDGET_MS)
+/// which checks it cooperatively (U2-B6), in every build: an embedder that
+/// drives [`native_engine::OcrModel`] directly gets the same cooperative
+/// budget.
+///
+/// `None` means "no budget": `0` or the literal `unlimited` disables it
+/// (GH #10), and the stage then runs until completion or cooperative
+/// cancellation. Unset or unparsable values use the 10-minute default.
+pub(crate) fn forward_stage_budget() -> Option<std::time::Duration> {
+    let millis = match std::env::var("FOCR_STAGE_BUDGET_FORWARD_MS") {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed == "0" || trimmed.eq_ignore_ascii_case("unlimited") {
+                return None;
+            }
+            trimmed
+                .parse::<u64>()
+                .ok()
+                .filter(|&ms| ms > 0)
+                .unwrap_or(DEFAULT_FORWARD_STAGE_BUDGET_MS)
+        }
+        Err(_) => DEFAULT_FORWARD_STAGE_BUDGET_MS,
+    };
+    Some(std::time::Duration::from_millis(millis))
 }
 
 /// The OCR engine handle.
@@ -141,7 +161,9 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Request cooperative shutdown: every in-flight recognition aborts with
 /// [`FocrError::Cancelled`] at its next checkpoint (page boundary or decode
-/// step). Idempotent; never blocks.
+/// step), except an Unlimited-OCR-2 document, which returns the pages it
+/// completed with `finish_reason: cancelled` (U2-E2). Idempotent; never
+/// blocks.
 pub fn request_shutdown() {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
@@ -719,122 +741,44 @@ impl OcrEngine {
         })
     }
 
-    /// Multi-page CROSS-PAGE document parsing (bd-1gv.25) — the reference
-    /// `infer_multi` contract: one 32K pass where page N attends to pages
-    /// 1..N−1 (OQ-13), returning ONE assembled markdown with `<PAGE>`
-    /// separators. This is NOT [`OcrEngine::recognize_batch`] (independent
-    /// pages); use this when the pages form one document whose later pages
-    /// reference earlier content.
+    /// Parse a document (U2-E2, D23; the reference `infer_multi` contract,
+    /// bd-1gv.25): one cross-page pass where page N attends to pages 1..N−1
+    /// (OQ-13), returning one [`DocumentResult`]. This is not
+    /// [`OcrEngine::recognize_batch`] (independent pages): use it when the
+    /// pages form one document whose later pages refer to earlier ones.
     ///
-    /// Prompt and output share v1's 32,768 positions (≈29 dense pages), so a
-    /// longer document's output stops early. That is not an error: take
-    /// [`OcrEngine::take_last_decode_report`] afterwards for the
-    /// `finish_reason` and [`crate::native_engine::decode_warnings`] for the
-    /// `v1_truncated` / `v1_page_merge` warnings.
+    /// The pages are rasterized one at a time on the forward stage's thread,
+    /// each dropped once preprocessed (U2-D0). `on_item` sees every page
+    /// before it is read, a skipped one included; `on_page`, when given,
+    /// gets each [`StreamedPage`] as its `<PAGE>` boundary is crossed in the
+    /// token stream (bd-2z0y). Both are boxed and `Send` because the pass
+    /// runs on the blocking pool.
     ///
-    /// # Errors
-    /// As [`crate::native_engine::OcrModel::recognize_multi_page`] — notably
-    /// `NotImplemented` for non-Unlimited-OCR artifacts and an actionable
-    /// error when the assembled prefix alone exceeds the position budget.
-    pub fn recognize_multi_page(&self, images: &[&Path]) -> FocrResult<String> {
-        self.recognize_multi_page_with_model(&Self::model_path(), images)
-    }
-
-    /// Path-explicit form of [`OcrEngine::recognize_multi_page`].
+    /// A document that stops early (the position limit, the stage budget or
+    /// a cancel) is a result with that `finish_reason` and the pages it
+    /// completed, never an error. The source is consumed: a caller that
+    /// retries (a first-run download) opens a fresh one.
     ///
     /// # Errors
-    /// As [`OcrEngine::recognize_multi_page`].
-    pub fn recognize_multi_page_with_model(
-        &self,
-        model_path: &Path,
-        images: &[&Path],
-    ) -> FocrResult<String> {
-        let model = self.model_at(model_path)?;
-        let owned: Vec<std::path::PathBuf> = images.iter().map(|p| p.to_path_buf()).collect();
-        let budget = Self::forward_budget(&model, owned.len());
-        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
-            let refs: Vec<&Path> = owned.iter().map(std::path::PathBuf::as_path).collect();
-            model.recognize_multi_page(&refs)
-        })
-    }
-
-    /// [`OcrEngine::recognize_multi_page`] over in-memory images (the PDF
-    /// rasterizer's entry — pages never touch disk).
-    ///
-    /// # Errors
-    /// As [`OcrEngine::recognize_multi_page`].
-    pub fn recognize_multi_page_dynamic(
-        &self,
-        images: Vec<image::DynamicImage>,
-    ) -> FocrResult<String> {
-        self.recognize_multi_page_dynamic_with_model(&Self::model_path(), images)
-    }
-
-    /// Path-explicit form of [`OcrEngine::recognize_multi_page_dynamic`].
-    ///
-    /// # Errors
-    /// As [`OcrEngine::recognize_multi_page`].
-    pub fn recognize_multi_page_dynamic_with_model(
-        &self,
-        model_path: &Path,
-        images: Vec<image::DynamicImage>,
-    ) -> FocrResult<String> {
-        let model = self.model_at(model_path)?;
-        let budget = Self::forward_budget(&model, images.len());
-        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
-            model.recognize_multi_page_dynamic(images)
-        })
-    }
-
-    /// [`OcrEngine::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING
-    /// sink (bd-2z0y): `on_page` gets each [`StreamedPage`] from the decode
-    /// driver as its `<PAGE>` boundary is crossed in the token stream (boxed
-    /// and `Send` because the pass runs on the blocking pool). The returned
-    /// markdown is still the full terminal assembly.
-    ///
-    /// # Errors
-    /// As [`OcrEngine::recognize_multi_page`].
-    pub fn recognize_multi_page_dynamic_streaming_with_model(
-        &self,
-        model_path: &Path,
-        images: Vec<image::DynamicImage>,
-        mut on_page: PageSink,
-    ) -> FocrResult<String> {
-        let model = self.model_at(model_path)?;
-        let budget = Self::forward_budget(&model, images.len());
-        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || {
-            model.recognize_multi_page_dynamic_streaming(images, &mut *on_page)
-        })
-    }
-
-    /// [`OcrEngine::recognize_multi_page`] over a lazy
-    /// [`page_source::PageSource`] (U2-D0): the pages are rasterized one at a
-    /// time on the forward stage's thread, each dropped once preprocessed.
-    /// `on_item` sees every page before it is read, a skipped one included;
-    /// `on_page`, when given, streams page bodies as
-    /// [`OcrEngine::recognize_multi_page_dynamic_streaming_with_model`] does.
-    /// Returns the markdown and the pages (U2-E3).
-    ///
-    /// The source is consumed: a caller that retries (a first-run download)
-    /// opens a fresh one.
-    ///
-    /// # Errors
-    /// As [`crate::native_engine::OcrModel::recognize_multi_page_source`].
+    /// As [`crate::native_engine::OcrModel::recognize_document`], plus the
+    /// model's load errors.
     #[cfg(feature = "pdf")]
-    pub fn recognize_multi_page_source_with_model(
+    pub fn recognize_document(
         &self,
         model_path: &Path,
         mut source: page_source::PageSource,
+        options: &DocumentOptions,
         mut on_item: Box<dyn FnMut(&page_source::PageItem) + Send>,
         on_page: Option<PageSink>,
-    ) -> FocrResult<DocumentPages> {
+    ) -> FocrResult<DocumentResult> {
         let model = self.model_at(model_path)?;
         let budget = Self::forward_budget(&model, source.len());
+        let options = *options;
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || match on_page {
             Some(mut sink) => {
-                model.recognize_multi_page_source(&mut source, &mut *on_item, Some(&mut *sink))
+                model.recognize_document(&mut source, &options, &mut *on_item, Some(&mut *sink))
             }
-            None => model.recognize_multi_page_source(&mut source, &mut *on_item, None),
+            None => model.recognize_document(&mut source, &options, &mut *on_item, None),
         })
     }
 
@@ -856,31 +800,6 @@ impl OcrEngine {
         })
     }
 
-    /// Stage wall-clock budget from `FOCR_STAGE_BUDGET_{stage}_MS`.
-    ///
-    /// `None` means "no budget": setting the variable to `0` or the literal
-    /// `unlimited` disables the stage timeout entirely (GH #10) — the stage
-    /// then runs until completion or cooperative cancellation. Unset or
-    /// unparsable values use the stage default.
-    fn stage_budget(stage: &str, default_ms: u64) -> Option<Duration> {
-        let key = format!("FOCR_STAGE_BUDGET_{stage}_MS");
-        match std::env::var(&key) {
-            Ok(raw) => {
-                let trimmed = raw.trim();
-                if trimmed == "0" || trimmed.eq_ignore_ascii_case("unlimited") {
-                    return None;
-                }
-                let millis = trimmed
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|&ms| ms > 0)
-                    .unwrap_or(default_ms);
-                Some(Duration::from_millis(millis))
-            }
-            Err(_) => Some(Duration::from_millis(default_ms)),
-        }
-    }
-
     fn run_blocking_stage_with_budget<T, F>(
         &self,
         stage: &'static str,
@@ -893,7 +812,7 @@ impl OcrEngine {
     {
         self.runtime.block_on(async move {
             let Some(budget) = budget else {
-                // Budget disabled (`FOCR_STAGE_BUDGET_*_MS=0`): run to
+                // Budget disabled (`FOCR_STAGE_BUDGET_FORWARD_MS=0`): run to
                 // completion; cooperative cancellation remains the only bound.
                 return asupersync::runtime::spawn_blocking(op).await;
             };

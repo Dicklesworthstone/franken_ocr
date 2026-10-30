@@ -569,7 +569,13 @@ fn multi_page_page_source_completes_within_budget() {
             })
         };
         let pass = engine
-            .recognize_multi_page_source_with_model(&model, source, on_item, None)
+            .recognize_document(
+                &model,
+                source,
+                &franken_ocr::DocumentOptions::default(),
+                on_item,
+                None,
+            )
             .map(|document| document.markdown.len())
             .map_err(|e| e.kind());
         // The walk itself: every page rasterized, preprocessed, dropped.

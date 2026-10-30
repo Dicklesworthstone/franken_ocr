@@ -3677,13 +3677,21 @@ fn run_l5_multi(
         );
     }
     let model = OcrModel::load(&model_dir).expect("subject model loads");
-    let refs: Vec<&Path> = pages.iter().map(PathBuf::as_path).collect();
-    let ours = model.recognize_multi_page(&refs);
+    let mut source =
+        franken_ocr::page_source::PageSource::images(pages.clone()).expect("a page source");
+    let ours = model.recognize_document(
+        &mut source,
+        &franken_ocr::DocumentOptions::default(),
+        &mut |_| {},
+        None,
+    );
     if subject_token_cap.is_some() {
         // Never leak the cap into other rungs in this process.
         franken_ocr::native_engine::set_decode_overrides(Default::default());
     }
     let ours = ours.expect("subject cross-page pass");
+    assert!(ours.skipped.is_empty(), "{:?}", ours.skipped);
+    let ours = ours.markdown;
 
     for line in &plate {
         log.assertion(

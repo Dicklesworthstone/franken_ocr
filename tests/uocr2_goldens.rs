@@ -328,39 +328,40 @@ struct Observed {
 fn run_case(model: &OcrModel, case: &Case, pages: &[PathBuf]) -> Result<Observed, String> {
     let _ = model.take_last_decode();
     let mut events = None;
+    let failed = |e: franken_ocr::FocrError| format!("{} (exit {}): {e}", e.kind(), e.exit_code());
     let markdown = match case.kind {
-        Kind::Single(_) => model.recognize(&pages[0]),
-        Kind::Multi(_) => {
-            let refs: Vec<&Path> = pages.iter().map(PathBuf::as_path).collect();
-            model.recognize_multi_page(&refs)
-        }
-        Kind::Stream(_) => {
+        Kind::Single(_) => model.recognize(&pages[0]).map_err(failed)?,
+        Kind::Multi(_) | Kind::Stream(_) => {
             let mut source = franken_ocr::page_source::PageSource::images(pages.to_vec())
                 .map_err(|e| format!("open the page source: {e}"))?;
-            let mut skipped = Vec::new();
             let mut seen = Vec::new();
-            let out = model.recognize_multi_page_source(
-                &mut source,
-                &mut |item: &franken_ocr::page_source::PageItem| {
-                    if let Err(e) = &item.raster {
-                        skipped.push(format!("page {}: {e}", item.source_page));
-                    }
-                },
-                Some(&mut |page: &franken_ocr::StreamedPage<'_>| {
-                    seen.push(franken_ocr::robot::page_decoded_event(
-                        page.index, page.body,
-                    ));
-                }),
-            )
-            .map(|document| document.markdown);
-            if !skipped.is_empty() {
-                return Err(format!("corpus pages failed to decode: {skipped:?}"));
+            let mut sink = |page: &franken_ocr::StreamedPage<'_>| {
+                seen.push(franken_ocr::robot::page_decoded_event(
+                    page.index, page.body,
+                ));
+            };
+            let streaming = matches!(case.kind, Kind::Stream(_));
+            let document = model
+                .recognize_document(
+                    &mut source,
+                    &franken_ocr::DocumentOptions::default(),
+                    &mut |_| {},
+                    streaming
+                        .then_some(&mut sink as &mut dyn FnMut(&franken_ocr::StreamedPage<'_>)),
+                )
+                .map_err(failed)?;
+            if !document.skipped.is_empty() {
+                return Err(format!(
+                    "corpus pages failed to decode: {:?}",
+                    document.skipped
+                ));
             }
-            events = Some(seen);
-            out
+            if streaming {
+                events = Some(seen);
+            }
+            document.markdown
         }
-    }
-    .map_err(|e| format!("{} (exit {}): {e}", e.kind(), e.exit_code()))?;
+    };
     let ids = model
         .take_last_decode()
         .map(|report| report.ids)

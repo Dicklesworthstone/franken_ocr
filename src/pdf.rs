@@ -985,7 +985,7 @@ pub struct DocumentPage {
 }
 
 /// One page that was refused, and why.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkippedPage {
     /// 1-based source page number.
     pub page: usize,

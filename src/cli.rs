@@ -52,10 +52,11 @@ pub fn cli_main() -> ExitCode {
 
     // Cooperative Ctrl+C (bd-223.2): the first signal requests shutdown —
     // every decode-step/page checkpoint aborts with Cancelled (exit 6) at its
-    // next boundary; a second signal hard-exits 130 (the shell convention)
-    // for a wedged stage. Installation failure (e.g. no signal handling in
-    // odd sandboxes) is non-fatal: the engine still works, just without
-    // graceful interrupt.
+    // next boundary, and an Unlimited-OCR-2 document writes the pages it
+    // completed before it exits 6 (U2-E2); a second signal hard-exits 130
+    // (the shell convention) for a wedged stage. Installation failure (e.g.
+    // no signal handling in odd sandboxes) is non-fatal: the engine still
+    // works, just without graceful interrupt.
     let _ = ctrlc::set_handler(|| {
         if crate::shutdown_requested() {
             std::process::exit(130);
@@ -1331,7 +1332,10 @@ impl FigureWriter {
         figures: Vec<native_engine::ExtractedFigure>,
     ) -> FocrResult<String> {
         let mut md = markdown.to_string();
-        let side = half.map(Half::initial).map(String::from).unwrap_or_default();
+        let side = half
+            .map(Half::initial)
+            .map(String::from)
+            .unwrap_or_default();
         for fig in figures {
             let fignum = fig.index + 1;
             let fmt = choose_figure_format(&fig.image);
@@ -1481,8 +1485,7 @@ fn run_ocr_inner(
     // composes with --split-spreads and --extract-figures. v1 merges pages.
     let paged_model = is_document.then(|| paged_model_id(&request)).flatten();
     let paged_document = request.multi_page && paged_model.is_some();
-    if request.multi_page && !paged_document && (request.split_spreads || figure_plan.is_some())
-    {
+    if request.multi_page && !paged_document && (request.split_spreads || figure_plan.is_some()) {
         return Err(FocrError::Usage(
             "--multi-page is one cross-page pass over whole pages; it does not compose \
              with --split-spreads or --extract-figures (run those per-page passes \
@@ -2359,8 +2362,13 @@ fn recognize_document_multi_page(
         } else {
             None
         };
-        let out =
-            engine.recognize_multi_page_source_with_model(&model_path, source, on_item, on_page);
+        let out = engine.recognize_document(
+            &model_path,
+            source,
+            &native_engine::DocumentOptions::default(),
+            on_item,
+            on_page,
+        );
         if out.is_ok() {
             decode_bar.finish();
         } else {
@@ -2368,9 +2376,13 @@ fn recognize_document_multi_page(
         }
         out
     })?;
-    let native_engine::DocumentPages {
+    // The run's finish_reason and warnings come from the engine's decode
+    // report, as for every other run; its skipped pages were reported as
+    // they were read.
+    let native_engine::DocumentResult {
         mut markdown,
         mut pages,
+        ..
     } = document;
     let written = match figures {
         Some(plan) => write_page_figures(request, &mut pages, plan)?,
@@ -2724,15 +2736,29 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     if args.multi_page {
         // ONE cross-page document pass (bd-1gv.25): page N attends to pages
         // 1..N-1; output is one assembled markdown with <PAGE> separators.
-        let image_refs: Vec<&std::path::Path> = args
-            .images
+        // An image that does not decode is left out of the pass and reported
+        // (D24); the run fails only when none decodes.
+        let model_path = model.clone().unwrap_or_else(OcrEngine::model_path);
+        let document = engine.recognize_document(
+            &model_path,
+            PageSource::images(args.images.clone())?,
+            &native_engine::DocumentOptions::default(),
+            Box::new(|_: &PageItem| {}),
+            None,
+        )?;
+        let markdown = document.markdown;
+        let skipped: Vec<serde_json::Value> = document
+            .skipped
             .iter()
-            .map(std::path::PathBuf::as_path)
+            .map(|skip| {
+                let image = args.images[skip.page - 1].display().to_string();
+                eprintln!(
+                    "[focr] image {} ({image}) skipped: {}",
+                    skip.page, skip.reason
+                );
+                serde_json::json!({"page": skip.page, "image": image, "reason": skip.reason})
+            })
             .collect();
-        let markdown = match model.as_deref() {
-            Some(m) => engine.recognize_multi_page_with_model(m, &image_refs),
-            None => engine.recognize_multi_page(&image_refs),
-        }?;
         let elapsed = total.elapsed().as_secs_f64();
         let report = engine.take_last_decode_report();
         let ran = engine.loaded_model_identity();
@@ -2760,6 +2786,9 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             if let Some(report) = &report {
                 value["finish_reason"] = report.run_finish_reason().as_str().into();
             }
+            if !skipped.is_empty() {
+                value["skipped"] = skipped.into();
+            }
             merge_run_warnings(&mut value, &run_warnings);
             if let Some(ran) = &ran {
                 ran.merge_into(&mut value);
@@ -2767,7 +2796,10 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             emit(&value);
         } else {
             println!("{markdown}");
-            eprintln!("[focr] multi-page: {count} pages in one cross-page pass, {elapsed:.2}s");
+            let read = count - document.skipped.len();
+            eprintln!(
+                "[focr] multi-page: {read} of {count} pages in one cross-page pass, {elapsed:.2}s"
+            );
         }
         // The pages are out; a v2 document that stopped early fails with
         // exit 5 (U2-B6).
@@ -4908,7 +4940,12 @@ mod tests {
                     Some(Half::Left),
                     Some(native_engine::PageFinish::PageCap),
                 ),
-                page(3, 3, Some(Half::Right), Some(native_engine::PageFinish::Eos)),
+                page(
+                    3,
+                    3,
+                    Some(Half::Right),
+                    Some(native_engine::PageFinish::Eos),
+                ),
             ]),
         });
         let json = rec.to_json(&[]);
@@ -5126,7 +5163,12 @@ mod tests {
             )),
         };
         let md = writer
-            .process_page(1, None, "before ![](images/0.jpg)\nafter", vec![fig.clone()])
+            .process_page(
+                1,
+                None,
+                "before ![](images/0.jpg)\nafter",
+                vec![fig.clone()],
+            )
             .expect("process page");
 
         // The placeholder is rewritten to `![figure 1](<ref_prefix><name>)`.

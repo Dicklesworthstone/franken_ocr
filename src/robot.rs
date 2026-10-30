@@ -184,7 +184,7 @@ pub fn robot_schema() -> Value {
             "doctor": "focr doctor --json",
         },
         "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
-        "status": "live — run_start/run_complete (carries `markdown`, `finish_reason`, `model_id` and `source_sha256`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` when a document stopped early (exit 5, no `run_complete`)"
+        "status": "live — run_start/run_complete (carries `markdown`, `finish_reason`, `model_id` and `source_sha256`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` when a document stopped early (exit 5, or 6 when cancelled; no `run_complete`)"
     })
 }
 
@@ -615,13 +615,8 @@ mod tests {
             })
         );
         assert_page_fields(&decoded);
-        let whole = document_page_decoded_event(
-            &crate::PageResult {
-                half: None,
-                ..page
-            },
-            "raw body",
-        );
+        let whole =
+            document_page_decoded_event(&crate::PageResult { half: None, ..page }, "raw body");
         assert!(whole.get("half").is_none(), "absent on a whole page");
 
         let skipped = document_page_skipped_event(
@@ -629,7 +624,10 @@ mod tests {
             &FocrError::InputDecode("bad xobject".into()),
             "unlimited-ocr-2",
         );
-        assert_eq!((&skipped["page"], &skipped["source_page"]), (&json!(4), &json!(4)));
+        assert_eq!(
+            (&skipped["page"], &skipped["source_page"]),
+            (&json!(4), &json!(4))
+        );
         assert_eq!(skipped["model_id"], "unlimited-ocr-2");
         assert_page_fields(&skipped);
         // v1 events keep their keys.

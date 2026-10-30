@@ -398,7 +398,7 @@ fn should_route_tall(model_id: &str, width: u32, height: u32) -> bool {
 /// iOS picker exposes specialty models as distinct product modes, so only the
 /// default Unlimited-OCR model is eligible here; a tall photo-description,
 /// chart, structured-GOT, or music input is not safely line-concatenable.
-fn recognize_document(
+fn recognize_single_image(
     engine: &FocrEngine,
     image: image::DynamicImage,
 ) -> FocrResult<(RecognizedDocument, Option<usize>)> {
@@ -423,12 +423,12 @@ fn recognize_document(
     Ok((franken_ocr::tall::merge_documents(parts), Some(strip_count)))
 }
 
-/// Figure-preserving twin of [`recognize_document`]. Tall screenshots keep the
-/// same smart-strip route as ordinary Apple recognition; figure indices are
+/// Figure-preserving twin of [`recognize_single_image`]. Tall screenshots keep
+/// the same smart-strip route as ordinary Apple recognition; figure indices are
 /// renumbered across strips and their boxes are translated back into full-image
 /// coordinates so the caller never receives a crop from a different inference
 /// path than the text beside it.
-fn recognize_document_with_figures(
+fn recognize_single_image_with_figures(
     engine: &FocrEngine,
     image: image::DynamicImage,
 ) -> FocrResult<(RecognizedDocument, Vec<ExtractedFigure>, Option<usize>)> {
@@ -554,7 +554,7 @@ fn recognize_envelope(engine: &FocrEngine, image_bytes: &[u8]) -> FocrResult<Str
     let img = image::load_from_memory(image_bytes)
         .map_err(|e| FocrError::InputDecode(format!("could not decode image: {e}")))?;
     let (width, height) = (img.width(), img.height());
-    let (doc, tall_strip_count) = recognize_document(engine, img)?;
+    let (doc, tall_strip_count) = recognize_single_image(engine, img)?;
     Ok(recognition_envelope_json(
         engine,
         &doc,
@@ -580,7 +580,7 @@ fn recognize_figure_result(
     let image = image::load_from_memory(image_bytes)
         .map_err(|error| FocrError::InputDecode(format!("could not decode image: {error}")))?;
     let (width, height) = (image.width(), image.height());
-    let (document, figures, tall_strip_count) = recognize_document_with_figures(engine, image)?;
+    let (document, figures, tall_strip_count) = recognize_single_image_with_figures(engine, image)?;
     let mut metadata = Vec::with_capacity(figures.len());
     let mut pngs = Vec::with_capacity(figures.len());
     for figure in figures {
@@ -657,6 +657,11 @@ pub unsafe extern "C" fn focr_recognize_with_figures(
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `result` must be NULL or a live handle from [`focr_recognize_with_figures`]
+/// not yet passed to [`focr_figure_result_free`]. The returned string lives as
+/// long as that handle.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
 pub unsafe extern "C" fn focr_figure_result_json(result: *const FocrFigureResult) -> *const c_char {
@@ -667,6 +672,10 @@ pub unsafe extern "C" fn focr_figure_result_json(result: *const FocrFigureResult
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `result` must be NULL or a live handle from [`focr_recognize_with_figures`]
+/// not yet passed to [`focr_figure_result_free`].
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
 pub unsafe extern "C" fn focr_figure_result_count(result: *const FocrFigureResult) -> usize {
@@ -677,6 +686,11 @@ pub unsafe extern "C" fn focr_figure_result_count(result: *const FocrFigureResul
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `result` must be NULL or a live handle from [`focr_recognize_with_figures`]
+/// not yet passed to [`focr_figure_result_free`], and `out_len` NULL or a
+/// writable `size_t`. The returned bytes live as long as that handle.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
 pub unsafe extern "C" fn focr_figure_result_png(
@@ -695,6 +709,10 @@ pub unsafe extern "C" fn focr_figure_result_png(
 }
 
 /// See `focr_ios.h`.
+///
+/// # Safety
+/// `result` must be NULL or a live handle from [`focr_recognize_with_figures`];
+/// it is freed here and must not be used again.
 #[unsafe(no_mangle)]
 #[allow(unsafe_code)]
 pub unsafe extern "C" fn focr_figure_result_free(result: *mut FocrFigureResult) {
@@ -1149,7 +1167,16 @@ fn recognize_pdf_cross_page_envelope(
         images.push(pdf.pages.render(page as usize - 1)?);
     }
 
-    let output = engine.model.recognize_multi_page_dynamic(images)?;
+    let mut source = franken_ocr::page_source::PageSource::rasters(images)?;
+    let output = engine
+        .model
+        .recognize_document(
+            &mut source,
+            &franken_ocr::DocumentOptions::default(),
+            &mut |_| {},
+            None,
+        )?
+        .markdown;
     let page_bodies = split_cross_page_output(&output, selected.len())?;
     let pages = selected
         .iter()

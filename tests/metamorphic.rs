@@ -254,7 +254,7 @@ fn mr1_mr3a_mr4_strict_text_relations() {
     );
     eprintln!(
         "{{\"suite\":\"metamorphic\",\"relation\":\"MR-5\",\"result\":\"gated\",\
-         \"detail\":\"OQ-13 RESOLVED + recognize_multi_page SHIPPED (bd-1gv.25; the 2-page \
+         \"detail\":\"OQ-13 RESOLVED + recognize_document SHIPPED (bd-1gv.25, U2-E2; the 2-page \
          real-model e2e runs one fused 227-token cross-page prefill); the dependence-EXISTENCE \
          live leg still needs a cross-referencing corpus document + the infer_multi oracle \
          (bd-1gv.26). sum-of-parts stays BANNED\"}}"

@@ -534,9 +534,8 @@ mod tests {
         })
     }
 
-    /// The census (U2-A7): every `FOCR_*` literal in `src/`, and every
-    /// dynamic `FOCR_STAGE_BUDGET_{stage}_MS`, has exactly one row; every row
-    /// names a variable read outside this table.
+    /// The census (U2-A7): every `FOCR_*` literal in `src/` has exactly one
+    /// row; every row names a variable read outside this table.
     #[test]
     fn every_focr_variable_in_src_has_exactly_one_uocr2_row() {
         let test = "every_focr_variable_in_src_has_exactly_one_uocr2_row";
@@ -544,9 +543,6 @@ mod tests {
         let mut sources = Vec::new();
         rust_sources(&src, &mut sources);
         let mut literals: BTreeMap<String, BTreeSet<PathBuf>> = BTreeMap::new();
-        // The stage budgets are named through `format!`, so the literal scan
-        // cannot see them; their stage names can.
-        let mut dynamic = BTreeSet::new();
         for (path, text) in &sources {
             for name in quoted_after(text, "\"FOCR_") {
                 literals
@@ -554,12 +550,11 @@ mod tests {
                     .or_default()
                     .insert(path.clone());
             }
-            for stage in quoted_after(text, "stage_budget(\"") {
-                dynamic.insert(format!("FOCR_STAGE_BUDGET_{stage}_MS"));
-            }
         }
+        // No variable is named through `format!`: a dynamic name would hide
+        // from this scan.
         assert!(
-            dynamic.contains("FOCR_STAGE_BUDGET_FORWARD_MS"),
+            literals.contains_key("FOCR_STAGE_BUDGET_FORWARD_MS"),
             "the scan finds the forward budget"
         );
 
@@ -575,7 +570,6 @@ mod tests {
         let rows: BTreeSet<&str> = names.iter().copied().collect();
         let missing: Vec<&String> = literals
             .keys()
-            .chain(dynamic.iter())
             .filter(|name| !rows.contains(name.as_str()))
             .collect();
         let this_file = src.join("native_engine").join("lever_policy.rs");
@@ -583,10 +577,9 @@ mod tests {
             .iter()
             .copied()
             .filter(|name| {
-                let named_elsewhere = literals
+                !literals
                     .get(*name)
-                    .is_some_and(|files| files.iter().any(|file| *file != this_file));
-                !named_elsewhere && !dynamic.contains(*name)
+                    .is_some_and(|files| files.iter().any(|file| *file != this_file))
             })
             .collect();
         let pass = missing.is_empty() && stale.is_empty();
@@ -596,9 +589,9 @@ mod tests {
             "assert",
             pass,
             serde_json::json!({
-                "assertion": "rows == FOCR_* literals in src + dynamic stage budgets",
+                "assertion": "rows == FOCR_* literals in src",
                 "pass": pass, "rows": rows.len(), "literals": literals.len(),
-                "dynamic": dynamic, "missing": missing, "stale": stale,
+                "missing": missing, "stale": stale,
             }),
         );
         assert!(

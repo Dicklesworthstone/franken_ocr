@@ -52,7 +52,8 @@ use std::time::Instant;
 mod parity_harness;
 
 use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
-use franken_ocr::{DEFAULT_MODEL_PATH, FocrError, MODEL_PATH_ENV, OcrEngine};
+use franken_ocr::page_source::PageSource;
+use franken_ocr::{DEFAULT_MODEL_PATH, DocumentOptions, FocrError, MODEL_PATH_ENV, OcrEngine};
 
 // ───────────────────────────────────────────────────────────────────────────
 // Structured logging (the "great detailed logging" mandate, TL1/TL2).
@@ -673,16 +674,17 @@ fn public_recognize_without_weights_is_model_not_found_or_defers() {
 ///   * A `ModelNotFound` here means the developer set `FOCR_MODEL_PATH` to a path
 ///     that does not resolve — a **misconfiguration FAIL** (§4.3: a model that
 ///     was *expected present* but does not resolve is not a silent skip).
-/// bd-1gv.25 S3: the MULTI-PAGE cross-page pass end-to-end over the real
-/// model (gated exactly like the single-image e2e): two tiny pages become ONE
-/// document — Base-640 preprocess ×2, one fused cross-page prefill, one AR
-/// decode, `finalize_multi` assembly. Asserts the public facade returns a
-/// well-formed `<PAGE>`-assembled markdown and that BOTH non-Unlimited
-/// refusal modes stay typed (the /nonexistent-model leg is covered by the CLI
-/// golden). Absent/unarmed ⇒ skip-with-SUCCESS (§4.3).
+/// bd-1gv.25 S3, U2-E2: the cross-page document pass end-to-end over the
+/// real model (gated exactly like the single-image e2e): two tiny page files
+/// become ONE document through `OcrEngine::recognize_document` — Base-640
+/// preprocess ×2, one fused cross-page prefill, one AR decode,
+/// `finalize_multi` assembly. Asserts a well-formed `<PAGE>`-assembled
+/// markdown, no skipped page, and that the model that ran is reported (the
+/// /nonexistent-model leg is covered by the CLI golden). Absent/unarmed ⇒
+/// skip-with-SUCCESS (§4.3).
 #[test]
-fn recognize_multi_page_real_model_when_present_else_skip_with_success() {
-    let test = "recognize_multi_page_real_model_when_present_else_skip_with_success";
+fn recognize_document_real_model_when_present_else_skip_with_success() {
+    let test = "recognize_document_real_model_when_present_else_skip_with_success";
     let case = "two_tiny_pages_one_document";
 
     let Some(model_path) = armed_present_model() else {
@@ -719,15 +721,28 @@ fn recognize_multi_page_real_model_when_present_else_skip_with_success() {
 
     let engine = OcrEngine::new().expect("OcrEngine::new builds");
     let started = Instant::now();
-    let result = engine.recognize_multi_page(&[page_a.as_path(), page_b.as_path()]);
+    let source = PageSource::images(vec![page_a, page_b]).expect("a page source");
+    let result = engine.recognize_document(
+        &model_path,
+        source,
+        &DocumentOptions::default(),
+        Box::new(|_| {}),
+        None,
+    );
     let elapsed_ms = started.elapsed().as_millis();
 
     match result {
-        Ok(markdown) => {
+        Ok(document) => {
+            let markdown = &document.markdown;
             assert!(
                 markdown.starts_with("<PAGE>"),
                 "finalize_multi assembly must lead with the page marker; got: {:?}",
                 &markdown[..markdown.len().min(120)]
+            );
+            assert!(document.skipped.is_empty(), "{:?}", document.skipped);
+            assert_eq!(
+                Some(document.model.model_id),
+                engine.loaded_model_identity().map(|m| m.model_id)
             );
             let seps = markdown.matches("<PAGE>").count();
             log_line(
@@ -737,8 +752,12 @@ fn recognize_multi_page_real_model_when_present_else_skip_with_success() {
                 "pass",
                 &format!(
                     "elapsed_ms={elapsed_ms} markdown_bytes={} page_markers={seps} \
+                     pages_out={} finish_reason={} model={} \
                      note=\"cross-page pass completed; ngram_window=1024 in force\"",
                     markdown.len(),
+                    document.pages_out,
+                    document.finish_reason.as_str(),
+                    document.model.model_id,
                 ),
             );
         }
@@ -816,7 +835,15 @@ fn stream_against_plain(
     model_path: &Path,
     pages: &[PathBuf],
 ) -> (String, Vec<(usize, String)>, usize) {
-    let load = |p: &PathBuf| image::open(p).expect("page fixture decodes");
+    let rasters = || {
+        PageSource::rasters(
+            pages
+                .iter()
+                .map(|p| image::open(p).expect("page fixture decodes"))
+                .collect(),
+        )
+        .expect("a page source")
+    };
     let engine = OcrEngine::new().expect("OcrEngine::new builds");
     let events: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -827,20 +854,39 @@ fn stream_against_plain(
             .expect("sink mutex")
             .push((page.index, page.body.to_string()));
     });
+    let options = DocumentOptions::default();
     let streamed = engine
-        .recognize_multi_page_dynamic_streaming_with_model(
+        .recognize_document(
             model_path,
-            pages.iter().map(load).collect(),
-            sink,
+            rasters(),
+            &options,
+            Box::new(|_| {}),
+            Some(sink),
         )
-        .expect("streaming multi-page pass");
+        .expect("streaming document pass");
     let plain = engine
-        .recognize_multi_page_dynamic_with_model(model_path, pages.iter().map(load).collect())
-        .expect("plain multi-page pass");
+        .recognize_document(model_path, rasters(), &options, Box::new(|_| {}), None)
+        .expect("plain document pass");
+    // Page timings differ run to run; everything else must not.
+    let facts = |doc: &franken_ocr::DocumentResult| {
+        let texts: Vec<&str> = doc.pages.iter().map(|p| p.text.as_str()).collect();
+        format!(
+            "{:?}",
+            (
+                &doc.markdown,
+                texts,
+                doc.pages_out,
+                doc.finish_reason,
+                &doc.warnings
+            )
+        )
+    };
     assert_eq!(
-        streamed, plain,
-        "streaming must not change the terminal assembly"
+        facts(&streamed),
+        facts(&plain),
+        "streaming must not change the result"
     );
+    let streamed = streamed.markdown;
     let events = events.lock().expect("events mutex").clone();
     let markers = streamed.matches("<PAGE>").count();
     assert_eq!(
@@ -2949,6 +2995,184 @@ fn v2_cli_writes_a_stopped_document_then_exits_5_when_armed() {
             warning_kinds(&batch),
             started.elapsed().as_secs_f64()
         ),
+    );
+}
+
+/// U2-E2: the library's document API over Unlimited-OCR-2. Three page files
+/// whose second does not decode: `on_item` sees all three in order, the sink
+/// streams the two pages read exactly once each, in order and named by their
+/// source pages (1 and 3), and the result lists the skipped page, both pages
+/// with the facts they streamed, and a `stop` finish from the model that ran.
+#[test]
+fn v2_library_document_streams_its_pages_in_order_across_a_skip_when_armed() {
+    const TEST: &str = "v2_library_document_streams_its_pages_in_order_across_a_skip_when_armed";
+    let Some((model, _bin, pages)) = v2_inputs(TEST) else {
+        return;
+    };
+    let bad = unique_output_path("png");
+    std::fs::write(&bad, b"not an image").expect("write the unreadable page");
+    let source = PageSource::images(vec![pages[0].clone(), bad.clone(), pages[1].clone()])
+        .expect("a page source");
+    type Streamed = (usize, Option<(usize, Option<&'static str>, Option<usize>)>);
+    let items = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(usize, bool)>::new()));
+    let streamed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Streamed>::new()));
+    let on_item = {
+        let items = std::sync::Arc::clone(&items);
+        Box::new(move |item: &franken_ocr::page_source::PageItem| {
+            let mut items = items.lock().expect("items");
+            items.push((item.source_page, item.raster.is_ok()));
+        })
+    };
+    let sink = {
+        let streamed = std::sync::Arc::clone(&streamed);
+        Box::new(move |page: &franken_ocr::StreamedPage<'_>| {
+            let facts = page
+                .page
+                .map(|p| (p.source_page, p.half.map(|h| h.as_str()), p.tokens));
+            streamed.lock().expect("streamed").push((page.index, facts));
+        })
+    };
+    let started = Instant::now();
+    let engine = OcrEngine::new().expect("OcrEngine::new builds");
+    let document = engine
+        .recognize_document(
+            &model,
+            source,
+            &DocumentOptions::default(),
+            on_item,
+            Some(sink),
+        )
+        .expect("the document parses");
+    let _ = std::fs::remove_file(&bad);
+    let items = items.lock().expect("items").clone();
+    let streamed = streamed.lock().expect("streamed").clone();
+
+    assert_eq!(items, vec![(1, true), (2, false), (3, true)], "on_item");
+    assert_eq!(document.skipped.len(), 1, "{:?}", document.skipped);
+    assert_eq!(document.skipped[0].page, 2);
+    assert!(!document.skipped[0].reason.is_empty());
+    let read: Vec<_> = document
+        .pages
+        .iter()
+        .map(|p| (p.run_index, Some((p.source_page, None, p.tokens))))
+        .collect();
+    assert_eq!(read.len(), 2, "two pages read: {read:?}");
+    assert_eq!(streamed, read, "each page streams once, in order");
+    let source_pages: Vec<usize> = document.pages.iter().map(|p| p.source_page).collect();
+    assert_eq!(source_pages, vec![1, 3]);
+    assert_eq!(document.pages_out, 2);
+    assert_eq!(document.finish_reason.as_str(), "stop");
+    assert_eq!(document.extra_markers, 0);
+    assert!(document.warnings.is_empty(), "{:?}", document.warnings);
+    assert_eq!(document.model.model_id, "unlimited-ocr-2");
+    let joined = franken_ocr::native_engine::postprocess::join_page_texts(
+        document.pages.iter().map(|p| &p.text),
+    );
+    assert_eq!(document.markdown, joined, "the markdown joins the pages");
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "test": TEST, "case": "three_files_one_unreadable", "event": "result",
+            "result": "pass", "source_pages": source_pages, "pages_out": document.pages_out,
+            "skipped": [2], "finish_reason": document.finish_reason.as_str(),
+            "wall_s": started.elapsed().as_secs_f64(),
+        })
+    );
+}
+
+/// U2-E2: a cancel is a result too. Ctrl+C after the first page streams
+/// stops the document loop at its next step; the CLI writes the page bodies
+/// produced, ends the robot stream with a `run_error` carrying
+/// `finish_reason: cancelled` and `pages_out`, with no `run_complete`, and
+/// exits 6.
+#[cfg(unix)]
+#[test]
+fn v2_cli_cancelled_document_writes_its_pages_then_exits_6_when_armed() {
+    use std::io::BufRead;
+    const TEST: &str = "v2_cli_cancelled_document_writes_its_pages_then_exits_6_when_armed";
+    let Some((model, bin, pages)) = v2_inputs(TEST) else {
+        return;
+    };
+    let pdf = pdf_of_pages(&pages);
+    let output = unique_output_path("md");
+    let started = Instant::now();
+    let mut command = Command::new(&bin);
+    command
+        .arg("ocr")
+        .arg(&pdf)
+        .args(["--multi-page", "--robot", "-o"])
+        .arg(&output)
+        .arg("--model")
+        .arg(&model)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("FOCR_") {
+            command.env_remove(key);
+        }
+    }
+    command.env("FOCR_NO_RESIDENT", "1");
+    let mut child = command.spawn().expect("spawn focr");
+    let stderr = child.stderr.take().expect("stderr");
+    let stderr = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut std::io::BufReader::new(stderr), &mut text);
+        text
+    });
+    let mut events = Vec::new();
+    let mut interrupted = false;
+    for line in std::io::BufReader::new(child.stdout.take().expect("stdout")).lines() {
+        let line = line.expect("read stdout");
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if !interrupted && event["event"] == "page" && event["status"] == "decoded" {
+            let status = Command::new("kill")
+                .args(["-INT", &child.id().to_string()])
+                .status()
+                .expect("run kill");
+            assert!(status.success(), "kill -INT failed");
+            interrupted = true;
+        }
+        events.push(event);
+    }
+    let code = child.wait().expect("wait for focr").code();
+    let stderr = stderr.join().expect("stderr reader");
+    let _ = std::fs::remove_file(&pdf);
+    let written = std::fs::read_to_string(&output).unwrap_or_default();
+    let _ = std::fs::remove_file(&output);
+
+    assert!(
+        interrupted,
+        "no page streamed before the end: {events:?}\n{stderr}"
+    );
+    assert_eq!(code, Some(6), "{stderr}");
+    assert!(
+        events.iter().all(|v| v["event"] != "run_complete"),
+        "a cancelled run never completes: {events:?}"
+    );
+    let last = events.last().expect("robot events");
+    assert_eq!(last["event"], "run_error", "{last}");
+    assert_eq!(last["error_kind"], "cancelled", "{last}");
+    assert_eq!(last["code"], 6, "{last}");
+    assert_eq!(last["finish_reason"], "cancelled", "{last}");
+    let pages_out = last["pages_out"].as_u64().expect("pages_out");
+    assert!(
+        (1..=3).contains(&pages_out),
+        "the streamed page is out: {last}"
+    );
+    assert_eq!(
+        written.matches("<PAGE>").count() as u64,
+        pages_out,
+        "the produced bodies are written:\n{written}"
+    );
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "test": TEST, "case": "ctrl_c_after_page_1", "event": "result", "result": "pass",
+            "pages_out": pages_out, "finish_reason": "cancelled", "exit_code": 6,
+            "wall_s": started.elapsed().as_secs_f64(),
+        })
     );
 }
 

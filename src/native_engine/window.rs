@@ -978,8 +978,8 @@ impl OcrModel {
             doc.window_ids.push(decode.ids);
             doc.windows.push(stats);
             match decode.finish_reason {
-                FinishReason::Budget => {
-                    doc.finish_reason = FinishReason::Budget;
+                stop @ (FinishReason::Budget | FinishReason::Cancelled) => {
+                    doc.finish_reason = stop;
                     break;
                 }
                 FinishReason::Length => doc.finish_reason = FinishReason::Length,

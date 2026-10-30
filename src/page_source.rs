@@ -114,10 +114,30 @@ impl Rasterize for ImageFiles {
     }
 }
 
+/// Pages already in memory (an app's camera captures, a test's pages): each
+/// render hands out a copy, so a later [`PageSource::fetch`] still has it.
+struct Rasters(Vec<DynamicImage>);
+
+impl Rasterize for Rasters {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn render(&self, idx: usize) -> FocrResult<DynamicImage> {
+        self.0.get(idx).cloned().ok_or_else(|| {
+            FocrError::InputDecode(format!(
+                "page index {idx} out of range ({} pages)",
+                self.0.len()
+            ))
+        })
+    }
+}
+
 /// A document's pages, rasterized one at a time as the walk asks for them.
 ///
 /// Build one with [`PageSource::open`], [`PageSource::pdf`],
-/// [`PageSource::images`] or [`PageSource::directory`], narrow it with
+/// [`PageSource::images`], [`PageSource::directory`] or
+/// [`PageSource::rasters`], narrow it with
 /// [`PageSource::select`] and [`PageSource::split_spreads`] before the walk,
 /// then iterate it: each [`PageItem`] carries one page's raster or its error.
 pub struct PageSource {
@@ -169,6 +189,20 @@ impl PageSource {
             ));
         }
         Ok(Self::new(Box::new(ImageFiles(paths))))
+    }
+
+    /// Pages already decoded, in the order given. A raster is used as it is:
+    /// no EXIF orientation is applied, since a decoded image has none.
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] for an empty list.
+    pub fn rasters(pages: Vec<DynamicImage>) -> FocrResult<Self> {
+        if pages.is_empty() {
+            return Err(FocrError::Usage(
+                "a page source needs at least one page".into(),
+            ));
+        }
+        Ok(Self::new(Box::new(Rasters(pages))))
     }
 
     /// The page images in `dir` ([`PAGE_IMAGE_EXTENSIONS`]), in natural
@@ -574,6 +608,31 @@ mod tests {
         assert!(warning.message.contains("notes.txt"), "{}", warning.message);
         assert!(!warning.recovery.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rasters_walk_in_order_split_like_any_page_and_fetch_again() {
+        assert!(matches!(
+            PageSource::rasters(Vec::new()),
+            Err(FocrError::Usage(_))
+        ));
+        let pages = vec![portrait(), spread()];
+        let mut source = PageSource::rasters(pages.clone())
+            .expect("rasters")
+            .split_spreads(true);
+        assert_eq!((source.source_len(), source.len()), (2, 2));
+        assert_eq!(
+            summary(&mut source),
+            vec![
+                (0, 1, None, true),
+                (1, 2, Some(Half::Left), true),
+                (2, 2, Some(Half::Right), true),
+            ]
+        );
+        assert_eq!(source.fetch(1, None).expect("page 1"), pages[0]);
+        let (left, _, _) = pdf::split_spread(&pages[1]).expect("a spread");
+        assert_eq!(source.fetch(2, Some(Half::Left)).expect("left"), left);
+        assert!(source.warnings().is_empty());
     }
 
     #[test]
