@@ -98,3 +98,11 @@ Wall times are `/usr/bin/time` real, model load included:
 * `$P scripts/gen_reference_fixtures_uocr2.py --windowed-compare <dump root>/w2-n7-t12,<dump root>/w2-n7-t12r,<dump root>/w2-n7-t4` (model-free; under 1 s)
 
 The dump root was a session scratch directory, so rerun the commands to regenerate the dumps.
+
+`tests/fixtures/uocr2_windowed/<tag>.json` keeps what the Rust gates read from five of those runs
+(`w2-n7-t12`, `w3-n7-t12`, `w2-n7-recompute-t12`, `w2-n5-markeronly-t12`,
+`degenerate-s2-w3-t12`; the `t12r` and `t4` repeats hold the same ids). That is the plan, the forced
+fallbacks and the bodies, and per window the copy plan, forced and generated ids, retention and the
+sha256 of each per-row coordinate array's int32 data. `python3 -I
+scripts/extract_uocr2_windowed_fixtures.py <dump root> <tag>...` writes them from the dumps. It
+checks every array against the dump's own manifest hash.
