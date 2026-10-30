@@ -4189,7 +4189,11 @@ struct CorpusGatePaths {
 impl CorpusGatePaths {
     /// The paths, or `None` after a skip line naming what is missing.
     fn from_env(log: &mut Logger) -> Option<Self> {
-        let var = |name: &str| std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from);
+        let var = |name: &str| {
+            std::env::var_os(name)
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+        };
         let armed = matches!(
             std::env::var("FOCR_UOCR2_CORPUS_GATE").ok().as_deref(),
             Some(v) if !v.is_empty() && v != "0"
@@ -4208,7 +4212,10 @@ impl CorpusGatePaths {
                 "the v2 int8 artifact, in a directory holding v2's own tokenizer.json",
             ),
             ("FOCR_UOCR2_V1_REFS_DIR", "the v1 f32 corpus references"),
-            ("FOCR_UOCR2_FIXTURES_DIR", "the v2 f32 oracle (<oracle root>/f32/t12)"),
+            (
+                "FOCR_UOCR2_FIXTURES_DIR",
+                "the v2 f32 oracle (<oracle root>/f32/t12)",
+            ),
         ];
         let mut found = Vec::new();
         for (name, what) in named {
@@ -4256,13 +4263,18 @@ fn corpus_lane(
         CorpusLane::V1 => "unlimited-ocr",
         CorpusLane::V2 => "unlimited-ocr-2",
     };
-    assert_eq!(model_id, expected_id, "{}: wrong artifact", artifact.display());
+    assert_eq!(
+        model_id,
+        expected_id,
+        "{}: wrong artifact",
+        artifact.display()
+    );
     let tok = model.tokenizer().expect("the model's tokenizer");
     let mut pages = Vec::with_capacity(CORPUS_GATE_PAGES.len());
     for (page, category) in CORPUS_GATE_PAGES {
         let ref_path = lane.reference_path(refs, page);
-        let ref_bytes = std::fs::read(&ref_path)
-            .unwrap_or_else(|e| panic!("{}: {e}", ref_path.display()));
+        let ref_bytes =
+            std::fs::read(&ref_path).unwrap_or_else(|e| panic!("{}: {e}", ref_path.display()));
         let reference: Value = serde_json::from_slice(&ref_bytes).expect("reference parses");
         let image = paths.corpus.join(format!("{page}.png"));
         if lane == CorpusLane::V2 {
@@ -4331,7 +4343,10 @@ fn corpus_lane(
             ("finish_reason", json!(finish.as_str())),
             ("tokens", json!(row.tokens)),
             ("ref_tokens", json!(row.ref_tokens)),
-            ("hard_page", json!(row.ref_tokens >= HARD_PAGE_REFERENCE_IDS)),
+            (
+                "hard_page",
+                json!(row.ref_tokens >= HARD_PAGE_REFERENCE_IDS),
+            ),
             ("wall_s", json!(wall_s)),
             ("artifact_sha256", json!(artifact_sha256)),
             ("model_id", json!(model_id)),
@@ -4353,9 +4368,13 @@ fn corpus_bounds(pages: &[CorpusPage]) -> Vec<franken_ocr::conformance::Category
             let members = pages
                 .iter()
                 .filter(|p| category == "all" || p.category == category);
-            let (passes, failures) = members.fold((0, 0), |(s, f), p| {
-                if p.pass() { (s + 1, f) } else { (s, f + 1) }
-            });
+            let (passes, failures) =
+                members.fold(
+                    (0, 0),
+                    |(s, f), p| {
+                        if p.pass() { (s + 1, f) } else { (s, f + 1) }
+                    },
+                );
             category_bound(CategoryCounts {
                 category,
                 passes,
@@ -4385,7 +4404,7 @@ fn corpus_aggregate(pages: &[CorpusPage]) -> f64 {
 fn uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline() {
     use franken_ocr::conformance::{BoundMethod, ratchet_decide, transparency_card};
     use franken_ocr::native_engine::{
-        DocumentOptions, FinishReason, OcrModel, UOCR2_UNWINDOWED_PAGE_LIMIT,
+        DocumentOptions, FinishReason, OcrModel, PageWindow, UOCR2_UNWINDOWED_PAGE_LIMIT,
     };
     use franken_ocr::page_source::PageSource;
 
@@ -4453,7 +4472,10 @@ fn uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline() {
         ("lane", json!("v2")),
         ("aggregate", json!(true)),
         ("v1_same_invocation_aggregate", json!(v1_aggregate)),
-        ("v1_recorded_aggregate_vs_bf16", json!(V1_RECORDED_AGGREGATE_CER)),
+        (
+            "v1_recorded_aggregate_vs_bf16",
+            json!(V1_RECORDED_AGGREGATE_CER),
+        ),
     ] {
         extra.insert(key.to_string(), value);
     }
@@ -4482,16 +4504,14 @@ fn uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline() {
     let mut f32_page_tokens: Vec<usize> = v2_pages.iter().map(|p| p.ref_tokens).collect();
     for doc in CORPUS_GATE_DOCUMENTS {
         let ref_path = paths.v2_refs.join(format!("{doc}_reference.json"));
-        let ref_bytes = std::fs::read(&ref_path)
-            .unwrap_or_else(|e| panic!("{}: {e}", ref_path.display()));
+        let ref_bytes =
+            std::fs::read(&ref_path).unwrap_or_else(|e| panic!("{}: {e}", ref_path.display()));
         let reference: Value = serde_json::from_slice(&ref_bytes).expect("reference parses");
         let listed = reference["pages"].as_array().expect("reference pages");
         let mut images = Vec::with_capacity(listed.len());
         let mut dims = Vec::with_capacity(listed.len());
         for page in listed {
-            let image = paths
-                .corpus
-                .join(page["name"].as_str().expect("page name"));
+            let image = paths.corpus.join(page["name"].as_str().expect("page name"));
             let bytes = std::fs::read(&image).expect("corpus page reads");
             assert_eq!(
                 Some(sha256_hex(&bytes).as_str()),
@@ -4506,11 +4526,16 @@ fn uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline() {
         let n = images.len();
         let started = Instant::now();
         let mut source = PageSource::images(images).expect("a page source");
+        // The reference read each document in one pass; so does the gate,
+        // as pre-registered, whatever the default window (U2-D1b).
+        let one_pass = DocumentOptions::default().page_window(PageWindow::Off);
         let result = model
-            .recognize_document(&mut source, &DocumentOptions::default(), &mut |_| {}, None)
+            .recognize_document(&mut source, &one_pass, &mut |_| {}, None)
             .expect("read the document");
         let wall_s = started.elapsed().as_secs_f64();
-        let report = model.take_last_decode().expect("the document's decode report");
+        let report = model
+            .take_last_decode()
+            .expect("the document's decode report");
         let (ours, our_tokens) = uocr2_document_text(tok, &report.ids, &dims);
         assert_eq!(
             ours, result.markdown,
@@ -4582,7 +4607,10 @@ fn uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline() {
         limits.push(limit);
         let mut extra = serde_json::Map::new();
         for (key, value) in [
-            ("assertion", json!(format!("{name} per-page token distribution"))),
+            (
+                "assertion",
+                json!(format!("{name} per-page token distribution")),
+            ),
             ("pass", json!(flagged == 0)),
             ("distribution", json!(name)),
             ("pages", json!(tokens.len())),
@@ -4629,10 +4657,7 @@ fn uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline() {
 #[test]
 fn corpus_gate_helpers_match_the_python_harness_and_the_plan() {
     // corpus_cer.py: strip, collapse runs, drop empty lines; no case folding.
-    assert_eq!(
-        corpus_normalize("  A \t b \r\n\n\n c  d\nE"),
-        "A b\nc d\nE"
-    );
+    assert_eq!(corpus_normalize("  A \t b \r\n\n\n c  d\nE"), "A b\nc d\nE");
     assert_eq!(corpus_edits("abc", "abd"), (1, 3, 3));
     assert_eq!(corpus_edits("Abc", "abc").0, 1, "case is a divergence");
     assert_eq!(corpus_cer(0, 0), 0.0);

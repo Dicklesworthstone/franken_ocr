@@ -3080,6 +3080,317 @@ fn v2_library_document_streams_its_pages_in_order_across_a_skip_when_armed() {
     );
 }
 
+/// `count` short, distinct page files for a windowed document: horizontal
+/// bands of S2's pages (each page cut in 8, so a band holds a few lines),
+/// in order and cycling, with page `bad` (1-based) an unreadable file. Within
+/// any window the bands are distinct, so the n-gram ban never sees a page
+/// repeat.
+fn banded_pages(s2: &[PathBuf], count: usize, bad: usize) -> Vec<PathBuf> {
+    const BANDS: u32 = 8;
+    let bands: Vec<image::RgbImage> = s2
+        .iter()
+        .flat_map(|page| {
+            let page = image::open(page).expect("corpus page decodes").to_rgb8();
+            let (w, h) = page.dimensions();
+            let band = h / BANDS;
+            (0..BANDS)
+                .map(|k| image::imageops::crop_imm(&page, 0, k * band, w, band).to_image())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    (0..count)
+        .map(|k| {
+            let path = unique_output_path("png");
+            if k + 1 == bad {
+                std::fs::write(&path, b"not an image").expect("write the unreadable page");
+            } else {
+                bands[k % bands.len()].save(&path).expect("write a band");
+            }
+            path
+        })
+        .collect()
+}
+
+/// U2-D1b: Unlimited-OCR-2's default document parse windows a long document
+/// through the library. `count` page files, page `bad` unreadable: the other
+/// pages are read in windows of 10 own pages, each read and vision-encoded
+/// once; each comes back and streams once, in order, named by its source
+/// page across the skip and by the window that owns it; every window but
+/// the last reads a lookahead page it does not transcribe; and the decode
+/// report counts one encode and one body per page read.
+///
+/// Pages in flight (D19): a page's raster is dropped once preprocessed, and
+/// a page is held from its read until it streams out. When a page is read,
+/// the readable pages read so far exceed those streamed by at most a window
+/// and its lookahead, W + 1.
+fn v2_windows_a_document(test: &str, count: usize, bad: usize) {
+    const W: usize = 10;
+    let Some((model, _bin, s2)) = v2_inputs(test) else {
+        return;
+    };
+    let files = banded_pages(&s2, count, bad);
+    let source = PageSource::images(files.clone()).expect("a page source");
+    // Per page read: its source page, whether it read, and the pages
+    // streamed out by then.
+    type Item = (usize, bool, usize);
+    let items = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Item>::new()));
+    type Streamed = (usize, Option<(usize, Option<usize>)>);
+    let streamed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Streamed>::new()));
+    let on_item = {
+        let items = std::sync::Arc::clone(&items);
+        let streamed = std::sync::Arc::clone(&streamed);
+        Box::new(move |item: &franken_ocr::page_source::PageItem| {
+            let out = streamed.lock().expect("streamed").len();
+            let mut items = items.lock().expect("items");
+            items.push((item.source_page, item.raster.is_ok(), out));
+        })
+    };
+    let sink = {
+        let streamed = std::sync::Arc::clone(&streamed);
+        Box::new(move |page: &franken_ocr::StreamedPage<'_>| {
+            let facts = page.page.map(|p| (p.source_page, p.window));
+            streamed.lock().expect("streamed").push((page.index, facts));
+        })
+    };
+    let started = Instant::now();
+    let engine = OcrEngine::new().expect("OcrEngine::new builds");
+    let document = engine
+        .recognize_document(
+            &model,
+            source,
+            &DocumentOptions::default(),
+            on_item,
+            Some(sink),
+        )
+        .expect("the document parses");
+    let report = engine
+        .take_last_decode_report()
+        .expect("the document's decode report");
+    for file in &files {
+        let _ = std::fs::remove_file(file);
+    }
+    let items = items.lock().expect("items").clone();
+    let streamed = streamed.lock().expect("streamed").clone();
+
+    let seen: Vec<(usize, bool)> = items.iter().map(|&(p, ok, _)| (p, ok)).collect();
+    let want_items: Vec<(usize, bool)> = (1..=count).map(|p| (p, p != bad)).collect();
+    assert_eq!(seen, want_items, "on_item sees every page once, in order");
+    let mut readable = 0;
+    let mut in_flight = 0;
+    for &(page, ok, out) in &items {
+        readable += usize::from(ok);
+        in_flight = in_flight.max(readable - out);
+        assert!(
+            readable - out <= W + 1,
+            "page {page}: {readable} pages read, {out} streamed"
+        );
+    }
+    let skipped: Vec<usize> = document.skipped.iter().map(|s| s.page).collect();
+    assert_eq!(skipped, vec![bad]);
+    let read = count - 1;
+    let want: Vec<Streamed> = (1..=count)
+        .filter(|&p| p != bad)
+        .enumerate()
+        .map(|(k, p)| (k + 1, Some((p, Some(k / W)))))
+        .collect();
+    let got: Vec<_> = document
+        .pages
+        .iter()
+        .map(|p| (p.run_index, Some((p.source_page, p.window))))
+        .collect();
+    assert_eq!(got, want, "pages in order, across the skip, by window");
+    assert_eq!(streamed, want, "each page streams once, in order");
+    assert!(
+        document
+            .pages
+            .iter()
+            .all(|p| p.tokens.is_some() && p.finish.is_some()),
+        "every page has its decode facts"
+    );
+    let windows = read.div_ceil(W);
+    let spans: Vec<(std::ops::Range<usize>, bool)> = document
+        .windows
+        .iter()
+        .map(|w| (w.pages.clone(), w.lookahead))
+        .collect();
+    let want_spans: Vec<(std::ops::Range<usize>, bool)> = (0..windows)
+        .map(|k| (k * W..read.min(k * W + W), k + 1 < windows))
+        .collect();
+    assert_eq!(
+        spans, want_spans,
+        "windows of W own pages, lookahead on all but the last"
+    );
+    assert!(
+        document
+            .windows
+            .iter()
+            .all(|w| w.index == 0 || w.reused || w.fallback_reason.is_some()),
+        "a later window reuses its predecessor or names why it recomputed: {:?}",
+        document.windows
+    );
+    let stats = report.document.as_ref().expect("a v2 document's stats");
+    assert_eq!(stats.windows, windows);
+    assert_eq!(stats.vision_encodes, read, "each page encoded once");
+    assert_eq!(
+        report.pages.map(|p| (p.expected, p.bodies)),
+        Some((read, read))
+    );
+    assert_eq!(document.pages_out, read);
+    assert_eq!(document.finish_reason.as_str(), "stop");
+    assert_eq!(document.extra_markers, 0);
+    let joined = franken_ocr::native_engine::postprocess::join_page_texts(
+        document.pages.iter().map(|p| &p.text),
+    );
+    assert_eq!(document.markdown, joined, "the markdown joins the pages");
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "test": test, "case": format!("{count}_bands_page_{bad}_unreadable"),
+            "event": "result", "result": "pass", "pages_out": document.pages_out,
+            "windows": document.windows.len(),
+            "recomputed": document.windows.iter().filter(|w| w.fallback_reason.is_some()).count(),
+            "vision_encodes": stats.vision_encodes, "tokens": report.ids.len(),
+            "max_pages_in_flight": in_flight, "wall_s": started.elapsed().as_secs_f64(),
+        })
+    );
+}
+
+/// U2-D1b: a 25-page document, page 13 (in window 2) unreadable.
+#[test]
+fn v2_library_windows_a_25_page_document_across_a_skip_when_armed() {
+    v2_windows_a_document(
+        "v2_library_windows_a_25_page_document_across_a_skip_when_armed",
+        25,
+        13,
+    );
+}
+
+/// U2-D1b: the page limit is lifted. A document one page past
+/// [`franken_ocr::native_engine::UOCR2_UNWINDOWED_PAGE_LIMIT`] readable pages,
+/// which U2-B6 refused, runs windowed (`FOCR_E2E_LONG`).
+#[test]
+fn v2_library_windows_a_document_past_the_page_limit_when_armed() {
+    const TEST: &str = "v2_library_windows_a_document_past_the_page_limit_when_armed";
+    if std::env::var_os("FOCR_E2E_LONG").is_none() {
+        log_success(TEST, "gate", "long run: set FOCR_E2E_LONG=1");
+        return;
+    }
+    let readable = franken_ocr::native_engine::UOCR2_UNWINDOWED_PAGE_LIMIT + 1;
+    v2_windows_a_document(TEST, readable + 1, 2);
+}
+
+/// U2-D1b: figures in a windowed CLI document. Twelve pages in a directory,
+/// the two corpus pages with figures at pages 3 and 12 (one in each window)
+/// and bands of S2 elsewhere: `focr ocr <dir> --multi-page
+/// --extract-figures --json` reads them in windows [1, 10] and [11, 12],
+/// lists each page with its window, and writes each figure once, named by
+/// its source page and referenced from the markdown.
+#[test]
+fn v2_cli_windowed_document_names_figures_by_source_page_when_armed() {
+    const TEST: &str = "v2_cli_windowed_document_names_figures_by_source_page_when_armed";
+    const PAGES: usize = 12;
+    let Some((model, bin, s2)) = v2_inputs(TEST) else {
+        return;
+    };
+    let Some(figured) = corpus_pages(&["page_0136.png", "page_0437.png"]) else {
+        log_success(TEST, "gate", "corpus pages absent");
+        return;
+    };
+    let work = unique_output_path("d1b");
+    let pages_dir = work.join("pages");
+    std::fs::create_dir_all(&pages_dir).expect("the page directory");
+    let bands = banded_pages(&s2, PAGES, 0);
+    for (k, band) in bands.iter().enumerate() {
+        let page = k + 1;
+        let from = match page {
+            3 => &figured[0],
+            12 => &figured[1],
+            _ => band,
+        };
+        std::fs::copy(from, pages_dir.join(format!("{page:02}.png"))).expect("write a page");
+    }
+    for band in &bands {
+        let _ = std::fs::remove_file(band);
+    }
+    let out_json = work.join("out.json");
+    let (dir_arg, out_arg) = (
+        pages_dir.display().to_string(),
+        out_json.display().to_string(),
+    );
+    let started = Instant::now();
+    let out = run_v2(
+        &bin,
+        &model,
+        &[
+            "ocr",
+            &dir_arg,
+            "--multi-page",
+            "--extract-figures",
+            "--json",
+            "-o",
+            &out_arg,
+        ],
+        &[],
+    );
+    assert_eq!(out.code, Some(0), "{}\n{}", out.stdout, out.stderr);
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_json).expect("the JSON output"))
+            .expect("the JSON output parses");
+    let pages = doc["pages"].as_array().expect("pages");
+    let placed: Vec<(Option<u64>, Option<u64>)> = pages
+        .iter()
+        .map(|p| (p["page"].as_u64(), p["window"].as_u64()))
+        .collect();
+    let want: Vec<(Option<u64>, Option<u64>)> = (1..=PAGES as u64)
+        .map(|p| (Some(p), Some(u64::from(p > 10))))
+        .collect();
+    assert_eq!(placed, want, "each page with the window that owns it");
+    let markdown = doc["markdown"].as_str().expect("markdown");
+    let image_boxes: Vec<(String, serde_json::Value)> = pages
+        .iter()
+        .flat_map(|p| {
+            let name = format!("page{}_figure_", p["page"]);
+            p["layout"]
+                .as_array()
+                .expect("layout")
+                .iter()
+                .filter(|s| s["label"] == "image")
+                .map(move |s| (name.clone(), s["boxes"][0].clone()))
+        })
+        .collect();
+    let figures = doc["figures"].as_array().cloned().unwrap_or_default();
+    let figure_pages: std::collections::BTreeSet<u64> =
+        figures.iter().filter_map(|f| f["page"].as_u64()).collect();
+    assert!(
+        figure_pages.contains(&3) && figure_pages.contains(&12),
+        "a figure in each window: {figures:#?}"
+    );
+    assert_eq!(figures.len(), image_boxes.len(), "{figures:#?}");
+    for (figure, (name, bbox)) in figures.iter().zip(&image_boxes) {
+        let path = figure["path"].as_str().expect("path");
+        assert!(
+            path.starts_with(&format!("out_figures/{name}")),
+            "{path} vs {name}"
+        );
+        assert!(work.join(path).is_file(), "{path} written");
+        assert_eq!(markdown.matches(path).count(), 1, "{path} referenced once");
+        assert_eq!(&figure["bbox"], bbox, "{figure}");
+    }
+    log_line(
+        TEST,
+        "document",
+        "result",
+        "pass",
+        &format!(
+            "pages={PAGES} windows=2 figures={} figure_pages={figure_pages:?} exit_code=0 \
+             wall_s={:.1}",
+            figures.len(),
+            started.elapsed().as_secs_f64()
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&work);
+}
+
 /// U2-E2: a cancel is a result too. Ctrl+C after the first page streams
 /// stops the document loop at its next step; the CLI writes the page bodies
 /// produced, ends the robot stream with a `run_error` carrying
