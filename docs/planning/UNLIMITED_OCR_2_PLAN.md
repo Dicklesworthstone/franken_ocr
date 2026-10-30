@@ -1275,6 +1275,7 @@ Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a
 | DISC-U2-7 | page2d tok after an extra `<PAGE>` | reset to `pf_cnt[N]` (`SB:1486-1488`) | keeps the running count (`W/…/page2d_rope.py:579-591`) | HF; only reachable on a guard-forced EOS step |
 | DISC-U2-8 | guard lag | none | can lag one step under overlap scheduling | None; SGLang comparisons tolerate it |
 | DISC-U2-9 | non-blank text before the first `<PAGE>` (leading head) | `_uocr_save_results` drops it (`MU:1210`, `split('<PAGE>')[1:]`) | a recomputed window keeps it as body 0 with front-anchored ownership, which shifts pages and drops the last one (`doc_split.py:251-255`) | Prepend it to the first own page's body with `warnings[{kind:"leading_text"}]`, unwindowed and windowed alike (U2-B6, U2-D1a) |
+| DISC-U2-10 | EXIF orientation | ignored: `Image.open(f).convert('RGB')` (`MU:1070`) | ignored: `smart_rgb_conversion = False` (`base_processor.py:215`), so a plain `convert("RGB")` | Applied, as for v1 (the shared decoder, `src/preprocess/mod.rs` `decode_path`). Only an image with a non-identity Orientation tag differs, and the oracle corpus has none (U2-B7) |
 
 **Filing.** `scripts/check_ledgers.py:310` matches only `^## DISC-\d+:`, so a `## DISC-U2-k:` heading
 would escape the required-field, kill-switch and uniqueness checks.
@@ -2520,7 +2521,7 @@ evidence-gated defaults [uocr2,epic].
 |---|---|---|---|
 | OQ-V2-1 | SR-SWA candidate semantics | RESOLVED | §5.6.4 |
 | OQ-V2-2 | Router constants at inference | RESOLVED | §5.6 |
-| OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | OPEN | U2-A6 floor + U2-C1 |
+| OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | OPEN: floor measured by U2-A6 (`FLOOR.json`); U2-C1 sets the tolerances | U2-A6 floor + U2-C1 |
 | OQ-V2-4 | Does HF v2 run in f32 on CPU (dense SDPA path), and is a ported dense fallback needed? | RESOLVED (yes; no port: prefill `_forward_dense`, decode `_decode_attend`, deterministic algorithms on) | U2-A6 (`OQ_INDEX.md`) |
 | OQ-V2-5 | Are the `indexer.*` projections used at inference? | RESOLVED (no) | §5.6.7, D8 |
 | OQ-V2-6 | 1-D RoPE fallback | RESOLVED (franken builds `<PAGE>` prompts; no fallback) | §5.5 |
