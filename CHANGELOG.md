@@ -372,7 +372,8 @@ sections as they land.
   - `--multi-page --json` lists one `pages[]` entry per page read: `page` (the
     source page), `half` on a split spread, `run_index`, `text`, `layout`
     (boxes in that page's own pixels, whatever the other pages' sizes),
-    `tokens` and `finish` (`marker`, `eos`, `page_cap`, `length` or `budget`).
+    `tokens` and `finish` (`marker`, `eos`, `page_cap`, `length`, `budget`, or
+    `cancelled` since U2-E2).
     The markdown is the page texts joined by `<PAGE>`.
   - `--multi-page` now composes with `--split-spreads` and `--extract-figures`
     on an Unlimited-OCR-2 document. Each half of a spread is one page of the
@@ -389,12 +390,56 @@ sections as they land.
     Otherwise `pages` stays `[]` and the `v1_page_merge` warning says why: the
     recorded p20 run has 7 bodies for 20 pages. v1 keeps all three refusals,
     and its markdown is unchanged.
-  - Library: `recognize_multi_page_source_with_model` returns
-    `DocumentPages { markdown, pages }`, each page a `PageResult` (also its
-    `model_id` and `elapsed_ms`). The streaming sink receives a `StreamedPage`
-    that carries the `PageResult` when the model has one.
+  - Library: each page is a `PageResult` (also its `model_id` and
+    `elapsed_ms`), returned in U2-E2's `DocumentResult`. The streaming sink
+    receives a `StreamedPage` that carries the `PageResult` when the model has
+    one.
+- **One library call parses a document** (bead U2-E2; **breaking**, hence
+  0.10.0). `OcrEngine::recognize_document(model_path, source, &options,
+  on_item, on_page)` and its model-level driver `OcrModel::recognize_document`
+  replace every `recognize_multi_page*` function. The CLI's `--multi-page`
+  and `ocr-batch --multi-page` run on it.
+  - The pages come from a `PageSource`: `pdf`, `images`, `directory`, `open`,
+    or the new `rasters` for pages already in memory. Each is read, used and
+    dropped in turn.
+  - `DocumentResult` carries `markdown`, `pages`, `pages_out`, `skipped`
+    (pages that did not rasterize, left out of the prompt), `finish_reason`,
+    `extra_markers`, `warnings` (the run's `{kind, message, recovery, ...}`
+    entries) and `model` (`model_id`, `source_sha256`).
+  - A document that stops early is a result, not an error. An
+    Unlimited-OCR-2 document stopped by the position limit, the stage budget
+    or a cancel returns its completed pages with `finish_reason` `length`,
+    `budget` or the new `cancelled`. The CLI writes those pages, then exits 5,
+    or 6 for a cancel, with a `run_error` carrying `finish_reason` and
+    `pages_out`. Ctrl+C on an Unlimited-OCR-2 document now keeps its pages.
+  - `DocumentOptions` (`page_window`, `resume`, with chaining setters) refuses
+    what this build cannot honor rather than ignoring it: a window smaller
+    than the document and `PageWindow::Auto` until windowed documents land
+    (U2-D1b), and resume until checkpoints land (U2-D4).
+    `PageWindow::Off`, or a window as large as the document, reads past
+    Unlimited-OCR-2's 60-page limit, and the position limit then stops it.
+  - `ocr-batch --multi-page` skips an image that does not decode instead of
+    failing the run, names it on stderr and lists it in the JSON `skipped`
+    (`page`, `image`, `reason`); the run fails only when no image decodes.
+
+  | Removed | Use instead |
+  |---|---|
+  | `OcrEngine::recognize_multi_page(paths)` / `_with_model(m, paths)` | `engine.recognize_document(m, PageSource::images(paths)?, &DocumentOptions::default(), Box::new(\|_\| {}), None)?.markdown` |
+  | `OcrEngine::recognize_multi_page_dynamic(images)` / `_with_model(m, images)` | the same with `PageSource::rasters(images)?` |
+  | `OcrEngine::recognize_multi_page_dynamic_streaming_with_model(m, images, sink)` | the same with `Some(sink)` as `on_page` |
+  | `OcrEngine::recognize_multi_page_source_with_model(m, source, on_item, sink)` | `engine.recognize_document(m, source, &DocumentOptions::default(), on_item, sink)` |
+  | `OcrModel::recognize_multi_page`, `_dynamic`, `_dynamic_streaming`, `recognize_multi_page_source` | `model.recognize_document(&mut source, &options, &mut on_item, on_page)` |
+  | `DocumentPages { markdown, pages }` | `DocumentResult`, whose `markdown` and `pages` are the same |
 
 ### Fixed
+
+- **focr-ios and focr-wasm compile again** (found in U2-E2). Unlimited-OCR-2's
+  document loop read the forward stage budget through a function that only
+  the `native` feature built, so the library failed to compile with the
+  features the iOS and browser crates use (`pdf`, `mmap`). The workspace
+  check hid it, because cargo unifies features across members. The budget
+  is now read in every build, so an embedder driving `OcrModel` directly gets
+  the same cooperative budget.
 
 - The resident daemon is no longer started for a model whose header this
   binary refuses (a newer format, an unknown checkpoint). The run fails inline
