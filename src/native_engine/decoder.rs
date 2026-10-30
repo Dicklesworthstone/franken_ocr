@@ -1701,6 +1701,8 @@ fn prefill_srswa(
     trace: Option<srswa::SrSwaTrace>,
 ) -> FocrResult<(Mat, srswa::SrSwaState)> {
     check_coords("decoder::prefill_with_cache_srswa", inputs_embeds, coords)?;
+    // Every input check before any weight is read.
+    check_embeds("decoder::prefill_with_cache_srswa", inputs_embeds)?;
     let mut state = srswa::SrSwaState::new(wc.router()?, coords, 0)?;
     state.domain = domain;
     state.trace = trace;

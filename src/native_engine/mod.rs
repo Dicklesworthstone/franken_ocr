@@ -578,6 +578,9 @@ pub struct DocumentStats {
     pub peak_kv_bytes: usize,
     /// Reruns without retirement after the retirement detector fired.
     pub retire_fallbacks: usize,
+    /// The page was read from a gundam view, which has no oracle
+    /// certification for Unlimited-OCR-2 yet (U2-E1, U2-G1).
+    pub gundam_view: bool,
 }
 
 /// One document decode `pass(retire, budget_floor, ids, observer)`, first
@@ -817,6 +820,8 @@ pub enum WarningKind {
     LeadingText,
     /// A directory input held files that are not page images (U2-D0).
     IgnoredFiles,
+    /// Unlimited-OCR-2 read a page in the uncertified gundam mode (U2-E1).
+    UncertifiedCropMode,
 }
 
 /// Every machine-stable `warnings[].kind` a run can report, in the robot
@@ -830,6 +835,7 @@ pub const RUN_WARNING_KINDS: &[&str] = &[
     "v2_budget",
     "leading_text",
     "ignored_files",
+    "uncertified_crop_mode",
 ];
 
 /// The one actionable next step for each [`WarningKind`]: the single source
@@ -859,6 +865,10 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
         WarningKind::IgnoredFiles => {
             "only page images are read (PNG, JPEG, TIFF, WebP, BMP, GIF, PNM); convert any of \
              these files that belong to the document"
+        }
+        WarningKind::UncertifiedCropMode => {
+            "use `--crop-mode base` (the default) for certified output; check gundam output \
+             against the page"
         }
     }
 }
@@ -983,6 +993,16 @@ fn v1_page_warnings(report: &DecodeReport) -> Vec<RunWarning> {
 /// at the position limit or the stage budget, with the page bodies produced.
 fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWarning> {
     let mut warnings = Vec::new();
+    if stats.gundam_view {
+        warnings.push(RunWarning {
+            kind: "uncertified_crop_mode",
+            message: "Unlimited-OCR-2 read the page in gundam mode, which no oracle has \
+                      certified yet"
+                .into(),
+            recovery: warning_recovery(WarningKind::UncertifiedCropMode),
+            fields: serde_json::Map::new(),
+        });
+    }
     if stats.leading_text {
         warnings.push(RunWarning {
             kind: "leading_text",
@@ -1394,6 +1414,26 @@ fn resolve_preprocess_mode(o: PreprocessOverrides) -> preprocess::PreprocessMode
     }
 }
 
+/// The view a paged model (`model`) reads each document page in: a base view
+/// of `mode`'s size.
+///
+/// # Errors
+/// [`FocrError::Usage`] for gundam `mode`, which reads a single page: a
+/// document reads base views only (DISC-U2-6), so the request is refused
+/// rather than dropped (U2-E1).
+fn paged_document_view(
+    mode: preprocess::PreprocessMode,
+    model: &str,
+) -> FocrResult<preprocess::PreprocessMode> {
+    match mode {
+        preprocess::PreprocessMode::Base { .. } => Ok(mode),
+        preprocess::PreprocessMode::Gundam { .. } => Err(FocrError::Usage(format!(
+            "--crop-mode gundam reads a single page; a {model} document reads every page as a \
+             base view. Omit --crop-mode, or parse the pages one at a time without --multi-page"
+        ))),
+    }
+}
+
 /// The forward path's preprocess mode under the current process-wide overrides.
 fn preprocess_mode() -> preprocess::PreprocessMode {
     resolve_preprocess_mode(
@@ -1609,6 +1649,37 @@ fn raw_single_shard_names() -> impl Iterator<Item = &'static str> {
 fn is_short_model_spec(path: &Path) -> bool {
     let mut components = path.components();
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+/// The registered model a bare `spec` names (`unlimited-ocr-2`): one path
+/// component equal to a registry id. Such a spec names a model, not a path
+/// (U2-E1, plan §9.1).
+fn registry_spec(spec: &Path) -> Option<&'static dyn model_arch::ModelArch> {
+    if !is_short_model_spec(spec) {
+        return None;
+    }
+    spec.to_str().and_then(model_arch::arch_by_id)
+}
+
+/// Whether the bounded header probe finds `arch` in the artifact at
+/// `resolved`.
+fn artifact_holds(resolved: &Path, arch: &dyn model_arch::ModelArch) -> bool {
+    validate_model_header_file(resolved).is_ok_and(|found| found.id() == arch.id())
+}
+
+/// An artifact found under `arch`'s name whose header names another model is
+/// refused, naming both. A header the probe cannot read is left to the
+/// loader, which reports the format error it is.
+fn check_named_artifact(resolved: &Path, arch: &dyn model_arch::ModelArch) -> FocrResult<()> {
+    match validate_model_header_file(resolved) {
+        Ok(found) if found.id() != arch.id() => Err(FocrError::ModelNotFound(format!(
+            "{} holds the {:?} model, not the requested {:?}",
+            resolved.display(),
+            found.id(),
+            arch.id()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1918,9 +1989,14 @@ fn resolve_model_from_search_dirs_with_quant(
     quant: Option<ModelQuantPreference>,
 ) -> FocrResult<PathBuf> {
     let specs = model_search_specs(spec);
+    // A bare registry id is answered only by that model (U2-E1).
+    let wanted = registry_spec(spec);
     for dir in search_dirs {
+        // A search entry that is itself an artifact serves any other spec, but
+        // a registry id only when its header holds that model.
         if let Some(resolved) = resolve_existing_model_artifact(dir)
             && !focrq_declares_wasm_recipe(&resolved)
+            && wanted.is_none_or(|arch| artifact_holds(&resolved, arch))
         {
             return Ok(resolved);
         }
@@ -1929,6 +2005,9 @@ fn resolve_model_from_search_dirs_with_quant(
                 if let Some(resolved) = resolve_existing_model_artifact(&candidate)
                     && !focrq_declares_wasm_recipe(&resolved)
                 {
+                    if let Some(arch) = wanted {
+                        check_named_artifact(&resolved, arch)?;
+                    }
                     return Ok(resolved);
                 }
             }
@@ -3102,7 +3181,20 @@ impl OcrModel {
     /// specs are searched under `$FOCR_MODEL_DIR` (split with the platform
     /// path-list separator) and the user cache default; each `$FOCR_MODEL_DIR`
     /// entry may itself be a direct artifact/package or a search root.
+    ///
+    /// A bare registry id (`unlimited-ocr-2`) names a model, never a path in
+    /// the working directory: it is only searched for, and the artifact found
+    /// must hold that model (U2-E1). A search entry that is itself an artifact
+    /// of another model is passed over, and an artifact named for the id whose
+    /// header names another model is [`FocrError::ModelNotFound`] naming both.
     pub fn resolve_model(path: &Path) -> FocrResult<PathBuf> {
+        if registry_spec(path).is_some() {
+            return resolve_model_from_search_dirs_with_quant(
+                path,
+                &model_search_dirs(),
+                model_quant_preference(),
+            );
+        }
         if let Some(resolved) = resolve_existing_model_artifact(path) {
             return Ok(resolved);
         }
@@ -3862,12 +3954,16 @@ impl OcrModel {
     /// One document page's preprocess: v1's Base-640 squash, or a paged
     /// model's base letterbox (Unlimited-OCR-2 reads a document page like a
     /// single page, never squashed; U2-B7).
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] when gundam mode was asked of a paged model, whose
+    /// documents read base views only (DISC-U2-6), rather than dropping the
+    /// flag (U2-E1); a decode or preprocess error.
     fn document_page(&self, img: image::DynamicImage) -> FocrResult<Preprocessed> {
         if self.arch().decode_contract().pages.is_some() {
-            let base_size = preprocess_mode().base_size();
             preprocess::preprocess_dynamic(
                 img,
-                preprocess::PreprocessMode::Base { base_size },
+                paged_document_view(preprocess_mode(), self.arch().id())?,
                 preprocess_profile(self.arch()),
             )
         } else {
@@ -4191,6 +4287,9 @@ impl OcrModel {
         stats.page_tokens.clone_from(&split.tokens);
         stats.leading_text = split.leading_text;
         stats.extra_markers = split.extra_markers;
+        stats.gundam_view = pres
+            .iter()
+            .any(|p| matches!(p.mode, preprocess::PreprocessMode::Gundam { .. }));
         timing_log(&format!(
             "document {} pages: {} tokens, finish {}, pages {:?}, forced {}, hf-id-0 {}, \
              retired {} blocks, peak kv {} bytes, retire fallbacks {}",
@@ -6328,6 +6427,65 @@ mod tests {
         }
     }
 
+    /// U2-E1: gundam mode is refused for a paged model's document rather than
+    /// dropped, and a v2 page read from a gundam view warns that the mode is
+    /// uncertified, ahead of the document's other warnings.
+    #[test]
+    fn gundam_is_refused_for_a_v2_document_and_warns_on_a_v2_page() {
+        let base = preprocess::PreprocessMode::Base { base_size: 1024 };
+        assert_eq!(
+            paged_document_view(base, "unlimited-ocr-2").expect("base"),
+            base
+        );
+        let gundam = preprocess::PreprocessMode::Gundam {
+            base_size: 1024,
+            tile_size: 640,
+        };
+        let error = paged_document_view(gundam, "unlimited-ocr-2").expect_err("refused");
+        assert!(matches!(error, FocrError::Usage(_)), "{error}");
+        assert!(
+            error.to_string().contains("unlimited-ocr-2 document"),
+            "{error}"
+        );
+
+        let report = |gundam_view: bool| DecodeReport {
+            ids: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            cap: None,
+            pages: Some(PageBodies {
+                expected: 1,
+                bodies: 1,
+            }),
+            max_length: 32_768,
+            max_positions: sampler::UOCR2_MAX_POSITIONS,
+            decodes: 1,
+            length_stops: 0,
+            document: Some(DocumentStats {
+                gundam_view,
+                leading_text: true,
+                ..DocumentStats::default()
+            }),
+            admission_warnings: Vec::new(),
+        };
+        let kinds = |r: &DecodeReport| {
+            decode_warnings(r)
+                .iter()
+                .map(|w| w.kind)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(kinds(&report(false)), ["leading_text"]);
+        assert_eq!(
+            kinds(&report(true)),
+            ["uncertified_crop_mode", "leading_text"]
+        );
+        let warning = decode_warnings(&report(true)).remove(0);
+        assert_eq!(
+            warning.recovery,
+            warning_recovery(WarningKind::UncertifiedCropMode)
+        );
+        assert!(RUN_WARNING_KINDS.contains(&warning.kind));
+    }
+
     /// U2-B6: an Unlimited-OCR-2 document report earns v2's warnings, never
     /// v1's: the admission's ignored levers first, then `leading_text`, then
     /// `v2_length` or `v2_budget` with the bodies produced. Only a stopped
@@ -6888,6 +7046,73 @@ mod tests {
         let resolved = resolve_model_from_search_dirs(Path::new("unlimited-ocr-2"), &[dir])
             .expect("the subdirectory resolves");
         assert_eq!(resolved, subdir.join(shards::SHARD_INDEX_NAME));
+    }
+
+    /// U2-E1: a bare registry id is answered only by its own model. A search
+    /// entry that is another model's package is passed over (and still serves
+    /// that model's id and any other spec), search order holds, and an
+    /// artifact named for the id whose header holds another model is
+    /// `ModelNotFound` naming both.
+    #[cfg(unix)]
+    #[test]
+    fn a_registry_id_resolves_only_to_its_own_model() {
+        let v1_dir = temp_model_dir("registry_id_v1_raw");
+        let v1_index = write_sparse_two_shard_stand_in(
+            &v1_dir,
+            &unlimited_ocr_census::v1_source_tensors(),
+            &[],
+        );
+        let root = temp_model_dir("registry_id_root");
+        let v2_dir = root.join(model_arch::UNLIMITED_OCR_V2_ID);
+        std::fs::create_dir_all(&v2_dir).expect("v2 subdirectory");
+        let v2_index = write_sparse_v2_stand_in(&v2_dir);
+        let resolve =
+            |spec: &str, dirs: &[PathBuf]| resolve_model_from_search_dirs(Path::new(spec), dirs);
+
+        let v1_only = std::slice::from_ref(&v1_dir);
+        assert_eq!(
+            resolve("unlimited-ocr", v1_only).expect("v1's id"),
+            v1_index
+        );
+        assert_eq!(
+            resolve("anything", v1_only).expect("any other spec"),
+            v1_index
+        );
+        let error = resolve("unlimited-ocr-2", v1_only).expect_err("v1 never answers v2's id");
+        assert!(matches!(error, FocrError::ModelNotFound(_)), "{error}");
+
+        let both = [v1_dir.clone(), root.clone()];
+        assert_eq!(
+            resolve("unlimited-ocr-2", &both).expect("a later entry holds v2"),
+            v2_index
+        );
+        assert_eq!(
+            resolve("unlimited-ocr", &both).expect("the first entry holds v1"),
+            v1_index
+        );
+
+        let misnamed_root = temp_model_dir("registry_id_misnamed");
+        let misnamed = misnamed_root.join(model_arch::UNLIMITED_OCR_V2_ID);
+        std::fs::create_dir_all(&misnamed).expect("misnamed directory");
+        write_sparse_two_shard_stand_in(&misnamed, &unlimited_ocr_census::v1_source_tensors(), &[]);
+        let error = resolve("unlimited-ocr-2", &[misnamed_root]).expect_err("v1 under v2's name");
+        let text = error.to_string();
+        assert!(matches!(error, FocrError::ModelNotFound(_)), "{error}");
+        assert!(
+            text.contains("\"unlimited-ocr\"") && text.contains("\"unlimited-ocr-2\""),
+            "{text}"
+        );
+
+        for (spec, named) in [
+            ("unlimited-ocr-2", true),
+            ("unlimited-ocr", true),
+            ("./unlimited-ocr-2", false),
+            ("models/unlimited-ocr-2", false),
+            ("unlimited-ocr-2.focrq", false),
+            ("unlimited-ocr-3", false),
+        ] {
+            assert_eq!(registry_spec(Path::new(spec)).is_some(), named, "{spec}");
+        }
     }
 
     #[test]
@@ -9484,28 +9709,18 @@ mod tests {
         );
     }
 
-    /// U2-D1a against U2-D2a's windowed oracle, armed by
-    /// `FOCR_UOCR2_WINDOWED_ORACLE`, a dump root (`tests/fixtures/
-    /// PROVENANCE.md`, "Windowed SGLang oracle runs"): per run under it, the
-    /// same plan, fallbacks and text splices, and per window the oracle's
-    /// forced ids and generated ids exactly, on the f32 cache. The oracle's
-    /// injected reasons map onto [`window::FallbackReason`]; `pool_too_small`
-    /// is (ix), which is (vi) here.
+    /// U2-D1a against U2-D2a's windowed oracle (`tests/fixtures/
+    /// uocr2_windowed`, U2-D2b): per windowed run, the same plan, fallbacks
+    /// and text splices, and per window the oracle's forced ids and
+    /// generated ids exactly, on the f32 cache. The oracle's injected reasons
+    /// map onto [`window::FallbackReason`]; `pool_too_small` is (ix), which
+    /// is (vi) here. The unsplit run plans no windows here either.
     #[test]
     fn real_v2_windowed_decode_matches_the_windowed_oracle() {
         let test = "real_v2_windowed_decode_matches_the_windowed_oracle";
         let started = std::time::Instant::now();
-        let Some(root) = std::env::var_os("FOCR_UOCR2_WINDOWED_ORACLE").map(PathBuf::from) else {
-            let why = serde_json::json!({"reason": "FOCR_UOCR2_WINDOWED_ORACLE unset"});
-            v2_gated_line(test, started, "windowed-oracle", "skip", "skip", why);
-            return;
-        };
         let Some(model) = v2_gated_model(test, started) else {
             return;
-        };
-        let read = |path: PathBuf| -> serde_json::Value {
-            serde_json::from_slice(&std::fs::read(&path).expect("oracle dump"))
-                .expect("oracle dump parses")
         };
         let ids = |v: &serde_json::Value| -> Vec<u32> {
             v.as_array().map_or_else(Vec::new, |a| {
@@ -9514,29 +9729,30 @@ mod tests {
                     .collect()
             })
         };
-        let mut tags: Vec<PathBuf> = std::fs::read_dir(&root)
-            .expect("the dump root lists")
-            .map(|e| e.expect("an entry").path())
-            .filter(|p| p.join("run.json").is_file())
-            .collect();
-        tags.sort();
-        assert!(!tags.is_empty(), "no oracle runs under {}", root.display());
         let mut failures = Vec::new();
-        for dir in tags {
-            let tag = dir
-                .file_name()
-                .expect("a tag")
-                .to_string_lossy()
-                .into_owned();
-            let run = read(dir.join("run.json"));
+        for run in window::oracle_fixtures() {
+            let tag = run["tag"].as_str().expect("a tag").to_string();
             let width = usize::try_from(run["window"].as_u64().expect("window")).expect("W");
-            let windows: Vec<serde_json::Value> =
-                (0..run["windows"].as_array().expect("windows").len())
-                    .map(|k| read(dir.join(format!("w{k}/window.json"))))
-                    .collect();
+            let windows = run["windows"].as_array().expect("windows");
+            if run["plan"].is_null() {
+                let [only] = windows.as_slice() else {
+                    panic!("{tag}: an unsplit run is one window");
+                };
+                let pages = only["pages"].as_array().expect("pages").len();
+                let opts = window::WindowedOptions {
+                    window: width,
+                    precision: Some(DocumentPrecision::CachedF32),
+                    ..window::WindowedOptions::default()
+                };
+                let unsplit = model
+                    .decode_document_windowed(pages, &mut std::iter::empty(), &opts, None)
+                    .expect("planning runs");
+                assert!(unsplit.is_none(), "{tag}: the oracle split no windows");
+                continue;
+            }
             // The document's pages: each window's own pages, in order.
             let mut names: Vec<String> = Vec::new();
-            for w in &windows {
+            for w in windows {
                 let lo_hi = w["lo_hi_emit"].as_array().expect("lo_hi_emit");
                 let own = lo_hi[1].as_u64().expect("hi") - lo_hi[0].as_u64().expect("lo");
                 let pages = w["pages"].as_array().expect("pages");
@@ -9561,7 +9777,7 @@ mod tests {
                 .unwrap_or_default();
             for (k, how) in &forced {
                 let k: usize = k.parse().expect("a window index");
-                match how["reason"].as_str().expect("a reason") {
+                match how.as_str().expect("a reason") {
                     "pool_too_small" => {
                         opts.force_fallback.push((k, window::FallbackReason::Alloc));
                     }
@@ -9580,7 +9796,7 @@ mod tests {
             let doc = v2_windowed(&model, &paths, &opts, &mut bodies);
             assert_eq!(doc.windows.len(), windows.len(), "{tag}: windows");
             let mut first_mismatch = Vec::new();
-            for ((w, ours), oracle) in doc.windows.iter().zip(&doc.window_ids).zip(&windows) {
+            for ((w, ours), oracle) in doc.windows.iter().zip(&doc.window_ids).zip(windows) {
                 let want_forced = ids(&oracle["forced_ids"]);
                 let want = ids(&oracle["generated_ids"]);
                 assert_eq!(
@@ -9610,13 +9826,29 @@ mod tests {
                     "tokens": got.len(), "oracle_tokens": want.len(),
                 }));
             }
+            // The stitched document: the wheel's bodies, as the sink saw them.
+            let want_bodies: Vec<&str> = run["document"]["bodies"]
+                .as_array()
+                .expect("bodies")
+                .iter()
+                .map(|b| b.as_str().expect("a body"))
+                .collect();
+            let bodies_equal =
+                doc.pages.bodies == want_bodies && bodies.concat() == doc.pages.bodies;
+            if !bodies_equal {
+                failures.push(format!(
+                    "{tag}: the stitched bodies differ from the oracle's"
+                ));
+            }
             let mut line = v2_windowed_line(&doc);
             line["compare"] = first_mismatch.into();
+            line["bodies_equal"] = bodies_equal.into();
             line["path"] = "f32-cached".into();
-            let exact = line["compare"].as_array().is_some_and(|c| {
-                c.iter()
-                    .all(|w| w["forced_equal"] == true && w["first_mismatch"].is_null())
-            });
+            let exact = bodies_equal
+                && line["compare"].as_array().is_some_and(|c| {
+                    c.iter()
+                        .all(|w| w["forced_equal"] == true && w["first_mismatch"].is_null())
+                });
             let result = if exact { "pass" } else { "fail" };
             v2_gated_line(test, started, &tag, "windowed_parity", result, line);
         }

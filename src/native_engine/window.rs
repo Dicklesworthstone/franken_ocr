@@ -1208,6 +1208,25 @@ fn page_base(base: usize) -> FocrResult<u32> {
         .map_err(|_| FocrError::Other(anyhow::anyhow!("page base {base} is out of range")))
 }
 
+/// The committed U2-D2a windowed-oracle runs (`tests/fixtures/uocr2_windowed`,
+/// U2-D2b), in tag order.
+#[cfg(test)]
+pub(super) fn oracle_fixtures() -> Vec<serde_json::Value> {
+    let dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uocr2_windowed");
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .expect("the fixture directory")
+        .map(|e| e.expect("an entry").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect();
+    paths.sort();
+    assert_eq!(paths.len(), 5, "the five committed runs");
+    paths
+        .iter()
+        .map(|p| serde_json::from_slice(&std::fs::read(p).expect("a fixture")).expect("JSON"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1749,5 +1768,402 @@ mod tests {
         assert!(straddles(&p, 300, true), "not at the run's last row");
         let one = parse_prompt(&full_prompt(&[273])).unwrap();
         assert!(!straddles(&one, 274, true), "the one-page variant's row");
+    }
+
+    /// One window's KV rows, as the U2-D2a dumps record them (`rows.*.npy`):
+    /// per row its id, origin (0 prefilled, 1 copied, 2 spliced text, 3
+    /// decode input), source row, image page, query page (−2 for a row that
+    /// never queried here), bucket, tok_pos and RoPE page (a copied row's
+    /// own), and its bucket and RoPE page in this window's frame.
+    #[derive(Debug, Default)]
+    struct OracleRows {
+        arrays: [Vec<i32>; 10],
+    }
+
+    /// [`OracleRows`]' arrays, in the fixture's `rows_sha256` names.
+    const ROW_ARRAYS: [&str; 10] = [
+        "ids",
+        "origin",
+        "src_row",
+        "img_page",
+        "q_page",
+        "bucket",
+        "tok_pos",
+        "rope_page",
+        "frame_bucket",
+        "frame_rope_page",
+    ];
+
+    impl OracleRows {
+        /// Append a row: `own` is its (bucket, tok_pos, RoPE page), `frame`
+        /// its (bucket, RoPE page) in this window.
+        fn push(
+            &mut self,
+            id: u32,
+            (origin, src, img, q): (i32, i32, i32, i32),
+            own: [u32; 3],
+            frame: [u32; 2],
+        ) {
+            let int = |v: u32| i32::try_from(v).expect("an i32 coordinate");
+            let row = [
+                int(id),
+                origin,
+                src,
+                img,
+                q,
+                int(own[0]),
+                int(own[1]),
+                int(own[2]),
+                int(frame[0]),
+                int(frame[1]),
+            ];
+            for (array, value) in self.arrays.iter_mut().zip(row) {
+                array.push(value);
+            }
+        }
+
+        /// Row `r`'s own (bucket, tok_pos, RoPE page), which a copy keeps.
+        fn own(&self, r: usize) -> [u32; 3] {
+            let at = |a: usize| u32::try_from(self.arrays[a][r]).expect("a coordinate");
+            [at(5), at(6), at(7)]
+        }
+
+        fn len(&self) -> usize {
+            self.arrays[0].len()
+        }
+
+        /// The sha256 of array `a`'s little-endian int32 data, the dumps'
+        /// manifest hash.
+        fn sha256(&self, a: usize) -> String {
+            use sha2::Digest as _;
+            let mut hasher = sha2::Sha256::new();
+            for v in &self.arrays[a] {
+                hasher.update(v.to_le_bytes());
+            }
+            hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        }
+    }
+
+    /// The dumps' RoPE page of a row in `bucket` at page base `base`: the
+    /// bucket plus the base's parity where the bucket is positive, unfolded.
+    /// The rotary folds it mod 2, as [`srswa::rope_page`] already has.
+    fn dump_rope(bucket: u32, base: usize) -> u32 {
+        let base = u32::try_from(base).expect("a page base");
+        let unfolded = if bucket == 0 { 0 } else { bucket + base % 2 };
+        assert_eq!(
+            unfolded % 2,
+            srswa::rope_page(bucket, base),
+            "the folded page"
+        );
+        unfolded
+    }
+
+    /// The decode rows fed from `seed` at page base `base`: each id's
+    /// coordinates as SGLang records them. A `<PAGE>` past the last bucket
+    /// clamps there; HF resets its tok_pos to the bucket's prompt count and
+    /// SGLang keeps the running count (DISC-U2-7), which only the
+    /// guard-forced EOS step after it reads.
+    fn decode_rows(
+        rows: &mut OracleRows,
+        mut seed: srswa::DecodePageState,
+        base: usize,
+        fed: &[u32],
+    ) {
+        let mut last: Option<srswa::DecodeCoord> = None;
+        for &id in fed {
+            let mut c = seed.feed(id);
+            assert_eq!(c.rope_page, dump_rope(c.bucket, base) % 2);
+            if let Some(prev) = last
+                && id == PAGE
+                && c.bucket == prev.bucket
+            {
+                c.tok_pos = prev.tok_pos + 1;
+            }
+            let rope = dump_rope(c.bucket, base);
+            let own = [c.bucket, c.tok_pos, rope];
+            rows.push(id, (3, -1, -1, c.query_page), own, [c.bucket, rope]);
+            last = Some(c);
+        }
+    }
+
+    /// A finished window, as its successor reads it.
+    struct OracleWindow {
+        prompt_ids: Vec<u32>,
+        /// Its output with its forced ids, cut before the extra marker.
+        output: Vec<u32>,
+        lookahead: usize,
+        rows: OracleRows,
+    }
+
+    fn fixture_ids(v: &serde_json::Value) -> Vec<u32> {
+        v.as_array().map_or_else(Vec::new, |a| {
+            a.iter()
+                .map(|id| u32::try_from(id.as_u64().expect("an id")).expect("a u32 id"))
+                .collect()
+        })
+    }
+
+    fn fixture_usize(v: &serde_json::Value) -> usize {
+        usize::try_from(v.as_u64().expect("a count")).expect("a usize")
+    }
+
+    /// U2-D2b, model-free: per committed U2-D2a run
+    /// (`tests/fixtures/uocr2_windowed`), the plan, each reused window's copy
+    /// plan, text tail, splice rows and retention, and every KV row's
+    /// coordinates, rebuilt here from the oracle's own generated ids, equal
+    /// the wheel's: the row arrays hash to the dumps' (§5.10.3–5.10.4).
+    #[test]
+    fn windowed_rows_match_the_oracle_dumps() {
+        let mut windows_checked = 0;
+        for fx in oracle_fixtures() {
+            let tag = fx["tag"].as_str().expect("a tag").to_string();
+            let width = fixture_usize(&fx["window"]);
+            let windows = fx["windows"].as_array().expect("windows");
+            let pages = fixture_usize(&windows.last().expect("a window")["lo_hi_emit"][1]);
+            let plan = plan_windows(pages, width, PER_PAGE_EST_BASE, UOCR2_UNWINDOWED_PAGE_LIMIT);
+            match fx["plan"].as_array() {
+                None => assert_eq!(plan, None, "{tag}: unwindowed"),
+                Some(want) => {
+                    let got: Vec<serde_json::Value> = plan
+                        .expect("windowed")
+                        .iter()
+                        .map(|w| serde_json::json!([w.lo, w.hi, w.lo]))
+                        .collect();
+                    assert_eq!(&got, want, "{tag}: plan");
+                }
+            }
+            let mut prev: Option<OracleWindow> = None;
+            for w in windows {
+                let k = fixture_usize(&w["window"]);
+                let at = format!("{tag} w{k}");
+                let lo = fixture_usize(&w["lo_hi_emit"][0]);
+                let hi = fixture_usize(&w["lo_hi_emit"][1]);
+                let lookahead = fixture_usize(&w["lookahead"]);
+                let counts: Vec<usize> = w["prompt_image_counts"]
+                    .as_array()
+                    .expect("image counts")
+                    .iter()
+                    .map(fixture_usize)
+                    .collect();
+                let bos = u32::try_from(w["prompt_bos_id"].as_u64().expect("BOS")).expect("u32");
+                let instruction = fixture_ids(&w["prompt_instruction_ids"]);
+                let (full, _) = paged_prompt(bos, PAGE, IMAGE, &counts, &instruction);
+                let forced = fixture_ids(&w["forced_ids"]);
+                let generated = fixture_ids(&w["generated_ids"]);
+                let mut rows = OracleRows::default();
+                let reused = w["reused"] == true;
+                let base;
+                let prompt_ids = if reused {
+                    let prev = prev.as_ref().expect("a reused window follows one");
+                    base = lo - CONTEXT_PAGES;
+                    let plan = plan_tail_copy(&prev.prompt_ids, &full, prev.lookahead, true)
+                        .expect("a tail plan");
+                    let want = &w["tail_copy_plan"];
+                    let got = serde_json::json!({
+                        "src_positions": [plan.marker_src, plan.copy_src.start, plan.copy_src.end],
+                        "copy_len": plan.copy_len, "kept_from": plan.kept_from,
+                        "old_pages": plan.old_pages, "new_pages": plan.new_pages,
+                        "copied_pages": plan.copied_pages, "allow_straddle": plan.straddle,
+                    });
+                    for (key, value) in got.as_object().expect("an object") {
+                        assert_eq!(&want[key], value, "{at}: tail plan {key}");
+                    }
+                    assert_eq!(plan.new_ids.len(), fixture_usize(&w["prompt_len"]), "{at}");
+                    let c = srswa::PageCoords::build(&plan.new_ids).expect("coordinates");
+                    let rope = |b: u32| dump_rope(b, base);
+                    let sources = std::iter::once(plan.marker_src).chain(plan.copy_src.clone());
+                    for (r, src) in sources.enumerate() {
+                        let flags = (1, src as i32, c.img_page[r], -2);
+                        let frame = [c.bucket[r], rope(c.bucket[r])];
+                        rows.push(plan.new_ids[r], flags, prev.rows.own(src), frame);
+                    }
+                    for r in plan.copy_len..plan.new_ids.len() {
+                        let flags = (0, -1, c.img_page[r], c.query_page[r]);
+                        let own = [c.bucket[r], c.tok_pos[r], rope(c.bucket[r])];
+                        rows.push(plan.new_ids[r], flags, own, [own[0], own[2]]);
+                    }
+                    // The text tail, which a failed text splice drops: only
+                    // the forced `<PAGE>` follows (DR:1257-1285).
+                    let (marker, text) = forced.split_last().expect("a forced <PAGE>");
+                    assert_eq!(*marker, PAGE, "{at}");
+                    if !text.is_empty() {
+                        let (start, tail) =
+                            text_tail(&prev.output, TAIL_TOKENS).expect("a text tail");
+                        assert_eq!(tail, text, "{at}: the text tail");
+                        for (j, &id) in tail.iter().enumerate() {
+                            let src = prev.prompt_ids.len() + start + j;
+                            // The seeded carry's response bucket is the tail page's.
+                            rows.push(
+                                id,
+                                (2, src as i32, -1, -2),
+                                prev.rows.own(src),
+                                [1, rope(1)],
+                            );
+                        }
+                    }
+                    let splice = plan.new_ids.len();
+                    let splice = serde_json::json!([splice, splice + text.len()]);
+                    assert_eq!(w["splice_rows"], splice, "{at}: splice rows");
+                    let seed = srswa::DecodePageState::reused_window(&c, base as u32)
+                        .expect("a reused-window seed");
+                    let fed: Vec<u32> = std::iter::once(PAGE).chain(generated.clone()).collect();
+                    decode_rows(&mut rows, seed, base, &fed);
+                    if text.is_empty() {
+                        // With no text rows to carry it, the wheel writes the
+                        // first step's carry into the prompt's last slot,
+                        // whose image page then reads −1; franken_ocr keeps
+                        // the row's page (DISC-U2-12).
+                        rows.arrays[3][plan.new_ids.len() - 1] = -1;
+                    }
+                    plan.new_ids
+                } else {
+                    base = lo;
+                    assert!(
+                        forced.is_empty(),
+                        "{at}: a recomputed window forces nothing"
+                    );
+                    assert_eq!(full.len(), fixture_usize(&w["prompt_len"]), "{at}");
+                    let c = srswa::PageCoords::build(&full).expect("coordinates");
+                    for r in 0..full.len() {
+                        let flags = (0, -1, c.img_page[r], c.query_page[r]);
+                        let rope = dump_rope(c.bucket[r], base);
+                        rows.push(
+                            full[r],
+                            flags,
+                            [c.bucket[r], c.tok_pos[r], rope],
+                            [c.bucket[r], rope],
+                        );
+                    }
+                    decode_rows(
+                        &mut rows,
+                        srswa::DecodePageState::after_prompt(&c, base as u32),
+                        base,
+                        &generated,
+                    );
+                    full
+                };
+                assert_eq!(
+                    fixture_usize(&w["page_base"]["effective"]),
+                    base,
+                    "{at}: page base"
+                );
+                assert_eq!(rows.len(), fixture_usize(&w["kv_rows"]), "{at}: KV rows");
+                for (a, name) in ROW_ARRAYS.iter().enumerate() {
+                    assert_eq!(
+                        rows.sha256(a),
+                        w["rows_sha256"][name].as_str().expect("a hash"),
+                        "{at}: rows.{name}"
+                    );
+                }
+                // Retention: the output with its forced ids, cut before the
+                // marker past the own pages; the kept rows widened to 32-row
+                // pages within the KV rows, as the wheel keeps them.
+                let own = hi - lo;
+                let output: Vec<u32> = forced.iter().chain(&generated).copied().collect();
+                let output = cut_at_extra_marker(&output, own).to_vec();
+                let retention = &w["retention"];
+                if retention["retained"] == true {
+                    assert_eq!(
+                        output.len(),
+                        fixture_usize(&retention["output_ids_kept"]),
+                        "{at}"
+                    );
+                    assert_eq!(
+                        fixture_usize(&retention["next_page"]),
+                        hi,
+                        "{at}: next page"
+                    );
+                    let p = parse_prompt(&prompt_ids).expect("the prompt parses");
+                    let last = p.pages() - lookahead - 1;
+                    let marker = p.page_starts[last];
+                    let image = tail_start(p.page_ends[last]).expect("an image tail")
+                        ..p.page_ends[last + 1];
+                    let (start, tail) = text_tail(&output, TAIL_TOKENS).expect("a text tail");
+                    let text = prompt_ids.len() + start..prompt_ids.len() + start + tail.len();
+                    let widen = |r: Range<usize>| {
+                        let b = srswa::BLOCK_SIZE;
+                        (r.start / b * b)..r.end.div_ceil(b).saturating_mul(b).min(rows.len())
+                    };
+                    let mut kept: Vec<usize> = [marker..marker + 1, image, text]
+                        .into_iter()
+                        .flat_map(widen)
+                        .collect();
+                    kept.sort_unstable();
+                    kept.dedup();
+                    let want: Vec<usize> = retention["kept_ranges"]
+                        .as_array()
+                        .expect("kept ranges")
+                        .iter()
+                        .flat_map(|r| fixture_usize(&r[0])..fixture_usize(&r[1]))
+                        .collect();
+                    assert_eq!(kept, want, "{at}: kept rows");
+                }
+                prev = Some(OracleWindow {
+                    prompt_ids,
+                    output,
+                    lookahead,
+                    rows,
+                });
+                windows_checked += 1;
+            }
+        }
+        assert_eq!(windows_checked, 15, "every committed window");
+    }
+
+    /// U2-D2b, tokenizer-gated (`FOCR_UOCR2_SOURCE_DIR`): each committed
+    /// run's windows, split into their own pages' bodies as the driver splits
+    /// them (an unsplit run as an unwindowed document), stitch to the wheel's
+    /// document bodies (W/`entrypoints/openai/doc_split.py`): the same
+    /// ownership across windows, hidden forced `<PAGE>` and closing
+    /// lookahead marker.
+    #[test]
+    fn windowed_bodies_match_the_oracle_stitching() {
+        use sha2::Digest as _;
+        let Some(dir) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR") else {
+            eprintln!("SKIP windowed stitching: FOCR_UOCR2_SOURCE_DIR unset");
+            return;
+        };
+        let bytes = std::fs::read(std::path::Path::new(&dir).join("tokenizer.json"))
+            .expect("the v2 tokenizer.json");
+        assert_eq!(
+            format!("{:x}", sha2::Sha256::digest(&bytes)),
+            super::super::model_arch::UNLIMITED_OCR_V2_TOKENIZER_SHA256,
+            "the pinned v2 tokenizer"
+        );
+        let tok = crate::tokenizer::Tokenizer::from_json_bytes(&bytes).expect("it loads");
+        for fx in oracle_fixtures() {
+            let tag = fx["tag"].as_str().expect("a tag");
+            let windowed = fx["plan"].is_array();
+            let mut bodies = Vec::new();
+            for w in fx["windows"].as_array().expect("windows") {
+                let lo = fixture_usize(&w["lo_hi_emit"][0]);
+                let own = fixture_usize(&w["lo_hi_emit"][1]) - lo;
+                let ids = fixture_ids(&w["generated_ids"]);
+                let split = if windowed {
+                    postprocess::split_window_pages(
+                        &tok,
+                        &ids,
+                        PAGE,
+                        own,
+                        w["reused"] == true,
+                        fixture_usize(&w["lookahead"]) > 0,
+                    )
+                } else {
+                    postprocess::split_pages_by_token(&tok, &ids, PAGE, own)
+                };
+                bodies.extend(split.expect("the ids split").bodies);
+            }
+            let want: Vec<&str> = fx["document"]["bodies"]
+                .as_array()
+                .expect("bodies")
+                .iter()
+                .map(|b| b.as_str().expect("a body"))
+                .collect();
+            assert_eq!(bodies, want, "{tag}: stitched bodies");
+        }
     }
 }

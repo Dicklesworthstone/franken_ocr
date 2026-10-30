@@ -30,13 +30,6 @@ use std::process::ExitCode;
 #[cfg(debug_assertions)]
 const FORCE_TEST_ERROR_ENV: &str = "FOCR_TEST_FORCE_ERROR";
 
-const DEFAULT_BASE_SIZE: i64 = 1024;
-const DEFAULT_IMAGE_SIZE: i64 = 640;
-const DEFAULT_MAX_LENGTH: i64 = 32_768;
-const DEFAULT_TEMPERATURE: f32 = 0.0;
-const DEFAULT_NO_REPEAT_NGRAM: i64 = 35;
-const DEFAULT_NGRAM_WINDOW: i64 = 128;
-
 /// The shared process entrypoint for both binaries (`focr` and `franken_ocr`).
 ///
 /// `fn main()` in each shim is **synchronous by design** (plan §3.3, §7.1): the
@@ -277,12 +270,15 @@ pub struct OcrRequestArgs {
     /// Explicit model artifact path for diagnostics and model-gated runs.
     #[arg(long)]
     pub model: Option<PathBuf>,
-    /// Reference global-view size from `infer(..., base_size=1024)`.
-    #[arg(long, default_value_t = DEFAULT_BASE_SIZE)]
-    pub base_size: i64,
-    /// Reference local tile size from `infer(..., image_size=640)`.
-    #[arg(long, default_value_t = DEFAULT_IMAGE_SIZE)]
-    pub image_size: i64,
+    /// Global-view edge length. Default: the model's (1024, the reference
+    /// `infer(..., base_size=1024)`). Like every tuning flag below, an explicit
+    /// value always reaches the model, even one equal to a default.
+    #[arg(long)]
+    pub base_size: Option<i64>,
+    /// Local tile edge length for `--crop-mode gundam`. Default: the model's
+    /// (640, the reference `infer(..., image_size=640)`).
+    #[arg(long)]
+    pub image_size: Option<i64>,
     /// Vision preprocessing mode (unlimited-ocr only — got-ocr2 always uses its
     /// own fixed squash-1024 preprocess). `base` (the default) is the certified
     /// single 1024-pixel global view — the mode every oracle cert and golden
@@ -292,29 +288,26 @@ pub struct OcrRequestArgs {
     /// e2e oracle certification yet. (Until bd-1e9n this flag was parsed and
     /// silently dropped with a `gundam` default label the engine never honored;
     /// the default now states the real, certified behavior.)
-    #[arg(long, value_enum, default_value_t = CropMode::Base)]
-    pub crop_mode: CropMode,
-    /// Maximum generated sequence length.
-    #[arg(long, default_value_t = DEFAULT_MAX_LENGTH)]
-    pub max_length: i64,
-    /// Decode temperature; 0.0 means greedy. (unlimited-ocr only — got-ocr2
-    /// decodes greedy.)
-    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
-    pub temperature: f32,
-    /// No-repeat n-gram size (env override: FOCR_NO_REPEAT_NGRAM). For
-    /// unlimited-ocr this is the sliding-window guard (with --ngram-window);
-    /// for got-ocr2 it overrides the model's global guard (default 20; 0
-    /// disables).
-    #[arg(
-        long,
-        env = "FOCR_NO_REPEAT_NGRAM",
-        default_value_t = DEFAULT_NO_REPEAT_NGRAM
-    )]
-    pub no_repeat_ngram: i64,
-    /// Sliding no-repeat n-gram lookback window. (unlimited-ocr only —
-    /// got-ocr2's guard is global.)
-    #[arg(long, default_value_t = DEFAULT_NGRAM_WINDOW)]
-    pub ngram_window: i64,
+    #[arg(long, value_enum)]
+    pub crop_mode: Option<CropMode>,
+    /// Maximum generated sequence length. Default: the model's (32768 for
+    /// unlimited-ocr).
+    #[arg(long)]
+    pub max_length: Option<i64>,
+    /// Decode temperature; 0.0 (the default) means greedy. (unlimited-ocr only
+    /// — got-ocr2 decodes greedy.)
+    #[arg(long)]
+    pub temperature: Option<f32>,
+    /// No-repeat n-gram size (env override: FOCR_NO_REPEAT_NGRAM; 0 disables).
+    /// Default: the model's. For unlimited-ocr this is the sliding-window guard
+    /// (35, with --ngram-window); for got-ocr2 it overrides the model's global
+    /// guard (default 20).
+    #[arg(long, env = "FOCR_NO_REPEAT_NGRAM")]
+    pub no_repeat_ngram: Option<i64>,
+    /// Sliding no-repeat n-gram lookback window. Default: the model's (128 for
+    /// unlimited-ocr). (got-ocr2's guard is global.)
+    #[arg(long)]
+    pub ngram_window: Option<i64>,
     /// GOT-OCR2 structured output: use the model's `OCR with format:` mode instead
     /// of plain text, emitting Mathpix-Markdown (.mmd) — inline LaTeX math, Markdown
     /// tables, TikZ geometry, SMILES molecules, and `**kern` sheet music (the model
@@ -383,13 +376,14 @@ pub struct OcrRequestArgs {
 pub struct OcrRequest {
     pub image: PathBuf,
     pub model: Option<PathBuf>,
-    pub base_size: u32,
-    pub image_size: u32,
-    pub crop_mode: CropMode,
-    pub max_length: u32,
-    pub temperature: f32,
-    pub no_repeat_ngram: u32,
-    pub ngram_window: u32,
+    /// The tuning flags, each `None` unless given (the model's default).
+    pub base_size: Option<u32>,
+    pub image_size: Option<u32>,
+    pub crop_mode: Option<CropMode>,
+    pub max_length: Option<u32>,
+    pub temperature: Option<f32>,
+    pub no_repeat_ngram: Option<u32>,
+    pub ngram_window: Option<u32>,
     pub format: bool,
     pub question: Option<String>,
     pub pages: Option<String>,
@@ -418,35 +412,27 @@ impl RobotRunArgs {
 }
 
 /// Map the request's preprocess tuning flags onto engine
-/// [`native_engine::PreprocessOverrides`] (bd-1e9n), with the same
-/// explicit-only rule as [`decode_overrides_from`] for the sizes. `--crop-mode`
-/// is a two-value enum whose `base` default IS the engine default, so only
-/// `gundam` produces an override.
+/// [`native_engine::PreprocessOverrides`] (bd-1e9n): every flag given becomes
+/// an override, as in [`decode_overrides_from`].
 fn preprocess_overrides_from(request: &OcrRequest) -> native_engine::PreprocessOverrides {
     native_engine::PreprocessOverrides {
-        base_size: (i64::from(request.base_size) != DEFAULT_BASE_SIZE)
-            .then_some(request.base_size as usize),
-        image_size: (i64::from(request.image_size) != DEFAULT_IMAGE_SIZE)
-            .then_some(request.image_size as usize),
-        gundam: matches!(request.crop_mode, CropMode::Gundam).then_some(true),
+        base_size: request.base_size.map(|v| v as usize),
+        image_size: request.image_size.map(|v| v as usize),
+        gundam: request.crop_mode.map(|mode| mode == CropMode::Gundam),
     }
 }
 
 /// Map the request's decode tuning flags onto engine
-/// [`native_engine::DecodeOverrides`]. A value becomes an override only when it
-/// differs from the compiled default (bit-exact for the float), so an untouched
-/// flag keeps the engine-side default AND leaves env overrides (e.g.
-/// `FOCR_MAX_NEW_TOKENS`) in force.
+/// [`native_engine::DecodeOverrides`]. Every flag given becomes an override,
+/// even one equal to a default, because another model's defaults differ
+/// (U2-E1); an untouched flag keeps the model's default and leaves env
+/// overrides (e.g. `FOCR_MAX_NEW_TOKENS`) in force.
 fn decode_overrides_from(request: &OcrRequest) -> native_engine::DecodeOverrides {
     native_engine::DecodeOverrides {
-        max_length: (i64::from(request.max_length) != DEFAULT_MAX_LENGTH)
-            .then_some(request.max_length as usize),
-        temperature: (request.temperature.to_bits() != DEFAULT_TEMPERATURE.to_bits())
-            .then_some(request.temperature),
-        no_repeat_ngram: (i64::from(request.no_repeat_ngram) != DEFAULT_NO_REPEAT_NGRAM)
-            .then_some(request.no_repeat_ngram as usize),
-        ngram_window: (i64::from(request.ngram_window) != DEFAULT_NGRAM_WINDOW)
-            .then_some(request.ngram_window as usize),
+        max_length: request.max_length.map(|v| v as usize),
+        temperature: request.temperature,
+        no_repeat_ngram: request.no_repeat_ngram.map(|v| v as usize),
+        ngram_window: request.ngram_window.map(|v| v as usize),
     }
 }
 
@@ -461,13 +447,31 @@ impl OcrRequestArgs {
         Ok(OcrRequest {
             image: self.image.clone(),
             model: self.model.clone(),
-            base_size: positive_u32("base-size", self.base_size)?,
-            image_size: positive_u32("image-size", self.image_size)?,
+            base_size: self
+                .base_size
+                .map(|v| positive_u32("base-size", v))
+                .transpose()?,
+            image_size: self
+                .image_size
+                .map(|v| positive_u32("image-size", v))
+                .transpose()?,
             crop_mode: self.crop_mode,
-            max_length: positive_u32("max-length", self.max_length)?,
-            temperature: non_negative_finite_f32("temperature", self.temperature)?,
-            no_repeat_ngram: non_negative_u32("no-repeat-ngram", self.no_repeat_ngram)?,
-            ngram_window: non_negative_u32("ngram-window", self.ngram_window)?,
+            max_length: self
+                .max_length
+                .map(|v| positive_u32("max-length", v))
+                .transpose()?,
+            temperature: self
+                .temperature
+                .map(|v| non_negative_finite_f32("temperature", v))
+                .transpose()?,
+            no_repeat_ngram: self
+                .no_repeat_ngram
+                .map(|v| non_negative_u32("no-repeat-ngram", v))
+                .transpose()?,
+            ngram_window: self
+                .ngram_window
+                .map(|v| non_negative_u32("ngram-window", v))
+                .transpose()?,
             // `--format` and a format-implying `--task` compose OR-wise: an
             // explicit `--format` wins / is idempotent alongside `--task`.
             format: self.format || self.task.implies_got_format(),
@@ -3562,13 +3566,13 @@ mod tests {
                 request: OcrRequestArgs {
                     image: PathBuf::from("scan.png"),
                     model: None,
-                    base_size: DEFAULT_BASE_SIZE,
-                    image_size: DEFAULT_IMAGE_SIZE,
-                    crop_mode: CropMode::Gundam,
-                    max_length: DEFAULT_MAX_LENGTH,
-                    temperature: DEFAULT_TEMPERATURE,
-                    no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
-                    ngram_window: DEFAULT_NGRAM_WINDOW,
+                    base_size: None,
+                    image_size: None,
+                    crop_mode: Some(CropMode::Gundam),
+                    max_length: None,
+                    temperature: None,
+                    no_repeat_ngram: None,
+                    ngram_window: None,
                     format: false,
                     task: OcrTask::Ocr,
                     question: None,
@@ -3596,13 +3600,13 @@ mod tests {
                     request: OcrRequestArgs {
                         image: PathBuf::from("scan.png"),
                         model: None,
-                        base_size: DEFAULT_BASE_SIZE,
-                        image_size: DEFAULT_IMAGE_SIZE,
-                        crop_mode: CropMode::Gundam,
-                        max_length: DEFAULT_MAX_LENGTH,
-                        temperature: DEFAULT_TEMPERATURE,
-                        no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
-                        ngram_window: DEFAULT_NGRAM_WINDOW,
+                        base_size: None,
+                        image_size: None,
+                        crop_mode: Some(CropMode::Gundam),
+                        max_length: None,
+                        temperature: None,
+                        no_repeat_ngram: None,
+                        ngram_window: None,
                         format: false,
                         task: OcrTask::Ocr,
                         question: None,
@@ -3624,13 +3628,13 @@ mod tests {
             request: OcrRequestArgs {
                 image: PathBuf::from("scan.png"),
                 model: None,
-                base_size: -1,
-                image_size: DEFAULT_IMAGE_SIZE,
-                crop_mode: CropMode::Gundam,
-                max_length: DEFAULT_MAX_LENGTH,
-                temperature: DEFAULT_TEMPERATURE,
-                no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
-                ngram_window: DEFAULT_NGRAM_WINDOW,
+                base_size: Some(-1),
+                image_size: None,
+                crop_mode: Some(CropMode::Gundam),
+                max_length: None,
+                temperature: None,
+                no_repeat_ngram: None,
+                ngram_window: None,
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,
@@ -3904,8 +3908,8 @@ mod tests {
             native_engine::PreprocessOverrides::default()
         );
 
-        // Explicit flags ⇒ each maps onto the engine overrides; gundam is the
-        // only crop-mode value that produces one (base IS the engine default).
+        // Explicit flags ⇒ each maps onto the engine overrides, an explicit
+        // `--crop-mode base` included (U2-E1).
         let cli = Cli::try_parse_from([
             "focr",
             "ocr",
@@ -3932,7 +3936,7 @@ mod tests {
             unreachable!("expected ocr command");
         };
         let o = preprocess_overrides_from(&args.to_request().expect("request builds"));
-        assert_eq!(o.gundam, None);
+        assert_eq!(o.gundam, Some(false));
     }
 
     #[test]
@@ -3973,15 +3977,30 @@ mod tests {
         assert_eq!(o.no_repeat_ngram, Some(20));
         assert_eq!(o.ngram_window, Some(1024));
 
-        // Explicitly passing the default value is indistinguishable from default
-        // (and behaviorally identical), so it maps to no override.
-        let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--max-length", "32768"])
-            .expect("ocr parses");
+        // An explicit value equal to unlimited-ocr's default is still forwarded:
+        // another model's defaults differ (U2-E1).
+        let cli = Cli::try_parse_from([
+            "focr",
+            "ocr",
+            "scan.png",
+            "--max-length",
+            "32768",
+            "--no-repeat-ngram",
+            "35",
+            "--ngram-window",
+            "128",
+            "--temperature",
+            "0",
+        ])
+        .expect("ocr parses");
         let Command::Ocr(args) = cli.command else {
             unreachable!("expected ocr command");
         };
         let o = decode_overrides_from(&args.to_request().expect("request builds"));
-        assert_eq!(o.max_length, None);
+        assert_eq!(o.max_length, Some(32_768));
+        assert_eq!(o.no_repeat_ngram, Some(35));
+        assert_eq!(o.ngram_window, Some(128));
+        assert_eq!(o.temperature, Some(0.0));
     }
 
     #[test]
@@ -4184,13 +4203,13 @@ mod tests {
             request: OcrRequestArgs {
                 image: PathBuf::from("scan.png"),
                 model: None,
-                base_size: DEFAULT_BASE_SIZE,
-                image_size: DEFAULT_IMAGE_SIZE,
-                crop_mode: CropMode::Gundam,
-                max_length: DEFAULT_MAX_LENGTH,
-                temperature: DEFAULT_TEMPERATURE,
-                no_repeat_ngram: DEFAULT_NO_REPEAT_NGRAM,
-                ngram_window: DEFAULT_NGRAM_WINDOW,
+                base_size: None,
+                image_size: None,
+                crop_mode: None,
+                max_length: None,
+                temperature: None,
+                no_repeat_ngram: None,
+                ngram_window: None,
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,

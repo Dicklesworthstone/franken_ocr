@@ -248,9 +248,9 @@ fn hermetic_home() -> &'static PathBuf {
     })
 }
 
-/// Run `focr <args...>` with a hermetic environment (no `FOCR_*` / golden-update
-/// leakage from the dev shell into the captured output) and return the raw output.
-fn run_focr(args: &[&str]) -> Output {
+/// `focr <args...>` in a hermetic environment: no `FOCR_*` / golden-update
+/// leakage from the dev shell into the captured output.
+fn hermetic_focr(args: &[&str]) -> Command {
     let mut command = Command::new(focr_bin());
     command
         .args(args)
@@ -263,7 +263,13 @@ fn run_focr(args: &[&str]) -> Output {
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove("FOCR_INT8_AUTOVEC")
         .env_remove(FORCE_TEST_ERROR_ENV);
-    run_focr_command(command, args)
+    command
+}
+
+/// Run `focr <args...>` hermetically ([`hermetic_focr`]) and return the raw
+/// output.
+fn run_focr(args: &[&str]) -> Output {
+    run_focr_command(hermetic_focr(args), args)
 }
 
 fn run_focr_with_model_path(args: &[&str], model_path: &Path) -> Output {
@@ -1540,6 +1546,37 @@ fn ocr_robot_error_stream_matches_exit_code() {
     assert!(
         stderr.trim().is_empty(),
         "robot-mode command errors must not write human decoration to stderr: {stderr:?}"
+    );
+}
+
+/// U2-E1: `--model unlimited-ocr-2` names the registered model, so a
+/// directory of that name in the working directory never shadows it. With no
+/// model installed the search reports the id as not found (exit 3), instead of
+/// opening the directory.
+#[test]
+fn a_registry_id_is_not_shadowed_by_a_working_directory_path() {
+    let test = "a_registry_id_is_not_shadowed_by_a_working_directory_path";
+    let cwd = std::env::temp_dir().join(format!("focr_registry_cwd_{}", std::process::id()));
+    let shadow = cwd.join("unlimited-ocr-2");
+    std::fs::create_dir_all(&shadow).expect("create the shadowing directory");
+    std::fs::write(shadow.join("model.safetensors.index.json"), b"{}").expect("write an index");
+    let args = ["ocr", "page.png", "--model", "unlimited-ocr-2"];
+    let mut command = hermetic_focr(&args);
+    command.current_dir(&cwd);
+    let out = run_focr_command(command, &args);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let searched = stderr.contains("no model artifact named unlimited-ocr-2");
+    tlog!(test,
+        "case": "cwd_directory_named_like_the_id",
+        "event": "assert",
+        "inputs": {"argv": args},
+        "exit_code": out.status.code(),
+        "result": if out.status.code() == Some(3) && searched { "pass" } else { "fail" },
+    );
+    assert_eq!(out.status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        searched,
+        "the id is searched for, not opened from the CWD: {stderr}"
     );
 }
 
