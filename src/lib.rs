@@ -789,7 +789,7 @@ impl OcrEngine {
     /// [`OcrEngine::recognize_multi_page_dynamic`] with a PER-PAGE STREAMING
     /// sink (bd-2z0y): `on_page` gets each [`StreamedPage`] from the decode
     /// driver as its `<PAGE>` boundary is crossed in the token stream (boxed
-    /// + `Send` because the pass runs on the blocking pool). The returned
+    /// and `Send` because the pass runs on the blocking pool). The returned
     /// markdown is still the full terminal assembly.
     ///
     /// # Errors
