@@ -236,6 +236,7 @@
     "v2_length",
     "v2_budget",
     "leading_text",
-    "ignored_files"
+    "ignored_files",
+    "uncertified_crop_mode"
   ]
 }
