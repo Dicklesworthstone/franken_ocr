@@ -336,7 +336,32 @@ The same engine exposes the surfaces the CLI uses:
 | `recognize_with_figures(path)` | Return Markdown/layout plus cropped figure regions, matching `--extract-figures`. |
 | `recognize_dynamic(image)` | Run an already-decoded `image::DynamicImage`, the same in-memory path used by PDF rasterization. |
 | `recognize_batch(&[paths])` | Load weights once and return one result per input path, in order. |
+| `recognize_document(model, source, &options, on_item, on_page)` | Parse a PDF, a directory or a list of pages as ONE cross-page document, matching `--multi-page`. The `PageSource` is read one page at a time; `on_page` streams each page as it ends. The `DocumentResult` has the markdown, the pages, the skipped pages and the `finish_reason`. A document that stops early returns the pages it completed. |
 | `request_shutdown()` / `reset_shutdown()` | Drive cooperative cancellation for long-running embedders. |
+
+A document parse, using the pages of a PDF:
+
+```rust,no_run
+use std::path::Path;
+
+use franken_ocr::page_source::PageSource;
+use franken_ocr::{DocumentOptions, FocrResult, OcrEngine};
+
+fn main() -> FocrResult<()> {
+    let engine = OcrEngine::new()?;
+    let source = PageSource::pdf(Path::new("book.pdf"))?.select(Some("1-20"))?;
+    let document = engine.recognize_document(
+        &OcrEngine::model_path(),
+        source,
+        &DocumentOptions::default(),
+        Box::new(|_| {}),
+        Some(Box::new(|page| eprintln!("page {} done", page.index))),
+    )?;
+    println!("{}", document.markdown);
+    eprintln!("{} pages, finish: {}", document.pages.len(), document.finish_reason.as_str());
+    Ok(())
+}
+```
 
 Model resolution follows the CLI rules: `FOCR_MODEL_PATH` wins, then the default
 cache location is searched. For path-explicit calls, pass the model artifact
@@ -434,7 +459,7 @@ Unlimited-OCR-2 (`--model unlimited-ocr-2`) emits exactly one `<PAGE>` per page,
 so its document mode has real pages. `--json` lists one `pages[]` entry per page
 read: `page` (the source page), `half` on a split spread, `run_index`, `text`,
 `layout` (boxes in that page's own pixels), `tokens` and `finish` (`marker`,
-`eos`, `page_cap`, `length` or `budget`). It composes with `--split-spreads`
+`eos`, `page_cap`, `length`, `budget` or `cancelled`). It composes with `--split-spreads`
 (each half is one page of the prompt) and with `--extract-figures`: figures are
 cropped from their page after the decode and named `page{N}_figure_{M}`, or
 `page{N}l_figure_{M}` / `page{N}r_figure_{M}` on a half. Robot `page` events add

@@ -759,6 +759,27 @@ impl OcrEngine {
     /// completed, never an error. The source is consumed: a caller that
     /// retries (a first-run download) opens a fresh one.
     ///
+    /// ```no_run
+    /// use std::path::Path;
+    ///
+    /// use franken_ocr::page_source::PageSource;
+    /// use franken_ocr::{DocumentOptions, OcrEngine};
+    ///
+    /// # fn main() -> franken_ocr::FocrResult<()> {
+    /// let engine = OcrEngine::new()?;
+    /// let source = PageSource::pdf(Path::new("book.pdf"))?.select(Some("1-20"))?;
+    /// let document = engine.recognize_document(
+    ///     &OcrEngine::model_path(),
+    ///     source,
+    ///     &DocumentOptions::default(),
+    ///     Box::new(|_| {}),
+    ///     Some(Box::new(|page| eprintln!("page {} done", page.index))),
+    /// )?;
+    /// println!("{}", document.markdown);
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
     /// # Errors
     /// As [`crate::native_engine::OcrModel::recognize_document`], plus the
     /// model's load errors.

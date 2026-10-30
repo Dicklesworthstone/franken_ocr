@@ -5722,12 +5722,14 @@ impl OcrModel {
     /// The tokenizer is needed for the prompt id-stream (the connector builds
     /// `images_seq_mask` against it) and to detokenize the generated ids. It is
     /// resolved next to the model file (the `tokenizer.json` ships beside the
-    /// weights).
+    /// weights). Public so a caller can render ids it holds (a reference's,
+    /// or [`DecodeReport::ids`]) with exactly the tokenizer this model decodes
+    /// with.
     ///
     /// # Errors
     /// [`FocrError::FormatMismatch`] (or an IO error) if `tokenizer.json` is
     /// missing or malformed beside the model artifact.
-    fn tokenizer(&self) -> FocrResult<&crate::tokenizer::Tokenizer> {
+    pub fn tokenizer(&self) -> FocrResult<&crate::tokenizer::Tokenizer> {
         self.tokenizer.get_or_try_init(|| {
             // Byte-loaded models carry the payload directly (no "beside").
             if let Some(bytes) = &self.sidecars.tokenizer_json {

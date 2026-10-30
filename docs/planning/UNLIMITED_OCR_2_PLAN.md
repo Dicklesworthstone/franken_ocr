@@ -2238,6 +2238,28 @@ let doc = engine.recognize_document(
 - The engine caches one model (`lib.rs:404-436` `model_at`), so per-mode defaults resolve the model
   before engine construction (D25).
 
+*As built (U2-E2, 2026-10-30).* The call is
+`engine.recognize_document(model_path, source, &options, on_item, on_page)`, wrapping
+`OcrModel::recognize_document(&mut source, &options, on_item, on_page)`. Version 0.10.0; the CHANGELOG
+holds the migration table. Where it departs from the sketch above:
+- **Model.** The model is the explicit `model_path` (D25 resolves it first), not a `ModelChoice` option.
+- **Options.** `DocumentOptions { page_window, resume }` is `#[non_exhaustive]` with chaining setters,
+  not a builder. `max_page_tokens` and `entmax_domain` are left out because they already have one
+  route each (`DecodeOverrides`, `--max-page-tokens`; `FOCR_SRSWA_ENTMAX`), and a second would
+  duplicate config. `crop_mode` is left out because a document reads base views only (DISC-U2-6).
+- **Sink.** `on_page` streams `StreamedPage` (a body, and its `PageResult` when the model splits pages
+  exactly), because v1's bodies can merge pages and have none. `on_item` sees every page before it is
+  read, a skipped one included.
+- **Result.** `DocumentResult { markdown, pages, pages_out, skipped, finish_reason, extra_markers,
+  warnings, model }`. `skipped` lists the pages (with reasons), not a count; `model` is
+  `ModelIdentity { model_id, source_sha256 }`. `windows` and `resumed_from` arrive with U2-D1b and
+  U2-D4.
+- **Cancellation.** Ctrl+C or `request_shutdown()` stops Unlimited-OCR-2's document loop at its next
+  step with `finish_reason: cancelled`; the CLI writes the pages, then exits 6. v1 still fails with
+  `Cancelled`.
+- **Features.** Documents need the `pdf` feature, which every shipped build enables, because the page
+  source and `SkippedPage` live behind it. A pure core without `pdf` has no document API (bd-x7jt).
+
 ### 9.5 Distribution (U2-E4)
 
 - **Manifest.** A manifest-v2 `models["unlimited-ocr-2"]` entry holds:

@@ -433,7 +433,8 @@ since exact-token OCR fails in the tail.
 - Tests affected: `l5_multi_page_matches_infer_multi_oracle` (3-line plate +
     CER ≤ 0.10); `l5_multi_page_10p_long_horizon` (2-line plate + CER ≤
     0.40); `multi_page_streaming_matches_terminal_assembly_when_armed`;
-    `recognize_multi_page_real_model_when_present_else_skip_with_success`.
+    `recognize_document_real_model_when_present_else_skip_with_success`
+    (`recognize_multi_page_…` until U2-E2).
 - Review date: when an int8 or bf16-matched decode variant lands for the
     multi-page path — re-measure the fork point and the near-tie margins.
 
