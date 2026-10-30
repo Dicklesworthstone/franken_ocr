@@ -329,6 +329,7 @@ mod tests {
             layout: vec![LayoutSpan {
                 label: "text".to_string(),
                 boxes: vec![[1, 2, 3, 4]],
+                level: None,
             }],
         };
         let b = RecognizedDocument {
@@ -340,6 +341,7 @@ mod tests {
             layout: vec![LayoutSpan {
                 label: "text".to_string(),
                 boxes: vec![[5, 6, 7, 8]],
+                level: None,
             }],
         };
         let merged = merge_documents(vec![(a, 0), (b, 500), (c, 1000)]);

@@ -299,6 +299,91 @@ proptest! {
     }
 }
 
+// ── 4b. Postprocess totality on grounding fragments ─────────────────────────
+
+/// Pieces of Unlimited-OCR-2's block grammar (U2-E3b) and multi-byte text, so
+/// a generated page reaches every partial prefix the block scanner can meet in
+/// model output (a page cut off by its token cap ends anywhere).
+const BLOCK_FRAGMENTS: &[&str] = &[
+    "<BLOCK>", "<FORK>", "<LEVEL", "<LEVEL1>", ">", "text", "title", "image", "[", "]", "1", "999",
+    ", ", ",", " ", "-", "\n", "<PAGE>", "é", "中",
+];
+
+/// v1's grounding tags, mixed in for the totality leg only: v1's span rule
+/// keeps Python `str.replace` semantics, under which a repeated or nested
+/// span's image index need not reach the markdown.
+const V1_FRAGMENTS: &[&str] = &["<|ref|>", "<|/ref|>", "<|det|>", "<|/det|>", "[[0,0,9,9]]"];
+
+fn fragment_page(fragments: &'static [&'static str]) -> impl Strategy<Value = String> {
+    proptest::collection::vec(proptest::sample::select(fragments), 0..64)
+        .prop_map(|picks| picks.concat())
+}
+
+/// A page of well-formed blocks whose bodies are [`BLOCK_FRAGMENTS`] noise,
+/// cut at an arbitrary char boundary as a page token cap would cut it. Boxes
+/// come from a tiny range so identical prefixes are common.
+fn block_page() -> impl Strategy<Value = String> {
+    let block = (
+        proptest::sample::select(&["image", "text", "title", "other"][..]),
+        proptest::option::of(1_u8..3),
+        proptest::array::uniform4(0_u16..3),
+        fragment_page(BLOCK_FRAGMENTS),
+    )
+        .prop_map(|(label, level, [x1, y1, x2, y2], body)| {
+            let level = level.map_or(String::new(), |l| format!("<LEVEL{l}>"));
+            format!("<BLOCK>{label}{level}[{x1}, {y1}, {x2}, {y2}]<FORK>{body}\n")
+        });
+    (
+        proptest::collection::vec(block, 0..8),
+        any::<prop::sample::Index>(),
+    )
+        .prop_map(|(blocks, cut)| {
+            let page = blocks.concat();
+            let ends: Vec<usize> = page
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain([page.len()])
+                .collect();
+            page[..ends[cut.index(ends.len())]].to_owned()
+        })
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// Every postprocess entry point is total on any mix of both grammars.
+    #[test]
+    fn postprocess_is_total_on_grounding_fragments(
+        page in prop_oneof![block_page(), fragment_page(BLOCK_FRAGMENTS), fragment_page(V1_FRAGMENTS)],
+        tail in fragment_page(BLOCK_FRAGMENTS),
+    ) {
+        use franken_ocr::native_engine::postprocess;
+        let text = format!("{page}{tail}");
+        prop_assert!(postprocess::finalize(&text, 640, 480).is_ok());
+        prop_assert!(postprocess::finalize_multi(&text, 3).is_ok());
+        let _ = postprocess::parse_layout(&text, 640, 480);
+        let _ = postprocess::figure_refs(&text, 640, 480, "page_0_");
+    }
+
+    /// On block-grammar pages each image block's reference reaches the
+    /// markdown exactly once, so `--extract-figures` writes only figures the
+    /// text points at, and the layout lists every block the markdown dropped.
+    #[test]
+    fn every_v2_image_block_is_referenced_once(text in block_page()) {
+        use franken_ocr::native_engine::postprocess;
+        let md = postprocess::finalize(&text, 640, 480).expect("infallible");
+        let figures = postprocess::figure_refs(&text, 640, 480, "");
+        for r in &figures {
+            prop_assert_eq!(md.matches(&r.markdown_ref).count(), 1, "{:?} -> {:?}", text, md);
+        }
+        let layout = postprocess::parse_layout(&text, 640, 480);
+        let images = layout.iter().filter(|s| s.label == "image").count();
+        prop_assert_eq!(images, figures.len());
+        let left = md.matches("<FORK>").count();
+        prop_assert_eq!(text.matches("<FORK>").count(), left + layout.len(), "{:?}", text);
+    }
+}
+
 // ── 5. Tokenizer round-trip (model-gated) ───────────────────────────────────
 
 /// Byte-level BPE must be LOSSLESS: `decode(encode(s)) == s` for any text

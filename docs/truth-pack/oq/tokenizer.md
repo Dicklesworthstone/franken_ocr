@@ -223,8 +223,8 @@ Model: `baidu/Unlimited-OCR-2` (pins in `docs/truth-pack/PINNED_SOURCES.md`).
   | id | content | used by inference |
   |----|---------|-------------------|
   | 128827 | `<PAGE>` | yes: the prompt is `"<PAGE><image>" * n + "Multi page parsing."`, and the output separates pages with it |
-  | 128828 | `<BLOCK>` | no |
-  | 128829 | `<FORK>` | no |
+  | 128828 | `<BLOCK>` | output only: opens each block of the block grammar, `<BLOCK>label[<LEVELn>][x1, y1, x2, y2]<FORK>text` (U2-E3b, plan §5.1) |
+  | 128829 | `<FORK>` | output only: ends a block's prefix, before its text |
   | 128830 | `<CHILD>` | no |
 
 - **Id range.** 834 added tokens; the max producible id is **128830** (v1:

@@ -2496,6 +2496,10 @@ fn v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed() {
     assert_eq!(complete["model_id"], "unlimited-ocr-2", "S1: {complete}");
     assert!(complete["source_sha256"].is_null(), "S1: {complete}");
     assert!(!markdown.trim().is_empty(), "S1: empty markdown");
+    // U2-E3b: the block grammar is rendered away, as v1's spans are.
+    for grammar in ["<BLOCK>", "<FORK>", "<LEVEL"] {
+        assert!(!markdown.contains(grammar), "S1: {grammar} in:\n{markdown}");
+    }
     assert!(
         out.stderr
             .contains("[focr] note: unlimited-ocr-2 is experimental"),
@@ -2532,6 +2536,12 @@ fn v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed() {
         pages.len(),
         "S2 batch: one body per page:\n{batch_markdown}"
     );
+    for grammar in ["<BLOCK>", "<FORK>", "<LEVEL"] {
+        assert!(
+            !batch_markdown.contains(grammar),
+            "S2 batch: {grammar} in:\n{batch_markdown}"
+        );
+    }
     log_line(
         TEST,
         "S2_batch",

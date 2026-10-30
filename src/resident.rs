@@ -560,31 +560,7 @@ fn roundtrip(
         let layout = reply
             .get("layout")
             .and_then(Value::as_array)
-            .map(|spans| {
-                spans
-                    .iter()
-                    .filter_map(|span| {
-                        let label = span.get("label")?.as_str()?.to_owned();
-                        let boxes = span
-                            .get("boxes")?
-                            .as_array()?
-                            .iter()
-                            .filter_map(|b| {
-                                let coords = b.as_array()?;
-                                if coords.len() != 4 {
-                                    return None;
-                                }
-                                let mut out = [0_i64; 4];
-                                for (slot, coord) in out.iter_mut().zip(coords) {
-                                    *slot = coord.as_i64()?;
-                                }
-                                Some(out)
-                            })
-                            .collect();
-                        Some(LayoutSpan { label, boxes })
-                    })
-                    .collect()
-            })
+            .map(|spans| spans.iter().filter_map(LayoutSpan::from_json).collect())
             .unwrap_or_default();
         // Absent from an older daemon's reply: the run then reports none.
         let finish_reason = match reply.get("finish_reason").and_then(Value::as_str) {
@@ -993,11 +969,7 @@ fn handle_connection(
         .recognize_with_layout_model(model_root, &image)
     {
         Ok(document) => {
-            let layout: Vec<Value> = document
-                .layout
-                .iter()
-                .map(|span| json!({ "label": span.label, "boxes": span.boxes }))
-                .collect();
+            let layout: Vec<Value> = document.layout.iter().map(LayoutSpan::to_json).collect();
             // Taken per request: the warm model's report would otherwise
             // accumulate across requests.
             let finish_reason = engine

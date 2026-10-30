@@ -120,12 +120,15 @@ pub mod special {
     /// prefixes each page's `<image>` in the prompt and separates pages in the
     /// output. Non-special, so `skip_special` decoding keeps it (U2-A4).
     pub const PAGE: u32 = 128827;
-    /// `<BLOCK>` — Unlimited-OCR-2 only, non-special; unused by inference.
+    /// `<BLOCK>` — Unlimited-OCR-2 only, non-special. Inference never reads it;
+    /// the model emits it to open each output block, which the postprocess
+    /// parses as text (U2-E3b).
     pub const BLOCK: u32 = 128828;
-    /// `<FORK>` — Unlimited-OCR-2 only, non-special; unused by inference.
+    /// `<FORK>` — Unlimited-OCR-2 only, non-special. The model emits it between
+    /// a block's prefix and its text (U2-E3b).
     pub const FORK: u32 = 128829;
-    /// `<CHILD>` — Unlimited-OCR-2 only, non-special; unused by inference. The
-    /// highest id the v2 tokenizer produces (v1's is [`ASSISTANT`]).
+    /// `<CHILD>` — Unlimited-OCR-2 only, non-special; in none of the oracle
+    /// outputs. The highest id the v2 tokenizer produces (v1's is [`ASSISTANT`]).
     pub const CHILD: u32 = 128830;
 }
 

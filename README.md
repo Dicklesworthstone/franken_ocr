@@ -374,7 +374,7 @@ format follows the extension: `.json` emits structured JSON, any other extension
 (e.g. `.md`) emits Markdown. `--json` forces JSON regardless of extension. The
 structured JSON carries the rendered `markdown` plus a `layout` array, one
 `{label, boxes}` entry per grounded span, where each box is `[x1, y1, x2, y2]` in
-source-image pixels. A PDF nests these under a per-page `pages` array; split
+source-image pixels. An Unlimited-OCR-2 title adds its heading `level` (1, 2, …). A PDF nests these under a per-page `pages` array; split
 spreads become separate logical page entries with the same source `page` number
 and a `"half": "left"` or `"right"` marker. This is the same shape `--json`
 prints to stdout. TrOMR music runs also include a `staves` array in source order;

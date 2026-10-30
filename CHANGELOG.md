@@ -351,6 +351,17 @@ sections as they land.
   - `focr models` lists `unlimited-ocr-2` as `experimental`, with its `recipe`,
     an `installed` field (a LOCAL column in the table) and the note "best for
     documents and long documents".
+- **Unlimited-OCR-2 output reads like v1's** (bead U2-E3b, DISC-U2-13).
+  Unlimited-OCR-2 does not use v1's `<|ref|>`/`<|det|>` grounding. It opens
+  every block with `<BLOCK>label[<LEVELn>][x1, y1, x2, y2]<FORK>`, which no
+  reference renders, so its markdown used to carry those prefixes raw.
+  - Each prefix is now handled as v1 handles a grounding span: an `image` block
+    becomes `![](images/…)` (and a figure for `--extract-figures`), and every
+    other prefix is deleted. Titles stay plain, as in v1.
+  - `--json` `layout` lists every block with its label (`title`, `header`,
+    `page_number`, `table`, `cross_text`, …) and its box in source pixels. A
+    leveled title adds `level` (`<LEVEL1>` gives 1). v1 entries are unchanged.
+  - A block prefix cut off by the page token cap stays in the text as emitted.
 
 ### Fixed
 

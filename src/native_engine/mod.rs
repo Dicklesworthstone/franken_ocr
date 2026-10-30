@@ -1830,16 +1830,66 @@ pub struct MusicPageMeta {
 }
 
 /// One parsed layout span from the model's grounding output: a ref/det label
-/// (`"title"`, `"text"`, `"image"`, …) plus its bounding boxes in PIXEL
-/// coordinates `[x1, y1, x2, y2]` for the source image (de-normalized from the
-/// model's 0..=999 grid). Surfaced by [`OcrModel::recognize_with_layout`] for the
-/// `focr ocr --json` / `-o out.json` structured-output path.
+/// or Unlimited-OCR-2 block label (`"title"`, `"text"`, `"image"`, …) plus its
+/// bounding boxes in PIXEL coordinates `[x1, y1, x2, y2]` for the source image
+/// (de-normalized from the model's 0..=999 grid). Surfaced by
+/// [`OcrModel::recognize_with_layout`] for the `focr ocr --json` /
+/// `-o out.json` structured-output path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LayoutSpan {
-    /// The ref/det label classifying the span.
+    /// The label classifying the span.
     pub label: String,
     /// Pixel bounding boxes `[x1, y1, x2, y2]`; a span may carry several.
     pub boxes: Vec<[i64; 4]>,
+    /// The heading level of an Unlimited-OCR-2 `title` block (`<LEVELn>`, U2-E3b);
+    /// `None` for v1 spans and unleveled blocks.
+    pub level: Option<u8>,
+}
+
+impl LayoutSpan {
+    /// The span as `{label, boxes}`, plus `level` when it has one: the
+    /// `--json` layout entry and the resident daemon's wire form.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut value = serde_json::json!({ "label": self.label, "boxes": self.boxes });
+        if let Some(level) = self.level {
+            value["level"] = level.into();
+        }
+        value
+    }
+
+    /// The inverse of [`Self::to_json`]; `None` without a string `label` or a
+    /// `boxes` array. A box that is not four integers is skipped, as is a
+    /// `level` that is not a `u8`.
+    #[must_use]
+    pub fn from_json(value: &serde_json::Value) -> Option<Self> {
+        let label = value.get("label")?.as_str()?.to_owned();
+        let boxes = value
+            .get("boxes")?
+            .as_array()?
+            .iter()
+            .filter_map(|b| {
+                let coords = b.as_array()?;
+                if coords.len() != 4 {
+                    return None;
+                }
+                let mut out = [0_i64; 4];
+                for (slot, coord) in out.iter_mut().zip(coords) {
+                    *slot = coord.as_i64()?;
+                }
+                Some(out)
+            })
+            .collect();
+        let level = value
+            .get("level")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|l| u8::try_from(l).ok());
+        Some(Self {
+            label,
+            boxes,
+            level,
+        })
+    }
 }
 
 /// A recognized document: the rendered markdown body plus the structured layout
@@ -3859,10 +3909,7 @@ impl OcrModel {
         image_h: u32,
     ) -> FocrResult<RecognizedDocument> {
         let markdown = postprocess::finalize(decoded, image_w, image_h)?;
-        let layout = postprocess::parse_layout(decoded, image_w, image_h)
-            .into_iter()
-            .map(|(label, boxes)| LayoutSpan { label, boxes })
-            .collect();
+        let layout = postprocess::parse_layout(decoded, image_w, image_h);
         Ok(RecognizedDocument { markdown, layout })
     }
 

@@ -123,7 +123,7 @@ Source-file SHA-256 pins for the v2 commit are in Appendix B.
 | Attention | R-SWA: a frozen reference prefix plus a ring of 128 generated tokens; every reference token is attended at every step | **SR-SWA (DASH)**: block-sparse, ≤ 128 local + 12×32 remote tokens per query, in prefill **and** decode | §5.6–5.8 |
 | RoPE | 1-D, theta 1e4, no scaling | Main and router: **page2d**, 63 intra-page token pairs (theta 1e4, "resample" spacing) + 1 page-parity pair (page mod 2, theta 256). Config `rope_theta=5e5` with YaRN ×4 is used only on the 1-D fallback path. | §5.5 |
 | Context | `max_position_embeddings` 32768, shared by prompt and output | 131072. Positions only index blocks and causality; RoPE uses page-local coordinates. | config, `mod.rs:2750-2783` |
-| Tokenizer | BPE vocab 128000 + 830 added (max id 128826) | Same BPE model, pre-tokenizer, normalizer and decoder. **+4 added non-special tokens**: `<PAGE>`=128827, `<BLOCK>`=128828, `<FORK>`=128829, `<CHILD>`=128830 (the last three unused by inference code). tokenizer.json sha256 `c55c165e…c589`. | tokenizer diff |
+| Tokenizer | BPE vocab 128000 + 830 added (max id 128826) | Same BPE model, pre-tokenizer, normalizer and decoder. **+4 added non-special tokens**: `<PAGE>`=128827, `<BLOCK>`=128828, `<FORK>`=128829, `<CHILD>`=128830 (inference code reads only `<PAGE>`; the model emits `<BLOCK>`/`<FORK>` in its block grammar, §5.1; `<CHILD>` is in none of the nine oracle outputs). tokenizer.json sha256 `c55c165e…c589`. | tokenizer diff |
 | Prompt | single: BOS + `<image>`×n + task text; multi: BOS + images + "Multi page parsing." | **Always** BOS + (`<PAGE>` + image tokens) per page + "Multi page parsing.", even for one page | §5.1 |
 | Multi-page image size | each page squashed to 640² (111 tokens per page) | each page letterboxed to **1024** (273 tokens per page) in HF; SGLang defaults to gundam for every request (§5.11, DISC-U2-6) | §5.2 |
 | Single-page default view | franken_ocr base 1024; HF v1 `infer` gundam ≤ 32 tiles | HF v2 `infer`: **gundam ≤ 16 tiles**; base available | §5.2 |
@@ -645,10 +645,24 @@ franken_ocr always builds the prompt itself and never accepts caller `<image>` p
 **Generation output.**
 - The output is `<PAGE>body_1<PAGE>body_2…<PAGE>body_N`, then EOS (id 1), which is not appended.
   Each `<PAGE>` *opens* a page.
-- Body text keeps v1's grounding grammar, with coordinates normalized to 0–999 per page. It has two
-  forms, both accepted by `re_match` (`postprocess.rs:18-20`):
-  - `<|ref|>…<|/ref|><|det|>[[x1,y1,x2,y2]]<|/det|>`;
-  - the bare `<|det|>label [x1, y1, x2, y2]<|/det|>`, which v1 multi-page actually emits.
+- Body text does **not** use v1's grounding grammar (U2-E3b, found in U2-B6). Every block opens with
+  `<BLOCK>{label}[<LEVELn>][x1, y1, x2, y2]<FORK>`, and its text runs to the next block:
+  ```
+  <PAGE><BLOCK>header[391, 31, 513, 53]<FORK>( 535 )
+  <BLOCK>title<LEVEL1>[223, 178, 656, 197]<FORK>APPENDIX TO CHAPTER XXIV.
+  ```
+  - `<BLOCK>` (128828) and `<FORK>` (128829) are added tokens. `<LEVEL1>`/`<LEVEL2>` are plain BPE
+    text and appear only on `title`.
+  - Coordinates are 0–999 per page, as in v1. v1's `x/999·W` rescale lands on the right regions of
+    page_0590, checked by cropping.
+  - The nine oracle outputs carry 431 blocks with twelve labels: `text`, `title`, `header`, `footer`,
+    `page_number`, `page_footnote`, `cross_text`, `append_text`, `table`, `image`, `image_caption`
+    and `other`. `image` and `other` blocks have no text.
+  - `cross_text` is a page's last text block when its paragraph runs onto the next page. It ends
+    mid-sentence. `append_text` opens the next page with that paragraph's continuation. The model
+    does not always pair them.
+  - Neither reference parses the grammar. HF's `re_match` (`MU:44-59`) knows only v1's spans, so its
+    `result.md` keeps the prefixes raw. franken_ocr's rendering is DISC-U2-13.
 - franken_ocr segments pages on the **token id** (D20), not on decoded text.
 
 ### 5.2 Preprocessing (`MU:531-580`)
@@ -1301,6 +1315,7 @@ Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a
 | DISC-U2-10 | EXIF orientation | ignored: `Image.open(f).convert('RGB')` (`MU:1070`) | ignored: `smart_rgb_conversion = False` (`base_processor.py:215`), so a plain `convert("RGB")` | Applied, as for v1 (the shared decoder, `src/preprocess/mod.rs` `decode_path`). Only an image with a non-identity Orientation tag differs, and the oracle corpus has none (U2-B7) |
 | DISC-U2-11 | FFN/expert weight storage in the default decoder | f32 parity oracle over the bf16 checkpoint | bf16 | The shipping cache keeps the 2,148 FFN/expert matrices per-channel int8 (the fixed recipe); attention, router, norms and `lm_head` stay f32. Its greedy ids leave the f32 oracle's at a near-tie, where the all-f32 cache (`FOCR_DECODE_F32`, otherwise the same ops) keeps the oracle's token: S1 page_0014 at step 47 (the oracle's token 0.214 below the int8-FFN pick), page_0590 at step 32 (0.156), S2 at step 44 (0.156), S3 p9_p14 at step 73 (0.065); page_0009 is exact. On the long lane the f32 cache is exact over S3-p10 (6,272 ids) and S3-p20 (16,880 ids), with block retirement on and off, while the int8-FFN path leaves at S3-p10 step 203 (0.017) and S3-p20 step 118 (0.056). It still ends at `stop` with one body per page, 6,277 and 17,165 ids long. No layer routes differently at any of them (U2-C2). U2-C4 measures the impact at L5 and files the entry |
 | DISC-U2-12 | page state of a reused window's last prompt row when no text is spliced (the text KV allocation failed) | n/a (no windows) | the first decode step's carry is written into that row's slot (`_seed_continuation`, `W/session/uocr_doc_reuse.py:490-497`), so its image page reads −1 | The reused-window seed (`DecodePageState::reused_window`) carries the step and the row keeps its page. Both stacks read a row's page only through its 32-row block's (min, max), which skips −1, so they differ only when that row opens its block (rewritten prompt length ≡ 1 mod 32). franken_ocr's KV is never pool-allocated, so only the `marker_only_splice` test hook reaches the path; `w2-n5-markeronly-t12` (prompt 956 rows) is token-exact (U2-D1a) |
+| DISC-U2-13 | rendering of the block grammar (`<BLOCK>label[<LEVELn>][box]<FORK>text`, §5.1) | `result.md` keeps every prefix raw: `re_match` (`MU:44-59`) knows only v1's spans | no postprocess (returns the generated text) | Each block prefix is a span under v1's rule (`postprocess.rs` `scan_block_spans`): an `image` block becomes `![](images/…)` and is a figure, every other prefix is deleted. The text so has v1's shape (titles unmarked, one newline between blocks, tables as HTML). `layout` keeps each block's label, its `level` and its box rescaled as v1's are. A prefix off the grammar, such as one cut off by a page's token cap, stays in the text. `cross_text`/`append_text` continuations stay on their own pages. Measured: all 431 blocks of the nine oracle outputs parse, and none of the grammar reaches the markdown (U2-E3b) |
 
 **Filing.** `scripts/check_ledgers.py:310` matches only `^## DISC-\d+:`, so a `## DISC-U2-k:` heading
 would escape the required-field, kill-switch and uniqueness checks.
@@ -2148,7 +2163,8 @@ ends with `run_error`. A nonzero exit never follows `run_complete`.
 
 v2's token-level `<PAGE>` segmentation gives document mode:
 - a per-page `pages[]` array, with layout boxes (0–999 per page) mapped through each source page's
-  original size;
+  original size. The layout and figures come from v2's block grammar, which U2-E3b parses
+  (§5.1, DISC-U2-13);
 - per-page figure extraction (`page{N}_figure_{M}`);
 - the source-page map.
 

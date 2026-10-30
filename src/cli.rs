@@ -1045,18 +1045,14 @@ impl Recognition {
     }
 }
 
-/// Serialize a page's layout spans as a JSON array of `{label, boxes}`, where each
-/// box is the `[x1, y1, x2, y2]` pixel rectangle the model grounded that span to.
+/// Serialize a page's layout spans as a JSON array of `{label, boxes}` (plus
+/// `level` on a leveled Unlimited-OCR-2 title), where each box is the
+/// `[x1, y1, x2, y2]` pixel rectangle the model grounded that span to.
 fn layout_to_json(layout: &[native_engine::LayoutSpan]) -> serde_json::Value {
     serde_json::Value::Array(
         layout
             .iter()
-            .map(|span| {
-                serde_json::json!({
-                    "label": span.label,
-                    "boxes": span.boxes,
-                })
-            })
+            .map(native_engine::LayoutSpan::to_json)
             .collect(),
     )
 }
@@ -4442,10 +4438,18 @@ mod tests {
     fn single_image_json_carries_markdown_and_bounding_boxes() {
         let rec = Recognition::Single(native_engine::RecognizedDocument {
             markdown: "# Title\n\nbody".to_string(),
-            layout: vec![native_engine::LayoutSpan {
-                label: "title".to_string(),
-                boxes: vec![[10, 20, 110, 60]],
-            }],
+            layout: vec![
+                native_engine::LayoutSpan {
+                    label: "title".to_string(),
+                    boxes: vec![[10, 20, 110, 60]],
+                    level: None,
+                },
+                native_engine::LayoutSpan {
+                    label: "title".to_string(),
+                    boxes: vec![[10, 70, 110, 90]],
+                    level: Some(2),
+                },
+            ],
         });
         let json = rec.to_json(&[]);
         assert_eq!(json["schema_version"], robot::ROBOT_SCHEMA_VERSION);
@@ -4455,8 +4459,29 @@ mod tests {
             json["layout"][0]["boxes"][0],
             serde_json::json!([10, 20, 110, 60])
         );
+        // `level` only on a leveled v2 title (U2-E3b): v1 entries keep their shape.
+        assert!(json["layout"][0].get("level").is_none());
+        assert_eq!(json["layout"][1]["level"], 2);
         // A single image has no per-page `pages` array.
         assert!(json.get("pages").is_none());
+    }
+
+    /// U2-E3b: the resident daemon's wire carries a span whole, `level` included.
+    #[test]
+    fn a_layout_span_round_trips_its_json() {
+        for level in [None, Some(1)] {
+            let span = native_engine::LayoutSpan {
+                label: "title".to_string(),
+                boxes: vec![[1, 2, 3, 4], [5, 6, 7, 8]],
+                level,
+            };
+            let back = native_engine::LayoutSpan::from_json(&span.to_json());
+            assert_eq!(back, Some(span));
+        }
+        assert_eq!(
+            native_engine::LayoutSpan::from_json(&serde_json::json!({"boxes": []})),
+            None
+        );
     }
 
     /// bd-av64.11: the --pages spec parser — 1-based pages/ranges to
@@ -4580,6 +4605,7 @@ mod tests {
                     layout: vec![native_engine::LayoutSpan {
                         label: "text".to_string(),
                         boxes: vec![[0, 0, 5, 5]],
+                        level: None,
                     }],
                 },
                 DocumentPageLayout {
@@ -4609,6 +4635,7 @@ mod tests {
             layout: vec![native_engine::LayoutSpan {
                 label: "text".to_string(),
                 boxes: vec![[1, 2, 3, 4]],
+                level: None,
             }],
         });
 
