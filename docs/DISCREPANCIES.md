@@ -634,9 +634,15 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
       `stop`, no extra marker (the gate). Their CER, recorded and not gated: S2 **0.5272** (1,232
       ids against 2,152), S3-p9_p14 0.0916 (314 against 538), S3-p10 0.0013 (6,277 against 6,272),
       S3-p20 0.0199 (17,165 against 16,880). S2 and S3-p9_p14 leave the reference at a near-tie
-      (steps 44 and 73). Most of S2's edits fall on its third page, page_0019 (a list of
-      illustrations with dot leaders): the reference reads it at 1,841 ids in this document and at
-      802 alone; int8 reads it at 694.
+      (steps 44 and 73). S2's 0.5272 is mostly dot leaders. On its third page, page_0019 (a
+      list of illustrations), the reference spells each leader as a long `. . . .` run (1,841 ids
+      there, against 802 when it reads the page alone), and int8 writes `.....` (694 ids).
+      Re-measured on the captured v2 golden (`tests/fixtures/uocr2_v2_goldens/s2.md`; 0.5355
+      as-is), collapsing every leader to one mark on both sides gives 0.1025: page 2 is exact and
+      page 3 is at 0.1383. Most of page 3's remainder is the reference's own gaps, which int8
+      reads: five missing page numbers, stray `$` signs, and a run of 17 empty table cells after
+      MINORCA. The rest is the superscript int8 renders as `$ ^{1} $` where the reference prints
+      `1`, one joined line, and one digit (HAGBOAT 538 against 533).
     * Generated ids per page over the 55 measured pages: int8 p50 735, p90 852, p99 2,892; f32 p50
       740, p90 982, p99 2,892. No page reached 16,000. The one-pass page limit this supports is 102
       (`64 + 274·N + (N − 1)·p90 + p99 ≤ 131,072` on the stricter f32 distribution; 114 on int8).

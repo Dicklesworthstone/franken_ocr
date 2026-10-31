@@ -193,6 +193,22 @@ sections as they land.
     The search-dir resolver's wasm skip now applies to v1 artifacts only, so a
     v2 file declaring that id gets the named error, not "not found".
   - `focr convert` reports `output_sha256`.
+- **The Unlimited-OCR-2 int8 artifact passes its corpus gate** (bead U2-C4,
+  DISC-019). Against the f32 reference, all 20 corpus pages read within the
+  per-page CER budget of 0.45, pre-registered before the run, and the
+  aggregate is 0.0685. v1 in the same run scored 0.1328 against its own f32
+  reference. The release ratchet admits v2 over v1: lower bound 0.726 against
+  v1's 0.676. The S2 and S3 documents give one body per page.
+  - The densest page, page_0590, passes by 0.00004. The near-ties that int8
+    flips and their cost are in DISC-019, and `FOCR_DECODE_F32` is the exact
+    path.
+  - One pass is now sized for 102 pages, re-derived from measured page
+    lengths (it was 60).
+  - `tests/fixtures/uocr2_v2_goldens/` pins v2's token ids, markdown and page
+    events. `scripts/token_golden_gate.sh` checks them whenever the artifact
+    is on the machine.
+  - The model stays experimental until U2-E4 ships the artifact and its
+    tokenizer.
 - **Unlimited-OCR-2 preprocessing** (bead U2-B7).
   - `preprocess_image`, `preprocess_bytes` and `preprocess_dynamic` take a
     `PreprocessProfile`, which the engine picks from the model. v2's profile
