@@ -441,6 +441,17 @@ impl OcrEngine {
             .and_then(|model| model.take_music_meta())
     }
 
+    /// Take (consume) the OneChart number head and verdict of the run on this
+    /// engine's cached model, if any.
+    #[must_use]
+    pub fn take_chart_page_meta(&self) -> Option<native_engine::ChartPageMeta> {
+        self.model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone))
+            .and_then(|model| model.take_chart_meta())
+    }
+
     /// Take (consume) the [`native_engine::DecodeReport`] of the most recent
     /// Unlimited-OCR decode on this engine's cached model, if any (U2-X2): its
     /// `finish_reason` and, for a multi-page run, expected pages vs page

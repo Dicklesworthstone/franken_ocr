@@ -336,6 +336,10 @@ pub struct OcrModel {
     /// forward" is well-defined. Taken (consumed) by the CLI after a music
     /// run to emit robot `staff` events and the `--json` staves array.
     music_meta: std::sync::Mutex<Option<MusicPageMeta>>,
+    /// The run's OneChart number head and verdict, same side channel as
+    /// `music_meta`. An unverified page is kept over any later verified one, so
+    /// a document's warning cannot be overwritten by its last page.
+    chart_meta: std::sync::Mutex<Option<ChartPageMeta>>,
     /// What the most recent decode through the sequential driver
     /// ([`Self::generate_with_observer`]: every single-page, multi-page and
     /// streaming Unlimited-OCR forward) did. Same side-channel idiom as
@@ -867,6 +871,8 @@ pub enum WarningKind {
     ResumeRecompute,
     /// A run stopped writing its journal and checkpoint (U2-D4).
     CheckpointFailed,
+    /// OneChart's text did not pass its number-head check (bd-a7zs).
+    ChartUnverified,
 }
 
 /// Every machine-stable `warnings[].kind` a run can report, in the robot
@@ -885,6 +891,7 @@ pub const RUN_WARNING_KINDS: &[&str] = &[
     "pull_hint",
     "resume_recompute",
     "checkpoint_failed",
+    "chart_unverified",
 ];
 
 /// The one actionable next step for each [`WarningKind`]: the single source
@@ -931,6 +938,11 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
         WarningKind::CheckpointFailed => {
             "the output is complete, but this run could not have resumed; free space or fix \
              the permissions where its checkpoint is written"
+        }
+        WarningKind::ChartUnverified => {
+            "do not trust the text; `pred_locs` in `--json` is the chart's number head, each \
+             bar's height from 0 (smallest) to 1 (largest), and slots past the last bar mean \
+             nothing"
         }
     }
 }
@@ -1456,6 +1468,25 @@ pub fn force_got_format(on: bool) {
 fn got_format_requested() -> bool {
     FORCE_GOT_FORMAT.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var_os(GOT_FORMAT_ENV).is_some()
+}
+
+/// Process-global "pad GOT's image to a square first" flag, set by the CLI from the
+/// task (same threading as [`FORCE_GOT_FORMAT`]).
+static FORCE_GOT_SQUARE_PAD: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Force (or clear) GOT's square pad process-wide. Default false ⇒ the upstream squash.
+pub fn force_got_square_pad(on: bool) {
+    FORCE_GOT_SQUARE_PAD.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `img` as the GOT forward should see it, per [`crate::preprocess::pad_to_white_square`].
+fn got_input(img: &image::DynamicImage) -> std::borrow::Cow<'_, image::DynamicImage> {
+    if FORCE_GOT_SQUARE_PAD.load(std::sync::atomic::Ordering::Relaxed) {
+        std::borrow::Cow::Owned(crate::preprocess::pad_to_white_square(img))
+    } else {
+        std::borrow::Cow::Borrowed(img)
+    }
 }
 
 /// Optional env override for the smolvlm2 describe/VQA question (the env
@@ -2014,6 +2045,41 @@ pub struct MusicPageMeta {
     pub skips: Vec<tromr::StaffSkip>,
     /// Annotate-only musical-sanity observations (bd-av64.5).
     pub warnings: Vec<tromr::MusicWarning>,
+}
+
+/// What OneChart's number head says about a page: the one signal in that lane
+/// worth trusting, since its text decoder garbles in every precision (bd-a7zs).
+/// Surfaced like [`MusicPageMeta`], through [`OcrModel::take_chart_meta`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChartPageMeta {
+    /// [`onechart::ChartResult::pred_locs`]; empty when `<Number>` never fired.
+    pub pred_locs: Vec<f32>,
+    /// [`onechart::ChartResult::reliable_distance`].
+    pub reliable_distance: Option<f64>,
+    /// [`onechart::ChartResult::reliable`]; `None` when the text gave no values
+    /// to hold against the head.
+    pub reliable: Option<bool>,
+}
+
+/// The `chart_unverified` warning, unless the page's text passed the head check.
+#[must_use]
+pub fn chart_warning(meta: &ChartPageMeta) -> Option<RunWarning> {
+    let message = match meta.reliable {
+        Some(true) => return None,
+        Some(false) => "OneChart's text disagrees with its number head: the values are wrong",
+        None => "OneChart's text gave no values to check: it cannot be verified",
+    };
+    let mut fields = serde_json::Map::new();
+    fields.insert("pred_locs".into(), serde_json::json!(meta.pred_locs));
+    if let Some(distance) = meta.reliable_distance {
+        fields.insert("reliable_distance".into(), distance.into());
+    }
+    Some(RunWarning {
+        kind: "chart_unverified",
+        message: message.into(),
+        recovery: warning_recovery(WarningKind::ChartUnverified),
+        fields,
+    })
 }
 
 /// One parsed layout span from the model's grounding output: a ref/det label
@@ -4165,6 +4231,7 @@ impl OcrModel {
             got_tokenizer: FallibleOnce::new(),
             tromr_tokenizer: FallibleOnce::new(),
             music_meta: std::sync::Mutex::new(None),
+            chart_meta: std::sync::Mutex::new(None),
             last_decode: std::sync::Mutex::new(None),
         }
     }
@@ -4290,7 +4357,15 @@ impl OcrModel {
         // charts/molecular/geometry/sheet-music); default plain `OCR: ` unchanged.
         let format = got_format_requested();
         let max_new = self.decode_params.max_length.min(got::MAX_NEW_TOKENS);
-        let text = got::recognize(&self.weights, self.got_statics()?, tk, img, max_new, format)?;
+        let image = got_input(img);
+        let text = got::recognize(
+            &self.weights,
+            self.got_statics()?,
+            tk,
+            &image,
+            max_new,
+            format,
+        )?;
         timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
         Ok((text, w, h))
     }
@@ -4331,10 +4406,8 @@ impl OcrModel {
     /// squash preprocess → the certified SAM tower + `mm_projector` →
     /// `<imgpad>` splice → OPT KV-cache greedy → the `<Number>` number-head
     /// tap → strip/brace-complete → the self-verify verdict. The text output
-    /// is the repaired chart dict; the verdict + `pred_locs` are logged via
-    /// [`timing_log`] (a structured robot field is future surface — the
-    /// census's 'structured fields' contract is [`onechart::ChartResult`],
-    /// already the library return type).
+    /// is the repaired chart dict; the verdict + `pred_locs` go out through
+    /// [`Self::take_chart_meta`] and [`chart_warning`].
     fn forward_onechart(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
         use image::GenericImageView;
         let t = Instant::now();
@@ -4348,6 +4421,15 @@ impl OcrModel {
             res.reliable_distance,
             res.reliable
         ));
+        if let Ok(mut slot) = self.chart_meta.lock()
+            && slot.as_ref().is_none_or(|held| held.reliable == Some(true))
+        {
+            *slot = Some(ChartPageMeta {
+                pred_locs: res.pred_locs.unwrap_or_default(),
+                reliable_distance: res.reliable_distance,
+                reliable: res.reliable,
+            });
+        }
         Ok((res.json_text, w, h))
     }
 
@@ -4362,6 +4444,11 @@ impl OcrModel {
     /// set it; a second take returns `None` until the next music forward.
     pub fn take_music_meta(&self) -> Option<MusicPageMeta> {
         self.music_meta.lock().ok().and_then(|mut slot| slot.take())
+    }
+
+    /// Take (consume) the OneChart number head and verdict of this run, if any.
+    pub fn take_chart_meta(&self) -> Option<ChartPageMeta> {
+        self.chart_meta.lock().ok().and_then(|mut slot| slot.take())
     }
 
     /// Take (consume) the [`DecodeReport`] of the most recent decode through
@@ -5880,14 +5967,19 @@ impl OcrModel {
             let dims: Vec<(u32, u32)> = imgs.iter().map(|im| im.dimensions()).collect();
             let refs: Vec<&image::DynamicImage> = imgs.iter().collect();
             let texts: Vec<String> = match arch_id {
-                "got-ocr2" => got::recognize_batch(
-                    &self.weights,
-                    self.got_statics()?,
-                    self.got_tokenizer()?,
-                    &refs,
-                    max_new,
-                    got_format_requested(),
-                )?,
+                "got-ocr2" => {
+                    let inputs: Vec<_> = refs.iter().map(|img| got_input(img)).collect();
+                    let views: Vec<&image::DynamicImage> =
+                        inputs.iter().map(std::borrow::Cow::as_ref).collect();
+                    got::recognize_batch(
+                        &self.weights,
+                        self.got_statics()?,
+                        self.got_tokenizer()?,
+                        &views,
+                        max_new,
+                        got_format_requested(),
+                    )?
+                }
                 "smolvlm2" => smolvlm2::recognize_batch(
                     &self.weights,
                     self.smol_statics()?,
@@ -7589,6 +7681,30 @@ mod tests {
                 half: None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_chart_warns_unless_its_text_passed_the_head_check() {
+        let meta = |distance, reliable| ChartPageMeta {
+            pred_locs: vec![0.25, 1.0],
+            reliable_distance: distance,
+            reliable,
+        };
+        assert_eq!(chart_warning(&meta(Some(0.01), Some(true))), None);
+
+        let unverifiable = chart_warning(&meta(None, None)).expect("no verdict warns");
+        assert_eq!(unverifiable.kind, "chart_unverified");
+        assert!(RUN_WARNING_KINDS.contains(&unverifiable.kind));
+        assert!(unverifiable.message.contains("cannot be verified"));
+        assert_eq!(
+            unverifiable.fields["pred_locs"],
+            serde_json::json!([0.25, 1.0])
+        );
+        assert!(!unverifiable.fields.contains_key("reliable_distance"));
+
+        let refuted = chart_warning(&meta(Some(0.5), Some(false))).expect("a refuted text warns");
+        assert!(refuted.message.contains("disagrees"));
+        assert_eq!(refuted.fields["reliable_distance"], serde_json::json!(0.5));
     }
 
     /// A multi-page report as v1's document parse records it.

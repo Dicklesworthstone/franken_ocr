@@ -48,7 +48,7 @@ use crate::error::{
 };
 use crate::native_engine::tromr::{MusicWarning, StaffBBox, StaffSkip};
 use crate::native_engine::{
-    DecodeOverrides, FinishReason, ModelIdentity, MusicPageMeta, PreprocessOverrides,
+    ChartPageMeta, DecodeOverrides, FinishReason, ModelIdentity, MusicPageMeta, PreprocessOverrides,
 };
 use crate::{LayoutSpan, OcrEngine, RecognizedDocument};
 
@@ -92,7 +92,7 @@ const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 /// Request size cap (pre-auth): paths + option scalars run a few KB.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
-const PROTOCOL: u64 = 3;
+const PROTOCOL: u64 = 4;
 
 /// Upper clamp for user-supplied second counts (one year). `Instant + Duration`
 /// PANICS on overflow, so an absurd `FOCR_RESIDENT_*_SECS` value must not reach
@@ -312,6 +312,40 @@ pub struct ResidentReply {
     /// A TrOMR run's staves and musical-sanity warnings; `None` for every
     /// other run.
     pub music: Option<MusicPageMeta>,
+    /// A OneChart run's number head and verdict; `None` for every other run.
+    pub chart: Option<ChartPageMeta>,
+}
+
+fn chart_to_wire(meta: &ChartPageMeta) -> Value {
+    json!({
+        "pred_locs": meta.pred_locs,
+        "reliable_distance": meta.reliable_distance,
+        "reliable": meta.reliable,
+    })
+}
+
+/// `None` when any part cannot be read: a half-read head is worse than falling
+/// back to an inline run.
+fn chart_from_wire(value: &Value) -> Option<ChartPageMeta> {
+    let pred_locs = value
+        .get("pred_locs")?
+        .as_array()?
+        .iter()
+        .map(|slot| slot.as_f64().map(|v| v as f32))
+        .collect::<Option<Vec<f32>>>()?;
+    let reliable_distance = match value.get("reliable_distance")? {
+        Value::Null => None,
+        distance => Some(distance.as_f64()?),
+    };
+    let reliable = match value.get("reliable")? {
+        Value::Null => None,
+        verdict => Some(verdict.as_bool()?),
+    };
+    Some(ChartPageMeta {
+        pred_locs,
+        reliable_distance,
+        reliable,
+    })
 }
 
 fn bbox_to_wire(bbox: StaffBBox) -> Value {
@@ -435,6 +469,8 @@ pub struct ResidentRequest<'a> {
     pub preprocess: PreprocessOverrides,
     /// GOT-OCR2 `--format` mode (forward-read; set per request in the daemon).
     pub format: bool,
+    /// GOT-OCR2 square pad, from the task (forward-read; set per request).
+    pub square_pad: bool,
     /// SmolVLM2 `--task describe` question (forward-read; set per request).
     pub question: Option<&'a str>,
     /// Told each stage the daemon enters for this request.
@@ -459,6 +495,7 @@ fn options_value(request: &ResidentRequest<'_>) -> Value {
             "gundam": request.preprocess.gundam,
         },
         "format": request.format,
+        "square_pad": request.square_pad,
         "question": request.question,
     })
 }
@@ -672,6 +709,11 @@ fn reply_from_wire(line: &[u8]) -> FocrResult<Option<ResidentReply>> {
             Some(Some(music)) => Some(music),
             Some(None) => return Ok(None),
         };
+        let chart = match reply.get("chart").map(chart_from_wire) {
+            None => None,
+            Some(Some(chart)) => Some(chart),
+            Some(None) => return Ok(None),
+        };
         return Ok(Some(ResidentReply {
             document: RecognizedDocument {
                 markdown,
@@ -681,6 +723,7 @@ fn reply_from_wire(line: &[u8]) -> FocrResult<Option<ResidentReply>> {
             finish_reason,
             model: model_from_reply(&reply),
             music,
+            chart,
         }));
     }
     // A recognition error is real and final; anything transport-shaped means
@@ -1133,6 +1176,12 @@ fn handle_connection(
             .and_then(Value::as_bool)
             .unwrap_or(false),
     );
+    crate::native_engine::force_got_square_pad(
+        options
+            .get("square_pad")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
     crate::native_engine::set_smolvlm2_question(
         options
             .get("question")
@@ -1211,6 +1260,9 @@ fn handle_connection(
             });
             if let Some(music) = engine.engine.take_music_page_meta() {
                 reply["music"] = music_to_wire(&music);
+            }
+            if let Some(chart) = engine.engine.take_chart_page_meta() {
+                reply["chart"] = chart_to_wire(&chart);
             }
             if let Some(model) = engine.engine.loaded_model_identity() {
                 model.merge_into(&mut reply);
@@ -1383,6 +1435,38 @@ mod tests {
     }
 
     #[test]
+    fn a_chart_head_crosses_the_wire_whole_or_not_at_all() {
+        let meta = ChartPageMeta {
+            pred_locs: vec![0.25, 1.0],
+            reliable_distance: Some(0.5),
+            reliable: Some(false),
+        };
+        assert_eq!(chart_from_wire(&chart_to_wire(&meta)), Some(meta.clone()));
+        let unverifiable = ChartPageMeta {
+            reliable_distance: None,
+            reliable: None,
+            ..meta
+        };
+        assert_eq!(
+            chart_from_wire(&chart_to_wire(&unverifiable)),
+            Some(unverifiable.clone())
+        );
+        let wire = chart_to_wire(&unverifiable);
+        for (key, broken) in [
+            ("pred_locs", json!(["x"])),
+            ("reliable_distance", json!("far")),
+            ("reliable", json!(1)),
+        ] {
+            let mut bad = wire.clone();
+            bad[key] = broken;
+            assert!(chart_from_wire(&bad).is_none(), "{key}");
+        }
+        let reply = json!({ "ok": true, "markdown": "m", "raw": "r", "chart": { "reliable": 1 } });
+        let served = reply_from_wire(reply.to_string().as_bytes()).unwrap();
+        assert!(served.is_none(), "an unreadable head falls back inline");
+    }
+
+    #[test]
     fn a_served_run_reports_music_it_can_read_and_otherwise_runs_inline() {
         let served = |music: Value| {
             let reply = json!({ "ok": true, "markdown": "m", "raw": "r", "music": music });
@@ -1513,10 +1597,12 @@ mod tests {
                 gundam: Some(true),
             },
             format: true,
+            square_pad: true,
             question: Some("what?"),
             on_stage: None,
         };
         let wire = options_value(&request);
+        assert_eq!(wire["square_pad"], true);
         let decode = decode_overrides_from_wire(&wire);
         assert_eq!(decode.max_length, Some(4096));
         assert_eq!(decode.temperature, Some(0.5));

@@ -439,7 +439,8 @@ mod tests {
     /// assets are read and which are misread. Env-gated like B11 (`FOCR_GOT_MODEL` +
     /// `FOCR_GOT_TIKTOKEN`; skip-with-success when absent); `UPDATE_GOLDENS=1` is the
     /// only writer, and a new reading needs its score reviewed and updated too.
-    fn format_corpus_reading(asset: &str) {
+    /// `square_pad` is the image `--task chart` and `--task formula` feed the model.
+    fn format_corpus_reading(asset: &str, square_pad: bool) {
         let (Ok(model), Ok(tkp)) = (
             std::env::var("FOCR_GOT_MODEL"),
             std::env::var("FOCR_GOT_TIKTOKEN"),
@@ -454,6 +455,11 @@ mod tests {
         let tk = Tiktoken::from_qwen_tiktoken(&std::fs::read(&tkp).expect("qwen.tiktoken"))
             .expect("tiktoken");
         let img = image::open(dir.join(format!("{asset}.png"))).expect("corpus image");
+        let img = if square_pad {
+            preprocess::pad_to_white_square(&img)
+        } else {
+            img
+        };
 
         let statics = hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
         // `recognize` decodes int8 whatever the file holds: its KV-cache weights
@@ -472,12 +478,20 @@ mod tests {
             let cfg = DecoderConfig::got_ocr2();
             let ids = decoder_qwen2::generate_greedy(&weights, &cfg, &embeds, 512, EOS_ID)
                 .expect("f32 greedy decode");
-            tk.decode_skip_special(&ids).expect("decode").trim().to_string()
+            tk.decode_skip_special(&ids)
+                .expect("decode")
+                .trim()
+                .to_string()
         };
         eprintln!("[format corpus {asset}] {text:?}");
 
         let reading = format!("{text}\n");
-        let suffix = if int8 { "got" } else { "f32.got" };
+        let suffix = match (square_pad, int8) {
+            (false, true) => "got",
+            (false, false) => "f32.got",
+            (true, true) => "task.got",
+            (true, false) => "task.f32.got",
+        };
         let frozen = dir.join(format!("{asset}.{suffix}.txt"));
         if matches!(std::env::var("UPDATE_GOLDENS").ok().as_deref(), Some("1")) {
             std::fs::write(&frozen, &reading).expect("freeze the reading");
@@ -494,31 +508,37 @@ mod tests {
     /// formula.png — misread as SMILES, on f32 too.
     #[test]
     fn format_corpus_formula_e2e() {
-        format_corpus_reading("formula");
+        format_corpus_reading("formula", false);
     }
 
     /// table.png — read exactly.
     #[test]
     fn format_corpus_table_e2e() {
-        format_corpus_reading("table");
+        format_corpus_reading("table", false);
     }
 
     /// chart.png — three of four values misread by int8 (bd-kd75), all four read by f32.
     #[test]
     fn format_corpus_chart_e2e() {
-        format_corpus_reading("chart");
+        format_corpus_reading("chart", false);
+    }
+
+    /// chart.png as `--task chart` feeds it: padded to a square, every value is read.
+    #[test]
+    fn format_corpus_chart_task_e2e() {
+        format_corpus_reading("chart", true);
     }
 
     /// molecule.png — read as aspirin.
     #[test]
     fn format_corpus_molecule_e2e() {
-        format_corpus_reading("molecule");
+        format_corpus_reading("molecule", false);
     }
 
     /// music.png — misread, on f32 too: a second spine and a wrong second bar.
     #[test]
     fn format_corpus_music_e2e() {
-        format_corpus_reading("music");
+        format_corpus_reading("music", false);
     }
 
     /// **B7 — the `OCR with format:` (.mmd) prompt swaps only the instruction.** Fast

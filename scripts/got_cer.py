@@ -238,6 +238,7 @@ FORMAT_SCORES = {
     "table": (0.0, 0.0, "read"),
     "molecule": (0.0, 0.0, "read"),
     "chart": (0.3, 0.1, "MISREAD by int8, bd-kd75"),
+    "chart.task": (0.55, 0.55, "values read, title lost"),
     "music": (1.3023, 1.3023, "MISREAD, f32 too"),
     "formula": (4.8485, 4.8485, "MISREAD as SMILES, f32 too"),
 }
@@ -294,14 +295,15 @@ def format_corpus(root=FORMAT_CORPUS, scores=None):
     scores = FORMAT_SCORES if scores is None else scores
     failures = []
     for asset, (int8, f32, verdict) in scores.items():
+        base = asset.split(".")[0]
         sidecar = next(
             name for name in sorted(os.listdir(root))
-            if name.startswith(f"{asset}.gt.")
+            if name.startswith(f"{base}.gt.")
         )
         truth = _read(os.path.join(root, sidecar))
         for arm, recorded, suffix in (("int8", int8, "got"), ("f32", f32, "f32.got")):
             reading = _read(os.path.join(root, f"{asset}.{suffix}.txt"))
-            cer = format_cer(asset, reading, truth)
+            cer = format_cer(base, reading, truth)
             print(json.dumps({"asset": asset, "arm": arm, "cer": cer, "verdict": verdict}))
             if cer != recorded:
                 failures.append(f"{asset} {arm}: scored {cer}, recorded {recorded}")

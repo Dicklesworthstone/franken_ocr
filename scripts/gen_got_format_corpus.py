@@ -13,10 +13,9 @@ ground-truth sidecar holding the exact SOURCE the image was rendered from:
         music.png     + music.gt.krn      (**kern source, Verovio engraving)
         manifest.json                     (generator versions + asset sha256s)
 
-The Rust format-mode smoke gates (`src/native_engine/got.rs` tests, env-gated on
-`FOCR_GOT_MODEL`) run `recognize(..., format=true)` on these and assert lenient
-structural markers; exact CER budgets are phase 2 (see bd-3kix), scored with
-``scripts/got_cer.py`` against the sidecars once outputs are eyeballed.
+The Rust `format_corpus_*_e2e` tests (`src/native_engine/got.rs`, env-gated on
+`FOCR_GOT_MODEL`) run `recognize(..., format=true)` on these and assert the frozen
+readings; ``scripts/got_cer.py --format-corpus`` scores those against the sidecars.
 
 Everything is deterministic: fixed data (no randomness — seeds are pinned anyway
 for belt-and-braces), fixed figure sizes/DPI/fonts (matplotlib's bundled DejaVu),

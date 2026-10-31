@@ -495,6 +495,8 @@ pub struct OcrRequest {
     pub ngram_window: Option<u32>,
     pub max_page_tokens: Option<u32>,
     pub format: bool,
+    /// Pad the image to a square before GOT sees it (per [`OcrTask::pads_got_image`]).
+    pub square_pad: bool,
     pub question: Option<String>,
     pub pages: Option<String>,
     pub split_spreads: bool,
@@ -595,6 +597,7 @@ impl OcrRequestArgs {
             // `--format` and a format-implying `--task` compose OR-wise: an
             // explicit `--format` wins / is idempotent alongside `--task`.
             format: self.format || self.task.implies_got_format(),
+            square_pad: self.task.pads_got_image(),
             question: self.question.clone(),
             pages: self.pages.clone(),
             split_spreads: self.split_spreads,
@@ -832,6 +835,14 @@ impl OcrTask {
                 | Self::Geometry
                 | Self::Music
         )
+    }
+
+    /// The tasks GOT reads better from a square-padded image, measured in
+    /// `artifacts/accuracy/bd-kd75/`. `tables` must stay off this list: a padded
+    /// table is read as SMILES. `molecular` and `geometry` were not measured apart
+    /// from one already-square molecule, and `music` misreads either way.
+    fn pads_got_image(self) -> bool {
+        matches!(self, Self::Chart | Self::Formula)
     }
 }
 
@@ -1824,6 +1835,7 @@ fn run_ocr_inner(
     // format-implying `--task` (folded in `to_request`). MUST precede
     // `OcrEngine::new()`: the decode params are resolved at model load.
     native_engine::force_got_format(request.format);
+    native_engine::force_got_square_pad(request.square_pad);
     native_engine::set_smolvlm2_question(request.question.clone());
     native_engine::set_decode_overrides(decode_overrides_from(&request));
     native_engine::set_preprocess_overrides(preprocess_overrides_from(&request));
@@ -1939,6 +1951,7 @@ fn run_ocr_inner(
     let mut resident_finish: Option<native_engine::FinishReason> = None;
     let mut resident_model: Option<native_engine::ModelIdentity> = None;
     let mut resident_music: Option<native_engine::MusicPageMeta> = None;
+    let mut resident_chart: Option<native_engine::ChartPageMeta> = None;
     let stages = robot_mode.then(|| Arc::new(robot::StageClock::start()));
     if let Some(stages) = &stages {
         let stages = Arc::clone(stages);
@@ -2026,6 +2039,7 @@ fn run_ocr_inner(
                         resident_finish = reply.finish_reason;
                         resident_model = reply.model;
                         resident_music = reply.music;
+                        resident_chart = reply.chart;
                         reply.document
                     }
                     None => {
@@ -2059,6 +2073,12 @@ fn run_ocr_inner(
             .unwrap_or_default(),
     );
     run_warnings.extend(document_outcome.warnings);
+    run_warnings.extend(
+        resident_chart
+            .or_else(|| engine.take_chart_page_meta())
+            .as_ref()
+            .and_then(native_engine::chart_warning),
+    );
     let resumed_from = document_outcome.resumed_from;
     // An Unlimited-OCR-2 document that stopped at its position limit or
     // stage budget writes what it produced below, then exits 5 (U2-B6). A
@@ -2554,6 +2574,7 @@ fn resident_recognition(
         decode: decode_overrides_from(request),
         preprocess: preprocess_overrides_from(request),
         format: request.format,
+        square_pad: request.square_pad,
         question: request.question.as_deref(),
         on_stage: Some(&on_stage),
     })
@@ -5303,6 +5324,26 @@ mod tests {
         assert!(!req.format, "--task ocr stays plain");
         let req = ocr_request_from(&["scan.png"]).expect("request builds");
         assert!(!req.format, "default task stays plain");
+    }
+
+    #[test]
+    fn only_chart_and_formula_pad_the_got_image() {
+        for (task, pads) in [
+            ("chart", true),
+            ("formula", true),
+            ("tables", false),
+            ("molecular", false),
+            ("geometry", false),
+            ("music", false),
+        ] {
+            let req =
+                ocr_request_from(&["scan.png", "--task", task, "--model", "got-ocr2.int8.focrq"])
+                    .expect("request builds");
+            assert_eq!(req.square_pad, pads, "--task {task}");
+        }
+        let req = ocr_request_from(&["scan.png", "--format", "--model", "got-ocr2.int8.focrq"])
+            .expect("request builds");
+        assert!(!req.square_pad, "`--format` alone is the upstream squash");
     }
 
     #[test]

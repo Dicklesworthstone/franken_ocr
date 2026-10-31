@@ -993,6 +993,25 @@ pub fn onechart_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor:
     crate::native_engine::tensor::Mat::from_vec(3, n, data)
 }
 
+/// `img` centered on a white square, so [`got_view_tensor`]'s square resize keeps its
+/// shape. Upstream squashes every image and plain `--format` stays faithful to that;
+/// `--task chart` and `--task formula` pad first because the squash misreads them,
+/// on f32 too (`artifacts/accuracy/bd-kd75/`). It is per task because a padded table
+/// is read as SMILES.
+#[must_use]
+pub fn pad_to_white_square(img: &DynamicImage) -> DynamicImage {
+    let (w, h) = img.dimensions();
+    let side = w.max(h);
+    let mut square = image::RgbImage::from_pixel(side, side, image::Rgb([255, 255, 255]));
+    image::imageops::replace(
+        &mut square,
+        &img.to_rgb8(),
+        i64::from((side - w) / 2),
+        i64::from((side - h) / 2),
+    );
+    DynamicImage::ImageRgb8(square)
+}
+
 /// [`preprocess_got`] over an already-decoded image (shared with the CLI/tests).
 pub fn got_view_tensor(img: &DynamicImage) -> crate::native_engine::tensor::Mat {
     let rgb = resample_exact(img, GOT_SIZE, GOT_SIZE).to_rgb8();
@@ -1135,6 +1154,30 @@ pub fn tromr_staff_tensor(img: &DynamicImage) -> FocrResult<(Vec<f32>, usize)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pad_to_white_square_centers_the_image() {
+        use image::{DynamicImage, GenericImageView, Rgb, RgbImage};
+        let white = [255, 255, 255];
+        let black = RgbImage::from_pixel(4, 2, Rgb([0, 0, 0]));
+
+        let wide = super::pad_to_white_square(&DynamicImage::ImageRgb8(black.clone()));
+        assert_eq!(wide.dimensions(), (4, 4));
+        let rows: Vec<bool> = (0..4)
+            .map(|y| wide.to_rgb8().get_pixel(0, y).0 == white)
+            .collect();
+        assert_eq!(rows, [true, false, false, true], "bars above and below");
+
+        let tall = DynamicImage::ImageRgb8(image::imageops::rotate90(&black));
+        let tall = super::pad_to_white_square(&tall).to_rgb8();
+        assert_eq!(tall.dimensions(), (4, 4));
+        let columns: Vec<bool> = (0..4).map(|x| tall.get_pixel(x, 0).0 == white).collect();
+        assert_eq!(columns, [true, false, false, true], "bars left and right");
+
+        let square = RgbImage::from_pixel(3, 3, Rgb([9, 8, 7]));
+        let kept = super::pad_to_white_square(&DynamicImage::ImageRgb8(square.clone()));
+        assert_eq!(kept.to_rgb8(), square, "a square image is left alone");
+    }
+
     /// GH#4 companion check: palette (indexed-color) PNGs need no special
     /// handling on the raster input path — the `image` crate expands PNG color
     /// type 3 through its PLTE table during decode. This pins that behavior so
@@ -1995,7 +2038,11 @@ mod tests {
             for &b in bytes {
                 crc ^= u32::from(b);
                 for _ in 0..8 {
-                    crc = if crc & 1 == 1 { (crc >> 1) ^ 0xEDB8_8320 } else { crc >> 1 };
+                    crc = if crc & 1 == 1 {
+                        (crc >> 1) ^ 0xEDB8_8320
+                    } else {
+                        crc >> 1
+                    };
                 }
             }
             !crc

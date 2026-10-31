@@ -423,6 +423,7 @@
     "uncertified_crop_mode",
     "pull_hint",
     "resume_recompute",
-    "checkpoint_failed"
+    "checkpoint_failed",
+    "chart_unverified"
   ]
 }
