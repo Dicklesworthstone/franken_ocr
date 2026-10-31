@@ -1289,20 +1289,11 @@ fn write_ocr_output(
     rec: &Recognition,
     shape: OutputShape,
     figures: &[WrittenFigure],
-    music_meta: Option<&native_engine::MusicPageMeta>,
-    run_warnings: &[native_engine::RunWarning],
-    model: Option<&native_engine::ModelIdentity>,
+    extras: RunExtras<'_>,
 ) -> FocrResult<()> {
     let contents = if shape.json {
         let mut value = rec.to_json(figures, shape.raw);
-        if let Some(meta) = music_meta {
-            value["staves"] = music_meta_to_json(meta);
-            value["warnings"] = music_warnings_to_json(meta);
-        }
-        merge_run_warnings(&mut value, run_warnings);
-        if let Some(model) = model {
-            model.merge_into(&mut value);
-        }
+        extras.merge_into(&mut value);
         let mut s = serde_json::to_string_pretty(&value).map_err(|e| {
             FocrError::Other(anyhow::anyhow!(
                 "serializing OCR JSON for {}: {e}",
@@ -2073,12 +2064,8 @@ fn run_ocr_inner(
             .unwrap_or_default(),
     );
     run_warnings.extend(document_outcome.warnings);
-    run_warnings.extend(
-        resident_chart
-            .or_else(|| engine.take_chart_page_meta())
-            .as_ref()
-            .and_then(native_engine::chart_warning),
-    );
+    let chart_meta = resident_chart.or_else(|| engine.take_chart_page_meta());
+    run_warnings.extend(chart_meta.as_ref().and_then(native_engine::chart_warning));
     let resumed_from = document_outcome.resumed_from;
     // An Unlimited-OCR-2 document that stopped at its position limit or
     // stage budget writes what it produced below, then exits 5 (U2-B6). A
@@ -2169,20 +2156,18 @@ fn run_ocr_inner(
         json: args.json || output_is_json(args.output.as_deref()),
         raw: args.raw,
     };
+    let extras = RunExtras {
+        music: music_meta.as_ref(),
+        chart: chart_meta.as_ref(),
+        warnings: &run_warnings,
+        model: model.as_ref(),
+    };
 
     // An `-o/--output FILE` writes the result to disk (markdown or JSON-with-boxes)
     // regardless of mode, and is written FIRST so the file already exists when a
     // robot consumer sees the completion event below.
     if let Some(path) = args.output.as_deref() {
-        write_ocr_output(
-            path,
-            &recognition,
-            shape,
-            &figures,
-            music_meta.as_ref(),
-            &run_warnings,
-            model.as_ref(),
-        )?;
+        write_ocr_output(path, &recognition, shape, &figures, extras)?;
     }
     // The document is out, so what could have resumed it is done with. A
     // file left behind costs disk, not the result.
@@ -2212,6 +2197,9 @@ fn run_ocr_inner(
             if let Some(page) = resumed_from {
                 event["resumed_from"] = page.into();
             }
+            if let Some(meta) = &chart_meta {
+                event["chart"] = chart_meta_to_json(meta);
+            }
             if let Some(counts) = &document_outcome.counts {
                 event["pages_out"] = counts.pages_out.into();
                 event["pages_skipped"] = counts.pages_skipped.into();
@@ -2231,20 +2219,49 @@ fn run_ocr_inner(
         eprintln!("[focr] wrote {} ({}{figs})", path.display(), shape.name());
     } else if args.json {
         let mut value = recognition.to_json(&figures, args.raw);
-        if let Some(meta) = &music_meta {
-            value["staves"] = music_meta_to_json(meta);
-            value["warnings"] = music_warnings_to_json(meta);
-        }
-        merge_run_warnings(&mut value, &run_warnings);
-        if let Some(model) = &model {
-            model.merge_into(&mut value);
-        }
+        extras.merge_into(&mut value);
         emit(&value);
     } else {
         println!("{}", recognition.text(args.raw));
     }
     // The pages are out; a partial run now fails with exit 5.
     partial.map_or(Ok(()), Err)
+}
+
+/// What a JSON result carries beside the recognition itself.
+#[derive(Clone, Copy, Default)]
+struct RunExtras<'a> {
+    music: Option<&'a native_engine::MusicPageMeta>,
+    chart: Option<&'a native_engine::ChartPageMeta>,
+    warnings: &'a [native_engine::RunWarning],
+    model: Option<&'a native_engine::ModelIdentity>,
+}
+
+impl RunExtras<'_> {
+    fn merge_into(self, value: &mut serde_json::Value) {
+        if let Some(meta) = self.music {
+            value["staves"] = music_meta_to_json(meta);
+            value["warnings"] = music_warnings_to_json(meta);
+        }
+        if let Some(meta) = self.chart {
+            value["chart"] = chart_meta_to_json(meta);
+        }
+        merge_run_warnings(value, self.warnings);
+        if let Some(model) = self.model {
+            model.merge_into(value);
+        }
+    }
+}
+
+/// The JSON `chart` object for a OneChart run (bd-a7zs): the number head, and
+/// the verdict on the text, null when the text gave no values to check. Absent
+/// on every other run, and present whether or not the run warned.
+fn chart_meta_to_json(meta: &native_engine::ChartPageMeta) -> serde_json::Value {
+    serde_json::json!({
+        "pred_locs": meta.pred_locs,
+        "reliable_distance": meta.reliable_distance,
+        "reliable": meta.reliable,
+    })
 }
 
 /// Merge the run's decode warnings (U2-X2) into a `--json` value's
@@ -3244,18 +3261,56 @@ fn recognize_document_pages_with_figures(
     ))
 }
 
+/// How one `ocr-batch` image's decode ended, in the terms `focr ocr` reports
+/// for a run (bd-hntz).
+#[derive(Default)]
+struct PageEnd {
+    finish_reason: Option<native_engine::FinishReason>,
+    warnings: Vec<native_engine::RunWarning>,
+    chart: Option<native_engine::ChartPageMeta>,
+    /// The page stopped early: its text is out, and it failed all the same.
+    partial: Option<FocrError>,
+}
+
+impl PageEnd {
+    /// Consume what `engine`'s last decode recorded.
+    fn take(engine: &OcrEngine) -> Self {
+        let report = engine.take_last_decode_report();
+        let chart = engine.take_chart_page_meta();
+        let mut warnings = report
+            .as_ref()
+            .map(native_engine::decode_warnings)
+            .unwrap_or_default();
+        warnings.extend(chart.as_ref().and_then(native_engine::chart_warning));
+        let partial = report
+            .as_ref()
+            .zip(engine.loaded_model_identity().as_ref())
+            .and_then(|(report, model)| native_engine::partial_output(report, &warnings, model));
+        Self {
+            finish_reason: report
+                .as_ref()
+                .map(native_engine::DecodeReport::run_finish_reason),
+            warnings,
+            chart,
+            partial,
+        }
+    }
+}
+
 /// Emit ONE batch image's outcome in the shared `ocr-batch` shape — a JSON object
 /// pushed to `results` (with `--json`) or the `[focr] … =====` markdown block on
 /// stdout/stderr, or under `--output-dir` the line naming its `saved` file.
 /// Factored so the sequential and spine drivers render byte-for-byte
-/// identically; only the source of `outcome` differs between them. Returns the
-/// image's failure, once reported.
+/// identically; the spine records no per-image `end`, and otherwise only the
+/// source of `outcome` differs between them. Returns the image's failure, once
+/// reported.
 fn emit_batch_result(
     json: bool,
     image: &std::path::Path,
     secs: f64,
     outcome: FocrResult<String>,
     saved: Option<&Path>,
+    end: PageEnd,
     results: &mut Vec<serde_json::Value>,
 ) -> Option<FocrError> {
     match outcome {
@@ -3263,26 +3318,41 @@ fn emit_batch_result(
             if json {
                 let mut result = serde_json::json!({
                     "image": image.display().to_string(),
-                    "ok": true,
+                    "ok": end.partial.is_none(),
                     "seconds": secs,
                     "markdown": markdown,
                 });
                 if let Some(saved) = saved {
                     result["output"] = saved.display().to_string().into();
                 }
+                if let Some(reason) = end.finish_reason {
+                    result["finish_reason"] = reason.as_str().into();
+                }
+                if let Some(err) = &end.partial {
+                    result["error"] = err.to_string().into();
+                }
+                RunExtras {
+                    chart: end.chart.as_ref(),
+                    warnings: &end.warnings,
+                    ..RunExtras::default()
+                }
+                .merge_into(&mut result);
                 results.push(result);
-            } else if let Some(saved) = saved {
-                eprintln!(
-                    "[focr] {} ({secs:.2}s) -> {}",
-                    image.display(),
-                    saved.display()
-                );
             } else {
-                eprintln!("[focr] {} ({secs:.2}s)", image.display());
-                println!("===== {} =====", image.display());
-                println!("{markdown}");
+                print_run_warnings(&end.warnings);
+                if let Some(saved) = saved {
+                    eprintln!(
+                        "[focr] {} ({secs:.2}s) -> {}",
+                        image.display(),
+                        saved.display()
+                    );
+                } else {
+                    eprintln!("[focr] {} ({secs:.2}s)", image.display());
+                    println!("===== {} =====", image.display());
+                    println!("{markdown}");
+                }
             }
-            None
+            end.partial
         }
         Err(err) => {
             if json {
@@ -3599,9 +3669,16 @@ fn run_batch_images(
                 save_batch_markdown(saved, &markdown)?;
                 Ok(markdown)
             });
-            if let Some(err) =
-                emit_batch_result(args.json, image, per_image, outcome, saved, &mut results)
-            {
+            let end = PageEnd::default();
+            if let Some(err) = emit_batch_result(
+                args.json,
+                image,
+                per_image,
+                outcome,
+                saved,
+                end,
+                &mut results,
+            ) {
                 failed += 1;
                 first_failure.get_or_insert(err);
             }
@@ -3632,10 +3709,12 @@ fn run_batch_images(
                 Ok(markdown)
             });
             let secs = started.elapsed().as_secs_f64();
+            let end = PageEnd::take(&engine);
             bar.complete_item();
             bar.suspend();
             if let Some(events) = events {
-                events.image_ended(i + 1, image, &outcome);
+                let failure = outcome.as_ref().err().or(end.partial.as_ref());
+                events.image_ended(i + 1, image, failure);
             }
             if matches!(outcome, Err(FocrError::Cancelled)) {
                 stopped = Some("cancelled");
@@ -3643,7 +3722,7 @@ fn run_batch_images(
                 break;
             }
             if let Some(err) =
-                emit_batch_result(args.json, image, secs, outcome, saved, &mut results)
+                emit_batch_result(args.json, image, secs, outcome, saved, end, &mut results)
             {
                 failed += 1;
                 first_failure.get_or_insert(err);
@@ -6042,6 +6121,85 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_row_says_how_its_page_ended() {
+        use native_engine::FinishReason;
+        let page = Path::new("a.png");
+        let mut rows = Vec::new();
+        let mut emit =
+            |end| emit_batch_result(true, page, 1.0, Ok("text".into()), None, end, &mut rows);
+
+        let clean = PageEnd {
+            finish_reason: Some(FinishReason::Stop),
+            ..PageEnd::default()
+        };
+        assert!(emit(clean).is_none());
+        // `focr ocr` exits 0 on a v1 length stop, and so does this row.
+        let capped = PageEnd {
+            finish_reason: Some(FinishReason::Length),
+            ..PageEnd::default()
+        };
+        assert!(emit(capped).is_none());
+        let stopped = PageEnd {
+            finish_reason: Some(FinishReason::Budget),
+            partial: Some(FocrError::Timeout("stopped early".into())),
+            ..PageEnd::default()
+        };
+        let failure = emit(stopped).expect("a stopped page is a failed page");
+        assert_eq!(failure.exit_code(), 5);
+
+        assert_eq!(rows[0]["ok"], true);
+        assert_eq!(rows[0]["finish_reason"], "stop");
+        assert!(rows[0].get("error").is_none());
+        assert_eq!(rows[1]["ok"], true);
+        assert_eq!(rows[1]["finish_reason"], "length");
+        assert_eq!(rows[2]["ok"], false);
+        assert_eq!(rows[2]["finish_reason"], "budget");
+        assert_eq!(rows[2]["markdown"], "text");
+        assert!(rows[2]["error"].as_str().unwrap().contains("stopped early"));
+    }
+
+    #[test]
+    fn a_chart_keeps_its_head_whether_or_not_it_warned() {
+        let chart = |reliable: Option<bool>| native_engine::ChartPageMeta {
+            pred_locs: vec![0.25, 1.0],
+            reliable_distance: reliable.map(|_| 0.01),
+            reliable,
+        };
+        let run = |meta: &native_engine::ChartPageMeta| {
+            let warnings: Vec<_> = native_engine::chart_warning(meta).into_iter().collect();
+            let mut value = serde_json::json!({ "markdown": "x" });
+            RunExtras {
+                chart: Some(meta),
+                warnings: &warnings,
+                ..RunExtras::default()
+            }
+            .merge_into(&mut value);
+            value
+        };
+
+        let verified = run(&chart(Some(true)));
+        assert_eq!(
+            verified["chart"]["pred_locs"],
+            serde_json::json!([0.25, 1.0])
+        );
+        assert_eq!(verified["chart"]["reliable"], true);
+        assert!(verified.get("warnings").is_none());
+
+        let unverified = run(&chart(None));
+        assert_eq!(
+            unverified["chart"]["pred_locs"],
+            serde_json::json!([0.25, 1.0])
+        );
+        assert!(unverified["chart"]["reliable"].is_null());
+        assert!(unverified["chart"]["reliable_distance"].is_null());
+        assert_eq!(unverified["warnings"][0]["kind"], "chart_unverified");
+
+        let mut other = serde_json::json!({ "markdown": "x" });
+        RunExtras::default().merge_into(&mut other);
+        assert!(other.get("chart").is_none());
+    }
+
+    #[test]
     fn write_ocr_output_writes_markdown_and_json_with_boxes() {
         let dir = std::env::temp_dir().join(format!("focr_output_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -6062,7 +6220,7 @@ mod tests {
             json: false,
             raw: false,
         };
-        write_ocr_output(&md_path, &rec, text, &[], None, &[], None).expect("write md");
+        write_ocr_output(&md_path, &rec, text, &[], RunExtras::default()).expect("write md");
         assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "hello world\n");
 
         // `--raw`: the same file holds the decode, markers and all.
@@ -6070,7 +6228,7 @@ mod tests {
             json: false,
             raw: true,
         };
-        write_ocr_output(&md_path, &rec, raw_shape, &[], None, &[], None).expect("write raw");
+        write_ocr_output(&md_path, &rec, raw_shape, &[], RunExtras::default()).expect("write raw");
         assert_eq!(
             std::fs::read_to_string(&md_path).unwrap(),
             "<|ref|>text<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\nhello world\n"
@@ -6086,7 +6244,11 @@ mod tests {
             json: true,
             raw: false,
         };
-        write_ocr_output(&json_path, &rec, json, &[], None, &[], Some(&model)).expect("write json");
+        let extras = RunExtras {
+            model: Some(&model),
+            ..RunExtras::default()
+        };
+        write_ocr_output(&json_path, &rec, json, &[], extras).expect("write json");
         let raw = std::fs::read_to_string(&json_path).unwrap();
         assert!(raw.ends_with('\n'), "json file should end with a newline");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");

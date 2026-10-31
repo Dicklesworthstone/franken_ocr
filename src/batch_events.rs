@@ -301,23 +301,24 @@ impl BatchEvents {
         stream.write("batch_start", fields);
     }
 
-    /// Report image `ordinal` (1-based) of an independent batch. A cancelled
-    /// image did not end, so it is `batch_cancelled`, not an error.
-    pub fn image_ended(&self, ordinal: usize, image: &Path, outcome: &FocrResult<String>) {
+    /// Report image `ordinal` (1-based) of an independent batch, with its
+    /// failure if it had one: a page that stopped early has text and a failure.
+    /// A cancelled image did not end, so it is `batch_cancelled`, not an error.
+    pub fn image_ended(&self, ordinal: usize, image: &Path, failure: Option<&FocrError>) {
         let mut stream = self.lock();
-        if matches!(outcome, Err(FocrError::Cancelled)) {
+        if matches!(failure, Some(FocrError::Cancelled)) {
             stream.cancelled(Some(image));
             return;
         }
         let now = (stream.now_ms)();
-        let elapsed = stream.tally.ended(outcome.is_ok(), now);
+        let elapsed = stream.tally.ended(failure.is_none(), now);
         let mut fields = Map::new();
         fields.insert("ordinal".into(), ordinal.into());
         fields.insert("image".into(), image.display().to_string().into());
         stream.tally.progress(&mut fields, now, elapsed);
-        let event = match outcome {
-            Ok(_) => "image_complete",
-            Err(err) => {
+        let event = match failure {
+            None => "image_complete",
+            Some(err) => {
                 fields.insert("error".into(), err.to_string().into());
                 fields.insert("exit_code".into(), err.exit_code().into());
                 "image_error"
@@ -516,12 +517,11 @@ mod tests {
         let run = Harness::new();
         run.start(BatchMode::Images, 3);
         run.at(40_000);
-        let page = Ok("body".to_string());
-        run.events.image_ended(1, Path::new("a.png"), &page);
+        run.events.image_ended(1, Path::new("a.png"), None);
         run.at(60_000);
-        run.events.image_ended(2, Path::new("b.png"), &page);
+        run.events.image_ended(2, Path::new("b.png"), None);
         run.at(80_000);
-        run.events.image_ended(3, Path::new("c.png"), &page);
+        run.events.image_ended(3, Path::new("c.png"), None);
         run.events.end(&Ok(()));
 
         let lines = run.lines();
@@ -565,11 +565,11 @@ mod tests {
         let run = Harness::new();
         run.start(BatchMode::Images, 2);
         run.at(10_000);
-        let failed = Err(FocrError::InputDecode("not an image".into()));
-        run.events.image_ended(1, Path::new("bad.png"), &failed);
-        run.at(40_000);
+        let failed = FocrError::InputDecode("not an image".into());
         run.events
-            .image_ended(2, Path::new("good.png"), &Ok(String::new()));
+            .image_ended(1, Path::new("bad.png"), Some(&failed));
+        run.at(40_000);
+        run.events.image_ended(2, Path::new("good.png"), None);
         run.events.end(&Ok(()));
 
         let lines = run.lines();
@@ -595,11 +595,10 @@ mod tests {
         let run = Harness::new();
         run.start(BatchMode::Images, 3);
         run.at(30_000);
-        run.events
-            .image_ended(1, Path::new("a.png"), &Ok(String::new()));
+        run.events.image_ended(1, Path::new("a.png"), None);
         run.at(35_000);
         run.events
-            .image_ended(2, Path::new("b.png"), &Err(FocrError::Cancelled));
+            .image_ended(2, Path::new("b.png"), Some(&FocrError::Cancelled));
         run.events.end(&Err(FocrError::Cancelled));
 
         let lines = run.lines();
@@ -675,7 +674,7 @@ mod tests {
         });
         assert!(events.lock().write_failed);
         // Later lines are dropped, not retried.
-        events.image_ended(1, Path::new("a.png"), &Ok(String::new()));
+        events.image_ended(1, Path::new("a.png"), None);
         events.end(&Ok(()));
     }
 

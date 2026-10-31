@@ -168,11 +168,11 @@ pub fn event_fields() -> Value {
             // whenever the model that ran is known; `resumed_from` when the
             // run picked up an interrupted document (U2-D4); `pages_out`,
             // `pages_skipped`, `windows` and `extra_markers` on an
-            // Unlimited-OCR-2 document (U2-D5).
+            // Unlimited-OCR-2 document (U2-D5); `chart` on a OneChart run.
             "optional": [
                 "finish_reason", "warnings", "low_yield", "yield_chars", "input_megapixels",
                 "model_id", "source_sha256", "resumed_from", "pages_out", "pages_skipped",
-                "windows", "extra_markers",
+                "windows", "extra_markers", "chart",
             ],
         },
         "run_error": {

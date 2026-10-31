@@ -272,7 +272,8 @@
         "pages_out",
         "pages_skipped",
         "windows",
-        "extra_markers"
+        "extra_markers",
+        "chart"
       ],
       "required": [
         "schema_version",

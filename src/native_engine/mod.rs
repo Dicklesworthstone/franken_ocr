@@ -940,9 +940,9 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
              the permissions where its checkpoint is written"
         }
         WarningKind::ChartUnverified => {
-            "do not trust the text; `pred_locs` in `--json` is the chart's number head, each \
-             bar's height from 0 (smallest) to 1 (largest), and slots past the last bar mean \
-             nothing"
+            "do not trust the text; `chart.pred_locs` in `--json` is the chart's number head, \
+             each bar's height from 0 (smallest) to 1 (largest), and slots past the last bar \
+             mean nothing"
         }
     }
 }
@@ -2069,16 +2069,11 @@ pub fn chart_warning(meta: &ChartPageMeta) -> Option<RunWarning> {
         Some(false) => "OneChart's text disagrees with its number head: the values are wrong",
         None => "OneChart's text gave no values to check: it cannot be verified",
     };
-    let mut fields = serde_json::Map::new();
-    fields.insert("pred_locs".into(), serde_json::json!(meta.pred_locs));
-    if let Some(distance) = meta.reliable_distance {
-        fields.insert("reliable_distance".into(), distance.into());
-    }
     Some(RunWarning {
         kind: "chart_unverified",
         message: message.into(),
         recovery: warning_recovery(WarningKind::ChartUnverified),
-        fields,
+        fields: serde_json::Map::new(),
     })
 }
 
@@ -7696,15 +7691,9 @@ mod tests {
         assert_eq!(unverifiable.kind, "chart_unverified");
         assert!(RUN_WARNING_KINDS.contains(&unverifiable.kind));
         assert!(unverifiable.message.contains("cannot be verified"));
-        assert_eq!(
-            unverifiable.fields["pred_locs"],
-            serde_json::json!([0.25, 1.0])
-        );
-        assert!(!unverifiable.fields.contains_key("reliable_distance"));
 
         let refuted = chart_warning(&meta(Some(0.5), Some(false))).expect("a refuted text warns");
         assert!(refuted.message.contains("disagrees"));
-        assert_eq!(refuted.fields["reliable_distance"], serde_json::json!(0.5));
     }
 
     /// A multi-page report as v1's document parse records it.

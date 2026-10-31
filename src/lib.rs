@@ -66,11 +66,13 @@ pub use native_engine::{
 pub const OUTPUT_CONTRACT_VERSION: u32 = 1;
 
 #[cfg(feature = "native")]
+use std::cell::RefCell;
+#[cfg(feature = "native")]
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "native")]
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 #[cfg(feature = "native")]
 use std::time::Duration;
 
@@ -189,12 +191,83 @@ pub fn reset_shutdown() {
 /// boundary and decode step.
 ///
 /// # Errors
-/// [`FocrError::Cancelled`] once [`request_shutdown`] has been called.
+/// [`FocrError::Cancelled`] once [`request_shutdown`] has been called, and
+/// [`FocrError::Timeout`] once this thread's stage is past its budget.
 pub fn cancel_checkpoint() -> FocrResult<()> {
     if shutdown_requested() {
         return Err(FocrError::Cancelled);
     }
+    #[cfg(feature = "native")]
+    if RUNNING_STAGE.with_borrow(|stage| stage.as_ref().is_some_and(|s| s.stop_requested())) {
+        return Err(FocrError::Timeout("the stage's budget ran out".into()));
+    }
     Ok(())
+}
+
+// ── Stage budgets (bd-3ttp) ─────────────────────────────────────────────────
+//
+// A budget ending does not end its closure, for the reason above, and a decode
+// left running keeps every core from the next input, which then times out too.
+// So a stage past its budget is told to stop and is waited for. The request
+// goes through a thread-local, not the shutdown flag: it reaches only that
+// stage's own decode, on the blocking thread every decode loop runs on, and
+// it reads as a timeout, not as a cancel.
+
+/// One blocking stage's stop request, and the proof that it ended.
+#[cfg(feature = "native")]
+#[derive(Default)]
+struct StageStop {
+    stop: AtomicBool,
+    ended: Mutex<bool>,
+    ended_changed: Condvar,
+}
+
+#[cfg(feature = "native")]
+impl StageStop {
+    fn stop_requested(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// Ask the stage to stop and wait up to `grace` for it: vision and prefill
+    /// run unbroken, and a stage stuck between checkpoints must not hold the
+    /// timeout. Returns whether it ended.
+    fn halt(&self, grace: Duration) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        let ended = self.ended.lock().unwrap_or_else(PoisonError::into_inner);
+        let (ended, _) = self
+            .ended_changed
+            .wait_timeout_while(ended, grace, |ended| !*ended)
+            .unwrap_or_else(PoisonError::into_inner);
+        *ended
+    }
+}
+
+#[cfg(feature = "native")]
+thread_local! {
+    /// The stage on this thread, cleared when it ends: blocking threads are reused.
+    static RUNNING_STAGE: RefCell<Option<Arc<StageStop>>> = const { RefCell::new(None) };
+}
+
+/// Holds [`RUNNING_STAGE`] for a stage's closure, and marks it ended on drop,
+/// an unwind included.
+#[cfg(feature = "native")]
+struct RunningStage(Arc<StageStop>);
+
+#[cfg(feature = "native")]
+impl RunningStage {
+    fn enter(stage: Arc<StageStop>) -> Self {
+        RUNNING_STAGE.with_borrow_mut(|running| *running = Some(Arc::clone(&stage)));
+        Self(stage)
+    }
+}
+
+#[cfg(feature = "native")]
+impl Drop for RunningStage {
+    fn drop(&mut self) {
+        RUNNING_STAGE.with_borrow_mut(|running| *running = None);
+        *self.0.ended.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        self.0.ended_changed.notify_all();
+    }
 }
 
 // ── The one thread/CPU budget (bd-223.2 addendum; plan §7.5) ────────────────
@@ -952,25 +1025,38 @@ impl OcrEngine {
         F: FnOnce() -> FocrResult<T> + Send + 'static,
     {
         self.report_stage(stage, budget);
-        self.runtime.block_on(async move {
-            let Some(budget) = budget else {
-                // Budget disabled (`FOCR_STAGE_BUDGET_FORWARD_MS=0`): run to
-                // completion; cooperative cancellation remains the only bound.
-                return asupersync::runtime::spawn_blocking(op).await;
-            };
-            match asupersync::time::timeout(
+        let Some(budget) = budget else {
+            // Budget disabled (`FOCR_STAGE_BUDGET_FORWARD_MS=0`): run to
+            // completion; cooperative cancellation remains the only bound.
+            return self
+                .runtime
+                .block_on(async move { asupersync::runtime::spawn_blocking(op).await });
+        };
+        let stop = Arc::<StageStop>::default();
+        let running = Arc::clone(&stop);
+        let finished = self.runtime.block_on(async move {
+            asupersync::time::timeout(
                 asupersync::time::wall_now(),
                 budget,
-                asupersync::runtime::spawn_blocking(op),
+                asupersync::runtime::spawn_blocking(move || {
+                    let _running = RunningStage::enter(running);
+                    op()
+                }),
             )
             .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(FocrError::Timeout(format!(
-                    "{stage} stage exceeded {}ms budget",
-                    budget.as_millis()
-                ))),
+        });
+        finished.unwrap_or_else(|_| {
+            let grace = native_engine::document_budget_grace(budget);
+            if !stop.halt(grace) {
+                eprintln!(
+                    "[focr] warning: the {stage} stage is still running {}s past its budget",
+                    grace.as_secs()
+                );
             }
+            Err(FocrError::Timeout(format!(
+                "{stage} stage exceeded {}ms budget",
+                budget.as_millis()
+            )))
         })
     }
 }
@@ -1036,10 +1122,18 @@ mod tests {
         );
     }
 
+    /// Serializes the tests that read a checkpoint against the one that raises
+    /// the process-global shutdown flag.
+    fn shutdown_flag_test() -> MutexGuard<'static, ()> {
+        static FLAG: Mutex<()> = Mutex::new(());
+        FLAG.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// bd-223.2: the checkpoint aborts a decode-style loop with Cancelled
     /// (exit 6) — the flag is observed INSIDE the spawn_blocking closure.
     #[test]
     fn cancellation_token_into_closure_aborts() {
+        let _shutdown = shutdown_flag_test();
         reset_shutdown();
         let engine = OcrEngine::new().expect("engine builds");
         let out = engine.run_blocking_stage_with_budget(
@@ -1323,6 +1417,63 @@ mod tests {
             started.elapsed() < Duration::from_millis(500),
             "timeout wrapper waited for the whole blocking closure"
         );
+    }
+
+    /// bd-3ttp: a timed-out decode has stopped by the time the timeout returns,
+    /// so the next input has the model and the cores to itself.
+    #[test]
+    fn a_stage_past_its_budget_stops_before_the_timeout_returns() {
+        struct Ended(Arc<AtomicBool>);
+        impl Drop for Ended {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _shutdown = shutdown_flag_test();
+        let engine = OcrEngine::new().expect("runtime builds");
+        let ended = Arc::new(AtomicBool::new(false));
+        let witness = Ended(Arc::clone(&ended));
+        let err = engine
+            .run_blocking_stage_with_budget(
+                "test-runaway",
+                Some(Duration::from_millis(10)),
+                move || {
+                    let _witness = witness;
+                    // Bounded, so a regression fails below and does not spin on.
+                    for _ in 0..3_000 {
+                        cancel_checkpoint()?;
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Ok(())
+                },
+            )
+            .expect_err("the stage must time out");
+        assert!(matches!(err, FocrError::Timeout(_)), "got {err:?}");
+        assert!(err.to_string().contains("test-runaway stage exceeded"));
+        assert!(
+            ended.load(Ordering::SeqCst),
+            "the decode outlived its timeout"
+        );
+        // The stop dies with its stage: the blocking pool reuses this thread.
+        engine
+            .run_blocking_stage_with_budget(
+                "test-next",
+                Some(Duration::from_secs(5)),
+                cancel_checkpoint,
+            )
+            .expect("the next stage is not stopped");
+    }
+
+    /// bd-3ttp: a stage that never reaches a checkpoint cannot hold the timeout.
+    #[test]
+    fn a_stage_stuck_between_checkpoints_cannot_hold_its_timeout() {
+        let stuck = Arc::<StageStop>::default();
+        assert!(!stuck.halt(Duration::from_millis(5)));
+        assert!(stuck.stop_requested());
+
+        let stage = Arc::<StageStop>::default();
+        drop(RunningStage::enter(Arc::clone(&stage)));
+        assert!(stage.halt(Duration::from_secs(5)));
     }
 
     /// A recognized but too-new `.focrq` must stay a public FormatMismatch
