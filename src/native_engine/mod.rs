@@ -292,8 +292,8 @@ pub struct OcrModel {
     /// Lazily-built conservative recipe cache: int8 FFN/expert weights with
     /// high-precision attention and `lm_head`. Reused across every page.
     decoder_cache: FallibleOnce<decoder::DecoderWeightCache>,
-    /// Lazily-built all-f32 cache ([`DECODE_F32_ENV`]): Unlimited-OCR-2's
-    /// parity path. Built only when a document asks for it.
+    /// Lazily-built all-f32 cache ([`DECODE_F32_ENV`]): the Unlimited-OCR
+    /// parity path. Built only when a decode asks for it.
     decoder_cache_f32: FallibleOnce<decoder::DecoderWeightCache>,
     /// Lazily-hydrated, then reused CLIP tower weights (bd-av64.10). Hydration
     /// widens ~300 M bf16 params to f32 and pre-transposes every linear into
@@ -381,15 +381,17 @@ const BASE_PROMPT_TEXT: &str = "document parsing.";
 /// same text, for one page as for many (MU:1073-1080).
 const MULTI_PAGE_PROMPT_TEXT: &str = "Multi page parsing.";
 
-/// The most pages one Unlimited-OCR-2 pass is sized for (U2-B6):
-/// `floor((131,072 − 64) / (274 + 1,900)) = 60`, i.e. 274 prompt tokens and
-/// at most 1,900 generated tokens per page within the position limit. It
-/// caps a decode window's own pages (U2-D1b), so prompt, lookahead and
+/// The most pages one Unlimited-OCR-2 pass is sized for: the largest N with
+/// `64 + 274·N + (N − 1)·p90 + p99 ≤ 131,072`, over the generated ids per
+/// page U2-C4 measured on 55 pages. The stricter distribution, the f32
+/// reference's (p90 982, p99 2,892), gives 102; the int8 decoder's gives 114.
+/// It caps a decode window's own pages (U2-D1b), so prompt, lookahead and
 /// output fit one window; a denser window can still reach the limit sooner,
 /// and that stop is reported, never silent. An unwindowed request
-/// ([`PageWindow::Off`]) is not held to it. U2-C4 re-derives it from
-/// measured page lengths.
-pub const UOCR2_UNWINDOWED_PAGE_LIMIT: usize = 60;
+/// ([`PageWindow::Off`]) is not held to it. The corpus gate
+/// (`uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline`) fails if a
+/// remeasured distribution supports fewer pages.
+pub const UOCR2_UNWINDOWED_PAGE_LIMIT: usize = 102;
 
 /// Unlimited-OCR-2's prompt (U2-B6; MU:531-580, 1073-1082): `bos`, then per
 /// page its `marker` and `image_tokens[p]` image slots, then the task `text`
@@ -709,11 +711,12 @@ fn document_guard(pages: usize, marker: u32, params: &DecodeParams) -> sampler::
     sampler::PageGuard::new(pages, marker, params.eos_token_id, page_cap)
 }
 
-/// The decoder an Unlimited-OCR-2 document pass runs on.
+/// The decoder an Unlimited-OCR pass runs on: a v2 document pass, or a v1
+/// page or document ([`OcrModel::generate_with_observer`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DocumentPrecision {
-    /// The shipping cache: int8 FFN/experts, f32 attention, router and
-    /// `lm_head`.
+    /// The shipping cache: int8 FFN/experts, f32 attention, `lm_head` and
+    /// (v2) router.
     Mixed,
     /// [`DECODE_F32_ENV`]: the all-f32 cache.
     CachedF32,
@@ -723,22 +726,39 @@ enum DocumentPrecision {
 }
 
 impl DocumentPrecision {
-    /// The decoder the environment asks for.
+    /// The decoder the environment asks for ([`Self::from_flags`]).
     ///
     /// # Errors
-    /// [`FocrError::Usage`] when both variables are set: each picks the
-    /// decoder.
+    /// As [`Self::from_flags`].
     fn from_env() -> FocrResult<Self> {
-        match (
+        Self::from_flags(
             std::env::var_os(DECODE_STATELESS_ENV).is_some(),
             std::env::var_os(DECODE_F32_ENV).is_some(),
-        ) {
-            (true, true) => Err(FocrError::Usage(format!(
+            int8_decode_requested(),
+        )
+    }
+
+    /// The decoder for [`DECODE_STATELESS_ENV`] (`stateless`),
+    /// [`DECODE_F32_ENV`] (`f32`) and a full-int8 request (`full_int8`).
+    /// Stateless outranks full int8, as it always has; with neither variable
+    /// set the pass is [`Self::Mixed`], and the caller runs the full-int8
+    /// cache in its place when that is requested.
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] when `f32` meets either of the others: each picks
+    /// the decoder.
+    fn from_flags(stateless: bool, f32: bool, full_int8: bool) -> FocrResult<Self> {
+        match (stateless, f32, full_int8) {
+            (true, true, _) => Err(FocrError::Usage(format!(
                 "{DECODE_STATELESS_ENV} and {DECODE_F32_ENV} each pick the decoder; set one"
             ))),
-            (true, false) => Ok(Self::Stateless),
-            (false, true) => Ok(Self::CachedF32),
-            (false, false) => Ok(Self::Mixed),
+            (false, true, true) => Err(FocrError::Usage(format!(
+                "the full-int8 decoder ({DECODE_INT8_ENV} or the library override) and \
+                 {DECODE_F32_ENV} each pick the decoder; set one"
+            ))),
+            (true, false, _) => Ok(Self::Stateless),
+            (false, true, false) => Ok(Self::CachedF32),
+            (false, false, _) => Ok(Self::Mixed),
         }
     }
 
@@ -1239,10 +1259,10 @@ const MAX_NEW_TOKENS_ENV: &str = "FOCR_MAX_NEW_TOKENS";
 /// R-SWA ring window, before any generated-tail eviction).
 const DECODE_STATELESS_ENV: &str = "FOCR_DECODE_STATELESS";
 
-/// Decode an Unlimited-OCR-2 document on the all-f32 cache
-/// ([`decoder::DecoderWeightCache::build_srswa_f32`]): the stateless path's
-/// math with the KV kept, in linear time (U2-C2). Present ⇒ f32. It needs the
-/// raw checkpoint, and it excludes [`DECODE_STATELESS_ENV`].
+/// Decode on the all-f32 cache ([`decoder::DecoderWeightCache::build_f32`],
+/// plus the router for Unlimited-OCR-2): the stateless path's math with the KV
+/// kept, in linear time (U2-C2). Present ⇒ f32. It needs the raw checkpoint,
+/// and it excludes [`DECODE_STATELESS_ENV`] and the full-int8 decoder.
 const DECODE_F32_ENV: &str = "FOCR_DECODE_F32";
 
 /// Default-on cache for the immutable Unlimited-OCR SAM/projector bundles.
@@ -5404,9 +5424,10 @@ impl OcrModel {
     #[must_use]
     pub fn recognize_batch(&self, image_paths: &[&Path]) -> Vec<FocrResult<String>> {
         // The spine reproduces the int8 R-SWA cached decode (`generate_cached_i8`),
-        // which `generate` selects only when int8 is requested AND the stateless
-        // O(n^2) oracle is NOT forced. Engage the spine under EXACTLY that
-        // condition so its output tracks whichever sequential oracle is in force.
+        // which `generate` selects only when int8 is requested AND neither the
+        // stateless O(n^2) oracle nor the all-f32 cache is asked for. Engage the
+        // spine under EXACTLY that condition so its output tracks whichever
+        // sequential path is in force (which refuses int8 with f32).
         // Arch gate (fresh-eyes fix): the spine pipeline is built for
         // Unlimited-OCR v1 (Baidu tensor names, R-SWA rings, the
         // BASE_PROMPT tokenizer); a got-ocr2/zoo artifact must take the
@@ -5414,6 +5435,7 @@ impl OcrModel {
         let spine = batch_scheduler::spine_enabled()
             && (int8_decode_requested() || self.artifact_stores_gated_int8())
             && std::env::var_os(DECODE_STATELESS_ENV).is_none()
+            && std::env::var_os(DECODE_F32_ENV).is_none()
             && self.arch().unlimited_variant() == Some(model_arch::UnlimitedVariant::V1Rswa);
         // A7.5 (bd-3jo6.1.7.5): the DENSE continuous-batch spine. GOT decode is
         // int8 by construction (the QInt8 panels), so it needs only the master
@@ -5725,22 +5747,30 @@ impl OcrModel {
             })
     }
 
-    /// Unlimited-OCR-2's all-f32 cache ([`DECODE_F32_ENV`]), built once.
+    /// The all-f32 cache ([`DECODE_F32_ENV`]), built once: v2's carries the
+    /// router, as [`Self::decoder_cache`]'s does.
     ///
     /// # Errors
-    /// [`FocrError::Usage`] for another model; otherwise as
-    /// [`decoder::DecoderWeightCache::build_srswa_f32`], which refuses a
-    /// quantized artifact.
+    /// [`FocrError::Usage`] for a model other than Unlimited-OCR; otherwise as
+    /// [`decoder::DecoderWeightCache::build_f32`], which refuses a quantized
+    /// artifact.
     fn decoder_cache_f32(&self) -> FocrResult<&decoder::DecoderWeightCache> {
-        if self.arch().unlimited_variant() != Some(model_arch::UnlimitedVariant::V2SrSwa) {
+        let Some(variant) = self.arch().unlimited_variant() else {
             return Err(FocrError::Usage(format!(
-                "{DECODE_F32_ENV} decodes Unlimited-OCR-2 documents; {} has no all-f32 cache",
+                "{DECODE_F32_ENV} decodes Unlimited-OCR models; {} has no all-f32 cache",
                 self.arch().id()
             )));
-        }
+        };
         self.decoder_cache_f32.get_or_try_init(|| {
             let t = Instant::now();
-            let built = decoder::DecoderWeightCache::build_srswa_f32(&self.weights)?;
+            let built = match variant {
+                model_arch::UnlimitedVariant::V1Rswa => {
+                    decoder::DecoderWeightCache::build_f32(&self.weights)?
+                }
+                model_arch::UnlimitedVariant::V2SrSwa => {
+                    decoder::DecoderWeightCache::build_srswa_f32(&self.weights)?
+                }
+            };
             timing_log(&format!(
                 "decoder f32 cache {:.2}s",
                 t.elapsed().as_secs_f64()
@@ -6333,7 +6363,8 @@ impl OcrModel {
         // One controller instance per decode invocation. Unset/0 is a no-op;
         // invalid values fail before model work, and an armed trigger is sticky.
         let mut runaway_guard = sampler::RunawayGuard::from_env()?;
-        let generated = if std::env::var_os(DECODE_STATELESS_ENV).is_some() {
+        let precision = DocumentPrecision::from_env()?;
+        let generated = if precision == DocumentPrecision::Stateless {
             self.generate_stateless(
                 inputs_embeds,
                 prompt_ids,
@@ -6341,7 +6372,9 @@ impl OcrModel {
                 observer,
                 &mut runaway_guard,
             )
-        } else if int8_decode_requested() || self.artifact_stores_gated_int8() {
+        } else if precision == DocumentPrecision::Mixed
+            && (int8_decode_requested() || self.artifact_stores_gated_int8())
+        {
             // The wasm experts-int4 artifact routes through the int8 cache by
             // default: its attention/lm_head are int8 IN the artifact (so they
             // stay int8-resident) and its expert tensors are consumed as
@@ -6355,6 +6388,7 @@ impl OcrModel {
             )
         } else {
             self.generate_cached(
+                precision,
                 inputs_embeds,
                 prompt_ids,
                 params,
@@ -6393,25 +6427,28 @@ impl OcrModel {
     /// reference block (the entire prefill) is never evicted; the generated tail
     /// rides a 128-slot ring, so memory and per-step cost are bounded.
     ///
-    /// Both prefill and decode run off the conservative
-    /// [`decoder::DecoderWeightCache`], built once per model: the 2,148
-    /// FFN/expert matrices are int8 (quantized at build even from a raw bf16
-    /// source), and attention, the router and `lm_head` stay f32. That int8 FFN
-    /// is a real numeric difference from the all-f32 stateless path
-    /// ([`Self::generate_stateless`]); this is the path the certified
-    /// conservative artifact runs.
+    /// Both prefill and decode run off a [`decoder::DecoderWeightCache`] built
+    /// once per model. For [`DocumentPrecision::Mixed`] it is the conservative
+    /// cache: the 2,148 FFN/expert matrices are int8 (quantized at build even
+    /// from a raw bf16 source), and attention, the router and `lm_head` stay
+    /// f32. That int8 FFN is a real numeric difference from the all-f32
+    /// stateless path ([`Self::generate_stateless`]); this is the path the
+    /// certified conservative artifact runs. [`DocumentPrecision::CachedF32`]
+    /// ([`DECODE_F32_ENV`]) runs the same ops on the all-f32 cache. The caller
+    /// runs [`DocumentPrecision::Stateless`] itself.
     ///
     /// # Errors
     /// As [`Self::generate`].
     fn generate_cached(
         &self,
+        precision: DocumentPrecision,
         inputs_embeds: Mat,
         prompt_ids: &[u32],
         params: &sampler::DecodeParams,
         mut observer: Option<&mut dyn FnMut(u32)>,
         runaway_guard: &mut sampler::RunawayGuard,
     ) -> FocrResult<Vec<u32>> {
-        timing_log("precision focr-mixed-ffn-int8");
+        timing_log(&format!("precision {}", precision.name()));
         let hidden_dim = inputs_embeds.cols;
         let prefill_len = inputs_embeds.rows;
 
@@ -6425,10 +6462,14 @@ impl OcrModel {
             )));
         }
 
-        // Build the conservative recipe cache once per model: int8 FFN/expert
-        // matrices, high-precision attention and lm_head.
+        // Build the cache once per model: the conservative recipe (int8
+        // FFN/expert matrices, high-precision attention and lm_head) or all f32.
         let tb = Instant::now();
-        let wc = self.decoder_cache()?;
+        let wc = if precision == DocumentPrecision::CachedF32 {
+            self.decoder_cache_f32()?
+        } else {
+            self.decoder_cache()?
+        };
         timing_log(&format!(
             "weight_cache_build {:.2}s",
             tb.elapsed().as_secs_f64()
@@ -9480,6 +9521,37 @@ mod tests {
             v1.recognize_document(&mut source, &options, &mut |_| {}, None),
             Err(FocrError::InputDecode(_))
         ));
+    }
+
+    /// bd-1jx0: the decoder variables pick one decoder each. Stateless
+    /// outranks a full-int8 request, the all-f32 cache refuses to share the
+    /// pick with either, and nothing set is the shipping cache.
+    #[test]
+    fn decoder_variables_pick_one_decoder() {
+        use DocumentPrecision::{CachedF32, Mixed, Stateless};
+        for (stateless, f32, full_int8, want) in [
+            (false, false, false, Some(Mixed)),
+            (false, false, true, Some(Mixed)),
+            (true, false, false, Some(Stateless)),
+            (true, false, true, Some(Stateless)),
+            (false, true, false, Some(CachedF32)),
+            (false, true, true, None),
+            (true, true, false, None),
+            (true, true, true, None),
+        ] {
+            let got = DocumentPrecision::from_flags(stateless, f32, full_int8);
+            match want {
+                Some(want) => assert_eq!(
+                    got.ok(),
+                    Some(want),
+                    "stateless {stateless}, f32 {f32}, full int8 {full_int8}"
+                ),
+                None => assert!(
+                    matches!(&got, Err(FocrError::Usage(m)) if m.contains(DECODE_F32_ENV)),
+                    "stateless {stateless}, f32 {f32}, full int8 {full_int8}: {got:?}"
+                ),
+            }
+        }
     }
 
     /// U2-E2, U2-D1b: how each document option plans on a windowed model
