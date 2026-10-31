@@ -1025,4 +1025,268 @@ mod tests {
         // A journal shorter than its checkpoint is refused.
         assert!(Journal::reopen(&path, 4).is_err());
     }
+
+    #[cfg(feature = "pdf")]
+    mod runs {
+        use super::*;
+        use crate::native_engine::window::WindowStats;
+        use crate::native_engine::{FinishReason, Half};
+
+        fn files(dir: &Path) -> RunFiles {
+            RunFiles {
+                journal: dir.join("doc.md.partial"),
+                checkpoint: dir.join("doc.md.focr-ckpt"),
+                key: ResumeKey::new(),
+            }
+        }
+
+        fn key(window: usize) -> ResumeKey {
+            ResumeKey::new()
+                .with(INPUT_FIELD, "abc")
+                .with(SELECTION_FIELD, "all")
+                .with("window", window)
+        }
+
+        fn read(page: usize) -> ReadPage {
+            ReadPage {
+                origin: PageOrigin {
+                    source_page: page + 1,
+                    half: (page == 1).then_some(Half::Left),
+                },
+                size: (640, 480),
+                walk: WalkCursor {
+                    next: page + 1,
+                    held: page == 1,
+                },
+                skipped: if page == 1 {
+                    vec![SkippedPage {
+                        page: 9,
+                        reason: "no raster".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }
+        }
+
+        fn page(page: usize, window: usize) -> JournalPage {
+            JournalPage {
+                run_index: page + 1,
+                window,
+                read: read(page),
+                body: Some(format!("body {page}")),
+                tokens: Some(10 + page),
+                finish: Some(PageFinish::Marker),
+            }
+        }
+
+        fn record(index: usize, lo: usize) -> WindowRecord {
+            WindowRecord {
+                stats: WindowStats {
+                    index,
+                    pages: lo..lo + 1,
+                    lookahead: true,
+                    reused: index > 0,
+                    fallback_reason: None,
+                    straddle: false,
+                    prefill_tokens: 100,
+                    copied_rows: 0,
+                    forced_tokens: 0,
+                    generated_tokens: 10 + lo,
+                    finish: FinishReason::Stop,
+                    kv_bytes_peak: 1000 + lo,
+                    retire_fallbacks: 0,
+                    elapsed_ms: 5,
+                },
+                ids: vec![7, 8, u32::try_from(lo).unwrap()],
+                bodies: vec![format!("body {lo}")],
+                tokens: vec![10 + lo],
+                finish: vec![PageFinish::Marker],
+                leading_text: lo == 1,
+                extra_markers: lo,
+                forced_steps: 1,
+                hf_all_neg_inf_steps: 0,
+                retired_blocks: 2,
+                vision_encodes: 2,
+            }
+        }
+
+        /// A run that finished `windows` one-page windows, then stopped.
+        fn interrupted(dir: &Path, windows: usize) -> RunFiles {
+            let files = files(dir);
+            let (mut run, resumed) =
+                DocumentRun::open(&files, key(1), ResumePolicy::Never).unwrap();
+            assert!(resumed.is_none());
+            for lo in 0..windows {
+                let carried = Mat::from_vec(2, 2, vec![0.5, -0.0, f32::MIN_POSITIVE, 3.0]);
+                let boundary = WindowBoundary::bare(lo + 1, lo + 1, &carried);
+                run.window_end(
+                    vec![page(lo, lo)],
+                    &record(lo, lo),
+                    &boundary,
+                    &read(lo + 1),
+                );
+                assert_eq!(run.failure(), None);
+            }
+            files
+        }
+
+        fn refusal(result: FocrResult<(DocumentRun, Option<Resumed>)>) -> String {
+            match result {
+                Err(FocrError::Usage(why)) => why,
+                other => panic!("not refused: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn a_matching_run_gets_its_pages_back_and_the_next_window_starts_at_the_boundary() {
+            let dir = scratch("resume");
+            let files = interrupted(&dir, 2);
+            let (mut run, resumed) =
+                DocumentRun::open(&files, key(1), ResumePolicy::IfMatching).unwrap();
+            let resumed = resumed.expect("an interrupted run");
+            assert!(!resumed.recomputed);
+            assert_eq!(resumed.pages, [page(0, 0), page(1, 1)]);
+            assert_eq!(resumed.carried, Some(read(2)));
+            assert_eq!(resumed.read(), [read(0), read(1), read(2)]);
+            assert_eq!(resumed.from.next_page(), 2);
+            let slots: Vec<MappedPage> = resumed
+                .read()
+                .iter()
+                .flat_map(ReadPage::map_slots)
+                .collect();
+            assert_eq!(slots.len(), 4, "a failed page keeps its slot");
+            assert_eq!(slots[1].source_page, 9);
+            assert_eq!(slots[1].size, None);
+            let doc = resumed.from.into_document();
+            assert_eq!(doc.pages.bodies, ["body 0", "body 1"]);
+            assert_eq!(doc.pages.tokens, [10, 11]);
+            assert!(doc.pages.leading_text);
+            assert_eq!(doc.pages.extra_markers, 1);
+            assert_eq!(doc.stats.vision_encodes, 4);
+            assert_eq!(doc.stats.retired_blocks, 4);
+            assert_eq!(doc.stats.peak_kv_bytes, 1001);
+            assert_eq!(doc.window_ids, [vec![7, 8, 0], vec![7, 8, 1]]);
+            // The run goes on writing where the journal stopped.
+            let carried = Mat::from_vec(1, 1, vec![1.0]);
+            let boundary = WindowBoundary::bare(3, 3, &carried);
+            run.window_end(vec![page(2, 2)], &record(2, 2), &boundary, &read(3));
+            assert_eq!(run.failure(), None);
+            let (_, resumed) = DocumentRun::open(&files, key(1), ResumePolicy::IfMatching).unwrap();
+            let doc = resumed.expect("still resumable").from.into_document();
+            assert_eq!(doc.pages.bodies.len(), 3);
+        }
+
+        #[test]
+        fn lines_past_the_checkpoint_are_cut() {
+            let dir = scratch("past");
+            let files = interrupted(&dir, 2);
+            // A crash after a third window's lines, before its checkpoint.
+            let (mut journal, _) = Journal::reopen(&files.journal, 5).unwrap();
+            journal
+                .append(&[JournalLine::Page(Box::new(page(2, 2))).to_value()])
+                .unwrap();
+            let (_, resumed) = DocumentRun::open(&files, key(1), ResumePolicy::IfMatching).unwrap();
+            assert_eq!(resumed.expect("resumable").pages.len(), 2);
+            assert_eq!(
+                whole_lines(&files.journal).unwrap().0.len(),
+                5,
+                "the key and two windows of two lines each"
+            );
+        }
+
+        #[test]
+        fn a_differing_key_is_refused_by_name_and_a_recompute_continues() {
+            let dir = scratch("key");
+            let files = interrupted(&dir, 2);
+            let why = refusal(DocumentRun::open(&files, key(2), ResumePolicy::IfMatching));
+            assert!(why.contains("differs from this one in window"), "{why}");
+            assert!(why.contains("--resume=recompute"), "{why}");
+            let (_, resumed) = DocumentRun::open(&files, key(2), ResumePolicy::Recompute).unwrap();
+            let resumed = resumed.expect("the journal's pages");
+            assert!(resumed.recomputed);
+            assert_eq!(resumed.pages.len(), 2);
+            assert_eq!(resumed.carried, None);
+            assert_eq!(resumed.read(), [read(0), read(1)]);
+            assert_eq!(resumed.from.next_page(), 2);
+            // The next line says which key wrote what follows.
+            let (lines, _) = whole_lines(&files.journal).unwrap();
+            assert_eq!(replay(&lines).unwrap().key, Some(key(2)));
+        }
+
+        #[test]
+        fn another_documents_journal_is_refused_even_a_recompute() {
+            let dir = scratch("other");
+            let files = interrupted(&dir, 1);
+            for field in DOCUMENT_FIELDS {
+                let other = key(1).with(field, "different");
+                let why = refusal(DocumentRun::open(&files, other, ResumePolicy::Recompute));
+                assert!(why.contains(field), "{why}");
+            }
+        }
+
+        #[test]
+        fn a_damaged_or_missing_checkpoint_offers_a_recompute() {
+            let dir = scratch("damaged");
+            let files = interrupted(&dir, 1);
+            let mut bytes = std::fs::read(&files.checkpoint).unwrap();
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 1;
+            std::fs::write(&files.checkpoint, &bytes).unwrap();
+            let why = refusal(DocumentRun::open(&files, key(1), ResumePolicy::IfMatching));
+            assert!(why.contains("--resume=recompute"), "{why}");
+            std::fs::remove_file(&files.checkpoint).unwrap();
+            let why = refusal(DocumentRun::open(&files, key(1), ResumePolicy::IfMatching));
+            assert!(why.contains("is missing"), "{why}");
+            let (_, resumed) = DocumentRun::open(&files, key(1), ResumePolicy::Recompute).unwrap();
+            assert!(resumed.expect("the journal's pages").recomputed);
+        }
+
+        #[test]
+        fn nothing_to_pick_up_is_a_fresh_run() {
+            let dir = scratch("fresh");
+            let files = files(&dir);
+            for policy in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
+                let (_, resumed) = DocumentRun::open(&files, key(1), policy).unwrap();
+                assert!(resumed.is_none());
+            }
+            assert!(!files.journal.exists(), "opening writes nothing");
+            let mut journal = Journal::create(&files.journal).unwrap();
+            let line = JournalLine::Key { key: key(1) };
+            journal.append(&[line.to_value()]).unwrap();
+            for policy in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
+                let (_, resumed) = DocumentRun::open(&files, key(1), policy).unwrap();
+                assert!(resumed.is_none(), "no window completed");
+            }
+        }
+
+        #[test]
+        fn a_run_that_cannot_write_says_so_and_stops_trying() {
+            let dir = scratch("unwritable");
+            let files = RunFiles {
+                journal: dir.join("missing").join("doc.md.partial"),
+                checkpoint: dir.join("missing").join("doc.md.focr-ckpt"),
+                key: ResumeKey::new(),
+            };
+            let (mut run, _) = DocumentRun::open(&files, key(1), ResumePolicy::Never).unwrap();
+            let carried = Mat::from_vec(1, 1, vec![1.0]);
+            let boundary = WindowBoundary::bare(1, 1, &carried);
+            run.window_end(vec![page(0, 0)], &record(0, 0), &boundary, &read(1));
+            let first = run.failure().expect("the write failed").to_owned();
+            run.window_end(vec![page(1, 1)], &record(1, 1), &boundary, &read(2));
+            assert_eq!(run.failure(), Some(first.as_str()));
+        }
+
+        #[test]
+        fn a_finished_run_removes_its_files_and_can_keep_the_checkpoint() {
+            let dir = scratch("finish");
+            let files = interrupted(&dir, 1);
+            files.remove(true).unwrap();
+            assert!(!files.journal.exists());
+            assert!(files.checkpoint.exists());
+            files.remove(false).unwrap();
+            assert!(!files.checkpoint.exists());
+            files.remove(false).unwrap();
+        }
+    }
 }

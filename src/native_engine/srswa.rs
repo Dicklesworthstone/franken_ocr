@@ -2327,8 +2327,15 @@ impl SrSwaLayerCache {
     /// # Errors
     /// As [`Self::tail_rows`].
     pub fn serialize_tail(&self, ranges: &[Range<usize>]) -> FocrResult<Vec<u8>> {
-        let rows = self.tail_rows(ranges)?;
-        let n = rows.rows();
+        Ok(self.tail_rows(ranges)?.serialize())
+    }
+}
+
+impl TailRows {
+    /// These rows in the tail format ([`deserialize_tail`]).
+    #[must_use]
+    pub fn serialize(&self) -> Vec<u8> {
+        let n = self.rows();
         let mut out = Vec::with_capacity(TAIL_HEADER + n * ROW_BYTES);
         out.extend_from_slice(TAIL_MAGIC);
         for word in [TAIL_VERSION, NUM_HEADS as u32, HEAD_DIM as u32] {
@@ -2336,17 +2343,15 @@ impl SrSwaLayerCache {
         }
         out.extend_from_slice(&(n as u64).to_le_bytes());
         for r in 0..n {
-            for xs in [rows.k.row(r), rows.v.row(r), rows.ik.row(r)] {
+            for xs in [self.k.row(r), self.v.row(r), self.ik.row(r)] {
                 for x in xs {
                     out.extend_from_slice(&x.to_le_bytes());
                 }
             }
         }
-        Ok(out)
+        out
     }
-}
 
-impl TailRows {
     /// Rows `r` of these rows, as a new set.
     #[must_use]
     pub fn slice(&self, r: Range<usize>) -> Self {

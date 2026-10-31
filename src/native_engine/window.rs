@@ -29,8 +29,9 @@ use super::tensor::Mat;
 use super::{
     DecodeParams, DecodeReport, DocumentDecode, DocumentDecoder, DocumentLoop, DocumentPass,
     DocumentPrecision, DocumentStats, FinishReason, LengthCap, MULTI_PAGE_PROMPT_TEXT, OcrModel,
-    PageBodies, PageFinish, UOCR2_UNWINDOWED_PAGE_LIMIT, connector, decode_with_retire_fallback,
-    decoder, document_guard, lever_policy, paged_prompt, postprocess, sampler, srswa, timing_log,
+    PageBodies, PageFinish, UOCR2_UNWINDOWED_PAGE_LIMIT, checkpoint, connector,
+    decode_with_retire_fallback, decoder, document_guard, lever_policy, paged_prompt, postprocess,
+    sampler, srswa, timing_log,
 };
 use crate::error::{FocrError, FocrResult};
 use crate::preprocess::Preprocessed;
@@ -373,7 +374,8 @@ pub fn pinned_rows(prompt_ids: &[u32], lookahead: usize) -> Vec<Range<usize>> {
 /// Why a window after the first prefilled its full prompt instead of reusing
 /// its predecessor's tail (§5.10.5). The order is the wheel's order of
 /// checks (DR:956-1101).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FallbackReason {
     /// (ii) The follow-up was retracted or already has output: SGLang
     /// scheduling only, reachable here through the test hook.
@@ -415,7 +417,7 @@ impl FallbackReason {
 }
 
 /// What a finished window leaves its successor (DR:836-935).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Retained {
     /// The window's prompt as it ran (the rewritten one when reused).
     prompt_ids: Vec<u32>,
@@ -432,7 +434,7 @@ struct Retained {
 
 /// A finished window's kept rows (DR:323-366, row-exact; the wheel keeps the
 /// whole 32-row KV pages around them, which only costs memory).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct TailCapture {
     /// The tail page's marker row.
     marker: usize,
@@ -440,7 +442,9 @@ struct TailCapture {
     image: Range<usize>,
     /// The text tail.
     text: Range<usize>,
-    /// Per layer: the rows `marker`, `image`, `text`, in that order.
+    /// Per layer: the rows `marker`, `image`, `text`, in that order. A
+    /// checkpoint holds them as blobs ([`WindowBoundary::encode`]).
+    #[serde(skip)]
     layers: Vec<srswa::TailRows>,
 }
 
@@ -657,7 +661,7 @@ pub struct WindowedOptions {
 }
 
 /// One window's record (U2-D1a; U2-D5 makes it the robot `window` event).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WindowStats {
     /// Position in the plan.
     pub index: usize,
@@ -709,20 +713,222 @@ pub struct WindowedDocument {
     pub window_ids: Vec<Vec<u32>>,
 }
 
-/// A window's own pages as it ends, in page order: their bodies, and per
-/// body its generated ids and how it ended.
-#[derive(Debug, Clone, Copy)]
-pub struct WindowPages<'a> {
-    /// The bodies ([`postprocess::TokenPages::bodies`]).
-    pub bodies: &'a [String],
-    /// Generated ids per body, its `<PAGE>` excluded.
-    pub tokens: &'a [usize],
-    /// How each body ended ([`DocumentStats::page_finish`]).
-    pub finish: &'a [PageFinish],
+impl WindowedDocument {
+    /// A document no window has added to yet.
+    pub(super) fn empty() -> Self {
+        Self {
+            pages: postprocess::TokenPages {
+                bodies: Vec::new(),
+                tokens: Vec::new(),
+                leading_text: false,
+                extra_markers: 0,
+            },
+            finish_reason: FinishReason::Stop,
+            stats: DocumentStats::default(),
+            windows: Vec::new(),
+            window_ids: Vec::new(),
+        }
+    }
+
+    /// This document with the window `record` added: what the driver does
+    /// as a window ends, and what a resumed run replays from its journal.
+    pub(super) fn absorb(&mut self, record: WindowRecord) {
+        let pages = &mut self.pages;
+        pages.bodies.extend(record.bodies);
+        pages.tokens.extend(record.tokens);
+        pages.leading_text |= record.leading_text;
+        pages.extra_markers += record.extra_markers;
+        let total = &mut self.stats;
+        total.page_finish.extend(record.finish);
+        total.forced_steps += record.forced_steps;
+        total.hf_all_neg_inf_steps += record.hf_all_neg_inf_steps;
+        total.retired_blocks += record.retired_blocks;
+        total.peak_kv_bytes = total.peak_kv_bytes.max(record.stats.kv_bytes_peak);
+        total.retire_fallbacks += record.stats.retire_fallbacks;
+        total.vision_encodes += record.vision_encodes;
+        self.finish_reason = record.stats.finish;
+        self.window_ids.push(record.ids);
+        self.windows.push(record.stats);
+    }
 }
 
-/// Gets each window's record and its own pages as it ends.
-pub type WindowSink<'a> = &'a mut dyn FnMut(&WindowStats, WindowPages<'_>);
+/// What one window added to its document, as it ends (U2-D4: one journal
+/// entry). Bodies are text a journal keeps on its page lines, so this
+/// serializes without them.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WindowRecord {
+    /// The window's record.
+    pub stats: WindowStats,
+    /// Its ids: the forced prefix, then the ids it generated.
+    pub ids: Vec<u32>,
+    /// Its own pages' bodies, in page order
+    /// ([`postprocess::TokenPages::bodies`]).
+    #[serde(skip)]
+    pub bodies: Vec<String>,
+    /// Generated ids per body, its `<PAGE>` excluded.
+    pub tokens: Vec<usize>,
+    /// How each page its output reached ended
+    /// ([`DocumentStats::page_finish`]).
+    pub finish: Vec<PageFinish>,
+    /// Non-blank text preceded its first marker.
+    pub leading_text: bool,
+    /// Markers past its own pages.
+    pub extra_markers: usize,
+    /// [`DocumentStats::forced_steps`].
+    pub forced_steps: usize,
+    /// [`DocumentStats::hf_all_neg_inf_steps`].
+    pub hf_all_neg_inf_steps: usize,
+    /// [`DocumentStats::retired_blocks`].
+    pub retired_blocks: usize,
+    /// Pages whose vision it ran; its carried page is its predecessor's.
+    pub vision_encodes: usize,
+}
+
+/// The state between a window that ended on EOS and its successor, borrowed
+/// from the driver as the window ends: a window boundary's share of a
+/// checkpoint. Encoding it costs a copy of the tail, so a sink that keeps no
+/// checkpoint pays nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct WindowBoundary<'a> {
+    /// The next window.
+    index: usize,
+    /// Its first own page.
+    lo: usize,
+    /// Its first page's vision block, which the ended window read as its
+    /// lookahead.
+    carried: &'a Mat,
+    /// What it reuses.
+    retained: Option<&'a Retained>,
+}
+
+impl WindowBoundary<'_> {
+    /// The next window's first own page (global, 0-based).
+    #[must_use]
+    pub fn next_page(&self) -> usize {
+        self.lo
+    }
+
+    /// This boundary as a checkpoint's state and blobs: the carried block,
+    /// then the retained rows per layer in U2-B4's tail format
+    /// ([`WindowResume::from_checkpoint`]).
+    #[must_use]
+    pub fn encode(&self) -> (serde_json::Value, Vec<Vec<u8>>) {
+        let state = serde_json::json!({
+            "index": self.index,
+            "lo": self.lo,
+            "retained": self.retained,
+        });
+        let mut blobs = vec![checkpoint::mat_blob(self.carried)];
+        if let Some(rows) = self.retained.and_then(|r| r.rows.as_ref()) {
+            blobs.extend(rows.layers.iter().map(srswa::TailRows::serialize));
+        }
+        (state, blobs)
+    }
+}
+
+#[cfg(test)]
+impl<'a> WindowBoundary<'a> {
+    /// A boundary with nothing retained.
+    pub(super) fn bare(index: usize, lo: usize, carried: &'a Mat) -> Self {
+        Self {
+            index,
+            lo,
+            carried,
+            retained: None,
+        }
+    }
+}
+
+/// Where a windowed decode picks a document up (U2-D4), for
+/// [`OcrModel::resume_document_windowed`].
+#[derive(Debug)]
+pub struct WindowResume {
+    /// The next window.
+    index: usize,
+    /// Its first own page.
+    lo: usize,
+    /// Its first page's vision block; `None` reads the page again.
+    carried: Option<Mat>,
+    /// What it reuses; `None` recomputes it (§5.10.5, `no_retained`).
+    retained: Option<Retained>,
+    /// The windows so far.
+    doc: WindowedDocument,
+}
+
+impl WindowResume {
+    /// The boundary [`WindowBoundary::encode`] wrote, with the document so
+    /// far replayed: its continuation is byte-identical to the run it
+    /// continues.
+    ///
+    /// # Errors
+    /// [`FocrError::Other`] when the state or a blob does not parse.
+    pub fn from_checkpoint(
+        state: &serde_json::Value,
+        blobs: &[Vec<u8>],
+        doc: WindowedDocument,
+    ) -> FocrResult<Self> {
+        #[derive(serde::Deserialize)]
+        struct Boundary {
+            index: usize,
+            lo: usize,
+            retained: Option<Retained>,
+        }
+        let bad = |why: String| {
+            FocrError::Other(anyhow::anyhow!("document checkpoint: window state: {why}"))
+        };
+        let Boundary {
+            index,
+            lo,
+            mut retained,
+        } = serde::Deserialize::deserialize(state).map_err(|e| bad(e.to_string()))?;
+        let (carried, tails) = blobs
+            .split_first()
+            .ok_or_else(|| bad("no carried page".into()))?;
+        if let Some(rows) = retained.as_mut().and_then(|r| r.rows.as_mut()) {
+            rows.layers = tails
+                .iter()
+                .map(|bytes| srswa::deserialize_tail(bytes))
+                .collect::<FocrResult<_>>()?;
+        }
+        Ok(Self {
+            index,
+            lo,
+            carried: Some(checkpoint::blob_mat(carried)?),
+            retained,
+            doc,
+        })
+    }
+
+    /// The document so far with no retained state: the next window reads
+    /// its pages again and recomputes (§5.10.5). Not byte-identical to an
+    /// uninterrupted run.
+    #[must_use]
+    pub fn recompute(doc: WindowedDocument) -> Self {
+        Self {
+            index: doc.windows.len(),
+            lo: doc.windows.last().map_or(0, |w| w.pages.end),
+            carried: None,
+            retained: None,
+            doc,
+        }
+    }
+
+    /// The next window's first own page (global, 0-based).
+    #[must_use]
+    pub fn next_page(&self) -> usize {
+        self.lo
+    }
+
+    /// The windows so far.
+    #[cfg(test)]
+    pub(super) fn into_document(self) -> WindowedDocument {
+        self.doc
+    }
+}
+
+/// Gets each window's record as it ends, and the boundary a successor will
+/// start from: none when the window was the document's last or stopped it.
+pub type WindowSink<'a> = &'a mut dyn FnMut(&WindowRecord, Option<&WindowBoundary<'_>>);
 
 /// How a window starts.
 enum WindowStart<'s> {
@@ -785,10 +991,11 @@ impl OcrModel {
     /// each takes its pages' vision as it reads them, the first carried over
     /// from the previous window's lookahead, so vision runs once per page and
     /// a window's pages are dropped once encoded. `on_window` gets each
-    /// window's record and its own pages' bodies as it ends. A window that
-    /// stops (its position limit, a spent budget, a cancel) ends the document
-    /// with the pages so far; nothing done is discarded. The run's report
-    /// stays on the model ([`OcrModel::take_last_decode`]).
+    /// window's record as it ends, and the boundary its successor starts
+    /// from. A window that stops (its position limit, a spent budget, a
+    /// cancel) ends the document with the pages so far; nothing done is
+    /// discarded. The run's report stays on the model
+    /// ([`OcrModel::take_last_decode`]).
     ///
     /// # Errors
     /// A model without a guarded page contract, `window = 0`,
@@ -798,8 +1005,53 @@ impl OcrModel {
         &self,
         pages: &mut dyn Iterator<Item = FocrResult<Preprocessed>>,
         opts: &WindowedOptions,
-        mut on_window: Option<WindowSink<'_>>,
+        on_window: Option<WindowSink<'_>>,
     ) -> FocrResult<Windowing> {
+        let own = self.own_pages(opts)?;
+        // A document that fits one window has at most `own` pages.
+        let mut head = Vec::with_capacity(own + 1);
+        while head.len() <= own {
+            match pages.next() {
+                Some(pre) => head.push(pre?),
+                None => return Ok(Windowing::Fits(head)),
+            }
+        }
+        // The head's pages first, then the rest of the stream.
+        let mut stream = head.into_iter().map(Ok).chain(pages);
+        let start = WindowResume {
+            index: 0,
+            lo: 0,
+            carried: None,
+            retained: None,
+            doc: WindowedDocument::empty(),
+        };
+        self.run_windows(&mut stream, own, start, opts, on_window)
+            .map(|doc| Windowing::Windowed(Box::new(doc)))
+    }
+
+    /// [`Self::decode_document_windowed`] from `from` on (U2-D4): `pages`
+    /// yields the document's pages past those `from` holds or will read
+    /// again. The document was split into windows, so it is not read for
+    /// a fit.
+    ///
+    /// # Errors
+    /// As [`Self::decode_document_windowed`].
+    pub fn resume_document_windowed(
+        &self,
+        pages: &mut dyn Iterator<Item = FocrResult<Preprocessed>>,
+        from: WindowResume,
+        opts: &WindowedOptions,
+        on_window: Option<WindowSink<'_>>,
+    ) -> FocrResult<WindowedDocument> {
+        let own = self.own_pages(opts)?;
+        self.run_windows(pages, own, from, opts, on_window)
+    }
+
+    /// The pages each window of `opts` owns.
+    ///
+    /// # Errors
+    /// A model without a guarded page contract, or `window = 0`.
+    fn own_pages(&self, opts: &WindowedOptions) -> FocrResult<usize> {
         if !self.decodes_windows() {
             return Err(FocrError::Other(anyhow::anyhow!(
                 "{} has no guarded <PAGE> contract, so no windowed decode",
@@ -811,15 +1063,22 @@ impl OcrModel {
                 "a page window must own at least one page".into(),
             ));
         }
-        let own = own_pages_per_window(opts.window, PER_PAGE_EST_BASE, UOCR2_UNWINDOWED_PAGE_LIMIT);
-        // A document that fits one window has at most `own` pages.
-        let mut head = Vec::with_capacity(own + 1);
-        while head.len() <= own {
-            match pages.next() {
-                Some(pre) => head.push(pre?),
-                None => return Ok(Windowing::Fits(head)),
-            }
-        }
+        Ok(own_pages_per_window(
+            opts.window,
+            PER_PAGE_EST_BASE,
+            UOCR2_UNWINDOWED_PAGE_LIMIT,
+        ))
+    }
+
+    /// Windows of `own` pages from `start` to the end of `pages`.
+    fn run_windows(
+        &self,
+        pages: &mut dyn Iterator<Item = FocrResult<Preprocessed>>,
+        own: usize,
+        start: WindowResume,
+        opts: &WindowedOptions,
+        mut on_window: Option<WindowSink<'_>>,
+    ) -> FocrResult<WindowedDocument> {
         let precision = match opts.precision {
             Some(precision) => precision,
             None => DocumentPrecision::from_env()?,
@@ -836,41 +1095,33 @@ impl OcrModel {
                 )));
             }
         };
-        let params = self.document_params(head.len());
+        // A windowed document has at least `own + 1` pages, which is what
+        // the n-gram window goes by.
+        let params = self.document_params(own + 1);
         let tok = self.tokenizer()?;
         let instruction = tok.encode(MULTI_PAGE_PROMPT_TEXT)?;
         timing_log(&format!(
-            "windowed document: windows of {own} own pages, precision {}",
+            "windowed document: windows of {own} own pages from page {}, precision {}",
+            start.lo,
             precision.name()
         ));
-        // The head's pages first, then the rest of the stream.
-        let mut head = head.into_iter();
-        let mut next_page = || head.next().map(Ok).or_else(|| pages.next());
-        let mut carried: Option<Mat> = None;
-        let mut retained: Option<Retained> = None;
-        let mut doc = WindowedDocument {
-            pages: postprocess::TokenPages {
-                bodies: Vec::new(),
-                tokens: Vec::new(),
-                leading_text: false,
-                extra_markers: 0,
-            },
-            finish_reason: FinishReason::Stop,
-            stats: DocumentStats::default(),
-            windows: Vec::new(),
-            window_ids: Vec::new(),
-        };
+        let WindowResume {
+            index: first,
+            mut lo,
+            mut carried,
+            mut retained,
+            mut doc,
+        } = start;
         // The cooperative budget (D11): `FOCR_STAGE_BUDGET_FORWARD_MS` per
         // page, times the window's prompt pages, from the window's start.
         let page_budget = crate::forward_stage_budget();
-        let mut lo = 0;
-        for index in 0.. {
+        for index in first.. {
             let t0 = Instant::now();
             // Vision: the window's prompt pages as they are read, its first
             // carried over; each page's preprocess is dropped once encoded.
             let mut blocks: Vec<Mat> = carried.take().into_iter().collect();
             let held = blocks.len();
-            let span = stream_span(index, lo, own, held, &mut |page| match next_page() {
+            let span = stream_span(index, lo, own, held, &mut |page| match pages.next() {
                 Some(pre) => {
                     blocks.push(self.page_block(&pre?, page)?);
                     Ok(true)
@@ -882,7 +1133,7 @@ impl OcrModel {
                     "window {index} has no page: the stream ended at page {lo}"
                 )));
             }
-            doc.stats.vision_encodes += blocks.len() - held;
+            let vision_encodes = blocks.len() - held;
             let deadline = if opts.budget_spent_at == Some(span.index) {
                 Some(t0)
             } else {
@@ -941,34 +1192,38 @@ impl OcrModel {
                     "forward stage budget ran out before window {}'s prefill",
                     span.index
                 ));
-                let stats = WindowStats {
-                    index: span.index,
-                    pages: span.lo..span.hi,
-                    lookahead: span.lookahead,
-                    reused,
-                    fallback_reason,
-                    straddle: false,
-                    prefill_tokens: 0,
-                    copied_rows: 0,
-                    forced_tokens: 0,
-                    generated_tokens: 0,
-                    finish: FinishReason::Budget,
-                    kv_bytes_peak: 0,
-                    retire_fallbacks: 0,
-                    elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+                let record = WindowRecord {
+                    stats: WindowStats {
+                        index: span.index,
+                        pages: span.lo..span.hi,
+                        lookahead: span.lookahead,
+                        reused,
+                        fallback_reason,
+                        straddle: false,
+                        prefill_tokens: 0,
+                        copied_rows: 0,
+                        forced_tokens: 0,
+                        generated_tokens: 0,
+                        finish: FinishReason::Budget,
+                        kv_bytes_peak: 0,
+                        retire_fallbacks: 0,
+                        elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    },
+                    ids: Vec::new(),
+                    bodies: Vec::new(),
+                    tokens: Vec::new(),
+                    finish: vec![PageFinish::Budget],
+                    leading_text: false,
+                    extra_markers: 0,
+                    forced_steps: 0,
+                    hf_all_neg_inf_steps: 0,
+                    retired_blocks: 0,
+                    vision_encodes,
                 };
                 if let Some(f) = on_window.as_deref_mut() {
-                    let none = WindowPages {
-                        bodies: &[],
-                        tokens: &[],
-                        finish: &[],
-                    };
-                    f(&stats, none);
+                    f(&record, None);
                 }
-                doc.stats.page_finish.push(PageFinish::Budget);
-                doc.windows.push(stats);
-                doc.window_ids.push(Vec::new());
-                doc.finish_reason = FinishReason::Budget;
+                doc.absorb(record);
                 break;
             }
             let run = WindowRun {
@@ -1048,37 +1303,38 @@ impl OcrModel {
                 stats.kv_bytes_peak,
                 t0.elapsed().as_secs_f64(),
             ));
-            if let Some(f) = on_window.as_deref_mut() {
-                let own = WindowPages {
-                    bodies: &split.bodies,
-                    tokens: &split.tokens,
-                    finish: &decode.stats.page_finish,
-                };
-                f(&stats, own);
-            }
-            let window_stats = decode.stats;
-            let pages_out = &mut doc.pages;
-            pages_out.bodies.extend(split.bodies);
-            pages_out.tokens.extend(split.tokens);
-            pages_out.leading_text |= split.leading_text;
-            pages_out.extra_markers += split.extra_markers;
-            let total = &mut doc.stats;
-            total.page_finish.extend(window_stats.page_finish);
-            total.forced_steps += window_stats.forced_steps;
-            total.hf_all_neg_inf_steps += window_stats.hf_all_neg_inf_steps;
-            total.retired_blocks += window_stats.retired_blocks;
-            total.peak_kv_bytes = total.peak_kv_bytes.max(window_stats.peak_kv_bytes);
-            total.retire_fallbacks += window_stats.retire_fallbacks;
-            doc.window_ids.push(decode.ids);
-            doc.windows.push(stats);
             // A stop inside a window ends the document with its completed
             // pages (plan §9.2); a later window would leave a gap of pages.
-            if decode.finish_reason != FinishReason::Stop {
-                doc.finish_reason = decode.finish_reason;
-                break;
+            let stopped = decode.finish_reason != FinishReason::Stop;
+            let record = WindowRecord {
+                stats,
+                ids: decode.ids,
+                bodies: split.bodies,
+                tokens: split.tokens,
+                finish: decode.stats.page_finish,
+                leading_text: split.leading_text,
+                extra_markers: split.extra_markers,
+                forced_steps: decode.stats.forced_steps,
+                hf_all_neg_inf_steps: decode.stats.hf_all_neg_inf_steps,
+                retired_blocks: decode.stats.retired_blocks,
+                vision_encodes,
+            };
+            if let Some(f) = on_window.as_deref_mut() {
+                let boundary =
+                    carried
+                        .as_ref()
+                        .filter(|_| !stopped)
+                        .map(|carried| WindowBoundary {
+                            index: span.index + 1,
+                            lo: span.hi,
+                            carried,
+                            retained: retained.as_ref(),
+                        });
+                f(&record, boundary.as_ref());
             }
+            doc.absorb(record);
             // Only the last window has no lookahead.
-            if !span.lookahead {
+            if stopped || !span.lookahead {
                 break;
             }
             lo = span.hi;
@@ -1088,7 +1344,7 @@ impl OcrModel {
         doc.stats.extra_markers = doc.pages.extra_markers;
         doc.stats.windows = doc.windows.len();
         self.record_windowed(&doc, &params);
-        Ok(Windowing::Windowed(Box::new(doc)))
+        Ok(doc)
     }
 
     /// The windowed run's [`DecodeReport`], as a one-pass document leaves

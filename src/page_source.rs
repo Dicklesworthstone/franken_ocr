@@ -55,6 +55,18 @@ pub struct PageItem {
     /// The page's raster, or why it has none. Every raster failure is a
     /// [`FocrError::InputDecode`].
     pub raster: FocrResult<DynamicImage>,
+    /// Where the walk stands past this page ([`PageSource::seek`]).
+    pub walk: WalkCursor,
+}
+
+/// A position in a [`PageSource`]'s walk, which a resumed run seeks to
+/// without rasterizing the pages before it (U2-D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WalkCursor {
+    /// Entries of the selection already walked.
+    pub next: usize,
+    /// The walk holds the right half of the spread it last read.
+    pub held: bool,
 }
 
 /// One slot of the source-page map.
@@ -358,6 +370,32 @@ impl PageSource {
         })
     }
 
+    /// Continue the walk from `cursor`, with `map` as the pages it has
+    /// yielded: the pages before it are not rasterized. A held right half
+    /// is, since the walk yields it next.
+    ///
+    /// # Errors
+    /// [`FocrError::Usage`] for a cursor past the selection, or the held
+    /// page's raster error.
+    pub fn seek(&mut self, cursor: WalkCursor, map: Vec<MappedPage>) -> FocrResult<()> {
+        if cursor.next > self.selected.len() || (cursor.held && cursor.next == 0) {
+            return Err(FocrError::Usage(format!(
+                "a resumed walk at entry {} is outside this selection of {} pages",
+                cursor.next,
+                self.selected.len()
+            )));
+        }
+        self.held = if cursor.held {
+            let source_page = self.selected[cursor.next - 1] + 1;
+            Some((source_page, self.fetch(source_page, Some(Half::Right))?))
+        } else {
+            None
+        };
+        self.next = cursor.next;
+        self.map = map;
+        Ok(())
+    }
+
     /// Record `source_page` (or its half) in the map and hand it out.
     fn yield_page(
         &mut self,
@@ -376,6 +414,10 @@ impl PageSource {
             source_page,
             half,
             raster,
+            walk: WalkCursor {
+                next: self.next,
+                held: self.held.is_some(),
+            },
         }
     }
 }
@@ -842,6 +884,78 @@ mod tests {
             1,
             "the right half is not re-read"
         );
+    }
+
+    #[test]
+    fn a_seek_continues_the_walk_and_rasterizes_only_a_held_half() {
+        struct Spreads(Arc<AtomicUsize>);
+        impl Rasterize for Spreads {
+            fn len(&self) -> usize {
+                5
+            }
+            fn render(&self, _idx: usize) -> FocrResult<DynamicImage> {
+                self.0.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(spread())
+            }
+        }
+        // Past a whole page: nothing is read until the walk reaches page 3.
+        let renders = Arc::new(AtomicUsize::new(0));
+        let mut source = PageSource::new(Box::new(Counting {
+            pages: 5,
+            renders: Arc::clone(&renders),
+        }));
+        let walked = vec![
+            MappedPage {
+                source_page: 1,
+                half: None,
+                size: Some((64, 96)),
+            };
+            2
+        ];
+        let cursor = WalkCursor {
+            next: 2,
+            held: false,
+        };
+        source.seek(cursor, walked).expect("a position in the walk");
+        assert_eq!(renders.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(source.unread(), 3);
+        let item = source.next().expect("page 3");
+        assert_eq!((item.index, item.source_page), (2, 3));
+        assert_eq!(
+            item.walk,
+            WalkCursor {
+                next: 3,
+                held: false
+            }
+        );
+        assert_eq!(renders.load(AtomicOrdering::SeqCst), 1);
+
+        // Past a left half: the right half is read again and yielded next,
+        // and the cursor the walk gave out is the one a seek takes.
+        let renders = Arc::new(AtomicUsize::new(0));
+        let mut walk = PageSource::new(Box::new(Spreads(Arc::clone(&renders)))).split_spreads(true);
+        let left = walk.next().expect("left");
+        assert!(left.walk.held);
+        let map = walk.page_map().to_vec();
+        let mut source =
+            PageSource::new(Box::new(Spreads(Arc::clone(&renders)))).split_spreads(true);
+        source.seek(left.walk, map).expect("a held half");
+        assert_eq!(source.unread(), walk.unread());
+        let right = source.next().expect("right");
+        assert_eq!(
+            (right.index, right.source_page, right.half),
+            (1, 1, Some(Half::Right))
+        );
+
+        // A cursor outside the selection is refused.
+        let too_far = WalkCursor {
+            next: 6,
+            held: false,
+        };
+        assert!(matches!(
+            source.seek(too_far, Vec::new()),
+            Err(FocrError::Usage(_))
+        ));
     }
 
     #[test]

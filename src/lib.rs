@@ -52,6 +52,7 @@ pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
 #[cfg(feature = "pdf")]
 pub use native_engine::DocumentResult;
+pub use native_engine::checkpoint::{ResumeKey, RunFiles};
 /// Multi-model architecture descriptors + registry (the "model zoo" foundation,
 /// epic bd-3jo6 / A1). Additive metadata layer; the live forward is unchanged.
 pub use native_engine::model_arch;
@@ -797,7 +798,7 @@ impl OcrEngine {
     ) -> FocrResult<DocumentResult> {
         let model = self.model_at(model_path)?;
         let budget = Self::forward_budget(&model, source.len());
-        let options = *options;
+        let options = options.clone();
         self.run_blocking_stage_with_budget("forward-multi-page", budget, move || match on_page {
             Some(mut sink) => {
                 model.recognize_document(&mut source, &options, &mut *on_item, Some(&mut *sink))
