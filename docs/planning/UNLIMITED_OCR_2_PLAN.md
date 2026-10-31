@@ -2293,7 +2293,8 @@ holds the migration table. Where it departs from the sketch above:
 - **Docs and hints.** The install docs' size text is updated, and `with_pull_hint` (`cli.rs:3036`)
   becomes model-aware.
 - **Before publishing,** U2-E4 runs U2-A1's upstream-drift check (R20).
-- **HF mirror.** Per bd-3p8y/bd-aio5; non-blocking.
+- **HF mirror.** Per bd-3p8y/bd-aio5; non-blocking. The mirror repo exists and verifies (2026-10-30), so
+  v2 can be mirrored there as one file; HF has no 2 GiB cap.
 
 ### 9.6 Health and doctor (U2-E7)
 
@@ -2592,7 +2593,7 @@ evidence-gated defaults [uocr2,epic].
 | R7 | The shared-decoder refactor perturbs v1 | M | H | T3 token-id goldens before B5; enum dispatch; the shared `prefill_attention` stays untouched |
 | R8 | Windowed mode is approximate (Baidu's word) | M | M | Splice parity against a Python oracle; accuracy vs unwindowed (`Some(PageWindow::Off)`) and vs ground truth, with a pass/fail verdict against a pre-registered tolerance; W tunable |
 | R9 | The windowed reference exists only as a GPU SGLang wheel | H | L | Independent Python windowed oracle on the HF model, ported function by function from the wheel before U2-D1a is written; an optional SGLang run |
-| R10 | Distribution blocked by the missing HF org (bd-3p8y) | H | L | GitHub release parts are primary |
+| R10 | Distribution blocked by the missing HF org (bd-3p8y) | H | L | GitHub release parts are primary. Retired 2026-10-30: the HF repo has existed since 2026-08-13, and every manifest HF URL verifies (bd-3p8y closed) |
 | R11 | License ambiguity (no LICENSE file in the HF v2 repo) | L | M | Use the GitHub LICENSE text and the HF metadata; record both in the truth pack and the artifact notice |
 | R12 | Process ceremony crowding out shipping | M | M | Every bead closes on cited evidence; tests live in the beads that own them; no spec-only beads beyond A1 |
 | R13 | No CUDA host (the v1 bf16 oracle never ran here) | H | H | f32 CPU oracle as primary (D4); GPU only for the optional ledger |
@@ -2981,7 +2982,8 @@ Unlimited-OCR-2.pdf           1eb5885f4ddfa4ec6fbff375092377f30b5d6a5e034ec49362
 | bd-wp8.2 (freeze robot schema), bd-wp8.3 (streaming transport), bd-znwm (ocr-batch streaming), bd-mgd3 (per-page progress) | open | U2-D5/E1 robot changes go through these |
 | bd-hfdt-admission-prereqs-dfr1, bd-json-per-span-text-wbbu, bd-v73v | open | U2-E3 structured output |
 | bd-0a7 / bd-0a7.4 native PDF and vector rasterization | open | Book inputs (D24); the decoder evaluation lives there |
-| bd-3p8y, bd-aio5, bd-we84, bd-b8cg (HF mirror); bd-jprb (atomic pull) | open | U2-E4 |
+| bd-3p8y, bd-aio5, bd-we84, bd-b8cg (HF mirror) | closed 2026-10-30 (mirror verified) | U2-E4 |
+| bd-jprb (atomic pull) | in progress (per-model packages done in U2-E4) | U2-E4 |
 | bd-3ryl task-vs-arch guard | open | U2-A7 is the v2 case |
 | bd-fuh2 resident daemon follow-ups | open | The daemon refuses v2 until its protocol carries the v2 flags |
 | bd-1azu.12 (shared-prefix KV), bd-1azu.34/38/40/41/44 (spec decode/spine), bd-1azu.55/56 (megakernel) | open | Levers that refuse v2 (D18) |
