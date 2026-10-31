@@ -1308,6 +1308,38 @@ claims.
   agent: task-K2 wasm vision perf pass
   evidence dir: artifacts/perf/bd-K2-wasm-vision-f32/
 
+2026-10-31 | NEGATIVE(reverted) | `focr ocr-batch` images served one at a time by the resident
+    daemon (`src/cli.rs::run_batch_images`, `resident::try_recognize`)
+  claim_id: CLAIM-resident-ocr-batch   evidence_id: artifacts/perf/bd-fuh2/
+  model source commit + fixture hash:
+    HF 3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5
+    unlimited-ocr.int8.focrq sha256 573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592
+    page_0009.png sha256 62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da
+    page_0014.png sha256 f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2
+    page_0019.png sha256 ad98fcc10f580bfa2271cc7ce3b581806d0392844d41201db95eaaa4713a1c1c
+  CPU feature string: aarch64+neon+dotprod (Apple M5 Ultra)
+  exact command + env: python3 -I artifacts/perf/bd-fuh2/warm_bench.py focr
+    unlimited-ocr.int8.focrq pages state out.json. Warm arm FOCR_RESIDENT_DIR=state
+    FOCR_RESIDENT_IDLE_SECS=900, inline arm FOCR_NO_RESIDENT=1. release-perf, LTO off,
+    16 codegen units, load average 65 to 78 from the U2-C5a evaluation. Three ABBA pairs.
+  fallback / kill-switch state: reverted, so none remains. The tested code had `--no-resident`
+    and FOCR_NO_RESIDENT=1. allocator=system.
+  measured before -> after vs reference: no reference, focr inline against focr served in the same
+    invocation: 205.63 s -> 207.16 s, median paired ratio 0.996, range 0.993 to 1.007. The same
+    harness measured a single page at 14.47 s -> 12.51 s, ratio 1.16: a warm run saves one load,
+    about 2 s here, and a batch saves it once however many pages it reads.
+  bit-exact correctness proof: stdout sha256 f3fb3b7610… identical on all 3 pairs; the model-gated
+    `tests/resident_e2e.rs` batch step matched `focr ocr` on v1 weights before the revert.
+  disposition: REVERT. No wall-clock gain, and it added a cost: a batch that released its 8 GB to
+    10 GB at exit would have left them resident for the ten-minute idle period.
+  do-not-retry: "do not route ocr-batch through the resident daemon for speed unless a measured
+    load is a large share of a batch's wall time, which needs an uncached artifact on a slow disk
+    or a batch of very few short pages. The saving is one load per run, so a longer batch shrinks
+    it."
+  per-lever tally: W 0 / L 0 / N 1
+  agent: Claude Code, bd-fuh2
+  evidence dir: artifacts/perf/bd-fuh2/
+
 
 The first real entry MUST carry **full truth-pack provenance** (model commit
 `3a7f4db…` + `(file_sha256, lines)` from `SOURCE_HASHES.md` + weights/`.focrq`

@@ -68,7 +68,7 @@ success** — one line, revert, next lever, no retraction narrative.
 **CPU is the priority** (most target hosts lack a usable GPU); CUDA is an explicit later stretch goal.
 
 It is built on:
-- `/dp/frankentorch` (`ft-kernel-cpu`, `ft-core`, `ft-serialize`) — custom CPU tensor kernels, consumed at the **kernel** level (not the autograd level).
+- `/dp/frankentorch` (`ft-kernel-cpu`, `ft-core`) — custom CPU tensor kernels, consumed at the **kernel** level (not the autograd level). `ft-serialize` is not a dependency: `src/native_engine/weights.rs` parses safetensors itself.
 - `../asupersync` — structured-concurrency runtime, for **orchestration / cancellation / IO only** (not for intra-op math parallelism).
 - `/dp/frankensqlite` (`fsqlite`) — durable local run state + telemetry (NEVER `rusqlite`).
 

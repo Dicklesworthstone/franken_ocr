@@ -336,8 +336,15 @@ The same engine exposes the surfaces the CLI uses:
 | `recognize_with_figures(path)` | Return Markdown/layout plus cropped figure regions, matching `--extract-figures`. |
 | `recognize_dynamic(image)` | Run an already-decoded `image::DynamicImage`, the same in-memory path used by PDF rasterization. |
 | `recognize_batch(&[paths])` | Load weights once and return one result per input path, in order. |
-| `recognize_document(model, source, &options, on_item, on_page)` | Parse a PDF, a directory or a list of pages as ONE cross-page document, matching `--multi-page`. The `PageSource` is read one page at a time; `on_page` streams each page as it ends. `DocumentOptions` picks the decode windows (Unlimited-OCR-2 reads windows of 10 pages by default; `PageWindow::Off` is one pass). The `DocumentResult` has the markdown, the pages, the skipped pages, the windows and the `finish_reason`. A document that stops early returns the pages it completed. |
+| `recognize_document(model, source, &options, on_item, on_event)` | Parse a PDF, a directory or a list of pages as ONE cross-page document, matching `--multi-page`. The `PageSource` is read one page at a time; `on_event` streams each page as it ends, and each decode window (`DocumentEvent`). `DocumentOptions` picks the decode windows (Unlimited-OCR-2 reads windows of 10 pages by default; `PageWindow::Off` is one pass). The `DocumentResult` has the markdown, the pages, the skipped pages, the windows and the `finish_reason`. A document that stops early returns the pages it completed. |
+| `recognize_pages(model, source, observer)` | Read a `PageSource` one page at a time, each page its own forward, matching `focr ocr book.pdf`. A failed page is skipped and reported to `observer`; a missing model or a cancel ends the walk. |
 | `request_shutdown()` / `reset_shutdown()` | Drive cooperative cancellation for long-running embedders. |
+
+`OcrEngine` belongs to the `native` feature. A program that wants the engine alone
+links `default-features = false, features = ["library"]`, which brings no CLI, async
+runtime, run store, signal handler or network path, and calls `OcrModel` directly.
+[`docs/library-output.md`](docs/library-output.md) is its versioned contract: page and
+span fields, box coordinates, reading order, side effects and what is not promised.
 
 A document parse, using the pages of a PDF:
 
@@ -392,19 +399,46 @@ focr ocr eq.png --task formula --model got-ocr2.int8.focrq   # specialized task 
 focr ocr chart.png --task chart-data --model onechart.int8.focrq
 focr ocr book.pdf --pages 3,5-9 --split-spreads -o excerpt.md
 focr ocr ./scans/ --multi-page -o book.md  # a directory of page images as one document
+curl -s "$URL" | focr ocr - -o page.md     # an image or a PDF on stdin
+focr ocr book.pdf --multi-page --check     # is this run ready? about a second, no weights loaded
+focr ocr page.png --raw -o page.raw.txt    # the model's output, grounding markers included
+focr ocr page.png --threads 8 --timing     # eight kernel threads, stage timings on stderr
 ```
+
+**Stdin (`-`).** `focr ocr -` reads an image or a PDF from stdin, whichever the bytes
+are. The run holds them in a private temp file and removes it when it ends. A file
+actually named `-` is `./-`. Empty stdin, or bytes that are neither, exits 4.
+
+**Preflight (`--check`).** Runs the checks that can fail before a decode, then stops:
+the arguments, the input's header or page list, `--pages`, the model's header and
+tokenizer, and that `-o` has a directory to write into. It takes about a second on the
+real artifacts, exits with the code the run would fail with, and records nothing in
+`focr runs`. `--json` prints `{command: "ocr.check", ok, input, model, output}`. It
+does not decode pixels, so a truncated image or a PDF page that will not rasterize
+passes here and fails in the run. Use `--json`, not `--robot`, with it.
 
 **Output (`-o`/`--output FILE`).** Writes the result to a file instead of stdout; the
 format follows the extension: `.json` emits structured JSON, any other extension
 (e.g. `.md`) emits Markdown. `--json` forces JSON regardless of extension. The
 structured JSON carries the rendered `markdown` plus a `layout` array, one
 `{label, boxes}` entry per grounded span, where each box is `[x1, y1, x2, y2]` in
-source-image pixels. An Unlimited-OCR-2 title adds its heading `level` (1, 2, …). A PDF nests these under a per-page `pages` array; split
+source-image pixels. A span adds `text`, what the model wrote for that region: the
+text after its marker, up to the next span, normalized as the markdown is. Image
+spans have no `text`, and neither does a region the model boxed without writing
+anything. An Unlimited-OCR-2 title adds its heading `level` (1, 2, …). A PDF nests these under a per-page `pages` array; split
 spreads become separate logical page entries with the same source `page` number
 and a `"half": "left"` or `"right"` marker. This is the same shape `--json`
 prints to stdout. TrOMR music runs also include a `staves` array in source order;
 each entry carries the 1-based staff number, page-space bbox, `recognized` or
 `skipped` status, and an optional skip reason.
+
+**Raw output (`--raw`).** Outputs the decode as the model wrote it, grounding markers
+included: `<|det|>label [x1, y1, x2, y2]<|/det|>` spans (or the `<|ref|>` form), or
+Unlimited-OCR-2's `<BLOCK>label[x1, y1, x2, y2]<FORK>` prefixes.
+It replaces the markdown on stdout and in a text `-o` file. With JSON it adds a `raw`
+string beside the `markdown` and to each entry of `pages`, and with `--robot` to
+`run_complete`. Boxes stay on the model's 0–999 grid, relative to each page, or to
+each strip of a tall image, so use `layout` for source-image pixels.
 
 **Figures (`--extract-figures`).** The model sees figures/photos/diagrams it does not
 transcribe to text. With `--extract-figures`, those regions are cropped out of the
@@ -455,6 +489,15 @@ boundaries are unreliable. On v1 it does not compose with `--split-spreads` or
 `--extract-figures` (per-page semantics), and `--json` lists real `pages[]` only
 when the text has exactly one body per page (otherwise `pages: []`).
 
+`--page-window N|auto|off` sets how `unlimited-ocr-2` splits a `--multi-page`
+document into decode windows. `N` is pages per window, at most 102, and the
+default is 10. `auto` picks the largest window, up to 10, whose estimated
+whole-process memory fits `FOCR_MEMORY_BUDGET`, and refuses with the estimate's
+parts when not even one page fits. `off` reads one pass with no checkpoint, so
+a long document can stop at the position limit with its pages written and exit 5.
+Robot mode reports a `window` event after each window's pages, and a terminal
+shows pages and windows done, tokens per second and an estimate of the time left.
+
 Unlimited-OCR-2 (`--model unlimited-ocr-2`) emits exactly one `<PAGE>` per page,
 so its document mode has real pages. A document of more than 10 pages is read
 in windows of 10: each window's prompt holds its own pages and the next
@@ -463,12 +506,12 @@ bounded at any length. A window that stops early ends the document with its
 completed pages. `--json` lists one `pages[]` entry per page
 read: `page` (the source page), `half` on a split spread, `run_index`, `window`
 when windowed, `text`, `layout` (boxes in that page's own pixels), `tokens` and
-`finish` (`marker`, `eos`, `page_cap`, `length`, `budget` or `cancelled`). It composes with `--split-spreads`
+`finish` (`marker`, `eos`, `page_cap`, `length`, `budget` or `cancelled`), and `raw` under `--raw`. It composes with `--split-spreads`
 (each half is one page of the prompt) and with `--extract-figures`: figures are
 cropped from their page after the decode and named `page{N}_figure_{M}`, or
 `page{N}l_figure_{M}` / `page{N}r_figure_{M}` on a half. Robot `page` events add
-`source_page`, `half`, `model_id`, and for decoded pages `tokens`, `finish` and,
-for a page read in one pass, `elapsed_ms`.
+`source_page`, `half`, `model_id`, and for decoded pages `tokens`, `finish`,
+`window` (null in one pass) and, for a page read in one pass, `elapsed_ms`.
 
 **Stopping and resuming a long document.** After each window, a windowed
 Unlimited-OCR-2 run appends its pages to a journal and replaces a checkpoint:
@@ -552,6 +595,30 @@ large tensors for each page.
 order. Without the experimental flag, attention and `lm_head` stay high
 precision by construction.
 
+To watch a long batch, add `--progress-events PATH` (`-` for stderr). Each line
+is one JSON object: `batch_start` with the resolved thread budget, model and
+backend, then `image_complete` or `image_error` as each image ends, with the
+pages per hour measured so far and `eta_ms`, and `batch_end` with the outcome.
+stdout does not change, so `--json` is still one final object. `eta_ms` is
+`null` until one image has ended, then the mean time per image so far times the
+images left; the first image carries the model load, so the estimate starts
+high. With `--multi-page` the lines are `page_complete` and `page_skipped`, and
+`batch_start` says the pages are one cross-page pass, not independent images.
+`focr robot schema` lists every field under `batch_progress`. The flag refuses
+`FOCR_BATCH_SPINE`, which decodes the images together and has no per-image end
+to report.
+
+`--inputs-from FILE` reads more paths, one per line, after any named on the
+command line (`-` reads stdin). `--output-dir DIR` writes each image's markdown
+to `DIR/<stem>.md` as it ends, so a stopped batch keeps what it finished; two
+inputs that would write one file are refused before any work.
+
+An image that fails does not stop the batch: the run goes on, and fails with the
+first failure's exit code only if no image was read. `--fail-fast` stops at the
+first failure instead. Ctrl+C stops at the image it interrupted, and the run
+exits 6. Either way the images that ended are still reported, and `--json` adds
+`"stopped": "image_failed"` or `"stopped": "cancelled"`.
+
 ### `focr pull`
 
 Download a manifest-compatible model and tokenizer into the cache, verifying
@@ -572,9 +639,11 @@ focr pull --manifest ./manifest.json        # compatible custom default manifest
 ```
 
 Downloads run over asupersync's native HTTP stack (rustls + webpki-roots), reassemble GitHub split parts, verify against a committed SHA256 manifest, and cache to `~/.cache/franken_ocr/models`. Manifest schema v2 requires an exact recipe for every quant; size, paths, counts, declared sizes, HTTPS URLs, and hashes are validated before installation. The release-bound schema-v2 manifest is embedded in each binary; a local or HTTPS override is explicit.
-The v0.7.0 primary Unlimited-OCR artifact uses the conservative exact recipe and installs directly under the cache root as `unlimited-ocr.v0.7.0.int8.focrq`. The embedded manifest pins its three release parts, byte count, and final SHA256; the historical full-int8 artifact remains only in the schema-v1 manifest used by already-released v0.6 binaries.
-Other models install under `~/.cache/franken_ocr/models/<model-id>/` so their
-tokenizer sidecars cannot collide. The resolver searches those subdirectories,
+The v0.7.0 primary Unlimited-OCR artifact uses the conservative exact recipe and installs as `unlimited-ocr/unlimited-ocr.v0.7.0.int8.focrq`. The embedded manifest pins its three release parts, byte count, and final SHA256; the historical full-int8 artifact remains only in the schema-v1 manifest used by already-released v0.6 binaries.
+Every model installs as one package under `~/.cache/franken_ocr/models/<model-id>/`.
+Tokenizer sidecars cannot collide, and a pull replaces the whole directory at once, so
+a crash never leaves a new artifact beside an old tokenizer. The resolver searches
+those packages, then the cache root,
 so `--model onechart.int8.focrq`, `--model tromr.int8.focrq`, and
 `--model tromr.focrq` work after their pulls. TrOMR publishes `int8` and `f32`;
 the default `focr pull tromr` fetches the int8 artifact, while
@@ -789,8 +858,8 @@ There is no GPU backend: inference is CPU-only by design (see [Limitations](#lim
 
 1. **Rule out swapping first.** The default Unlimited-OCR artifact is ~4 GB on disk and inference peaks well above that; on an 8 GB machine the slowness is usually paging, not compute. Either add RAM headroom, close other large processes, or use a smaller model (below).
 2. **Match the model to the task.** For plain text/structured pages, `got-ocr2.int8.focrq` (~0.8 GB) loads and runs far lighter than the 4 GB Unlimited-OCR default; `onechart` (~0.3 GB) and `smolvlm2` (~1 GB) are likewise much smaller. `focr models` lists the zoo; `focr pull <model>` installs it.
-3. **Amortize the model load.** Eligible single-image `focr ocr` runs are served by the **resident warm-model daemon** by default: the first run spawns a per-model background process that keeps the loaded weights in RAM, so back-to-back invocations skip the multi-GB artifact load entirely; it auto-exits after 10 idle minutes (`FOCR_RESIDENT_IDLE_SECS`; opt out with `--no-resident` / `FOCR_NO_RESIDENT=1`). For a known batch of images, `focr ocr-batch a.png b.png ...` (weights load once, results stream per page) or the library's `recognize_batch` remains the throughput path, and `FOCR_BATCH_SPINE=1` additionally decodes dense-zoo pages through shared batch steps.
-4. **Check the thread budget.** The kernel pool defaults to physical cores (`FOCR_THREADS` overrides it). If the host is shared or cgroup-limited, set it explicitly; oversubscription with hyperthreads or other tenants slows the int8 GEMMs down.
+3. **Amortize the model load.** Eligible single-image `focr ocr` runs are served by the **resident warm-model daemon** by default: the first run spawns a per-model background process that keeps the loaded weights in RAM, so back-to-back invocations skip the multi-GB artifact load (measured about 2 s saved on a 14 s page with the artifact in the OS page cache); it auto-exits after 10 idle minutes (`FOCR_RESIDENT_IDLE_SECS`; opt out with `--no-resident` / `FOCR_NO_RESIDENT=1`). For a known batch of images, `focr ocr-batch a.png b.png ...` (weights load once, results stream per page) or the library's `recognize_batch` remains the throughput path, and `FOCR_BATCH_SPINE=1` additionally decodes dense-zoo pages through shared batch steps.
+4. **Check the thread budget.** The kernel pool defaults to physical cores (`--threads N` or `FOCR_THREADS` overrides it). If the host is shared or cgroup-limited, set it explicitly; oversubscription with hyperthreads or other tenants slows the int8 GEMMs down.
 5. **Verify the SIMD tier.** `focr robot backends` shows the detected ISA and the effective dense-int8 route. On x86 you want AVX-512-VNNI > AVX-VNNI > AVX2; plain scalar means an old CPU (or a mis-forced `FOCR_FORCE_ARCH`) and will be several times slower.
 6. **Cut the work.** `--pages 3,5-9` OCRs only the PDF pages you need; `FOCR_MAX_NEW_TOKENS` (or `--max-length`) caps runaway generations; `FOCR_MMAP=1` on immutable artifact inodes gives lazy page-in and OS page-cache reuse across repeated runs.
 7. **Measure before tuning further.** `FOCR_TIMING=1` prints the nested stage breakdown (artifact load, vision attention, decode, output) so you can see whether your pages are load-bound, vision-bound, or decode-bound.
@@ -856,7 +925,8 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_QUANT` | Pick the quant-suffixed artifact name during cache resolution when multiple variants are present. |
 | `FOCR_MANIFEST_URL` | Override the release-bound embedded manifest with a local path or an HTTPS URL. |
 | `FOCR_RUN_STORE` | Override the local run-history database path. Defaults to `~/.cache/franken_ocr/runs.db`. |
-| `FOCR_MMAP` | Opt into read-only mmap for trusted artifact inodes that are guaranteed immutable for the process lifetime. Unset is the safe owned-buffer default. |
+| `FOCR_MMAP` | Opt into read-only mmap for trusted artifact inodes that are guaranteed immutable for the process lifetime. Unset is the safe owned-buffer default. On a 20-page `unlimited-ocr-2` document, output was byte-identical and peak footprint fell from 11.13 GB to 6.64 GB. Peak RSS barely moved (10.76 GB), because mapped pages count towards it until the system needs them back, and wall time doubled in that one run on a busy host, so measure before relying on it. |
+| `FOCR_MEMORY_BUDGET` | How much memory `--page-window auto` may plan for, as bytes or a whole number of `KiB`, `MiB`, `GiB` or `TiB`. Defaults to three quarters of physical memory. |
 | `FOCR_NO_REPEAT_NGRAM` | Override the sliding no-repeat n-gram size for decode (default 35). |
 | `FOCR_GOT_NO_REPEAT_NGRAM` | Override the GOT-OCR2 global no-repeat n-gram size (default 20, matching the upstream model; `0` disables the repetition guard). |
 | `FOCR_GOT_FORMAT` | Force GOT-OCR2's `OCR with format:` structured-output mode, the env analog of `--format` and the format-implying `--task` values. |
@@ -876,8 +946,8 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_BATCH_PACK` | When present, admit pending streams by similar prefill length inside the batch scheduler. Output order is restored before return, and each stream's tokens stay independent; unset preserves submission-order admission. |
 | `FOCR_BATCH_VISION` | Inside the batch spine, run the vision tower batched across pages (the default). `0`/`off`/`false`/`no` reverts to the per-page vision loop. Read only when the spine is armed. |
 | `FOCR_UNLIMITED_VISION_CACHE` | Cache Unlimited-OCR's immutable SAM weights and pretransposed bridge projector on the loaded model (default). `0`/`off`/`false`/`no` restores per-page hydration for diagnostics and memory comparisons. |
-| `FOCR_THREADS` | Override the process-wide kernel thread budget. Default is the PHYSICAL core count (hyperthreads oversubscribe the int8 GEMMs; on iOS one core is left to the UI). Read once at startup; every pool-sizing consumer uses it. |
-| `FOCR_TIMING` | Emit nested native-forward timing rows for performance work, including SAM hydrate/forward/block/attention/MLP splits and decode/output stages. Interactive progress is disabled while this line-oriented trace is active. |
+| `FOCR_THREADS` | Override the process-wide kernel thread budget. Default is the PHYSICAL core count (hyperthreads oversubscribe the int8 GEMMs; on iOS one core is left to the UI). Read once at startup; every pool-sizing consumer uses it. `--threads N` on `ocr` and `ocr-batch` outranks it for one run, and `focr ocr` then loads its own model, because a resident daemon keeps the budget it started with. |
+| `FOCR_TIMING` | Emit nested native-forward timing rows for performance work, including SAM hydrate/forward/block/attention/MLP splits and decode/output stages. Interactive progress is disabled while this line-oriented trace is active. `--timing` on `ocr` and `ocr-batch` does the same for one run; either way `focr ocr` loads its own model, so the rows reach your stderr. |
 | `FOCR_NO_PROGRESS` | Disable the interactive stderr progress bar shown during multi-page PDF and sequential `ocr-batch` runs (any value other than empty or `0`). The bar already auto-disables when stderr is not a TTY and in `--robot`/`--json` modes; this is the explicit opt-out for TTY sessions. |
 | `FOCR_FORCE_ARCH` | Force an available SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`avxvnni`/`avx512vnni`) for CPU dispatch; used by `robot selftest`, `robot backends`, and pinned perf runs. |
 | `FOCR_INT8_AUTOVEC` | Apple-only ordinary dense-int8 route switch. Default uses measured-faster LLVM autovec; `0`/`off`/`false`/`no` restores SDOT when no valid `FOCR_FORCE_ARCH` override is active. It does not affect packed-int4 or offline-packed SMMLA paths. |

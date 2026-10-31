@@ -1343,7 +1343,7 @@ Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a
 | DISC-U2-10 | EXIF orientation | ignored: `Image.open(f).convert('RGB')` (`MU:1070`) | ignored: `smart_rgb_conversion = False` (`base_processor.py:215`), so a plain `convert("RGB")` | Applied, as for v1 (the shared decoder, `src/preprocess/mod.rs` `decode_path`). Only an image with a non-identity Orientation tag differs, and the oracle corpus has none (U2-B7) |
 | DISC-U2-11 | FFN/expert weight storage in the default decoder | f32 parity oracle over the bf16 checkpoint | bf16 | The shipping cache keeps the 2,148 FFN/expert matrices per-channel int8 (the fixed recipe); attention, router, norms and `lm_head` stay f32. Its greedy ids leave the f32 oracle's at a near-tie, where the all-f32 cache (`FOCR_DECODE_F32`, otherwise the same ops) keeps the oracle's token: S1 page_0014 at step 47 (the oracle's token 0.214 below the int8-FFN pick), page_0590 at step 32 (0.156), S2 at step 44 (0.156), S3 p9_p14 at step 73 (0.065); page_0009 is exact. On the long lane the f32 cache is exact over S3-p10 (6,272 ids) and S3-p20 (16,880 ids), with block retirement on and off, while the int8-FFN path leaves at S3-p10 step 203 (0.017) and S3-p20 step 118 (0.056). It still ends at `stop` with one body per page, 6,277 and 17,165 ids long. No layer routes differently at any of them (U2-C2). At L5 (U2-C4, **DISC-019**, ACCEPTED): 20/20 corpus pages within 0.45 CER, aggregate 0.0685; page_0590 at 0.44996; document CERs S2 0.5272, S3-p9_p14 0.0916, S3-p10 0.0013, S3-p20 0.0199 |
 | DISC-U2-12 | page state of a reused window's last prompt row when no text is spliced (the text KV allocation failed) | n/a (no windows) | the first decode step's carry is written into that row's slot (`_seed_continuation`, `W/session/uocr_doc_reuse.py:490-497`), so its image page reads −1 | The reused-window seed (`DecodePageState::reused_window`) carries the step and the row keeps its page. Both stacks read a row's page only through its 32-row block's (min, max), which skips −1, so they differ only when that row opens its block (rewritten prompt length ≡ 1 mod 32). franken_ocr's KV is never pool-allocated, so only the `marker_only_splice` test hook reaches the path; `w2-n5-markeronly-t12` (prompt 956 rows) is token-exact (U2-D1a) |
-| DISC-U2-13 | rendering of the block grammar (`<BLOCK>label[<LEVELn>][box]<FORK>text`, §5.1) | `result.md` keeps every prefix raw: `re_match` (`MU:44-59`) knows only v1's spans | no postprocess (returns the generated text) | Each block prefix is a span under v1's rule (`postprocess.rs` `scan_block_spans`): an `image` block becomes `![](images/…)` and is a figure, every other prefix is deleted. The text so has v1's shape (titles unmarked, one newline between blocks, tables as HTML). `layout` keeps each block's label, its `level` and its box rescaled as v1's are. A prefix off the grammar, such as one cut off by a page's token cap, stays in the text. `cross_text`/`append_text` continuations stay on their own pages. Measured: all 431 blocks of the nine oracle outputs parse, and none of the grammar reaches the markdown (U2-E3b) |
+| DISC-U2-13 | rendering of the block grammar (`<BLOCK>label[<LEVELn>][box]<FORK>text`, §5.1) | `result.md` keeps every prefix raw: `re_match` (`MU:44-59`) knows only v1's spans | no postprocess (returns the generated text) | Each block prefix is a span under v1's rule (`postprocess.rs` `scan_block_spans`): an `image` block becomes `![](images/…)` and is a figure, every other prefix is deleted. The text so has v1's shape (titles unmarked, one newline between blocks, tables as HTML). `layout` keeps each block's label, its `level`, its box rescaled as v1's are, and its `text` (the slice up to the next block). `--raw` returns the prefixes as the reference's `result.md` keeps them. A prefix off the grammar, such as one cut off by a page's token cap, stays in the text. `cross_text`/`append_text` continuations stay on their own pages. Measured: all 431 blocks of the nine oracle outputs parse, and none of the grammar reaches the markdown (U2-E3b) |
 
 **Filing.** `scripts/check_ledgers.py:310` matches only `^## DISC-\d+:`, so a `## DISC-U2-k:` heading
 would escape the required-field, kill-switch and uniqueness checks.
@@ -1617,6 +1617,30 @@ measures the real numbers.
 - **Estimator.** U2-D3 adds a whole-process memory-budget estimator. `--page-window auto` uses it, and
   robot `window` events report it.
 
+**As built (U2-D3).** `estimate_peak_bytes` adds three fitted constants (90 MB process, 2.6 GB vision
+scratch, 0.6 GB decode scratch) to what the artifact's tensor directory and the KV arithmetic above
+give. The fit came from a different document, so the calibration pages never informed it. Against the
+pre-registered rule, measured peak RSS ≤ estimate × 1.10, all three runs passed with no change to the
+model:
+
+| Run | Pages | Estimate | Peak RSS | RSS ÷ estimate | Peak footprint |
+|---|---:|---:|---:|---:|---:|
+| Owned weights | 3 | 10.55 GB | 10.05 GB | 0.953 | 10.05 GB |
+| Owned weights | 20 | 11.06 GB | 11.13 GB | 1.007 | 11.13 GB |
+| Owned weights | 36 | 11.06 GB | 10.88 GB | 0.984 | 11.13 GB |
+| `FOCR_MMAP=1` (extra) | 20 | 11.06 GB | 10.76 GB | 0.972 | 6.64 GB |
+
+KV is not where the memory goes: it peaked at 393–426 MB at W=10 (0.37–0.40 GiB), a little above the
+table's ≤ ~0.35 GiB. The peak comes from the step-up before decoding: the weights reach 4.25 GB,
+vision statics 4.74 GB, the SAM forward 6.73 GB, CLIP hydration 8.54 GB and the decoder weights 9.28 GB.
+
+**The M3 exit is at risk.** Peak RSS ≤ 8 GiB at W=10 is missed with owned weights, 10.37 GiB. With
+mapped weights the output is byte-identical and the footprint falls 40% to 6.19 GiB, but RSS stays at
+10.02 GiB, because clean mapped pages count towards it and this 256 GiB host never needs to drop them.
+A run here cannot show what RSS does on a 16 GB host. Mapping also cost about twice the wall time and
+1.16× the CPU in one unpaired run on a loaded host, which needs a quiet paired measurement. U2-T1b
+judges the exit. Evidence: `artifacts/perf/bd-uocr2-epic-cgux.26/`.
+
 ### 6.4 Concurrency (doctrine #5)
 
 - One live forward at a time.
@@ -1672,9 +1696,9 @@ recipe id), or whose `source_sha256` does not match the multi-shard convention (
 ### 6.6 Document pipeline (U2-D0, U2-E2, U2-E3)
 
 **Page sources.** The PDF page source wraps the lazy primitive `PdfPages::open`/`render(idx)`
-(`pdf.rs:89/144`). `pdf::walk_document` (`pdf.rs:1032`) is push-style (render, then recognize), only
-pdf.rs tests call it, and bd-3gyt re-expresses it over the page source. U2-D0 implements the
-multi-page part and coordinates with bd-3gyt and bd-paom (`related` links, not blockers).
+(`pdf.rs:89/144`). bd-3gyt removed the push-style `pdf::walk_document`: `PageSource::read_pages` is the
+one per-page walk, and the CLI and `OcrEngine::recognize_pages` (bd-paom) run on it. U2-D0 implements
+the multi-page part.
 - The page source is **lazy**: it yields a page's raster on demand, plus per-page `(width, height)`,
   and `PageSource::fetch` re-renders a page for figure crops.
 - It must be `Send + 'static`: the whole document runs inside one `run_blocking_stage_with_budget`
@@ -1929,6 +1953,16 @@ and (p) use synthetic artifacts and always run.
 - (r) `ocr-batch --model unlimited-ocr-2` over 3 images, and with `--multi-page` over one 3-page
   document. Outputs equal the solo v2 runs.
 
+*As built (U2-T1a).* `scripts/uocr2_e2e.sh` finds or builds the binary and runs
+`scripts/uocr2_e2e.py`, which keeps every run's stdout and stderr under `FOCR_E2E_DIR` and checks its
+own log with `scripts/check_test_logs.py`. Each run has its own `HOME` and
+`FOCR_MODEL_PATH=/nonexistent`, so no step can fall back to another model. (g) needs `FOCR_E2E_LONG=1`
+too. (c) passes `--page-window off`, because T1b owns the windowed run. (j) is two steps: the refusals
+run on a sparse stand-in with v2's tensor census, and `j_ignored_lever` needs the real artifact. (h)'s
+refusal is its own step. (l) requires the warning's recovery to name `focr pull unlimited-ocr-2`
+exactly when `models/manifest-v2.json` lists the model, so it goes red if U2-E4 publishes without
+updating `warning_recovery`.
+
 **T1b (M3).** Every T1b step decodes long documents, so each runs only under `FOCR_E2E_LONG=1`;
 `check.sh` runs none by default.
 - (d) 35-page windowed document, W=10, built by concatenating corpus pages;
@@ -2131,6 +2165,19 @@ Decoded v2 events also gain `tokens`, `finish:"marker"|"eos"|"page_cap"|"length"
  prefill_tokens, generated_tokens, kv_bytes_peak, rss_bytes_peak, elapsed_ms, eta_ms}
 ```
 
+*As built (U2-D5).*
+- A window ends with its pages, then its checkpoint, then this event, so a consumer that has the event
+  can resume from it. Pages stream at their window's end, not during it: one window is the unit of
+  progress. A resumed run streams the journal's pages, and `window` events only for what it decodes.
+- `pages` is 0-based and half-open over the pages the run read. `rss_bytes_peak` is the process's
+  high-water mark so far, so it never falls. `eta_ms` is pages left × the running mean of a page's wall
+  time over the windows this run decoded; `elapsed_ms` includes vision.
+- The terminal line uses the same mean, labelled `estimate`, and stays on the last finished window. A
+  model that reads pages between window decodes therefore has one bar, not v1's `raster` then `ocr`.
+- `--page-window off` keeps no checkpoint, so it refuses `--resume` and `--keep-checkpoint` (exit 2)
+  rather than ignoring them. `PageWindow::Pages` above the limit is refused by the library too, where
+  it used to be clamped without a word. `--page-window` needs `--multi-page`.
+
 **`run_complete` additions:** `model_id`, `source_sha256`, `pages_out`, `pages_skipped`, `windows`,
 `extra_markers` (U2-D5 adds `pages_out`, `pages_skipped`, `windows` and `extra_markers`),
 `finish_reason` and `warnings[]` (U2-X2), and `resumed_from` (owned by U2-D4). The library mirror is
@@ -2270,17 +2317,19 @@ let doc = engine.recognize_document(
   before engine construction (D25).
 
 *As built (U2-E2, 2026-10-30).* The call is
-`engine.recognize_document(model_path, source, &options, on_item, on_page)`, wrapping
-`OcrModel::recognize_document(&mut source, &options, on_item, on_page)`. Version 0.10.0; the CHANGELOG
+`engine.recognize_document(model_path, source, &options, on_item, on_event)`, wrapping
+`OcrModel::recognize_document(&mut source, &options, on_item, on_event)`. Version 0.10.0; the CHANGELOG
 holds the migration table. Where it departs from the sketch above:
 - **Model.** The model is the explicit `model_path` (D25 resolves it first), not a `ModelChoice` option.
 - **Options.** `DocumentOptions { page_window, resume, run }` is `#[non_exhaustive]` with chaining
   setters, not a builder; `run` (U2-D4) names the journal and checkpoint files. `max_page_tokens` and `entmax_domain` are left out because they already have one
   route each (`DecodeOverrides`, `--max-page-tokens`; `FOCR_SRSWA_ENTMAX`), and a second would
   duplicate config. `crop_mode` is left out because a document reads base views only (DISC-U2-6).
-- **Sink.** `on_page` streams `StreamedPage` (a body, and its `PageResult` when the model splits pages
-  exactly), because v1's bodies can merge pages and have none. `on_item` sees every page before it is
-  read, a skipped one included.
+- **Sink.** `on_event` streams `DocumentEvent`, one ordered stream: `Page(StreamedPage)` (a body, and
+  its `PageResult` when the model splits pages exactly, because v1's bodies can merge pages and have
+  none), and `Window(&WindowStats)` as each window ends, after its pages and checkpoint (U2-D5). A
+  resumed run streams the windows it decodes, not those it picks up. `on_item` sees every page before
+  it is read, a skipped one included.
 - **Result.** `DocumentResult { markdown, pages, pages_out, skipped, finish_reason, extra_markers,
   windows, warnings, model, resumed_from }`. `skipped` lists the pages (with reasons), not a count;
   `model` is `ModelIdentity { model_id, source_sha256 }`. `windows` (U2-D1b) is one `WindowStats` per
@@ -2289,8 +2338,9 @@ holds the migration table. Where it departs from the sketch above:
 - **Cancellation.** Ctrl+C or `request_shutdown()` stops Unlimited-OCR-2's document loop at its next
   step with `finish_reason: cancelled`; the CLI writes the pages, then exits 6. v1 still fails with
   `Cancelled`.
-- **Features.** Documents need the `pdf` feature, which every shipped build enables, because the page
-  source and `SkippedPage` live behind it. A pure core without `pdf` has no document API (bd-x7jt).
+- **Features.** The document API compiles in every build (bd-x7jt). `pdf` adds only the PDF reader:
+  `PageSource::pdf`, and `PageSource::open` of a file. Without it, `open` refuses a file with
+  `NotImplemented` and a document reads page images or in-memory rasters.
 
 ### 9.5 Distribution (U2-E4)
 

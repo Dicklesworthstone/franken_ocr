@@ -47,8 +47,8 @@ These are the non-negotiable invariants the whole design is built to satisfy (fr
 
 `franken_ocr` is **one crate, not a workspace** (the `franken_whisper` template, verbatim — plan §4.1). Two `[[bin]]` targets (`focr` short + `franken_ocr` long) both point at `src/main.rs`; the explicit `[[bin]]` declarations disable the implicit package-named bin. Sibling crates are path deps:
 
-- `ft-kernel-cpu`, `ft-core`, `ft-serialize` (frankentorch) — consumed at the **kernel** level (plan §3.2).
-- `asupersync = {">=0.3.5,<0.4", default-features=false}` — orchestration/cancellation/IO only (plan §3.3).
+- `ft-kernel-cpu`, `ft-core` (frankentorch) — consumed at the **kernel** level (plan §3.2). `ft-serialize` is not a dependency: `src/native_engine/weights.rs` parses safetensors itself.
+- `asupersync = {version = "0.5.0", default-features=false}` — orchestration/cancellation/IO only (plan §3.3).
 - `fsqlite` (frankensqlite) — durable run state; **NEVER `rusqlite`**.
 - `image` / `fast_image_resize`, `clap`, `serde_json` — front end + CLI.
 

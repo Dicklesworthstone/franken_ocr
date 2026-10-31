@@ -28,6 +28,99 @@ sections as they land.
 
 ### Added
 
+- **Robot `stage` events** (bead bd-fuh2). The stream now says when a run enters
+  `load` and `forward`: `name`, `seq`, `elapsed_ms` from the run's start, and
+  `budget_ms` on a stage with a time budget. `load` appears only when weights
+  are read, so a warm resident run has none, and a model refused on its header
+  has no stage at all. The plan required this event and `FEATURE_PARITY` called
+  it present, but nothing emitted it until now.
+- **`focr ocr --task music` uses the resident daemon** (bead bd-fuh2). Staves,
+  skipped staves and musical-sanity warnings now cross the wire, so a served run
+  reports the same `staff` and `music_warning` events and `--json` fields. On
+  real TrOMR weights, two pages matched an inline run byte for byte, cold and
+  warm, with 28 MB client peaks showing that the daemon served them.
+- **`focr ocr --check`** (bead bd-m76g). A preflight that runs the checks a run
+  makes before its decode, then stops: arguments, the input's header or page
+  list, `--pages`, the model's header and tokenizer, and `-o`'s directory. About
+  half a second on the real artifacts, with the run's exit codes, and no row in
+  `focr runs`. `--json` prints an `ocr.check` report.
+- **The `library` feature and its output contract** (bead bd-hfdt). A program can
+  link the engine with `default-features = false, features = ["library"]` and get
+  no CLI, async runtime, run store, signal handler, network path or allocator
+  override. `docs/library-output.md` is the versioned contract
+  (`OUTPUT_CONTRACT_VERSION`): fields, box coordinates, reading order, side effects
+  and what is not promised. `tests/library_contract.rs` reads the resolved tree and
+  freezes spans on five real pages, and `scripts/e2e_hfdt_admission_surface.py`
+  builds a separate consumer on its own lockfile. `PageResult` gains `size`, and
+  `--json` `pages[]` gains `width` and `height`.
+- **`--threads N` and `--timing` on `focr ocr` and `focr ocr-batch`** (bead
+  bd-heti). Flags for what `FOCR_THREADS` and `FOCR_TIMING` set from the
+  environment. `--threads` outranks the variable, `0` is a usage error, and
+  either flag makes `focr ocr` load its own model, because a resident daemon
+  keeps the budget it started with and its stderr would never reach you.
+  `ocr --check --json` reports `threads` and `timing`.
+- **`tests/fixtures/golden/cli_surface.golden`** (bead bd-heti). Every command,
+  flag, value name, default and possible value in the tree, from clap itself.
+  A change anywhere in the command surface is now a reviewed golden diff,
+  where only the root `--help` was one before.
+- **`focr ocr -` reads stdin** (bead bd-0pwb). An image or a PDF, told apart by
+  its bytes, held in a private temp file for the run.
+- **`focr ocr --raw`** (bead bd-v73v, GH #11). Outputs the decode as the model
+  wrote it, grounding markers included, in place of the markdown. With JSON it
+  adds `raw` beside the markdown and to each page, and with `--robot` to
+  `run_complete`. `RecognizedDocument`, `PageResult` and `DocumentResult` gain a
+  `raw` field.
+- **Each layout span says what the model wrote there** (bead
+  bd-json-per-span-text-wbbu, GH #8). `layout` entries gain `text`, the text after
+  the span's marker up to the next span, so a box can be paired with its
+  transcription. Image spans, and regions boxed without text, have none. Over the
+  40 Unlimited-OCR-2 oracle pages, the span texts in order are exactly the page's
+  markdown.
+- **`OcrEngine::recognize_pages`** (beads bd-paom, bd-3gyt). Embedders can read a
+  PDF or a directory one page at a time, the walk `focr ocr book.pdf` runs,
+  without rebuilding it: a failed page is skipped with its reason and only a
+  whole-run failure ends the walk. `PageSource::read_pages` is the one loop, and
+  the CLI's two per-page loops now run on it. `pdf::walk_document`,
+  `DocumentOutcome`, `DocumentPage` and `DocumentEvent` are removed; use
+  `recognize_pages` or `read_pages`, with `PagesRead`, `PageRead` and `PageEvent`.
+- **The document API compiles without the `pdf` feature** (bead bd-x7jt).
+  `recognize_document`, `DocumentResult` and `PageSource` are in every build, and
+  `pdf` adds only the PDF reader. `select_pages`, `split_spread`,
+  `is_fatal_to_document` and `SkippedPage` moved from `pdf` to `page_source`.
+
+- **`focr ocr-batch --progress-events PATH`** (bead bd-mgd3) writes one versioned
+  JSON object per line to a file or stderr (`-`) as a batch runs: the resolved
+  thread budget, model and backend, each image or `--multi-page` page as it ends
+  with the measured pages per hour and `eta_ms`, then how the run ended. stdout
+  is unchanged, and `focr robot schema` lists the events under `batch_progress`.
+
+- **`focr ocr-batch --inputs-from`, `--output-dir` and `--fail-fast`** (bead
+  bd-znwm). `--inputs-from FILE` reads paths one per line (`-` for stdin), as
+  `fw transcribe --inputs-from` does. `--output-dir DIR` writes `DIR/<stem>.md` as
+  each image ends. `--fail-fast` stops at the first image that fails.
+
+- **Long documents you can size and watch** (beads U2-D3, U2-D5).
+  `focr ocr --multi-page --page-window N|auto|off` sets how Unlimited-OCR-2
+  splits a document. `N` is at most 102 pages. `auto` picks the largest window
+  whose estimated whole-process memory fits `FOCR_MEMORY_BUDGET` (three quarters
+  of physical memory by default), and refuses with the estimate's parts when
+  not even one page fits. `off` reads one pass with no checkpoint, and can stop
+  at the position limit with its pages written and exit 5.
+  - Robot mode adds a `window` event after each window's pages, with its pages,
+    lookahead, reuse, token counts, KV and process memory peaks, wall time and
+    `eta_ms`. `page` events gain `window`, and `run_complete` on an
+    Unlimited-OCR-2 document gains `pages_out`, `pages_skipped`, `windows` and
+    `extra_markers`. All additive: schema v1, and v1 streams are unchanged.
+  - The progress line on a terminal stays on the last finished window, with
+    pages and windows done, tokens per second and a labelled estimate of the
+    time left, from the running mean of a page's wall time.
+  - Library: `recognize_document` takes an `on_event` sink of `DocumentEvent`
+    (`Page`, `Window`) in place of `on_page`, and `DocumentSink` replaces
+    `PageSink`. `OcrModel::estimate_peak_bytes` gives the estimate, and
+    `WindowStats.rss_bytes_peak` the process's high-water mark as each window
+    ends. A `PageWindow::Pages` above the page limit is now refused rather than
+    clamped.
+
 - **Durable resume for long documents** (bead U2-D4). A windowed Unlimited-OCR-2
   `--multi-page` run keeps a journal of its completed pages and a checkpoint of
   the last window boundary (`<out>.partial`, `<out>.focr-ckpt`, or
@@ -324,7 +417,8 @@ sections as they land.
   - Each window yields exactly its own pages. A spent
     `FOCR_STAGE_BUDGET_FORWARD_MS` (per page, scaled by the window's pages)
     stops the document as `budget` with the pages done.
-  - Per-window statistics go to `FOCR_TIMING`, with no robot event yet (U2-D5).
+  - Per-window statistics go to `FOCR_TIMING` and the robot `window` event
+    (U2-D5).
   - On the f32 cache, every window's forced and generated ids equal the
     independent windowed oracle's (U2-D2a), retirement on. This covers W = 2
     and 3, the one-page variant, a marker-only splice, and three forced
@@ -452,7 +546,7 @@ sections as they land.
     one.
 - **One library call parses a document** (bead U2-E2; **breaking**, hence
   0.10.0). `OcrEngine::recognize_document(model_path, source, &options,
-  on_item, on_page)` and its model-level driver `OcrModel::recognize_document`
+  on_item, on_event)` and its model-level driver `OcrModel::recognize_document`
   replace every `recognize_multi_page*` function. The CLI's `--multi-page`
   and `ocr-batch --multi-page` run on it.
   - The pages come from a `PageSource`: `pdf`, `images`, `directory`, `open`,
@@ -469,9 +563,8 @@ sections as they land.
     or 6 for a cancel, with a `run_error` carrying `finish_reason` and
     `pages_out`. Ctrl+C on an Unlimited-OCR-2 document now keeps its pages.
   - `DocumentOptions` (`page_window`, `resume`, with chaining setters) refuses
-    what this build cannot honor rather than ignoring it: `PageWindow::Auto`
-    until memory sizing lands (U2-D3), a v1 window smaller than the document
-    (v1 has no windowed decoding), and resume until checkpoints land (U2-D4).
+    what this build cannot honor rather than ignoring it, such as a v1 window
+    smaller than the document (v1 has no windowed decoding).
     `PageWindow::Off` reads an Unlimited-OCR-2 document in one pass, however
     long, and the position limit then stops it.
   - `ocr-batch --multi-page` skips an image that does not decode instead of
@@ -513,6 +606,58 @@ sections as they land.
   `focr pull <id>` when this release publishes that model.
 
 ### Fixed
+
+- **The speculative-decode gate proves the loop ran** (bead bd-2dui). The loop
+  lives only in the experimental all-int8 decoder, so on the default artifact
+  `scripts/spec_gate_e2e.sh` compared two identical decodes and passed. It now
+  arms that decoder for both arms, reads the rounds from the ON arm, and fails a
+  page that never entered the loop. Three pages, including page_0590, ran 999
+  rounds and stayed byte-identical.
+- **Gauntlet build receipts say where the binary was built** (bead bd-2mo.30.14).
+  `rch exec` fails open to a local build and cannot be told to stay local, so a
+  receipt could prove neither the machine nor the toolchain behind its binary.
+  Evidence builds now run locally by real cargo, and a `focr-build-receipt/v2`
+  receipt names `cargo` as the runner. A receipt naming RCH is refused.
+- **A served error reads as an inline one does** (bead bd-fuh2). An error from the
+  resident daemon crossed the wire with its prefix and got it again on the client:
+  `input decode error: input decode error: …`.
+- **Every model installs as one package** (bead bd-jprb). `focr pull` used to
+  put the primary model's artifact and tokenizer directly in the cache root,
+  one file at a time, so a crash between them could pair a new artifact with an
+  old tokenizer. The primary now installs under `models/unlimited-ocr/` the way
+  every other model does, and the directory replaces its predecessor in one
+  rename. The resolver searches packages before the cache root, so a flat
+  install from an earlier release still loads until a pull puts the package in
+  front of it. `focr doctor`'s format and readability checks look inside
+  packages, and the pull transaction outcome `incomplete` is gone.
+- **`--task` is judged by the model in the file, not by its filename** (bead
+  bd-3ryl). A task the loaded model cannot serve used to pass or fail on the
+  filename, then return plain OCR text with exit 0 when the header disagreed.
+  `--task` now reads the header first and exits 2, naming the task, the model
+  the file holds and the models that serve it.
+- **Two first runs no longer fail on a store neither has finished** (bead
+  bd-qnps). On a machine with no run store yet, parallel `focr` runs could see
+  `_meta` with no row or fail creating a table another had just made, so `focr
+  runs` exited 1 with nothing on stdout. In a reproduction, 92 of 160 concurrent
+  openers failed; 640 of 640 now succeed. The schema is created in one
+  transaction, a process that loses the race retries and finds the winner's
+  tables, and a store with anything but one `_meta` row is refused.
+- **A stopped resident daemon costs seconds, not ten minutes** (bead bd-mapo). A
+  daemon that accepted a connection and then said nothing held `focr ocr` for the
+  full 600 s read timeout. The daemon now answers each connection from its own
+  thread, even while its model serves another request, and a client that hears
+  nothing for 5 s runs inline. A busy daemon still queues its clients. The wire
+  protocol moved to 2, so an older daemon retires.
+
+- **Ctrl+C stops `focr ocr-batch`** (found in bd-mgd3). The interrupted image was
+  recorded as a failed image, the loop went on to the next one, and the run
+  exited 0. It now stops at that image, reports the images that ended, adds
+  `"stopped": "cancelled"` under `--json`, and exits 6.
+
+- **A batch that read no image no longer exits 0** (bead bd-znwm). `focr
+  ocr-batch` with a missing model, or with every image unreadable, reported each
+  failure and then succeeded. It now exits with the first failure's code, as a
+  document does (D24). A batch with at least one image read still exits 0.
 
 - **focr-ios and focr-wasm compile again** (found in U2-E2). Unlimited-OCR-2's
   document loop read the forward stage budget through a function that only

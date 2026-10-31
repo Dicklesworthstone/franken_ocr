@@ -264,6 +264,38 @@ events. Stage lines should use the dispatched tier that actually ran.
 {"case":"base_001","event":"result","elapsed_us":500,"result":"pass","run_seq":0,"schema_version":1,"test":"preprocess_l0","ts":1.4}
 ```
 
+## Proving The Safety Nets
+
+A net that never meets a real fault can break without anyone noticing.
+`scripts/meta_tests.py` injects one fault per net and requires the net to fire:
+
+| Probe | Injected fault | The net must |
+|---|---|---|
+| `bench_guardrail` | a stage 50% slower than its baseline | fail with `REGRESSION` |
+| `parity_receipt` | a parity receipt that is not all-green | refuse the perf report |
+| `log_validator` | a log line missing a required field | reject it |
+| `watchdog` | a lock held across a rayon scope whose task wants it | time out with `DEADLOCK SUSPECTED` |
+| `model_gate` | an armed gate pointed at a broken artifact | fail, not skip |
+| `determinism_gate` | a nondeterministic function, in the gate's own test | fail inside that test |
+
+The lane deliberately runs failing tests, so it is not part of `scripts/check.sh`,
+which only runs `--self-test`. Run it before a release, or from any scheduler:
+
+```bash
+python3 scripts/meta_tests.py                 # every probe
+python3 scripts/meta_tests.py --deep          # plus long property and fuzz budgets
+python3 scripts/meta_tests.py --disarm watchdog   # no fault: the lane must go red
+```
+
+Green means every net caught its fault. Red means a net missed one, which is a
+broken safety net and not an ordinary test failure. An expected failure counts only
+with the net's own marker in the output, so a compile error or a renamed test reads
+as a miss. The scorecard is NDJSON in this schema (`--scorecard`, default
+`target/meta_tests/scorecard.ndjson`), and the lane fails if the validator rejects it.
+
+Where `cargo test` needs a different invocation, set `FOCR_META_CARGO_TEST`, and
+`FOCR_META_FUZZ` for `cargo fuzz run`.
+
 ## Validator
 
 Run the schema self-test:
