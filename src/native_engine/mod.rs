@@ -1916,23 +1916,31 @@ fn model_search_dirs() -> Vec<PathBuf> {
         dirs.extend(std::env::split_paths(&raw));
     }
     if let Some(root) = dist_cache_root() {
-        let models = root.join("models");
-        // Flat root FIRST (the layout every released binary knows), then one
-        // level of per-model subdirectories, name-sorted for determinism:
-        // `focr pull <model>` installs non-primary models into their own
-        // subdir so same-named sidecars (e.g. two different tokenizer.json)
-        // cannot clobber each other (bd-av64.7).
-        let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&models)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        subdirs.sort();
-        dirs.push(models);
-        dirs.extend(subdirs);
+        dirs.extend(cache_search_dirs(root.join("models")));
     }
+    dirs
+}
+
+/// The model cache's search dirs: the flat root FIRST (the layout every
+/// released binary knows), then one level of per-model subdirectories,
+/// name-sorted for determinism. `focr pull <model>` installs non-primary
+/// models into their own subdir so same-named sidecars (e.g. two different
+/// tokenizer.json) cannot clobber each other (bd-av64.7). Hidden directories
+/// are pull state, never a package: the next package being assembled
+/// (`.focr-stage-…`, partial files under their final names) and the previous
+/// one moved aside (`.focr-prev-…`).
+fn cache_search_dirs(models: PathBuf) -> Vec<PathBuf> {
+    let mut subdirs: Vec<PathBuf> = std::fs::read_dir(&models)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| !e.file_name().as_encoded_bytes().starts_with(b"."))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    subdirs.sort();
+    let mut dirs = vec![models];
+    dirs.extend(subdirs);
     dirs
 }
 
@@ -7991,6 +7999,32 @@ mod tests {
         let resolved = resolve_model_from_search_dirs(Path::new("unlimited-ocr-2"), &[dir])
             .expect("the subdirectory resolves");
         assert_eq!(resolved, subdir.join(shards::SHARD_INDEX_NAME));
+    }
+
+    /// bd-jprb: the cache's search dirs are its root, then its per-model
+    /// packages, never the hidden pull state beside them. A package being
+    /// assembled holds a partial artifact under its final name and sorts first.
+    #[test]
+    fn the_model_cache_search_skips_pull_state() {
+        let models = temp_model_dir("cache_search_pull_state");
+        for name in [
+            "unlimited-ocr-2",
+            "got-ocr2",
+            ".focr-stage-0123456789abcdef0123456789abcdef-1-0.pkg",
+            ".focr-prev-0123456789abcdef0123456789abcdef.pkg",
+        ] {
+            std::fs::create_dir_all(models.join(name)).expect("create cache entry");
+        }
+        std::fs::write(models.join("unlimited-ocr.int8.focrq"), b"flat").expect("flat file");
+        assert_eq!(
+            cache_search_dirs(models.clone()),
+            [
+                models.clone(),
+                models.join("got-ocr2"),
+                models.join("unlimited-ocr-2"),
+            ]
+        );
+        std::fs::remove_dir_all(models).expect("remove test cache");
     }
 
     /// U2-E1: a bare registry id is answered only by its own model. A search

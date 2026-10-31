@@ -254,7 +254,9 @@ pub struct PullArgs {
     /// `$FOCR_MANIFEST_URL`, else the release-bound embedded manifest.
     #[arg(long)]
     pub manifest: Option<String>,
-    /// Emit a single JSON result object instead of human progress lines.
+    /// Emit a single JSON result object on stdout, and each pull step (part
+    /// SHA-256s, the install transaction) as an NDJSON line on stderr, instead
+    /// of human progress lines.
     #[arg(long)]
     pub json: bool,
 }
@@ -2134,10 +2136,13 @@ where
                 progress::clear_active_line();
                 match offer_first_run_download()? {
                     Some(outcome) => recog(Some(&outcome.focrq_path)),
-                    None => Err(FocrError::ModelNotFound(with_pull_hint(&msg))),
+                    None => Err(FocrError::ModelNotFound(with_pull_hint(&msg, None))),
                 }
             } else {
-                Err(FocrError::ModelNotFound(with_pull_hint(&msg)))
+                Err(FocrError::ModelNotFound(with_pull_hint(
+                    &msg,
+                    request.model.as_deref(),
+                )))
             }
         }
         Err(e) => Err(e),
@@ -3711,13 +3716,34 @@ fn is_interactive() -> bool {
     std::io::stdin().is_terminal() && std::io::stderr().is_terminal()
 }
 
-/// Append the actionable acquisition hint to a model-not-found message.
-fn with_pull_hint(msg: &str) -> String {
-    format!(
-        "{msg} — run `focr pull` to install the compatible conservative default, point \
-         FOCR_MODEL_PATH at raw BF16 weights or an exact-recipe local artifact, or inspect \
-         `focr models` for other compatible pulls"
-    )
+/// Append the actionable acquisition hint to a model-not-found message. A
+/// `--model` that names a registry id gets that model's own pull when this
+/// release's embedded manifest publishes a compatible one, and says so when
+/// it does not.
+fn with_pull_hint(msg: &str, requested: Option<&Path>) -> String {
+    let Some(id) = requested
+        .and_then(Path::to_str)
+        .filter(|id| crate::model_arch::arch_by_id(id).is_some())
+    else {
+        return format!(
+            "{msg} — run `focr pull` to install the compatible conservative default, point \
+             FOCR_MODEL_PATH at raw BF16 weights or an exact-recipe local artifact, or inspect \
+             `focr models` for other compatible pulls"
+        );
+    };
+    let manifest = dist::builtin_manifest().ok();
+    if !pull_availability(manifest.as_ref(), id).compatible.is_empty() {
+        format!(
+            "{msg} — run `focr pull {id}` to install it, or point FOCR_MODEL_PATH at its raw \
+             weights or an exact-recipe local artifact"
+        )
+    } else {
+        format!(
+            "{msg} — this release's manifest does not publish {id}; point FOCR_MODEL_PATH at \
+             its raw weights or an exact-recipe local artifact, or inspect `focr models` for \
+             the models `focr pull` installs"
+        )
+    }
 }
 
 /// Prompt on the TTY only when the selected manifest may supply a compatible
@@ -3745,8 +3771,8 @@ fn offer_first_run_download() -> FocrResult<Option<dist::PullOutcome>> {
     if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
         return Ok(None);
     }
-    let outcome = dist::pull(Some(model), dist::DEFAULT_QUANT, &source, false, |line| {
-        eprintln!("focr pull: {line}");
+    let outcome = dist::pull(Some(model), dist::DEFAULT_QUANT, &source, |event| {
+        eprintln!("focr pull: {event}");
     })?;
     Ok(Some(outcome))
 }
@@ -3762,10 +3788,16 @@ fn run_pull(args: &PullArgs) -> FocrResult<()> {
         ),
         &args.quant,
         &source,
-        args.json,
-        |line| {
-            if !args.json {
-                eprintln!("focr pull: {line}");
+        |event| {
+            // `--json` keeps stdout for the one result object; each step is an
+            // NDJSON line on stderr (parts and their SHA-256s, the transaction).
+            if args.json {
+                let mut line = event.to_json();
+                line["schema_version"] = robot::ROBOT_SCHEMA_VERSION.into();
+                line["command"] = "pull".into();
+                eprintln!("{line}");
+            } else {
+                eprintln!("focr pull: {event}");
             }
         },
     )?;
@@ -4085,6 +4117,7 @@ mod tests {
 
         let entry = |recipe: &str| dist::ModelEntry {
             license_notice: builtin.license_notice.clone(),
+            version: None,
             quants: [(
                 "int8".to_owned(),
                 dist::QuantEntry {
@@ -5309,6 +5342,43 @@ mod tests {
                     a.id()
                 );
             }
+        }
+    }
+
+    /// U2-E4: a missing `--model <id>` names that id's own pull exactly when
+    /// the embedded manifest publishes a compatible one (so v2's hint switches
+    /// with its manifest entry); a path or no `--model` keeps the default's.
+    #[test]
+    fn the_pull_hint_names_the_requested_model_when_it_is_published() {
+        let manifest = crate::dist::builtin_manifest().expect("embedded manifest parses");
+        for arch in crate::model_arch::registry() {
+            let id = arch.id();
+            let hint = with_pull_hint("model not found", Some(Path::new(id)));
+            let pullable = !pull_availability(Some(&manifest), id).compatible.is_empty();
+            assert_eq!(
+                hint.contains(&format!("run `focr pull {id}`")),
+                pullable,
+                "{id}: {hint}"
+            );
+            assert_eq!(
+                hint.contains(&format!("does not publish {id}")),
+                !pullable,
+                "{id}: {hint}"
+            );
+        }
+        assert!(
+            pull_availability(Some(&manifest), "got-ocr2")
+                .compatible
+                .iter()
+                .any(|(quant, _)| quant == "int8"),
+            "a published model keeps the positive case exercised"
+        );
+        for requested in [None, Some(Path::new("/models/custom.focrq"))] {
+            assert!(
+                with_pull_hint("model not found", requested)
+                    .contains("run `focr pull` to install the compatible conservative default"),
+                "{requested:?}"
+            );
         }
     }
 

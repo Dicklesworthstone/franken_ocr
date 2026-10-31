@@ -220,6 +220,65 @@ fn stale_focrq_is_refused_with_recommended_command() {
     );
 }
 
+/// Failure mode 4 (bd-jprb): a per-model package install interrupted between
+/// its commit's two renames leaves the previous package aside and none in
+/// place. Doctor reports it as an error naming `focr pull <model>`, the
+/// repair that restores it under the package lock, and `--fix` moves nothing.
+/// A stage a crashed pull was assembling is reported the same way.
+#[test]
+fn interrupted_package_install_is_refused_with_the_pull_that_restores_it() {
+    use sha2::{Digest, Sha256};
+    let home = fresh_home("package");
+    let digest = Sha256::digest(b"unlimited-ocr-2");
+    let key: String = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()[..32]
+        .to_owned();
+    let aside = models_dir(&home).join(format!(".focr-prev-{key}.pkg"));
+    let stage = models_dir(&home).join(format!(".focr-stage-{key}-1-0.pkg"));
+    std::fs::create_dir_all(&aside).expect("seed aside package");
+    std::fs::create_dir_all(&stage).expect("seed stage");
+    std::fs::write(aside.join("tokenizer.json"), b"{}").expect("seed aside file");
+    std::fs::write(stage.join("tokenizer.json"), b"{}").expect("seed stage file");
+
+    let out = focr(&home, &["doctor", "--json"]);
+    let v = json_stdout(&out);
+    let findings = v["findings"].as_array().unwrap();
+    let finding = |detector: &str| {
+        findings
+            .iter()
+            .find(|f| f["detector"] == detector)
+            .cloned()
+            .unwrap_or_else(|| panic!("{detector} not reported: {v}"))
+    };
+    let interrupted = finding("interrupted_package_install");
+    let abandoned = finding("abandoned_package_stage");
+    let names_pull = [&interrupted, &abandoned].iter().all(|f| {
+        f["fixability"]["recommended_command"] == "focr pull unlimited-ocr-2"
+    });
+    let severities = interrupted["severity"] == "error" && abandoned["severity"] == "warn";
+
+    let out = focr(&home, &["doctor", "--fix"]);
+    let v = json_stdout(&out);
+    let refused = v["refused_unsafe"].as_u64().unwrap() >= 2;
+    let untouched = aside.join("tokenizer.json").is_file()
+        && stage.join("tokenizer.json").is_file()
+        && !models_dir(&home).join("unlimited-ocr-2").exists();
+    let ok = names_pull && severities && refused && untouched;
+    emit(
+        "package_interrupted",
+        ok,
+        &format!(
+            r#""names_pull":{names_pull},"severities":{severities},"refused":{refused},"untouched":{untouched}"#
+        ),
+    );
+    assert!(
+        ok,
+        "interrupted package state must be reported and left to the pull: {v}"
+    );
+}
+
 /// `--dry-run` mutates NOTHING and records NO run.
 #[test]
 fn dry_run_has_zero_blast_radius() {
@@ -295,7 +354,7 @@ fn contract_surfaces_answer() {
     let caps_ok = caps["exit_codes"]["5"]
         .as_str()
         .is_some_and(|s| s.contains("lock"))
-        && caps["detectors"].as_array().is_some_and(|d| d.len() == 4);
+        && caps["detectors"].as_array().is_some_and(|d| d.len() == 7);
     let docs = focr(&home, &["doctor", "robot-docs"]);
     let docs_ok = String::from_utf8_lossy(&docs.stdout).contains("focr doctor undo");
     let triage = json_stdout(&focr(&home, &["doctor", "--robot-triage"]));

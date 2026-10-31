@@ -14,6 +14,7 @@
 //! is streamed frame-by-frame so a 2 GB part never sits in RAM.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -480,6 +481,14 @@ fn validate_manifest(manifest: &Manifest) -> FocrResult<()> {
     let mut model_ids = BTreeSet::from([manifest.model.to_ascii_lowercase()]);
     for (model_id, entry) in &manifest.models {
         validate_filename(model_id, "secondary model id")?;
+        // A secondary model installs into `models/<id>/`, and the model search
+        // passes over hidden directories (they hold pull state).
+        if model_id.starts_with('.') {
+            return Err(FocrError::FormatMismatch(format!(
+                "manifest secondary model id {model_id:?} must not start with '.': its \
+                 package directory would be hidden from the model search"
+            )));
+        }
         if !model_ids.insert(model_id.to_ascii_lowercase()) {
             return Err(FocrError::FormatMismatch(format!(
                 "manifest model id {model_id:?} is duplicated under portable case-folding"
@@ -675,6 +684,65 @@ async fn fetch_manifest_bytes(cx: &Cx, url: &str) -> FocrResult<Vec<u8>> {
     Ok(buf)
 }
 
+/// Where artifact part bytes come from: the HTTPS mirrors in a real pull, and
+/// memory in the offline tests. Either way [`download_remote_file`] does the
+/// per-part and whole-file verification.
+trait PartSource {
+    /// Stream `url`'s body into `sink`; returns the bytes delivered.
+    async fn stream(
+        &self,
+        cx: &Cx,
+        url: &str,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Result<u64, DownloadError>;
+}
+
+/// The source of a real pull: each part URL is an HTTPS mirror.
+struct HttpsMirrors {
+    client: Client,
+}
+
+impl PartSource for HttpsMirrors {
+    async fn stream(
+        &self,
+        cx: &Cx,
+        url: &str,
+        sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+    ) -> Result<u64, DownloadError> {
+        stream_url(cx, &self.client, url, sink).await
+    }
+}
+
+/// Downloads a [`RemoteFile`] from a [`PartSource`] into an open staging file,
+/// blocking on the pull's runtime.
+struct Downloader<'a, S> {
+    runtime: &'a asupersync::runtime::Runtime,
+    source: &'a S,
+}
+
+impl<S: PartSource> Downloader<'_, S> {
+    fn fetch(
+        &self,
+        file: &RemoteFile,
+        dest: &Path,
+        out: std::fs::File,
+        progress: &mut dyn FnMut(&PullEvent),
+    ) -> FocrResult<()> {
+        progress(&PullEvent::Note(format!(
+            "downloading {} ({:.2} GB, {} part(s))",
+            file.filename,
+            file.size as f64 / 1.0e9,
+            file.parts.len()
+        )));
+        self.runtime.block_on(async {
+            let cx = Cx::current().ok_or_else(|| {
+                FocrError::Other(anyhow::anyhow!("runtime did not install an ambient Cx"))
+            })?;
+            download_remote_file(&cx, self.source, file, dest, out, progress).await
+        })
+    }
+}
+
 fn read_local_manifest(path: &Path) -> FocrResult<Vec<u8>> {
     let file = std::fs::File::open(path)
         .map_err(|e| FocrError::ModelNotFound(format!("manifest {}: {e}", path.display())))?;
@@ -702,20 +770,19 @@ fn read_local_manifest(path: &Path) -> FocrResult<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Download + verify one [`RemoteFile`] into `dest` (a `.tmp` path), then return.
-/// Each part is streamed straight into `dest` while a per-part AND a whole-file
-/// hasher run; a failed mirror rolls `dest` + the whole-file hash back to the
-/// part boundary and tries the next URL. The whole-file sha256 is checked last.
-/// Per-part progress goes to stderr (stdout stays clean for any JSON consumer);
-/// `quiet` silences it.
+/// Download + verify one [`RemoteFile`] from `source` into `dest`, a fresh
+/// staging file. Each part is streamed straight into `dest` while a per-part AND
+/// a whole-file hasher run; a failed mirror rolls `dest` + the whole-file hash
+/// back to the part boundary and tries the next URL. The whole-file sha256 is
+/// checked last. Every attempt and the whole-file check report to `progress`.
 async fn download_remote_file(
     cx: &Cx,
+    source: &impl PartSource,
     file: &RemoteFile,
     dest: &Path,
     mut out: std::fs::File,
-    quiet: bool,
+    progress: &mut dyn FnMut(&PullEvent),
 ) -> FocrResult<()> {
-    let client = streaming_client();
     let mut full = Sha256::new();
     let mut committed: u64 = 0;
 
@@ -723,6 +790,7 @@ async fn download_remote_file(
         let full_checkpoint = full.clone();
         let mut part_ok = false;
         let mut last_err: Option<String> = None;
+        let expected = part.sha256.trim().to_ascii_lowercase();
 
         for url in &part.urls {
             // Roll back to the part boundary before each attempt.
@@ -732,39 +800,56 @@ async fn download_remote_file(
             full = full_checkpoint.clone();
             let mut part_hash = Sha256::new();
 
-            if !quiet {
-                eprintln!(
-                    "  part {}/{} ({:.1} MB) <- {url}",
-                    i + 1,
-                    file.parts.len(),
-                    part.size as f64 / 1.0e6
-                );
-            }
+            progress(&PullEvent::PartStart {
+                file: file.filename.clone(),
+                part: i + 1,
+                parts: file.parts.len(),
+                bytes: part.size,
+                url: url.clone(),
+            });
             let mut received = 0u64;
-            let res = stream_url(cx, &client, url, |chunk| {
-                let next = checked_part_response_size(received, chunk.len(), part.size)?;
-                out.write_all(chunk)?;
-                part_hash.update(chunk);
-                full.update(chunk);
-                received = next;
-                Ok(())
-            })
-            .await;
+            let res = source
+                .stream(cx, url, &mut |chunk| {
+                    let next = checked_part_response_size(received, chunk.len(), part.size)?;
+                    out.write_all(chunk)?;
+                    part_hash.update(chunk);
+                    full.update(chunk);
+                    received = next;
+                    Ok(())
+                })
+                .await;
 
-            match res {
+            let (computed, error) = match res {
                 Ok(n) if n == part.size => {
                     let got: [u8; 32] = part_hash.finalize().into();
-                    if hex32(&got) == part.sha256.trim().to_ascii_lowercase() {
-                        part_ok = true;
-                        committed += part.size;
-                        break;
-                    }
-                    last_err = Some(format!("part {} sha256 mismatch from {url}", i + 1));
+                    let got = hex32(&got);
+                    let error = (got != expected)
+                        .then(|| format!("part {} sha256 mismatch from {url}", i + 1));
+                    (Some(got), error)
                 }
-                Ok(n) => {
-                    last_err = Some(format!("part {} size {n} != expected {}", i + 1, part.size))
+                Ok(n) => (
+                    None,
+                    Some(format!("part {} size {n} != expected {}", i + 1, part.size)),
+                ),
+                Err(e) => (None, Some(format!("{e} (from {url})"))),
+            };
+            progress(&PullEvent::Part {
+                file: file.filename.clone(),
+                part: i + 1,
+                parts: file.parts.len(),
+                url: url.clone(),
+                bytes: received,
+                expected_sha256: expected.clone(),
+                computed_sha256: computed,
+                error: error.clone(),
+            });
+            match error {
+                None => {
+                    part_ok = true;
+                    committed += part.size;
+                    break;
                 }
-                Err(e) => last_err = Some(format!("{e} (from {url})")),
+                Some(error) => last_err = Some(error),
             }
         }
 
@@ -783,12 +868,18 @@ async fn download_remote_file(
     out.sync_all()
         .map_err(|e| FocrError::Other(anyhow::anyhow!("sync {}: {e}", dest.display())))?;
     let got: [u8; 32] = full.finalize().into();
-    if hex32(&got) != file.sha256.trim().to_ascii_lowercase() {
+    let got = hex32(&got);
+    let expected = file.sha256.trim().to_ascii_lowercase();
+    progress(&PullEvent::File {
+        file: file.filename.clone(),
+        bytes: committed,
+        expected_sha256: expected.clone(),
+        computed_sha256: got.clone(),
+    });
+    if got != expected {
         return Err(FocrError::FormatMismatch(format!(
-            "reassembled {} sha256 {} != manifest {}",
-            file.filename,
-            hex32(&got),
-            file.sha256
+            "reassembled {} sha256 {got} != manifest {}",
+            file.filename, file.sha256
         )));
     }
     if committed != file.size {
@@ -836,6 +927,16 @@ struct InstallLock {
     _file: std::fs::File,
 }
 
+/// The coordination key of one install target name: a file of the flat layout
+/// or a per-model package directory. Its lock, stages and aside copy all carry
+/// it.
+fn name_key(name: &str) -> String {
+    let mut hash = Sha256::new();
+    hash.update(name.as_bytes());
+    let digest: [u8; 32] = hash.finalize().into();
+    hex32(&digest)[..32].to_owned()
+}
+
 fn coordination_key(final_path: &Path) -> FocrResult<String> {
     let filename = final_path
         .file_name()
@@ -846,29 +947,76 @@ fn coordination_key(final_path: &Path) -> FocrResult<String> {
                 final_path.display()
             ))
         })?;
-    let mut hash = Sha256::new();
-    hash.update(filename.as_bytes());
-    let digest: [u8; 32] = hash.finalize().into();
-    Ok(hex32(&digest)[..32].to_owned())
+    Ok(name_key(filename))
 }
 
-/// Map a downloader-owned staging pathname back to its advisory lock. Doctor
-/// uses this to distinguish a live multi-gigabyte download from an orphan left
-/// by a crashed process.
-pub(crate) fn pull_lock_path_for_staging(staging_path: &Path) -> Option<PathBuf> {
-    let name = staging_path.file_name()?.to_str()?;
-    let remainder = name.strip_prefix(".focr-stage-")?;
-    let (key, suffix) = remainder.split_once('-')?;
-    if key.len() != 32
-        || !key.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || !suffix.ends_with(".partial")
+/// The coordination key of model `model_id`'s package directory
+/// (`models/<id>/`), for `focr doctor` to name the model behind pull state.
+pub(crate) fn package_key(model_id: &str) -> String {
+    name_key(model_id)
+}
+
+/// Hidden pull state in the model cache, parsed from its name. A pull creates
+/// it only while it holds the lock with the same key, so `focr doctor` treats
+/// it as interrupted once nothing holds that lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PullState {
+    /// A file download's staging file, `.focr-stage-<key>-<pid>-<n>.partial`.
+    FileStage { key: String },
+    /// A package install's stage directory, `.focr-stage-<key>-<pid>-<n>.pkg`.
+    PackageStage { key: String },
+    /// The previous package, moved aside by a commit: `.focr-prev-<key>.pkg`.
+    PackageAside { key: String },
+}
+
+impl PullState {
+    /// The coordination key the entry carries.
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            Self::FileStage { key } | Self::PackageStage { key } | Self::PackageAside { key } => {
+                key
+            }
+        }
+    }
+}
+
+fn is_key(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Parse a model-cache entry name as [`PullState`]; `None` for anything else.
+pub(crate) fn parse_pull_state(name: &str) -> Option<PullState> {
+    if let Some(key) = name
+        .strip_prefix(".focr-prev-")
+        .and_then(|rest| rest.strip_suffix(".pkg"))
     {
+        return is_key(key).then(|| PullState::PackageAside {
+            key: key.to_owned(),
+        });
+    }
+    let (key, suffix) = name.strip_prefix(".focr-stage-")?.split_once('-')?;
+    if !is_key(key) {
         return None;
     }
+    let key = key.to_owned();
+    if suffix.ends_with(".partial") {
+        Some(PullState::FileStage { key })
+    } else if suffix.ends_with(".pkg") {
+        Some(PullState::PackageStage { key })
+    } else {
+        None
+    }
+}
+
+/// Map a pull-owned staging file, package stage or aside copy back to its
+/// advisory lock. Doctor uses this to tell a live multi-gigabyte pull from
+/// state a crashed process left behind.
+pub(crate) fn pull_lock_path_for_staging(staging_path: &Path) -> Option<PathBuf> {
+    let state = parse_pull_state(staging_path.file_name()?.to_str()?)?;
     Some(
         staging_path
             .parent()?
-            .join(format!(".focr-pull-{key}.lock")),
+            .join(format!(".focr-pull-{}.lock", state.key())),
     )
 }
 
@@ -941,7 +1089,15 @@ impl InstallLock {
     }
 }
 
-fn create_staging_file(final_path: &Path) -> FocrResult<(PathBuf, std::fs::File)> {
+/// Create a fresh `.focr-stage-<key>-<pid>-<nonce><suffix>` entry beside
+/// `final_path` with `create`, which must fail with `AlreadyExists` on a taken
+/// name.
+fn create_staging_entry<T>(
+    final_path: &Path,
+    suffix: &str,
+    what: &str,
+    create: impl Fn(&Path) -> std::io::Result<T>,
+) -> FocrResult<(PathBuf, T)> {
     let parent = final_path.parent().ok_or_else(|| {
         FocrError::Other(anyhow::anyhow!(
             "install path {} has no parent directory",
@@ -952,27 +1108,46 @@ fn create_staging_file(final_path: &Path) -> FocrResult<(PathBuf, std::fs::File)
     for _ in 0..64 {
         let nonce = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(
-            ".focr-stage-{key}-{}-{nonce}.partial",
+            ".focr-stage-{key}-{}-{nonce}{suffix}",
             std::process::id(),
         ));
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => return Ok((path, file)),
+        match create(&path) {
+            Ok(created) => return Ok((path, created)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => {
                 return Err(FocrError::Other(anyhow::anyhow!(
-                    "create staging file {}: {error}",
+                    "create {what} {}: {error}",
                     path.display()
                 )));
             }
         }
     }
     Err(FocrError::Other(anyhow::anyhow!(
-        "could not allocate a unique staging file for {}",
+        "could not allocate a unique {what} for {}",
         final_path.display()
     )))
 }
 
+fn create_staging_file(final_path: &Path) -> FocrResult<(PathBuf, std::fs::File)> {
+    create_staging_entry(final_path, ".partial", "staging file", |path| {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    })
+}
+
 #[cfg(unix)]
+fn sync_directory(directory: &Path) -> FocrResult<()> {
+    std::fs::File::open(directory)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            FocrError::Other(anyhow::anyhow!("sync {}: {error}", directory.display()))
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_directory: &Path) -> FocrResult<()> {
+    Ok(())
+}
+
 fn sync_parent_dir(path: &Path) -> FocrResult<()> {
     let parent = path.parent().ok_or_else(|| {
         FocrError::Other(anyhow::anyhow!(
@@ -980,14 +1155,7 @@ fn sync_parent_dir(path: &Path) -> FocrResult<()> {
             path.display()
         ))
     })?;
-    std::fs::File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|error| FocrError::Other(anyhow::anyhow!("sync {}: {error}", parent.display())))
-}
-
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> FocrResult<()> {
-    Ok(())
+    sync_directory(parent)
 }
 
 fn ensure_real_directory(path: &Path, what: &str) -> FocrResult<()> {
@@ -1057,6 +1225,251 @@ pub struct PullOutcome {
     pub from_cache: bool,
 }
 
+/// What a pull did to the installed state, in [`PullEvent::Transaction`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransactionOutcome {
+    /// Already byte-perfect; nothing changed.
+    Cached,
+    /// The new file or package is in place.
+    Installed,
+    /// A step failed; the installed state is as it was before the pull.
+    RolledBack,
+    /// The manifest entry was refused before any download or cache change.
+    Refused,
+    /// A rename failed after some of the primary model's files were renamed in;
+    /// pulling again completes it.
+    Incomplete,
+    /// State an interrupted pull left behind was restored or removed.
+    Recovered,
+}
+
+impl TransactionOutcome {
+    /// The NDJSON `outcome` value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Installed => "installed",
+            Self::RolledBack => "rolled_back",
+            Self::Refused => "refused",
+            Self::Incomplete => "incomplete",
+            Self::Recovered => "recovered",
+        }
+    }
+}
+
+/// One step of a [`pull`], reported as it happens. `Display` is the human
+/// status line; [`PullEvent::to_json`] is the object `focr pull --json` writes
+/// to stderr, one line per step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PullEvent {
+    /// A status line with nothing to verify.
+    Note(String),
+    /// One mirror's download of one part is starting.
+    PartStart {
+        /// The file the part belongs to.
+        file: String,
+        /// 1-based part number.
+        part: usize,
+        /// The file's part count.
+        parts: usize,
+        /// The part's size in the manifest.
+        bytes: u64,
+        /// The mirror.
+        url: String,
+    },
+    /// One mirror's download of one part ended.
+    Part {
+        /// The file the part belongs to.
+        file: String,
+        /// 1-based part number.
+        part: usize,
+        /// The file's part count.
+        parts: usize,
+        /// The mirror.
+        url: String,
+        /// Bytes the mirror delivered.
+        bytes: u64,
+        /// The part's SHA-256 in the manifest.
+        expected_sha256: String,
+        /// The delivered bytes' SHA-256; `None` when the part did not arrive
+        /// whole.
+        computed_sha256: Option<String>,
+        /// Why the part was rejected; `None` when it verified.
+        error: Option<String>,
+    },
+    /// A reassembled file's whole-file check.
+    File {
+        /// The file.
+        file: String,
+        /// Its reassembled size.
+        bytes: u64,
+        /// Its SHA-256 in the manifest.
+        expected_sha256: String,
+        /// The reassembled bytes' SHA-256.
+        computed_sha256: String,
+    },
+    /// What happened to an installed file or package.
+    Transaction {
+        /// The file (flat layout), package directory (per-model layout) or
+        /// pull state the step acted on.
+        target: PathBuf,
+        /// What happened.
+        outcome: TransactionOutcome,
+        /// Why; empty for `cached` and `installed`.
+        reason: String,
+    },
+}
+
+impl PullEvent {
+    fn transaction(target: &Path, outcome: TransactionOutcome, reason: impl Into<String>) -> Self {
+        Self::Transaction {
+            target: target.to_owned(),
+            outcome,
+            reason: reason.into(),
+        }
+    }
+
+    /// The machine-readable form: an `event` tag plus the variant's fields.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        match self {
+            Self::Note(message) => serde_json::json!({"event": "note", "message": message}),
+            Self::PartStart {
+                file,
+                part,
+                parts,
+                bytes,
+                url,
+            } => serde_json::json!({
+                "event": "part_start",
+                "file": file,
+                "part": part,
+                "parts": parts,
+                "bytes": bytes,
+                "url": url,
+            }),
+            Self::Part {
+                file,
+                part,
+                parts,
+                url,
+                bytes,
+                expected_sha256,
+                computed_sha256,
+                error,
+            } => serde_json::json!({
+                "event": "part",
+                "file": file,
+                "part": part,
+                "parts": parts,
+                "url": url,
+                "bytes": bytes,
+                "expected_sha256": expected_sha256,
+                "computed_sha256": computed_sha256,
+                "verified": error.is_none(),
+                "error": error,
+            }),
+            Self::File {
+                file,
+                bytes,
+                expected_sha256,
+                computed_sha256,
+            } => serde_json::json!({
+                "event": "file",
+                "file": file,
+                "bytes": bytes,
+                "expected_sha256": expected_sha256,
+                "computed_sha256": computed_sha256,
+                "verified": expected_sha256 == computed_sha256,
+            }),
+            Self::Transaction {
+                target,
+                outcome,
+                reason,
+            } => serde_json::json!({
+                "event": "transaction",
+                "target": target.display().to_string(),
+                "outcome": outcome.as_str(),
+                "reason": reason,
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for PullEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Note(message) => f.write_str(message),
+            Self::PartStart {
+                part,
+                parts,
+                bytes,
+                url,
+                ..
+            } => write!(
+                f,
+                "  part {part}/{parts} ({:.1} MB) <- {url}",
+                *bytes as f64 / 1.0e6
+            ),
+            Self::Part {
+                part,
+                parts,
+                computed_sha256,
+                error: None,
+                ..
+            } => write!(
+                f,
+                "  part {part}/{parts} verified (sha256 {})",
+                computed_sha256.as_deref().unwrap_or("")
+            ),
+            Self::Part {
+                part,
+                parts,
+                error: Some(error),
+                ..
+            } => write!(f, "  part {part}/{parts} rejected: {error}"),
+            Self::File {
+                file,
+                bytes,
+                expected_sha256,
+                computed_sha256,
+            } if expected_sha256 == computed_sha256 => {
+                write!(f, "verified {file} ({bytes} bytes, sha256 {computed_sha256})")
+            }
+            Self::File {
+                file,
+                expected_sha256,
+                computed_sha256,
+                ..
+            } => write!(
+                f,
+                "{file} reassembled to sha256 {computed_sha256}, but the manifest says \
+                 {expected_sha256}"
+            ),
+            Self::Transaction {
+                target,
+                outcome,
+                reason,
+            } => {
+                let target = target.display();
+                match outcome {
+                    TransactionOutcome::Cached => write!(f, "cached: {target}"),
+                    TransactionOutcome::Installed => write!(f, "installed {target}"),
+                    TransactionOutcome::RolledBack => {
+                        write!(f, "rolled back {target}: {reason}")
+                    }
+                    TransactionOutcome::Refused => write!(f, "refused {target}: {reason}"),
+                    TransactionOutcome::Incomplete => {
+                        write!(f, "incomplete install of {target}: {reason}")
+                    }
+                    TransactionOutcome::Recovered => write!(f, "recovered {target}: {reason}"),
+                }
+            }
+        }
+    }
+}
+
 /// Pick the quant entry for a pull. Exact match wins; otherwise, when the
 /// model publishes EXACTLY ONE quant, fall back to it — failing a pull over
 /// a default flag serves no one when the model's only artifact is
@@ -1086,14 +1499,13 @@ fn select_quant<'m>(
 
 /// Fetch (or confirm-cached) the `quant` weights + tokenizer described by the
 /// manifest at `manifest_source` (path or URL) into the model cache. `progress`
-/// receives human status lines. Network only happens here — once it returns Ok,
-/// the model loads offline.
+/// receives each step ([`PullEvent`]). Network only happens here — once it
+/// returns Ok, the model loads offline.
 pub fn pull(
     model: Option<&str>,
     quant: &str,
     manifest_source: &str,
-    quiet: bool,
-    mut progress: impl FnMut(&str),
+    mut progress: impl FnMut(&PullEvent),
 ) -> FocrResult<PullOutcome> {
     let runtime = RuntimeBuilder::new()
         .build()
@@ -1103,11 +1515,15 @@ pub fn pull(
     // an explicit remote URL. The default never delegates artifact identity to
     // mutable branch state.
     let manifest_bytes = if manifest_source == DEFAULT_MANIFEST_SOURCE {
-        progress("using release-bound embedded model manifest");
+        progress(&PullEvent::Note(
+            "using release-bound embedded model manifest".into(),
+        ));
         BUILTIN_MANIFEST_JSON.as_bytes().to_vec()
     } else if is_url(manifest_source) {
         validate_https_url(manifest_source, "source")?;
-        progress(&format!("fetching manifest {manifest_source}"));
+        progress(&PullEvent::Note(format!(
+            "fetching manifest {manifest_source}"
+        )));
         let url = manifest_source.to_string();
         runtime.block_on(async move {
             let cx = Cx::current().ok_or_else(|| {
@@ -1119,7 +1535,35 @@ pub fn pull(
         read_local_manifest(Path::new(manifest_source))?
     };
     let manifest = parse_manifest(&manifest_bytes)?;
+    let cache_dir = cache_models_dir()?;
+    let source = HttpsMirrors {
+        client: streaming_client(),
+    };
+    let downloader = Downloader {
+        runtime: &runtime,
+        source: &source,
+    };
+    pull_from(
+        &downloader,
+        &manifest,
+        model,
+        quant,
+        &cache_dir,
+        &mut progress,
+    )
+}
 
+/// [`pull`] once the manifest is parsed: select the model and quant, refuse an
+/// incompatible recipe before touching the cache, then install into
+/// `cache_dir` from `downloader`'s source.
+fn pull_from<S: PartSource>(
+    downloader: &Downloader<'_, S>,
+    manifest: &Manifest,
+    model: Option<&str>,
+    quant: &str,
+    cache_dir: &Path,
+    progress: &mut dyn FnMut(&PullEvent),
+) -> FocrResult<PullOutcome> {
     // Select the model: the primary top-level model (default, and the only one
     // old binaries know) unless `model` names a distinct entry in `models`.
     // Non-primary models install into their own `<cache>/<model-id>/` subdir:
@@ -1169,111 +1613,479 @@ pub fn pull(
 
     let (quant_used, quant_entry) = select_quant(quants, quant)?;
     if quant_used != quant {
-        progress(&format!(
+        progress(&PullEvent::Note(format!(
             "manifest has no quant '{quant}' for this model; using the sole \
              published quant '{quant_used}'"
-        ));
+        )));
     }
 
+    let dir = subdir.map_or_else(|| cache_dir.to_owned(), |sub| cache_dir.join(sub));
     // Compatibility is a manifest contract, not a post-download surprise. The
     // currently committed primary entry intentionally fails here before cache
     // creation, cache hashing, or any multi-GB artifact request.
-    validate_quant_compatibility(model_id, &quant_used, quant_entry)?;
-
-    let cache_dir = cache_models_dir()?;
-    ensure_real_directory(&cache_dir, "model cache")?;
-    let mut dir = cache_dir;
-    if let Some(sub) = subdir {
-        dir = dir.join(sub);
-        ensure_real_directory(&dir, "model cache subdirectory")?;
+    if let Err(error) = validate_quant_compatibility(model_id, &quant_used, quant_entry) {
+        progress(&PullEvent::transaction(
+            &dir,
+            TransactionOutcome::Refused,
+            error.to_string(),
+        ));
+        return Err(error);
     }
-    let focrq_path = dir.join(&quant_entry.focrq.filename);
-    let tokenizer_path = dir.join(&tokenizer.filename);
 
-    // 2. Download each artifact unless already byte-perfect in the cache. Each
-    // call rechecks under an exclusive per-file install lock, closing the race
-    // between an optimistic cache miss and another process's completed rename.
-    let focrq_cached = install_file(
-        &runtime,
-        &quant_entry.focrq,
-        &focrq_path,
-        quiet,
-        &mut progress,
-    )?;
-    let tokenizer_cached =
-        install_file(&runtime, tokenizer, &tokenizer_path, quiet, &mut progress)?;
-    let mut from_cache = focrq_cached && tokenizer_cached;
-    let mut sidecar_paths = Vec::with_capacity(sidecars.len());
-    for sidecar in sidecars {
-        let path = dir.join(&sidecar.filename);
-        let cached = install_file(&runtime, sidecar, &path, quiet, &mut progress)?;
-        from_cache &= cached;
-        sidecar_paths.push(path);
-    }
+    ensure_real_directory(cache_dir, "model cache")?;
+    let files: Vec<&RemoteFile> = [&quant_entry.focrq, tokenizer]
+        .into_iter()
+        .chain(sidecars)
+        .collect();
+    // 2. Download what is not already byte-perfect in the cache, then commit:
+    // a per-model package as one directory swap, the primary model's flat files
+    // only once every one of them has verified.
+    let from_cache = match subdir {
+        Some(_) => install_package(downloader, &dir, &files, progress)?,
+        None => install_flat(downloader, &dir, &files, progress)?,
+    };
 
     Ok(PullOutcome {
-        focrq_path,
-        tokenizer_path,
-        sidecar_paths,
+        focrq_path: dir.join(&quant_entry.focrq.filename),
+        tokenizer_path: dir.join(&tokenizer.filename),
+        sidecar_paths: sidecars
+            .iter()
+            .map(|sidecar| dir.join(&sidecar.filename))
+            .collect(),
         quant: quant_used,
         license_notice: license_notice.to_owned(),
         from_cache,
     })
 }
 
-/// Ensure one cache file is byte-perfect. Returns `true` for a cache hit and
-/// `false` when this call installed the file. A per-file `create_new` lock plus a
-/// unique staging file prevents concurrent writers from sharing an inode.
-fn install_file(
-    runtime: &asupersync::runtime::Runtime,
-    file: &RemoteFile,
-    final_path: &Path,
-    quiet: bool,
-    progress: &mut impl FnMut(&str),
+/// Install the primary model flat into `dir`, the layout every released binary
+/// knows. Returns `true` when every file was already cached. Each missing file
+/// downloads and verifies into its own staging file, under that file's install
+/// lock, before any file is renamed into place: a failed download leaves every
+/// installed file as it was, and only a crash between the closing renames can
+/// leave a mix (a per-model package has no such window: [`install_package`]).
+fn install_flat<S: PartSource>(
+    downloader: &Downloader<'_, S>,
+    dir: &Path,
+    files: &[&RemoteFile],
+    progress: &mut dyn FnMut(&PullEvent),
 ) -> FocrResult<bool> {
-    if already_cached(final_path, file) {
-        progress(&format!("cached: {}", final_path.display()));
-        return Ok(true);
-    }
-    validate_install_target_type(final_path)?;
-
-    let _lock = InstallLock::acquire(final_path)?;
-    if already_cached(final_path, file) {
-        progress(&format!("cached: {}", final_path.display()));
-        return Ok(true);
-    }
-    validate_install_target_type(final_path)?;
-
-    let (tmp, staging_file) = create_staging_file(final_path)?;
-    let tmp_for_async = tmp.clone();
-    let file_owned = file.clone();
-    progress(&format!(
-        "downloading {} ({:.2} GB, {} part(s))",
-        file.filename,
-        file.size as f64 / 1.0e9,
-        file.parts.len()
-    ));
-    let download = runtime.block_on(async move {
-        let cx = Cx::current().ok_or_else(|| {
-            FocrError::Other(anyhow::anyhow!("runtime did not install an ambient Cx"))
-        })?;
-        download_remote_file(&cx, &file_owned, &tmp_for_async, staging_file, quiet).await
-    });
-    if let Err(e) = download {
-        // Don't leave a half-written `.partial` littering the cache; the next
-        // attempt would truncate it anyway, but a failed pull should be tidy.
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    // `rename` within one directory is the commit point: it replaces a regular
-    // destination atomically, while a failure leaves the previously verified
-    // file in place. Never unlink the working cache entry before this step.
-    if let Err(error) = commit_staging_file(&tmp, final_path) {
-        let _ = std::fs::remove_file(&tmp);
+    let mut locks = Vec::new();
+    let mut staged = Vec::new();
+    if let Err(error) = stage_flat_files(downloader, dir, files, &mut locks, &mut staged, progress)
+    {
+        for (staging_path, _) in &staged {
+            let _ = std::fs::remove_file(staging_path);
+        }
+        progress(&PullEvent::transaction(
+            dir,
+            TransactionOutcome::RolledBack,
+            error.to_string(),
+        ));
         return Err(error);
     }
-    progress(&format!("installed {}", final_path.display()));
+    // `rename` within one directory is the commit point of each file: it
+    // replaces a regular destination atomically, while a failure leaves the
+    // previously verified file in place.
+    for (index, (staging_path, final_path)) in staged.iter().enumerate() {
+        if let Err(error) = commit_staging_file(staging_path, final_path) {
+            for (rest, _) in &staged[index..] {
+                let _ = std::fs::remove_file(rest);
+            }
+            let outcome = if index == 0 {
+                TransactionOutcome::RolledBack
+            } else {
+                TransactionOutcome::Incomplete
+            };
+            progress(&PullEvent::transaction(dir, outcome, error.to_string()));
+            return Err(error);
+        }
+        progress(&PullEvent::transaction(
+            final_path,
+            TransactionOutcome::Installed,
+            "",
+        ));
+    }
+    Ok(staged.is_empty())
+}
+
+/// Download every file of `files` that `dir` lacks into a staging file, under
+/// the file's install lock (kept in `locks` until the commit). `staged` lists
+/// each staging file as soon as it exists, so the caller can remove it.
+fn stage_flat_files<S: PartSource>(
+    downloader: &Downloader<'_, S>,
+    dir: &Path,
+    files: &[&RemoteFile],
+    locks: &mut Vec<InstallLock>,
+    staged: &mut Vec<(PathBuf, PathBuf)>,
+    progress: &mut dyn FnMut(&PullEvent),
+) -> FocrResult<()> {
+    for file in files {
+        let final_path = dir.join(&file.filename);
+        if already_cached(&final_path, file) {
+            progress(&PullEvent::transaction(
+                &final_path,
+                TransactionOutcome::Cached,
+                "",
+            ));
+            continue;
+        }
+        validate_install_target_type(&final_path)?;
+        // Recheck under the lock: another process may have finished this file
+        // between the optimistic miss and the lock.
+        let lock = InstallLock::acquire(&final_path)?;
+        if already_cached(&final_path, file) {
+            progress(&PullEvent::transaction(
+                &final_path,
+                TransactionOutcome::Cached,
+                "",
+            ));
+            continue;
+        }
+        validate_install_target_type(&final_path)?;
+        locks.push(lock);
+        let (staging_path, out) = create_staging_file(&final_path)?;
+        staged.push((staging_path.clone(), final_path));
+        downloader.fetch(file, &staging_path, out, progress)?;
+    }
+    Ok(())
+}
+
+/// Install a non-primary model as one package: its directory `dir`
+/// (`models/<id>/`) is replaced whole, so no reader ever finds a new artifact
+/// beside an old or missing tokenizer (bd-jprb). Returns `true` when the
+/// package was already complete.
+///
+/// Under the package lock the next package is assembled in a hidden sibling
+/// stage ([`assemble_package`]), then committed by [`swap_package`]. A failure
+/// before the commit leaves the live package untouched. A crash between the
+/// commit's two renames leaves the previous package aside, which the next pull
+/// restores before anything else ([`recover_package`]) and `focr doctor`
+/// reports; the model search never reads hidden directories.
+fn install_package<S: PartSource>(
+    downloader: &Downloader<'_, S>,
+    dir: &Path,
+    files: &[&RemoteFile],
+    progress: &mut dyn FnMut(&PullEvent),
+) -> FocrResult<bool> {
+    validate_package_dir(dir)?;
+    if !package_has_pull_state(dir) && cached_files(dir, files).len() == files.len() {
+        progress(&PullEvent::transaction(
+            dir,
+            TransactionOutcome::Cached,
+            "",
+        ));
+        return Ok(true);
+    }
+    let _lock = InstallLock::acquire(dir)?;
+    recover_package(dir, progress)?;
+    validate_package_dir(dir)?;
+    let cached = cached_files(dir, files);
+    if cached.len() == files.len() {
+        progress(&PullEvent::transaction(
+            dir,
+            TransactionOutcome::Cached,
+            "",
+        ));
+        return Ok(true);
+    }
+    let (stage, ()) = create_staging_entry(dir, ".pkg", "package stage", |path| {
+        std::fs::create_dir(path)
+    })?;
+    let committed = assemble_package(downloader, dir, &stage, files, &cached, progress)
+        .and_then(|()| swap_package(&stage, dir, progress));
+    if let Err(error) = committed {
+        // `swap_package` puts the live package back before it fails, so the
+        // stage is all there is to clean up.
+        let _ = std::fs::remove_dir_all(&stage);
+        progress(&PullEvent::transaction(
+            dir,
+            TransactionOutcome::RolledBack,
+            error.to_string(),
+        ));
+        return Err(error);
+    }
+    progress(&PullEvent::transaction(
+        dir,
+        TransactionOutcome::Installed,
+        "",
+    ));
     Ok(false)
+}
+
+/// A package directory, when present, must be a real directory.
+fn validate_package_dir(dir: &Path) -> FocrResult<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(FocrError::FormatMismatch(format!(
+            "model package {} must be a real directory, not a symlink or other file type",
+            dir.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(FocrError::Other(anyhow::anyhow!(
+            "inspect model package {}: {error}",
+            dir.display()
+        ))),
+    }
+}
+
+/// Whether package `dir` has a stage or aside copy beside it: one a running
+/// pull holds, or one an interrupted pull left. Even a complete package then
+/// takes the lock, so the pull recovers that state rather than reporting a
+/// cache hit over it.
+fn package_has_pull_state(dir: &Path) -> bool {
+    let (Some(parent), Ok(key)) = (dir.parent(), coordination_key(dir)) else {
+        return false;
+    };
+    std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(parse_pull_state)
+                .is_some_and(|state| {
+                    !matches!(state, PullState::FileStage { .. }) && state.key() == key
+                })
+        })
+}
+
+/// The names of `files` that `dir` already holds byte-perfect.
+fn cached_files(dir: &Path, files: &[&RemoteFile]) -> BTreeSet<String> {
+    files
+        .iter()
+        .filter(|file| already_cached(&dir.join(&file.filename), file))
+        .map(|file| file.filename.clone())
+        .collect()
+}
+
+/// Where a commit moves the previous package of `dir` aside.
+fn package_aside_path(dir: &Path) -> FocrResult<PathBuf> {
+    let parent = dir.parent().ok_or_else(|| {
+        FocrError::Other(anyhow::anyhow!(
+            "model package {} has no parent directory",
+            dir.display()
+        ))
+    })?;
+    Ok(parent.join(format!(".focr-prev-{}.pkg", coordination_key(dir)?)))
+}
+
+/// Fill `stage` with the next package. Every live entry that stays (a file the
+/// manifest still names and `cached` found byte-perfect, or a file the manifest
+/// does not name, such as another quant) is hard-linked in, or copied on a
+/// filesystem without hard links; every other manifest file downloads and
+/// verifies in the stage. Leftover `.focr-` pull state is not carried over.
+fn assemble_package<S: PartSource>(
+    downloader: &Downloader<'_, S>,
+    dir: &Path,
+    stage: &Path,
+    files: &[&RemoteFile],
+    cached: &BTreeSet<String>,
+    progress: &mut dyn FnMut(&PullEvent),
+) -> FocrResult<()> {
+    let replaced: BTreeSet<&OsStr> = files
+        .iter()
+        .filter(|file| !cached.contains(&file.filename))
+        .map(|file| OsStr::new(file.filename.as_str()))
+        .collect();
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "read model package {}: {error}",
+                dir.display()
+            )));
+        }
+    };
+    for entry in entries.into_iter().flatten() {
+        let entry = entry.map_err(|error| {
+            FocrError::Other(anyhow::anyhow!(
+                "read model package {}: {error}",
+                dir.display()
+            ))
+        })?;
+        let name = entry.file_name();
+        if replaced.contains(name.as_os_str()) || name.as_encoded_bytes().starts_with(b".focr-") {
+            continue;
+        }
+        let source = entry.path();
+        let metadata = std::fs::symlink_metadata(&source).map_err(|error| {
+            FocrError::Other(anyhow::anyhow!("inspect {}: {error}", source.display()))
+        })?;
+        if !metadata.is_file() {
+            return Err(FocrError::FormatMismatch(format!(
+                "model package {} holds {}, which is not a regular file; move it out of the \
+                 model cache and pull again",
+                dir.display(),
+                source.display()
+            )));
+        }
+        let dest = stage.join(&name);
+        if std::fs::hard_link(&source, &dest).is_err() {
+            std::fs::copy(&source, &dest)
+                .and_then(|_| std::fs::File::open(&dest)?.sync_all())
+                .map_err(|error| {
+                    FocrError::Other(anyhow::anyhow!(
+                        "keep {} in the new package: {error}",
+                        source.display()
+                    ))
+                })?;
+        }
+    }
+    for file in files {
+        if cached.contains(&file.filename) {
+            progress(&PullEvent::transaction(
+                &dir.join(&file.filename),
+                TransactionOutcome::Cached,
+                "",
+            ));
+            continue;
+        }
+        let dest = stage.join(&file.filename);
+        let out = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+            .map_err(|error| {
+                FocrError::Other(anyhow::anyhow!("create {}: {error}", dest.display()))
+            })?;
+        downloader.fetch(file, &dest, out, progress)?;
+    }
+    sync_directory(stage)
+}
+
+/// Commit a staged package: move the live package (if any) aside, rename the
+/// stage into its place, then remove the aside copy. When the second rename
+/// fails the live package is put back.
+fn swap_package(
+    stage: &Path,
+    dir: &Path,
+    progress: &mut dyn FnMut(&PullEvent),
+) -> FocrResult<()> {
+    let aside = package_aside_path(dir)?;
+    let had_live = std::fs::symlink_metadata(dir).is_ok();
+    if had_live {
+        std::fs::rename(dir, &aside).map_err(|error| {
+            FocrError::Other(anyhow::anyhow!(
+                "move {} aside to {}: {error}",
+                dir.display(),
+                aside.display()
+            ))
+        })?;
+    }
+    if let Err(error) = std::fs::rename(stage, dir) {
+        if had_live && let Err(restore) = std::fs::rename(&aside, dir) {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "install {} -> {}: {error}; putting the previous package back also failed \
+                 ({restore}); the next `focr pull` restores it from {}",
+                stage.display(),
+                dir.display(),
+                aside.display()
+            )));
+        }
+        return Err(FocrError::Other(anyhow::anyhow!(
+            "install {} -> {}: {error}",
+            stage.display(),
+            dir.display()
+        )));
+    }
+    // The new package is in place from here on; what follows cannot undo it.
+    if let Err(error) = sync_parent_dir(dir) {
+        progress(&PullEvent::Note(format!(
+            "installed {}, but {error}",
+            dir.display()
+        )));
+    }
+    if had_live && let Err(error) = std::fs::remove_dir_all(&aside) {
+        progress(&PullEvent::Note(format!(
+            "could not remove the previous package {}: {error}; the next pull removes it",
+            aside.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Undo what an interrupted install of package `dir` left behind; the caller
+/// holds the package lock. An aside copy is the previous package: restored
+/// when `dir` is missing (the crash fell between the commit's two renames) and
+/// removed when `dir` is present (it fell after them). Every stage with this
+/// package's key is abandoned, since stages exist only under the lock.
+fn recover_package(dir: &Path, progress: &mut dyn FnMut(&PullEvent)) -> FocrResult<()> {
+    let aside = package_aside_path(dir)?;
+    match std::fs::symlink_metadata(&aside) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            if std::fs::symlink_metadata(dir).is_ok() {
+                std::fs::remove_dir_all(&aside).map_err(|error| {
+                    FocrError::Other(anyhow::anyhow!("remove {}: {error}", aside.display()))
+                })?;
+                progress(&PullEvent::transaction(
+                    &aside,
+                    TransactionOutcome::Recovered,
+                    "removed the previous package an interrupted install left behind",
+                ));
+            } else {
+                std::fs::rename(&aside, dir).map_err(|error| {
+                    FocrError::Other(anyhow::anyhow!(
+                        "restore {} -> {}: {error}",
+                        aside.display(),
+                        dir.display()
+                    ))
+                })?;
+                sync_parent_dir(dir)?;
+                progress(&PullEvent::transaction(
+                    dir,
+                    TransactionOutcome::Recovered,
+                    format!(
+                        "restored the previous package from {} after an interrupted install",
+                        aside.display()
+                    ),
+                ));
+            }
+        }
+        Ok(_) => {
+            return Err(FocrError::FormatMismatch(format!(
+                "{} must be a directory; move it out of the model cache",
+                aside.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "inspect {}: {error}",
+                aside.display()
+            )));
+        }
+    }
+
+    let parent = aside.parent().unwrap_or(dir);
+    let key = coordination_key(dir)?;
+    let entries = std::fs::read_dir(parent).map_err(|error| {
+        FocrError::Other(anyhow::anyhow!("read {}: {error}", parent.display()))
+    })?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let is_stage = name.to_str().and_then(parse_pull_state)
+            == Some(PullState::PackageStage { key: key.clone() });
+        let path = entry.path();
+        if !is_stage
+            || !std::fs::symlink_metadata(&path)
+                .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
+            continue;
+        }
+        std::fs::remove_dir_all(&path).map_err(|error| {
+            FocrError::Other(anyhow::anyhow!("remove {}: {error}", path.display()))
+        })?;
+        progress(&PullEvent::transaction(
+            &path,
+            TransactionOutcome::Recovered,
+            "removed a package stage an interrupted install left behind",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1621,16 +2433,527 @@ mod tests {
             None,
             DEFAULT_QUANT,
             path.to_str().expect("UTF-8 temp path"),
-            true,
-            |line| progress.push(line.to_owned()),
+            |event| progress.push(event.clone()),
         )
         .expect_err("legacy recipe must fail before its unreachable artifact URL");
         assert!(matches!(error, FocrError::FormatMismatch(_)));
         assert!(
-            progress.is_empty(),
-            "artifact progress proves the fail-before-download order"
+            matches!(
+                progress.as_slice(),
+                [PullEvent::Transaction {
+                    outcome: TransactionOutcome::Refused,
+                    ..
+                }]
+            ),
+            "the refusal is the only step, which proves the fail-before-download order: \
+             {progress:?}"
         );
         std::fs::remove_file(path).expect("remove test manifest");
+    }
+
+    /// Serves synthetic part bodies from memory by URL and records every
+    /// request, so the offline pull tests run the real verification and
+    /// install path (U2-E4; the HTTPS fetch itself is U2-T1a's).
+    struct MemoryParts {
+        bodies: BTreeMap<String, Vec<u8>>,
+        requests: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl MemoryParts {
+        fn new(bodies: BTreeMap<String, Vec<u8>>) -> Self {
+            Self {
+                bodies,
+                requests: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.borrow().len()
+        }
+    }
+
+    impl PartSource for MemoryParts {
+        async fn stream(
+            &self,
+            _cx: &Cx,
+            url: &str,
+            sink: &mut dyn FnMut(&[u8]) -> std::io::Result<()>,
+        ) -> Result<u64, DownloadError> {
+            self.requests.borrow_mut().push(url.to_owned());
+            let Some(body) = self.bodies.get(url) else {
+                return Err(DownloadError::UnexpectedStatus(404));
+            };
+            for chunk in body.chunks(7) {
+                sink(chunk).map_err(DownloadError::Io)?;
+            }
+            Ok(body.len() as u64)
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        hex32(&Sha256::digest(bytes).into())
+    }
+
+    /// `bytes` as a remote file of `parts` parts served from
+    /// `https://mirror.invalid/<filename>.partNN`; the bodies go to `bodies`.
+    fn split_file(
+        filename: &str,
+        bytes: &[u8],
+        parts: usize,
+        bodies: &mut BTreeMap<String, Vec<u8>>,
+    ) -> RemoteFile {
+        let remote_parts = bytes
+            .chunks(bytes.len().div_ceil(parts))
+            .enumerate()
+            .map(|(index, part)| {
+                let url = format!("https://mirror.invalid/{filename}.part{index:02}");
+                bodies.insert(url.clone(), part.to_vec());
+                RemotePart {
+                    size: part.len() as u64,
+                    sha256: sha256_hex(part),
+                    urls: vec![url],
+                }
+            })
+            .collect();
+        RemoteFile {
+            filename: filename.into(),
+            size: bytes.len() as u64,
+            sha256: sha256_hex(bytes),
+            parts: remote_parts,
+        }
+    }
+
+    const V2: &str = crate::model_arch::UNLIMITED_OCR_V2_ID;
+
+    fn v2_artifact_name() -> String {
+        let version = crate::model_arch::arch_by_id(V2)
+            .expect("v2 arch")
+            .artifact_version();
+        format!("{V2}.v{version}.int8.focrq")
+    }
+
+    /// A manifest publishing v2 as a secondary model with these artifact
+    /// (3 parts) and tokenizer bytes, and the bodies its URLs serve.
+    fn v2_manifest(artifact: &[u8], tokenizer: &[u8]) -> (Manifest, BTreeMap<String, Vec<u8>>) {
+        let mut bodies = BTreeMap::new();
+        let mut manifest = tiny_manifest();
+        manifest.models.insert(
+            V2.into(),
+            ModelEntry {
+                license_notice: "MIT License, Copyright (c) 2026 Baidu".into(),
+                version: Some(
+                    crate::model_arch::arch_by_id(V2)
+                        .expect("v2 arch")
+                        .artifact_version()
+                        .into(),
+                ),
+                quants: BTreeMap::from([(
+                    DEFAULT_QUANT.into(),
+                    QuantEntry {
+                        recipe: required_recipe(V2, DEFAULT_QUANT)
+                            .expect("v2 int8 recipe")
+                            .into(),
+                        focrq: split_file(&v2_artifact_name(), artifact, 3, &mut bodies),
+                    },
+                )]),
+                tokenizer: split_file("tokenizer.json", tokenizer, 1, &mut bodies),
+                sidecars: Vec::new(),
+            },
+        );
+        parse_serialized(&manifest).expect("the synthetic v2 manifest is valid");
+        (manifest, bodies)
+    }
+
+    fn pattern(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    fn temp_cache(label: &str) -> (PathBuf, PathBuf) {
+        let suffix = STAGING_NONCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "focr_dist_{label}_{}_{suffix}",
+            std::process::id()
+        ));
+        (root.clone(), root.join("models"))
+    }
+
+    /// Pull `model` from `manifest` into `cache` from `source`, keeping every
+    /// step.
+    fn pull_offline(
+        manifest: &Manifest,
+        model: Option<&str>,
+        cache: &Path,
+        source: &MemoryParts,
+    ) -> (FocrResult<PullOutcome>, Vec<PullEvent>) {
+        let runtime = RuntimeBuilder::new().build().expect("runtime");
+        let downloader = Downloader {
+            runtime: &runtime,
+            source,
+        };
+        let mut events = Vec::new();
+        let result = pull_from(
+            &downloader,
+            manifest,
+            model,
+            DEFAULT_QUANT,
+            cache,
+            &mut |event| events.push(event.clone()),
+        );
+        (result, events)
+    }
+
+    fn entry_names(dir: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .expect("read directory")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .into_string()
+                    .expect("UTF-8 name")
+            })
+            .collect()
+    }
+
+    fn package_lock_name() -> String {
+        format!(".focr-pull-{}.lock", package_key(V2))
+    }
+
+    fn outcomes(events: &[PullEvent]) -> Vec<TransactionOutcome> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PullEvent::Transaction { outcome, .. } => Some(*outcome),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// U2-E4 happy path, offline: the parts reassemble, every part and the
+    /// whole file verify, and the package lands in `models/unlimited-ocr-2/`
+    /// with nothing left beside it but its lock. Pulling again is a cache hit
+    /// that requests nothing.
+    #[test]
+    fn offline_v2_pull_installs_one_verified_package_then_hits_the_cache() {
+        let (root, cache) = temp_cache("v2_pull");
+        let artifact = pattern(1000, 7);
+        let tokenizer = br#"{"model":"v2"}"#.to_vec();
+        let (manifest, bodies) = v2_manifest(&artifact, &tokenizer);
+        let source = MemoryParts::new(bodies);
+
+        let (outcome, events) = pull_offline(&manifest, Some(V2), &cache, &source);
+        let outcome = outcome.expect("offline v2 pull");
+        let package = cache.join(V2);
+        assert_eq!(outcome.focrq_path, package.join(v2_artifact_name()));
+        assert_eq!(outcome.tokenizer_path, package.join("tokenizer.json"));
+        assert!(!outcome.from_cache);
+        assert_eq!(outcome.license_notice, "MIT License, Copyright (c) 2026 Baidu");
+        assert_eq!(std::fs::read(&outcome.focrq_path).unwrap(), artifact);
+        assert_eq!(std::fs::read(&outcome.tokenizer_path).unwrap(), tokenizer);
+        assert_eq!(
+            entry_names(&cache),
+            BTreeSet::from([V2.to_owned(), package_lock_name()]),
+            "no stage or aside copy outlives a successful install"
+        );
+        assert_eq!(
+            entry_names(&package),
+            BTreeSet::from([v2_artifact_name(), "tokenizer.json".to_owned()])
+        );
+
+        let verified_parts: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                PullEvent::Part {
+                    expected_sha256,
+                    computed_sha256,
+                    error: None,
+                    ..
+                } => Some((expected_sha256, computed_sha256)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(verified_parts.len(), 4, "3 artifact parts + 1 tokenizer part");
+        assert!(
+            verified_parts
+                .iter()
+                .all(|(expected, computed)| computed.as_deref() == Some(expected.as_str()))
+        );
+        let whole_files = events
+            .iter()
+            .filter(|event| {
+                matches!(event, PullEvent::File { expected_sha256, computed_sha256, .. }
+                    if expected_sha256 == computed_sha256)
+            })
+            .count();
+        assert_eq!(whole_files, 2);
+        assert_eq!(outcomes(&events), [TransactionOutcome::Installed]);
+        let part_line = events
+            .iter()
+            .find(|event| matches!(event, PullEvent::Part { .. }))
+            .expect("a part step")
+            .to_json();
+        assert_eq!(part_line["event"], "part");
+        assert_eq!(part_line["verified"], true);
+        assert_eq!(part_line["expected_sha256"], part_line["computed_sha256"]);
+
+        let requests = source.request_count();
+        let (again, events) = pull_offline(&manifest, Some(V2), &cache, &source);
+        assert!(again.expect("cached pull").from_cache);
+        assert_eq!(outcomes(&events), [TransactionOutcome::Cached]);
+        assert_eq!(source.request_count(), requests, "a cache hit requests nothing");
+        std::fs::remove_dir_all(root).expect("remove test cache");
+    }
+
+    /// U2-E4: a corrupted part is refused and nothing is installed; a second
+    /// mirror with the right bytes then completes the same pull, rolling the
+    /// file back to the part boundary first.
+    #[test]
+    fn offline_v2_pull_refuses_a_corrupt_part_and_installs_nothing() {
+        let (root, cache) = temp_cache("v2_corrupt");
+        let artifact = pattern(1000, 11);
+        let (mut manifest, mut bodies) = v2_manifest(&artifact, b"{}");
+        let part_url = manifest.models[V2].quants[DEFAULT_QUANT].focrq.parts[1].urls[0].clone();
+        let good = bodies[&part_url].clone();
+        bodies.get_mut(&part_url).expect("part body")[5] ^= 0xff;
+
+        let source = MemoryParts::new(bodies.clone());
+        let (result, events) = pull_offline(&manifest, Some(V2), &cache, &source);
+        result.expect_err("a corrupt part fails the pull");
+        assert!(!cache.join(V2).exists(), "nothing installed");
+        assert_eq!(entry_names(&cache), BTreeSet::from([package_lock_name()]));
+        assert!(events.iter().any(|event| matches!(event,
+            PullEvent::Part { part: 2, error: Some(error), computed_sha256: Some(_), .. }
+                if error.contains("sha256 mismatch"))));
+        assert_eq!(outcomes(&events), [TransactionOutcome::RolledBack]);
+
+        let mirror = "https://mirror2.invalid/part01".to_owned();
+        bodies.insert(mirror.clone(), good);
+        manifest
+            .models
+            .get_mut(V2)
+            .and_then(|entry| entry.quants.get_mut(DEFAULT_QUANT))
+            .expect("v2 int8")
+            .focrq
+            .parts[1]
+            .urls
+            .push(mirror);
+        let source = MemoryParts::new(bodies);
+        let (outcome, events) = pull_offline(&manifest, Some(V2), &cache, &source);
+        let outcome = outcome.expect("the second mirror completes the pull");
+        assert_eq!(std::fs::read(outcome.focrq_path).unwrap(), artifact);
+        assert_eq!(outcomes(&events), [TransactionOutcome::Installed]);
+        std::fs::remove_dir_all(root).expect("remove test cache");
+    }
+
+    /// U2-E4 / bd-jprb: an install that fails keeps the previous package
+    /// byte-identical; a crash between the commit's renames (previous package
+    /// aside, none in place, a stage left over) is restored by the next pull
+    /// before it does anything else; a crash after them leaves an aside copy
+    /// the next pull removes. Files the manifest does not name (another quant)
+    /// survive a real install.
+    #[test]
+    fn an_interrupted_v2_install_keeps_or_restores_the_previous_package() {
+        let (root, cache) = temp_cache("v2_interrupted");
+        let package = cache.join(V2);
+        let old_artifact = pattern(900, 1);
+        let (old_manifest, old_bodies) = v2_manifest(&old_artifact, b"{\"old\":1}");
+        let old_source = MemoryParts::new(old_bodies);
+        pull_offline(&old_manifest, Some(V2), &cache, &old_source)
+            .0
+            .expect("install the previous package");
+        let other_quant = package.join(format!("{V2}.v0.1.0.int4.focrq"));
+        std::fs::write(&other_quant, b"another quant").expect("write another quant");
+        let snapshot = |dir: &Path| {
+            entry_names(dir)
+                .into_iter()
+                .map(|name| {
+                    let bytes = std::fs::read(dir.join(&name)).expect("read package file");
+                    (name, bytes)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let previous = snapshot(&package);
+
+        // A download that fails part-way changes nothing.
+        let new_artifact = pattern(1200, 2);
+        let (new_manifest, mut new_bodies) = v2_manifest(&new_artifact, b"{\"new\":1}");
+        let last_part = new_manifest.models[V2].quants[DEFAULT_QUANT].focrq.parts[2].urls[0].clone();
+        let last_body = new_bodies.remove(&last_part).expect("last part body");
+        let failing = MemoryParts::new(new_bodies.clone());
+        let (result, events) = pull_offline(&new_manifest, Some(V2), &cache, &failing);
+        result.expect_err("a missing part fails the pull");
+        assert_eq!(snapshot(&package), previous);
+        assert_eq!(
+            entry_names(&cache),
+            BTreeSet::from([V2.to_owned(), package_lock_name()])
+        );
+        assert_eq!(outcomes(&events), [TransactionOutcome::RolledBack]);
+
+        // A crash between the commit's renames.
+        let key = package_key(V2);
+        let aside = cache.join(format!(".focr-prev-{key}.pkg"));
+        let stage = cache.join(format!(".focr-stage-{key}-999999-0.pkg"));
+        std::fs::create_dir(&stage).expect("abandoned stage");
+        std::fs::write(stage.join(v2_artifact_name()), b"partial").expect("stage file");
+        std::fs::rename(&package, &aside).expect("move the package aside");
+        let (outcome, events) = pull_offline(&old_manifest, Some(V2), &cache, &old_source);
+        assert!(outcome.expect("recovering pull").from_cache);
+        assert_eq!(snapshot(&package), previous, "the previous package is back");
+        assert_eq!(
+            outcomes(&events),
+            [
+                TransactionOutcome::Recovered,
+                TransactionOutcome::Recovered,
+                TransactionOutcome::Cached
+            ]
+        );
+        assert_eq!(
+            entry_names(&cache),
+            BTreeSet::from([V2.to_owned(), package_lock_name()])
+        );
+
+        // A crash after them: the aside copy is stale.
+        std::fs::create_dir(&aside).expect("stale aside copy");
+        std::fs::write(aside.join("tokenizer.json"), b"stale").expect("aside file");
+        let (outcome, events) = pull_offline(&old_manifest, Some(V2), &cache, &old_source);
+        assert!(outcome.expect("cleanup pull").from_cache);
+        assert_eq!(
+            outcomes(&events),
+            [TransactionOutcome::Recovered, TransactionOutcome::Cached]
+        );
+        assert!(!aside.exists());
+
+        // The real install: new artifact and tokenizer, the other quant kept.
+        new_bodies.insert(last_part, last_body);
+        let source = MemoryParts::new(new_bodies);
+        let (outcome, events) = pull_offline(&new_manifest, Some(V2), &cache, &source);
+        let outcome = outcome.expect("install the new package");
+        assert_eq!(std::fs::read(&outcome.focrq_path).unwrap(), new_artifact);
+        assert_eq!(std::fs::read(&outcome.tokenizer_path).unwrap(), b"{\"new\":1}");
+        assert_eq!(std::fs::read(&other_quant).unwrap(), b"another quant");
+        assert_eq!(outcomes(&events), [TransactionOutcome::Installed]);
+        assert_eq!(
+            entry_names(&cache),
+            BTreeSet::from([V2.to_owned(), package_lock_name()])
+        );
+        std::fs::remove_dir_all(root).expect("remove test cache");
+    }
+
+    /// U2-E4: a local manifest whose v2 entry declares another recipe is
+    /// refused before any part is requested or the cache is touched; the
+    /// refusal is the only step.
+    #[test]
+    fn a_v2_recipe_mismatch_is_refused_before_any_request() {
+        let (root, cache) = temp_cache("v2_recipe");
+        let (mut manifest, bodies) = v2_manifest(&pattern(300, 3), b"{}");
+        manifest
+            .models
+            .get_mut(V2)
+            .and_then(|entry| entry.quants.get_mut(DEFAULT_QUANT))
+            .expect("v2 int8")
+            .recipe = "unlimited-ocr-2-full-int8-attn-int8-lmhead-int8-v1".into();
+        let source = MemoryParts::new(bodies);
+        let (result, events) = pull_offline(&manifest, Some(V2), &cache, &source);
+        assert!(matches!(result, Err(FocrError::FormatMismatch(_))));
+        assert_eq!(source.request_count(), 0);
+        assert!(!root.exists(), "the cache is not created");
+        assert!(matches!(
+            events.as_slice(),
+            [PullEvent::Transaction { target, outcome: TransactionOutcome::Refused, reason }]
+                if *target == cache.join(V2) && reason.contains("requires")
+        ));
+    }
+
+    /// bd-jprb: a second pull of a package another pull holds fails fast and
+    /// changes nothing.
+    #[test]
+    fn a_held_package_lock_refuses_a_concurrent_pull() {
+        let (root, cache) = temp_cache("v2_locked");
+        std::fs::create_dir_all(&cache).expect("create cache");
+        let (manifest, bodies) = v2_manifest(&pattern(300, 4), b"{}");
+        let source = MemoryParts::new(bodies);
+        let held = InstallLock::acquire(&cache.join(V2)).expect("hold the package lock");
+        let (result, _) = pull_offline(&manifest, Some(V2), &cache, &source);
+        assert!(matches!(result, Err(FocrError::Timeout(_))));
+        assert_eq!(source.request_count(), 0);
+        assert_eq!(entry_names(&cache), BTreeSet::from([package_lock_name()]));
+        drop(held);
+        std::fs::remove_dir_all(root).expect("remove test cache");
+    }
+
+    /// The primary model's flat layout: when one file fails to download, no
+    /// file is renamed in, so the installed artifact keeps its previous bytes
+    /// beside its previous tokenizer, and no staging file is left.
+    #[test]
+    fn a_failed_primary_download_leaves_every_flat_file_as_it_was() {
+        let (root, cache) = temp_cache("flat");
+        let mut bodies = BTreeMap::new();
+        let mut manifest = tiny_manifest();
+        manifest.quants.get_mut(DEFAULT_QUANT).expect("int8").focrq =
+            split_file("unlimited-ocr.int8.focrq", &pattern(500, 5), 2, &mut bodies);
+        manifest.tokenizer = split_file("tokenizer.json", b"{\"v\":1}", 1, &mut bodies);
+        let source = MemoryParts::new(bodies);
+        pull_offline(&manifest, None, &cache, &source)
+            .0
+            .expect("install the previous files");
+        let installed = entry_names(&cache);
+
+        let mut bodies = BTreeMap::new();
+        manifest.quants.get_mut(DEFAULT_QUANT).expect("int8").focrq =
+            split_file("unlimited-ocr.int8.focrq", &pattern(600, 6), 2, &mut bodies);
+        manifest.tokenizer = split_file("tokenizer.json", b"{\"v\":2}", 1, &mut bodies);
+        bodies.retain(|url, _| !url.contains("tokenizer"));
+        let source = MemoryParts::new(bodies);
+        let (result, events) = pull_offline(&manifest, None, &cache, &source);
+        result.expect_err("the tokenizer is unreachable");
+        assert_eq!(
+            std::fs::read(cache.join("unlimited-ocr.int8.focrq")).unwrap(),
+            pattern(500, 5),
+            "the verified new artifact was not renamed in beside the old tokenizer"
+        );
+        assert_eq!(std::fs::read(cache.join("tokenizer.json")).unwrap(), b"{\"v\":1}");
+        assert_eq!(entry_names(&cache), installed, "no staging file is left");
+        assert_eq!(outcomes(&events), [TransactionOutcome::RolledBack]);
+        std::fs::remove_dir_all(root).expect("remove test cache");
+    }
+
+    /// Every pull-owned hidden name maps to its lock; others do not parse.
+    #[test]
+    fn pull_state_names_map_to_their_lock() {
+        let key = "c".repeat(32);
+        let dir = Path::new("/cache/models");
+        for (name, state) in [
+            (
+                format!(".focr-stage-{key}-12-3.partial"),
+                PullState::FileStage { key: key.clone() },
+            ),
+            (
+                format!(".focr-stage-{key}-12-3.pkg"),
+                PullState::PackageStage { key: key.clone() },
+            ),
+            (
+                format!(".focr-prev-{key}.pkg"),
+                PullState::PackageAside { key: key.clone() },
+            ),
+        ] {
+            assert_eq!(parse_pull_state(&name), Some(state), "{name}");
+            assert_eq!(
+                pull_lock_path_for_staging(&dir.join(&name)),
+                Some(dir.join(format!(".focr-pull-{key}.lock"))),
+                "{name}"
+            );
+        }
+        for name in [
+            format!(".focr-stage-{key}-12-3.tmp"),
+            format!(".focr-prev-{key}"),
+            ".focr-prev-short.pkg".to_owned(),
+            format!(".focr-pull-{key}.lock"),
+            "unlimited-ocr-2".to_owned(),
+        ] {
+            assert_eq!(parse_pull_state(&name), None, "{name}");
+        }
     }
 
     #[test]

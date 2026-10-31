@@ -114,6 +114,7 @@ pub fn detect(root: &DoctorRoot) -> Vec<Finding> {
     detect_stale_focrq_format(root, &mut findings);
     detect_unreadable_cache_entries(root, &mut findings);
     detect_orphaned_partials(root, &mut findings);
+    detect_package_transactions(root, &mut findings);
     findings
 }
 
@@ -284,6 +285,88 @@ fn detect_orphaned_partials(root: &DoctorRoot, out: &mut Vec<Finding>) {
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
             detect_orphaned_partials_in_dir(&path, out);
         }
+    }
+}
+
+/// The model whose package directory (`models/<id>/`) has coordination key
+/// `key`: a registry id or an installed package's name.
+fn package_model_for_key(models: &Path, key: &str) -> Option<String> {
+    let installed = std::fs::read_dir(models)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter(|name| !name.starts_with('.'));
+    crate::model_arch::registry()
+        .iter()
+        .map(|arch| arch.id().to_owned())
+        .chain(installed)
+        .find(|id| crate::dist::package_key(id) == key)
+}
+
+/// A per-model package install (bd-jprb) leaves hidden state beside
+/// `models/<id>/` only when it is interrupted: an abandoned stage, or the
+/// previous package moved aside by a commit that did not finish. A live pull
+/// holds the package lock, so its state is not reported. The repair is the
+/// pull itself, which recovers this state under the lock before anything
+/// else, so doctor names it instead of moving package directories.
+fn detect_package_transactions(root: &DoctorRoot, out: &mut Vec<Finding>) {
+    use crate::dist::PullState;
+    let models = root.models_dir();
+    let Ok(entries) = std::fs::read_dir(&models) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(state) = crate::dist::parse_pull_state(&name) else {
+            continue;
+        };
+        if matches!(state, PullState::FileStage { .. })
+            || !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+            || staging_download_is_active(&path)
+        {
+            continue;
+        }
+        let model = package_model_for_key(&models, state.key());
+        let command = format!("focr pull {}", model.as_deref().unwrap_or("<model>"));
+        let model = model.unwrap_or_else(|| "a model".to_owned());
+        let (detector, severity, message) = match state {
+            PullState::PackageStage { .. } => (
+                "abandoned_package_stage",
+                "warn",
+                format!(
+                    "{name}: the {model} package an interrupted pull was assembling; `{command}` \
+                     removes it"
+                ),
+            ),
+            PullState::PackageAside { .. } if models.join(&model).is_dir() => (
+                "superseded_package_left",
+                "warn",
+                format!(
+                    "{name}: the previous {model} package, left by an interrupted pull after \
+                     the new one was installed; `{command}` removes it"
+                ),
+            ),
+            PullState::PackageAside { .. } => (
+                "interrupted_package_install",
+                "error",
+                format!(
+                    "{name}: an interrupted pull moved the installed {model} package aside \
+                     and did not finish, so {model} is not installed; `{command}` restores it"
+                ),
+            ),
+            PullState::FileStage { .. } => continue,
+        };
+        out.push(Finding {
+            detector,
+            severity,
+            path: Some(path.display().to_string()),
+            message,
+            fixability: Fixability::RefusedUnsafe {
+                recommended_command: command,
+            },
+        });
     }
 }
 
@@ -712,6 +795,9 @@ pub fn capabilities() -> serde_json::Value {
             {"name": "stale_focrq_format", "fix": "refused_unsafe (re-quantization is irreversible; exact command recommended)"},
             {"name": "unreadable_cache_entry", "fix": "auto (chmod_u_rw, mode+bytes backed up)", "platform": "unix"},
             {"name": "orphaned_partial_download", "fix": "auto (quarantine into the run's backups; reversible)"},
+            {"name": "abandoned_package_stage", "fix": "refused_unsafe (`focr pull <model>` removes it under the package lock)"},
+            {"name": "superseded_package_left", "fix": "refused_unsafe (`focr pull <model>` removes it under the package lock)"},
+            {"name": "interrupted_package_install", "fix": "refused_unsafe (`focr pull <model>` restores the previous package under the package lock)"},
         ],
         "fixers": ["chmod_u_rw", "quarantine"],
         "exit_codes": {
