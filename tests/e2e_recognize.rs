@@ -3116,8 +3116,9 @@ fn banded_pages(s2: &[PathBuf], count: usize, bad: usize) -> Vec<PathBuf> {
 /// pages are read in windows of 10 own pages, each read and vision-encoded
 /// once; each comes back and streams once, in order, named by its source
 /// page across the skip and by the window that owns it; every window but
-/// the last reads a lookahead page it does not transcribe; and the decode
-/// report counts one encode and one body per page read.
+/// the last reads a lookahead page it does not transcribe; the decode
+/// report counts one encode and one body per page read; and an extra
+/// `<PAGE>` comes only from a reused last window (DISC-011).
 ///
 /// Pages in flight (D19): a page's raster is dropped once preprocessed, and
 /// a page is held from its read until it streams out. When a page is read,
@@ -3237,7 +3238,15 @@ fn v2_windows_a_document(test: &str, count: usize, bad: usize) {
     );
     assert_eq!(document.pages_out, read);
     assert_eq!(document.finish_reason.as_str(), "stop");
-    assert_eq!(document.extra_markers, 0);
+    // A reused last window may end on one `<PAGE>` past its pages, which
+    // neither reference stack bans; it is counted and its empty body dropped
+    // (DISC-011). Only a recomputed last window bans it.
+    let last_reused = document.windows.last().is_some_and(|w| w.reused);
+    assert!(
+        document.extra_markers <= usize::from(last_reused),
+        "{} extra markers, last window reused: {last_reused}",
+        document.extra_markers
+    );
     let joined = franken_ocr::native_engine::postprocess::join_page_texts(
         document.pages.iter().map(|p| &p.text),
     );
@@ -3247,7 +3256,7 @@ fn v2_windows_a_document(test: &str, count: usize, bad: usize) {
         serde_json::json!({
             "test": test, "case": format!("{count}_bands_page_{bad}_unreadable"),
             "event": "result", "result": "pass", "pages_out": document.pages_out,
-            "windows": document.windows.len(),
+            "windows": document.windows.len(), "extra_markers": document.extra_markers,
             "recomputed": document.windows.iter().filter(|w| w.fallback_reason.is_some()).count(),
             "vision_encodes": stats.vision_encodes, "tokens": report.ids.len(),
             "max_pages_in_flight": in_flight, "wall_s": started.elapsed().as_secs_f64(),
