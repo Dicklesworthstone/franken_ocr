@@ -30,6 +30,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -744,15 +745,18 @@ def _timed(argv: list[str], stdout_path: Path, timeout: int, env: dict) -> dict:
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     load = _loadavg()
-    try:
-        with open(stdout_path, "wb") as out:
-            proc = subprocess.run(["/usr/bin/time", "-l", *argv], stdout=out,
-                                  stderr=subprocess.PIPE, timeout=timeout, env=env)
-        stderr = proc.stderr.decode("utf-8", "replace")
-        code = proc.returncode
-    except subprocess.TimeoutExpired as expired:
-        stderr = (expired.stderr or b"").decode("utf-8", "replace")
-        code = "timeout"
+    with open(stdout_path, "wb") as out:
+        proc = subprocess.Popen(["/usr/bin/time", "-l", *argv], stdout=out,
+                                stderr=subprocess.PIPE, env=env, start_new_session=True)
+        try:
+            raw = proc.communicate(timeout=timeout)[1]
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            # `time` is only the parent: kill the group, or focr runs on beside the next cell.
+            os.killpg(proc.pid, signal.SIGKILL)
+            raw = proc.communicate()[1]
+            code = "timeout"
+    stderr = raw.decode("utf-8", "replace")
     stdout_path.with_suffix(".stderr").write_text(stderr, encoding="utf-8")
     return {"started": started, "loadavg_at_start": load, "exit": code, **_parse_time(stderr)}
 
@@ -1179,7 +1183,8 @@ def main() -> int:
     p.add_argument("--v1-artifact", required=True)
     p.add_argument("--v2-artifact", required=True)
     p.add_argument("--part", choices=["all", "single", "docs"], default="all")
-    p.add_argument("--timeout", type=int, default=3 * 3600)
+    # A chunk of 40 pages at the 600 s stage budget can take 24,000 s and be fine.
+    p.add_argument("--timeout", type=int, default=7 * 3600)
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("score")
