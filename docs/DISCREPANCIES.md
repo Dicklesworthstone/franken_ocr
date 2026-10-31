@@ -586,6 +586,67 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
     No XFAIL.
 - Review date: 2026-10-30
 
+## DISC-019: U2-11 — int8 FFN/expert weights in the shipping v2 decoder, measured at L5
+
+- claim_id / evidence_id: CLAIM-uocr2-int8-ffn-l5 → `tests/parity_ladder.rs`
+    (`uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline`) + the U2-C2 close comment
+    (bd-uocr2-epic-cgux.19, first divergences) + the U2-C4 close comment (bd-uocr2-epic-cgux.20,
+    the gate run of 2026-10-30).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR-2
+    `5632329a32e103d5f1add270681e0f5c1233c6e4`; shipping artifact
+    `unlimited-ocr-2.v0.1.0.int8.focrq` sha256
+    `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398` (the conservative recipe:
+    the 2,148 FFN/expert matrices per-channel int8; attention, router, norms and `lm_head` f32);
+    v2 tokenizer sha256 `c55c165e…`; the f32 references are U2-A6's S1C/S2/S3 sets, generated
+    by `scripts/gen_reference_fixtures_uocr2.py --dtype f32 --threads 12` (torch 2.13.0 /
+    transformers 4.52.1), each fixture's sha256 in its gate row; the v1 baseline lane reads
+    `unlimited-ocr.int8.focrq` (sha256 `573340…fb592`) against v1's f32 S1C references.
+- CPU feature string: aarch64+neon+dotprod (Apple M4).
+- Exact command + env: pre-registered 2026-10-30, run 18:56–20:23 EDT (5,179 s):
+    `FOCR_UOCR2_CORPUS_GATE=1 FOCR_MODEL_PATH=<v1 int8 .focrq>
+    FOCR_UOCR2_MODEL_PATH=<dir holding the v2 .focrq and v2's tokenizer.json>/unlimited-ocr-2.v0.1.0.int8.focrq
+    FOCR_UOCR2_V1_REFS_DIR=<v1 S1C f32 refs> FOCR_UOCR2_FIXTURES_DIR=<v2 f32 refs, t12>
+    FOCR_CORPUS_DIR=~/.cache/franken_ocr/corpus/pages FOCR_STAGE_BUDGET_FORWARD_MS=0 cargo test
+    --profile release-perf --test parity_ladder uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline
+    -- --exact --nocapture --test-threads=1`. Documents read with `PageWindow::Off` (one pass, as
+    the references did).
+- Reference behavior: the f32 reference runs every weight in f32 (the bf16 checkpoint upcast).
+- Our impl: the shipping decoder keeps FFN and expert matrices in per-channel int8 (the fixed
+    recipe, AGENTS.md); everything else is f32. The all-f32 cache (`FOCR_DECODE_F32`, otherwise the
+    same ops) is the parity path. U2-C2 traced the int8 path's first divergences, each at a near-tie
+    where the f32 cache keeps the reference's token and no layer routes differently: S1 page_0014
+    step 47 (the reference's token 0.214 below the int8 pick), page_0590 step 32 (0.156), S2 step 44
+    (0.156), S3 p9_p14 step 73 (0.065), S3-p10 step 203 (0.017), S3-p20 step 118 (0.056);
+    page_0009 is exact. The f32 cache is exact over S3-p10 (6,272 ids) and S3-p20 (16,880 ids).
+- Fallback / kill-switch state: `FOCR_DECODE_F32=1` decodes Unlimited-OCR-2 on the all-f32 cache,
+    which reproduces the f32 reference on every measured near-tie. It loads the raw checkpoint (it
+    refuses a quantized artifact) and decodes slower.
+- Measured impact: the gate run, CER through `scripts/corpus_cer.py`'s normalization, per page
+    against the f32 reference; pre-registered budgets 0.45 per page and 0.25 aggregate, documents
+    exact in page count with `stop` and no extra marker.
+    * 20 corpus pages: 19 at CER ≤ 0.032 (10 exactly 0; page_0014 0.0272 at 441 ids against 256,
+      page_0358 0.0318); aggregate **0.0685**. page_0590 (the one dense table page) reads at
+      **0.44996**, inside its 0.45 budget by 0.00004, stopping at 1,644 ids against the reference's
+      2,329. The v1 baseline lane on the same page, with the same recipe class, is 0.9504 (4,032 ids
+      against 2,327).
+    * Documents: S2 (3 pages), S3-p9_p14, S3-p10 and S3-p20 each give exactly one body per page,
+      `stop`, no extra marker. Their id counts differ where the trajectory left the reference: S2
+      1,232 against 2,152, S3-p9_p14 314 against 538, S3-p10 6,277 against 6,272, S3-p20 17,165
+      against 16,880.
+    * Generated ids per page over the 55 measured pages: int8 p50 735, p90 852, p99 2,892; f32 p50
+      740, p90 982, p99 2,892. No page reached 16,000. The one-pass page limit this supports is 102
+      (`64 + 274·N + (N − 1)·p90 + p99 ≤ 131,072` on the stricter f32 distribution; 114 on int8).
+    * Release decision (conformal ratchet, α = 0.05): v2 passes 20/20 pages, lower bound 0.726333,
+      against v1's floor 0.676333 (19/20). The decision does not hinge on page_0590: at 19/20 v2's
+      bound would be 0.676333, which still holds the floor.
+- Resolution: ACCEPTED. The int8 FFN/expert recipe is the shipping trade (memory and speed) and
+    the near-ties it flips are measured; `FOCR_DECODE_F32` is the exact path.
+- Tests affected: `uocr2_l5_corpus_gate_admits_v2_against_the_v1_baseline` (`tests/parity_ladder.rs`,
+    model-gated); the U2-C2 L4 rungs (`real_v2_l4_*`, `src/native_engine/mod.rs`); the v2 token
+    golden lane (`tests/uocr2_goldens.rs`). No XFAIL.
+- Review date: when the recipe or the decoder changes; page_0590's margin makes it the first page
+    to recheck.
+
 ## DISC-020: U2-12 — reused window without a text splice: the last prompt row keeps its page
 
 - claim_id / evidence_id: CLAIM-uocr2-markeronly-seed → `srswa::DecodePageState::reused_window` +
