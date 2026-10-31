@@ -870,7 +870,8 @@ pub enum WarningKind {
 
 /// Every machine-stable `warnings[].kind` a run can report, in the robot
 /// schema's `warning_kinds` (U2-A7 registers `ignored_lever`, U2-B6 the
-/// Unlimited-OCR-2 document kinds, U2-D0 `ignored_files`).
+/// Unlimited-OCR-2 document kinds, U2-D0 `ignored_files`, U2-D4 the resume
+/// kinds).
 pub const RUN_WARNING_KINDS: &[&str] = &[
     "v1_truncated",
     "v1_page_merge",
@@ -903,8 +904,9 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
              pages independently (omit `--multi-page`)"
         }
         WarningKind::V2Budget => {
-            "the completed pages were written; raise FOCR_STAGE_BUDGET_FORWARD_MS (0 = \
-             unlimited), or select fewer pages with `--pages`"
+            "the completed pages were written; re-run the same command to continue from the \
+             last completed window, raise FOCR_STAGE_BUDGET_FORWARD_MS (0 = unlimited), or \
+             select fewer pages with `--pages`"
         }
         WarningKind::LeadingText => {
             "check the start of page 1: the model wrote text before its first page marker"
@@ -1198,6 +1200,8 @@ pub fn partial_output(
              pages produced were written",
             finish.as_str()
         ),
+        checkpoint: None,
+        resumed_from: None,
     })))
 }
 
@@ -9830,11 +9834,10 @@ mod tests {
             refused(window(PageWindow::Auto), windowed, 3, "not yet available");
             for resume in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
                 refused(default().resume(resume), windowed, 1, "resume");
-                let files = checkpoint::RunFiles {
-                    journal: "doc.md.partial".into(),
-                    checkpoint: "doc.md.focr-ckpt".into(),
-                    key: checkpoint::ResumeKey::new(),
-                };
+                let files = checkpoint::RunFiles::beside(
+                    std::path::Path::new("doc.md"),
+                    checkpoint::ResumeKey::new(),
+                );
                 let with_files = default().resume(resume).run(files);
                 if windowed {
                     assert!(matches!(

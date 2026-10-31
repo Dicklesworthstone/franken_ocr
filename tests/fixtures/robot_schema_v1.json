@@ -129,7 +129,8 @@
         "yield_chars",
         "input_megapixels",
         "model_id",
-        "source_sha256"
+        "source_sha256",
+        "resumed_from"
       ],
       "required": [
         "schema_version",
@@ -143,7 +144,9 @@
         "pages_out",
         "warnings",
         "model_id",
-        "source_sha256"
+        "source_sha256",
+        "checkpoint",
+        "resumed_from"
       ],
       "required": [
         "schema_version",
@@ -237,7 +240,7 @@
   ],
   "model_license_notice": "Baidu Unlimited-OCR - Copyright (c) 2026 Baidu, MIT License",
   "schema_version": 1,
-  "status": "live — run_start/run_complete (carries `markdown`, `finish_reason`, `model_id` and `source_sha256`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` when a document stopped early (exit 5, or 6 when cancelled; no `run_complete`)",
+  "status": "live — run_start/run_complete (carries `markdown`, `finish_reason`, `model_id` and `source_sha256`, plus `warnings` when a decode reported any and `resumed_from` when the run continued an interrupted document)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` when a document stopped early (exit 5, or 6 when cancelled; no `run_complete`), `checkpoint` when the same command can continue it, and `resumed_from` when it was itself a continuation",
   "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
   "warning_kinds": [
     "v1_truncated",
@@ -248,6 +251,8 @@
     "leading_text",
     "ignored_files",
     "uncertified_crop_mode",
-    "pull_hint"
+    "pull_hint",
+    "resume_recompute",
+    "checkpoint_failed"
   ]
 }

@@ -103,6 +103,11 @@ pub struct PartialOutput {
     pub source_sha256: Option<String>,
     /// The human summary.
     pub message: String,
+    /// The document checkpoint a later run continues from (U2-D4).
+    pub checkpoint: Option<String>,
+    /// The run page this run started decoding at, when it picked up an
+    /// interrupted run.
+    pub resumed_from: Option<usize>,
 }
 
 impl PartialOutput {
@@ -206,12 +211,13 @@ impl FocrError {
                  generation with --max-length, or check for memory pressure/swapping"
             }
             FocrError::Partial(partial) if partial.finish_reason == "budget" => {
-                "the completed pages were written; raise the stage budget with \
-                 FOCR_STAGE_BUDGET_FORWARD_MS (0 = unlimited), or select fewer pages with `--pages`"
+                "the completed pages were written; re-run the same command to continue from the \
+                 last completed window, raise the stage budget with FOCR_STAGE_BUDGET_FORWARD_MS \
+                 (0 = unlimited), or select fewer pages with `--pages`"
             }
             FocrError::Partial(partial) if partial.cancelled() => {
-                "the run was interrupted after writing its completed pages; re-run (with `--pages` \
-                 for the rest) to continue"
+                "the run was interrupted after writing its completed pages; re-run the same \
+                 command to continue from the last completed window"
             }
             FocrError::Partial(_) => {
                 "the completed pages were written; split the document with `--pages`, or parse \
@@ -282,6 +288,8 @@ mod tests {
             model_id: "unlimited-ocr-2",
             source_sha256: None,
             message: "x".into(),
+            checkpoint: None,
+            resumed_from: None,
         }));
         assert_eq!(partial.exit_code(), EXIT_TIMEOUT);
         assert_eq!(partial.kind(), "timeout");

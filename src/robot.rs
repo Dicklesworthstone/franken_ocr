@@ -143,17 +143,21 @@ pub fn event_fields() -> Value {
             // `finish_reason` is on every run whose model records a decode
             // report (every Unlimited-OCR run); `warnings` only when non-empty;
             // `model_id` and `source_sha256` (null for a raw checkpoint)
-            // whenever the model that ran is known.
+            // whenever the model that ran is known; `resumed_from` when the
+            // run picked up an interrupted document (U2-D4).
             "optional": [
                 "finish_reason", "warnings", "low_yield", "yield_chars", "input_megapixels",
-                "model_id", "source_sha256",
+                "model_id", "source_sha256", "resumed_from",
             ],
         },
         "run_error": {
             "required": ["schema_version", "event", "error_kind", "code", "message", "recovery"],
             // A partial-output run_error (completed pages written, then a
             // nonzero exit) adds these; their producers are the v2 beads.
-            "optional": ["finish_reason", "pages_out", "warnings", "model_id", "source_sha256"],
+            "optional": [
+                "finish_reason", "pages_out", "warnings", "model_id", "source_sha256",
+                "checkpoint", "resumed_from",
+            ],
         },
     })
 }
@@ -184,7 +188,7 @@ pub fn robot_schema() -> Value {
             "doctor": "focr doctor --json",
         },
         "stdout_contract": "robot mode emits one JSON object per line on stdout and NOTHING else there; diagnostics go to stderr",
-        "status": "live — run_start/run_complete (carries `markdown`, `finish_reason`, `model_id` and `source_sha256`, plus `warnings` when a decode reported any)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` when a document stopped early (exit 5, or 6 when cancelled; no `run_complete`)"
+        "status": "live — run_start/run_complete (carries `markdown`, `finish_reason`, `model_id` and `source_sha256`, plus `warnings` when a decode reported any and `resumed_from` when the run continued an interrupted document)/run_error plus the streaming page, staff, and music_warning events are wired and contract-tested against `event_fields`; `run_error` carries `recovery`, plus `finish_reason`, `pages_out`, `warnings`, `model_id` and `source_sha256` when a document stopped early (exit 5, or 6 when cancelled; no `run_complete`), `checkpoint` when the same command can continue it, and `resumed_from` when it was itself a continuation"
     })
 }
 
@@ -283,6 +287,12 @@ pub fn run_error_event(err: &FocrError) -> Value {
         }
         event["model_id"] = partial.model_id.into();
         event["source_sha256"] = partial.source_sha256.clone().into();
+        if let Some(checkpoint) = &partial.checkpoint {
+            event["checkpoint"] = checkpoint.as_str().into();
+        }
+        if let Some(page) = partial.resumed_from {
+            event["resumed_from"] = page.into();
+        }
     }
     event
 }
@@ -490,6 +500,8 @@ mod tests {
             model_id: "unlimited-ocr-2",
             source_sha256: None,
             message: "stopped in page 2 of 3".into(),
+            checkpoint: Some("out.md.focr-ckpt".into()),
+            resumed_from: Some(11),
         }));
         let event = run_error_event(&err);
         assert_eq!(event["code"], 5);
@@ -498,6 +510,8 @@ mod tests {
         assert_eq!(event["pages_out"], 2);
         assert_eq!(event["warnings"], json!([warning]));
         assert_eq!(event["model_id"], "unlimited-ocr-2");
+        assert_eq!(event["checkpoint"], "out.md.focr-ckpt");
+        assert_eq!(event["resumed_from"], 11);
         assert_eq!(event["source_sha256"], serde_json::Value::Null);
         assert!(
             event["message"]

@@ -213,7 +213,8 @@ pub struct OcrBatchArgs {
     /// see `focr models`.
     #[arg(long)]
     pub model: Option<PathBuf>,
-    /// Emit machine-readable JSON (one object per image + a final summary).
+    /// Emit one machine-readable JSON object when the run ends: every image's
+    /// result, then the run's timing.
     #[arg(long)]
     pub json: bool,
     /// Use the experimental all-int8 decoder. This also requires
@@ -379,6 +380,26 @@ pub struct OcrRequestArgs {
     /// independently.
     #[arg(long)]
     pub multi_page: bool,
+    /// Continue an interrupted unlimited-ocr-2 `--multi-page` document from
+    /// its last completed window: the result is byte-identical to an
+    /// uninterrupted run. Re-running the same command does the same.
+    /// `--resume=recompute` keeps the completed pages and recomputes the next
+    /// window when the run cannot continue exactly (its settings changed, or
+    /// its checkpoint is damaged); later pages can differ, and a
+    /// `resume_recompute` warning says so.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "matching"
+    )]
+    pub resume: Option<ResumeMode>,
+    /// Keep a windowed document's checkpoint when it finishes. Its journal
+    /// is removed either way.
+    #[arg(long)]
+    pub keep_checkpoint: bool,
     /// Disable the resident warm-model daemon for this run (env analog:
     /// FOCR_NO_RESIDENT=1). By default, eligible single-image runs are served
     /// by a per-model background process that keeps the loaded weights in RAM
@@ -413,6 +434,8 @@ pub struct OcrRequest {
     pub pages: Option<String>,
     pub split_spreads: bool,
     pub multi_page: bool,
+    pub resume: Option<ResumeMode>,
+    pub keep_checkpoint: bool,
     pub no_resident: bool,
 }
 
@@ -508,6 +531,8 @@ impl OcrRequestArgs {
             pages: self.pages.clone(),
             split_spreads: self.split_spreads,
             multi_page: self.multi_page,
+            resume: self.resume,
+            keep_checkpoint: self.keep_checkpoint,
             no_resident: self.no_resident,
         })
     }
@@ -633,6 +658,15 @@ fn model_spec_is_knowably_not_got(spec: Option<&Path>) -> bool {
     };
     let name = name.to_string_lossy().to_ascii_lowercase();
     name.contains("unlimited") && !name.contains("got")
+}
+
+/// How `--resume` continues an interrupted document (U2-D4).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ResumeMode {
+    /// From a checkpoint whose settings match, byte-identically.
+    Matching,
+    /// From the completed pages, recomputing the next window.
+    Recompute,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1507,6 +1541,18 @@ fn run_ocr_inner(
                 .into(),
         ));
     }
+    if (request.resume.is_some() || request.keep_checkpoint) && !paged_document {
+        return Err(FocrError::Usage(
+            "--resume and --keep-checkpoint continue a windowed document: pass --multi-page \
+             with --model unlimited-ocr-2"
+                .into(),
+        ));
+    }
+    let run_files = if paged_document {
+        document_run_files(&request, args.output.as_deref())?
+    } else {
+        None
+    };
     // A document's pages, opened once here so a bad `--pages` spec or a
     // directory without page images fails before the model loads. Files a
     // directory leaves out are reported now, and again on `run_complete`,
@@ -1529,9 +1575,10 @@ fn run_ocr_inner(
     // engine's model.
     let mut resident_finish: Option<native_engine::FinishReason> = None;
     let mut resident_model: Option<native_engine::ModelIdentity> = None;
+    let mut resume_outcome = ResumeOutcome::default();
     let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, source) {
         (plan, Some(source)) if request.multi_page => {
-            let (document, figs) = recognize_document_multi_page(
+            let (document, figs, outcome) = recognize_document_multi_page(
                 &engine,
                 &request,
                 source,
@@ -1541,7 +1588,9 @@ fn run_ocr_inner(
                     paged_model,
                 },
                 plan.as_ref(),
+                run_files.as_ref(),
             )?;
+            resume_outcome = outcome;
             (Recognition::Document(document), figs)
         }
         (Some(plan), Some(source)) => {
@@ -1637,14 +1686,17 @@ fn run_ocr_inner(
             .map(native_engine::decode_warnings)
             .unwrap_or_default(),
     );
+    run_warnings.extend(resume_outcome.warnings);
+    let resumed_from = resume_outcome.resumed_from;
     // An Unlimited-OCR-2 document that stopped at its position limit or
     // stage budget writes what it produced below, then exits 5 (U2-B6). A
     // decode report comes from this engine's loaded model, so `model` is
-    // known whenever there is one.
+    // known whenever there is one. Its journal and checkpoint stay (U2-D4).
     let partial = decode_report
         .as_ref()
         .zip(model.as_ref())
-        .and_then(|(report, model)| native_engine::partial_output(report, &run_warnings, model));
+        .and_then(|(report, model)| native_engine::partial_output(report, &run_warnings, model))
+        .map(|stopped| with_resume_fields(stopped, run_files.as_ref(), resumed_from));
     if !robot_mode {
         print_run_warnings(&run_warnings);
     }
@@ -1737,6 +1789,14 @@ fn run_ocr_inner(
             model.as_ref(),
         )?;
     }
+    // The document is out, so what could have resumed it is done with. A
+    // file left behind costs disk, not the result.
+    if partial.is_none()
+        && let Some(files) = &run_files
+        && let Err(e) = files.remove(request.keep_checkpoint)
+    {
+        eprintln!("[focr] warning: {e}");
+    }
 
     if robot_mode {
         // The terminal success event carries the recognized markdown so a machine
@@ -1744,13 +1804,17 @@ fn run_ocr_inner(
         // human / `--json` modes print it below instead). A partial run ends
         // on its `run_error` instead, never after a `run_complete`.
         if partial.is_none() {
-            emit(&robot::run_complete_event_assessed(
+            let mut event = robot::run_complete_event_assessed(
                 markdown,
                 low_yield.as_ref(),
                 finish_reason,
                 &run_warnings,
                 model.as_ref(),
-            ));
+            );
+            if let Some(page) = resumed_from {
+                event["resumed_from"] = page.into();
+            }
+            emit(&event);
         }
     } else if let Some(path) = args.output.as_deref() {
         // Result already went to the file; don't also echo it to stdout. Confirm
@@ -2268,6 +2332,85 @@ struct DocumentPageLayout {
     layout: Vec<crate::native_engine::LayoutSpan>,
 }
 
+/// What a windowed document's run adds to its report (U2-D4).
+#[derive(Debug, Default)]
+struct ResumeOutcome {
+    /// The run page decoding started at, when the run picked up an
+    /// interrupted one.
+    resumed_from: Option<usize>,
+    /// The warnings of the run rather than its decode.
+    warnings: Vec<native_engine::RunWarning>,
+}
+
+/// Where a windowed document keeps its journal and checkpoint (U2-D4): beside
+/// `output`, or for a stdout run under `<cache_root>/document-runs/`, in the
+/// directory its key names, so the same command finds it again. `None` when
+/// there is neither.
+fn document_run_files(
+    request: &OcrRequest,
+    output: Option<&std::path::Path>,
+) -> FocrResult<Option<native_engine::checkpoint::RunFiles>> {
+    use native_engine::checkpoint::{INPUT_FIELD, ResumeKey, RunFiles, SELECTION_FIELD};
+    let key = ResumeKey::new()
+        .with(
+            INPUT_FIELD,
+            crate::page_source::input_sha256(&request.image)?,
+        )
+        .with(
+            SELECTION_FIELD,
+            format!(
+                "pages={} split_spreads={}",
+                request.pages.as_deref().unwrap_or("all"),
+                request.split_spreads
+            ),
+        )
+        .with(
+            "decode_flags",
+            format!("{:?}", decode_overrides_from(request)),
+        );
+    let files = match (output, crate::dist::cache_root()) {
+        (Some(path), _) => RunFiles::beside(path, key),
+        (None, Some(root)) => RunFiles::keyed(&root.join("document-runs"), key),
+        (None, None) => return Ok(None),
+    };
+    Ok(Some(files.with_command(resume_command())))
+}
+
+/// This process's command line, quoted for a POSIX shell, for `focr doctor`
+/// to report: re-running it continues the document.
+fn resume_command() -> String {
+    let quoted = std::env::args().skip(1).map(|arg| {
+        let plain = !arg.is_empty()
+            && arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./=:,@%+".contains(c));
+        if plain {
+            arg
+        } else {
+            format!("'{}'", arg.replace('\'', r"'\''"))
+        }
+    });
+    std::iter::once("focr".to_owned())
+        .chain(quoted)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `error` with what a later run continues from, when a document stopped.
+fn with_resume_fields(
+    mut error: FocrError,
+    files: Option<&native_engine::checkpoint::RunFiles>,
+    resumed_from: Option<usize>,
+) -> FocrError {
+    if let FocrError::Partial(partial) = &mut error {
+        partial.resumed_from = resumed_from;
+        partial.checkpoint = files
+            .filter(|files| files.has_checkpoint())
+            .map(|files| files.checkpoint.display().to_string());
+    }
+    error
+}
+
 /// A document's JSON `pages`.
 enum DocumentPageList {
     /// Page-by-page passes: each decoded page's layout.
@@ -2307,13 +2450,19 @@ struct DocumentRecognition {
 /// no other raster is held. Its figures are cropped, written as
 /// `page{N}[l|r]_figure_{M}` and referenced from its markdown, once, outside
 /// the retryable parse.
+///
+/// With `files` (a windowed model's run), each window's pages and boundary
+/// are written there, and the run continues an interrupted one it finds
+/// (U2-D4): `--resume=recompute` from its completed pages, otherwise exactly,
+/// or not at all when its settings differ.
 fn recognize_document_multi_page(
     engine: &OcrEngine,
     request: &OcrRequest,
     source: PageSource,
     run: DocumentRun,
     figures: Option<&FigurePlan>,
-) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>)> {
+    files: Option<&native_engine::checkpoint::RunFiles>,
+) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>, ResumeOutcome)> {
     let DocumentRun {
         robot_mode,
         show_progress,
@@ -2321,6 +2470,30 @@ fn recognize_document_multi_page(
     } = run;
     let opened = std::cell::Cell::new(Some(source));
     let noun = page_noun(request);
+    let recompute = request.resume == Some(ResumeMode::Recompute);
+    let options = match files {
+        Some(files) => {
+            if files.journal.exists() {
+                eprintln!(
+                    "[focr] {} the interrupted run in {}",
+                    if recompute {
+                        "recomputing"
+                    } else {
+                        "continuing"
+                    },
+                    files.journal.display()
+                );
+            }
+            native_engine::DocumentOptions::default()
+                .resume(if recompute {
+                    native_engine::ResumePolicy::Recompute
+                } else {
+                    native_engine::ResumePolicy::IfMatching
+                })
+                .run(files.clone())
+        }
+        None => native_engine::DocumentOptions::default(),
+    };
     let document = recognize_with_autodownload(request, robot_mode, |model| {
         let source = attempt_source(&opened, request)?;
         let model_path = model
@@ -2337,17 +2510,19 @@ fn recognize_document_multi_page(
         let raster_bar = progress::Progress::new("raster", selected, show_progress);
         let on_item: Box<dyn FnMut(&PageItem) + Send> = {
             let decode_bar = std::sync::Arc::clone(&decode_bar);
-            let (mut walked, mut rendered) = (0usize, 0usize);
+            let mut failed = 0usize;
             Box::new(move |item: &PageItem| {
                 raster_bar.start_item(format!("page {}/{page_count}", item.source_page));
-                match &item.raster {
-                    Ok(_) => rendered += 1,
-                    Err(e) => report_skipped_page(run, &raster_bar, noun, item.source_page, e),
+                if let Err(e) = &item.raster {
+                    failed += 1;
+                    report_skipped_page(run, &raster_bar, noun, item.source_page, e);
                 }
                 if item.half != Some(Half::Left) {
                     raster_bar.complete_item();
-                    walked += 1;
                 }
+                // Counted from the walk, which a resumed run joins part way.
+                let rendered = item.index + 1 - failed;
+                let walked = item.walk.next - usize::from(item.walk.held);
                 if walked == selected {
                     raster_bar.finish();
                     decode_bar.set_total(rendered);
@@ -2375,13 +2550,7 @@ fn recognize_document_multi_page(
         } else {
             None
         };
-        let out = engine.recognize_document(
-            &model_path,
-            source,
-            &native_engine::DocumentOptions::default(),
-            on_item,
-            on_page,
-        );
+        let out = engine.recognize_document(&model_path, source, &options, on_item, on_page);
         if out.is_ok() {
             decode_bar.finish();
         } else {
@@ -2389,12 +2558,14 @@ fn recognize_document_multi_page(
         }
         out
     })?;
-    // The run's finish_reason and warnings come from the engine's decode
-    // report, as for every other run; its skipped pages were reported as
-    // they were read.
+    // The run's finish_reason and decode warnings come from the engine's
+    // decode report, as for every other run; its skipped pages were reported
+    // as they were read.
     let native_engine::DocumentResult {
         mut markdown,
         mut pages,
+        resumed_from,
+        warnings,
         ..
     } = document;
     let written = match figures {
@@ -2410,6 +2581,13 @@ fn recognize_document_multi_page(
             pages: DocumentPageList::Read(pages),
         },
         written,
+        ResumeOutcome {
+            resumed_from,
+            warnings: warnings
+                .into_iter()
+                .filter(|w| matches!(w.kind, "resume_recompute" | "checkpoint_failed"))
+                .collect(),
+        },
     ))
 }
 
@@ -3562,6 +3740,12 @@ fn run_doctor(args: &DoctorArgs) -> FocrResult<()> {
     } else {
         for f in &findings {
             println!("[{}] {}: {}", f.severity, f.detector, f.message);
+            if let doctor::Fixability::RefusedUnsafe {
+                recommended_command,
+            } = &f.fixability
+            {
+                println!("    run: {recommended_command}");
+            }
         }
     }
     std::process::exit(if findings.is_empty() {
@@ -3732,7 +3916,10 @@ fn with_pull_hint(msg: &str, requested: Option<&Path>) -> String {
         );
     };
     let manifest = dist::builtin_manifest().ok();
-    if !pull_availability(manifest.as_ref(), id).compatible.is_empty() {
+    if !pull_availability(manifest.as_ref(), id)
+        .compatible
+        .is_empty()
+    {
         format!(
             "{msg} — run `focr pull {id}` to install it, or point FOCR_MODEL_PATH at its raw \
              weights or an exact-recipe local artifact"
@@ -4171,6 +4358,64 @@ mod tests {
     }
 
     #[test]
+    fn resume_flags_parse_and_a_stopped_document_names_its_checkpoint() {
+        let resume = |flags: &[&str]| {
+            let mut argv = vec!["focr", "ocr", "book.pdf", "--multi-page"];
+            argv.extend_from_slice(flags);
+            match Cli::try_parse_from(argv).expect("ocr parses").command {
+                Command::Ocr(args) => (args.request.resume, args.request.keep_checkpoint),
+                _ => panic!("not ocr"),
+            }
+        };
+        assert_eq!(resume(&[]), (None, false));
+        assert_eq!(resume(&["--resume"]), (Some(ResumeMode::Matching), false));
+        assert_eq!(
+            resume(&["--resume=recompute", "--keep-checkpoint"]),
+            (Some(ResumeMode::Recompute), true)
+        );
+        assert!(Cli::try_parse_from(["focr", "ocr", "b.pdf", "--resume=sideways"]).is_err());
+        // `--resume` takes no separate value, so a path after it stays one.
+        let cli = Cli::try_parse_from(["focr", "ocr", "--resume", "book.pdf"]).expect("parses");
+        assert!(
+            matches!(cli.command, Command::Ocr(args) if args.request.image.ends_with("book.pdf"))
+        );
+
+        let dir = std::env::temp_dir().join(format!("focr-cli-resume-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a directory");
+        let key = native_engine::checkpoint::ResumeKey::new();
+        let files = native_engine::checkpoint::RunFiles::beside(&dir.join("out.md"), key);
+        let stopped = || {
+            FocrError::Partial(Box::new(crate::error::PartialOutput {
+                finish_reason: "cancelled",
+                pages_out: 10,
+                warnings: Vec::new(),
+                model_id: "unlimited-ocr-2",
+                source_sha256: None,
+                message: "x".into(),
+                checkpoint: None,
+                resumed_from: None,
+            }))
+        };
+        // A run stopped before its first boundary has nothing to continue.
+        let error = with_resume_fields(stopped(), Some(&files), None);
+        assert!(matches!(&error, FocrError::Partial(p) if p.checkpoint.is_none()));
+        std::fs::write(&files.checkpoint, b"state").expect("a checkpoint");
+        let error = with_resume_fields(stopped(), Some(&files), Some(11));
+        match &error {
+            FocrError::Partial(partial) => {
+                assert_eq!(partial.resumed_from, Some(11));
+                assert_eq!(
+                    partial.checkpoint.as_deref(),
+                    Some(files.checkpoint.display().to_string().as_str())
+                );
+            }
+            other => panic!("not partial: {other:?}"),
+        }
+        let other = with_resume_fields(FocrError::Cancelled, Some(&files), None);
+        assert!(matches!(other, FocrError::Cancelled));
+    }
+
+    #[test]
     fn long_version_carries_project_and_model_license_notices() {
         let report = long_version_report();
         assert!(report.contains("focr "));
@@ -4223,6 +4468,8 @@ mod tests {
                     pages: None,
                     split_spreads: false,
                     multi_page: false,
+                    resume: None,
+                    keep_checkpoint: false,
                     no_resident: false,
                     fail_on_low_yield: false,
                 },
@@ -4258,6 +4505,8 @@ mod tests {
                         pages: None,
                         split_spreads: false,
                         multi_page: false,
+                        resume: None,
+                        keep_checkpoint: false,
                         no_resident: false,
                         fail_on_low_yield: false,
                     },
@@ -4287,6 +4536,8 @@ mod tests {
                 pages: None,
                 split_spreads: false,
                 multi_page: false,
+                resume: None,
+                keep_checkpoint: false,
                 no_resident: false,
                 fail_on_low_yield: false,
             },
@@ -5090,6 +5341,8 @@ mod tests {
                 pages: None,
                 split_spreads: false,
                 multi_page: false,
+                resume: None,
+                keep_checkpoint: false,
                 no_resident: false,
                 fail_on_low_yield: false,
             },

@@ -478,9 +478,55 @@ pub struct RunFiles {
     /// The resume-key fields only the caller knows: [`INPUT_FIELD`] and
     /// [`SELECTION_FIELD`]. The library adds the model's and the decode's.
     pub key: ResumeKey,
+    /// The command that continues this run, which the journal keeps for
+    /// `focr doctor` to report.
+    pub command: Option<String>,
 }
 
+/// The journal's name under a keyed run directory.
+pub const KEYED_JOURNAL: &str = "run.partial";
+
+/// The checkpoint's name under a keyed run directory.
+pub const KEYED_CHECKPOINT: &str = "run.focr-ckpt";
+
 impl RunFiles {
+    /// A run whose output is the file `output`: `<output>.partial` and
+    /// `<output>.focr-ckpt` beside it.
+    #[must_use]
+    pub fn beside(output: &Path, key: ResumeKey) -> Self {
+        let sibling = |suffix: &str| {
+            let mut name = output.as_os_str().to_owned();
+            name.push(suffix);
+            PathBuf::from(name)
+        };
+        Self {
+            journal: sibling(".partial"),
+            checkpoint: sibling(".focr-ckpt"),
+            key,
+            command: None,
+        }
+    }
+
+    /// A run with no output file: under `root`, in a directory named by the
+    /// digest of `key`, so a rerun of the same command finds it.
+    #[must_use]
+    pub fn keyed(root: &Path, key: ResumeKey) -> Self {
+        let dir = root.join(key.digest());
+        Self {
+            journal: dir.join(KEYED_JOURNAL),
+            checkpoint: dir.join(KEYED_CHECKPOINT),
+            key,
+            command: None,
+        }
+    }
+
+    /// This run with its resume `command`.
+    #[must_use]
+    pub fn with_command(mut self, command: String) -> Self {
+        self.command = Some(command);
+        self
+    }
+
     /// Drop the finished run's journal, and its checkpoint unless
     /// `keep_checkpoint`. A file that is already gone is fine. Call this once
     /// the output is written: until then these files are the run.
@@ -499,7 +545,19 @@ impl RunFiles {
                 return Err(io_error(path, "remove")(e));
             }
         }
+        // A keyed run's directory goes with its last file.
+        if let Some(dir) = self.journal.parent()
+            && self.journal.file_name() == Some(KEYED_JOURNAL.as_ref())
+        {
+            let _ = std::fs::remove_dir(dir);
+        }
         Ok(())
+    }
+
+    /// Whether a checkpoint is there for a later run.
+    #[must_use]
+    pub fn has_checkpoint(&self) -> bool {
+        self.checkpoint.exists()
     }
 }
 
@@ -561,8 +619,13 @@ pub(super) struct JournalPage {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JournalLine {
-    /// The key of the run that wrote the lines after it.
-    Key { key: ResumeKey },
+    /// The key of the run that wrote the lines after it, and the command
+    /// that continues it.
+    Key {
+        key: ResumeKey,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
+    },
     /// A completed page.
     Page(Box<JournalPage>),
     /// The window the page lines before it belong to.
@@ -588,11 +651,41 @@ struct RunState {
     carried_page: ReadPage,
 }
 
+/// What `focr doctor` reports of an interrupted run: a pure read of its
+/// journal.
+#[cfg(feature = "pdf")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalSummary {
+    /// Pages of the closed windows.
+    pub pages: usize,
+    /// Closed windows.
+    pub windows: usize,
+    /// The command that continues the run.
+    pub command: Option<String>,
+}
+
+/// The run journaled at `path`.
+///
+/// # Errors
+/// A whole line that does not parse, or any I/O error.
+#[cfg(feature = "pdf")]
+pub fn journal_summary(path: &Path) -> FocrResult<JournalSummary> {
+    let (lines, _) = whole_lines(path)?;
+    let journal = replay(&lines)?;
+    Ok(JournalSummary {
+        pages: journal.pages.len(),
+        windows: journal.doc.windows.len(),
+        command: journal.command,
+    })
+}
+
 /// A journal's lines read back.
 #[cfg(feature = "pdf")]
 struct Replay {
-    /// The last key line.
+    /// The last key line's key.
     key: Option<ResumeKey>,
+    /// Its command.
+    command: Option<String>,
     /// The pages of the closed windows.
     pages: Vec<JournalPage>,
     /// The closed windows.
@@ -605,6 +698,7 @@ struct Replay {
 fn replay(lines: &[serde_json::Value]) -> FocrResult<Replay> {
     let mut replay = Replay {
         key: None,
+        command: None,
         pages: Vec::new(),
         doc: WindowedDocument::empty(),
         closed: 0,
@@ -615,8 +709,9 @@ fn replay(lines: &[serde_json::Value]) -> FocrResult<Replay> {
             FocrError::Other(anyhow::anyhow!("document journal: line {}: {e}", n + 1))
         })?;
         match line {
-            JournalLine::Key { key } => {
+            JournalLine::Key { key, command } => {
                 replay.key = Some(key);
+                replay.command = command;
                 if replay.closed == n {
                     replay.closed = n + 1;
                 }
@@ -668,6 +763,7 @@ pub(super) struct DocumentRun {
     journal_path: PathBuf,
     checkpoint_path: PathBuf,
     key: ResumeKey,
+    command: Option<String>,
     /// `None` until the first window ends, so a document that fits one
     /// window leaves no files.
     journal: Option<Journal>,
@@ -693,6 +789,7 @@ impl DocumentRun {
             journal_path: files.journal.clone(),
             checkpoint_path: files.checkpoint.clone(),
             key,
+            command: files.command.clone(),
             journal: None,
             failure: None,
         };
@@ -725,6 +822,11 @@ impl DocumentRun {
     /// [`ResumePolicy::IfMatching`]: the byte-identical continuation, or
     /// `None` when no window completed.
     fn continue_checkpoint(&mut self) -> FocrResult<Option<Resumed>> {
+        // A checkpoint with no journal is what `--keep-checkpoint` left of a
+        // finished run.
+        if !self.journal_path.exists() {
+            return Ok(None);
+        }
         if !self.checkpoint_path.exists() {
             let windows = self
                 .read_journal()
@@ -782,6 +884,7 @@ impl DocumentRun {
             pages,
             doc,
             closed,
+            ..
         } = journal;
         if doc.windows.is_empty() {
             return Ok(None);
@@ -797,10 +900,7 @@ impl DocumentRun {
             }
         }
         let (mut journal, _) = Journal::reopen(&self.journal_path, closed)?;
-        let key = JournalLine::Key {
-            key: self.key.clone(),
-        };
-        journal.append(&[key.to_value()])?;
+        journal.append(&[self.key_line()])?;
         self.journal = Some(journal);
         Ok(Some(Resumed {
             pages,
@@ -808,6 +908,14 @@ impl DocumentRun {
             from: WindowResume::recompute(doc),
             recomputed: true,
         }))
+    }
+
+    fn key_line(&self) -> serde_json::Value {
+        JournalLine::Key {
+            key: self.key.clone(),
+            command: self.command.clone(),
+        }
+        .to_value()
     }
 
     /// Record a window that ended at `boundary`: its `pages` and `record`
@@ -838,11 +946,11 @@ impl DocumentRun {
     ) -> FocrResult<()> {
         let t0 = Instant::now();
         if self.journal.is_none() {
+            if let Some(dir) = self.journal_path.parent().filter(|d| !d.exists()) {
+                std::fs::create_dir_all(dir).map_err(io_error(dir, "create"))?;
+            }
             let mut journal = Journal::create(&self.journal_path)?;
-            let key = JournalLine::Key {
-                key: self.key.clone(),
-            };
-            journal.append(&[key.to_value()])?;
+            journal.append(&[self.key_line()])?;
             self.journal = Some(journal);
         }
         let journal = self.journal.as_mut().expect("the journal was just opened");
@@ -1037,6 +1145,7 @@ mod tests {
                 journal: dir.join("doc.md.partial"),
                 checkpoint: dir.join("doc.md.focr-ckpt"),
                 key: ResumeKey::new(),
+                command: Some("focr ocr doc.pdf -o doc.md --multi-page".into()),
             }
         }
 
@@ -1252,7 +1361,10 @@ mod tests {
             }
             assert!(!files.journal.exists(), "opening writes nothing");
             let mut journal = Journal::create(&files.journal).unwrap();
-            let line = JournalLine::Key { key: key(1) };
+            let line = JournalLine::Key {
+                key: key(1),
+                command: None,
+            };
             journal.append(&[line.to_value()]).unwrap();
             for policy in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
                 let (_, resumed) = DocumentRun::open(&files, key(1), policy).unwrap();
@@ -1263,11 +1375,10 @@ mod tests {
         #[test]
         fn a_run_that_cannot_write_says_so_and_stops_trying() {
             let dir = scratch("unwritable");
-            let files = RunFiles {
-                journal: dir.join("missing").join("doc.md.partial"),
-                checkpoint: dir.join("missing").join("doc.md.focr-ckpt"),
-                key: ResumeKey::new(),
-            };
+            // A file where the run's directory would go.
+            let blocked = dir.join("blocked");
+            std::fs::write(&blocked, b"").unwrap();
+            let files = RunFiles::beside(&blocked.join("doc.md"), ResumeKey::new());
             let (mut run, _) = DocumentRun::open(&files, key(1), ResumePolicy::Never).unwrap();
             let carried = Mat::from_vec(1, 1, vec![1.0]);
             let boundary = WindowBoundary::bare(1, 1, &carried);
@@ -1281,12 +1392,50 @@ mod tests {
         fn a_finished_run_removes_its_files_and_can_keep_the_checkpoint() {
             let dir = scratch("finish");
             let files = interrupted(&dir, 1);
+            assert!(files.has_checkpoint());
             files.remove(true).unwrap();
             assert!(!files.journal.exists());
-            assert!(files.checkpoint.exists());
+            assert!(files.has_checkpoint());
             files.remove(false).unwrap();
-            assert!(!files.checkpoint.exists());
+            assert!(!files.has_checkpoint());
             files.remove(false).unwrap();
+        }
+
+        #[test]
+        fn a_keyed_run_lives_in_its_keys_directory_and_leaves_with_it() {
+            let dir = scratch("keyed");
+            let files = RunFiles::keyed(&dir, key(1));
+            assert_eq!(
+                files.journal.parent(),
+                Some(dir.join(key(1).digest()).as_path())
+            );
+            let (mut run, _) = DocumentRun::open(&files, key(1), ResumePolicy::Never).unwrap();
+            let carried = Mat::from_vec(1, 1, vec![1.0]);
+            let boundary = WindowBoundary::bare(1, 1, &carried);
+            run.window_end(vec![page(0, 0)], &record(0, 0), &boundary, &read(1));
+            assert_eq!(run.failure(), None, "the directory is made as needed");
+            assert!(files.journal.exists());
+            files.remove(false).unwrap();
+            assert!(!dir.join(key(1).digest()).exists());
+        }
+
+        #[test]
+        fn a_journal_summary_reads_a_run_without_touching_it() {
+            let dir = scratch("summary");
+            let files = interrupted(&dir, 2);
+            let before = std::fs::read(&files.journal).unwrap();
+            let summary = journal_summary(&files.journal).unwrap();
+            assert_eq!(summary.pages, 2);
+            assert_eq!(summary.windows, 2);
+            assert_eq!(summary.command, files.command);
+            assert_eq!(std::fs::read(&files.journal).unwrap(), before);
+        }
+
+        #[test]
+        fn beside_names_the_output_and_never_replaces_its_extension() {
+            let files = RunFiles::beside(Path::new("out/doc.v1.md"), ResumeKey::new());
+            assert_eq!(files.journal, Path::new("out/doc.v1.md.partial"));
+            assert_eq!(files.checkpoint, Path::new("out/doc.v1.md.focr-ckpt"));
         }
     }
 }

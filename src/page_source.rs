@@ -463,6 +463,54 @@ impl Iterator for PageSource {
     }
 }
 
+/// The SHA-256 a resume key names `input` by (U2-D4): a file's bytes, or for
+/// a directory one line per page image, `name size sha256`, in natural order,
+/// so renaming, reordering or editing a page changes it.
+///
+/// # Errors
+/// [`FocrError::InputDecode`] when `input` cannot be read.
+pub fn input_sha256(input: &Path) -> FocrResult<String> {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    let file_digest = |path: &Path| {
+        let unreadable =
+            |e: std::io::Error| FocrError::InputDecode(format!("read {}: {e}", path.display()));
+        let mut file = std::fs::File::open(path).map_err(unreadable)?;
+        let (mut hasher, mut size) = (Sha256::new(), 0u64);
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let read = file.read(&mut buffer).map_err(unreadable)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            size += read as u64;
+        }
+        let digest = hasher.finalize().iter().fold(String::new(), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        });
+        Ok::<_, FocrError>((digest, size))
+    };
+    if !input.is_dir() {
+        return Ok(file_digest(input)?.0);
+    }
+    let (pages, _) = list_page_images(input)?;
+    let mut manifest = String::new();
+    for page in &pages {
+        let (digest, size) = file_digest(page)?;
+        let name = page.file_name().map(|n| n.to_string_lossy());
+        let _ = writeln!(manifest, "{} {size} {digest}", name.unwrap_or_default());
+    }
+    Ok(Sha256::digest(manifest.as_bytes())
+        .iter()
+        .fold(String::new(), |mut hex, b| {
+            let _ = write!(hex, "{b:02x}");
+            hex
+        }))
+}
+
 /// The page images in `dir`, in natural order, and the other files it holds.
 fn list_page_images(dir: &Path) -> FocrResult<(Vec<PathBuf>, IgnoredFiles)> {
     let unreadable = |e: std::io::Error| {
@@ -884,6 +932,26 @@ mod tests {
             1,
             "the right half is not re-read"
         );
+    }
+
+    #[test]
+    fn the_input_digest_follows_the_bytes_and_a_directorys_names() {
+        let dir = temp_dir("input-digest");
+        let page = write_page(&dir, "p1.png", &portrait());
+        let directory = input_sha256(&dir).expect("a directory");
+        let file = input_sha256(&page).expect("a file");
+        assert_eq!(file.len(), 64);
+        assert_ne!(directory, file);
+        assert_eq!(input_sha256(&dir).expect("again"), directory);
+        // Text beside the pages is no page.
+        std::fs::write(dir.join("notes.txt"), b"x").expect("notes");
+        assert_eq!(input_sha256(&dir).expect("notes"), directory);
+        std::fs::rename(&page, dir.join("p2.png")).expect("rename");
+        assert_ne!(input_sha256(&dir).expect("renamed"), directory);
+        assert!(matches!(
+            input_sha256(&dir.join("absent.pdf")),
+            Err(FocrError::InputDecode(_))
+        ));
     }
 
     #[test]
