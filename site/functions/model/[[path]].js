@@ -4,13 +4,10 @@
 // model mirror, not an open proxy: only the allow-listed files forward, and only
 // the Range request header crosses.
 //
-// WHY THE PROXY STILL EXISTS, now that HuggingFace sends
-// `access-control-allow-origin: *` and the browser could fetch it directly:
-// the page's CSP is `connect-src 'self'`, and the site sells that as the
-// enforceable form of "your document never leaves the tab". Fetching a model
-// straight from huggingface.co would mean widening `connect-src` to an external
-// origin, which retires exactly the guarantee a reader can verify from the CSP
-// alone. Keeping the fetch same-origin costs a proxy hop and keeps the promise.
+// WHY THE PROXY STILL EXISTS, now that the page fetches weights straight from
+// Hugging Face (site/loader.js): it is the fallback. If that origin is down, or a
+// CSP or an extension blocks the cross-origin fetch, the loader comes here, and
+// this hop goes server-side to the same two hosts.
 //
 // UPSTREAM ORDER: HuggingFace first, GitHub second. GitHub release assets 503
 // under load — which is what motivated the mirror — and cap a single asset at

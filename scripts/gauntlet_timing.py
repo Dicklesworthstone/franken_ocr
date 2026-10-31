@@ -333,6 +333,7 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 ]
 
 _KNOWN_EVENT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^spec_decode rounds=(?P<rounds>\d+) accepted=(?P<accepted>\d+)$"),
     re.compile(
         r"^pdf page (?P<page>\d+): spread split at x=(?P<gutter>\d+) "
         r"\((?P<w>\d+)x(?P<h>\d+)\)$"
@@ -2154,7 +2155,13 @@ def _self_test() -> int:
         math.isclose(tromr_events["tromr_split"]["s"], 0.2),
     )
 
+    spec_events = parse_run(
+        "[focr-timing] preprocess 0.01s\n[focr-timing] spec_decode rounds=12 accepted=30\n"
+    )
+    check("spec-decode-is-an-event-not-a-stage", set(spec_events) == {"preprocess"})
+
     for name, malformed in (
+        ("refuses-malformed-spec-decode", "spec_decode rounds=x accepted=1"),
         ("refuses-near-miss-got-batch-name", "got-ocr2x forward(batch of 3) 1.00s"),
         ("refuses-malformed-tromr-split", "tromr.split seg 0 [a..b] 0.20s (4 chars)"),
         ("refuses-empty-tromr-skip-reason", "tromr.staff 1 SKIP (90x20):"),

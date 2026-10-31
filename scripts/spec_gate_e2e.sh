@@ -18,12 +18,15 @@
 # shields the A/B from a value the caller happens to have exported.
 #
 # MODEL-GATED (Testing Policy: skip-with-SUCCESS without weights). Required env:
-#   FOCR_MODEL_PATH       — the model artifact. An int8 `.focrq` is recommended:
-#                           the spec loop lives inside the int8 decode path
-#                           (`generate_cached_i8`), and a pre-quantized int8
-#                           artifact self-engages it. For other artifacts export
-#                           FOCR_DECODE_INT8=1 yourself — it passes through to
-#                           BOTH arms equally, so composition stays controlled.
+#   FOCR_MODEL_PATH       — a v1 model artifact. The spec loop lives only inside
+#                           the experimental all-int8 decoder
+#                           (`generate_cached_i8`). The conservative artifact
+#                           decodes through `generate_cached`, which has no spec
+#                           loop, so this gate arms FOCR_DECODE_INT8,
+#                           FOCR_INT8_ATTN and FOCR_INT8_LMHEAD for BOTH arms.
+#                           A page whose ON arm never entered the loop FAILS:
+#                           byte identity proves nothing about a loop that
+#                           did not run.
 #   FOCR_SPEC_E2E_IMAGES  — a DIRECTORY of page images (*.png/*.jpg/*.jpeg,
 #                           sorted) or a whitespace-separated LIST of image
 #                           paths (list paths must not contain whitespace).
@@ -37,9 +40,10 @@
 #                           OFF==OFF, separating "spec changed the bytes" from
 #                           ambient nondeterminism before blaming the lever
 #
-# Exit 0 = every page byte-identical ON==OFF (or the gated SKIP). Non-zero = at
-# least one page diverged; outputs are PRESERVED under the printed workdir for
-# diffing. RETRY-PREDICATE (bd-1azu.36): a divergence — especially page_0590 —
+# Exit 0 = every page ran the loop and came out byte-identical ON==OFF (or the
+# gated SKIP). Non-zero = at least one page diverged or never finished the
+# comparison; outputs are PRESERVED under the printed workdir for diffing.
+# RETRY-PREDICATE (bd-1azu.36): a divergence — especially page_0590 —
 # means the verify kernel reordered reductions (the bd-1waa failure class):
 # REVERT the spec lever and record it in docs/NEGATIVE_EVIDENCE.md; never
 # tolerance it away.
@@ -118,9 +122,9 @@ fi
 if [ -n "${FOCR_SPEC_DECODE:-}" ]; then
   info "caller has FOCR_SPEC_DECODE set — OFF arm strips it via 'env -u', ON arm forces =1"
 fi
-if [ -n "${FOCR_DECODE_INT8:-}" ]; then
-  info "FOCR_DECODE_INT8=${FOCR_DECODE_INT8} passes through to BOTH arms (controlled composition)"
-fi
+# Both arms run in their own process on the decoder that holds the spec loop.
+export FOCR_DECODE_INT8=1 FOCR_INT8_ATTN=1 FOCR_INT8_LMHEAD=1 FOCR_NO_RESIDENT=1
+info "both arms: FOCR_DECODE_INT8=1 FOCR_INT8_ATTN=1 FOCR_INT8_LMHEAD=1 FOCR_NO_RESIDENT=1"
 
 # ── sha256 tool (macOS shasum / GNU sha256sum / openssl fallback) ─────────────
 if command -v shasum >/dev/null 2>&1; then
@@ -201,6 +205,8 @@ info "$N_PAGES page(s) queued"
 step "4/4 A/B"
 PASS=0
 FAIL=0
+DIVERGED=0
+ROUNDS=0
 while IFS= read -r img; do
   name=$(basename -- "$img")
   if [ ! -f "$img" ]; then
@@ -237,35 +243,53 @@ while IFS= read -r img; do
     fi
   fi
 
-  # ON arm: the spec loop armed.
-  if ! env FOCR_SPEC_DECODE=1 "$BIN" ocr "$img" --model "$FOCR_MODEL_PATH" \
+  # ON arm: the spec loop armed. FOCR_TIMING reports the rounds it ran (and runs
+  # the page in this process, where the variable reaches the decode).
+  if ! env FOCR_SPEC_DECODE=1 FOCR_TIMING=1 "$BIN" ocr "$img" --model "$FOCR_MODEL_PATH" \
        >"$on_out" 2>"$WORK/$name.on.log"; then
     fail "$name: ON arm exited non-zero (log: $WORK/$name.on.log)"
     FAIL=$((FAIL + 1))
     continue
   fi
+  rounds=$(sed -n 's/.*\[focr-timing\] spec_decode rounds=\([0-9]*\) .*/\1/p' \
+    "$WORK/$name.on.log" | head -n 1)
+  if [ -z "$rounds" ]; then
+    fail "$name: the ON arm never entered the spec loop: decode params outside the frozen ban? (log: $WORK/$name.on.log)"
+    FAIL=$((FAIL + 1))
+    continue
+  fi
+  ROUNDS=$((ROUNDS + rounds))
 
   off_sha=$(sha_of "$off_out")
   on_sha=$(sha_of "$on_out")
   ms=$(( $(now_ms) - S ))
   if [ "$off_sha" = "$on_sha" ]; then
-    ok "$name: ON==OFF sha256=$off_sha (${ms}ms)"
+    ok "$name: ON==OFF sha256=$off_sha rounds=$rounds (${ms}ms)"
     PASS=$((PASS + 1))
   else
     fail "$name: DIVERGED off=$off_sha on=$on_sha (${ms}ms)"
     fail "$name: diff \"$off_out\" \"$on_out\""
     FAIL=$((FAIL + 1))
+    DIVERGED=$((DIVERGED + 1))
   fi
 done < "$LIST"
 
 # ── banner ────────────────────────────────────────────────────────────────────
-log "RESULT pages=$N_PAGES pass=$PASS fail=$FAIL"
+log "RESULT pages=$N_PAGES pass=$PASS fail=$FAIL spec_rounds=$ROUNDS"
+if [ "$FAIL" -eq 0 ] && [ "$ROUNDS" -eq 0 ]; then
+  log "VERDICT FAIL — no page drafted a round, so the verifier never ran on this corpus; outputs preserved under $WORK"
+  exit 1
+fi
 if [ "$FAIL" -eq 0 ]; then
   log "VERDICT PASS — FOCR_SPEC_DECODE is byte-lossless on this corpus"
   rm -rf "$WORK" 2>/dev/null || true
   exit 0
 fi
-log "VERDICT FAIL — spec decode changed bytes; outputs preserved under $WORK"
+if [ "$DIVERGED" -eq 0 ]; then
+  log "VERDICT FAIL — $FAIL page(s) never finished the comparison; none diverged; outputs preserved under $WORK"
+  exit 1
+fi
+log "VERDICT FAIL — spec decode changed bytes on $DIVERGED page(s); outputs preserved under $WORK"
 log "RETRY-PREDICATE (bd-1azu.36): a divergence means the verify kernel reordered"
 log "reductions (bd-1waa class) -> REVERT the lever + record in docs/NEGATIVE_EVIDENCE.md"
 exit 1

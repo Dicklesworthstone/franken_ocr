@@ -181,7 +181,8 @@ fi
 # ── --self-test: full dry run against a stub binary that emits synthetic
 #    FOCR_TIMING lines; asserts the pipeline produces the expected stages. ────
 if (( SELF_TEST )); then
-  TMP="$(mktemp -d "${TMPDIR:-/tmp}/focr-gauntlet-selftest.XXXXXX")"
+  # Evidence paths refuse symlinks, and macOS keeps its temp dir behind one.
+  TMP="$(cd "$(mktemp -d "${TMPDIR:-/tmp}/focr-gauntlet-selftest.XXXXXX")" && pwd -P)"
   for spine_value in enabled 'f alse'; do
     SPINE_OUTPUT=""
     SPINE_RC=0
@@ -237,7 +238,7 @@ path, binary, digest, size = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
-            "schema": "focr-build-receipt/v1",
+            "schema": "focr-build-receipt/v2",
             "profile": "release-perf",
             "binary": {
                 "path": binary,
@@ -324,7 +325,7 @@ path, binary, digest, size = sys.argv[1:]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump(
         {
-            "schema": "focr-build-receipt/v1",
+            "schema": "focr-build-receipt/v2",
             "profile": "release-perf",
             "binary": {
                 "path": binary,
@@ -775,7 +776,7 @@ with open(receipt_path, encoding="utf-8") as handle:
     receipt = json.load(handle)
 binary = receipt.get("binary") if isinstance(receipt, dict) else None
 if (
-    receipt.get("schema") != "focr-build-receipt/v1"
+    receipt.get("schema") != "focr-build-receipt/v2"
     or receipt.get("profile") != "release-perf"
     or not isinstance(binary, dict)
     or os.path.realpath(str(binary.get("path", ""))) != os.path.realpath(binary_path)

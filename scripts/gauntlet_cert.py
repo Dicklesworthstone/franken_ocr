@@ -125,7 +125,7 @@ RAW_TIMING_SCHEMA = "focr-gauntlet-raw-timing/v1"
 PERF_MAX_RAW_TIMING_RUNS = 256
 PERF_MAX_RAW_TIMING_STAGES = 64
 PERF_MAX_RAW_TIMING_FILES = 1024
-BUILD_RECEIPT_SCHEMA = "focr-build-receipt/v1"
+BUILD_RECEIPT_SCHEMA = "focr-build-receipt/v2"
 SOURCE_MANIFEST_SCHEMA = "focr-source-input-manifest/v1"
 SOURCE_PACK_SCHEMA = "focr-source-input-pack/v1"
 SOURCE_ROOT_DOMAIN = b"focr-source-input-root/v1\0"
@@ -3868,9 +3868,6 @@ def _build_receipt_reasons(
         reasons.append("build receipt created_utc is noncanonical")
     target = receipt.get("target_triple")
     expected_command = [
-        "rch",
-        "exec",
-        "--",
         "cargo",
         "build",
         "--locked",
@@ -3890,7 +3887,7 @@ def _build_receipt_reasons(
         or any(character.isspace() for character in target)
         or not isinstance(build, dict)
         or set(build) != {"runner", "command", "cargo_target_dir"}
-        or build.get("runner") != "rch"
+        or build.get("runner") != "cargo"
         or build.get("command") != expected_command
         or not isinstance(build.get("cargo_target_dir"), str)
         or not build["cargo_target_dir"]
@@ -3901,7 +3898,7 @@ def _build_receipt_reasons(
     toolchain = receipt.get("toolchain")
     if (
         not isinstance(toolchain, dict)
-        or set(toolchain) != {"rustc_verbose_version", "cargo_version", "rch_version"}
+        or set(toolchain) != {"rustc_verbose_version", "cargo_version"}
         or any(not isinstance(value, str) or not value.strip() for value in toolchain.values())
     ):
         reasons.append("build receipt toolchain identity is invalid")
@@ -12179,7 +12176,6 @@ def self_test() -> int:
             toolchain={
                 "rustc_verbose_version": "rustc self-test\nhost: aarch64-apple-darwin\n",
                 "cargo_version": "cargo self-test",
-                "rch_version": "rch self-test",
             },
             build_environment={
                 "RUSTFLAGS": None,
@@ -13308,8 +13304,8 @@ def self_test() -> int:
             paths["source_input_manifest"].write_bytes(manifest_content)
             if duplicate_receipt:
                 paths["build_receipt"].write_text(
-                    '{"schema":"focr-build-receipt/v1",'
-                    '"schema":"focr-build-receipt/v1"}\n',
+                    '{"schema":"focr-build-receipt/v2",'
+                    '"schema":"focr-build-receipt/v2"}\n',
                     encoding="utf-8",
                 )
             else:
@@ -13351,7 +13347,24 @@ def self_test() -> int:
         )
         build_contract_case(
             "cert-build-legacy-schema-rejected",
-            mutate_receipt=lambda value: value.update(schema="focr-build-receipt/v0"),
+            mutate_receipt=lambda value: value.update(schema="focr-build-receipt/v1"),
+        )
+        build_contract_case(
+            "cert-build-rch-runner-rejected",
+            mutate_receipt=lambda value: value["build"].update(runner="rch"),
+            required_reason="HEAD/profile/target/command",
+        )
+        build_contract_case(
+            "cert-build-rch-command-rejected",
+            mutate_receipt=lambda value: value["build"]["command"].__setitem__(
+                slice(0, 0), ["rch", "exec", "--"]
+            ),
+            required_reason="HEAD/profile/target/command",
+        )
+        build_contract_case(
+            "cert-build-rch-toolchain-field-rejected",
+            mutate_receipt=lambda value: value["toolchain"].update(rch_version="rch 2"),
+            required_reason="toolchain identity",
         )
         build_contract_case(
             "cert-build-extra-field-rejected",

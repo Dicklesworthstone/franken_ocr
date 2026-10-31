@@ -922,12 +922,14 @@ Rules:
 
 - `FOCR_SPEC_DECODE` is presence-armed. `FOCR_SPEC_DECODE=0` still turns it on;
   scripts use `env -u FOCR_SPEC_DECODE` for the OFF arm.
-- `bd-1azu.36` proves the LINEAR gate ON==OFF over 20 pages in f32 and int8.
-  A new drift means the gate regressed or the environment composed in another
-  lever.
-- That proof is output identity, not proof that the spec loop engaged on every
-  ON run. If engagement matters, first add/read telemetry such as spec-round
-  timing or acceptance counters.
+- The spec loop lives only in the experimental all-int8 decoder. On the default
+  conservative artifact `FOCR_SPEC_DECODE` changes nothing, so the gate arms
+  `FOCR_DECODE_INT8`, `FOCR_INT8_ATTN` and `FOCR_INT8_LMHEAD` for both arms.
+- `bd-1azu.36` proves the LINEAR gate ON==OFF over 20 pages in int8. Its f32 arm
+  compared two identical paths and proves nothing about the loop. A new drift
+  means the gate regressed or the environment composed in another lever.
+- The ON arm reports `spec_decode rounds=… accepted=…` under `FOCR_TIMING`, and
+  the gate fails a page that never entered the loop.
 - Do not certify with `FOCR_ATTN_GEMM` or `FOCR_INT8_KV` present; those rejected
   key-batch levers are explicitly barred from the spec path.
 - Preserve the failing workdir from `scripts/spec_gate_e2e.sh` and compare the

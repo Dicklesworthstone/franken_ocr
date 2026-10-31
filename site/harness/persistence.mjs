@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const require = (await import("node:module")).createRequire(
-  "/Users/jemanuel/projects/frankentts/package.json",
+  process.env.FOCR_PLAYWRIGHT_PACKAGE ?? "/Users/jemanuel/projects/frankentts/package.json",
 );
 const { chromium } = require("playwright");
 

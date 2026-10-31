@@ -4,9 +4,13 @@
 Usage:
     python3 scripts/got_cer.py <hypothesis.txt> <ground_truth.txt>
     python3 scripts/got_cer.py --raw <hypothesis.txt> <ground_truth.txt>
+    python3 scripts/got_cer.py --format-corpus
     python3 scripts/got_cer.py --selftest
 
 Prints JSON: {"chars_gt", "edit_distance", "cer", "words_gt", "word_edit_distance", "wer"}
+
+`--format-corpus` scores the frozen readings in tests/fixtures/got/format_corpus
+against their sidecars and exits 1 if any score differs from `FORMAT_SCORES`.
 
 Normalization (applied to BOTH hypothesis and ground truth so the comparison is
 fair on a scanned historical book), in order:
@@ -18,9 +22,13 @@ fair on a scanned historical book), in order:
   6. collapse all whitespace runs to a single space (and strip)
 """
 
+import contextlib
+import io
 import json
+import os
 import re
 import sys
+import tempfile
 
 
 # ---------------------------------------------------------------------------
@@ -215,6 +223,92 @@ def score(hyp, gt, raw=False):
 
 
 # ---------------------------------------------------------------------------
+# The `--format` corpus (bd-fqn1)
+# ---------------------------------------------------------------------------
+
+FORMAT_CORPUS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tests", "fixtures", "got", "format_corpus",
+)
+
+# asset -> (int8 CER, f32 CER, verdict). Exact on purpose, in both directions: a
+# frozen reading that gets worse OR better has to change a number here in a
+# reviewed diff. A misread asset is listed with its real CER and is not a pass.
+FORMAT_SCORES = {
+    "table": (0.0, 0.0, "read"),
+    "molecule": (0.0, 0.0, "read"),
+    "chart": (0.3, 0.1, "MISREAD by int8, bd-kd75"),
+    "music": (1.3023, 1.3023, "MISREAD, f32 too"),
+    "formula": (4.8485, 4.8485, "MISREAD as SMILES, f32 too"),
+}
+
+
+def _squeeze(text):
+    return _WS_RE.sub("", text)
+
+
+def _table_cells(text):
+    return re.sub(r"\\begin\{tabular\}\{[^}]*\}|\\end\{tabular\}|\\hline|&|\\\\", "", text)
+
+
+# RDKit writes the sidecar's benzene ring Kekulé and GOT writes it aromatic. Both
+# name the same ring, so one spelling is scored.
+def _molecule(text):
+    return re.sub(r"</?smiles>", "", text).replace("C1=CC=CC=C1", "c1ccccc1")
+
+
+def format_reference(asset, sidecar):
+    """Reduce a ground-truth sidecar to the content a reader would check."""
+    if asset == "table":
+        table = json.loads(sidecar)
+        return "".join("".join(map(str, row)) for row in [table["headers"], *table["rows"]])
+    if asset == "chart":
+        chart = json.loads(sidecar)
+        pairs = zip(chart["labels"], chart["values"])
+        return chart["title"] + "".join(f"{k}{v}" for k, v in pairs)
+    if asset == "molecule":
+        return _molecule(sidecar)
+    return sidecar
+
+
+def format_hypothesis(asset, reading):
+    """Reduce a frozen reading the same way, keeping everything the model said."""
+    if asset == "table":
+        return _table_cells(reading)
+    if asset == "chart":
+        chart = json.loads(reading)
+        return chart["title"] + "".join(f"{k}{v}" for k, v in chart["values"].items())
+    if asset == "molecule":
+        return _molecule(reading)
+    return reading
+
+
+def format_cer(asset, reading, sidecar):
+    hyp = _squeeze(format_hypothesis(asset, reading))
+    ref = _squeeze(format_reference(asset, sidecar))
+    return round(edit_distance(list(hyp), list(ref)) / len(ref), 4)
+
+
+def format_corpus(root=FORMAT_CORPUS, scores=None):
+    """Score every frozen reading. Returns the disagreements with `scores`."""
+    scores = FORMAT_SCORES if scores is None else scores
+    failures = []
+    for asset, (int8, f32, verdict) in scores.items():
+        sidecar = next(
+            name for name in sorted(os.listdir(root))
+            if name.startswith(f"{asset}.gt.")
+        )
+        truth = _read(os.path.join(root, sidecar))
+        for arm, recorded, suffix in (("int8", int8, "got"), ("f32", f32, "f32.got")):
+            reading = _read(os.path.join(root, f"{asset}.{suffix}.txt"))
+            cer = format_cer(asset, reading, truth)
+            print(json.dumps({"asset": asset, "arm": arm, "cer": cer, "verdict": verdict}))
+            if cer != recorded:
+                failures.append(f"{asset} {arm}: scored {cer}, recorded {recorded}")
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
@@ -252,6 +346,28 @@ def selftest():
     r = score("pene-\ntrate the WALL", "penetrate the wall")
     assert r["cer"] == 0.0, r
 
+    # The `--format` reductions: both spellings of a ring, a tabular, a chart.
+    assert format_cer("molecule", "<smiles>Oc1ccccc1</smiles>", "OC1=CC=CC=C1\n") == 0.0
+    table = '{"headers": ["Item", "Qty"], "rows": [["Nut", 4]]}'
+    latex = "\\begin{tabular}{|c|c|}\n\\hline Item & Qty \\\\\n\\hline Nut & 4 \\\\\n\\end{tabular}"
+    assert format_cer("table", latex, table) == 0.0
+    chart = '{"title": "T", "labels": ["A", "B"], "values": [3, 7]}'
+    assert format_cer("chart", '{"title": "T", "values": {"A": "3", "B": "7"}}', chart) == 0.0
+    assert format_cer("chart", '{"title": "T", "values": {"A": "3", "B": "5"}}', chart) == 0.2
+
+    # A frozen reading that moves either way fails against its recorded score.
+    with tempfile.TemporaryDirectory() as tmp:
+        for name, text in (
+            ("music.gt.krn", "4c 4d\n"), ("music.got.txt", "4c 4d\n"),
+            ("music.f32.got.txt", "4c 4e\n"),
+        ):
+            with open(os.path.join(tmp, name), "w", encoding="utf-8") as fh:
+                fh.write(text)
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert format_corpus(tmp, {"music": (0.0, 0.25, "x")}) == []
+            assert len(format_corpus(tmp, {"music": (0.25, 0.25, "x")})) == 1
+            assert len(format_corpus(tmp, {"music": (0.0, 0.0, "x")})) == 1
+
     print("selftest OK")
     return 0
 
@@ -269,6 +385,11 @@ def main(argv):
     args = list(argv)
     if "--selftest" in args:
         return selftest()
+    if "--format-corpus" in args:
+        failures = format_corpus()
+        for failure in failures:
+            sys.stderr.write(f"got_cer.py: {failure}\n")
+        return 1 if failures else 0
 
     raw = False
     if "--raw" in args:
@@ -278,6 +399,7 @@ def main(argv):
     if len(args) != 2:
         sys.stderr.write(
             "usage: got_cer.py [--raw] <hypothesis.txt> <ground_truth.txt>\n"
+            "       got_cer.py --format-corpus\n"
             "       got_cer.py --selftest\n"
         )
         return 2

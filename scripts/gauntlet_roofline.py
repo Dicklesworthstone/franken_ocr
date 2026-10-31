@@ -877,7 +877,9 @@ def measured_views(doc: dict) -> int:
     for name in ("vision_sam", "got_vision_splice", "onechart_vision_splice", "vision_encode"):
         record = stage_record(doc, name)
         if record is not None:
-            return record.get("occurrences", 1)
+            # A per-view format has one line per view. A batched line is one
+            # occurrence of many views, and says how many.
+            return record.get("views", record.get("occurrences", 1))
     raise RooflineError("measurement file has no vision stage to derive the view count from")
 
 
@@ -1078,6 +1080,12 @@ def _self_test() -> int:
         check("got-refuses-unmeasured-kv", False)
     except RooflineError:
         check("got-refuses-unmeasured-kv", True)
+
+    # The view count: one line per view, or one batched line naming its views.
+    per_view = {"stages": [{"stage": "vision_sam", "occurrences": 2}]}
+    check("views-from-per-view-lines", measured_views(per_view) == 2)
+    batched = {"stages": [{"stage": "vision_sam", "occurrences": 1, "views": 5}]}
+    check("views-from-a-batched-line", measured_views(batched) == 5)
 
     # Prefill refuses a fabricated token count; accepts a measured one.
     try:

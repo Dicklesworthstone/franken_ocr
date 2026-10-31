@@ -120,7 +120,7 @@ MAX_RAW_TIMING_STAGES = 64
 MAX_RAW_TIMING_FILES = 1024
 MAX_RAW_TIMING_FILE_BYTES = 64 * 1024 * 1024
 MAX_RAW_TIMING_TOTAL_BYTES = 512 * 1024 * 1024
-BUILD_RECEIPT_SCHEMA = "focr-build-receipt/v1"
+BUILD_RECEIPT_SCHEMA = "focr-build-receipt/v2"
 SOURCE_MANIFEST_SCHEMA = "focr-source-input-manifest/v1"
 SOURCE_PACK_SCHEMA = "focr-source-input-pack/v1"
 SOURCE_ROOT_DOMAIN = b"focr-source-input-root/v1\0"
@@ -866,7 +866,6 @@ def _active_build_toolchain(workspace_root: str) -> tuple[dict, str]:
     for name, command in (
         ("rustc_verbose_version", ["rustc", "-vV"]),
         ("cargo_version", ["cargo", "--version"]),
-        ("rch_version", ["rch", "--version"]),
     ):
         try:
             result = subprocess.run(
@@ -1083,11 +1082,8 @@ def build_receipt_document(
         "profile": "release-perf",
         "target_triple": target_triple,
         "build": {
-            "runner": "rch",
+            "runner": "cargo",
             "command": [
-                "rch",
-                "exec",
-                "--",
                 "cargo",
                 "build",
                 "--locked",
@@ -1188,9 +1184,6 @@ def validate_build_provenance(
     _canonical_utc_timestamp(receipt.get("created_utc"), "build receipt created_utc")
     target = receipt.get("target_triple")
     expected_command = [
-        "rch",
-        "exec",
-        "--",
         "cargo",
         "build",
         "--locked",
@@ -1210,7 +1203,7 @@ def validate_build_provenance(
         or any(character.isspace() for character in target)
         or not isinstance(build, dict)
         or set(build) != {"runner", "command", "cargo_target_dir"}
-        or build.get("runner") != "rch"
+        or build.get("runner") != "cargo"
         or build.get("command") != expected_command
         or not isinstance(build.get("cargo_target_dir"), str)
         or not build["cargo_target_dir"]
@@ -1221,8 +1214,7 @@ def validate_build_provenance(
     toolchain = receipt.get("toolchain")
     if (
         not isinstance(toolchain, dict)
-        or set(toolchain)
-        != {"rustc_verbose_version", "cargo_version", "rch_version"}
+        or set(toolchain) != {"rustc_verbose_version", "cargo_version"}
         or any(not isinstance(toolchain.get(key), str) or not toolchain[key].strip() for key in toolchain)
     ):
         raise RowError("build receipt toolchain identity is invalid")
@@ -3518,7 +3510,6 @@ def _attach_synthetic_provenance(
     synthetic_toolchain = {
         "rustc_verbose_version": "rustc self-test\nhost: aarch64-apple-darwin\n",
         "cargo_version": "cargo self-test",
-        "rch_version": "rch self-test",
     }
     receipt = build_receipt_document(
         created_utc="2026-07-01T00:00:00Z",
@@ -3730,6 +3721,8 @@ def _self_test() -> int:
             failures.append(name)
 
     with tempfile.TemporaryDirectory(prefix="focr-gauntlet-row-selftest-") as tmp:
+        # Evidence paths refuse symlinks, and macOS keeps its temp dir behind one.
+        tmp = os.path.realpath(tmp)
         focr_path, ref_path, roofline_path, focr = _synthetic_inputs(tmp)
         synthetic_head = "0123456789abcdef0123456789abcdef01234567"
         focr, ref, _receipt, _manifest, synthetic_host = _attach_synthetic_provenance(

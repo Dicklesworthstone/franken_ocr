@@ -10,7 +10,7 @@
 #
 # or step-by-step (each step is idempotent and strictly serial):
 #
-#   bash scripts/gauntlet_runbook.sh build          # clean-tree RCH release-perf build
+#   bash scripts/gauntlet_runbook.sh build          # clean-tree local release-perf build
 #   bash scripts/gauntlet_runbook.sh preflight      # receipt + fixtures + self-tests
 #   bash scripts/gauntlet_runbook.sh focr           # TIMED: focr best-of-5 warm @8
 #   bash scripts/gauntlet_runbook.sh reference      # TIMED: HF baseline best-of-5 warm @8
@@ -135,7 +135,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from gauntlet_row import build_receipt_document
 
 MANIFEST_SCHEMA = "focr-source-input-manifest/v1"
-RECEIPT_SCHEMA = "focr-build-receipt/v1"
+RECEIPT_SCHEMA = "focr-build-receipt/v2"
 ROOT_DOMAIN = b"focr-source-input-root/v1\0"
 MAX_SOURCE_ENTRIES = 50_000
 MAX_SOURCE_FILE_BYTES = 64 * 1024 * 1024
@@ -634,16 +634,13 @@ def validate_receipt_shape(receipt, *, head, binary_path, binary_identity, manif
     build = receipt.get("build")
     if (
         not isinstance(build, dict)
-        or build.get("runner") != "rch"
+        or build.get("runner") != "cargo"
         or not isinstance(build.get("cargo_target_dir"), str)
         or not build["cargo_target_dir"]
     ):
         raise ReceiptError("build receipt runner/target-dir identity is incomplete")
     command = build.get("command")
     expected = [
-        "rch",
-        "exec",
-        "--",
         "cargo",
         "build",
         "--locked",
@@ -655,7 +652,7 @@ def validate_receipt_shape(receipt, *, head, binary_path, binary_identity, manif
         triple,
     ]
     if command != expected:
-        raise ReceiptError("build receipt command is not the canonical RCH release-perf build")
+        raise ReceiptError("build receipt command is not the canonical local release-perf build")
     environment = receipt.get("build_environment")
     required_environment = (
         "RUSTFLAGS",
@@ -690,7 +687,7 @@ def validate_receipt_shape(receipt, *, head, binary_path, binary_identity, manif
     toolchain = receipt.get("toolchain")
     if not isinstance(toolchain, dict) or any(
         not isinstance(toolchain.get(key), str) or not toolchain[key].strip()
-        for key in ("rustc_verbose_version", "cargo_version", "rch_version")
+        for key in ("rustc_verbose_version", "cargo_version")
     ):
         raise ReceiptError("build receipt toolchain identity is incomplete")
 
@@ -729,7 +726,6 @@ def mode_write_receipt(root, manifest_path, receipt_path, binary_path, target, t
         toolchain={
             "rustc_verbose_version": run(["rustc", "-vV"], cwd=root).stdout,
             "cargo_version": run(["cargo", "--version"], cwd=root).stdout.strip(),
-            "rch_version": run(["rch", "--version"], cwd=root).stdout.strip(),
         },
         build_environment={
             "RUSTFLAGS": os.environ.get("RUSTFLAGS"),
@@ -802,10 +798,9 @@ def mode_verify_receipt(root, receipt_path, manifest_path, binary_path):
     current_toolchain = {
         "rustc_verbose_version": run(["rustc", "-vV"], cwd=root).stdout,
         "cargo_version": run(["cargo", "--version"], cwd=root).stdout.strip(),
-        "rch_version": run(["rch", "--version"], cwd=root).stdout.strip(),
     }
     if receipt.get("toolchain") != current_toolchain:
-        raise ReceiptError("active Rust/RCH toolchain drifted from the build receipt")
+        raise ReceiptError("active Rust toolchain drifted from the build receipt")
 
 
 def mode_self_test():
@@ -849,17 +844,16 @@ def mode_self_test():
         "profile": "release-perf",
         "target_triple": triple,
         "build": {
-            "runner": "rch",
+            "runner": "cargo",
             "cargo_target_dir": "/scratch/target",
             "command": [
-                "rch", "exec", "--", "cargo", "build", "--locked",
+                "cargo", "build", "--locked",
                 "--profile", "release-perf", "--bin", "focr", "--target", triple,
             ],
         },
         "toolchain": {
             "rustc_verbose_version": "rustc test",
             "cargo_version": "cargo test",
-            "rch_version": "rch test",
         },
         "build_environment": {
             "RUSTFLAGS": None,
@@ -912,8 +906,8 @@ def mode_self_test():
     wrong_manifest["source_manifest"]["sha256"] = "1" * 64
     mutations.append((wrong_manifest, "source-manifest hash"))
     wrong_runner = json.loads(json.dumps(receipt))
-    wrong_runner["build"]["runner"] = "cargo"
-    mutations.append((wrong_runner, "non-RCH runner"))
+    wrong_runner["build"]["runner"] = "rch"
+    mutations.append((wrong_runner, "an RCH runner, whose route no receipt can prove"))
     missing_flags = json.loads(json.dumps(receipt))
     missing_flags["build_environment"].pop("RUSTFLAGS")
     mutations.append((missing_flags, "missing Rust flags"))
@@ -1214,9 +1208,9 @@ verify_build_receipt() {
   note "trusted release-perf build receipt verified"
 }
 
-# ── build — clean-source RCH build + immutable producer receipt ─────────────
+# ── build — clean-source local build + immutable producer receipt ───────────
 step_build() {
-  note "build: clean local source closure + RCH release-perf receipt"
+  note "build: clean local source closure + local release-perf receipt"
   build_receipt_tool validate-destinations \
     "$OUT" "$SOURCE_MANIFEST" "$BUILD_RECEIPT" "$FOCR_BIN" \
     || die "release evidence destination contains a symlink component"
@@ -1235,7 +1229,7 @@ step_build() {
 
   # Snapshot first: a dirty current tree must fail before a target directory or
   # release artifact is created. The post-build check rejects source/config
-  # changes that occurred while RCH was compiling.
+  # changes that occurred while cargo was compiling.
   build_receipt_tool snapshot "$SOURCE_MANIFEST" \
     || die "release evidence build refused the dirty or unreadable source closure"
 
@@ -1245,14 +1239,18 @@ step_build() {
   scratch="${FOCR_GAUNTLET_SCRATCH_ROOT:-/Volumes/USBNVME16TB/temp_agent_space}"
   [[ -d "$scratch" ]] || die "gauntlet scratch root is missing: $scratch"
   target_dir="$(mktemp -d "$scratch/focr-gauntlet-target.XXXXXX")"
-  note "RCH build target: $target_dir ($target)"
-  CARGO_TARGET_DIR="$target_dir" \
-    rch exec -- cargo build --locked --profile release-perf --bin focr --target "$target"
+  note "local build target: $target_dir ($target)"
+  # Evidence builds here, by the cargo the receipt records. `rch exec` fails open
+  # to a local build and cannot be told to stay local, so its receipt could prove
+  # neither the machine nor the toolchain that compiled the binary (bd-2mo.30.14).
+  # The bypass keeps an installed rch cargo shim from offloading this build.
+  CARGO_TARGET_DIR="$target_dir" RCH_CARGO_WRAPPER_BYPASS=1 \
+    cargo build --locked --profile release-perf --bin focr --target "$target"
   built="$target_dir/$target/release-perf/focr"
-  [[ -x "$built" ]] || die "RCH build did not produce the expected focr binary: $built"
+  [[ -x "$built" ]] || die "the build did not produce the expected focr binary: $built"
 
   build_receipt_tool verify-snapshot "$SOURCE_MANIFEST" \
-    || die "source closure changed during the RCH build"
+    || die "source closure changed during the build"
   pre_sha="$(shasum -a 256 "$built" | awk '{print $1}')"
   pre_size="$(wc -c <"$built" | tr -d '[:space:]')"
   mkdir -p "$(dirname "$FOCR_BIN")"
@@ -1260,9 +1258,9 @@ step_build() {
   post_sha="$(shasum -a 256 "$built" | awk '{print $1}')"
   post_size="$(wc -c <"$built" | tr -d '[:space:]')"
   [[ "$pre_sha" == "$post_sha" && "$pre_size" == "$post_size" ]] \
-    || die "RCH output changed while copying the receipted binary"
+    || die "the build output changed while copying the receipted binary"
   [[ "$(shasum -a 256 "$FOCR_BIN" | awk '{print $1}')" == "$pre_sha" ]] \
-    || die "evidence binary copy hash does not match the RCH output"
+    || die "evidence binary copy hash does not match the build output"
 
   build_receipt_tool write-receipt \
     "$SOURCE_MANIFEST" "$BUILD_RECEIPT" "$FOCR_BIN" "$target" "$target_dir" \
