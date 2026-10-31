@@ -22,6 +22,7 @@
 
 pub mod batch_scheduler;
 pub mod calib;
+pub mod checkpoint;
 pub mod connector;
 pub mod decoder;
 pub mod decoder_qwen2;
@@ -466,7 +467,8 @@ pub fn validate_test_max_positions() -> FocrResult<()> {
 }
 
 /// How a decode ended (U2-X2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FinishReason {
     /// The model emitted EOS.
     Stop,
@@ -535,7 +537,8 @@ pub struct DecodeReport {
 }
 
 /// How one Unlimited-OCR-2 page body ended (U2-B6): its `finish`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PageFinish {
     /// The model opened the next page.
     Marker,
@@ -859,6 +862,10 @@ pub enum WarningKind {
     UncertifiedCropMode,
     /// The run mode's default model is not installed, so v1 served (D25).
     PullHint,
+    /// A document continued with a recomputed window (U2-D4).
+    ResumeRecompute,
+    /// A run stopped writing its journal and checkpoint (U2-D4).
+    CheckpointFailed,
 }
 
 /// Every machine-stable `warnings[].kind` a run can report, in the robot
@@ -874,6 +881,8 @@ pub const RUN_WARNING_KINDS: &[&str] = &[
     "ignored_files",
     "uncertified_crop_mode",
     "pull_hint",
+    "resume_recompute",
+    "checkpoint_failed",
 ];
 
 /// The one actionable next step for each [`WarningKind`]: the single source
@@ -911,6 +920,14 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
         WarningKind::PullHint => {
             "install the default with `focr pull <model_id>` (this warning's `model_id`), or \
              choose a model with `--model`"
+        }
+        WarningKind::ResumeRecompute => {
+            "for output identical to an uninterrupted run, remove the journal and checkpoint \
+             and parse the document from its first page"
+        }
+        WarningKind::CheckpointFailed => {
+            "the output is complete, but this run could not have resumed; free space or fix \
+             the permissions where its checkpoint is written"
         }
     }
 }
@@ -1059,6 +1076,36 @@ fn v1_page_warnings(report: &DecodeReport) -> Vec<RunWarning> {
         (FinishReason::Budget | FinishReason::Cancelled, _) => return Vec::new(),
     };
     vec![warning]
+}
+
+/// A document that continued with a recomputed window from run page
+/// `from_page` (U2-D4).
+#[cfg(feature = "pdf")]
+fn resume_recompute_warning(from_page: usize) -> RunWarning {
+    let mut fields = serde_json::Map::new();
+    fields.insert("from_page".into(), from_page.into());
+    RunWarning {
+        kind: "resume_recompute",
+        message: format!(
+            "resumed with a recomputed window at page {from_page}: pages from there on can \
+             differ from an uninterrupted run's"
+        ),
+        recovery: warning_recovery(WarningKind::ResumeRecompute),
+        fields,
+    }
+}
+
+/// A run that stopped writing its files because of `cause` (U2-D4).
+#[cfg(feature = "pdf")]
+fn checkpoint_failed_warning(cause: &str) -> RunWarning {
+    let mut fields = serde_json::Map::new();
+    fields.insert("cause".into(), cause.into());
+    RunWarning {
+        kind: "checkpoint_failed",
+        message: format!("the run stopped writing its journal and checkpoint: {cause}"),
+        recovery: warning_recovery(WarningKind::CheckpointFailed),
+        fields,
+    }
 }
 
 /// An Unlimited-OCR-2 document decode's warnings (U2-B6), never v1's: the
@@ -2031,7 +2078,8 @@ impl LayoutSpan {
 }
 
 /// Which half of a split two-page spread a page is (`--split-spreads`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Half {
     Left,
     Right,
@@ -2060,7 +2108,7 @@ impl Half {
 
 /// Where one page of a document came from. A document read from an image
 /// list has no source document, so its pages are their 1-based positions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PageOrigin {
     /// 1-based page of the source.
     pub source_page: usize,
@@ -2200,16 +2248,21 @@ pub enum PageWindow {
     Off,
 }
 
-/// Whether a document run resumes from its checkpoint (U2-E2). Resume
-/// arrives with U2-D4; until then only [`ResumePolicy::Never`] is admitted.
+/// Whether a document run picks up an interrupted run's files
+/// ([`DocumentOptions::run`], U2-D4).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ResumePolicy {
     /// Always parse from the first page.
     #[default]
     Never,
-    /// Resume when a checkpoint of the same document and model exists.
+    /// Continue from a checkpoint whose resume key matches, byte-identical
+    /// to an uninterrupted run; refuse one that does not, naming the fields.
+    /// With no interrupted run, parse from the first page.
     IfMatching,
-    /// Discard any checkpoint and parse from the first page.
+    /// Keep the journal's completed pages and recompute the next window
+    /// (§5.10.5), whatever the checkpoint says. The rest of the document can
+    /// differ from an uninterrupted run, and a `resume_recompute` warning
+    /// says so.
     Recompute,
 }
 
@@ -2220,13 +2273,17 @@ pub enum ResumePolicy {
 /// `DocumentOptions::default().page_window(PageWindow::Off)`. Decode tuning
 /// ([`DecodeOverrides`], `--max-page-tokens` among them) and preprocess
 /// overrides apply as for any run; a document reads base views only.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DocumentOptions {
     /// The decode windows; `None` is the model's default policy.
     pub page_window: Option<PageWindow>,
     /// Checkpoint resume.
     pub resume: ResumePolicy,
+    /// Where a windowed run keeps its journal and checkpoint; `None` keeps
+    /// neither. The caller removes them once the output is written
+    /// ([`checkpoint::RunFiles::remove`]).
+    pub run: Option<checkpoint::RunFiles>,
 }
 
 impl DocumentOptions {
@@ -2244,19 +2301,40 @@ impl DocumentOptions {
         self
     }
 
+    /// These options with a run that keeps its state in `files`.
+    #[must_use]
+    pub fn run(mut self, files: checkpoint::RunFiles) -> Self {
+        self.run = Some(files);
+        self
+    }
+
     /// How a document of `pages` source pages decodes under these options
     /// on `model`, which decodes windows when `windowed`.
     ///
     /// # Errors
-    /// [`FocrError::Usage`] for a window `model` cannot decode, or an option
-    /// this build cannot honor yet: refused, never ignored.
+    /// [`FocrError::Usage`] for a window `model` cannot decode, a resume with
+    /// no files or no windows, or an option this build cannot honor yet:
+    /// refused, never ignored.
     fn plan(&self, model: &str, windowed: bool, pages: usize) -> FocrResult<DocumentPlan> {
+        let plan = self.window_plan(model, windowed, pages)?;
         if self.resume != ResumePolicy::Never {
-            return Err(FocrError::Usage(format!(
-                "document resume ({:?}) is not yet available; parse with ResumePolicy::Never",
-                self.resume
-            )));
+            if self.run.is_none() {
+                return Err(FocrError::Usage(
+                    "a document resume needs the interrupted run's files (RunFiles)".into(),
+                ));
+            }
+            if plan == DocumentPlan::OnePass {
+                return Err(FocrError::Usage(format!(
+                    "{model} reads this document in one pass, which has no window to resume \
+                     from"
+                )));
+            }
         }
+        Ok(plan)
+    }
+
+    /// [`Self::plan`]'s window policy.
+    fn window_plan(&self, model: &str, windowed: bool, pages: usize) -> FocrResult<DocumentPlan> {
         match self.page_window {
             Some(PageWindow::Pages(0)) => Err(FocrError::Usage(
                 "a page window needs at least one page".into(),
@@ -2321,9 +2399,13 @@ pub struct DocumentResult {
     pub extra_markers: usize,
     /// The decode windows, in order (U2-D1b); empty for one pass.
     pub windows: Vec<window::WindowStats>,
+    /// The run page (1-based) this run started decoding at, when it picked
+    /// up an interrupted run (U2-D4).
+    pub resumed_from: Option<usize>,
     /// The source's warnings (`ignored_files`), then the decode's: the lever
     /// admission's `ignored_lever`, then the document's (`leading_text`,
-    /// `v2_length`, `v2_budget`) or v1's (`v1_truncated`, `v1_page_merge`).
+    /// `v2_length`, `v2_budget`) or v1's (`v1_truncated`, `v1_page_merge`),
+    /// then the run's (`resume_recompute`, `checkpoint_failed`).
     pub warnings: Vec<RunWarning>,
     /// The model that read the document.
     pub model: ModelIdentity,
@@ -4508,11 +4590,39 @@ impl OcrModel {
     ) -> FocrResult<DocumentResult> {
         multi_page_route(self.arch())?;
         let plan = options.plan(self.arch().id(), self.decodes_windows(), source.len())?;
+        let (mut run, resumed) = match (plan, &options.run) {
+            (DocumentPlan::Windows(window), Some(files)) => {
+                let key = self.resume_key(window, &files.key)?;
+                let (run, resumed) = checkpoint::DocumentRun::open(files, key, options.resume)?;
+                (Some(run), resumed)
+            }
+            _ => (None, None),
+        };
+        let resumed_from = resumed.as_ref().map(|r| r.from.next_page() + 1);
+        let recompute_from = resumed
+            .as_ref()
+            .filter(|r| r.recomputed)
+            .map(|r| r.from.next_page() + 1);
+        // The pages a resumed run already read: it walks on past them.
+        let read_before = resumed
+            .as_ref()
+            .map_or_else(Vec::new, checkpoint::Resumed::read);
+        if let Some(last) = read_before.last() {
+            let map = read_before
+                .iter()
+                .flat_map(checkpoint::ReadPage::map_slots)
+                .collect();
+            source.seek(last.walk, map)?;
+        }
+        let mut skipped: Vec<crate::pdf::SkippedPage> = read_before
+            .iter()
+            .flat_map(|page| page.skipped.iter().cloned())
+            .collect();
         // The pages as they are read: each rasterized, preprocessed and its
         // raster dropped; one that did not rasterize is skipped (D24) and
         // keeps its source page, so no later page's numbering shifts.
-        let read = std::cell::RefCell::new(Vec::<(PageOrigin, (u32, u32))>::new());
-        let mut skipped = Vec::new();
+        let read = std::cell::RefCell::new(read_before);
+        let mut skipped_since_read = Vec::new();
         let mut first_error: Option<FocrError> = None;
         let mut pages = std::iter::from_fn(|| {
             for item in source.by_ref() {
@@ -4525,15 +4635,22 @@ impl OcrModel {
                         };
                         let pre = self.document_page(img);
                         if let Ok(pre) = &pre {
-                            read.borrow_mut().push((origin, pre.original_size));
+                            read.borrow_mut().push(checkpoint::ReadPage {
+                                origin,
+                                size: pre.original_size,
+                                walk: item.walk,
+                                skipped: std::mem::take(&mut skipped_since_read),
+                            });
                         }
                         return Some(pre);
                     }
                     Err(e) => {
-                        skipped.push(crate::pdf::SkippedPage {
+                        let page = crate::pdf::SkippedPage {
                             page: item.source_page,
                             reason: e.to_string(),
-                        });
+                        };
+                        skipped_since_read.push(page.clone());
+                        skipped.push(page);
                         first_error.get_or_insert(e);
                     }
                 }
@@ -4547,7 +4664,7 @@ impl OcrModel {
             }
             DocumentPlan::Windows(window) => {
                 let sink = on_page.as_mut().map(|sink| &mut **sink as PageSink<'_>);
-                self.parse_windowed(&mut pages, window, &read, sink)?
+                self.parse_windowed(&mut pages, window, &read, resumed, run.as_mut(), sink)?
             }
         };
         let (DocumentPages { markdown, pages }, windows) = match parsed {
@@ -4559,7 +4676,7 @@ impl OcrModel {
                 }
                 // Split spreads can make more logical pages than source pages.
                 options.plan(self.arch().id(), self.decodes_windows(), pres.len())?;
-                let origins: Vec<PageOrigin> = read.borrow().iter().map(|(o, _)| *o).collect();
+                let origins: Vec<PageOrigin> = read.borrow().iter().map(|p| p.origin).collect();
                 (self.parse_document(pres, &origins, on_page)?, Vec::new())
             }
             DocumentParse::Windowed(pages, windows) => {
@@ -4593,6 +4710,12 @@ impl OcrModel {
         ));
         let mut warnings = source.warnings();
         warnings.extend(report.as_ref().map(decode_warnings).unwrap_or_default());
+        warnings.extend(recompute_from.map(resume_recompute_warning));
+        warnings.extend(
+            run.as_ref()
+                .and_then(checkpoint::DocumentRun::failure)
+                .map(checkpoint_failed_warning),
+        );
         Ok(DocumentResult {
             markdown,
             pages_out: report
@@ -4609,17 +4732,57 @@ impl OcrModel {
                 .and_then(|r| r.document.as_ref())
                 .map_or(0, |stats| stats.extra_markers),
             windows,
+            resumed_from,
             warnings,
             model: self.identity(),
         })
     }
 
+    /// The resume key of a document in windows of `window` own pages on this
+    /// model (U2-D4, plan D14): the caller's fields, then everything that
+    /// shapes the decode. Thread width is no part of it: the decode does not
+    /// depend on it.
+    ///
+    /// # Errors
+    /// An invalid decoder-precision setting.
+    #[cfg(feature = "pdf")]
+    fn resume_key(
+        &self,
+        window: usize,
+        caller: &checkpoint::ResumeKey,
+    ) -> FocrResult<checkpoint::ResumeKey> {
+        let params = self.document_params(window + 1);
+        Ok(caller
+            .clone()
+            .with("binary_version", env!("CARGO_PKG_VERSION"))
+            .with("target_arch", std::env::consts::ARCH)
+            .with("model_id", self.arch().id())
+            .with("artifact_sha256", self.weights.source_sha256())
+            .with(
+                "quant_recipe",
+                self.weights.quant_recipe().unwrap_or("none"),
+            )
+            .with("window", window)
+            .with("temperature", params.temperature.to_bits())
+            .with("max_length", params.max_length)
+            .with("max_page_tokens", params.max_page_tokens)
+            .with("max_positions", params.max_positions)
+            .with("no_repeat_ngram_size", params.no_repeat_ngram_size)
+            .with("ngram_window", params.ngram_window)
+            .with("entmax_domain", format!("{:?}", params.entmax_domain))
+            .with("crop_mode", format!("{:?}", preprocess_mode()))
+            .with("retirement", srswa::retire_enabled())
+            .with("precision", DocumentPrecision::from_env()?.name())
+            .with("kv_dtype", "f32"))
+    }
+
     /// A document in windows of `window` own pages (U2-D1b): the windowed
     /// decode over `pages` as they stream in ([`Self::decode_document_windowed`]),
     /// or the pages back for one pass when they fit one window. `read` holds
-    /// each page read so far, its origin and raster size; each window's pages
-    /// stream to `on_page` as the window ends, their boxes in their own
-    /// pixels.
+    /// each page read so far; each window's pages stream to `on_page` as the
+    /// window ends, their boxes in their own pixels, and each boundary goes
+    /// to `run` (U2-D4). `resumed` picks up an interrupted run, whose pages
+    /// stream first, from its journal.
     ///
     /// # Errors
     /// Any page, vision or decode error.
@@ -4628,7 +4791,9 @@ impl OcrModel {
         &self,
         pages: &mut dyn Iterator<Item = FocrResult<Preprocessed>>,
         window: usize,
-        read: &std::cell::RefCell<Vec<(PageOrigin, (u32, u32))>>,
+        read: &std::cell::RefCell<Vec<checkpoint::ReadPage>>,
+        resumed: Option<checkpoint::Resumed>,
+        mut run: Option<&mut checkpoint::DocumentRun>,
         mut on_page: Option<PageSink<'_>>,
     ) -> FocrResult<DocumentParse> {
         let opts = window::WindowedOptions {
@@ -4637,43 +4802,83 @@ impl OcrModel {
         };
         let model_id = self.arch().id();
         let mut results: Vec<PageResult> = Vec::new();
-        let mut sink = |w: &window::WindowStats, own: window::WindowPages<'_>| {
-            let read = read.borrow();
-            for (k, body) in own.bodies.iter().enumerate() {
-                let run = w.pages.start + k;
-                let (origin, size) = read[run];
-                let page = PageResult {
-                    window: Some(w.index),
-                    tokens: own.tokens.get(k).copied(),
-                    finish: own.finish.get(k).copied(),
-                    ..PageResult::read(run + 1, body, size, origin, model_id)
-                };
-                if let Some(sink) = on_page.as_deref_mut() {
-                    sink(&StreamedPage {
-                        index: run + 1,
-                        body: body.trim(),
-                        page: Some(&page),
-                    });
+        let mut add_page = |page: &checkpoint::JournalPage, body: &str| {
+            let result = PageResult {
+                window: Some(page.window),
+                tokens: page.tokens,
+                finish: page.finish,
+                ..PageResult::read(
+                    page.run_index,
+                    body,
+                    page.read.size,
+                    page.read.origin,
+                    model_id,
+                )
+            };
+            if let Some(sink) = on_page.as_deref_mut() {
+                sink(&StreamedPage {
+                    index: page.run_index,
+                    body: body.trim(),
+                    page: Some(&result),
+                });
+            }
+            results.push(result);
+        };
+        let from = resumed.map(|resumed| {
+            for page in &resumed.pages {
+                if let Some(body) = &page.body {
+                    add_page(page, body);
                 }
-                results.push(page);
+            }
+            resumed.from
+        });
+        let mut sink = |record: &window::WindowRecord,
+                        boundary: Option<&window::WindowBoundary<'_>>| {
+            let w = &record.stats;
+            let read = read.borrow();
+            let own: Vec<checkpoint::JournalPage> = w
+                .pages
+                .clone()
+                .enumerate()
+                .map(|(k, page)| checkpoint::JournalPage {
+                    run_index: page + 1,
+                    window: w.index,
+                    read: read[page].clone(),
+                    body: record.bodies.get(k).cloned(),
+                    tokens: record.tokens.get(k).copied(),
+                    finish: record.finish.get(k).copied(),
+                })
+                .collect();
+            for page in &own {
+                if let Some(body) = &page.body {
+                    add_page(page, body);
+                }
+            }
+            if let (Some(run), Some(boundary)) = (run.as_deref_mut(), boundary) {
+                run.window_end(own, record, boundary, &read[boundary.next_page()]);
             }
         };
         let _admission = forward_admission().acquire();
-        Ok(
-            match self.decode_document_windowed(pages, &opts, Some(&mut sink))? {
-                window::Windowing::Fits(pres) => DocumentParse::OnePass(pres),
-                window::Windowing::Windowed(doc) => {
-                    let markdown = postprocess::join_page_texts(results.iter().map(|p| &p.text));
-                    DocumentParse::Windowed(
-                        DocumentPages {
-                            markdown,
-                            pages: results,
-                        },
-                        doc.windows,
-                    )
-                }
-            },
-        )
+        let decoded =
+            match from {
+                Some(from) => window::Windowing::Windowed(Box::new(
+                    self.resume_document_windowed(pages, from, &opts, Some(&mut sink))?,
+                )),
+                None => self.decode_document_windowed(pages, &opts, Some(&mut sink))?,
+            };
+        Ok(match decoded {
+            window::Windowing::Fits(pres) => DocumentParse::OnePass(pres),
+            window::Windowing::Windowed(doc) => {
+                let markdown = postprocess::join_page_texts(results.iter().map(|p| &p.text));
+                DocumentParse::Windowed(
+                    DocumentPages {
+                        markdown,
+                        pages: results,
+                    },
+                    doc.windows,
+                )
+            }
+        })
     }
 
     /// One document page's preprocess: v1's Base-640 squash, or a paged
@@ -9514,7 +9719,7 @@ mod tests {
         ] {
             let options = DocumentOptions {
                 page_window: window,
-                ..options
+                ..options.clone()
             };
             reads_input(document(&mut files(over), &options).expect_err("unread pages"));
         }
@@ -9605,12 +9810,12 @@ mod tests {
         let plan = |options: DocumentOptions, windowed: bool, pages: usize| {
             options.plan(v1, windowed, pages).expect("planned")
         };
-        let default = DocumentOptions::default();
+        let default = DocumentOptions::default;
         assert_eq!(
-            plan(default, true, 500),
+            plan(default(), true, 500),
             DocumentPlan::Windows(window::DEFAULT_PAGE_WINDOW)
         );
-        assert_eq!(plan(default, false, 500), DocumentPlan::OnePass);
+        assert_eq!(plan(default(), false, 500), DocumentPlan::OnePass);
         for windowed in [true, false] {
             assert_eq!(
                 plan(window(PageWindow::Off), windowed, 500),
@@ -9624,7 +9829,27 @@ mod tests {
             );
             refused(window(PageWindow::Auto), windowed, 3, "not yet available");
             for resume in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
-                refused(default.resume(resume), windowed, 1, "resume");
+                refused(default().resume(resume), windowed, 1, "resume");
+                let files = checkpoint::RunFiles {
+                    journal: "doc.md.partial".into(),
+                    checkpoint: "doc.md.focr-ckpt".into(),
+                    key: checkpoint::ResumeKey::new(),
+                };
+                let with_files = default().resume(resume).run(files);
+                if windowed {
+                    assert!(matches!(
+                        plan(with_files.clone(), true, 500),
+                        DocumentPlan::Windows(_)
+                    ));
+                    refused(
+                        with_files.page_window(PageWindow::Off),
+                        true,
+                        500,
+                        "no window to resume",
+                    );
+                } else {
+                    refused(with_files, false, 500, "no window to resume");
+                }
             }
         }
         assert_eq!(
@@ -10603,8 +10828,8 @@ mod tests {
                 .map_err(|e| FocrError::Other(anyhow::anyhow!("{}: {e}", path.display())))?;
             model.document_page(img)
         });
-        let mut sink = |_: &window::WindowStats, own: window::WindowPages<'_>| {
-            bodies.push(own.bodies.to_vec())
+        let mut sink = |record: &window::WindowRecord, _: Option<&window::WindowBoundary<'_>>| {
+            bodies.push(record.bodies.clone())
         };
         model
             .decode_document_windowed(&mut pages, opts, Some(&mut sink))
