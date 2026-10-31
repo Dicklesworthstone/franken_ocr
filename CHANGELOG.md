@@ -607,6 +607,20 @@ sections as they land.
 
 ### Fixed
 
+- **`--task chart` and `--task formula` pad the image to a square** (bead bd-pi74).
+  GOT's upstream resize stretches every image to a square, and on these two tasks that
+  costs more than quantization does, on the f32 checkpoint too. Charts with every value
+  right went from 20 to 29 of 36, and formulas from 1 to 3 of 8. `--format` alone and
+  every other task keep the upstream resize: a padded table is read as SMILES. The
+  daemon protocol moves to 4, so a stale daemon is restarted, not silently unpadded.
+- **`--task chart-data` says when its reading is unverified** (bead bd-a7zs). OneChart's
+  text gave usable values on 0 of 36 clean charts, and its reliability check never
+  reached a verdict, yet nothing reported that. Such a run now gets a `chart_unverified`
+  warning carrying the number head as `pred_locs`, the part that does work: within 10%
+  of the range on 31 of 36. This holds through the daemon too.
+- **The GOT `--format` corpus has real scores** (bead bd-fqn1). The lenient smoke tests
+  passed garbage: a formula read as SMILES contained `=`. Frozen readings on int8 and
+  f32 now hold each asset to an exact score, and the README says which lanes misread.
 - **The speculative-decode gate proves the loop ran** (bead bd-2dui). The loop
   lives only in the experimental all-int8 decoder, so on the default artifact
   `scripts/spec_gate_e2e.sh` compared two identical decodes and passed. It now

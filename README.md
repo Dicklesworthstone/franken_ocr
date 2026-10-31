@@ -551,7 +551,10 @@ glyphs below ~12px — re-capture at higher resolution; no OCR engine recovers
 (the default) is plain document OCR, unchanged. `--task formula`, `tables`, `chart`,
 `molecular`, and `geometry` are served by GOT-OCR2's `OCR with format:` mode, so each
 implies `--format` (an explicit `--format` composes idempotently) and needs the
-got-ocr2 model: `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `--task music`
+got-ocr2 model: `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `--task chart`
+and `--task formula` also pad the image to a white square first, because GOT misreads
+both when upstream's square resize stretches them; `--format` alone keeps that resize,
+and so does every other task. `--task music`
 has two valid lanes: TrOMR is the native OMR path and returns MusicXML, while GOT-OCR2
 can still run its sheet-music format mode. Use `focr pull tromr`, then `--model tromr.int8.focrq --task music`
 for a full printed/scanned page or a staff crop. Use `focr pull tromr --quant f32`
@@ -561,7 +564,8 @@ model: `focr pull smolvlm2`, then `--model smolvlm2.int8.focrq --task describe`,
 color is the car?"`. SmolVLM2 has no instruction modes; the task is the question
 (default: the model-card caption prompt). `--task chart-data` is the OneChart path: it
 runs chart-to-dict extraction with the number-head reliability check and needs a
-onechart artifact, for example `focr pull onechart`, then `--model onechart.int8.focrq`. Pointing a
+onechart artifact, for example `focr pull onechart`, then `--model onechart.int8.focrq`.
+A reading that does not pass that check says so with a `chart_unverified` warning. Pointing a
 specialized task at the wrong model family fails with usage guidance before any weights
 load.
 
@@ -663,9 +667,9 @@ focr models --json                          # machine-readable list
 | Model | Status | Use it for | Notes |
 |---|---:|---|---|
 | **`unlimited-ocr`** *(default)* | runtime ready, pull ready | Plain-text document OCR for general documents and PDFs. This is what `focr ocr` runs by default. | `focr pull` installs the v0.7.0 conservative exact-recipe artifact; raw BF16 and locally converted compatible artifacts are also supported. |
-| **`got-ocr2`** | ready | Specialized structured output the default cannot produce: formulas, tables, charts, molecular diagrams, geometry, and sheet music. | Heavier per page; `--task formula|tables|chart|molecular|geometry|music` implies `--format`. |
+| **`got-ocr2`** | ready | Specialized structured output the default cannot produce: formulas, tables, charts, molecular diagrams, geometry, and sheet music. | Heavier per page; `--task formula|tables|chart|molecular|geometry|music` implies `--format`. Accuracy varies widely by format, so read the table below the zoo first. |
 | **`smolvlm2`** | ready | Photo description and VQA through `--task describe [--question "..."]`. | `focr pull smolvlm2` installs `smolvlm2.int8.focrq` plus `tokenizer.json` in the model subdirectory. |
-| **`onechart`** | ready | Chart-to-data extraction through `--task chart-data`. | `focr pull onechart` installs `onechart.int8.focrq`, `vocab.json`, `merges.txt`, and `added_tokens.json`. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. |
+| **`onechart`** | ready | Chart-to-data extraction through `--task chart-data`. | `focr pull onechart` installs `onechart.int8.focrq`, `vocab.json`, `merges.txt`, and `added_tokens.json`. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. Its number head is the part to trust; its text often is not, and an unverified reading warns. |
 | **`tromr`** | ready | Polyphonic sheet-music OMR through `--task music`. | `focr pull tromr` installs `tromr.int8.focrq` plus the rhythm, pitch, lift, and note tokenizer tables; `focr pull tromr --quant f32` installs the bit-exact `tromr.focrq` reference artifact. Staff crops and full pages both run; bad staves are skipped with reasons when at least one staff recognizes, and over-budget systems can split at detected barlines. |
 | **`unlimited-ocr-2`** | experimental | Baidu's long-document successor to the default model (sparse routed attention across pages). | Runs from its raw checkpoint directory (`--model <dir>`) on single pages and on documents of any length (`--multi-page`, read in windows of 10 pages). A document that stops early at its position limit or forward budget writes its pages, then exits 5. Not yet certified against the reference, so use `unlimited-ocr` for production. |
 | **`trocr`**, **`pix2tex`** | planned | Handwriting and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
@@ -678,6 +682,24 @@ focr ocr --model got-ocr2.int8.focrq page.png         # plain-text OCR
 focr ocr --model got-ocr2.int8.focrq --format eq.png  # structured .mmd: LaTeX / tables / charts / music
 focr ocr --model got-ocr2.int8.focrq --task tables page.png  # task shorthand (implies --format)
 ```
+
+**How far to trust the structured lanes.** These are small synthetic sets, measured on
+the published artifacts. They can show a lane failing; they do not show one working on
+your documents. None of these lanes warns on a wrong reading except OneChart.
+
+| Lane | Measured | Advice |
+|---|---|---|
+| `--task tables` | One table, read exactly. | |
+| `--task molecular` | One molecule, read correctly. | |
+| `--task chart` | 29 of 36 bar charts have every value right. The misses are plausible wrong numbers. | Check the numbers against the chart. |
+| `--task formula` | 3 of 8 formulas right. The rest come back as SMILES or TikZ, not as bad LaTeX. | Expect misses, and check each formula. |
+| `--task music` on GOT-OCR2 | One two-bar staff, misread. | Use TrOMR. |
+| `--task chart-data` | Text gave usable values on 0 of 36 charts. The number head averaged within 10% of the range on 31 of 36. | Read `pred_locs` from `--json`: bar heights from 0 to 1, in order. It does not say how many bars there are. |
+
+Tables, the molecule, music and formulas read the same on the upstream f32 checkpoint.
+Charts do not: int8 costs a further margin there. Evidence:
+[`artifacts/accuracy/bd-kd75/`](artifacts/accuracy/bd-kd75/README.md) and
+[`tests/fixtures/got/format_corpus/`](tests/fixtures/got/format_corpus/README.md).
 
 Run SmolVLM2 (photo description / VQA):
 

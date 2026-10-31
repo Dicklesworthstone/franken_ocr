@@ -1,10 +1,8 @@
-# GOT `--format` validation corpus — phase 1 (model-free synthesis, bd-3kix)
+# GOT `--format` validation corpus (bd-3kix, bd-fqn1)
 
 Small, clean, fully synthetic images for each GOT-OCR2 specialized
-`OCR with format:` modality — the corpus that did not exist anywhere on this
-machine (scout inventory, bd-3kix), so `--format` (bd-3jo6.2.10) was
-plumbing-tested but accuracy-unvalidated. Every image is rendered from a source
-that is committed verbatim as its ground-truth sidecar:
+`OCR with format:` modality. Every image is rendered from a source that is
+committed verbatim as its ground-truth sidecar:
 
 | image | modality | ground truth (the render source) |
 |---|---|---|
@@ -35,20 +33,48 @@ cairosvg 2.9.0, homebrew cairo 1.18.4. `molecule.png`/`music.png` are optional
 at generation time (the script SKIPs them with a note if rdkit/verovio are
 unavailable); both installed cleanly on this machine, so none were skipped.
 
-## Consumers
+## Readings and scores (bd-fqn1)
 
-- **Phase 1 (this):** `src/native_engine/got.rs` `format_corpus_*_smoke_e2e`
-  tests — env-gated (`FOCR_GOT_MODEL` + `FOCR_GOT_TIKTOKEN`, skip-with-success)
-  format-mode smoke gates asserting non-empty output containing LENIENT
-  structural markers (a table digit, a chart value, ...). Run:
+Each asset has two frozen readings of the upstream `--format` pipeline, which stretches
+the image to a square:
 
-  ```
-  FOCR_GOT_MODEL=/path/to/got-ocr2.int8.focrq \
-  FOCR_GOT_TIKTOKEN=/path/to/qwen.tiktoken \
-      cargo test --release format_corpus -- --nocapture
-  ```
+- `<asset>.got.txt`: the published int8 artifact, through the shipped KV-cache decode.
+- `<asset>.f32.got.txt`: the upstream checkpoint
+  (`stepfun-ai/GOT-OCR2_0@979938bf`), through the re-prefill decode. This is the only
+  true f32 path: `got::recognize` quantizes at build, whatever the file holds.
 
-- **Phase 2 (bd-3kix follow-up):** once the real-model outputs are eyeballed,
-  freeze per-asset hypothesis files and exact CER budgets scored with
-  `scripts/got_cer.py` against these sidecars (the B8 pattern,
-  `tests/fixtures/got/cer/`).
+`chart.task.got.txt` and `chart.task.f32.got.txt` are the same two arms on what
+`--task chart` feeds the model, the image padded to a white square. `--task formula`
+pads too, but `formula.png` stays misread, so it has no reading of its own here.
+
+A frozen reading records what the model says, and **frozen does not mean right**.
+`scripts/got_cer.py --format-corpus` scores every reading against its sidecar, with
+markup and whitespace removed, and fails if a score differs from `FORMAT_SCORES` in
+either direction. `scripts/check.sh` runs it.
+
+| asset | int8 CER | f32 CER | verdict |
+|---|---:|---:|---|
+| table | 0 | 0 | Read exactly. |
+| molecule | 0 | 0 | Read as aspirin. RDKit canonicalizes the reading and the sidecar to one SMILES. |
+| chart | 0.30 | 0.10 | **Misread.** Int8 gets three of four values wrong (A3 B5 C9 D10 for 3/7/5/9); f32 gets all four. Both say "Budget" for "Widget". See bd-kd75. |
+| chart, `--task chart` | 0.55 | 0.55 | **Values read, title lost.** Every value right on both arms, byte-identical. The title reads `None`, and on a 20-character reference that alone costs more than three wrong digits: CER is a poor measure of a chart. |
+| music | 1.3023 | 1.3023 | **Misread.** Both invent a second spine and `*M22`, and lose the second bar. |
+| formula | 4.8485 | 4.8485 | **Misread as SMILES.** Both arms, byte-identical. |
+
+Formula, table, molecule and music are byte-identical between the arms, so int8 costs
+nothing on them; the squashed chart is the one reading where it does. Five images is one image per
+format, so this table can show a lane failing but cannot show one working in general.
+`artifacts/accuracy/bd-kd75/` holds the larger probe behind the chart and formula
+findings.
+
+Run the readings, armed by real weights:
+
+```
+FOCR_GOT_MODEL=/path/to/got-ocr2.int8.focrq \
+FOCR_GOT_TIKTOKEN=/path/to/qwen.tiktoken \
+    cargo ltest --release format_corpus -- --nocapture
+```
+
+`FOCR_GOT_MODEL=/path/to/model.safetensors` runs the f32 arm instead, at about five
+minutes per asset. To freeze a new reading, set `UPDATE_GOLDENS=1`, review the diff,
+and update its score in `scripts/got_cer.py` in the same change.
