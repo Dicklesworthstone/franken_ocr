@@ -89,6 +89,9 @@ impl DoctorRoot {
         Ok(Self { cache_root })
     }
 
+    pub fn document_runs_dir(&self) -> PathBuf {
+        self.cache_root.join("document-runs")
+    }
     pub fn models_dir(&self) -> PathBuf {
         self.cache_root.join("models")
     }
@@ -115,7 +118,76 @@ pub fn detect(root: &DoctorRoot) -> Vec<Finding> {
     detect_unreadable_cache_entries(root, &mut findings);
     detect_orphaned_partials(root, &mut findings);
     detect_package_transactions(root, &mut findings);
+    #[cfg(feature = "pdf")]
+    detect_document_runs(root, &mut findings);
     findings
+}
+
+/// Runs a document left under `document-runs/` (U2-D4): resumable state, not
+/// litter, so this reports each with the command that continues it and no
+/// fixer touches them. A run with `-o` keeps its files beside the output,
+/// where the doctor does not look.
+#[cfg(feature = "pdf")]
+fn detect_document_runs(root: &DoctorRoot, out: &mut Vec<Finding>) {
+    use crate::native_engine::checkpoint::{KEYED_CHECKPOINT, KEYED_JOURNAL, journal_summary};
+    let Ok(entries) = std::fs::read_dir(root.document_runs_dir()) else {
+        return;
+    };
+    let mut runs: Vec<PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    runs.sort();
+    for run in runs {
+        let (journal, checkpoint) = (run.join(KEYED_JOURNAL), run.join(KEYED_CHECKPOINT));
+        if journal.exists() {
+            let (message, fixability) = match journal_summary(&journal) {
+                Ok(summary) => (
+                    format!(
+                        "an interrupted document run (or one still running): {} pages in {} \
+                         windows, {}",
+                        summary.pages,
+                        summary.windows,
+                        if checkpoint.exists() {
+                            "with its checkpoint"
+                        } else {
+                            "no checkpoint, so only `--resume=recompute` can continue it"
+                        }
+                    ),
+                    match summary.command {
+                        Some(command) => Fixability::RefusedUnsafe {
+                            recommended_command: command,
+                        },
+                        None => Fixability::AdviceOnly {
+                            hint: "re-run the command that started it".into(),
+                        },
+                    },
+                ),
+                Err(e) => (
+                    format!("an interrupted document run whose journal does not read: {e}"),
+                    Fixability::AdviceOnly {
+                        hint: "re-run the command with `--resume=recompute`, or remove the \
+                               directory to start over"
+                            .into(),
+                    },
+                ),
+            };
+            out.push(Finding {
+                detector: "interrupted_document_run",
+                severity: "warn",
+                path: Some(journal.display().to_string()),
+                message,
+                fixability,
+            });
+        } else if checkpoint.exists() {
+            out.push(Finding {
+                detector: "kept_document_checkpoint",
+                severity: "info",
+                path: Some(checkpoint.display().to_string()),
+                message: "a finished document run's checkpoint (`--keep-checkpoint`)".into(),
+                fixability: Fixability::AdviceOnly {
+                    hint: "nothing reads it; remove the directory when you are done with it".into(),
+                },
+            });
+        }
+    }
 }
 
 fn detect_model_not_resolvable(_root: &DoctorRoot, out: &mut Vec<Finding>) {
@@ -798,6 +870,8 @@ pub fn capabilities() -> serde_json::Value {
             {"name": "abandoned_package_stage", "fix": "refused_unsafe (`focr pull <model>` removes it under the package lock)"},
             {"name": "superseded_package_left", "fix": "refused_unsafe (`focr pull <model>` removes it under the package lock)"},
             {"name": "interrupted_package_install", "fix": "refused_unsafe (`focr pull <model>` restores the previous package under the package lock)"},
+            {"name": "interrupted_document_run", "fix": "refused_unsafe (the journal and checkpoint are resumable state; its command continues the run)"},
+            {"name": "kept_document_checkpoint", "fix": "advice_only"},
         ],
         "fixers": ["chmod_u_rw", "quarantine"],
         "exit_codes": {
@@ -864,6 +938,77 @@ pub fn robot_docs() -> String {
 }
 
 #[cfg(test)]
+#[cfg(all(test, feature = "pdf"))]
+mod document_run_tests {
+    use super::*;
+    use crate::native_engine::checkpoint::{Journal, KEYED_CHECKPOINT, KEYED_JOURNAL};
+
+    fn root(test: &str) -> DoctorRoot {
+        let cache_root =
+            std::env::temp_dir().join(format!("focr_doctor_{test}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&cache_root);
+        std::fs::create_dir_all(&cache_root).expect("create test root");
+        DoctorRoot { cache_root }
+    }
+
+    /// A journal with only its key line, as a run writes it.
+    fn write_journal(dir: &Path, command: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).expect("run directory");
+        let path = dir.join(KEYED_JOURNAL);
+        let mut journal = Journal::create(&path).expect("journal");
+        journal
+            .append(&[serde_json::json!({"kind": "key", "key": {}, "command": command})])
+            .expect("key line");
+        path
+    }
+
+    #[test]
+    fn a_stale_run_is_reported_with_its_command_and_left_in_place() {
+        let root = root("stale");
+        let run = root.document_runs_dir().join("abc");
+        let journal = write_journal(&run, "focr ocr book.pdf --multi-page");
+        let checkpoint = run.join(KEYED_CHECKPOINT);
+        std::fs::write(&checkpoint, b"state").expect("checkpoint");
+        let findings: Vec<Finding> = detect(&root)
+            .into_iter()
+            .filter(|f| f.detector == "interrupted_document_run")
+            .collect();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(
+            findings[0].fixability,
+            Fixability::RefusedUnsafe {
+                recommended_command: "focr ocr book.pdf --multi-page".into()
+            }
+        );
+        assert!(findings[0].message.contains("with its checkpoint"));
+
+        let report = fix(&root, &findings, "doctor-test").expect("the fix pass");
+        assert_eq!((report.fixed, report.refused), (0, 1));
+        assert_eq!(std::fs::read(&checkpoint).expect("kept"), b"state");
+        assert!(journal.exists());
+    }
+
+    #[test]
+    fn a_checkpoint_without_a_journal_is_a_finished_runs_and_a_damaged_journal_says_so() {
+        let root = root("kept");
+        let kept = root.document_runs_dir().join("kept");
+        std::fs::create_dir_all(&kept).expect("run directory");
+        std::fs::write(kept.join(KEYED_CHECKPOINT), b"state").expect("checkpoint");
+        let damaged = root.document_runs_dir().join("damaged");
+        std::fs::create_dir_all(&damaged).expect("run directory");
+        std::fs::write(damaged.join(KEYED_JOURNAL), b"not json\n").expect("journal");
+        let detected = detect(&root);
+        let names: Vec<&str> = detected.iter().map(|f| f.detector).collect();
+        assert!(names.contains(&"kept_document_checkpoint"), "{names:?}");
+        let run = detected
+            .iter()
+            .find(|f| f.detector == "interrupted_document_run")
+            .expect("the damaged run");
+        assert!(run.message.contains("does not read"), "{}", run.message);
+        assert!(matches!(run.fixability, Fixability::AdviceOnly { .. }));
+    }
+}
+
 mod pull_coordination_tests {
     use super::*;
 

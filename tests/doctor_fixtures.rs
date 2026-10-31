@@ -254,9 +254,9 @@ fn interrupted_package_install_is_refused_with_the_pull_that_restores_it() {
     };
     let interrupted = finding("interrupted_package_install");
     let abandoned = finding("abandoned_package_stage");
-    let names_pull = [&interrupted, &abandoned].iter().all(|f| {
-        f["fixability"]["recommended_command"] == "focr pull unlimited-ocr-2"
-    });
+    let names_pull = [&interrupted, &abandoned]
+        .iter()
+        .all(|f| f["fixability"]["recommended_command"] == "focr pull unlimited-ocr-2");
     let severities = interrupted["severity"] == "error" && abandoned["severity"] == "warn";
 
     let out = focr(&home, &["doctor", "--fix"]);
@@ -354,7 +354,7 @@ fn contract_surfaces_answer() {
     let caps_ok = caps["exit_codes"]["5"]
         .as_str()
         .is_some_and(|s| s.contains("lock"))
-        && caps["detectors"].as_array().is_some_and(|d| d.len() == 7);
+        && caps["detectors"].as_array().is_some_and(|d| d.len() == 9);
     let docs = focr(&home, &["doctor", "robot-docs"]);
     let docs_ok = String::from_utf8_lossy(&docs.stdout).contains("focr doctor undo");
     let triage = json_stdout(&focr(&home, &["doctor", "--robot-triage"]));
