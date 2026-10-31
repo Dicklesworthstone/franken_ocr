@@ -70,7 +70,7 @@ static PROGRESS_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
 
 /// Mutable bar state behind the [`Progress`] handle. `Arc` so a boxed
-/// `'static` page sink (see [`Progress::page_sink`]) can advance the same bar
+/// `'static` document sink (see [`Progress::document_sink`]) can advance the same bar
 /// the owning driver renders.
 struct Inner {
     /// Short driver tag rendered after `[focr]` (e.g. `ocr`, `raster`, `batch`).
@@ -83,6 +83,8 @@ struct Inner {
     current: String,
     /// Run start, for elapsed/ETA.
     started: Instant,
+    /// A windowed run's estimate of the time left, once a window has ended.
+    eta_secs: Option<f64>,
 }
 
 /// Immutable renderer input. Streaming code clones this under the state mutex
@@ -93,6 +95,7 @@ struct RenderFrame {
     done: usize,
     current: String,
     elapsed_secs: f64,
+    eta_secs: Option<f64>,
 }
 
 impl From<&Inner> for RenderFrame {
@@ -103,7 +106,62 @@ impl From<&Inner> for RenderFrame {
             done: inner.done,
             current: inner.current.clone(),
             elapsed_secs: inner.started.elapsed().as_secs_f64(),
+            eta_secs: inner.eta_secs,
         }
+    }
+}
+
+/// The time left in a document, from the running mean of a page's wall time
+/// (U2-D5): the robot `window` event's `eta_ms` and the bar's estimate.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageEta {
+    pages: u64,
+    elapsed_ms: u64,
+}
+
+impl PageEta {
+    /// Count a window of `pages` pages that took `elapsed_ms`.
+    pub fn add_window(&mut self, pages: usize, elapsed_ms: u64) {
+        self.pages += pages as u64;
+        self.elapsed_ms = self.elapsed_ms.saturating_add(elapsed_ms);
+    }
+
+    /// The estimate for `pages_left` more pages; `None` before a window has
+    /// ended.
+    #[must_use]
+    pub fn remaining_ms(&self, pages_left: usize) -> Option<u64> {
+        (self.pages > 0).then(|| {
+            let ms = u128::from(self.elapsed_ms) * pages_left as u128 / u128::from(self.pages);
+            u64::try_from(ms).unwrap_or(u64::MAX)
+        })
+    }
+}
+
+/// A windowed run's running totals, for the bar's line.
+#[derive(Default)]
+struct WindowTally {
+    eta: PageEta,
+    /// A full window's pages; only the last window can be shorter.
+    width: usize,
+    tokens: usize,
+    elapsed_ms: u64,
+}
+
+impl WindowTally {
+    fn add(&mut self, window: &crate::native_engine::window::WindowStats) {
+        self.eta.add_window(window.pages.len(), window.elapsed_ms);
+        self.width = self.width.max(window.pages.len());
+        self.tokens += window.generated_tokens;
+        self.elapsed_ms = self.elapsed_ms.saturating_add(window.elapsed_ms);
+    }
+
+    /// The line's item once window `index` has ended: pages and windows
+    /// done, and the generation rate so far.
+    fn status(&self, index: usize, done: usize, total: usize) -> String {
+        let window = index + 1;
+        let windows = total.div_ceil(self.width.max(1)).max(window);
+        let rate = self.tokens as f64 * 1000.0 / self.elapsed_ms.max(1) as f64;
+        format!("page {done}/{total}, window {window}/{windows}, {rate:.1} tok/s")
     }
 }
 
@@ -155,6 +213,7 @@ impl Progress {
                 done: 0,
                 current: String::new(),
                 started: Instant::now(),
+                eta_secs: None,
             }),
             finished: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
@@ -201,6 +260,16 @@ impl Progress {
         g.current = current.into();
         drop(g);
         self.send(RenderCommand::Draw);
+    }
+
+    /// [`Self::start_item`] for a page a windowed run read, until a window
+    /// has ended: from then on the line reports the windows, and pages are
+    /// read in moments between their decodes.
+    pub fn reading_item(&self, current: impl Into<String>) {
+        let Some(inner) = &self.inner else { return };
+        if lock(&inner.state).eta_secs.is_none() {
+            self.start_item(current);
+        }
     }
 
     /// Record one completed item. No redraw: the next `start_item` (or sink
@@ -295,22 +364,23 @@ impl Progress {
         try_clear_bar_line(inner.generation);
     }
 
-    /// A `'static` boxed per-page sink ([`crate::PageSink`]) that advances
-    /// this bar as the multi-page decode crosses each `<PAGE>` boundary — the
-    /// human-mode twin of the robot NDJSON `page` events. The callback only
-    /// updates state and performs a nonblocking channel wake. A detached UI
-    /// thread owns all stderr I/O, so a stalled terminal can never pin the
-    /// model runtime's blocking worker or its timeout cleanup.
-    pub fn page_sink(&self) -> crate::PageSink {
+    /// A `'static` boxed sink ([`crate::DocumentSink`]) that advances this
+    /// bar as the decode crosses each `<PAGE>` boundary, and reports each
+    /// window as it ends — the human-mode twin of the robot NDJSON `page`
+    /// and `window` events. The callback only updates state and performs a
+    /// nonblocking channel wake. A detached UI thread owns all stderr I/O, so
+    /// a stalled terminal can never pin the model runtime's blocking worker
+    /// or its timeout cleanup.
+    pub fn document_sink(&self) -> crate::DocumentSink {
         let Some(inner) = &self.inner else {
-            return Box::new(|_: &crate::StreamedPage<'_>| {});
+            return Box::new(|_: &crate::DocumentEvent<'_>| {});
         };
         let Some(renderer) = self.renderer.as_ref().cloned() else {
-            return Box::new(|_: &crate::StreamedPage<'_>| {});
+            return Box::new(|_: &crate::DocumentEvent<'_>| {});
         };
         let inner = Arc::clone(inner);
-        Box::new(move |streamed: &crate::StreamedPage<'_>| {
-            let page = streamed.index;
+        let mut tally = WindowTally::default();
+        Box::new(move |event: &crate::DocumentEvent<'_>| {
             if inner.finished.load(Ordering::Acquire) || PROGRESS_SUPPRESSED.load(Ordering::Acquire)
             {
                 return;
@@ -319,8 +389,19 @@ impl Progress {
             if inner.finished.load(Ordering::Acquire) {
                 return;
             }
-            g.done = page.min(g.total);
-            g.current = format!("page {page}/{}", g.total);
+            match event {
+                crate::DocumentEvent::Page(streamed) => {
+                    let page = streamed.index;
+                    g.done = page.min(g.total);
+                    g.current = format!("page {page}/{}", g.total);
+                }
+                crate::DocumentEvent::Window(window) => {
+                    tally.add(window);
+                    g.current = tally.status(window.index, g.done, g.total);
+                    let left = g.total - g.done;
+                    g.eta_secs = tally.eta.remaining_ms(left).map(|ms| ms as f64 / 1000.0);
+                }
+            }
             drop(g);
             let _ = renderer.send(RenderCommand::Draw);
         })
@@ -403,6 +484,7 @@ fn draw_frame(inner: &Shared, frame: &RenderFrame) -> usize {
         frame.total,
         &frame.current,
         frame.elapsed_secs,
+        frame.eta_secs,
     );
     let width = line.chars().count();
     let previous_width = ACTIVE_LINE_WIDTH.load(Ordering::Acquire);
@@ -442,8 +524,16 @@ fn clear_generation_locked(generation: usize) {
 }
 
 /// Render one bar line (pure, for tests). ASCII only; never contains `\r` or
-/// `\n` — the caller owns cursor movement.
-fn render_line(label: &str, done: usize, total: usize, current: &str, elapsed_secs: f64) -> String {
+/// `\n` — the caller owns cursor movement. `eta_secs` is a windowed run's
+/// estimate, which stands in for the linear ETA.
+fn render_line(
+    label: &str,
+    done: usize,
+    total: usize,
+    current: &str,
+    elapsed_secs: f64,
+    eta_secs: Option<f64>,
+) -> String {
     let total = total.max(1);
     let done = done.min(total);
     let filled = done * BAR_CELLS / total;
@@ -470,8 +560,13 @@ fn render_line(label: &str, done: usize, total: usize, current: &str, elapsed_se
     // Linear ETA once at least one item has completed (before that there is
     // no rate to extrapolate; after the last item the bar is about to clear).
     if done > 0 && done < total {
-        let eta = elapsed_secs / done as f64 * (total - done) as f64;
-        line.push_str(&format!(", ~{} left", fmt_duration(eta)));
+        match eta_secs {
+            Some(eta) => line.push_str(&format!(", estimate {} left", fmt_duration(eta))),
+            None => {
+                let eta = elapsed_secs / done as f64 * (total - done) as f64;
+                line.push_str(&format!(", ~{} left", fmt_duration(eta)));
+            }
+        }
     }
     line
 }
@@ -570,7 +665,7 @@ fn stderr_supports_progress() -> bool {
     // Timing mode emits a high-volume stderr trace from inside the model
     // runtime. Keeping that diagnostic stream line-oriented is more useful
     // than repeatedly clearing and redrawing a progress bar around it.
-    if std::env::var_os("FOCR_TIMING").is_some() {
+    if crate::timing_enabled() {
         return false;
     }
     progress_allowed(
@@ -612,11 +707,37 @@ mod tests {
     static TEST_GLOBAL_LOCK: Mutex<()> = Mutex::new(());
 
     /// A streamed v1 page `index`.
-    fn streamed(index: usize) -> crate::StreamedPage<'static> {
-        crate::StreamedPage {
+    fn streamed(index: usize) -> crate::DocumentEvent<'static> {
+        crate::DocumentEvent::Page(crate::StreamedPage {
             index,
             body: "body",
             page: None,
+        })
+    }
+
+    /// A window over `pages` that took `elapsed_ms`.
+    fn window_stats(
+        index: usize,
+        pages: std::ops::Range<usize>,
+        generated_tokens: usize,
+        elapsed_ms: u64,
+    ) -> crate::native_engine::window::WindowStats {
+        crate::native_engine::window::WindowStats {
+            index,
+            pages,
+            lookahead: true,
+            reused: false,
+            fallback_reason: None,
+            straddle: false,
+            prefill_tokens: 0,
+            copied_rows: 0,
+            forced_tokens: 0,
+            generated_tokens,
+            finish: crate::native_engine::FinishReason::Stop,
+            kv_bytes_peak: 0,
+            rss_bytes_peak: None,
+            retire_fallbacks: 0,
+            elapsed_ms,
         }
     }
 
@@ -628,6 +749,7 @@ mod tests {
                 done: 0,
                 current: String::new(),
                 started: Instant::now(),
+                eta_secs: None,
             }),
             finished: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
@@ -678,7 +800,7 @@ mod tests {
         bar.complete_item();
         bar.suspend();
         bar.retire();
-        let mut sink = bar.page_sink();
+        let mut sink = bar.document_sink();
         sink(&streamed(3));
     }
 
@@ -688,7 +810,7 @@ mod tests {
     }
 
     #[test]
-    fn set_total_rescales_the_bar_and_its_page_sink() {
+    fn set_total_rescales_the_bar_and_its_document_sink() {
         let _global = TEST_GLOBAL_LOCK
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -705,7 +827,7 @@ mod tests {
         assert_eq!((done, total), (3, 3));
         bar.set_total(2);
         assert_eq!(lock(&shared.state).done, 2, "done never exceeds total");
-        let mut sink = bar.page_sink();
+        let mut sink = bar.document_sink();
         sink(&streamed(1));
         assert_eq!(lock(&shared.state).current, "page 1/2");
         bar.finish();
@@ -717,7 +839,7 @@ mod tests {
 
     #[test]
     fn render_line_shape() {
-        let line = render_line("ocr", 4, 12, "page 5/12", 42.0);
+        let line = render_line("ocr", 4, 12, "page 5/12", 42.0, None);
         assert!(line.starts_with("[focr] ocr ["));
         assert!(line.contains(" 33%"), "{line}");
         assert!(line.contains("page 5/12"), "{line}");
@@ -737,6 +859,7 @@ mod tests {
             1,
             "image 1/1: bad\r\n\u{1b}[31m-wide-\u{754c}.png",
             0.0,
+            None,
         );
         assert!(line.is_ascii(), "{line:?}");
         assert!(!line.contains('\r') && !line.contains('\n'));
@@ -745,7 +868,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_does_not_wait_for_page_sink_state_lock() {
+    fn finish_does_not_wait_for_document_sink_state_lock() {
         let _serial = TEST_GLOBAL_LOCK.lock().unwrap();
         let (bar, shared, renderer) = test_bar(2);
         let guard = lock(&shared.state);
@@ -819,6 +942,7 @@ mod tests {
                 done: 0,
                 current: String::new(),
                 started: Instant::now(),
+                eta_secs: None,
             }),
             finished: AtomicBool::new(true),
             suspended: AtomicBool::new(true),
@@ -861,10 +985,10 @@ mod tests {
     }
 
     #[test]
-    fn page_sink_never_waits_for_terminal_output() {
+    fn document_sink_never_waits_for_terminal_output() {
         let _serial = TEST_GLOBAL_LOCK.lock().unwrap();
         let (bar, _shared, renderer) = test_bar(2);
-        let mut sink = bar.page_sink();
+        let mut sink = bar.document_sink();
         let output_guard = output_lock();
         let (tx, rx) = mpsc::channel();
         let callback = std::thread::spawn(move || {
@@ -885,11 +1009,93 @@ mod tests {
     #[test]
     fn render_line_eta_bounds() {
         // No ETA before the first completion (no rate to extrapolate)...
-        assert!(!render_line("ocr", 0, 5, "page 1/5", 3.0).contains("left"));
+        assert!(!render_line("ocr", 0, 5, "page 1/5", 3.0, None).contains("left"));
         // ...and none once everything is done.
-        let done = render_line("ocr", 5, 5, "", 30.0);
+        let done = render_line("ocr", 5, 5, "", 30.0, None);
         assert!(!done.contains("left"));
         assert!(done.contains("100%"));
+    }
+
+    #[test]
+    fn a_windowed_estimate_is_labelled_and_replaces_the_linear_one() {
+        let line = render_line("ocr", 10, 20, "page 10/20", 900.0, Some(840.0));
+        assert!(line.ends_with(", estimate 14m00s left"), "{line:?}");
+        assert!(!line.contains('~'), "{line:?}");
+    }
+
+    #[test]
+    fn page_eta_is_the_running_mean_of_a_page() {
+        let mut eta = PageEta::default();
+        assert_eq!(eta.remaining_ms(20), None, "no rate before a window ends");
+        eta.add_window(10, 1_000);
+        assert_eq!(eta.remaining_ms(10), Some(1_000));
+        eta.add_window(10, 3_000);
+        assert_eq!(eta.remaining_ms(10), Some(2_000), "the mean of both");
+        assert_eq!(eta.remaining_ms(0), Some(0));
+    }
+
+    #[test]
+    fn page_eta_falls_as_a_steady_run_goes() {
+        let (pages, window) = (35, 10);
+        let mut eta = PageEta::default();
+        let mut previous = u64::MAX;
+        for done in (window..=pages).step_by(window) {
+            eta.add_window(window, 850_000);
+            let left = eta.remaining_ms(pages - done).expect("a window ended");
+            assert!(left < previous, "{left} after {previous}");
+            previous = left;
+        }
+    }
+
+    #[test]
+    fn a_window_reports_its_place_rate_and_estimate() {
+        let _serial = TEST_GLOBAL_LOCK.lock().unwrap();
+        let (bar, shared, renderer) = test_bar(25);
+        let mut sink = bar.document_sink();
+        sink(&streamed(10));
+        sink(&crate::DocumentEvent::Window(&window_stats(
+            0,
+            0..10,
+            5_000,
+            500_000,
+        )));
+        {
+            let g = lock(&shared.state);
+            assert_eq!(g.current, "page 10/25, window 1/3, 10.0 tok/s");
+            assert_eq!(g.eta_secs, Some(750.0));
+        }
+        bar.reading_item("read page 12/25");
+        assert_eq!(
+            lock(&shared.state).current,
+            "page 10/25, window 1/3, 10.0 tok/s",
+            "the line keeps reporting the windows"
+        );
+        sink(&streamed(25));
+        sink(&crate::DocumentEvent::Window(&window_stats(
+            2,
+            20..25,
+            1_000,
+            100_000,
+        )));
+        assert_eq!(
+            lock(&shared.state).current,
+            "page 25/25, window 3/3, 10.0 tok/s",
+            "a short last window leaves the count alone"
+        );
+        bar.finish();
+        drop(bar);
+        renderer.join().expect("renderer exits");
+    }
+
+    #[test]
+    fn reading_names_a_page_until_a_window_has_ended() {
+        let _serial = TEST_GLOBAL_LOCK.lock().unwrap();
+        let (bar, shared, renderer) = test_bar(25);
+        bar.reading_item("read page 3/25");
+        assert_eq!(lock(&shared.state).current, "read page 3/25");
+        bar.finish();
+        drop(bar);
+        renderer.join().expect("renderer exits");
     }
 
     #[test]

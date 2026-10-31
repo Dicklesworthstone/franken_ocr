@@ -99,22 +99,6 @@ pub(crate) enum DenseI8Route {
     Smmla,
 }
 
-/// Detect the int8 tier this CPU should dispatch to (cached after first call).
-///
-/// On non-AArch64 builds this is always [`ArmTier::None`].
-///
-/// **Apple Silicon prefers SDOT over SMMLA.** Every Apple aarch64 core (M-series
-/// on macOS, A-series on iOS)
-/// issues `SMMLA`/i8mm at *half* the rate of `SDOT`, so SMMLA's 2× MACs per
-/// instruction exactly cancel — measured on an Apple M4, SMMLA delivers 0.994× of
-/// SDOT's int8 MACs/second (`vmmlaq_s32` 5.31 Ginstr/s vs `vdotq_s32`
-/// 10.69 Ginstr/s) — and SMMLA *additionally* needs a 2×2 operand repack the dot
-/// path skips, so SDOT is the strictly faster kernel here. On other aarch64 cores
-/// (e.g. Neoverse) i8mm can be full-rate, so there SMMLA leads.
-///
-/// `FOCR_FORCE_ARCH=smmla|sdot|scalar` overrides the choice (benchmark/debug only;
-/// a tier whose feature is absent is ignored). Read once and cached.
-#[must_use]
 /// Whether the DENSE int8 GEMM entrypoints should prefer the LLVM-autovec
 /// scalar kernel over the hand-written SDOT micro-tile on Apple Silicon
 /// (bd-2mo.5.1, measured 2026-07-09 in a quiet window): the autovectorized
@@ -175,6 +159,27 @@ pub(crate) fn effective_dense_route() -> DenseI8Route {
     }
 }
 
+/// Detect the int8 tier this CPU should dispatch to (cached after first call).
+///
+/// On non-AArch64 builds this is always [`ArmTier::None`].
+///
+/// **Apple Silicon prefers SDOT over SMMLA.** Every Apple aarch64 core (M-series
+/// on macOS, A-series on iOS)
+/// issues `SMMLA`/i8mm at *half* the rate of `SDOT`, so SMMLA's 2× MACs per
+/// instruction exactly cancel — measured on an Apple M4, SMMLA delivers 0.994× of
+/// SDOT's int8 MACs/second (`vmmlaq_s32` 5.31 Ginstr/s vs `vdotq_s32`
+/// 10.69 Ginstr/s) — and SMMLA *additionally* needs a 2×2 operand repack the dot
+/// path skips, so SDOT is the strictly faster kernel here. On other aarch64 cores
+/// (e.g. Neoverse) i8mm can be full-rate, so there SMMLA leads.
+///
+/// **Detection is `std`'s, and it stops at what the OS reports.** On Windows,
+/// `std` asks `IsProcessorFeaturePresent(PF_ARM_V82_I8MM_INSTRUCTIONS_AVAILABLE)`.
+/// A Windows that does not report that flag lands on SDOT even on a core with
+/// i8mm, which is slower and changes nothing else.
+///
+/// `FOCR_FORCE_ARCH=smmla|sdot|scalar` overrides the choice (benchmark/debug only;
+/// a tier whose feature is absent is ignored). Read once and cached.
+#[must_use]
 pub fn detect_tier() -> ArmTier {
     use std::sync::OnceLock;
     static TIER: OnceLock<ArmTier> = OnceLock::new();

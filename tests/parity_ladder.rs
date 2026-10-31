@@ -1009,23 +1009,26 @@ fn l0_preprocess_exact() {
     log.setup(0);
     let t0 = Instant::now();
 
-    // Always-on L0 contract anchors (PARITY_LADDER §3.1): the EXACT constants the
-    // front end MUST reproduce — gray pad 127, [-1,1] normalize bounds, the 273
-    // image-token slots per 1024-view (CENSUS (c)). These are asserted against
-    // the pinned census numbers, not magic constants. They do not need the oracle
-    // (the reference is deterministic) so they run on every box.
-    const GRAY_PAD: u8 = 127; // (127,127,127) = int(0.5*255) [SPEC-022]
-    const NORM_LO: f32 = -1.0; // (0-0.5)/0.5 [SPEC-021]
-    const NORM_HI: f32 = 1.0; // (1-0.5)/0.5
-    const SLOTS_PER_1024_VIEW: usize = (16 + 1) * 16 + 1; // 273 [SPEC-028], CENSUS (c)
-    log.assertion("gray pad == int(0.5*255) == 127", GRAY_PAD == 127);
+    // Always-on L0 contract anchors (PARITY_LADDER §3.1): the front end's own
+    // constants against the EXACT numbers it MUST reproduce — gray pad 127,
+    // [-1,1] normalize bounds, the 273 image-token slots per 1024-view (CENSUS
+    // (c)). They do not need the oracle (the reference is deterministic) so they
+    // run on every box.
     log.assertion(
-        "normalize maps to [-1,1]",
-        NORM_LO == -1.0 && NORM_HI == 1.0,
+        "gray pad == int(0.5*255) == 127", // (127,127,127) [SPEC-022]
+        preprocess::PAD_FILL == 127,
     );
+    let normalized = |value: f32, channel: usize| {
+        (value - preprocess::IMAGE_MEAN[channel]) / preprocess::IMAGE_STD[channel]
+    };
     log.assertion(
-        "image-token slots per 1024-view == 273",
-        SLOTS_PER_1024_VIEW == 273,
+        "normalize maps to [-1,1]", // (0-0.5)/0.5, (1-0.5)/0.5 [SPEC-021]
+        (0..3).all(|c| normalized(0.0, c) == -1.0 && normalized(1.0, c) == 1.0),
+    );
+    let queries = preprocess::num_queries(preprocess::BASE_SIZE);
+    log.assertion(
+        "image-token slots per 1024-view == 273", // [SPEC-028], CENSUS (c)
+        preprocess::BASE_SIZE == 1024 && (queries + 1) * queries + 1 == 273,
     );
 
     if !fixtures_present() || !model_present(&mut log) {

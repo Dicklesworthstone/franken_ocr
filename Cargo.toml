@@ -159,6 +159,11 @@ getrandom = { version = "0.4", features = ["wasm_js"], optional = true }
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
 
+# Safe `getrusage` for peak RSS (U2-D3), so the memory probe needs no `unsafe`.
+# `ctrlc` already builds this crate; the new part is its `resource` feature.
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["resource"], optional = true }
+
 [dev-dependencies]
 # Property-based test plumbing (bd-10sb.1): generator-driven invariants for
 # the SIMD==scalar / i32-overflow / preprocess-geometry / parser-robustness
@@ -179,6 +184,7 @@ native = [
     "dep:ctrlc",
     "dep:fsqlite",
     "dep:fsqlite-types",
+    "dep:nix",
     "dep:uuid",
     "mmap",
     "pdf",
@@ -199,6 +205,11 @@ mmap = ["dep:memmap2"]
 # above, so `--no-default-features --features pdf` is a valid wasm core build
 # (focr-wasm enables it for the playground's scanned-PDF path).
 pdf = ["dep:lopdf", "dep:fax", "dep:flate2", "dep:getrandom"]
+# The engine for a program that links it in process: models, kernels, page
+# sources, PDF pages and mapped weights, and no CLI, async runtime, run store,
+# signal handling or network path. `docs/library-output.md` is the contract and
+# `tests/library_contract.rs` holds the dependency line.
+library = ["mmap", "pdf"]
 mimalloc = []
 
 # The browser/wasm boundary crate (site/pkg's source) shares this workspace so

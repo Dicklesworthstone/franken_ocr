@@ -21,6 +21,8 @@
 
 pub mod adaptive;
 #[cfg(feature = "native")]
+pub mod batch_events;
+#[cfg(feature = "native")]
 pub mod cli;
 #[cfg(feature = "native")]
 pub mod conformance;
@@ -30,7 +32,6 @@ pub mod dist;
 pub mod doctor;
 pub mod error;
 pub mod native_engine;
-#[cfg(feature = "pdf")]
 pub mod page_source;
 #[cfg(feature = "pdf")]
 pub mod pdf;
@@ -50,16 +51,19 @@ pub mod tokenizer;
 #[cfg(feature = "native")]
 pub use cli::cli_main;
 pub use error::{FocrError, FocrResult};
-#[cfg(feature = "pdf")]
 pub use native_engine::DocumentResult;
 pub use native_engine::checkpoint::{ResumeKey, RunFiles};
 /// Multi-model architecture descriptors + registry (the "model zoo" foundation,
 /// epic bd-3jo6 / A1). Additive metadata layer; the live forward is unchanged.
 pub use native_engine::model_arch;
 pub use native_engine::{
-    DocumentOptions, ExtractedFigure, Half, LayoutSpan, PageFinish, PageOrigin, PageResult,
-    PageWindow, RecognizedDocument, ResumePolicy, StreamedPage,
+    DocumentEvent, DocumentOptions, ExtractedFigure, Half, LayoutSpan, PageFinish, PageOrigin,
+    PageResult, PageWindow, RecognizedDocument, ResumePolicy, StreamedPage,
 };
+
+/// The version of the document output contract, `docs/library-output.md`. A new
+/// field keeps it; a changed meaning, unit or order bumps it.
+pub const OUTPUT_CONTRACT_VERSION: u32 = 1;
 
 #[cfg(feature = "native")]
 use std::path::Path;
@@ -195,19 +199,52 @@ pub fn cancel_checkpoint() -> FocrResult<()> {
 
 // ── The one thread/CPU budget (bd-223.2 addendum; plan §7.5) ────────────────
 
-/// The single process-wide thread budget, read ONCE: `FOCR_THREADS` (env)
-/// else the PHYSICAL core count (hyperthreads oversubscribe the int8 GEMMs —
-/// never `available_parallelism`). Every pool-sizing consumer (the kernel
-/// rayon pool, the gauntlet fairness pins, `robot health`) reads THIS.
+/// The budget, latched by [`set_thread_budget`] or the first [`thread_budget`].
+static THREAD_BUDGET: OnceLock<usize> = OnceLock::new();
+
+/// The single process-wide thread budget, read ONCE: [`set_thread_budget`]
+/// (`--threads`), else `FOCR_THREADS` (env), else the PHYSICAL core count
+/// (hyperthreads oversubscribe the int8 GEMMs — never
+/// `available_parallelism`). Every pool-sizing consumer (the kernel rayon
+/// pool, the gauntlet fairness pins, `robot health`) reads THIS.
 pub fn thread_budget() -> usize {
-    static BUDGET: OnceLock<usize> = OnceLock::new();
-    *BUDGET.get_or_init(|| {
+    *THREAD_BUDGET.get_or_init(|| {
         std::env::var("FOCR_THREADS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0)
             .unwrap_or_else(default_thread_budget)
     })
+}
+
+/// Fix the thread budget for this process, ahead of `FOCR_THREADS`. It must
+/// run before anything reads the budget: the kernel pool is sized once.
+///
+/// # Errors
+/// [`FocrError::Usage`] when the budget was already read or set to another
+/// value.
+pub fn set_thread_budget(threads: std::num::NonZeroUsize) -> FocrResult<()> {
+    let wanted = threads.get();
+    match *THREAD_BUDGET.get_or_init(|| wanted) {
+        latched if latched == wanted => Ok(()),
+        latched => Err(FocrError::Usage(format!(
+            "--threads {wanted}: this process already runs with {latched}"
+        ))),
+    }
+}
+
+/// `--timing`: [`timing_enabled`] without `FOCR_TIMING` in the environment.
+static TIMING: AtomicBool = AtomicBool::new(false);
+
+/// Turn the stage-timing rows on for this process.
+pub fn enable_timing() {
+    TIMING.store(true, Ordering::Relaxed);
+}
+
+/// Whether stage-timing rows are on: `--timing` or `FOCR_TIMING`.
+#[must_use]
+pub fn timing_enabled() -> bool {
+    TIMING.load(Ordering::Relaxed) || std::env::var_os("FOCR_TIMING").is_some()
 }
 
 /// The no-override default width. Physical cores everywhere (hyperthreads
@@ -366,10 +403,15 @@ where
     Ok(n)
 }
 
-/// Boxed per-page streaming sink for multi-page passes (bd-2z0y): called
-/// with each [`StreamedPage`] as its `<PAGE>` boundary is crossed in the
-/// token stream. `Send` because the pass runs on the engine's blocking pool.
-pub type PageSink = Box<dyn FnMut(&StreamedPage<'_>) + Send>;
+/// Boxed streaming sink for document decodes (bd-2z0y, U2-D5): called with
+/// each [`DocumentEvent`] as the decode reaches it. `Send` because the pass
+/// runs on the engine's blocking pool.
+pub type DocumentSink = Box<dyn FnMut(&DocumentEvent<'_>) + Send>;
+
+/// Told each stage a run enters: its name (`load`, `forward`) and its budget,
+/// if it has one (the robot `stage` event, plan §7.3).
+#[cfg(feature = "native")]
+pub type StageSink = Box<dyn Fn(&'static str, Option<Duration>) + Send>;
 
 #[cfg(feature = "native")]
 pub struct OcrEngine {
@@ -377,6 +419,8 @@ pub struct OcrEngine {
     runtime: Runtime,
     /// The lazily-loaded, shared model (one read-only weight blob per engine).
     model: Mutex<Option<Arc<OcrModel>>>,
+    /// Who hears about the stages this engine enters.
+    stage_sink: Mutex<Option<StageSink>>,
 }
 
 #[cfg(feature = "native")]
@@ -448,7 +492,23 @@ impl OcrEngine {
         Ok(Self {
             runtime,
             model: Mutex::new(None),
+            stage_sink: Mutex::new(None),
         })
+    }
+
+    /// Report the stages this engine enters to `sink`, or to nobody.
+    pub fn set_stage_sink(&self, sink: Option<StageSink>) {
+        if let Ok(mut slot) = self.stage_sink.lock() {
+            *slot = sink;
+        }
+    }
+
+    fn report_stage(&self, name: &'static str, budget: Option<Duration>) {
+        if let Ok(slot) = self.stage_sink.lock()
+            && let Some(sink) = slot.as_ref()
+        {
+            sink(name, budget);
+        }
     }
 
     /// Resolve the configured model artifact path ([`MODEL_PATH_ENV`] override,
@@ -482,7 +542,7 @@ impl OcrEngine {
             }
         }
 
-        let loaded = OcrModel::load(path)?;
+        let loaded = OcrModel::load_observed(path, || self.report_stage("load", None))?;
         let loaded_path = loaded.path().to_path_buf();
 
         let mut guard = self.model_guard()?;
@@ -753,10 +813,11 @@ impl OcrEngine {
     /// The pages are rasterized one at a time on the forward stage's thread,
     /// each dropped once preprocessed (U2-D0); a windowed parse reads each
     /// window's pages as the window starts. `on_item` sees every page before
-    /// it is read, a skipped one included; `on_page`, when given, gets each
+    /// it is read, a skipped one included; `on_event`, when given, gets each
     /// [`StreamedPage`] as its `<PAGE>` boundary is crossed in the token
-    /// stream (bd-2z0y), or as its window ends. Both are boxed and `Send`
-    /// because the parse runs on the blocking pool.
+    /// stream (bd-2z0y), or as its window ends, and each window as it ends
+    /// ([`DocumentEvent`]). Both are boxed and `Send` because the parse runs
+    /// on the blocking pool.
     ///
     /// A document that stops early (the position limit, the stage budget or
     /// a cancel) is a result with that `finish_reason` and the pages it
@@ -767,7 +828,7 @@ impl OcrEngine {
     /// use std::path::Path;
     ///
     /// use franken_ocr::page_source::PageSource;
-    /// use franken_ocr::{DocumentOptions, OcrEngine};
+    /// use franken_ocr::{DocumentEvent, DocumentOptions, OcrEngine};
     ///
     /// # fn main() -> franken_ocr::FocrResult<()> {
     /// let engine = OcrEngine::new()?;
@@ -777,7 +838,11 @@ impl OcrEngine {
     ///     source,
     ///     &DocumentOptions::default(),
     ///     Box::new(|_| {}),
-    ///     Some(Box::new(|page| eprintln!("page {} done", page.index))),
+    ///     Some(Box::new(|event| {
+    ///         if let DocumentEvent::Page(page) = event {
+    ///             eprintln!("page {} done", page.index);
+    ///         }
+    ///     })),
     /// )?;
     /// println!("{}", document.markdown);
     /// # Ok(())
@@ -787,24 +852,64 @@ impl OcrEngine {
     /// # Errors
     /// As [`crate::native_engine::OcrModel::recognize_document`], plus the
     /// model's load errors.
-    #[cfg(feature = "pdf")]
     pub fn recognize_document(
         &self,
         model_path: &Path,
         mut source: page_source::PageSource,
         options: &DocumentOptions,
         mut on_item: Box<dyn FnMut(&page_source::PageItem) + Send>,
-        on_page: Option<PageSink>,
+        on_event: Option<DocumentSink>,
     ) -> FocrResult<DocumentResult> {
         let model = self.model_at(model_path)?;
         let budget = Self::forward_budget(&model, source.len());
         let options = options.clone();
-        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || match on_page {
+        self.run_blocking_stage_with_budget("forward-multi-page", budget, move || match on_event {
             Some(mut sink) => {
                 model.recognize_document(&mut source, &options, &mut *on_item, Some(&mut *sink))
             }
             None => model.recognize_document(&mut source, &options, &mut *on_item, None),
         })
+    }
+
+    /// Read `source` one page at a time with the model at `model_path`, each
+    /// page its own forward: the walk `focr ocr book.pdf` runs, where
+    /// [`OcrEngine::recognize_document`] reads a document as one decode.
+    ///
+    /// A page that fails is skipped and reported through `observer`, and
+    /// only a failure of the whole run ends the walk
+    /// ([`crate::page_source::PageSource::read_pages`]).
+    ///
+    /// ```no_run
+    /// use std::path::Path;
+    ///
+    /// use franken_ocr::OcrEngine;
+    /// use franken_ocr::page_source::{PageEvent, PageSource};
+    ///
+    /// # fn main() -> franken_ocr::FocrResult<()> {
+    /// let engine = OcrEngine::new()?;
+    /// let source = PageSource::pdf(Path::new("book.pdf"))?;
+    /// let read = engine.recognize_pages(&OcrEngine::model_path(), source, &mut |event| {
+    ///     if let PageEvent::Skipped(page, why) = event {
+    ///         eprintln!("page {} skipped: {why}", page.source_page);
+    ///     }
+    /// })?;
+    /// println!("{}", read.markdown());
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Errors
+    /// As [`crate::page_source::PageSource::read_pages`].
+    pub fn recognize_pages(
+        &self,
+        model_path: &Path,
+        mut source: page_source::PageSource,
+        observer: &mut dyn FnMut(page_source::PageEvent<'_>),
+    ) -> FocrResult<page_source::PagesRead<RecognizedDocument>> {
+        source.read_pages(
+            |image| self.recognize_dynamic_with_layout_model(model_path, image),
+            observer,
+        )
     }
 
     /// The forward stage's wall-clock bound for `count` inputs to `model`: the
@@ -835,6 +940,7 @@ impl OcrEngine {
         T: Send + 'static,
         F: FnOnce() -> FocrResult<T> + Send + 'static,
     {
+        self.report_stage(stage, budget);
         self.runtime.block_on(async move {
             let Some(budget) = budget else {
                 // Budget disabled (`FOCR_STAGE_BUDGET_FORWARD_MS=0`): run to
@@ -1109,7 +1215,7 @@ mod tests {
         // resolver finds nothing — the normal CI condition. Checking the
         // repo-relative default alone is NOT enough: since bd-3u6x the
         // default spec also resolves via the user cache
-        // (~/.cache/franken_ocr/models/unlimited-ocr.int8.focrq), so a dev
+        // (~/.cache/franken_ocr/models/unlimited-ocr/), so a dev
         // box with a pulled artifact must skip rather than misfire.
         if std::env::var_os(MODEL_PATH_ENV).is_none()
             && !std::path::Path::new(DEFAULT_MODEL_PATH).exists()
@@ -1147,6 +1253,29 @@ mod tests {
             let err = engine.recognize_with_model(p, img).expect_err("absent");
             assert!(matches!(err, FocrError::ModelNotFound(_)));
         }
+    }
+
+    /// A book read without a model ends on its first page, as the error a
+    /// caller can act on, not as one skip per page.
+    #[test]
+    fn recognize_pages_stops_on_the_first_page_without_a_model() {
+        let engine = OcrEngine::new().expect("runtime builds");
+        let blank = || image::DynamicImage::new_rgb8(8, 8);
+        let source = page_source::PageSource::rasters(vec![blank(), blank()]).expect("a source");
+        let mut started = 0;
+        let err = engine
+            .recognize_pages(
+                Path::new("/nonexistent/franken_ocr/model.focrq"),
+                source,
+                &mut |event| {
+                    if matches!(event, page_source::PageEvent::Started(_)) {
+                        started += 1;
+                    }
+                },
+            )
+            .expect_err("absent model must error");
+        assert!(matches!(err, FocrError::ModelNotFound(_)), "got {err:?}");
+        assert_eq!(started, 1);
     }
 
     #[test]

@@ -1,0 +1,111 @@
+focr
+focr ocr
+focr ocr <image> Set value=IMAGE required
+focr ocr --model Set value=MODEL
+focr ocr --base-size Set value=BASE_SIZE
+focr ocr --image-size Set value=IMAGE_SIZE
+focr ocr --crop-mode Set value=CROP_MODE possible=gundam,base
+focr ocr --max-length Set value=MAX_LENGTH
+focr ocr --temperature Set value=TEMPERATURE
+focr ocr --no-repeat-ngram Set value=NO_REPEAT_NGRAM env=FOCR_NO_REPEAT_NGRAM
+focr ocr --ngram-window Set value=NGRAM_WINDOW
+focr ocr --max-page-tokens Set value=MAX_PAGE_TOKENS
+focr ocr --format SetTrue
+focr ocr --task Set value=TASK possible=ocr,formula,tables,chart,molecular,geometry,music,describe,chart-data default=ocr
+focr ocr --question Set value=QUESTION
+focr ocr --pages Set value=PAGES
+focr ocr --split-spreads SetTrue
+focr ocr --multi-page SetTrue
+focr ocr --page-window Set value=N|auto|off
+focr ocr --resume Set value=MODE num=0..=1 possible=matching,recompute
+focr ocr --keep-checkpoint SetTrue
+focr ocr --no-resident SetTrue
+focr ocr --threads Set value=N
+focr ocr --timing SetTrue
+focr ocr --fail-on-low-yield SetTrue
+focr ocr --json SetTrue
+focr ocr -o --output Set value=OUTPUT
+focr ocr --extract-figures SetTrue
+focr ocr --figures-dir Set value=DIR
+focr ocr --robot SetTrue
+focr ocr --check SetTrue
+focr ocr --raw SetTrue
+focr ocr-batch
+focr ocr-batch <images> Append value=IMAGES num=1..
+focr ocr-batch --inputs-from Set value=FILE
+focr ocr-batch --output-dir Set value=DIR
+focr ocr-batch --fail-fast SetTrue
+focr ocr-batch --model Set value=MODEL
+focr ocr-batch --json SetTrue
+focr ocr-batch --experimental-full-int8 SetTrue
+focr ocr-batch --multi-page SetTrue
+focr ocr-batch --progress-events Set value=PATH
+focr ocr-batch --threads Set value=N
+focr ocr-batch --timing SetTrue
+focr convert
+focr convert <input> Set value=INPUT required
+focr convert -o --output Set value=OUTPUT required
+focr convert --quant Set value=QUANT possible=int8,int4 default=int8
+focr convert --arch Set value=ARCH possible=generic,aarch64-smmla,x86-vnni,x86-amx default=generic
+focr convert --model-id Set value=MODEL_ID
+focr convert --calib Set value=FILE
+focr convert --json SetTrue
+focr pull
+focr pull <model> Set value=MODEL
+focr pull --quant Set value=QUANT default=int8
+focr pull --manifest Set value=MANIFEST
+focr pull --json SetTrue
+focr models
+focr models --json SetTrue
+focr robot
+focr robot run
+focr robot run <image> Set value=IMAGE required
+focr robot run --model Set value=MODEL
+focr robot run --base-size Set value=BASE_SIZE
+focr robot run --image-size Set value=IMAGE_SIZE
+focr robot run --crop-mode Set value=CROP_MODE possible=gundam,base
+focr robot run --max-length Set value=MAX_LENGTH
+focr robot run --temperature Set value=TEMPERATURE
+focr robot run --no-repeat-ngram Set value=NO_REPEAT_NGRAM env=FOCR_NO_REPEAT_NGRAM
+focr robot run --ngram-window Set value=NGRAM_WINDOW
+focr robot run --max-page-tokens Set value=MAX_PAGE_TOKENS
+focr robot run --format SetTrue
+focr robot run --task Set value=TASK possible=ocr,formula,tables,chart,molecular,geometry,music,describe,chart-data default=ocr
+focr robot run --question Set value=QUESTION
+focr robot run --pages Set value=PAGES
+focr robot run --split-spreads SetTrue
+focr robot run --multi-page SetTrue
+focr robot run --page-window Set value=N|auto|off
+focr robot run --resume Set value=MODE num=0..=1 possible=matching,recompute
+focr robot run --keep-checkpoint SetTrue
+focr robot run --no-resident SetTrue
+focr robot run --threads Set value=N
+focr robot run --timing SetTrue
+focr robot run --fail-on-low-yield SetTrue
+focr robot schema
+focr robot health
+focr robot backends
+focr robot selftest
+focr robot triage
+focr runs
+focr runs --id Set value=ID
+focr runs --limit Set value=LIMIT default=20
+focr runs --format Set value=FORMAT possible=plain,json,ndjson default=plain
+focr runs --json SetTrue
+focr sync
+focr sync --json SetTrue global
+focr sync export-jsonl
+focr sync export-jsonl --file Set value=FILE
+focr sync import-jsonl
+focr sync import-jsonl --file Set value=FILE required
+focr doctor
+focr doctor --json SetTrue
+focr doctor --fix SetTrue
+focr doctor --dry-run SetTrue
+focr doctor --robot-triage SetTrue
+focr doctor undo
+focr doctor undo <run_id> Set value=RUN_ID required
+focr doctor capabilities
+focr doctor robot-docs
+focr resident-daemon hidden
+focr resident-daemon --model-root Set value=MODEL_ROOT required

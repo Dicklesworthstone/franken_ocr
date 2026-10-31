@@ -69,16 +69,21 @@
 //! ```
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use franken_ocr::native_engine::window::{FallbackReason, WindowedOptions};
+use franken_ocr::native_engine::{DecodeOverrides, OcrModel, set_decode_overrides};
 use franken_ocr::page_source::PageSource;
-use franken_ocr::preprocess::preprocess_dynamic_squash;
+use franken_ocr::preprocess::{
+    PreprocessMode, PreprocessProfile, preprocess_dynamic, preprocess_dynamic_squash,
+};
 use franken_ocr::{
-    FocrError, MODEL_PATH_ENV, OcrEngine, kernel_pool_width, stream_pages, thread_budget,
+    DocumentEvent, DocumentOptions, FocrError, MODEL_PATH_ENV, OcrEngine, PageWindow, ResumeKey,
+    RunFiles, kernel_pool_width, stream_pages, thread_budget,
 };
 
 // ───────────────────────────── tunables ─────────────────────────────
@@ -1534,6 +1539,318 @@ fn capacity_certificate_bounded_stream_soak() {
             ft = json_str(&model_path.display().to_string()),
         ),
     );
+}
+
+// ──────────────────────── windowed v2 documents ────────────────────────
+//
+// U2-T2. The windowed pipeline adds sequencing the page loops above do not
+// have: pages rasterized between forwards, journal and checkpoint I/O between
+// windows, sink callbacks and a rayon fan-out per window. These need real
+// weights: every window starts with vision, and no synthetic v2 configuration
+// exists, so without `FOCR_WATCHDOG_V2_MODEL` they log `skip_no_model` and
+// pass. Run them with a small pool, so that pages ≫ pool stays affordable:
+//
+//   FOCR_THREADS=2 FOCR_WATCHDOG_V2_MODEL=… cargo test --locked \
+//     --profile release-perf --test many_pages_without_deadlock v2_
+
+/// The v2 artifact the windowed scenarios run on.
+const V2_MODEL_ENV: &str = "FOCR_WATCHDOG_V2_MODEL";
+
+/// Pages per pool thread, the bead's `pages ≫ pool`.
+const V2_PAGES_PER_THREAD: usize = 4;
+
+/// Small enough to force many windows and splices.
+const V2_WINDOW: usize = 2;
+
+/// The sequencing is under test, not the text.
+const V2_PAGE_TOKENS: usize = 16;
+
+/// One v2 decode at a time: each takes most of the machine.
+static V2_SERIAL: Mutex<()> = Mutex::new(());
+
+/// A v2 scenario's artifact and pages, or its logged skip. Pages come from
+/// `FOCR_CORPUS_DIR` (default `~/.cache/franken_ocr/corpus/pages`), repeated
+/// past the end of the corpus.
+fn v2_scenario(case: &str) -> Option<(PathBuf, Vec<PathBuf>)> {
+    let Some(artifact) = std::env::var_os(V2_MODEL_ENV).map(PathBuf::from) else {
+        log_line(
+            case,
+            "skip",
+            "skip_no_model",
+            &format!(
+                r#""reason":"{V2_MODEL_ENV} unset: a window needs real weights, so nothing ran","native_path_ran":false,"fallback_target":{}"#,
+                json_str(ABSENT_MODEL),
+            ),
+        );
+        return None;
+    };
+    let dir = match std::env::var_os("FOCR_CORPUS_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+            .join(".cache/franken_ocr/corpus/pages"),
+    };
+    let mut corpus: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "png"))
+        .collect();
+    corpus.sort();
+    assert!(!corpus.is_empty(), "{} holds no pages", dir.display());
+    let pages = (kernel_pool_width() * V2_PAGES_PER_THREAD).max(2 * V2_WINDOW + 1);
+    set_decode_overrides(DecodeOverrides {
+        max_page_tokens: Some(V2_PAGE_TOKENS),
+        ..DecodeOverrides::default()
+    });
+    log_line(
+        case,
+        "setup",
+        "pass",
+        &format!(
+            r#""pool":{},"pages_issued":{pages},"window":{V2_WINDOW},"timeout_budget_secs":{},"mode":"real_artifact","artifact":{}"#,
+            kernel_pool_width(),
+            WATCHDOG_BUDGET_HEAVY.as_secs(),
+            json_str(&artifact.display().to_string()),
+        ),
+    );
+    Some((
+        artifact,
+        corpus.iter().cycle().take(pages).cloned().collect(),
+    ))
+}
+
+/// This process's stacks, where the platform has a tool for them.
+fn thread_dump() -> String {
+    let pid = std::process::id().to_string();
+    let tools: [(&str, Vec<&str>); 2] = [
+        ("/usr/bin/sample", vec![&pid, "1", "-file", "/dev/stdout"]),
+        (
+            "gdb",
+            vec![
+                "-p",
+                &pid,
+                "-batch",
+                "-ex",
+                "thread apply all bt",
+                "-ex",
+                "detach",
+            ],
+        ),
+    ];
+    for (tool, args) in tools {
+        // ubs:ignore — `tool` is one of the two literals above, never input.
+        if let Ok(output) = Command::new(tool).args(&args).output()
+            && output.status.success()
+        {
+            return String::from_utf8_lossy(&output.stdout).into_owned();
+        }
+    }
+    "no thread dump: neither sample nor gdb ran".to_owned()
+}
+
+/// Fail a scenario that outlived the watchdog, with its stacks.
+fn v2_deadlock(case: &str, pages: usize) -> ! {
+    eprintln!("{}", thread_dump());
+    log_line(
+        case,
+        "error",
+        "fail",
+        &format!(
+            r#""diag":{{"error_kind":"DEADLOCK_SUSPECTED","focr_exit_code":5,"message":"windowed document did not finish"}},"pages_issued":{pages}"#,
+        ),
+    );
+    panic!(
+        "DEADLOCK SUSPECTED: {case}, {pages} pages (pool={}), did NOT finish within the {}s \
+         watchdog budget: a lock held across rayon, a nested runtime or a sink that blocks the \
+         decode hangs exactly here",
+        kernel_pool_width(),
+        WATCHDOG_BUDGET_HEAVY.as_secs()
+    );
+}
+
+/// What a v2 document scenario saw on its sink.
+#[derive(Debug, Default)]
+struct Streamed {
+    pages: AtomicUsize,
+    windows: AtomicUsize,
+}
+
+/// A sink that does I/O on the decode's thread: a line per event, synced.
+fn io_sink(path: &Path, seen: &Arc<Streamed>) -> franken_ocr::DocumentSink {
+    use std::io::Write as _;
+    let mut log = std::fs::File::create(path).expect("create the stream log");
+    let seen = Arc::clone(seen);
+    Box::new(move |event: &DocumentEvent<'_>| {
+        let line = match event {
+            DocumentEvent::Page(page) => {
+                seen.pages.fetch_add(1, Ordering::Relaxed);
+                format!("page {}\n", page.index)
+            }
+            DocumentEvent::Window(window) => {
+                seen.windows.fetch_add(1, Ordering::Relaxed);
+                format!("window {}\n", window.index)
+            }
+        };
+        log.write_all(line.as_bytes())
+            .expect("write the stream log");
+        log.sync_data().expect("sync the stream log");
+    })
+}
+
+/// A windowed document: journal and checkpoint on, an I/O sink, pages ≫ pool.
+#[test]
+fn v2_windowed_document_with_checkpoints_completes_within_budget() {
+    let case = "v2_windowed_checkpointed";
+    let _serial = V2_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((artifact, pages)) = v2_scenario(case) else {
+        return;
+    };
+    let count = pages.len();
+    let root = std::env::temp_dir().join(format!("{TEST}-{case}-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("a scratch directory");
+    let files = RunFiles::beside(&root.join("out.md"), ResumeKey::new());
+    let seen = Arc::new(Streamed::default());
+    let sink = io_sink(&root.join("stream.log"), &seen);
+    let options = DocumentOptions::default()
+        .page_window(PageWindow::Pages(V2_WINDOW))
+        .run(files.clone());
+    let outcome = run_with_watchdog(WATCHDOG_BUDGET_HEAVY, move || {
+        let engine = OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
+        let source = PageSource::images(pages).expect("a page source");
+        engine
+            .recognize_document(&artifact, source, &options, Box::new(|_| {}), Some(sink))
+            .expect("the document decodes")
+    });
+    let Watch::Finished { payload, elapsed } = outcome else {
+        v2_deadlock(case, count);
+    };
+    let windows = count.div_ceil(V2_WINDOW);
+    assert_eq!(payload.pages.len(), count);
+    assert_eq!(payload.windows.len(), windows);
+    assert_eq!(seen.pages.load(Ordering::Relaxed), count);
+    assert_eq!(seen.windows.load(Ordering::Relaxed), windows);
+    assert!(files.journal.exists() && files.checkpoint.exists());
+    files.remove(false).expect("remove the run's files");
+    log_line(
+        case,
+        "result",
+        "pass",
+        &format!(
+            r#""elapsed_us":{},"pages_issued":{count},"windows":{windows}"#,
+            elapsed.as_micros()
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The same pages in one pass: its sink runs inside the decode.
+#[test]
+fn v2_unwindowed_document_completes_within_budget() {
+    let case = "v2_unwindowed";
+    let _serial = V2_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((artifact, pages)) = v2_scenario(case) else {
+        return;
+    };
+    let count = pages.len();
+    let root = std::env::temp_dir().join(format!("{TEST}-{case}-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("a scratch directory");
+    let seen = Arc::new(Streamed::default());
+    let sink = io_sink(&root.join("stream.log"), &seen);
+    let options = DocumentOptions::default().page_window(PageWindow::Off);
+    let outcome = run_with_watchdog(WATCHDOG_BUDGET_HEAVY, move || {
+        let engine = OcrEngine::new().expect("OcrEngine::new builds its single owned runtime");
+        let source = PageSource::images(pages).expect("a page source");
+        engine
+            .recognize_document(&artifact, source, &options, Box::new(|_| {}), Some(sink))
+            .expect("the document decodes")
+    });
+    let Watch::Finished { payload, elapsed } = outcome else {
+        v2_deadlock(case, count);
+    };
+    assert_eq!(payload.pages.len(), count);
+    assert!(payload.windows.is_empty());
+    assert_eq!(seen.pages.load(Ordering::Relaxed), count);
+    assert_eq!(seen.windows.load(Ordering::Relaxed), 0);
+    log_line(
+        case,
+        "result",
+        "pass",
+        &format!(
+            r#""elapsed_us":{},"pages_issued":{count}"#,
+            elapsed.as_micros()
+        ),
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A window that falls back to a recompute mid-run: the one path that
+/// prefills a whole window after others have reused theirs.
+#[test]
+fn v2_window_fallback_completes_within_budget() {
+    let case = "v2_window_fallback";
+    const FALLS_BACK: usize = 1;
+    let _serial = V2_SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((artifact, pages)) = v2_scenario(case) else {
+        return;
+    };
+    let count = pages.len();
+    let outcome = run_with_watchdog(WATCHDOG_BUDGET_HEAVY, move || {
+        let model = OcrModel::load(&artifact).expect("load the v2 artifact");
+        let mut opts = WindowedOptions::default();
+        opts.window = V2_WINDOW;
+        opts.force_fallback = vec![(FALLS_BACK, FallbackReason::Alloc)];
+        let mut read = pages.iter().map(|path| {
+            preprocess_dynamic(
+                image::open(path).expect("open a corpus page"),
+                PreprocessMode::Base { base_size: 1024 },
+                PreprocessProfile::V2,
+            )
+        });
+        model
+            .decode_document_windowed(&mut read, &opts, None)
+            .expect("the document decodes")
+            .into_windowed()
+            .expect("the document is windowed")
+    });
+    let Watch::Finished { payload, elapsed } = outcome else {
+        v2_deadlock(case, count);
+    };
+    let fell_back = &payload.windows[FALLS_BACK];
+    assert!(!fell_back.reused, "{fell_back:?}");
+    assert_eq!(fell_back.fallback_reason, Some(FallbackReason::Alloc));
+    assert_eq!(payload.pages.bodies.len(), count);
+    log_line(
+        case,
+        "result",
+        "pass",
+        &format!(
+            r#""elapsed_us":{},"pages_issued":{count},"fallback_window":{FALLS_BACK}"#,
+            elapsed.as_micros()
+        ),
+    );
+}
+
+/// The net itself. A lock held across a rayon scope whose task wants that same
+/// lock is the hang this file exists to catch, so the watchdog has to report it.
+/// This fails on purpose: `scripts/meta_tests.py` runs it and requires the
+/// failure, and with `FOCR_META_DISARM` set the lock is not held, so the lane can
+/// prove it notices a net that stayed quiet.
+#[test]
+#[ignore = "fails on purpose; scripts/meta_tests.py requires the failure"]
+fn watchdog_catches_a_lock_held_across_rayon() {
+    let disarmed = std::env::var_os("FOCR_META_DISARM").is_some();
+    let lock = Arc::new(Mutex::new(()));
+    let wanted = Arc::clone(&lock);
+    let watch = run_with_watchdog(Duration::from_secs(5), move || {
+        let held = (!disarmed).then(|| lock.lock().expect("lock"));
+        rayon::scope(|scope| {
+            scope.spawn(|_| drop(wanted.lock().expect("lock")));
+        });
+        drop(held);
+    });
+    if matches!(watch, Watch::TimedOut) {
+        eprintln!("{}", thread_dump());
+        panic!("DEADLOCK SUSPECTED: a lock held across rayon hung past the watchdog budget");
+    }
 }
 
 /// Minimal JSON string escaper for the handful of values (paths) we embed. We

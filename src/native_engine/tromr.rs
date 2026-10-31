@@ -1240,6 +1240,19 @@ pub struct MusicWarning {
     pub detail: String,
 }
 
+/// The [`MusicWarning::kind`] spelled `value`, if it is one.
+#[cfg(feature = "native")]
+pub(crate) fn music_warning_kind(value: &str) -> Option<&'static str> {
+    [
+        "overfull_bar",
+        "underfull_bar",
+        "impossible_duration",
+        "key_mismatch",
+    ]
+    .into_iter()
+    .find(|kind| *kind == value)
+}
+
 /// Musical-sanity analysis over per-staff semantic streams (bd-av64.5),
 /// annotate-only per the alien-artifact contract (the deterministic
 /// fallback IS annotation; auto-correction would need a measured-win

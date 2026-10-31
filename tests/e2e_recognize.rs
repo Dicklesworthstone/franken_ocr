@@ -848,11 +848,13 @@ fn stream_against_plain(
     let events: std::sync::Arc<std::sync::Mutex<Vec<(usize, String)>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink_events = events.clone();
-    let sink = Box::new(move |page: &franken_ocr::StreamedPage<'_>| {
-        sink_events
-            .lock()
-            .expect("sink mutex")
-            .push((page.index, page.body.to_string()));
+    let sink = Box::new(move |event: &franken_ocr::DocumentEvent<'_>| {
+        if let franken_ocr::DocumentEvent::Page(page) = event {
+            sink_events
+                .lock()
+                .expect("sink mutex")
+                .push((page.index, page.body.to_string()));
+        }
     });
     let options = DocumentOptions::default();
     let streamed = engine
@@ -1162,14 +1164,18 @@ fn recognize_real_model_when_present_else_skip_with_success() {
 
 /// A unique temp output path with the given extension (we never delete fixtures
 /// proactively — AGENTS.md RULE 1 — but a freshly-stamped name can't collide, and
-/// the test clears it before each run so the existence check is meaningful).
+/// the test clears it before each run so the existence check is meaningful). The
+/// serial is what keeps two parallel tests apart: macOS clocks report whole
+/// microseconds.
 fn unique_output_path(ext: &str) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     std::env::temp_dir().join(format!(
-        "focr_e2e_out_{}_{}.{ext}",
+        "focr_e2e_out_{}_{}_{serial}.{ext}",
         std::process::id(),
         nanos
     ))
@@ -3025,11 +3031,13 @@ fn v2_library_document_streams_its_pages_in_order_across_a_skip_when_armed() {
     };
     let sink = {
         let streamed = std::sync::Arc::clone(&streamed);
-        Box::new(move |page: &franken_ocr::StreamedPage<'_>| {
-            let facts = page
-                .page
-                .map(|p| (p.source_page, p.half.map(|h| h.as_str()), p.tokens));
-            streamed.lock().expect("streamed").push((page.index, facts));
+        Box::new(move |event: &franken_ocr::DocumentEvent<'_>| {
+            if let franken_ocr::DocumentEvent::Page(page) = event {
+                let facts = page
+                    .page
+                    .map(|p| (p.source_page, p.half.map(|h| h.as_str()), p.tokens));
+                streamed.lock().expect("streamed").push((page.index, facts));
+            }
         })
     };
     let started = Instant::now();
@@ -3148,9 +3156,11 @@ fn v2_windows_a_document(test: &str, count: usize, bad: usize) {
     };
     let sink = {
         let streamed = std::sync::Arc::clone(&streamed);
-        Box::new(move |page: &franken_ocr::StreamedPage<'_>| {
-            let facts = page.page.map(|p| (p.source_page, p.window));
-            streamed.lock().expect("streamed").push((page.index, facts));
+        Box::new(move |event: &franken_ocr::DocumentEvent<'_>| {
+            if let franken_ocr::DocumentEvent::Page(page) = event {
+                let facts = page.page.map(|p| (p.source_page, p.window));
+                streamed.lock().expect("streamed").push((page.index, facts));
+            }
         })
     };
     let started = Instant::now();

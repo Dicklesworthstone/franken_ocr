@@ -34,7 +34,7 @@ impl MusicRunOutcomeV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProcessResourceDiagnosticsV1 {
-    /// `linux_procfs_process_v1` when sampled, otherwise `unavailable_v1`.
+    /// `process_usage_v1` when sampled, otherwise `unavailable_v1`.
     pub capability: String,
     /// Linux process user+system clock ticks consumed during the measured span.
     pub cpu_ticks_delta: Option<u64>,
@@ -150,10 +150,10 @@ impl ResourceSnapshot {
         let cpu_ticks_delta = after
             .zip(self.cpu_ticks)
             .and_then(|(after, before)| after.checked_sub(before));
-        let peak_rss_kib = process_peak_rss_kib();
+        let peak_rss_kib = crate::native_engine::memory::peak_rss_bytes().map(|bytes| bytes / 1024);
         ProcessResourceDiagnosticsV1 {
             capability: if cpu_ticks_delta.is_some() || peak_rss_kib.is_some() {
-                "linux_procfs_process_v1".to_owned()
+                "process_usage_v1".to_owned()
             } else {
                 "unavailable_v1".to_owned()
             },
@@ -465,20 +465,6 @@ fn process_cpu_ticks() -> Option<u64> {
 
 #[cfg(not(target_os = "linux"))]
 fn process_cpu_ticks() -> Option<u64> {
-    None
-}
-
-#[cfg(target_os = "linux")]
-fn process_peak_rss_kib() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    status.lines().find_map(|line| {
-        let value = line.strip_prefix("VmHWM:")?.trim();
-        value.strip_suffix(" kB")?.trim().parse().ok()
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn process_peak_rss_kib() -> Option<u64> {
     None
 }
 

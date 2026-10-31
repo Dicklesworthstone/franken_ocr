@@ -21,6 +21,7 @@
 
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -30,8 +31,11 @@ use web_time::Instant;
 use image::DynamicImage;
 
 use crate::error::{FocrError, FocrResult};
-use crate::native_engine::{Half, RunWarning, WarningKind, timing_log, warning_recovery};
-use crate::pdf::{self, PdfPages};
+use crate::native_engine::{
+    Half, RecognizedDocument, RunWarning, WarningKind, timing_log, warning_recovery,
+};
+#[cfg(feature = "pdf")]
+use crate::pdf::PdfPages;
 
 /// The file extensions a directory source reads as page images
 /// (case-insensitive).
@@ -41,6 +45,151 @@ pub const PAGE_IMAGE_EXTENSIONS: &[&str] = &[
 
 /// How many ignored file names an `ignored_files` warning names.
 const IGNORED_EXAMPLES: usize = 3;
+
+/// Resolve a `--pages` spec into 0-based page indices, in source order with
+/// duplicates removed. `None` selects the whole document.
+///
+/// Out-of-range and malformed pages are **usage errors naming the real page
+/// count**, not silently dropped: asking for page 400 of a 200-page book is a
+/// mistake worth reporting, and a frontend that quietly ignores it leaves the
+/// user believing pages were read that never were.
+///
+/// # Errors
+/// [`FocrError::Usage`] for an unparseable element, page 0 (pages are 1-based),
+/// a page past the end, a reversed range, or an empty element.
+pub fn select_pages(spec: Option<&str>, page_count: usize) -> FocrResult<Vec<usize>> {
+    let Some(spec) = spec else {
+        return Ok((0..page_count).collect());
+    };
+    let usage = |what: &str| {
+        FocrError::Usage(format!(
+            "--pages {spec:?}: {what} (expected 1-based pages/ranges like \"1,5-9\"; \
+             this document has {page_count} page(s))"
+        ))
+    };
+    let parse_one = |tok: &str| -> FocrResult<usize> {
+        let n: usize = tok
+            .trim()
+            .parse()
+            .map_err(|_| usage(&format!("unparseable page {tok:?}")))?;
+        if n == 0 {
+            return Err(usage("page 0 (pages are 1-based)"));
+        }
+        if n > page_count {
+            return Err(usage(&format!("page {n} is out of range")));
+        }
+        Ok(n - 1)
+    };
+    let mut selected = Vec::new();
+    let mut seen = vec![false; page_count];
+    for part in spec.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            return Err(usage("empty element"));
+        }
+        let range = match part.split_once('-') {
+            Some((a, b)) => {
+                let (a, b) = (parse_one(a)?, parse_one(b)?);
+                if a > b {
+                    return Err(usage(&format!("reversed range {part:?}")));
+                }
+                a..=b
+            }
+            None => {
+                let n = parse_one(part)?;
+                n..=n
+            }
+        };
+        for idx in range {
+            if !seen[idx] {
+                seen[idx] = true;
+                selected.push(idx);
+            }
+        }
+    }
+    selected.sort_unstable();
+    Ok(selected)
+}
+
+/// Detect and split a two-page book spread into (left, right) halves
+/// (bd-av64.11). A spread is a rasterized page that is (a) noticeably wider
+/// than tall (w/h >= 1.25 — portrait book pages side by side) AND (b) has a
+/// low-ink vertical gutter near the horizontal center. Returns `None` when
+/// either condition fails — a false split is worse than none (full-bleed
+/// landscape photos, single-column landscape pages, spreads with a plate
+/// crossing the gutter all pass through unsplit).
+///
+/// The gutter search: over the middle 20% of columns, a column qualifies
+/// as gutter when its dark fraction is EITHER <= 0.5% (a blank inter-page
+/// gap — flat-scanned loose pages) OR >= 60% (the dark binding shadow of a
+/// bound book pressed into the scanner — the Cadwallader case). Text
+/// columns are mixed black-on-white and match neither. Among qualifying
+/// columns the one closest to the exact center wins. Decision + geometry
+/// are logged by the caller under FOCR_TIMING.
+#[must_use]
+pub fn split_spread(img: &DynamicImage) -> Option<(DynamicImage, DynamicImage, u32)> {
+    let (w, h) = (img.width(), img.height());
+    if h == 0 || (f64::from(w) / f64::from(h)) < 1.25 {
+        return None;
+    }
+    let gray = img.to_luma8();
+    let ink_threshold = 160u8; // scanned text is near-black; paper near-white
+    let (lo, hi) = (w * 2 / 5, w * 3 / 5); // middle 20% of columns
+    let center = i64::from(w / 2);
+    let mut best: Option<(i64, u32)> = None; // (distance to center, column)
+    for x in lo..hi {
+        let mut dark = 0u32;
+        for y in 0..h {
+            if gray.get_pixel(x, y).0[0] < ink_threshold {
+                dark += 1;
+            }
+        }
+        let dark_frac_pct_x10 = u64::from(dark) * 1000 / u64::from(h);
+        let is_gutter = dark_frac_pct_x10 <= 5 || dark_frac_pct_x10 >= 600;
+        if is_gutter {
+            let dist = (i64::from(x) - center).abs();
+            if best.is_none_or(|(d, _)| dist < d) {
+                best = Some((dist, x));
+            }
+        }
+    }
+    let (_, gutter_x) = best?;
+    let left = img.crop_imm(0, 0, gutter_x, h);
+    let right = img.crop_imm(gutter_x, 0, w - gutter_x, h);
+    Some((left, right, gutter_x))
+}
+
+/// Whether an error ends the whole document walk or just this page.
+///
+/// The distinction is the load-bearing part of a document run, and it is easy to
+/// get wrong in the permissive direction. A page whose codec has no pure-Rust
+/// decoder is *this page's* problem — one JPEG-2000 page in a 300-page scan must
+/// not throw away the other 299. But a missing model, a cancelled run, or a
+/// format mismatch is the *document's* problem: skipping 300 pages one at a time
+/// and reporting "300 skipped" would be a slow, confusing way to say "you never
+/// had a model loaded".
+///
+/// [`PageSource::read_pages`] applies this set to every per-page run, so it
+/// decides what `focr ocr book.pdf` does. `Timeout` is deliberately NOT fatal:
+/// the stage budget is per-forward, so one slow page is a skip, not a verdict on
+/// the rest of the book.
+#[must_use]
+pub fn is_fatal_to_document(err: &FocrError) -> bool {
+    matches!(
+        err,
+        FocrError::ModelNotFound(_) | FocrError::Cancelled | FocrError::FormatMismatch(_)
+    )
+}
+
+/// One page that was refused, and why.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SkippedPage {
+    /// 1-based source page number.
+    pub page: usize,
+    /// The engine's own message — "JPXDecode: no pure-Rust decoder", not a
+    /// paraphrase.
+    pub reason: String,
+}
 
 /// One page from a [`PageSource`].
 #[derive(Debug)]
@@ -89,6 +238,84 @@ pub struct IgnoredFiles {
     pub examples: Vec<String>,
 }
 
+/// A page's place in a [`PageSource::read_pages`] walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageStep {
+    /// 0-based position in the run, as [`PageItem::index`].
+    pub index: usize,
+    /// 1-based page of the source.
+    pub source_page: usize,
+    /// The half of a split spread, or `None` for a whole page.
+    pub half: Option<Half>,
+}
+
+/// Progress across a [`PageSource::read_pages`] walk, in source order.
+#[derive(Debug, Clone, Copy)]
+pub enum PageEvent<'a> {
+    /// About to read this page. Its raster is already made.
+    Started(PageStep),
+    /// This page read.
+    Done(PageStep),
+    /// This page failed, for this reason; the walk continues.
+    Skipped(PageStep, &'a FocrError),
+}
+
+/// One page a [`PageSource::read_pages`] walk read.
+#[derive(Debug, Clone)]
+pub struct PageRead<T> {
+    /// 1-based page of the source.
+    pub source_page: usize,
+    /// The half of a split spread, or `None` for a whole page.
+    pub half: Option<Half>,
+    /// What the reader returned for it.
+    pub value: T,
+    /// Wall time for this page alone, its raster included.
+    pub duration: Duration,
+}
+
+/// What a [`PageSource::read_pages`] walk read and skipped.
+#[derive(Debug, Clone)]
+pub struct PagesRead<T> {
+    /// Pages that read, in source order.
+    pub pages: Vec<PageRead<T>>,
+    /// Pages that failed, in source order.
+    pub skipped: Vec<SkippedPage>,
+    /// Pages in the source.
+    pub source_pages: usize,
+}
+
+impl<T> PagesRead<T> {
+    /// Total wall time across the pages that read.
+    #[must_use]
+    pub fn duration(&self) -> Duration {
+        self.pages.iter().map(|page| page.duration).sum()
+    }
+}
+
+impl PagesRead<RecognizedDocument> {
+    /// The whole document as one markdown string, pages joined by a blank
+    /// line: the shape `focr ocr book.pdf` writes.
+    #[must_use]
+    pub fn markdown(&self) -> String {
+        self.pages
+            .iter()
+            .map(|page| page.value.markdown.trim_end())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    /// The pages as the model wrote them, joined as [`Self::markdown`] joins
+    /// them; each page's boxes are on that page's own 0–999 grid.
+    #[must_use]
+    pub fn raw(&self) -> String {
+        self.pages
+            .iter()
+            .map(|page| page.value.raw.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
 /// What a source rasterizes its pages from.
 trait Rasterize: Send {
     /// Pages in the source.
@@ -97,6 +324,7 @@ trait Rasterize: Send {
     fn render(&self, idx: usize) -> FocrResult<DynamicImage>;
 }
 
+#[cfg(feature = "pdf")]
 impl Rasterize for PdfPages {
     fn len(&self) -> usize {
         PdfPages::len(self)
@@ -172,19 +400,26 @@ impl PageSource {
     /// PDF. Nothing is rasterized yet.
     ///
     /// # Errors
-    /// As [`PageSource::directory`] or [`PageSource::pdf`].
+    /// As [`PageSource::directory`] or `PageSource::pdf`; without the `pdf`
+    /// feature, [`FocrError::NotImplemented`] for anything but a directory.
     pub fn open(path: &Path) -> FocrResult<Self> {
         if path.is_dir() {
-            Self::directory(path)
-        } else {
-            Self::pdf(path)
+            return Self::directory(path);
         }
+        #[cfg(feature = "pdf")]
+        return Self::pdf(path);
+        #[cfg(not(feature = "pdf"))]
+        Err(FocrError::NotImplemented(format!(
+            "{}: this build has no PDF reader (the `pdf` feature)",
+            path.display()
+        )))
     }
 
     /// The pages of the PDF at `path`.
     ///
     /// # Errors
     /// As [`PdfPages::open`].
+    #[cfg(feature = "pdf")]
     pub fn pdf(path: &Path) -> FocrResult<Self> {
         Ok(Self::new(Box::new(PdfPages::open(path)?)))
     }
@@ -254,18 +489,18 @@ impl PageSource {
         }
     }
 
-    /// Walk only the pages of a `--pages` spec ([`pdf::select_pages`]);
+    /// Walk only the pages of a `--pages` spec ([`select_pages`]);
     /// `None` keeps every page. Call it before the walk.
     ///
     /// # Errors
     /// [`FocrError::Usage`] for a malformed or out-of-range spec.
     pub fn select(mut self, spec: Option<&str>) -> FocrResult<Self> {
-        self.selected = pdf::select_pages(spec, self.pages.len())?;
+        self.selected = select_pages(spec, self.pages.len())?;
         Ok(self)
     }
 
     /// Yield a two-page spread as its left and right halves
-    /// ([`pdf::split_spread`]); a page without a detectable gutter stays
+    /// ([`split_spread`]); a page without a detectable gutter stays
     /// whole. Call it before the walk.
     #[must_use]
     pub fn split_spreads(mut self, on: bool) -> Self {
@@ -358,7 +593,7 @@ impl PageSource {
         let Some(half) = half else {
             return Ok(image);
         };
-        let (left, right, _) = pdf::split_spread(&image).ok_or_else(|| {
+        let (left, right, _) = split_spread(&image).ok_or_else(|| {
             FocrError::InputDecode(format!(
                 "page {source_page} is not a two-page spread, so it has no {} half",
                 half.as_str()
@@ -394,6 +629,71 @@ impl PageSource {
         self.next = cursor.next;
         self.map = map;
         Ok(())
+    }
+
+    /// Read the rest of the walk with `read`, one page at a time.
+    ///
+    /// A page that fails is skipped and reported, so one bad page cannot
+    /// cost the rest of a book. A failure of the whole run
+    /// ([`is_fatal_to_document`]) ends the walk on the page that met
+    /// it, so a missing model is not 300 skipped pages.
+    ///
+    /// The walk is sequential by construction, and that is a correctness
+    /// property: the engine admits one forward at a time and each forward
+    /// already fans out across every core, so concurrent pages would not be
+    /// faster and would multiply peak memory by the number in flight.
+    ///
+    /// # Errors
+    /// A whole-run failure, or the first page's error when no page read, so
+    /// "nothing worked" still says why.
+    pub fn read_pages<T>(
+        &mut self,
+        mut read: impl FnMut(DynamicImage) -> FocrResult<T>,
+        observer: &mut dyn FnMut(PageEvent<'_>),
+    ) -> FocrResult<PagesRead<T>> {
+        let mut pages = Vec::new();
+        let mut skipped = Vec::new();
+        let mut first_error = None;
+        loop {
+            let started = Instant::now();
+            let Some(item) = self.next() else { break };
+            let step = PageStep {
+                index: item.index,
+                source_page: item.source_page,
+                half: item.half,
+            };
+            observer(PageEvent::Started(step));
+            match item.raster.and_then(&mut read) {
+                Ok(value) => {
+                    pages.push(PageRead {
+                        source_page: step.source_page,
+                        half: step.half,
+                        value,
+                        duration: started.elapsed(),
+                    });
+                    observer(PageEvent::Done(step));
+                }
+                Err(error) if is_fatal_to_document(&error) => return Err(error),
+                Err(error) => {
+                    observer(PageEvent::Skipped(step, &error));
+                    skipped.push(SkippedPage {
+                        page: step.source_page,
+                        reason: error.to_string(),
+                    });
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if pages.is_empty() {
+            return Err(first_error.unwrap_or_else(|| {
+                FocrError::InputDecode("the page source has no pages left to read".to_owned())
+            }));
+        }
+        Ok(PagesRead {
+            pages,
+            skipped,
+            source_pages: self.source_len(),
+        })
     }
 
     /// Record `source_page` (or its half) in the map and hand it out.
@@ -448,7 +748,7 @@ impl Iterator for PageSource {
             started.elapsed().as_secs_f64() * 1e3
         ));
         if self.split_spreads {
-            if let Some((left, right, gutter_x)) = pdf::split_spread(&image) {
+            if let Some((left, right, gutter_x)) = split_spread(&image) {
                 timing_log(&format!(
                     "pagesource page {source_page}: spread split at x={gutter_x} ({width}x{height})"
                 ));
@@ -595,11 +895,120 @@ fn runs(s: &str) -> impl Iterator<Item = &str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::pdf::tests::{build_multi_page_pdf, jpeg_xobject, synth_page};
+    #[cfg(feature = "pdf")]
+    use crate::pdf::tests::{build_multi_page_pdf, jpeg_xobject};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    // ── page selection ─────────────────────────────────────────────────────
+
+    #[test]
+    fn no_spec_selects_every_page() {
+        assert_eq!(select_pages(None, 4).expect("ok"), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn spec_is_1_based_sorted_and_deduped() {
+        assert_eq!(select_pages(Some("3,1"), 5).expect("ok"), vec![0, 2]);
+        assert_eq!(select_pages(Some("2-4"), 5).expect("ok"), vec![1, 2, 3]);
+        // Overlapping ranges collapse rather than repeating a page.
+        assert_eq!(
+            select_pages(Some("1-3,2-4"), 5).expect("ok"),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn out_of_range_is_a_usage_error_naming_the_page_count() {
+        // Silently dropping this is the bug: the user would believe page 9 was
+        // read. The message has to name the real count.
+        let err = select_pages(Some("9"), 3).expect_err("must reject");
+        assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
+        let text = err.to_string();
+        assert!(text.contains("out of range"), "{text}");
+        assert!(text.contains("3 page(s)"), "{text}");
+    }
+
+    #[test]
+    fn zero_reversed_and_empty_elements_are_rejected() {
+        for bad in ["0", "3-1", "1,,2", "x"] {
+            let err = select_pages(Some(bad), 5).expect_err(bad);
+            assert!(matches!(err, FocrError::Usage(_)), "{bad}: {err:?}");
+        }
+    }
+
+    // ── fatal vs skippable ─────────────────────────────────────────────────
+
+    #[test]
+    fn only_document_level_failures_are_fatal() {
+        // A page the renderer cannot decode is this page's problem.
+        assert!(!is_fatal_to_document(&FocrError::InputDecode(
+            "JPXDecode: no pure-Rust decoder".into()
+        )));
+        assert!(!is_fatal_to_document(&FocrError::NotImplemented(
+            "x".into()
+        )));
+        // The stage budget is PER FORWARD, so one slow page is a skip, not a
+        // verdict on the rest of the book. This matches what cli.rs has always
+        // done; changing it would silently change `focr ocr book.pdf`.
+        assert!(!is_fatal_to_document(&FocrError::Timeout("x".into())));
+        // These say the run itself is over; skipping 300 pages one at a time
+        // would be a slow way to report "you never had a model".
+        assert!(is_fatal_to_document(&FocrError::ModelNotFound("x".into())));
+        assert!(is_fatal_to_document(&FocrError::Cancelled));
+        assert!(is_fatal_to_document(&FocrError::FormatMismatch("x".into())));
+    }
+
+    // ── spreads ────────────────────────────────────────────────────────────
+
+    pub(crate) fn synth_page(w: u32, h: u32, text_cols: &[(u32, u32)]) -> DynamicImage {
+        // White canvas with black "text block" columns [x0, x1).
+        let mut img = image::GrayImage::from_pixel(w, h, image::Luma([255u8]));
+        for &(x0, x1) in text_cols {
+            for x in x0..x1 {
+                for y in (10..h.saturating_sub(10)).step_by(3) {
+                    img.put_pixel(x, y, image::Luma([20u8]));
+                }
+            }
+        }
+        DynamicImage::ImageLuma8(img)
+    }
+
+    /// bd-av64.11: a synthetic spread (text left + right, blank center
+    /// gutter) splits at the gutter; the negatives pass through unsplit.
+    #[test]
+    fn split_spread_positive_and_negatives() {
+        // POSITIVE: 1600x1000 spread, text at [100,700) and [900,1500).
+        let spread = synth_page(1600, 1000, &[(100, 700), (900, 1500)]);
+        let (left, right, gx) = split_spread(&spread).expect("spread splits");
+        assert!((700..=900).contains(&gx), "gutter near center: {gx}");
+        assert_eq!(left.width() + right.width(), 1600);
+        assert_eq!(left.height(), 1000);
+        // NEGATIVE 1: portrait page (aspect below the spread threshold).
+        assert!(split_spread(&synth_page(1000, 1600, &[(100, 900)])).is_none());
+        // NEGATIVE 2: landscape but ink crosses the center (a full-width
+        // plate/table) — no blank gutter, no split.
+        assert!(split_spread(&synth_page(1600, 1000, &[(100, 1500)])).is_none());
+        // NEGATIVE 3: landscape blank page — a gutter exists but splitting a
+        // blank is harmless; the heuristic DOES split it (blank center
+        // qualifies). Accepting this is deliberate: both halves are blank,
+        // and OCR of blank halves is cheap + correct.
+        // NEGATIVE 4: single centered column (text crosses the middle).
+        assert!(split_spread(&synth_page(1600, 1000, &[(600, 1000)])).is_none());
+        // POSITIVE 2: a bound book's DARK binding shadow as the gutter (the
+        // Cadwallader case) — a solid dark band at the center qualifies.
+        let mut bound = synth_page(1600, 1000, &[(100, 700), (900, 1500)]).to_luma8();
+        for x in 780..820 {
+            for y in 0..1000 {
+                bound.put_pixel(x, y, image::Luma([30u8]));
+            }
+        }
+        let bound = DynamicImage::ImageLuma8(bound);
+        let (_, _, gx) = split_spread(&bound).expect("binding shadow splits");
+        assert!((780..=820).contains(&gx), "split inside the shadow: {gx}");
+    }
 
     /// A fresh, empty directory under the system temp dir.
     fn temp_dir(tag: &str) -> PathBuf {
@@ -727,7 +1136,7 @@ mod tests {
             ]
         );
         assert_eq!(source.fetch(1, None).expect("page 1"), pages[0]);
-        let (left, _, _) = pdf::split_spread(&pages[1]).expect("a spread");
+        let (left, _, _) = split_spread(&pages[1]).expect("a spread");
         assert_eq!(source.fetch(2, Some(Half::Left)).expect("left"), left);
         assert!(source.warnings().is_empty());
     }
@@ -752,6 +1161,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pdf")]
     fn a_pdf_page_that_will_not_rasterize_is_yielded_with_its_error_and_keeps_its_slot() {
         // Page 2 has no image XObject: the vector/text page the native path
         // refuses (bd-0a7).
@@ -1027,6 +1437,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pdf")]
     fn fetch_reproduces_the_walks_rasters_and_the_maps_sizes() {
         let path = build_multi_page_pdf(&[Some(jpeg_xobject()), None, Some(jpeg_xobject())]);
         let mut source = PageSource::pdf(&path).expect("open");
@@ -1077,6 +1488,156 @@ mod tests {
             PageSource::images(Vec::new()),
             Err(FocrError::Usage(_))
         ));
+    }
+
+    fn recognized(markdown: &str) -> RecognizedDocument {
+        RecognizedDocument {
+            markdown: markdown.to_owned(),
+            raw: markdown.to_owned(),
+            layout: Vec::new(),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn a_page_walk_reads_every_readable_page_and_skips_the_rest_with_reasons() {
+        // Page 2 has no image: the renderer refuses it, and the walk must carry
+        // on, because one bad page in a book cannot cost the other pages.
+        let path = build_multi_page_pdf(&[Some(jpeg_xobject()), None, Some(jpeg_xobject())]);
+        let mut source = PageSource::pdf(&path).expect("open");
+
+        let mut events: Vec<String> = Vec::new();
+        let mut read_count = 0;
+        let outcome = source
+            .read_pages(
+                |image| {
+                    assert!(image.width() > 0, "the page rasterized");
+                    read_count += 1;
+                    Ok(recognized(&format!("text {read_count}\n\n")))
+                },
+                &mut |event| {
+                    events.push(match event {
+                        PageEvent::Started(page) => format!("start {}", page.source_page),
+                        PageEvent::Done(page) => format!("done {}", page.source_page),
+                        PageEvent::Skipped(page, _) => format!("skip {}", page.source_page),
+                    });
+                },
+            )
+            .expect("the walk succeeds when at least one page reads");
+
+        assert_eq!(outcome.source_pages, 3);
+        let pages: Vec<usize> = outcome.pages.iter().map(|p| p.source_page).collect();
+        assert_eq!(pages, vec![1, 3]);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert_eq!(outcome.skipped[0].page, 2);
+        assert!(
+            !outcome.skipped[0].reason.is_empty(),
+            "a skip carries the engine's reason"
+        );
+        assert_eq!(outcome.markdown(), "text 1\n\ntext 2");
+        assert_eq!(
+            events,
+            [
+                "start 1", "done 1", "start 2", "skip 2", "start 3", "done 3"
+            ]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn pages_read_joins_with_a_blank_line_and_sums_only_what_read() {
+        let page = |source_page, markdown, millis| PageRead {
+            source_page,
+            half: None,
+            value: recognized(markdown),
+            duration: Duration::from_millis(millis),
+        };
+        let outcome = PagesRead {
+            pages: vec![page(1, "one\n\n", 10), page(2, "two", 20)],
+            skipped: vec![SkippedPage {
+                page: 3,
+                reason: "JBIG2Decode".into(),
+            }],
+            source_pages: 3,
+        };
+        assert_eq!(outcome.markdown(), "one\n\ntwo");
+        assert_eq!(outcome.duration(), Duration::from_millis(30));
+    }
+
+    #[test]
+    fn a_page_walk_ends_at_once_on_a_failure_of_the_whole_run() {
+        for fatal in [
+            FocrError::ModelNotFound("no model".into()),
+            FocrError::Cancelled,
+            FocrError::FormatMismatch("not a model".into()),
+        ] {
+            let kind = fatal.to_string();
+            let mut fatal = Some(fatal);
+            let pages = vec![portrait(), portrait(), portrait()];
+            let mut source = PageSource::rasters(pages).expect("a source");
+            let mut attempts = 0usize;
+            let err = source
+                .read_pages(
+                    |_| -> FocrResult<RecognizedDocument> {
+                        attempts += 1;
+                        Err(fatal.take().expect("read once"))
+                    },
+                    &mut |_| {},
+                )
+                .expect_err("the run ends");
+            assert_eq!(err.to_string(), kind);
+            assert_eq!(attempts, 1, "no grinding through the rest of the book");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn a_page_walk_with_no_readable_page_returns_the_first_error_unchanged() {
+        let path = build_multi_page_pdf(&[None, None]);
+        let mut source = PageSource::pdf(&path).expect("open");
+        let err = source
+            .read_pages(|_| Ok(recognized("")), &mut |_| {})
+            .expect_err("nothing readable");
+        assert!(matches!(err, FocrError::InputDecode(_)), "got {err:?}");
+        assert!(!err.to_string().is_empty(), "it still says why");
+        let _ = std::fs::remove_file(&path);
+
+        // A reader's own error keeps its kind, and so the run's exit code.
+        let mut source = PageSource::rasters(vec![portrait(), portrait()]).expect("a source");
+        let err = source
+            .read_pages(
+                |_| -> FocrResult<RecognizedDocument> {
+                    Err(FocrError::Timeout("the first page".into()))
+                },
+                &mut |_| {},
+            )
+            .expect_err("nothing read");
+        assert!(matches!(err, FocrError::Timeout(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn a_page_walk_reports_each_half_of_a_spread() {
+        let mut source = PageSource::rasters(vec![spread(), portrait()])
+            .expect("a source")
+            .split_spreads(true);
+        let mut started = Vec::new();
+        let outcome = source
+            .read_pages(|_| Ok(()), &mut |event| {
+                if let PageEvent::Started(page) = event {
+                    started.push((page.index, page.source_page, page.half));
+                }
+            })
+            .expect("every page reads");
+        assert_eq!(
+            started,
+            [
+                (0, 1, Some(Half::Left)),
+                (1, 1, Some(Half::Right)),
+                (2, 2, None)
+            ]
+        );
+        assert_eq!(outcome.pages[1].half, Some(Half::Right));
+        assert_eq!(outcome.source_pages, 2);
     }
 
     #[test]

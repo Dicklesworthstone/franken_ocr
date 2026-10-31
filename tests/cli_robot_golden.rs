@@ -21,7 +21,7 @@
 //!        `tests/fixtures/robot_schema_v1.json` contract fixture.               -> robot_schema_matches_frozen_contract_fixture
 //!   [R3] `schema_version` == `ROBOT_SCHEMA_VERSION` (== 1).                    -> robot_schema_advertises_version_and_all_events
 //!   [R4] every `EVENT_KIND`
-//!        (`run_start,stage,page,staff,music_warning,run_complete,run_error`)
+//!        (`run_start,stage,page,window,staff,music_warning,run_complete,run_error`)
 //!        is present in the advertised `events`.                                -> robot_schema_advertises_version_and_all_events
 //!   [R5] `robot health` is a single JSON line carrying `schema_version`.       -> robot_health_golden
 //!   [R6] `robot backends` is a single JSON line; host CPU/SIMD fields scrubbed. -> robot_backends_golden
@@ -29,7 +29,8 @@
 //!   [R8] `ocr --robot` errors emit run_start then run_error.code from
 //!        FocrError::exit_code.                                                -> ocr_robot_error_stream_matches_exit_code
 //! CLI surface (`src/cli.rs`):
-//!   [C1] `--help` renders the frozen root golden; `ocr --help` documents PDF.   -> cli_root_help_golden / ocr_help_documents_pdf_input
+//!   [C1] `--help` renders the frozen root golden; `ocr --help` documents PDF;
+//!        the whole clap tree is frozen too.                                    -> cli_root_help_golden / ocr_help_documents_pdf_input / cli_surface_golden
 //!   [C2] `--version` renders `focr <version>` (version scrubbed).             -> cli_version_golden
 //!   [C3] `ocr`    -> env/default model resolver; missing default exits 3.      -> exit_code_conformance / ocr_default_model_not_found_golden
 //!   [C4] `convert` int8 + int4 (wasm recipe) implemented; missing input -> 3.  -> exit_code_conformance / convert_int4_missing_input_model_not_found_golden
@@ -57,9 +58,11 @@
 //! self-diagnosing.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
+use clap::CommandFactory;
 use franken_ocr::FOCR_MODEL_LICENSE_NOTICE;
+use franken_ocr::cli::Cli;
 use franken_ocr::native_engine::model_arch::arch_by_id;
 use franken_ocr::native_engine::weights::{FOCRQ_FORMAT_VERSION, FOCRQ_MAGIC};
 use franken_ocr::quant::focrq::{FocrqBuilder, WriteDType};
@@ -152,9 +155,6 @@ fn validate_robot_events(stdout: &str) {
                 "event kind {kind:?} is not in event_fields: {line}"
             ));
         };
-        if spec.get("reserved") == Some(&serde_json::Value::Bool(true)) {
-            fail_test(format!("reserved event kind {kind:?} was emitted: {line}"));
-        }
         let names = |key: &str| -> Vec<&str> {
             spec[key]
                 .as_array()
@@ -186,12 +186,48 @@ fn validate_robot_events(stdout: &str) {
 fn robot_event_stream_contract_rejects_violations() {
     let ok = r#"{"schema_version":1,"event":"run_complete","markdown":"x","finish_reason":"stop"}"#;
     validate_robot_events(&format!("{ok}\nnot json\n{{\"plain\":1}}"));
-    for bad in [
+    // A windowed document's stream (U2-D5).
+    let window = franken_ocr::native_engine::window::WindowStats {
+        index: 0,
+        pages: 0..10,
+        lookahead: true,
+        reused: false,
+        fallback_reason: None,
+        straddle: false,
+        prefill_tokens: 3019,
+        copied_rows: 0,
+        forced_tokens: 0,
+        generated_tokens: 6293,
+        finish: franken_ocr::native_engine::FinishReason::Stop,
+        kv_bytes_peak: 396_963_072,
+        rss_bytes_peak: None,
+        retire_fallbacks: 0,
+        elapsed_ms: 851_950,
+    };
+    validate_robot_events(&format!(
+        "{}\n{}",
+        franken_ocr::robot::window_event(&window, Some(851_950)),
+        r#"{"schema_version":1,"event":"run_complete","markdown":"x","pages_out":20,"pages_skipped":0,"windows":2,"extra_markers":0}"#,
+    ));
+    let clock = franken_ocr::robot::StageClock::start();
+    let load = clock.entered("load", None);
+    let forward = clock.entered("forward", Some(std::time::Duration::from_secs(600)));
+    validate_robot_events(&format!("{load}\n{forward}"));
+    assert_eq!(
+        (load["seq"].as_u64(), forward["seq"].as_u64()),
+        (Some(1), Some(2))
+    );
+    assert_eq!(load.get("budget_ms"), None);
+    assert_eq!(forward["budget_ms"].as_u64(), Some(600_000));
+    let violations = [
         r#"{"schema_version":1,"event":"run_complete"}"#,
         r#"{"schema_version":1,"event":"run_complete","markdown":"x","surprise":1}"#,
         r#"{"schema_version":1,"event":"no_such_kind"}"#,
         r#"{"schema_version":1,"event":"stage"}"#,
-    ] {
+        r#"{"schema_version":1,"event":"stage","name":"load","seq":1,"elapsed_ms":1,"surprise":1}"#,
+        r#"{"schema_version":1,"event":"window","index":0}"#,
+    ];
+    for bad in violations {
         let caught = std::panic::catch_unwind(|| validate_robot_events(bad));
         assert!(caught.is_err(), "the contract accepted {bad}");
     }
@@ -199,8 +235,48 @@ fn robot_event_stream_contract_rejects_violations() {
         "case": "event_fields",
         "event": "assert",
         "result": "pass",
-        "rejected": 4,
+        "rejected": violations.len(),
     );
+}
+
+/// [bd-fuh2] A robot run names each stage as it enters it. This model loads and
+/// its forward fails on the missing tokenizer, so the real binary shows both
+/// stages with no weights: `load`, which has no budget, then `forward`.
+#[test]
+fn a_robot_run_says_when_it_enters_each_stage() {
+    let model = write_compatible_focrq();
+    let model_arg = model.to_string_lossy().into_owned();
+    let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cjk_stream/page_1.png");
+    let image_arg = image.to_string_lossy().into_owned();
+    let args = ["ocr", &image_arg, "--robot", "--model", &model_arg];
+    let mut command = hermetic_focr(&args);
+    command.env("FOCR_STAGE_BUDGET_FORWARD_MS", "1234");
+
+    let out = run_focr_command(command, &args);
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 4, "run_start, two stages, run_error: {stdout}");
+    let load = parse_json_line(lines[1], "the load stage");
+    assert_eq!(load["event"].as_str(), Some("stage"));
+    assert_eq!(load["name"].as_str(), Some("load"));
+    assert_eq!(load["seq"].as_u64(), Some(1));
+    assert!(load["elapsed_ms"].is_u64(), "{load}");
+    assert_eq!(load.get("budget_ms"), None, "{load}");
+    let forward = parse_json_line(lines[2], "the forward stage");
+    assert_eq!(forward["event"].as_str(), Some("stage"));
+    assert_eq!(forward["name"].as_str(), Some("forward"));
+    assert_eq!(forward["seq"].as_u64(), Some(2));
+    assert_eq!(forward["budget_ms"].as_u64(), Some(1234), "{forward}");
+    assert!(
+        forward["elapsed_ms"].as_u64() >= load["elapsed_ms"].as_u64(),
+        "{load} {forward}"
+    );
+    let end = parse_json_line(lines[3], "the terminal event");
+    assert_eq!(end["event"].as_str(), Some("run_error"));
+    tlog!("a_robot_run_says_when_it_enters_each_stage", "case": "stages",
+        "event": "assert", "assertion": "load, then forward with its budget",
+        "pass": true, "result": "pass");
 }
 
 /// U2-X2: the test-only position override refuses a budget above the arch's
@@ -268,6 +344,8 @@ fn hermetic_focr(args: &[&str]) -> Command {
         .env("USERPROFILE", hermetic_home())
         .env_remove("FOCR_FORCE_ARCH")
         .env_remove("FOCR_INT8_AUTOVEC")
+        .env_remove("FOCR_THREADS")
+        .env_remove("FOCR_TIMING")
         .env_remove(FORCE_TEST_ERROR_ENV);
     command
 }
@@ -863,6 +941,7 @@ const EXPECTED_EVENT_KINDS: &[&str] = &[
     "run_start",
     "stage",
     "page",
+    "window",
     "staff",
     "music_warning",
     "run_complete",
@@ -1430,6 +1509,57 @@ fn ocr_multi_page_flag_guards_are_typed_usage_errors() {
     );
 }
 
+/// U2-D5: `--page-window` refuses what it cannot do, exit 2 with what is wrong
+/// in the message, before any model loads.
+#[test]
+fn page_window_refusals_are_usage_errors_that_say_why() {
+    let test = "page_window_refusals_are_usage_errors_that_say_why";
+    let off = [
+        "ocr",
+        "b.pdf",
+        "--multi-page",
+        "--model",
+        "unlimited-ocr-2",
+        "--page-window",
+        "off",
+    ];
+    for (argv, says) in [
+        (
+            vec!["ocr", "b.pdf", "--multi-page", "--page-window", "103"],
+            "at most 102 pages",
+        ),
+        (
+            vec!["ocr", "b.pdf", "--multi-page", "--page-window", "0"],
+            "at least one page",
+        ),
+        (
+            vec!["ocr", "b.pdf", "--multi-page", "--page-window", "many"],
+            "`auto` or `off`",
+        ),
+        (vec!["ocr", "b.pdf", "--page-window", "5"], "--multi-page"),
+        ([&off[..], &["--resume"]].concat(), "--page-window off"),
+        (
+            [&off[..], &["--keep-checkpoint"]].concat(),
+            "--page-window off",
+        ),
+    ] {
+        let out = run_focr(&argv);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{argv:?}: {stderr}");
+        assert!(
+            stderr.contains(says),
+            "{argv:?} must say {says:?}: {stderr}"
+        );
+        tlog!(test,
+            "case": says,
+            "event": "result",
+            "inputs": {"argv": argv},
+            "exit_code": out.status.code(),
+            "result": "pass",
+        );
+    }
+}
+
 /// bd-1gv.25 S2: `focr batch --multi-page` parses, routes to the cross-page
 /// pass, and (hermetically, with no model present) fails with the CLEAN
 /// ModelNotFound contract (exit 3) — proving the flag reaches the engine
@@ -1650,6 +1780,70 @@ fn ocr_robot_missing_model_stream_matches_exit_code() {
     );
 }
 
+/// [bd-mapo] A daemon that accepts a connection and then says nothing (here
+/// stopped, as a wedged process would be) costs a client seconds, not the long
+/// read timeout that a real page needs: it falls back inline.
+#[cfg(unix)]
+#[test]
+fn an_unresponsive_daemon_costs_a_client_seconds() {
+    let test = "an_unresponsive_daemon_costs_a_client_seconds";
+    let model = write_compatible_focrq();
+    let model_arg = model.to_string_lossy().into_owned();
+    let resident_dir = fresh_run_store_path().with_extension("resident");
+    let image = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cjk_stream/page_1.png");
+    let image_arg = image.to_string_lossy().into_owned();
+    let args = ["ocr", &image_arg, "--robot", "--model", &model_arg];
+
+    let inline = run_focr(&args);
+
+    let mut daemon = Command::new(focr_bin())
+        .args(["resident-daemon", "--model-root", &model_arg])
+        .env("FOCR_RESIDENT_DIR", &resident_dir)
+        .env("FOCR_RESIDENT_IDLE_SECS", "120")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the daemon");
+    let pid = daemon.id().to_string();
+    let signal = |name: &str| {
+        Command::new("kill")
+            .args([name, &pid])
+            .status()
+            .expect("kill")
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::fs::read_dir(&resident_dir).map_or(0, Iterator::count) == 0 {
+        assert!(std::time::Instant::now() < deadline, "no daemon state");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(signal("-STOP").success());
+
+    let mut client = hermetic_focr(&args);
+    client
+        .env_remove(NO_RESIDENT_ENV)
+        .env("FOCR_RESIDENT_DIR", &resident_dir)
+        .env("FOCR_RESIDENT_CLIENT_TIMEOUT_SECS", "45");
+    let started = std::time::Instant::now();
+    let out = run_focr_command(client, &args);
+    let elapsed = started.elapsed();
+
+    signal("-CONT");
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    let fast = elapsed < std::time::Duration::from_secs(20);
+    tlog!(test, "case": "stopped_daemon", "event": "assert",
+        "elapsed_ms": elapsed.as_millis() as u64, "exit_code": out.status.code(),
+        "result": if fast { "pass" } else { "fail" });
+    assert!(fast, "the client waited {elapsed:?}");
+    assert_eq!(
+        out.status.code(),
+        inline.status.code(),
+        "the fallback ends as an inline run does: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// A model whose bounded header this binary refuses is never handed to the
 /// resident daemon: with resident enabled the run still fails inline (exit 7)
 /// and its state directory stays empty, so no daemon idles on a model it can
@@ -1830,6 +2024,92 @@ fn ocr_robot_forced_error_stream_matches_exit_code() {
 // ════════════════════════════════════════════════════════════════════════════
 // [C1]–[C2] HUMAN SURFACE GOLDENS — --help, --version (scrubbed exact).
 // ════════════════════════════════════════════════════════════════════════════
+
+/// One line per command and per argument under `cmd`, in declared order, with
+/// everything a caller depends on: names, value names, how often a value may
+/// repeat, defaults, possible values and environment variables. Help prose is
+/// left out, so rewording a sentence is no surface change.
+fn surface_lines(cmd: &clap::Command, path: &str, lines: &mut Vec<String>) {
+    let aliases: Vec<&str> = cmd.get_all_aliases().collect();
+    let mut line = path.to_owned();
+    if !aliases.is_empty() {
+        line += &format!(" alias={}", aliases.join(","));
+    }
+    if cmd.is_hide_set() {
+        line += " hidden";
+    }
+    lines.push(line);
+    for arg in cmd.get_arguments() {
+        let mut line = match (arg.get_short(), arg.get_long()) {
+            (Some(short), Some(long)) => format!("{path} -{short} --{long}"),
+            (None, Some(long)) => format!("{path} --{long}"),
+            (Some(short), None) => format!("{path} -{short}"),
+            (None, None) => format!("{path} <{}>", arg.get_id()),
+        };
+        line += &format!(" {:?}", arg.get_action());
+        let join = |values: Vec<String>| values.join(",");
+        // A switch's value name and `true,false` are clap's, not the caller's.
+        if arg.get_action().takes_values() {
+            if let Some(names) = arg.get_value_names() {
+                line += &format!(
+                    " value={}",
+                    join(names.iter().map(ToString::to_string).collect())
+                );
+            }
+            if let Some(range) = arg.get_num_args() {
+                line += &format!(" num={range}");
+            }
+            let possible = arg.get_possible_values();
+            if !possible.is_empty() {
+                let names = possible.iter().map(|p| p.get_name().to_owned()).collect();
+                line += &format!(" possible={}", join(names));
+            }
+            let defaults = arg.get_default_values();
+            if !defaults.is_empty() {
+                let values = defaults
+                    .iter()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .collect();
+                line += &format!(" default={}", join(values));
+            }
+        }
+        if let Some(env) = arg.get_env() {
+            line += &format!(" env={}", env.to_string_lossy());
+        }
+        for (set, word) in [
+            (arg.is_required_set(), "required"),
+            (arg.is_global_set(), "global"),
+            (arg.is_hide_set(), "hidden"),
+        ] {
+            if set {
+                line += &format!(" {word}");
+            }
+        }
+        lines.push(line);
+    }
+    for sub in cmd.get_subcommands() {
+        surface_lines(sub, &format!("{path} {}", sub.get_name()), lines);
+    }
+}
+
+/// [C1] The whole command surface from clap itself, not only the root help: a
+/// flag or subcommand added, renamed or dropped, or a default or possible value
+/// changed, anywhere in the tree, is a reviewed golden diff.
+#[test]
+fn cli_surface_golden() {
+    let test = "cli_surface_golden";
+    let mut lines = Vec::new();
+    surface_lines(&Cli::command(), "focr", &mut lines);
+    let surface = lines.join("\n") + "\n";
+    tlog!(test,
+        "case": "cli_surface",
+        "event": "stage",
+        "stage": "walk_clap_tree",
+        "lines": lines.len(),
+        "result": "pass",
+    );
+    assert_golden(test, "cli_surface", &surface);
+}
 
 /// [C1] Root `--help` golden. Pin nothing about terminal width via env — instead
 /// we scrub line endings + version; clap renders deterministically for a fixed
@@ -2131,6 +2411,426 @@ fn ocr_default_model_not_found_golden() {
         "ocr_not_implemented",
         &["ocr", "/some/document.png"],
     );
+}
+
+fn sample_image() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/got/sample_text.png")
+}
+
+/// `focr ocr --check` exits with the code the run would. Each request here
+/// fails before a decode, so the run itself is cheap to compare with, and the
+/// second one is wrong twice to pin that the model is judged first.
+#[test]
+fn ocr_check_exits_with_the_code_of_the_run() {
+    let test = "ocr_check_exits_with_the_code_of_the_run";
+    let future = write_future_focrq();
+    let image = sample_image();
+    let image = image.to_str().unwrap();
+    let cases: [(&str, Vec<&str>, Option<&Path>, i32); 4] = [
+        ("no_model", vec!["ocr", "/no/such.png"], None, 3),
+        (
+            "future_model",
+            vec!["ocr", "/no/such.png"],
+            Some(&future),
+            7,
+        ),
+        (
+            "pages_on_image",
+            vec!["ocr", image, "--pages", "1"],
+            None,
+            2,
+        ),
+        (
+            "window_alone",
+            vec!["ocr", image, "--page-window", "2"],
+            None,
+            2,
+        ),
+    ];
+    for (case, args, model, expected) in cases {
+        let mut checked = args.clone();
+        checked.push("--check");
+        let run = |argv: &[&str]| match model {
+            Some(model) => run_focr_with_model_path(argv, model),
+            None => run_focr(argv),
+        };
+        let (real, check) = (run(&args).status.code(), run(&checked).status.code());
+        let pass = real == Some(expected) && check == real;
+        tlog!(test,
+            "case": case,
+            "event": "assert",
+            "assertion": "--check exits as the run does",
+            "inputs": {"argv": &args},
+            "exit_code": check,
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert_eq!(real, Some(expected), "{case}: the run");
+        assert_eq!(check, real, "{case}: --check");
+    }
+}
+
+/// A request that can run: `--check` says what would run, loads nothing, and
+/// leaves `focr runs` alone.
+#[test]
+fn ocr_check_reports_a_runnable_request_without_running_it() {
+    let test = "ocr_check_reports_a_runnable_request_without_running_it";
+    let model = write_compatible_focrq();
+    let image = sample_image();
+    let image = image.to_str().unwrap();
+    let store = fresh_run_store_path();
+    let check = |args: &[&str]| {
+        let out = hermetic_focr(args)
+            .env("FOCR_MODEL_PATH", &model)
+            .env(RUN_STORE_ENV, &store)
+            .output()
+            .expect("spawn focr");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let report: serde_json::Value =
+        serde_json::from_str(check(&["ocr", image, "--check", "--json"]).trim())
+            .expect("--check --json stdout is one JSON object");
+    let human = check(&["ocr", image, "--check"]);
+    let pass = report["command"] == "ocr.check"
+        && report["ok"] == true
+        && report["input"]["kind"] == "image"
+        && report["input"]["width"].as_u64() > Some(0)
+        && report["model"]["id"].is_string()
+        && report["model"]["path"].is_string()
+        && human.starts_with("ok: ")
+        && !store.exists();
+    tlog!(test,
+        "case": "runnable_request",
+        "event": "assert",
+        "assertion": "--check reports the run and records none",
+        "stdout_len": human.len(),
+        "store_created": store.exists(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(
+        pass,
+        "report {report}\nhuman {human}\nstore {}",
+        store.exists()
+    );
+}
+
+/// `--threads` and `--timing` reach the run, and each outranks or joins its
+/// environment variable as documented. `--check` reports both, so this drives
+/// the real binary without a decode.
+#[test]
+fn ocr_tuning_flags_reach_the_run() {
+    let test = "ocr_tuning_flags_reach_the_run";
+    let model = write_compatible_focrq();
+    let image = sample_image();
+    let image = image.to_str().unwrap();
+    let report = |env: &[(&str, &str)], flags: &[&str]| -> serde_json::Value {
+        let mut command = hermetic_focr(&[&["ocr", image, "--check", "--json"], flags].concat());
+        command.env("FOCR_MODEL_PATH", &model);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        let out = command.output().expect("spawn focr");
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{flags:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).expect("--check --json stdout is one JSON object")
+    };
+    for (case, env, flags, threads, timing) in [
+        ("flag", vec![], vec!["--threads", "3"], 3, false),
+        (
+            "flag_outranks_env",
+            vec![("FOCR_THREADS", "5")],
+            vec!["--threads", "3"],
+            3,
+            false,
+        ),
+        ("env_alone", vec![("FOCR_THREADS", "5")], vec![], 5, false),
+        (
+            "timing_flag",
+            vec![("FOCR_THREADS", "5")],
+            vec!["--timing"],
+            5,
+            true,
+        ),
+        (
+            "timing_env",
+            vec![("FOCR_THREADS", "5"), ("FOCR_TIMING", "1")],
+            vec![],
+            5,
+            true,
+        ),
+    ] {
+        let report = report(&env, &flags);
+        let pass = report["threads"] == threads && report["timing"] == timing;
+        tlog!(test,
+            "case": case,
+            "event": "assert",
+            "assertion": "--check reports the tuning the run would use",
+            "inputs": {"argv": &flags},
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert!(pass, "{case}: {report}");
+    }
+    for (case, argv, expected) in [
+        ("zero_ocr", vec!["ocr", image, "--threads", "0"], 2),
+        ("word_ocr", vec!["ocr", image, "--threads", "many"], 2),
+        ("zero_batch", vec!["ocr-batch", image, "--threads", "0"], 2),
+    ] {
+        let code = run_focr(&argv).status.code();
+        let pass = code == Some(expected);
+        tlog!(test,
+            "case": case,
+            "event": "assert",
+            "assertion": "a thread budget that is not a positive count is a usage error",
+            "inputs": {"argv": &argv},
+            "exit_code": code,
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert_eq!(code, Some(expected), "{case}");
+    }
+}
+
+/// The model's header decides whether it serves a task, not its file name: a
+/// name that says nothing, or says the wrong thing, must not reach a run that
+/// returns plain text with exit 0.
+#[test]
+fn ocr_task_is_judged_by_the_model_header() {
+    let test = "ocr_task_is_judged_by_the_model_header";
+    let image = sample_image();
+    let image = image.to_str().unwrap();
+    let unnamed = write_compatible_focrq();
+    // The fixture is got-ocr2; this copy's name claims smolvlm2.
+    let misnamed = unnamed.with_file_name(format!(
+        "smolvlm2-{}.focrq",
+        fresh_run_store_path().file_stem().unwrap().display()
+    ));
+    std::fs::copy(&unnamed, &misnamed).expect("copy artifact");
+    let misnamed = misnamed.to_str().unwrap();
+    let unnamed = unnamed.to_str().unwrap();
+    for (model, task, expected) in [
+        (unnamed, "chart-data", 2),
+        (unnamed, "describe", 2),
+        (misnamed, "describe", 2),
+        (unnamed, "formula", 0),
+        (unnamed, "music", 0),
+        (unnamed, "ocr", 0),
+    ] {
+        let args = ["ocr", image, "--check", "--task", task, "--model", model];
+        let out = run_focr(&args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let named = expected == 0 || stderr.contains("holds got-ocr2");
+        let pass = out.status.code() == Some(expected) && named;
+        tlog!(test,
+            "case": task,
+            "event": "assert",
+            "assertion": "the header decides whether the model serves the task",
+            "inputs": {"task": task},
+            "exit_code": out.status.code(),
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert!(pass, "{task}: exit {:?}\n{stderr}", out.status.code());
+    }
+}
+
+#[test]
+fn ocr_check_counts_the_pages_a_document_would_read() {
+    let test = "ocr_check_counts_the_pages_a_document_would_read";
+    let model = write_compatible_focrq();
+    let dir = std::env::temp_dir().join(format!(
+        "focr_golden_check_pages_{}_{}",
+        std::process::id(),
+        fresh_run_store_path().file_stem().unwrap().display()
+    ));
+    std::fs::create_dir_all(&dir).expect("mk page dir");
+    for page in ["p1.png", "p2.png", "p3.png"] {
+        std::fs::copy(sample_image(), dir.join(page)).expect("copy page");
+    }
+    let dir_arg = dir.to_str().unwrap();
+    let args = ["ocr", dir_arg, "--pages", "2-3", "--check", "--json"];
+    let out = run_focr_with_model_path(&args, &model);
+    let report: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("--check --json stdout is one JSON object");
+    let pass = out.status.code() == Some(0)
+        && report["input"]["kind"] == "directory"
+        && report["input"]["pages"] == 2
+        && report["input"]["source_pages"] == 3;
+    tlog!(test,
+        "case": "directory_pages",
+        "event": "assert",
+        "assertion": "--check counts the selected pages",
+        "inputs": {"pages": "2-3"},
+        "exit_code": out.status.code(),
+        "pass": pass,
+        "result": if pass { "pass" } else { "fail" },
+    );
+    assert!(pass, "{report}\n{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `focr ocr -` with `input` on stdin, under its own temp directory so a test
+/// can see what the run leaves there.
+fn run_focr_on_stdin(input: &[u8], model: &Path, tmp: &Path, extra: &[&str]) -> Output {
+    std::fs::create_dir_all(tmp).expect("mk temp dir");
+    let mut args = vec!["ocr", "-"];
+    args.extend_from_slice(extra);
+    let mut child = hermetic_focr(&args)
+        .env("FOCR_MODEL_PATH", model)
+        .env("TMPDIR", tmp)
+        .env("TEMP", tmp)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn focr");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    // A refusal can exit before it reads, so a broken pipe is not a failure.
+    let _ = std::io::Write::write_all(&mut stdin, input);
+    drop(stdin);
+    child.wait_with_output().expect("wait for focr")
+}
+
+/// `-` reads an image or a PDF from stdin, and the run keeps nothing of it.
+#[test]
+fn ocr_reads_stdin_and_leaves_nothing_behind() {
+    let test = "ocr_reads_stdin_and_leaves_nothing_behind";
+    let model = write_compatible_focrq();
+    let pdf =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/lilypond_selectable_text.pdf");
+    let cases = [
+        ("image", std::fs::read(sample_image()).expect("read image")),
+        ("pdf", std::fs::read(pdf).expect("read pdf")),
+    ];
+    for (kind, input) in cases {
+        let tmp = fresh_run_store_path().with_extension("tmp");
+        let out = run_focr_on_stdin(&input, &model, &tmp, &["--check", "--json"]);
+        let report: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{kind}: {e}\n{}", String::from_utf8_lossy(&out.stderr)));
+        let left = std::fs::read_dir(&tmp).expect("read temp dir").count();
+        let pass = out.status.code() == Some(0)
+            && report["input"]["kind"] == kind
+            && report["input"]["path"] == "-"
+            && left == 0;
+        tlog!(test,
+            "case": kind,
+            "event": "assert",
+            "assertion": "stdin is read as its format, reported as -, and removed",
+            "exit_code": out.status.code(),
+            "left_in_temp": left,
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert!(pass, "{kind}: {report}\nleft {left}");
+    }
+}
+
+#[test]
+fn ocr_refuses_stdin_that_holds_no_input() {
+    let test = "ocr_refuses_stdin_that_holds_no_input";
+    let model = write_compatible_focrq();
+    let cases: [(&str, &[u8], &str); 2] = [
+        ("empty", b"", "stdin is empty"),
+        (
+            "not_an_image",
+            b"just some text",
+            "neither a PDF nor an image",
+        ),
+    ];
+    for (case, input, needle) in cases {
+        let tmp = fresh_run_store_path().with_extension("tmp");
+        let out = run_focr_on_stdin(input, &model, &tmp, &["--check"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let left = std::fs::read_dir(&tmp).expect("read temp dir").count();
+        let pass = out.status.code() == Some(4) && stderr.contains(needle) && left == 0;
+        tlog!(test,
+            "case": case,
+            "event": "assert",
+            "assertion": "stdin with no input exits 4, says so, and leaves nothing",
+            "exit_code": out.status.code(),
+            "left_in_temp": left,
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert!(
+            pass,
+            "{case}: exit {:?}, left {left}\n{stderr}",
+            out.status.code()
+        );
+    }
+}
+
+/// What a run could only discover at its start or, worse, its end.
+#[test]
+fn ocr_check_refuses_what_the_run_could_not_finish() {
+    let test = "ocr_check_refuses_what_the_run_could_not_finish";
+    let model = write_compatible_focrq();
+    let image = sample_image();
+    let image = image.to_str().unwrap();
+    let not_an_image = fresh_run_store_path().with_extension("png");
+    std::fs::write(&not_an_image, "not a picture").expect("write fixture");
+    let not_an_image = not_an_image.to_str().unwrap();
+    let no_dir = fresh_run_store_path().join("missing").join("out.md");
+    let no_dir = no_dir.to_str().unwrap();
+    let a_dir = std::env::temp_dir();
+    let a_dir = a_dir.to_str().unwrap();
+    let cases: [(&str, Vec<&str>, i32, &str); 4] = [
+        (
+            "undecodable",
+            vec!["ocr", not_an_image, "--check"],
+            4,
+            not_an_image,
+        ),
+        (
+            "output_dir_missing",
+            vec!["ocr", image, "--check", "-o", no_dir],
+            2,
+            "not a directory",
+        ),
+        (
+            "output_is_dir",
+            vec!["ocr", image, "--check", "-o", a_dir],
+            2,
+            "is a directory",
+        ),
+        (
+            "robot",
+            vec!["ocr", image, "--check", "--robot"],
+            2,
+            "--json instead of --robot",
+        ),
+    ];
+    for (case, args, expected, needle) in cases {
+        let out = run_focr_with_model_path(&args, &model);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let said = stderr.contains(needle) || stdout.contains(needle);
+        let pass = out.status.code() == Some(expected) && said;
+        tlog!(test,
+            "case": case,
+            "event": "assert",
+            "assertion": "--check refuses with the run's exit code and says why",
+            "inputs": {"argv": &args},
+            "exit_code": out.status.code(),
+            "pass": pass,
+            "result": if pass { "pass" } else { "fail" },
+        );
+        assert!(
+            pass,
+            "{case}: exit {:?}\n{stdout}\n{stderr}",
+            out.status.code()
+        );
+    }
 }
 
 /// `FOCR_MODEL_PATH` must be honored even when the user omits `--model`.

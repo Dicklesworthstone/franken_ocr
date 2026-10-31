@@ -750,6 +750,34 @@ mod tests {
         }
     }
 
+    /// bd-1fzo: the wasm lane enters through `recognize_dynamic`, so it has to
+    /// run the chart stages `focr ocr` runs: number head, repair and verdict.
+    #[test]
+    fn the_wasm_entry_point_reads_a_chart_as_focr_ocr_does() {
+        let Ok(dir) = std::env::var("FOCR_ONECHART_DIR") else {
+            return;
+        };
+        let artifact = format!("{dir}/onechart.int8.focrq");
+        if !std::path::Path::new(&artifact).is_file() {
+            eprintln!("skip-with-SUCCESS: {artifact} absent");
+            return;
+        }
+        let sample = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/onechart/sample_chart.png"
+        );
+        let model =
+            crate::native_engine::OcrModel::load(std::path::Path::new(&artifact)).expect("model");
+        let by_path = model
+            .recognize(std::path::Path::new(sample))
+            .expect("the path route");
+        let dynamic = model
+            .recognize_dynamic(image::open(sample).expect("sample chart decodes"))
+            .expect("the wasm route");
+        assert!(dynamic.trim_start().starts_with('{'), "dict open");
+        assert_eq!(by_path, dynamic);
+    }
+
     /// **bd-2lje — the in-distribution SCRM-proxy quality corpus** (skip-with-
     /// SUCCESS without weights): six default-style matplotlib charts with
     /// exact known values (`tests/fixtures/onechart/corpus/`), run through

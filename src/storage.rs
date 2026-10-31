@@ -21,9 +21,10 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use asupersync::runtime::{Runtime, RuntimeBuilder};
-use fsqlite::{Connection, SqliteValue};
+use fsqlite::{Connection, FrankenError, SqliteValue};
 
 use crate::error::{FocrError, FocrResult};
 
@@ -32,6 +33,12 @@ pub const SCHEMA_VERSION: i64 = 1;
 
 /// Env override for the store path (default `~/.cache/franken_ocr/runs.db`).
 pub const RUN_STORE_ENV: &str = "FOCR_RUN_STORE";
+
+/// How long a first open waits out other first opens of the same store.
+const FIRST_OPEN_WAIT: Duration = Duration::from_secs(10);
+
+/// The pause between attempts at creating a store another process is creating.
+const FIRST_OPEN_BACKOFF: Duration = Duration::from_millis(5);
 
 /// One recorded run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -163,51 +170,96 @@ impl RunStore {
         self.runtime.block_on(fut)
     }
 
-    fn sql(&self, sql: &str) -> FocrResult<usize> {
-        self.drive(self.conn.execute(sql))
-            .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite execute: {e}: {sql}")))
-    }
-
-    fn init_or_migrate(&self) -> FocrResult<()> {
-        let has_meta = !self
+    fn has_meta(&self) -> FocrResult<bool> {
+        let rows = self
             .drive(
                 self.conn
                     .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_meta'"),
             )
-            .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query: {e}")))?
-            .is_empty();
-        if !has_meta {
-            self.sql(
-                "CREATE TABLE _meta (\n\
-                     schema_version INTEGER NOT NULL,\n\
-                     created_at INTEGER NOT NULL,\n\
-                     franken_ocr_version TEXT NOT NULL,\n\
-                     model_version_tag TEXT NOT NULL)",
-            )?;
-            self.sql(
-                "CREATE TABLE runs (\n\
-                     run_id TEXT PRIMARY KEY,\n\
-                     started_at INTEGER NOT NULL,\n\
-                     finished_at INTEGER,\n\
-                     input_path TEXT NOT NULL,\n\
-                     mode TEXT NOT NULL,\n\
-                     quant TEXT NOT NULL,\n\
-                     model_version_tag TEXT NOT NULL,\n\
-                     exit_code INTEGER NOT NULL,\n\
-                     status TEXT NOT NULL)",
-            )?;
-            self.drive(self.conn.execute_with_params(
-                "INSERT INTO _meta (schema_version, created_at, franken_ocr_version, \
-                 model_version_tag) VALUES (?, ?, ?, ?)",
-                &[
-                    SqliteValue::Integer(SCHEMA_VERSION),
-                    SqliteValue::Integer(now_millis()),
-                    SqliteValue::Text(env!("CARGO_PKG_VERSION").into()),
-                    SqliteValue::Text("unknown".into()),
-                ],
-            ))
-            .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite insert _meta: {e}")))?;
+            .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query: {e}")))?;
+        Ok(!rows.is_empty())
+    }
+
+    /// Create the tables and the `_meta` row unless another process just did.
+    /// The caller holds the write transaction.
+    fn create_tables(&self) -> Result<(), FrankenError> {
+        let existing = self.drive(
+            self.conn
+                .query("SELECT name FROM sqlite_master WHERE type='table' AND name='_meta'"),
+        )?;
+        if !existing.is_empty() {
             return Ok(());
+        }
+        self.drive(self.conn.execute(
+            "CREATE TABLE _meta (\n\
+                 schema_version INTEGER NOT NULL,\n\
+                 created_at INTEGER NOT NULL,\n\
+                 franken_ocr_version TEXT NOT NULL,\n\
+                 model_version_tag TEXT NOT NULL)",
+        ))?;
+        self.drive(self.conn.execute(
+            "CREATE TABLE runs (\n\
+                 run_id TEXT PRIMARY KEY,\n\
+                 started_at INTEGER NOT NULL,\n\
+                 finished_at INTEGER,\n\
+                 input_path TEXT NOT NULL,\n\
+                 mode TEXT NOT NULL,\n\
+                 quant TEXT NOT NULL,\n\
+                 model_version_tag TEXT NOT NULL,\n\
+                 exit_code INTEGER NOT NULL,\n\
+                 status TEXT NOT NULL)",
+        ))?;
+        self.drive(self.conn.execute_with_params(
+            "INSERT INTO _meta (schema_version, created_at, franken_ocr_version, \
+             model_version_tag) VALUES (?, ?, ?, ?)",
+            &[
+                SqliteValue::Integer(SCHEMA_VERSION),
+                SqliteValue::Integer(now_millis()),
+                SqliteValue::Text(env!("CARGO_PKG_VERSION").into()),
+                SqliteValue::Text("unknown".into()),
+            ],
+        ))?;
+        Ok(())
+    }
+
+    /// One attempt at creating the schema in one transaction, so another
+    /// process sees no store or a whole one, never `_meta` without its row.
+    fn try_create_schema(&self) -> Result<(), FrankenError> {
+        let outcome = self
+            .drive(self.conn.execute("BEGIN IMMEDIATE"))
+            .and_then(|_| self.create_tables())
+            .and_then(|()| self.drive(self.conn.execute("COMMIT")).map(drop));
+        if outcome.is_err() && self.conn.in_transaction() {
+            // The first error is the one that says what happened.
+            let _ = self.drive(self.conn.execute("ROLLBACK"));
+        }
+        outcome
+    }
+
+    /// Create the schema, waiting out other first opens. fsqlite's writers
+    /// conflict at COMMIT rather than queue at BEGIN, so the loser retries
+    /// from BEGIN and finds the winner's tables.
+    fn create_schema(&self) -> FocrResult<()> {
+        let started = Instant::now();
+        loop {
+            match self.try_create_schema() {
+                Err(
+                    FrankenError::Busy
+                    | FrankenError::BusyRecovery
+                    | FrankenError::BusySnapshot { .. },
+                ) if started.elapsed() < FIRST_OPEN_WAIT => std::thread::sleep(FIRST_OPEN_BACKOFF),
+                outcome => {
+                    return outcome.map_err(|e| {
+                        FocrError::Other(anyhow::anyhow!("fsqlite create schema: {e}"))
+                    });
+                }
+            }
+        }
+    }
+
+    fn init_or_migrate(&self) -> FocrResult<()> {
+        if !self.has_meta()? {
+            self.create_schema()?;
         }
         let version = self.schema_version()?;
         if version > SCHEMA_VERSION {
@@ -238,9 +290,12 @@ impl RunStore {
         let rows = self
             .drive(self.conn.query("SELECT schema_version FROM _meta"))
             .map_err(|e| FocrError::Other(anyhow::anyhow!("fsqlite query _meta: {e}")))?;
-        rows.first()
-            .and_then(|r| r.get(0).map(int))
-            .ok_or_else(|| FocrError::Other(anyhow::anyhow!("empty _meta")))
+        match (rows.len(), rows.first().and_then(|r| r.get(0).map(int))) {
+            (1, Some(version)) => Ok(version),
+            (count, _) => Err(FocrError::Other(anyhow::anyhow!(
+                "malformed _meta: {count} rows, expected 1"
+            ))),
+        }
     }
 
     /// Insert (or replace, keyed by `run_id`) one run record.
@@ -525,6 +580,23 @@ mod tests {
     }
 
     #[test]
+    fn a_store_without_exactly_one_meta_row_is_refused() {
+        on_big_stack(|| {
+            for (change, rows) in [
+                ("DELETE FROM _meta", 0),
+                ("INSERT INTO _meta SELECT * FROM _meta", 2),
+            ] {
+                let (store, _dir) = scratch_store("metarows");
+                let path = store.path().to_path_buf();
+                store.drive(store.conn.execute(change)).unwrap();
+                drop(store);
+                let err = RunStore::open(&path).expect_err("a malformed store must refuse");
+                assert!(err.to_string().contains(&format!("{rows} rows")), "{err}");
+            }
+        });
+    }
+
+    #[test]
     fn meta_schema_created_and_versioned() {
         on_big_stack(|| {
             let (store, _dir) = scratch_store("meta");
@@ -542,12 +614,8 @@ mod tests {
         on_big_stack(|| {
             let (store, _dir) = scratch_store("toonew");
             let path = store.path().to_path_buf();
-            store
-                .sql(&format!(
-                    "UPDATE _meta SET schema_version = {}",
-                    SCHEMA_VERSION + 1
-                ))
-                .unwrap();
+            let bump = format!("UPDATE _meta SET schema_version = {}", SCHEMA_VERSION + 1);
+            store.drive(store.conn.execute(&bump)).unwrap();
             drop(store);
             let err = RunStore::open(&path).expect_err("newer store must refuse");
             assert!(matches!(err, FocrError::FormatMismatch(_)), "{err:?}");

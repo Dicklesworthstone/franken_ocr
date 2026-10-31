@@ -118,7 +118,6 @@ pub fn detect(root: &DoctorRoot) -> Vec<Finding> {
     detect_unreadable_cache_entries(root, &mut findings);
     detect_orphaned_partials(root, &mut findings);
     detect_package_transactions(root, &mut findings);
-    #[cfg(feature = "pdf")]
     detect_document_runs(root, &mut findings);
     findings
 }
@@ -127,7 +126,6 @@ pub fn detect(root: &DoctorRoot) -> Vec<Finding> {
 /// litter, so this reports each with the command that continues it and no
 /// fixer touches them. A run with `-o` keeps its files beside the output,
 /// where the doctor does not look.
-#[cfg(feature = "pdf")]
 fn detect_document_runs(root: &DoctorRoot, out: &mut Vec<Finding>) {
     use crate::native_engine::checkpoint::{KEYED_CHECKPOINT, KEYED_JOURNAL, journal_summary};
     let Ok(entries) = std::fs::read_dir(root.document_runs_dir()) else {
@@ -212,10 +210,30 @@ fn detect_model_not_resolvable(_root: &DoctorRoot, out: &mut Vec<Finding>) {
     }
 }
 
+/// The model cache's root and each model package in it. Hidden directories
+/// are pull state, and a symlink is not a package.
+fn model_cache_dirs(root: &DoctorRoot) -> Vec<PathBuf> {
+    let models = root.models_dir();
+    let packages = std::fs::read_dir(&models)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| !entry.file_name().as_encoded_bytes().starts_with(b"."))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+        });
+    let mut dirs: Vec<PathBuf> = packages.collect();
+    dirs.sort();
+    dirs.insert(0, models);
+    dirs
+}
+
 fn detect_stale_focrq_format(root: &DoctorRoot, out: &mut Vec<Finding>) {
-    let Ok(entries) = std::fs::read_dir(root.models_dir()) else {
-        return;
-    };
+    let entries = model_cache_dirs(root)
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten();
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -258,9 +276,10 @@ fn detect_stale_focrq_format(root: &DoctorRoot, out: &mut Vec<Finding>) {
 #[cfg(unix)]
 fn detect_unreadable_cache_entries(root: &DoctorRoot, out: &mut Vec<Finding>) {
     use std::os::unix::fs::PermissionsExt;
-    let Ok(entries) = std::fs::read_dir(root.models_dir()) else {
-        return;
-    };
+    let entries = model_cache_dirs(root)
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten();
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -310,10 +329,7 @@ fn staging_download_is_active(path: &Path) -> bool {
         Ok(file) => file,
         Err(_) => return true,
     };
-    match file.try_lock() {
-        Ok(()) => false,
-        Err(std::fs::TryLockError::WouldBlock | std::fs::TryLockError::Error(_)) => true,
-    }
+    crate::dist::try_lock_settled(&file).is_err()
 }
 
 fn detect_orphaned_partials_in_dir(directory: &Path, out: &mut Vec<Finding>) {
@@ -394,8 +410,7 @@ fn detect_package_transactions(root: &DoctorRoot, out: &mut Vec<Finding>) {
         let Some(state) = crate::dist::parse_pull_state(&name) else {
             continue;
         };
-        if matches!(state, PullState::FileStage { .. })
-            || !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
+        if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir())
             || staging_download_is_active(&path)
         {
             continue;
@@ -428,7 +443,6 @@ fn detect_package_transactions(root: &DoctorRoot, out: &mut Vec<Finding>) {
                      and did not finish, so {model} is not installed; `{command}` restores it"
                 ),
             ),
-            PullState::FileStage { .. } => continue,
         };
         out.push(Finding {
             detector,
@@ -938,7 +952,6 @@ pub fn robot_docs() -> String {
 }
 
 #[cfg(test)]
-#[cfg(all(test, feature = "pdf"))]
 mod document_run_tests {
     use super::*;
     use crate::native_engine::checkpoint::{Journal, KEYED_CHECKPOINT, KEYED_JOURNAL};
@@ -1009,6 +1022,7 @@ mod document_run_tests {
     }
 }
 
+#[cfg(test)]
 mod pull_coordination_tests {
     use super::*;
 
@@ -1019,10 +1033,7 @@ mod pull_coordination_tests {
         std::fs::create_dir_all(&root).expect("create test root");
         let key = "a".repeat(32);
         let lock_path = root.join(format!(".focr-pull-{key}.lock"));
-        let stage_path = root.join(format!(
-            ".focr-stage-{key}-{}-0.partial",
-            std::process::id()
-        ));
+        let stage_path = root.join(format!(".focr-stage-{key}-{}-0.pkg", std::process::id()));
         let holder = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1031,7 +1042,7 @@ mod pull_coordination_tests {
             .open(&lock_path)
             .expect("open lock");
         holder.try_lock().expect("hold pull lock");
-        std::fs::write(&stage_path, b"in progress").expect("write staging file");
+        std::fs::create_dir(&stage_path).expect("create stage");
 
         assert!(staging_download_is_active(&stage_path));
         drop(holder);
@@ -1040,9 +1051,62 @@ mod pull_coordination_tests {
             "descriptor release must make crash-left staging discoverable"
         );
 
-        std::fs::remove_file(stage_path).expect("remove stage");
+        std::fs::remove_dir(stage_path).expect("remove stage");
         std::fs::remove_file(lock_path).expect("remove lock");
         std::fs::remove_dir(root).expect("remove test root");
+    }
+
+    /// bd-jprb: every model lives in a package, so the cache's file scans look
+    /// inside packages. Pull state and a symlink stay out of them.
+    #[cfg(unix)]
+    #[test]
+    fn a_model_package_is_scanned_like_the_cache_root() {
+        use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+        let cache_root =
+            std::env::temp_dir().join(format!("focr_doctor_packages_{}", std::process::id()));
+        let root = DoctorRoot {
+            cache_root: cache_root.clone(),
+        };
+        let models = root.models_dir();
+        let package = models.join("unlimited-ocr");
+        let pull_state = models.join(format!(".focr-prev-{}.pkg", "d".repeat(32)));
+        std::fs::create_dir_all(&package).expect("create package");
+        std::fs::create_dir_all(&pull_state).expect("create pull state");
+        symlink(&package, models.join("linked")).expect("link a package");
+        assert_eq!(
+            model_cache_dirs(&root),
+            [models.clone(), package.clone()],
+            "hidden directories and symlinks are not packages"
+        );
+
+        let mut stale = crate::native_engine::weights::FOCRQ_MAGIC.to_vec();
+        stale.extend_from_slice(
+            &(crate::native_engine::weights::FOCRQ_FORMAT_VERSION + 1).to_le_bytes(),
+        );
+        stale.extend_from_slice(&[0; 8]);
+        let artifact = package.join("unlimited-ocr.int8.focrq");
+        std::fs::write(&artifact, &stale).expect("write a stale artifact");
+        std::fs::write(pull_state.join("old.focrq"), &stale).expect("write into pull state");
+        let mut findings = Vec::new();
+        detect_stale_focrq_format(&root, &mut findings);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].detector, "stale_focrq_format");
+        assert_eq!(findings[0].path.as_deref(), artifact.to_str());
+
+        let locked = package.join("tokenizer.json");
+        std::fs::write(&locked, b"{}").expect("write a tokenizer");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("drop read permission");
+        let mut findings = Vec::new();
+        detect_unreadable_cache_entries(&root, &mut findings);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].detector, "unreadable_cache_entry");
+        assert_eq!(findings[0].path.as_deref(), locked.to_str());
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o600))
+            .expect("restore read permission");
+        std::fs::remove_dir_all(cache_root).expect("remove test root");
     }
 
     #[test]

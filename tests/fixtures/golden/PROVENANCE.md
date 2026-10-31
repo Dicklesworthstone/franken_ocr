@@ -17,6 +17,11 @@ that a human reviews and re-blesses with `UPDATE_GOLDENS=1` (see "Regeneration")
 | Capture method | `std::process::Command::new(env!("CARGO_BIN_EXE_focr"))` — the STABLE committed surface (AGENTS.md "Agent Ergonomics", plan §7.2/§7.4) |
 | Generated/last-reviewed | 2026-06-25 (initial freeze, derived from the committed `src/cli.rs` + `src/robot.rs` source) |
 
+`cli_surface.golden` is the one exception to the capture method: it walks
+`Cli::command()` in the test process, one line per command and per argument.
+It carries what a caller depends on (names, value names, defaults, possible
+values, environment variables, required, hidden) and no help prose.
+
 ## Provenance of the schema fixture (the contract)
 
 `tests/fixtures/robot_schema_v1.json` is the **frozen robot-schema contract**

@@ -18,8 +18,8 @@
 //!    '--json'", Levenshtein-1 on the most common wrong invocation);
 //!  - no-results-is-success (`runs` on empty history = exit 0, Axiom 5).
 
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 
 fn hermetic_home() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("focr_ergo_home_{}", std::process::id()));
@@ -27,25 +27,38 @@ fn hermetic_home() -> PathBuf {
     dir
 }
 
-fn run_focr(args: &[&str]) -> Output {
-    let home = hermetic_home();
-    // Unique store per invocation: the in-file tests run in parallel and a
-    // shared store would collide on the open/lock path.
-    let store = home.join(format!(
-        "runs_{}.db",
+/// A store path no other invocation uses. The in-file tests run in parallel,
+/// and the clock alone does not keep them apart: macOS reports whole
+/// microseconds. The serial does, and the clock keeps a reused pid from
+/// finding an old file.
+fn fresh_store(home: &Path) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    home.join(format!(
+        "runs_{}_{serial}.db",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default()
-    ));
-    Command::new(env!("CARGO_BIN_EXE_focr"))
+    ))
+}
+
+fn focr_command(args: &[&str], home: &Path, store: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_focr"));
+    command
         .args(args)
         .env_remove("FOCR_MODEL_PATH")
         .env_remove("FOCR_MODEL_DIR")
         .env("FOCR_RUN_STORE", store)
-        .env("HOME", &home)
-        .env("LOCALAPPDATA", &home)
-        .env("USERPROFILE", &home)
+        .env("HOME", home)
+        .env("LOCALAPPDATA", home)
+        .env("USERPROFILE", home);
+    command
+}
+
+fn run_focr(args: &[&str]) -> Output {
+    let home = hermetic_home();
+    focr_command(args, &home, &fresh_store(&home))
         .output()
         .expect("spawn focr")
 }
@@ -130,7 +143,53 @@ fn read_side_json_stdout_is_pure_data() {
             ok,
             &format!(r#""argv":{args:?},"parsed_without_stripping":{parsed}"#),
         );
-        assert!(ok, "{args:?}: stdout not pure JSON:\n{stdout}");
+        assert!(
+            ok,
+            "{args:?}: stdout not pure JSON (exit {:?}):\n{stdout}\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Several first runs on a machine with no store yet. Each is its own process
+/// with its own connection, because threads in one process do not reach this
+/// race. Every one finds a whole store: none fails on `_meta` with no row, or
+/// on tables another has just created. The last open reads the finished store,
+/// and it refuses anything but one `_meta` row.
+#[test]
+fn concurrent_first_opens_of_one_store_all_succeed() {
+    const ROUNDS: usize = 5;
+    const PROCESSES: usize = 8;
+    let home = hermetic_home();
+    for round in 0..ROUNDS {
+        let store = fresh_store(&home);
+        let spawn = || {
+            focr_command(&["runs", "--format", "json"], &home, &store)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn focr")
+        };
+        let runs: Vec<_> = (0..PROCESSES).map(|_| spawn()).collect();
+        let finished = runs.into_iter().map(|run| run.wait_with_output());
+        let outs: Vec<_> = finished.collect::<Result<_, _>>().expect("wait for focr");
+        let after = spawn().wait_with_output().expect("wait for focr");
+        for out in outs.into_iter().chain([after]) {
+            let ok = out.status.success()
+                && serde_json::from_slice::<serde_json::Value>(&out.stdout).is_ok();
+            emit(
+                "concurrent_first_open",
+                ok,
+                &format!(r#""round":{round},"exit_code":{:?}"#, out.status.code()),
+            );
+            assert!(
+                ok,
+                "round {round}: exit {:?}\nstderr:\n{}",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }
 

@@ -7,6 +7,139 @@
     "selftest": "focr robot selftest",
     "triage": "focr robot triage"
   },
+  "batch_progress": {
+    "estimates": "pages_per_hour is pages done over the wall time since batch_start, including the model load. eta_ms is null until one item has ended, then the mean wall time of the items ended so far times the items left.",
+    "event_fields": {
+      "batch_cancelled": {
+        "optional": [],
+        "required": [
+          "schema_version",
+          "event",
+          "image",
+          "total",
+          "cumulative_ms",
+          "ok_images",
+          "failed_images"
+        ]
+      },
+      "batch_end": {
+        "optional": [],
+        "required": [
+          "schema_version",
+          "event",
+          "outcome",
+          "exit_code",
+          "error",
+          "total",
+          "cumulative_ms",
+          "ok_images",
+          "failed_images",
+          "pages_per_hour"
+        ]
+      },
+      "batch_start": {
+        "optional": [],
+        "required": [
+          "schema_version",
+          "event",
+          "mode",
+          "independent_images",
+          "total",
+          "threads",
+          "model_path",
+          "model_id",
+          "backend",
+          "decode_mode"
+        ]
+      },
+      "image_complete": {
+        "optional": [],
+        "required": [
+          "schema_version",
+          "event",
+          "ordinal",
+          "image",
+          "total",
+          "cumulative_ms",
+          "ok_images",
+          "failed_images",
+          "pages_per_hour",
+          "eta_ms",
+          "elapsed_ms"
+        ]
+      },
+      "image_error": {
+        "optional": [],
+        "required": [
+          "schema_version",
+          "event",
+          "ordinal",
+          "image",
+          "error",
+          "exit_code",
+          "total",
+          "cumulative_ms",
+          "ok_images",
+          "failed_images",
+          "pages_per_hour",
+          "eta_ms",
+          "elapsed_ms"
+        ]
+      },
+      "page_complete": {
+        "optional": [],
+        "required": [
+          "schema_version",
+          "event",
+          "ordinal",
+          "source_page",
+          "image",
+          "window",
+          "total",
+          "cumulative_ms",
+          "ok_images",
+          "failed_images",
+          "pages_per_hour",
+          "eta_ms",
+          "elapsed_ms"
+        ]
+      },
+      "page_skipped": {
+        "optional": [],
+        "required": [
+          "schema_version",
+          "event",
+          "source_page",
+          "image",
+          "error",
+          "total",
+          "cumulative_ms",
+          "ok_images",
+          "failed_images",
+          "pages_per_hour",
+          "eta_ms",
+          "elapsed_ms"
+        ]
+      }
+    },
+    "events": [
+      "batch_start",
+      "image_complete",
+      "image_error",
+      "page_complete",
+      "page_skipped",
+      "batch_cancelled",
+      "batch_end"
+    ],
+    "flag": "focr ocr-batch --progress-events <PATH>",
+    "outcomes": [
+      "completed",
+      "cancelled",
+      "failed"
+    ],
+    "schema_version": 1,
+    "stderr_destination": "-"
+  },
   "environment_variables": [
     {
       "name": "FOCR_MODEL_PATH",
@@ -43,6 +176,10 @@
     {
       "name": "FOCR_MMAP",
       "summary": "opt trusted immutable artifacts into read-only mmap"
+    },
+    {
+      "name": "FOCR_MEMORY_BUDGET",
+      "summary": "memory a memory-sized page window may use: bytes, or a whole number of KiB/MiB/GiB/TiB"
     },
     {
       "name": "FOCR_FORCE_ARCH",
@@ -112,7 +249,8 @@
         "model_id",
         "tokens",
         "finish",
-        "elapsed_ms"
+        "elapsed_ms",
+        "window"
       ],
       "required": [
         "schema_version",
@@ -130,7 +268,11 @@
         "input_megapixels",
         "model_id",
         "source_sha256",
-        "resumed_from"
+        "resumed_from",
+        "pages_out",
+        "pages_skipped",
+        "windows",
+        "extra_markers"
       ],
       "required": [
         "schema_version",
@@ -179,13 +321,41 @@
       ]
     },
     "stage": {
-      "reserved": true
+      "optional": [
+        "budget_ms"
+      ],
+      "required": [
+        "schema_version",
+        "event",
+        "name",
+        "seq",
+        "elapsed_ms"
+      ]
+    },
+    "window": {
+      "optional": [],
+      "required": [
+        "schema_version",
+        "event",
+        "index",
+        "pages",
+        "lookahead",
+        "reused",
+        "fallback_reason",
+        "prefill_tokens",
+        "generated_tokens",
+        "kv_bytes_peak",
+        "rss_bytes_peak",
+        "elapsed_ms",
+        "eta_ms"
+      ]
     }
   },
   "events": [
     "run_start",
     "stage",
     "page",
+    "window",
     "staff",
     "music_warning",
     "run_complete",

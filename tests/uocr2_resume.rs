@@ -41,8 +41,8 @@ use franken_ocr::native_engine::window::WindowStats;
 use franken_ocr::native_engine::{DocumentResult, DocumentStats, FinishReason, OcrModel};
 use franken_ocr::page_source::PageSource;
 use franken_ocr::{
-    DocumentOptions, FocrError, PageFinish, PageWindow, ResumeKey, ResumePolicy, RunFiles,
-    StreamedPage, request_shutdown, reset_shutdown,
+    DocumentEvent, DocumentOptions, FocrError, PageFinish, PageWindow, ResumeKey, ResumePolicy,
+    RunFiles, request_shutdown, reset_shutdown,
 };
 use parity_harness::Logger;
 
@@ -96,10 +96,12 @@ fn parse(
     let _ = model.take_last_decode();
     let mut source = PageSource::images(pages.to_vec()).expect("open the pages");
     let mut seen = 0;
-    let mut sink = |_: &StreamedPage<'_>| {
-        seen += 1;
-        if Some(seen) == stop_after {
-            request_shutdown();
+    let mut sink = |event: &DocumentEvent<'_>| {
+        if let DocumentEvent::Page(_) = event {
+            seen += 1;
+            if Some(seen) == stop_after {
+                request_shutdown();
+            }
         }
     };
     let document = model.recognize_document(&mut source, options, &mut |_| {}, Some(&mut sink));
@@ -113,11 +115,13 @@ fn parse(
     })
 }
 
-/// A window's record without its wall time.
+/// A window's record without what a machine, not the decode, decides: its
+/// wall time and the process's peak memory.
 fn timeless(windows: &[WindowStats]) -> Vec<WindowStats> {
     let mut windows = windows.to_vec();
     for window in &mut windows {
         window.elapsed_ms = 0;
+        window.rss_bytes_peak = None;
     }
     windows
 }
@@ -228,6 +232,7 @@ fn a_cancelled_document_resumes_byte_identical() {
     let next = &recomputed.document.windows[1];
     assert!(!next.reused && next.fallback_reason.is_some());
     files.remove(false).expect("remove the run's files");
+    let _ = std::fs::remove_dir_all(&root);
     log.emit("resume", "pass", serde_json::Map::new());
 }
 
@@ -338,17 +343,21 @@ fn a_stopped_cli_run_exits_6_and_the_same_command_finishes_it_identically() {
         focr_ocr(&home, &refs, interrupt_at)
     };
 
-    let (whole_out, whole_figures) = (root.join("whole.json"), root.join("whole-figures"));
-    let whole = run(&document(&whole_out, &whole_figures), None);
+    // Every run names one figures directory, because the output quotes its
+    // path. Each finished run's figures move aside for the comparison.
+    let (whole_out, figures) = (root.join("whole.json"), root.join("figures"));
+    let whole = run(&document(&whole_out, &figures), None);
     assert_eq!(whole.exit, Some(0), "{:?}", whole.last());
     assert!(whole.last().get("resumed_from").is_none());
     assert!(!PathBuf::from(format!("{}.partial", whole_out.display())).exists());
     assert!(!PathBuf::from(format!("{}.focr-ckpt", whole_out.display())).exists());
     let whole_bytes = std::fs::read(&whole_out).expect("the output");
     let whole_text = whole.last()["markdown"].clone();
+    let whole_figures = root.join("whole-figures");
+    std::fs::rename(&figures, &whole_figures).expect("keep the whole run's figures");
 
     // With -o: JSON, figures, files beside the output.
-    let (out, figures) = (root.join("doc.json"), root.join("figures"));
+    let out = root.join("doc.json");
     let args = document(&out, &figures);
     let stopped = run(&args, Some(WINDOW));
     assert_eq!(stopped.exit, Some(6), "{:?}", stopped.last());
@@ -373,11 +382,11 @@ fn a_stopped_cli_run_exits_6_and_the_same_command_finishes_it_identically() {
     assert_eq!(files_in(&figures), files_in(&whole_figures));
     assert!(!Path::new(&journal).exists());
     assert!(!Path::new(&checkpoint).exists());
+    std::fs::rename(&figures, root.join("resumed-figures")).expect("clear the figures directory");
 
     // To stdout: the files live under the cache, by key, and the doctor
     // reports them.
-    let (no_output, figures) = (PathBuf::from("-"), root.join("stdout-figures"));
-    let args = document(&no_output, &figures);
+    let args = document(Path::new("-"), &figures);
     let stopped = run(&args, Some(WINDOW));
     assert_eq!(stopped.exit, Some(6), "{:?}", stopped.last());
     let checkpoint = stopped.last()["checkpoint"].as_str().expect("a checkpoint");
@@ -411,6 +420,8 @@ fn a_stopped_cli_run_exits_6_and_the_same_command_finishes_it_identically() {
         "a resumed stdout run re-emits every page"
     );
     assert_eq!(resumed.last()["markdown"], whole_text);
+    assert_eq!(files_in(&figures), files_in(&whole_figures));
     assert!(!Path::new(checkpoint).exists());
+    let _ = std::fs::remove_dir_all(&root);
     log.emit("resume", "pass", serde_json::Map::new());
 }

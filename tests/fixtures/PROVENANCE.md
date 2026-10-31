@@ -18,6 +18,7 @@ fixture** (`_meta` blocks) — this file is the index, not the authority.
 | Path | Kind | Origin | Regenerate with |
 |------|------|--------|-----------------|
 | `golden/` | [C] | Frozen CLI/robot surfaces (scrubbed, canonicalized) | `UPDATE_GOLDENS=1 cargo test --test cli_robot_golden` (reviewed) |
+| `library/rotated_page.md` | [C] | `raw` from `focr ocr rotated.png --model unlimited-ocr-2 --json --raw`, on `unlimited-ocr-2.v0.1.0.int8.focrq` (SHA-256 `54b8a1ec…`). The page is corpus `page_0014.png` turned with `sips -r 90`. Read by `tests/library_contract.rs` | Rerun that command, then bless the golden (reviewed) |
 | `robot_schema_v1.json` | [C] | The frozen robot NDJSON contract (bd-zc1o) | Never regenerated — versioned by hand with the schema |
 | `runs_schema.json` | [C] | The frozen `focr runs`/`sync` record + one-way-audit contract (bd-wp8.11) | Never regenerated — versioned by hand |
 | `test_log_schema.json` | [C] | The TestLog line contract (bd-n68o) | Never regenerated — versioned by hand |

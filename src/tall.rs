@@ -147,15 +147,20 @@ pub fn cut_strips(img: &DynamicImage, plan: &[Strip]) -> Vec<DynamicImage> {
 /// Merge per-strip recognitions into one document: markdown concatenated in
 /// reading order (blank line between non-empty strips), layout boxes
 /// translated down by each strip's `top` offset so they address the source
-/// image's pixel space.
+/// image's pixel space. The raw text joins the same way but stays as the model
+/// wrote it, so each strip's boxes remain on that strip's own 0–999 grid.
 #[must_use]
 pub fn merge_documents(parts: Vec<(RecognizedDocument, u32)>) -> RecognizedDocument {
     let mut markdown_parts: Vec<String> = Vec::new();
+    let mut raw_parts: Vec<String> = Vec::new();
     let mut layout: Vec<LayoutSpan> = Vec::new();
     for (doc, top) in parts {
         let body = doc.markdown.trim();
         if !body.is_empty() {
             markdown_parts.push(body.to_string());
+        }
+        if !doc.raw.is_empty() {
+            raw_parts.push(doc.raw);
         }
         let dy = i64::from(top);
         for mut span in doc.layout {
@@ -168,6 +173,7 @@ pub fn merge_documents(parts: Vec<(RecognizedDocument, u32)>) -> RecognizedDocum
     }
     RecognizedDocument {
         markdown: markdown_parts.join("\n\n"),
+        raw: raw_parts.join("\n\n"),
         layout,
     }
 }
@@ -326,26 +332,36 @@ mod tests {
     fn merge_offsets_layout_and_joins_markdown() {
         let a = RecognizedDocument {
             markdown: "first strip\n".to_string(),
+            raw: "<|ref|>text<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\nfirst strip".to_string(),
             layout: vec![LayoutSpan {
                 label: "text".to_string(),
                 boxes: vec![[1, 2, 3, 4]],
                 level: None,
+                text: Some("first strip".to_string()),
             }],
         };
         let b = RecognizedDocument {
             markdown: "  ".to_string(), // whitespace-only strip contributes nothing
+            raw: String::new(),
             layout: vec![],
         };
         let c = RecognizedDocument {
             markdown: "third strip".to_string(),
+            raw: "third strip".to_string(),
             layout: vec![LayoutSpan {
                 label: "text".to_string(),
                 boxes: vec![[5, 6, 7, 8]],
                 level: None,
+                text: None,
             }],
         };
         let merged = merge_documents(vec![(a, 0), (b, 500), (c, 1000)]);
         assert_eq!(merged.markdown, "first strip\n\nthird strip");
+        assert_eq!(
+            merged.raw,
+            "<|ref|>text<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\nfirst strip\n\nthird strip"
+        );
+        assert_eq!(merged.layout[0].text.as_deref(), Some("first strip"));
         assert_eq!(merged.layout.len(), 2);
         assert_eq!(merged.layout[0].boxes[0], [1, 2, 3, 4]);
         assert_eq!(merged.layout[1].boxes[0], [5, 1006, 7, 1008]);

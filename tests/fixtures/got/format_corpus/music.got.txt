@@ -1,0 +1,17 @@
+**kern	**kern
+*clefG2	*clefG2
+*k[]	*k[]
+*M22	*M22
+=-	=-
+4c	4c
+4d	4d
+4e	4e
+4f	4f
+=	=
+12eL	4g
+12d	.
+12cJ	.
+4b	4a
+4f	4cc
+=	=
+*-	*-

@@ -22,24 +22,18 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-#[cfg(all(feature = "pdf", not(target_arch = "wasm32")))]
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
 use sha2::{Digest, Sha256};
-#[cfg(all(feature = "pdf", target_arch = "wasm32"))]
+#[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
 use super::tensor::Mat;
-#[cfg(feature = "pdf")]
 use super::window::{WindowBoundary, WindowRecord, WindowResume, WindowedDocument};
-#[cfg(feature = "pdf")]
 use super::{PageFinish, PageOrigin, ResumePolicy, timing_log};
 use crate::error::{FocrError, FocrResult};
-#[cfg(feature = "pdf")]
-use crate::{
-    page_source::{MappedPage, WalkCursor},
-    pdf::SkippedPage,
-};
+use crate::page_source::{MappedPage, SkippedPage, WalkCursor};
 
 /// The fields a resumed run must share with the run it continues, by name, so
 /// a mismatch can say which fields differ. Keys are ordered, so the digest is
@@ -563,7 +557,6 @@ impl RunFiles {
 
 /// What a document run keeps of a page it read: enough to walk past it again
 /// without rasterizing it, and to rebuild its result.
-#[cfg(feature = "pdf")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct ReadPage {
     /// Where it came from.
@@ -576,7 +569,6 @@ pub(super) struct ReadPage {
     pub skipped: Vec<SkippedPage>,
 }
 
-#[cfg(feature = "pdf")]
 impl ReadPage {
     /// The source-page map's slots the walk filled up to this page.
     pub fn map_slots(&self) -> impl Iterator<Item = MappedPage> + '_ {
@@ -595,7 +587,6 @@ impl ReadPage {
 
 /// A completed page's journal line: one for each page a window owned. A page
 /// its output never reached has no body, and no result.
-#[cfg(feature = "pdf")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct JournalPage {
     /// [`PageResult::run_index`](super::PageResult::run_index).
@@ -615,7 +606,6 @@ pub(super) struct JournalPage {
 
 /// One line of a document run's journal: the run's key, then per window its
 /// pages and the record that closes them.
-#[cfg(feature = "pdf")]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum JournalLine {
@@ -632,7 +622,6 @@ enum JournalLine {
     Window { record: Box<WindowRecord> },
 }
 
-#[cfg(feature = "pdf")]
 impl JournalLine {
     fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("a journal line serializes")
@@ -640,7 +629,6 @@ impl JournalLine {
 }
 
 /// A checkpoint's state.
-#[cfg(feature = "pdf")]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct RunState {
     /// The journal lines this checkpoint counts.
@@ -653,7 +641,6 @@ struct RunState {
 
 /// What `focr doctor` reports of an interrupted run: a pure read of its
 /// journal.
-#[cfg(feature = "pdf")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalSummary {
     /// Pages of the closed windows.
@@ -668,7 +655,6 @@ pub struct JournalSummary {
 ///
 /// # Errors
 /// A whole line that does not parse, or any I/O error.
-#[cfg(feature = "pdf")]
 pub fn journal_summary(path: &Path) -> FocrResult<JournalSummary> {
     let (lines, _) = whole_lines(path)?;
     let journal = replay(&lines)?;
@@ -680,7 +666,6 @@ pub fn journal_summary(path: &Path) -> FocrResult<JournalSummary> {
 }
 
 /// A journal's lines read back.
-#[cfg(feature = "pdf")]
 struct Replay {
     /// The last key line's key.
     key: Option<ResumeKey>,
@@ -694,7 +679,6 @@ struct Replay {
     closed: usize,
 }
 
-#[cfg(feature = "pdf")]
 fn replay(lines: &[serde_json::Value]) -> FocrResult<Replay> {
     let mut replay = Replay {
         key: None,
@@ -730,7 +714,6 @@ fn replay(lines: &[serde_json::Value]) -> FocrResult<Replay> {
 }
 
 /// What a run picks up from the files of an interrupted one.
-#[cfg(feature = "pdf")]
 #[derive(Debug)]
 pub(super) struct Resumed {
     /// The completed pages, a window's unreached pages included.
@@ -744,7 +727,6 @@ pub(super) struct Resumed {
     pub recomputed: bool,
 }
 
-#[cfg(feature = "pdf")]
 impl Resumed {
     /// Every page read so far, in order.
     pub fn read(&self) -> Vec<ReadPage> {
@@ -757,7 +739,6 @@ impl Resumed {
 /// the writing, not the decode: hours of pages are worth more than the
 /// ability to resume them, and the run says so
 /// ([`DocumentRun::failure`]).
-#[cfg(feature = "pdf")]
 #[derive(Debug)]
 pub(super) struct DocumentRun {
     journal_path: PathBuf,
@@ -770,7 +751,6 @@ pub(super) struct DocumentRun {
     failure: Option<String>,
 }
 
-#[cfg(feature = "pdf")]
 impl DocumentRun {
     /// The run over `files` under the full resume `key`, and what it picks up
     /// from an interrupted run, by `policy`.
@@ -1134,7 +1114,6 @@ mod tests {
         assert!(Journal::reopen(&path, 4).is_err());
     }
 
-    #[cfg(feature = "pdf")]
     mod runs {
         use super::*;
         use crate::native_engine::window::WindowStats;
@@ -1204,6 +1183,7 @@ mod tests {
                     generated_tokens: 10 + lo,
                     finish: FinishReason::Stop,
                     kv_bytes_peak: 1000 + lo,
+                    rss_bytes_peak: Some(2000),
                     retire_fallbacks: 0,
                     elapsed_ms: 5,
                 },

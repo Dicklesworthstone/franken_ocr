@@ -15,16 +15,19 @@
 //! points at its own thin shim that just calls [`cli_main`]. See AGENTS.md
 //! doctrine #9.
 
+use crate::batch_events::{BatchEvents, BatchMode, BatchRun};
 use crate::native_engine::Half;
-use crate::page_source::{PageItem, PageSource};
+use crate::page_source::{PageEvent, PageItem, PageSource, PageStep};
 use crate::{
     FOCR_MODEL_LICENSE_NOTICE, FOCR_PROJECT_LICENSE_NOTICE, FocrError, FocrResult, OcrEngine, dist,
     native_engine, pdf, progress, quant, robot, simd,
 };
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::ffi::OsString;
+use std::io::{IsTerminal as _, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 // Debug/test-only producer seam for process-level exit-code conformance while
 // the Phase-1 forward is not able to naturally emit every terminal error kind.
@@ -197,14 +200,45 @@ pub struct OcrArgs {
     /// Stream NDJSON robot events as pages complete.
     #[arg(long)]
     pub robot: bool,
+    /// Check the run without running it: the arguments, the input's header or
+    /// page list, the `--pages` spec, the model's header and tokenizer, and
+    /// the output's directory, in about a second. Reads no weights and decodes
+    /// no pixels, exits with the code the run would fail with, and records
+    /// nothing in `focr runs`. A truncated image or a page that will not
+    /// rasterize passes here and fails in the run.
+    #[arg(long)]
+    pub check: bool,
+    /// Output the decode as the model wrote it, grounding markers included
+    /// (`<|det|>…<|/det|>` spans, or Unlimited-OCR-2's `<BLOCK>…<FORK>`
+    /// prefixes), in place of the markdown. With `--json` it adds a
+    /// `raw` field beside the markdown and to each page, and with `--robot`
+    /// to `run_complete`. Its boxes stay on the model's 0–999 grid, per page
+    /// or tall-image strip.
+    #[arg(long)]
+    pub raw: bool,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct OcrBatchArgs {
     /// Input document image paths. The model + int8 decoder cache are built once
     /// and reused across all of them (load-once batch throughput).
-    #[arg(required = true)]
+    #[arg(required_unless_present = "inputs_from")]
     pub images: Vec<PathBuf>,
+    /// Read more image paths from FILE, one per line, after any named above
+    /// (`-` reads stdin). Lines are taken as written apart from the line
+    /// terminator; blank lines are skipped, and a relative path resolves
+    /// against the current directory, not the list's.
+    #[arg(long, value_name = "FILE")]
+    pub inputs_from: Option<PathBuf>,
+    /// Write each image's markdown to DIR/<stem>.md as it ends, in place of
+    /// printing it, so a long batch keeps what it finished if it is stopped.
+    /// Two inputs with the same stem are refused before any work.
+    #[arg(long, value_name = "DIR")]
+    pub output_dir: Option<PathBuf>,
+    /// Stop at the first image that fails and exit with its code. By default
+    /// the batch goes on, and fails only when no image was read.
+    #[arg(long)]
+    pub fail_fast: bool,
     /// Model artifact path or model id. Default (unset) = the FAST plain-text
     /// OCR model (unlimited-ocr). Pass a `got-ocr2.int8.focrq` for SPECIALIZED
     /// structured output — math (LaTeX), tables, charts, molecular, geometry,
@@ -234,6 +268,20 @@ pub struct OcrBatchArgs {
     /// document that stops early prints its pages, then exits 5.
     #[arg(long)]
     pub multi_page: bool,
+    /// Write one JSON object per line to PATH (`-` for stderr) as the run
+    /// goes: the resolved threads, model and backend, then each image or page
+    /// as it ends with the measured pages per hour and an estimate of the time
+    /// left, then how the run ended. stdout does not change. `focr robot
+    /// schema` lists the events under `batch_progress`.
+    #[arg(long, value_name = "PATH")]
+    pub progress_events: Option<PathBuf>,
+    /// The kernel thread budget for this run; outranks FOCR_THREADS. Default:
+    /// physical cores.
+    #[arg(long, value_name = "N")]
+    pub threads: Option<std::num::NonZeroUsize>,
+    /// Print nested stage timings to stderr, as FOCR_TIMING=1 does.
+    #[arg(long)]
+    pub timing: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -273,7 +321,8 @@ pub struct OcrRequestArgs {
     /// Input document path — an image (PNG/JPG/…), a PDF (each page is
     /// rasterized natively and OCR'd as one document), or a directory of page
     /// images (read in natural order, `p2` before `p10`, as one document;
-    /// other files are left out with an `ignored_files` warning).
+    /// other files are left out with an `ignored_files` warning). `-` reads an
+    /// image or a PDF from stdin (a file named `-` is `./-`).
     pub image: PathBuf,
     /// The model to run: a model id (`unlimited-ocr`, `unlimited-ocr-2`, …)
     /// found in the model directories, or an artifact path. Default: the
@@ -380,6 +429,13 @@ pub struct OcrRequestArgs {
     /// independently.
     #[arg(long)]
     pub multi_page: bool,
+    /// How unlimited-ocr-2 splits a `--multi-page` document into decode
+    /// windows: N pages each (at most 102; the default is 10), `auto` for the
+    /// largest window whose estimated memory fits FOCR_MEMORY_BUDGET, or
+    /// `off` for one pass over every page, which keeps no checkpoint and can
+    /// stop at the position limit with its pages written and exit 5.
+    #[arg(long, value_name = "N|auto|off")]
+    pub page_window: Option<native_engine::PageWindow>,
     /// Continue an interrupted unlimited-ocr-2 `--multi-page` document from
     /// its last completed window: the result is byte-identical to an
     /// uninterrupted run. Re-running the same command does the same.
@@ -407,6 +463,15 @@ pub struct OcrRequestArgs {
     /// back-to-back invocations skip the multi-gigabyte artifact load.
     #[arg(long)]
     pub no_resident: bool,
+    /// The kernel thread budget for this run; outranks FOCR_THREADS. Default:
+    /// physical cores. The run loads its own model: a resident daemon keeps
+    /// the budget it started with.
+    #[arg(long, value_name = "N")]
+    pub threads: Option<std::num::NonZeroUsize>,
+    /// Print nested stage timings to stderr, as FOCR_TIMING=1 does. The run
+    /// loads its own model and shows no progress bar.
+    #[arg(long)]
+    pub timing: bool,
     /// Fail (exit 8, `low_yield`) when a large input produces almost no
     /// recognized text, instead of the default warning. A page-sized capture
     /// yielding a handful of characters is the silent-failure signature of
@@ -434,6 +499,7 @@ pub struct OcrRequest {
     pub pages: Option<String>,
     pub split_spreads: bool,
     pub multi_page: bool,
+    pub page_window: Option<native_engine::PageWindow>,
     pub resume: Option<ResumeMode>,
     pub keep_checkpoint: bool,
     pub no_resident: bool,
@@ -454,6 +520,8 @@ impl RobotRunArgs {
             extract_figures: false,
             figures_dir: None,
             robot: true,
+            check: false,
+            raw: false,
         }
     }
 }
@@ -531,6 +599,7 @@ impl OcrRequestArgs {
             pages: self.pages.clone(),
             split_spreads: self.split_spreads,
             multi_page: self.multi_page,
+            page_window: self.page_window,
             resume: self.resume,
             keep_checkpoint: self.keep_checkpoint,
             no_resident: self.no_resident,
@@ -604,6 +673,41 @@ fn validate_task_selection(task: OcrTask, model_spec: Option<&Path>) -> FocrResu
 /// all (the default resolution is always unlimited-ocr) or a file name naming
 /// another family without `smolvlm`. An ambiguous name passes through to the
 /// engine's arch tag.
+/// The models that serve `task`; `None` when any model does.
+fn task_models(task: OcrTask) -> Option<&'static [&'static str]> {
+    match task {
+        OcrTask::Ocr => None,
+        OcrTask::Describe => Some(&["smolvlm2"]),
+        OcrTask::ChartData => Some(&["onechart"]),
+        OcrTask::Music => Some(&["tromr", "got-ocr2"]),
+        OcrTask::Formula
+        | OcrTask::Tables
+        | OcrTask::Chart
+        | OcrTask::Molecular
+        | OcrTask::Geometry => Some(&["got-ocr2"]),
+    }
+}
+
+/// Refuse a task the model in hand does not serve, judged by its header. The
+/// name guard in [`validate_task_selection`] passes a file whose name says
+/// nothing, and a model given a task it has no mode for returns plain text
+/// with exit 0. A spec that does not resolve passes: the load reports that.
+fn validate_task_for_header(task: OcrTask, request: &OcrRequest) -> FocrResult<()> {
+    let Some(models) = task_models(task) else {
+        return Ok(());
+    };
+    let spec = request.model.clone().unwrap_or_else(OcrEngine::model_path);
+    match native_engine::model_id_at(&spec) {
+        Some(id) if !models.contains(&id) => Err(FocrError::Usage(format!(
+            "--task {task} needs {}, but {} holds {id}. Re-run with a model that serves it \
+             (see `focr models`)",
+            models.join(" or "),
+            spec.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// True when the model spec is KNOWABLY not a onechart artifact (mirrors
 /// [`model_spec_is_knowably_not_smolvlm2`]).
 fn model_spec_is_knowably_not_onechart(spec: Option<&Path>) -> bool {
@@ -1028,17 +1132,32 @@ impl Recognition {
         }
     }
 
+    /// The decode as the model wrote it, grounding markers included.
+    fn raw(&self) -> &str {
+        match self {
+            Recognition::Single(doc) => &doc.raw,
+            Recognition::Document(document) => &document.raw,
+        }
+    }
+
+    /// What a text output holds: `--raw`'s decode, else the markdown.
+    fn text(&self, raw: bool) -> &str {
+        if raw { self.raw() } else { self.markdown() }
+    }
+
     /// The structured JSON form. Always carries `schema_version` + `markdown`; a
     /// single image adds a top-level `layout` array, a document adds a `pages`
     /// array of `{page, layout}` (plus `half` on a split spread's halves). A
     /// `--multi-page` document's pages also carry `run_index` and `text`, and
     /// `tokens` and `finish` when the model counts them
     /// ([`native_engine::PageResult::to_json`], U2-E3). Every `layout` is a list
-    /// of `{label, boxes}`, and each box is `[x1, y1, x2, y2]` in source-image
-    /// pixels (top-left origin). When figures were extracted, a top-level
-    /// `figures` array of `{label, page, bbox, path}` (plus `half`) is appended
-    /// (each `path` is the saved file, also referenced from the markdown).
-    fn to_json(&self, figures: &[WrittenFigure]) -> serde_json::Value {
+    /// of `{label, boxes}` (plus `level` and `text` when the span has them), and
+    /// each box is `[x1, y1, x2, y2]` in source-image pixels (top-left origin).
+    /// With `raw`, a `raw` string sits beside the markdown and in each page.
+    /// When figures were extracted, a top-level `figures` array of
+    /// `{label, page, bbox, path}` (plus `half`) is appended (each `path` is the
+    /// saved file, also referenced from the markdown).
+    fn to_json(&self, figures: &[WrittenFigure], raw: bool) -> serde_json::Value {
         let mut value = match self {
             Recognition::Single(doc) => serde_json::json!({
                 "schema_version": robot::ROBOT_SCHEMA_VERSION,
@@ -1059,12 +1178,21 @@ impl Recognition {
                             if let Some(half) = p.half {
                                 page["half"] = serde_json::json!(half);
                             }
+                            if raw {
+                                page["raw"] = p.raw.as_str().into();
+                            }
                             page
                         })
                         .collect(),
                     DocumentPageList::Read(pages) => pages
                         .iter()
-                        .map(native_engine::PageResult::to_json)
+                        .map(|p| {
+                            let mut page = p.to_json();
+                            if raw {
+                                page["raw"] = p.raw.as_str().into();
+                            }
+                            page
+                        })
                         .collect(),
                 };
                 serde_json::json!({
@@ -1074,6 +1202,9 @@ impl Recognition {
                 })
             }
         };
+        if raw {
+            value["raw"] = self.raw().into();
+        }
         if !figures.is_empty()
             && let Some(obj) = value.as_object_mut()
         {
@@ -1119,21 +1250,40 @@ fn output_is_json(output: Option<&Path>) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
 }
 
+/// What a run outputs: JSON or text, with the raw decode or without.
+#[derive(Clone, Copy)]
+struct OutputShape {
+    json: bool,
+    raw: bool,
+}
+
+impl OutputShape {
+    /// The confirmation line's name for this output.
+    fn name(self) -> &'static str {
+        match (self.json, self.raw) {
+            (true, _) => "json",
+            (false, true) => "raw decode",
+            (false, false) => "markdown",
+        }
+    }
+}
+
 /// Write the recognition result to `path` as pretty JSON (with per-span bounding
-/// boxes + any extracted `figures`, and the `model` that ran) when `want_json`,
-/// else as the rendered markdown. Both forms end with a trailing newline so the
-/// file is well-formed for downstream tools.
+/// boxes + any extracted `figures`, and the `model` that ran) when `shape.json`,
+/// else as the rendered markdown, or the raw decode under `shape.raw`. Both
+/// forms end with a trailing newline so the file is well-formed for downstream
+/// tools.
 fn write_ocr_output(
     path: &Path,
     rec: &Recognition,
-    want_json: bool,
+    shape: OutputShape,
     figures: &[WrittenFigure],
     music_meta: Option<&native_engine::MusicPageMeta>,
     run_warnings: &[native_engine::RunWarning],
     model: Option<&native_engine::ModelIdentity>,
 ) -> FocrResult<()> {
-    let contents = if want_json {
-        let mut value = rec.to_json(figures);
+    let contents = if shape.json {
+        let mut value = rec.to_json(figures, shape.raw);
         if let Some(meta) = music_meta {
             value["staves"] = music_meta_to_json(meta);
             value["warnings"] = music_warnings_to_json(meta);
@@ -1151,11 +1301,11 @@ fn write_ocr_output(
         s.push('\n');
         s
     } else {
-        let md = rec.markdown();
-        if md.ends_with('\n') {
-            md.to_string()
+        let text = rec.text(shape.raw);
+        if text.ends_with('\n') {
+            text.to_string()
         } else {
-            format!("{md}\n")
+            format!("{text}\n")
         }
     };
     std::fs::write(path, contents).map_err(|e| {
@@ -1399,6 +1549,17 @@ impl FigureWriter {
     }
 }
 
+/// `--threads` and `--timing`, before anything reads the budget.
+fn apply_tuning(threads: Option<std::num::NonZeroUsize>, timing: bool) -> FocrResult<()> {
+    if let Some(threads) = threads {
+        crate::set_thread_budget(threads)?;
+    }
+    if timing {
+        crate::enable_timing();
+    }
+    Ok(())
+}
+
 fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     // Best-effort run telemetry (bd-223.4): capture the logging fields before
     // the args move, record the outcome after — a store failure NEVER fails
@@ -1411,7 +1572,13 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
         .map_or_else(|| "default".to_owned(), |p| p.display().to_string());
     let started = crate::storage::now_millis();
     let mut ran = None;
+    let check = args.check;
+    apply_tuning(args.request.threads, args.request.timing)?;
     let outcome = run_ocr_inner(args, robot_mode, &mut ran);
+    // A preflight is not a run: `focr runs` is the recognition history.
+    if check {
+        return outcome;
+    }
     let quant = if telemetry_model.contains("int8") {
         "int8"
     } else if telemetry_model.contains("int4") {
@@ -1462,6 +1629,174 @@ fn run_ocr(args: OcrArgs, robot_mode: bool) -> FocrResult<()> {
     outcome
 }
 
+/// The input path that means stdin.
+const STDIN_INPUT: &str = "-";
+
+/// `focr ocr -`: the input copied from stdin into a private directory, which
+/// goes when the run ends. Every reader takes a path, the resident daemon's
+/// among them, and takes an image's format from the file's extension.
+struct StdinInput {
+    dir: PathBuf,
+    file: PathBuf,
+}
+
+impl StdinInput {
+    fn capture() -> FocrResult<Self> {
+        let stdin = std::io::stdin();
+        if stdin.is_terminal() {
+            return Err(FocrError::Usage(
+                "`focr ocr -` reads an image or a PDF from stdin, and nothing is piped in".into(),
+            ));
+        }
+        let dir =
+            std::env::temp_dir().join(format!("focr-stdin-{}", uuid::Uuid::new_v4().simple()));
+        let unwritable = |e: std::io::Error| {
+            FocrError::Other(anyhow::anyhow!("saving stdin under {}: {e}", dir.display()))
+        };
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir).map_err(unwritable)?;
+        let mut input = Self {
+            file: dir.join("stdin"),
+            dir: dir.clone(),
+        };
+        let mut file = std::fs::File::create_new(&input.file).map_err(unwritable)?;
+        let bytes = std::io::copy(&mut stdin.lock(), &mut file).map_err(unwritable)?;
+        drop(file);
+        if bytes == 0 {
+            return Err(FocrError::InputDecode(
+                "stdin is empty: pipe an image or a PDF into `focr ocr -`".into(),
+            ));
+        }
+        let mut head = [0u8; 64];
+        let read = std::fs::File::open(&input.file)
+            .and_then(|mut file| file.read(&mut head))
+            .map_err(unwritable)?;
+        let extension = if pdf::looks_like_pdf_bytes(&head[..read]) {
+            "pdf"
+        } else {
+            image::guess_format(&head[..read])
+                .ok()
+                .and_then(|format| format.extensions_str().first().copied())
+                .ok_or_else(|| {
+                    FocrError::InputDecode(
+                        "stdin holds neither a PDF nor an image format focr reads".into(),
+                    )
+                })?
+        };
+        let named = input.file.with_extension(extension);
+        std::fs::rename(&input.file, &named).map_err(unwritable)?;
+        input.file = named;
+        Ok(input)
+    }
+}
+
+impl Drop for StdinInput {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// What `focr ocr --check` says about the input: a single image from its
+/// header, a document from its page list. `named` is the input as given.
+fn check_input(
+    named: &Path,
+    request: &OcrRequest,
+    source: Option<&PageSource>,
+) -> FocrResult<serde_json::Value> {
+    let path = &request.image;
+    if let Some(source) = source {
+        let kind = if path.is_dir() { "directory" } else { "pdf" };
+        return Ok(serde_json::json!({
+            "path": named,
+            "kind": kind,
+            "pages": source.len(),
+            "source_pages": source.source_len(),
+        }));
+    }
+    let (width, height) = image::image_dimensions(path)
+        .map_err(|e| FocrError::InputDecode(format!("{}: {e}", named.display())))?;
+    Ok(serde_json::json!({
+        "path": named,
+        "kind": "image",
+        "width": width,
+        "height": height,
+    }))
+}
+
+/// Refuse `-o` when the run could not write its result, so a long decode does
+/// not end in a failed write.
+fn check_output(output: &Path) -> FocrResult<()> {
+    let parent = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if output.is_dir() {
+        return Err(FocrError::Usage(format!(
+            "-o {} is a directory: name a file",
+            output.display()
+        )));
+    }
+    if !parent.is_dir() {
+        return Err(FocrError::Usage(format!(
+            "-o {}: {} is not a directory",
+            output.display(),
+            parent.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Finish `focr ocr --check`: the run's own argument checks have passed, so
+/// check what is left before a decode and report it. A failure returns the
+/// error the run would return.
+fn report_check(
+    args: &OcrArgs,
+    request: &OcrRequest,
+    source: Option<&PageSource>,
+    warnings: &[native_engine::RunWarning],
+) -> FocrResult<()> {
+    // A run loads the model before it reads the image, so a request wrong in
+    // both ways fails on the model here too.
+    let model = request.model.clone().unwrap_or_else(OcrEngine::model_path);
+    let (artifact, model_id) = native_engine::preflight_model(&model).map_err(|e| match e {
+        FocrError::ModelNotFound(msg) => {
+            FocrError::ModelNotFound(with_pull_hint(&msg, request.model.as_deref()))
+        }
+        other => other,
+    })?;
+    let input = check_input(&args.request.image, request, source)?;
+    if let Some(output) = args.output.as_deref() {
+        check_output(output)?;
+    }
+    if args.json {
+        let mut value = serde_json::json!({
+            "schema_version": robot::ROBOT_SCHEMA_VERSION,
+            "command": "ocr.check",
+            "ok": true,
+            "input": input,
+            "model": { "id": model_id, "path": artifact },
+            "output": args.output,
+            "threads": crate::thread_budget(),
+            "timing": crate::timing_enabled(),
+        });
+        merge_run_warnings(&mut value, warnings);
+        println!("{value}");
+    } else {
+        let described = match (input["kind"].as_str(), input["pages"].as_u64()) {
+            (Some(kind), Some(pages)) => format!("{kind}, {pages} pages to read"),
+            _ => format!("image, {}x{}", input["width"], input["height"]),
+        };
+        println!(
+            "ok: {} ({described}); {model_id} from {}",
+            args.request.image.display(),
+            artifact.display()
+        );
+    }
+    Ok(())
+}
+
 /// One `focr ocr` run. `ran` is set to the model that served it as soon as the
 /// recognition returns, so the run store records it even when the run then
 /// fails (a partial document, a low yield).
@@ -1470,7 +1805,18 @@ fn run_ocr_inner(
     robot_mode: bool,
     ran: &mut Option<native_engine::ModelIdentity>,
 ) -> FocrResult<()> {
+    if args.check && robot_mode {
+        return Err(FocrError::Usage(
+            "--check reports once and streams no events: pass --json instead of --robot".into(),
+        ));
+    }
     let mut request = args.to_request()?;
+    let stdin_input = (request.image.as_os_str() == STDIN_INPUT)
+        .then(StdinInput::capture)
+        .transpose()?;
+    if let Some(input) = &stdin_input {
+        request.image.clone_from(&input.file);
+    }
     // GOT-OCR2 `--format` (.mmd) mode and the decode tuning flags (`--max-length`,
     // `--temperature`, `--no-repeat-ngram`, `--ngram-window`) are threaded to the
     // leaf via process-globals (the shared OcrEngine/OcrModel signatures stay
@@ -1519,6 +1865,7 @@ fn run_ocr_inner(
     // missing one leaves v1 serving with a pull hint.
     let mode = RunMode::of_ocr(&request, is_document);
     let pull_hint = apply_mode_default(&mut request.model, mode, &MODE_DEFAULTS);
+    validate_task_for_header(args.request.task, &request)?;
     // A model that splits a document into pages exactly (Unlimited-OCR-2,
     // U2-E3) gives one cross-page pass real pages, so its document mode
     // composes with --split-spreads and --extract-figures. v1 merges pages.
@@ -1541,6 +1888,19 @@ fn run_ocr_inner(
                 .into(),
         ));
     }
+    if request.page_window.is_some() && !request.multi_page {
+        return Err(FocrError::Usage(
+            "--page-window splits a document read as one: pass --multi-page".into(),
+        ));
+    }
+    let unwindowed = request.page_window == Some(native_engine::PageWindow::Off);
+    if unwindowed && (request.resume.is_some() || request.keep_checkpoint) {
+        return Err(FocrError::Usage(
+            "--page-window off reads the document in one pass, which has no window to resume \
+             from: drop --resume and --keep-checkpoint, or choose a window"
+                .into(),
+        ));
+    }
     if (request.resume.is_some() || request.keep_checkpoint) && !paged_document {
         return Err(FocrError::Usage(
             "--resume and --keep-checkpoint continue a windowed document: pass --multi-page \
@@ -1548,7 +1908,7 @@ fn run_ocr_inner(
                 .into(),
         ));
     }
-    let run_files = if paged_document {
+    let run_files = if paged_document && !unwindowed {
         document_run_files(&request, args.output.as_deref())?
     } else {
         None
@@ -1570,12 +1930,23 @@ fn run_ocr_inner(
     if !robot_mode {
         early_warnings.iter().for_each(print_run_warning);
     }
+    if args.check {
+        return report_check(&args, &request, source.as_ref(), &early_warnings);
+    }
     // A resident run decodes in the daemon, which reports its finish_reason
     // (U2-X2) and model (U2-E1) in the reply; inline runs leave both on this
     // engine's model.
     let mut resident_finish: Option<native_engine::FinishReason> = None;
     let mut resident_model: Option<native_engine::ModelIdentity> = None;
-    let mut resume_outcome = ResumeOutcome::default();
+    let mut resident_music: Option<native_engine::MusicPageMeta> = None;
+    let stages = robot_mode.then(|| Arc::new(robot::StageClock::start()));
+    if let Some(stages) = &stages {
+        let stages = Arc::clone(stages);
+        engine.set_stage_sink(Some(Box::new(move |name, budget| {
+            emit(&stages.entered(name, budget));
+        })));
+    }
+    let mut document_outcome = DocumentOutcome::default();
     let (recognition, figures): (Recognition, Vec<WrittenFigure>) = match (&figure_plan, source) {
         (plan, Some(source)) if request.multi_page => {
             let (document, figs, outcome) = recognize_document_multi_page(
@@ -1590,7 +1961,7 @@ fn run_ocr_inner(
                 plan.as_ref(),
                 run_files.as_ref(),
             )?;
-            resume_outcome = outcome;
+            document_outcome = outcome;
             (Recognition::Document(document), figs)
         }
         (Some(plan), Some(source)) => {
@@ -1650,10 +2021,11 @@ fn run_ocr_inner(
                 // unavailable, ineligible, or any transport-shaped failure —
                 // falls through to the classic in-process load; the observable
                 // output contract is identical either way.
-                let doc = match resident_recognition(&args, &request)? {
+                let doc = match resident_recognition(&args, &request, stages.as_deref())? {
                     Some(reply) => {
                         resident_finish = reply.finish_reason;
                         resident_model = reply.model;
+                        resident_music = reply.music;
                         reply.document
                     }
                     None => {
@@ -1686,8 +2058,8 @@ fn run_ocr_inner(
             .map(native_engine::decode_warnings)
             .unwrap_or_default(),
     );
-    run_warnings.extend(resume_outcome.warnings);
-    let resumed_from = resume_outcome.resumed_from;
+    run_warnings.extend(document_outcome.warnings);
+    let resumed_from = document_outcome.resumed_from;
     // An Unlimited-OCR-2 document that stopped at its position limit or
     // stage budget writes what it produced below, then exits 5 (U2-B6). A
     // decode report comes from this engine's loaded model, so `model` is
@@ -1703,7 +2075,7 @@ fn run_ocr_inner(
 
     // Staff-level metadata from a TrOMR music forward (bd-av64.2): consumed
     // once per run; None for every non-music run.
-    let music_meta = engine.take_music_page_meta();
+    let music_meta = resident_music.or_else(|| engine.take_music_page_meta());
     if robot_mode && let Some(meta) = &music_meta {
         let total = meta.staves.len() + meta.skips.len();
         for (index, bbox) in &meta.staves {
@@ -1773,7 +2145,10 @@ fn run_ocr_inner(
     // `--json` forces JSON; a `.json` output path selects it implicitly. (When no
     // `-o` is given, `output_is_json(None)` is false, so stdout behavior is exactly
     // the legacy `args.json` choice.)
-    let want_json = args.json || output_is_json(args.output.as_deref());
+    let shape = OutputShape {
+        json: args.json || output_is_json(args.output.as_deref()),
+        raw: args.raw,
+    };
 
     // An `-o/--output FILE` writes the result to disk (markdown or JSON-with-boxes)
     // regardless of mode, and is written FIRST so the file already exists when a
@@ -1782,7 +2157,7 @@ fn run_ocr_inner(
         write_ocr_output(
             path,
             &recognition,
-            want_json,
+            shape,
             &figures,
             music_meta.as_ref(),
             &run_warnings,
@@ -1811,8 +2186,17 @@ fn run_ocr_inner(
                 &run_warnings,
                 model.as_ref(),
             );
+            if args.raw {
+                event["raw"] = recognition.raw().into();
+            }
             if let Some(page) = resumed_from {
                 event["resumed_from"] = page.into();
+            }
+            if let Some(counts) = &document_outcome.counts {
+                event["pages_out"] = counts.pages_out.into();
+                event["pages_skipped"] = counts.pages_skipped.into();
+                event["windows"] = counts.windows.into();
+                event["extra_markers"] = counts.extra_markers.into();
             }
             emit(&event);
         }
@@ -1824,13 +2208,9 @@ fn run_ocr_inner(
         } else {
             format!(", {} figure(s)", figures.len())
         };
-        eprintln!(
-            "[focr] wrote {} ({}{figs})",
-            path.display(),
-            if want_json { "json" } else { "markdown" }
-        );
+        eprintln!("[focr] wrote {} ({}{figs})", path.display(), shape.name());
     } else if args.json {
-        let mut value = recognition.to_json(&figures);
+        let mut value = recognition.to_json(&figures, args.raw);
         if let Some(meta) = &music_meta {
             value["staves"] = music_meta_to_json(meta);
             value["warnings"] = music_warnings_to_json(meta);
@@ -1841,7 +2221,7 @@ fn run_ocr_inner(
         }
         emit(&value);
     } else {
-        println!("{markdown}");
+        println!("{}", recognition.text(args.raw));
     }
     // The pages are out; a partial run now fails with exit 5.
     partial.map_or(Ok(()), Err)
@@ -2140,19 +2520,19 @@ fn first_run_offer(
 /// warm-model daemon (GH #9). `Ok(None)` = run inline (never an error).
 ///
 /// Eligibility: single non-PDF image, no figure extraction (both enforced by
-/// the caller's match arm), any task except `music` (TrOMR staff/warning
-/// metadata is read off the client engine after recognition and would be lost
-/// daemon-side), resident not disabled, and no `FOCR_TIMING` trace (its
-/// stderr rows would print invisibly in the daemon). The model spec is
-/// resolved client-side first, so an unresolvable model keeps the inline
-/// path's download-offer / exit-3 contract byte-for-byte.
+/// the caller's match arm), resident not disabled, no `--threads` (the daemon
+/// keeps the budget it started with) and no timing trace (its stderr rows would
+/// print invisibly in the daemon). The model spec is resolved client-side first,
+/// so an unresolvable model keeps the inline path's download-offer / exit-3
+/// contract byte-for-byte.
 fn resident_recognition(
     args: &OcrArgs,
     request: &OcrRequest,
+    stages: Option<&robot::StageClock>,
 ) -> FocrResult<Option<crate::resident::ResidentReply>> {
     if !crate::resident::enabled(request.no_resident)
-        || args.request.task == OcrTask::Music
-        || std::env::var_os("FOCR_TIMING").is_some()
+        || args.request.threads.is_some()
+        || crate::timing_enabled()
     {
         return Ok(None);
     }
@@ -2163,6 +2543,11 @@ fn resident_recognition(
     let Ok(model) = native_engine::OcrModel::resolve_model(&spec) else {
         return Ok(None);
     };
+    let on_stage = |name: &str, budget: Option<std::time::Duration>| {
+        if let Some(stages) = stages {
+            emit(&stages.entered(name, budget));
+        }
+    };
     crate::resident::try_recognize(&crate::resident::ResidentRequest {
         image: &request.image,
         model,
@@ -2170,6 +2555,7 @@ fn resident_recognition(
         preprocess: preprocess_overrides_from(request),
         format: request.format,
         question: request.question.as_deref(),
+        on_stage: Some(&on_stage),
     })
 }
 
@@ -2254,7 +2640,8 @@ fn recognize_tall_capture(
 }
 
 /// The page source of a document input (a PDF or a directory of page
-/// images), narrowed to `--pages` (the grammar of [`pdf::select_pages`],
+/// images), narrowed to `--pages` (the grammar of
+/// [`select_pages`](crate::page_source::select_pages),
 /// shared with the library, the iOS app and the browser playground) and
 /// splitting spreads under `--split-spreads` (bd-av64.11).
 ///
@@ -2321,6 +2708,34 @@ fn report_skipped_page(
     }
 }
 
+/// A per-page run's observer: its progress bar, where a spread's two halves
+/// share one step, and each skip on the stream the caller reads, so a machine
+/// consumer can tell the document is missing pages.
+fn page_progress<'a>(
+    run: DocumentRun,
+    bar: &'a progress::Progress,
+    noun: &'a str,
+    page_count: usize,
+) -> impl FnMut(PageEvent<'_>) + 'a {
+    let finished = |page: PageStep| {
+        if page.half != Some(Half::Left) {
+            bar.complete_item();
+        }
+    };
+    move |event| match event {
+        PageEvent::Started(page) => {
+            if page.half != Some(Half::Right) {
+                bar.start_item(format!("page {}/{page_count}", page.source_page));
+            }
+        }
+        PageEvent::Done(page) => finished(page),
+        PageEvent::Skipped(page, error) => {
+            report_skipped_page(run, bar, noun, page.source_page, error);
+            finished(page);
+        }
+    }
+}
+
 /// One successfully-OCR'd document page's structured layout (for the JSON
 /// output).
 struct DocumentPageLayout {
@@ -2328,18 +2743,31 @@ struct DocumentPageLayout {
     page: usize,
     /// `Some("left"|"right")` when this entry is one half of a split spread.
     half: Option<&'static str>,
+    /// The page's decode as the model wrote it.
+    raw: String,
     /// The page's parsed layout spans (labels + pixel bounding boxes).
     layout: Vec<crate::native_engine::LayoutSpan>,
 }
 
-/// What a windowed document's run adds to its report (U2-D4).
+/// What a document's run adds to its report (U2-D4, U2-D5).
 #[derive(Debug, Default)]
-struct ResumeOutcome {
+struct DocumentOutcome {
     /// The run page decoding started at, when the run picked up an
     /// interrupted one.
     resumed_from: Option<usize>,
     /// The warnings of the run rather than its decode.
     warnings: Vec<native_engine::RunWarning>,
+    /// An Unlimited-OCR-2 document's counts, for `run_complete`.
+    counts: Option<DocumentCounts>,
+}
+
+/// How an Unlimited-OCR-2 document went (U2-D5).
+#[derive(Debug)]
+struct DocumentCounts {
+    pages_out: usize,
+    pages_skipped: usize,
+    windows: usize,
+    extra_markers: usize,
 }
 
 /// Where a windowed document keeps its journal and checkpoint (U2-D4): beside
@@ -2425,6 +2853,8 @@ enum DocumentPageList {
 /// markdown).
 struct DocumentRecognition {
     markdown: String,
+    /// The decode as the model wrote it, pages joined as the markdown's are.
+    raw: String,
     pages: DocumentPageList,
 }
 
@@ -2462,16 +2892,16 @@ fn recognize_document_multi_page(
     run: DocumentRun,
     figures: Option<&FigurePlan>,
     files: Option<&native_engine::checkpoint::RunFiles>,
-) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>, ResumeOutcome)> {
+) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>, DocumentOutcome)> {
     let DocumentRun {
         robot_mode,
         show_progress,
-        ..
+        paged_model,
     } = run;
     let opened = std::cell::Cell::new(Some(source));
     let noun = page_noun(request);
     let recompute = request.resume == Some(ResumeMode::Recompute);
-    let options = match files {
+    let mut options = match files {
         Some(files) => {
             if files.journal.exists() {
                 eprintln!(
@@ -2494,63 +2924,85 @@ fn recognize_document_multi_page(
         }
         None => native_engine::DocumentOptions::default(),
     };
+    options.page_window = request.page_window;
     let document = recognize_with_autodownload(request, robot_mode, |model| {
         let source = attempt_source(&opened, request)?;
         let model_path = model
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(OcrEngine::model_path);
         let (page_count, selected) = (source.source_len(), source.len());
-        // Human-mode progress (GH #2), two bars in turn: `raster` while the
-        // pages are read, then `ocr` over the pages that rendered while the
-        // document decodes (a windowed parse alternates them window by window
-        // until its last page is read; window progress is U2-D5's).
-        // Stderr-only; self-disabled off-TTY.
+        // Human-mode progress (GH #2): for v1 two bars in turn, `raster` while
+        // the pages are read, then `ocr` over the pages that rendered while
+        // the document decodes. A model that reads pages between its window
+        // decodes has the `ocr` bar alone, so the line stays on the window
+        // that ended instead of on the last page read. Stderr-only;
+        // self-disabled off-TTY.
         let decode_bar =
             std::sync::Arc::new(progress::Progress::new("ocr", selected, show_progress));
-        let raster_bar = progress::Progress::new("raster", selected, show_progress);
+        let raster_bar = paged_model
+            .is_none()
+            .then(|| progress::Progress::new("raster", selected, show_progress));
         let on_item: Box<dyn FnMut(&PageItem) + Send> = {
             let decode_bar = std::sync::Arc::clone(&decode_bar);
             let mut failed = 0usize;
             Box::new(move |item: &PageItem| {
-                raster_bar.start_item(format!("page {}/{page_count}", item.source_page));
+                let status = format!("page {}/{page_count}", item.source_page);
+                match &raster_bar {
+                    Some(bar) => bar.start_item(status),
+                    None => decode_bar.reading_item(format!("read {status}")),
+                }
                 if let Err(e) = &item.raster {
                     failed += 1;
-                    report_skipped_page(run, &raster_bar, noun, item.source_page, e);
+                    let bar = raster_bar.as_ref().unwrap_or(&decode_bar);
+                    report_skipped_page(run, bar, noun, item.source_page, e);
                 }
-                if item.half != Some(Half::Left) {
-                    raster_bar.complete_item();
+                if let Some(bar) = &raster_bar
+                    && item.half != Some(Half::Left)
+                {
+                    bar.complete_item();
                 }
                 // Counted from the walk, which a resumed run joins part way.
                 let rendered = item.index + 1 - failed;
                 let walked = item.walk.next - usize::from(item.walk.held);
                 if walked == selected {
-                    raster_bar.finish();
                     decode_bar.set_total(rendered);
-                    if rendered > 0 {
-                        decode_bar.start_item(format!("page 1/{rendered}"));
+                    if let Some(bar) = &raster_bar {
+                        bar.finish();
+                        if rendered > 0 {
+                            decode_bar.start_item(format!("page 1/{rendered}"));
+                        }
                     }
                 }
             })
         };
         // Robot mode streams a `page` event per crossed <PAGE> boundary
         // (bd-2z0y), naming the source page when the model splits pages
-        // exactly (U2-E3); the terminal run_complete still carries the
-        // assembled markdown. A human TTY advances the decode bar instead;
-        // off-TTY (or FOCR_NO_PROGRESS) the pass streams nothing, and its
-        // markdown is the same either way.
-        let on_page: Option<crate::PageSink> = if robot_mode {
-            Some(Box::new(|streamed: &crate::StreamedPage<'_>| {
-                emit(&match streamed.page {
-                    Some(page) => robot::document_page_decoded_event(page, streamed.body),
-                    None => robot::page_decoded_event(streamed.index, streamed.body),
+        // exactly (U2-E3), and a `window` event as each window ends (U2-D5);
+        // the terminal run_complete still carries the assembled markdown. A
+        // human TTY advances the decode bar instead; off-TTY (or
+        // FOCR_NO_PROGRESS) the pass streams nothing, and its markdown is the
+        // same either way.
+        let on_event: Option<crate::DocumentSink> = if robot_mode {
+            let mut eta = progress::PageEta::default();
+            Some(Box::new(move |event: &crate::DocumentEvent<'_>| {
+                emit(&match event {
+                    crate::DocumentEvent::Page(streamed) => match streamed.page {
+                        Some(page) => robot::document_page_decoded_event(page, streamed.body),
+                        None => robot::page_decoded_event(streamed.index, streamed.body),
+                    },
+                    crate::DocumentEvent::Window(window) => {
+                        eta.add_window(window.pages.len(), window.elapsed_ms);
+                        let left = selected.saturating_sub(window.pages.end);
+                        robot::window_event(window, eta.remaining_ms(left))
+                    }
                 });
             }))
         } else if decode_bar.is_enabled() {
-            Some(decode_bar.page_sink())
+            Some(decode_bar.document_sink())
         } else {
             None
         };
-        let out = engine.recognize_document(&model_path, source, &options, on_item, on_page);
+        let out = engine.recognize_document(&model_path, source, &options, on_item, on_event);
         if out.is_ok() {
             decode_bar.finish();
         } else {
@@ -2561,8 +3013,15 @@ fn recognize_document_multi_page(
     // The run's finish_reason and decode warnings come from the engine's
     // decode report, as for every other run; its skipped pages were reported
     // as they were read.
+    let counts = paged_model.map(|_| DocumentCounts {
+        pages_out: document.pages_out,
+        pages_skipped: document.skipped.len(),
+        windows: document.windows.len(),
+        extra_markers: document.extra_markers,
+    });
     let native_engine::DocumentResult {
         mut markdown,
+        raw,
         mut pages,
         resumed_from,
         warnings,
@@ -2578,15 +3037,17 @@ fn recognize_document_multi_page(
     Ok((
         DocumentRecognition {
             markdown,
+            raw,
             pages: DocumentPageList::Read(pages),
         },
         written,
-        ResumeOutcome {
+        DocumentOutcome {
             resumed_from,
             warnings: warnings
                 .into_iter()
                 .filter(|w| matches!(w.kind, "resume_recompute" | "checkpoint_failed"))
                 .collect(),
+            counts,
         },
     ))
 }
@@ -2664,71 +3125,28 @@ fn recognize_document_pages(
         // ModelNotFound retires it without waiting; the autodownload wrapper
         // synchronizes the terminal line before its first-run prompt renders.
         let bar = progress::Progress::new("ocr", source.len(), show_progress);
-        let mut document = String::new();
-        let mut page_layouts: Vec<DocumentPageLayout> = Vec::new();
-        let mut ok_pages = 0usize;
-        let mut first_error: Option<FocrError> = None;
-        for item in source.by_ref() {
-            // A spread's two halves share one bar step.
-            if item.half != Some(Half::Right) {
-                bar.start_item(format!("page {}/{page_count}", item.source_page));
-            }
-            // A raster failure skips the SOURCE page (both halves of a spread).
-            let page = item.raster.and_then(|image| match model {
+        let read = source.read_pages(
+            |image| match model {
                 Some(m) => engine.recognize_dynamic_with_layout_model(m, image),
                 None => engine.recognize_dynamic_with_layout(image),
-            });
-            match page {
-                Ok(doc) => {
-                    if ok_pages > 0 {
-                        document.push_str("\n\n");
-                    }
-                    document.push_str(doc.markdown.trim_end());
-                    page_layouts.push(DocumentPageLayout {
-                        page: item.source_page,
-                        half: item.half.map(Half::as_str),
-                        layout: doc.layout,
-                    });
-                    ok_pages += 1;
-                }
-                // Whole-run conditions are never per-page — abort immediately:
-                // a missing model (so the caller can offer the download + retry),
-                // a Ctrl+C / cooperative cancel, or a bad/incompatible model file
-                // (every page would fail it identically). Swallowing any of these
-                // per-page would lose the signal and waste compute on doomed pages.
-                Err(
-                    e @ (FocrError::ModelNotFound(_)
-                    | FocrError::Cancelled
-                    | FocrError::FormatMismatch(_)),
-                ) => return Err(e),
-                // Isolate every other per-page failure: skip it, keeping the rest
-                // of the document, but SURFACE the skip on whichever stream the
-                // caller is reading — a structured `page` NDJSON event in robot
-                // mode (so a machine consumer can tell the document is missing
-                // pages), else a human stderr warning.
-                Err(e) => {
-                    report_skipped_page(run, &bar, noun, item.source_page, &e);
-                    first_error.get_or_insert(e);
-                }
-            }
-            if item.half != Some(Half::Left) {
-                bar.complete_item();
-            }
-        }
+            },
+            &mut page_progress(run, &bar, noun, page_count),
+        )?;
         bar.finish();
-        if ok_pages == 0 {
-            // A source has >=1 page, and ModelNotFound returns early, so
-            // first_error is always Some here; fall back defensively.
-            return Err(first_error.unwrap_or_else(|| {
-                FocrError::InputDecode(format!(
-                    "{} produced no decodable pages",
-                    request.image.display()
-                ))
-            }));
-        }
         Ok(DocumentRecognition {
-            markdown: document,
-            pages: DocumentPageList::Layouts(page_layouts),
+            markdown: read.markdown(),
+            raw: read.raw(),
+            pages: DocumentPageList::Layouts(
+                read.pages
+                    .into_iter()
+                    .map(|page| DocumentPageLayout {
+                        page: page.source_page,
+                        half: page.half.map(Half::as_str),
+                        raw: page.value.raw,
+                        layout: page.value.layout,
+                    })
+                    .collect(),
+            ),
         })
     })
 }
@@ -2748,11 +3166,6 @@ fn recognize_document_pages_with_figures(
     run: DocumentRun,
     plan: &FigurePlan,
 ) -> FocrResult<(DocumentRecognition, Vec<WrittenFigure>)> {
-    type OkPage = (
-        usize,
-        native_engine::RecognizedDocument,
-        Vec<native_engine::ExtractedFigure>,
-    );
     let DocumentRun {
         robot_mode,
         show_progress,
@@ -2760,45 +3173,22 @@ fn recognize_document_pages_with_figures(
     } = run;
     let opened = std::cell::Cell::new(Some(source));
     let noun = page_noun(request);
-    let ok_pages: Vec<OkPage> = recognize_with_autodownload(request, robot_mode, |model| {
+    let read = recognize_with_autodownload(request, robot_mode, |model| {
         let mut source = attempt_source(&opened, request)?;
         let page_count = source.source_len();
         // Same per-page progress bar as `recognize_document_pages` (GH #2):
         // stderr-only, disabled in robot mode and off-TTY, per-attempt lifetime.
         // `--split-spreads` is refused with figures, so every item is a page.
         let bar = progress::Progress::new("ocr", source.len(), show_progress);
-        let mut out: Vec<OkPage> = Vec::new();
-        let mut first_error: Option<FocrError> = None;
-        for item in source.by_ref() {
-            bar.start_item(format!("page {}/{page_count}", item.source_page));
-            let page = item.raster.and_then(|image| match model {
+        let read = source.read_pages(
+            |image| match model {
                 Some(m) => engine.recognize_dynamic_with_figures_model(m, image),
                 None => engine.recognize_dynamic_with_figures(image),
-            });
-            match page {
-                Ok((doc, figs)) => out.push((item.source_page, doc, figs)),
-                Err(
-                    e @ (FocrError::ModelNotFound(_)
-                    | FocrError::Cancelled
-                    | FocrError::FormatMismatch(_)),
-                ) => return Err(e),
-                Err(e) => {
-                    report_skipped_page(run, &bar, noun, item.source_page, &e);
-                    first_error.get_or_insert(e);
-                }
-            }
-            bar.complete_item();
-        }
+            },
+            &mut page_progress(run, &bar, noun, page_count),
+        )?;
         bar.finish();
-        if out.is_empty() {
-            return Err(first_error.unwrap_or_else(|| {
-                FocrError::InputDecode(format!(
-                    "{} produced no decodable pages",
-                    request.image.display()
-                ))
-            }));
-        }
-        Ok(out)
+        Ok(read)
     })?;
 
     // Write pass — runs ONCE: write each page's figures and rewrite its markdown,
@@ -2806,22 +3196,27 @@ fn recognize_document_pages_with_figures(
     // blank-line join).
     let mut writer = plan.writer();
     let mut document = String::new();
+    let mut raws: Vec<String> = Vec::new();
     let mut page_layouts: Vec<DocumentPageLayout> = Vec::new();
-    for (i, (page_no, doc, figs)) in ok_pages.into_iter().enumerate() {
-        let md = writer.process_page(page_no, None, &doc.markdown, figs)?;
+    for (i, page) in read.pages.into_iter().enumerate() {
+        let (doc, figs) = page.value;
+        let md = writer.process_page(page.source_page, None, &doc.markdown, figs)?;
         if i > 0 {
             document.push_str("\n\n");
         }
         document.push_str(md.trim_end());
+        raws.push(doc.raw.clone());
         page_layouts.push(DocumentPageLayout {
-            page: page_no,
+            page: page.source_page,
             half: None,
+            raw: doc.raw,
             layout: doc.layout,
         });
     }
     Ok((
         DocumentRecognition {
             markdown: document,
+            raw: raws.join("\n\n"),
             pages: DocumentPageList::Layouts(page_layouts),
         },
         writer.into_written(),
@@ -2830,29 +3225,43 @@ fn recognize_document_pages_with_figures(
 
 /// Emit ONE batch image's outcome in the shared `ocr-batch` shape — a JSON object
 /// pushed to `results` (with `--json`) or the `[focr] … =====` markdown block on
-/// stdout/stderr. Factored so the sequential and spine drivers render byte-for-byte
-/// identically; only the source of `outcome` differs between them.
+/// stdout/stderr, or under `--output-dir` the line naming its `saved` file.
+/// Factored so the sequential and spine drivers render byte-for-byte
+/// identically; only the source of `outcome` differs between them. Returns the
+/// image's failure, once reported.
 fn emit_batch_result(
     json: bool,
     image: &std::path::Path,
     secs: f64,
     outcome: FocrResult<String>,
+    saved: Option<&Path>,
     results: &mut Vec<serde_json::Value>,
-) {
+) -> Option<FocrError> {
     match outcome {
         Ok(markdown) => {
             if json {
-                results.push(serde_json::json!({
+                let mut result = serde_json::json!({
                     "image": image.display().to_string(),
                     "ok": true,
                     "seconds": secs,
                     "markdown": markdown,
-                }));
+                });
+                if let Some(saved) = saved {
+                    result["output"] = saved.display().to_string().into();
+                }
+                results.push(result);
+            } else if let Some(saved) = saved {
+                eprintln!(
+                    "[focr] {} ({secs:.2}s) -> {}",
+                    image.display(),
+                    saved.display()
+                );
             } else {
                 eprintln!("[focr] {} ({secs:.2}s)", image.display());
                 println!("===== {} =====", image.display());
                 println!("{markdown}");
             }
+            None
         }
         Err(err) => {
             if json {
@@ -2865,8 +3274,81 @@ fn emit_batch_result(
             } else {
                 eprintln!("[focr] {} FAILED ({secs:.2}s): {err}", image.display());
             }
+            Some(err)
         }
     }
+}
+
+/// The batch's inputs: every image named, then each line of `--inputs-from`.
+fn batch_inputs(args: &OcrBatchArgs) -> FocrResult<Vec<PathBuf>> {
+    let mut images = args.images.clone();
+    if let Some(list) = &args.inputs_from {
+        let text = if list == Path::new("-") {
+            std::io::read_to_string(std::io::stdin())
+        } else {
+            std::fs::read_to_string(list)
+        }
+        .map_err(|e| FocrError::Usage(format!("--inputs-from {}: {e}", list.display())))?;
+        images.extend(parse_input_list(&text));
+    }
+    if images.is_empty() {
+        return Err(FocrError::Usage(
+            "ocr-batch has no images to read: --inputs-from listed none".into(),
+        ));
+    }
+    Ok(images)
+}
+
+/// An `--inputs-from` list's paths: each line as written (a leading UTF-8 BOM
+/// is ignored), blank lines skipped.
+fn parse_input_list(text: &str) -> impl Iterator<Item = PathBuf> + '_ {
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Each image's `--output-dir` file, `DIR/<stem>.md`. Two images that would
+/// write one file are refused, ignoring case: macOS and Windows disks do.
+fn batch_output_paths(dir: &Path, images: &[PathBuf]) -> FocrResult<Vec<PathBuf>> {
+    let mut seen: std::collections::HashMap<String, &Path> = std::collections::HashMap::new();
+    images
+        .iter()
+        .map(|image| {
+            let Some(stem) = image.file_stem() else {
+                return Err(FocrError::Usage(format!(
+                    "--output-dir names each file after its input, and {} has no file name",
+                    image.display()
+                )));
+            };
+            if let Some(first) = seen.insert(stem.to_string_lossy().to_lowercase(), image) {
+                return Err(FocrError::Usage(format!(
+                    "--output-dir would write {} and {} to one file: rename one, or run them \
+                     separately",
+                    first.display(),
+                    image.display()
+                )));
+            }
+            let mut name = stem.to_os_string();
+            name.push(".md");
+            Ok(dir.join(name))
+        })
+        .collect()
+}
+
+/// Save `markdown` where `--output-dir` puts this image, before the image is
+/// reported as done.
+fn save_batch_markdown(saved: Option<&Path>, markdown: &str) -> FocrResult<()> {
+    let Some(path) = saved else {
+        return Ok(());
+    };
+    std::fs::write(path, markdown).map_err(|e| {
+        FocrError::Other(anyhow::anyhow!(
+            "writing OCR output to {}: {e}",
+            path.display()
+        ))
+    })
 }
 
 /// Load-once batch OCR: reuse one model across every image in the process. The
@@ -2879,6 +3361,54 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     if let Some(err) = forced_test_error()? {
         return Err(err);
     }
+    apply_tuning(args.threads, args.timing)?;
+    let images = batch_inputs(&args)?;
+    let spine = !args.multi_page && native_engine::batch_scheduler::spine_enabled();
+    if args.multi_page && (args.output_dir.is_some() || args.fail_fast) {
+        return Err(FocrError::Usage(
+            "--output-dir and --fail-fast work image by image, and --multi-page reads one \
+             document: use -o on `focr ocr`, or drop --multi-page"
+                .into(),
+        ));
+    }
+    if spine && (args.progress_events.is_some() || args.fail_fast) {
+        return Err(FocrError::Usage(
+            "--progress-events and --fail-fast act as each image ends, and FOCR_BATCH_SPINE \
+             decodes them together: unset it for this run"
+                .into(),
+        ));
+    }
+    let saved = match &args.output_dir {
+        Some(dir) => {
+            let paths = batch_output_paths(dir, &images)?;
+            std::fs::create_dir_all(dir)
+                .map_err(|e| FocrError::Usage(format!("--output-dir {}: {e}", dir.display())))?;
+            paths.into_iter().map(Some).collect()
+        }
+        None => vec![None; images.len()],
+    };
+    let events = args
+        .progress_events
+        .as_deref()
+        .map(BatchEvents::open)
+        .transpose()?;
+    let outcome = run_batch_images(&args, &images, &saved, spine, events.as_ref());
+    if let Some(events) = &events {
+        events.end(&outcome);
+    }
+    outcome
+}
+
+/// [`run_ocr_batch`]'s run over `images`, each `saved` to its `--output-dir`
+/// file, reporting to `events`. An image that fails does not fail the batch
+/// unless none was read (as a document's, D24) or `--fail-fast` is set.
+fn run_batch_images(
+    args: &OcrBatchArgs,
+    images: &[PathBuf],
+    saved: &[Option<PathBuf>],
+    spine: bool,
+    events: Option<&BatchEvents>,
+) -> FocrResult<()> {
     if args.experimental_full_int8 {
         native_engine::force_int8_decode(true)?;
     }
@@ -2915,7 +3445,7 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     if let Some(hint) = &pull_hint {
         print_run_warning(hint);
     }
-    let count = args.images.len();
+    let count = images.len();
     let total = std::time::Instant::now();
     let mut results: Vec<serde_json::Value> = Vec::with_capacity(count);
     // A model with a lever policy is admitted once here, so its refusal is
@@ -2923,6 +3453,22 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
     let _policed = native_engine::load_if_policed(
         &model.clone().unwrap_or_else(crate::OcrEngine::model_path),
     )?;
+    if let Some(events) = events {
+        let model_path = model.clone().unwrap_or_else(OcrEngine::model_path);
+        events.start(&BatchRun {
+            mode: if args.multi_page {
+                BatchMode::Document
+            } else {
+                BatchMode::Images
+            },
+            total: count,
+            threads: crate::thread_budget(),
+            model_path: &model_path,
+            model_id: native_engine::model_id_at(&model_path),
+            backend: simd::effective_dense_route().tag(),
+            decode_mode,
+        });
+    }
 
     if args.multi_page {
         // A cross-page document parse (bd-1gv.25): page N attends to the
@@ -2933,17 +3479,20 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         let model_path = model.clone().unwrap_or_else(OcrEngine::model_path);
         let document = engine.recognize_document(
             &model_path,
-            PageSource::images(args.images.clone())?,
+            PageSource::images(images.to_vec())?,
             &native_engine::DocumentOptions::default(),
-            Box::new(|_: &PageItem| {}),
-            None,
+            events.map_or_else(
+                || Box::new(|_: &PageItem| {}) as Box<dyn FnMut(&PageItem) + Send>,
+                |events| events.page_read_sink(images.to_vec()),
+            ),
+            events.map(|events| events.document_sink(images.to_vec())),
         )?;
         let markdown = document.markdown;
         let skipped: Vec<serde_json::Value> = document
             .skipped
             .iter()
             .map(|skip| {
-                let image = args.images[skip.page - 1].display().to_string();
+                let image = images[skip.page - 1].display().to_string();
                 eprintln!(
                     "[focr] image {} ({image}) skipped: {}",
                     skip.page, skip.reason
@@ -3007,55 +3556,94 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
         return partial.map_or(Ok(()), Err);
     }
 
-    if native_engine::batch_scheduler::spine_enabled() {
+    let mut stopped = None;
+    let mut failed = 0;
+    let mut first_failure = None;
+    if spine {
         // Continuous-batch decode spine (FOCR_BATCH_SPINE=1): prefill + decode
         // every page TOGETHER. The per-page markdown is byte-identical to the
         // sequential loop below (bd-1azu.13), only throughput differs. A
         // batch-level failure (ModelNotFound / timeout) propagates as the run's
         // exit code rather than being folded into per-image results.
-        let image_refs: Vec<&std::path::Path> = args
-            .images
-            .iter()
-            .map(std::path::PathBuf::as_path)
-            .collect();
+        let image_refs: Vec<&std::path::Path> =
+            images.iter().map(std::path::PathBuf::as_path).collect();
         let batch = match model.as_deref() {
             Some(m) => engine.recognize_batch_with_model(m, &image_refs),
             None => engine.recognize_batch(&image_refs),
         }?;
         let per_image = total.elapsed().as_secs_f64() / (count.max(1) as f64);
-        for (image, outcome) in args.images.iter().zip(batch) {
-            emit_batch_result(args.json, image, per_image, outcome, &mut results);
+        for ((image, outcome), saved) in images.iter().zip(batch).zip(saved) {
+            let saved = saved.as_deref();
+            let outcome = outcome.and_then(|markdown| {
+                save_batch_markdown(saved, &markdown)?;
+                Ok(markdown)
+            });
+            if let Some(err) =
+                emit_batch_result(args.json, image, per_image, outcome, saved, &mut results)
+            {
+                failed += 1;
+                first_failure.get_or_insert(err);
+            }
         }
     } else {
         // Sequential per-image loop — the proven oracle path (FOCR_BATCH_SPINE=0),
         // byte-for-byte what it has always been. The progress bar (GH #2) is
         // stderr-only, disabled under `--json`, and self-disabled off-TTY; it
         // is suspended around each result block so the bar never fuses to the
-        // per-image markdown/summary output.
+        // per-image markdown/summary output. A Ctrl+C ends the run at the
+        // image it interrupted: the images before it are still reported.
         let bar = progress::Progress::new("batch", count, !args.json);
-        for (i, image) in args.images.iter().enumerate() {
+        for (i, (image, saved)) in images.iter().zip(saved).enumerate() {
+            let saved = saved.as_deref();
             let name = image.file_name().map_or_else(
                 || image.display().to_string(),
                 |n| n.to_string_lossy().into_owned(),
             );
             bar.start_item(format!("image {}/{count}: {name}", i + 1));
             let started = std::time::Instant::now();
-            let outcome = match model.as_deref() {
-                Some(m) => engine.recognize_with_model(m, image),
-                None => engine.recognize(image),
+            let outcome = match (forced_image_error(i + 1), model.as_deref()) {
+                (Some(err), _) => Err(err),
+                (None, Some(m)) => engine.recognize_with_model(m, image),
+                (None, None) => engine.recognize(image),
             };
+            let outcome = outcome.and_then(|markdown| {
+                save_batch_markdown(saved, &markdown)?;
+                Ok(markdown)
+            });
             let secs = started.elapsed().as_secs_f64();
             bar.complete_item();
             bar.suspend();
-            emit_batch_result(args.json, image, secs, outcome, &mut results);
+            if let Some(events) = events {
+                events.image_ended(i + 1, image, &outcome);
+            }
+            if matches!(outcome, Err(FocrError::Cancelled)) {
+                stopped = Some("cancelled");
+                first_failure = Some(FocrError::Cancelled);
+                break;
+            }
+            if let Some(err) =
+                emit_batch_result(args.json, image, secs, outcome, saved, &mut results)
+            {
+                failed += 1;
+                first_failure.get_or_insert(err);
+                if args.fail_fast {
+                    stopped = Some("image_failed");
+                    break;
+                }
+            }
         }
         bar.finish();
     }
 
     let elapsed = total.elapsed().as_secs_f64();
-    let per_image = elapsed / (count.max(1) as f64);
+    let ended = if stopped.is_some() {
+        results.len()
+    } else {
+        count
+    };
+    let per_image = elapsed / (ended.max(1) as f64);
     if args.json {
-        emit(&serde_json::json!({
+        let mut value = serde_json::json!({
             "schema_version": robot::ROBOT_SCHEMA_VERSION,
             "command": "ocr-batch",
             "count": count,
@@ -3064,14 +3652,23 @@ fn run_ocr_batch(args: OcrBatchArgs) -> FocrResult<()> {
             "seconds_total": elapsed,
             "seconds_per_image": per_image,
             "results": results,
-        }));
+        });
+        if let Some(stopped) = stopped {
+            value["stopped"] = stopped.into();
+        }
+        emit(&value);
+    } else if stopped.is_some() {
+        eprintln!("[focr] batch stopped after {elapsed:.2}s");
     } else {
         eprintln!(
             "[focr] batch complete: {count} images in {elapsed:.2}s \
              ({per_image:.2}s/image, decode_mode={decode_mode})"
         );
     }
-    Ok(())
+    match first_failure {
+        Some(err) if stopped.is_some() || failed == count => Err(err),
+        _ => Ok(()),
+    }
 }
 
 /// Offline weight transform: raw bf16 safetensors → a self-contained `.focrq`
@@ -3765,25 +4362,52 @@ fn forced_test_error() -> FocrResult<Option<FocrError>> {
             return Ok(None);
         }
         let value = raw.to_string_lossy();
-        let err = match value.as_ref() {
-            "input_decode" => {
-                FocrError::InputDecode(format!("forced by {FORCE_TEST_ERROR_ENV}=input_decode"))
-            }
-            "timeout" => FocrError::Timeout(format!("forced by {FORCE_TEST_ERROR_ENV}=timeout")),
-            "cancelled" => FocrError::Cancelled,
-            other => {
-                return Err(FocrError::Usage(format!(
-                    "invalid {FORCE_TEST_ERROR_ENV}={other:?}; expected input_decode, timeout, \
-                     or cancelled"
-                )));
-            }
-        };
-        Ok(Some(err))
+        if value.contains('@') {
+            return Ok(None);
+        }
+        forced_error_of_kind(&value).map(Some)
     }
 
     #[cfg(not(debug_assertions))]
     {
         Ok(None)
+    }
+}
+
+#[cfg(debug_assertions)]
+fn forced_error_of_kind(kind: &str) -> FocrResult<FocrError> {
+    match kind {
+        "input_decode" => Ok(FocrError::InputDecode(format!(
+            "forced by {FORCE_TEST_ERROR_ENV}=input_decode"
+        ))),
+        "timeout" => Ok(FocrError::Timeout(format!(
+            "forced by {FORCE_TEST_ERROR_ENV}=timeout"
+        ))),
+        "cancelled" => Ok(FocrError::Cancelled),
+        other => Err(FocrError::Usage(format!(
+            "invalid {FORCE_TEST_ERROR_ENV}={other:?}; expected input_decode, timeout, or \
+             cancelled"
+        ))),
+    }
+}
+
+/// `FOCR_TEST_FORCE_ERROR=<kind>@<ordinal>`: batch image `ordinal` ends with
+/// that error instead of being read, in debug builds only.
+fn forced_image_error(ordinal: usize) -> Option<FocrError> {
+    #[cfg(debug_assertions)]
+    {
+        let value = std::env::var(FORCE_TEST_ERROR_ENV).ok()?;
+        let (kind, at) = value.split_once('@')?;
+        at.parse::<usize>()
+            .is_ok_and(|at| at == ordinal)
+            .then(|| forced_error_of_kind(kind).ok())
+            .flatten()
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = ordinal;
+        None
     }
 }
 
@@ -4358,6 +4982,41 @@ mod tests {
     }
 
     #[test]
+    fn page_window_flag_takes_pages_auto_or_off_up_to_the_page_limit() {
+        use native_engine::{PageWindow, UOCR2_UNWINDOWED_PAGE_LIMIT};
+        let parse = |value: &str| {
+            Cli::try_parse_from([
+                "focr",
+                "ocr",
+                "b.pdf",
+                "--multi-page",
+                "--page-window",
+                value,
+            ])
+            .map(|cli| match cli.command {
+                Command::Ocr(args) => args.request.page_window,
+                _ => panic!("not ocr"),
+            })
+            .map_err(|error| (error.kind(), error.to_string()))
+        };
+        assert_eq!(parse("7"), Ok(Some(PageWindow::Pages(7))));
+        assert_eq!(parse("auto"), Ok(Some(PageWindow::Auto)));
+        assert_eq!(parse("off"), Ok(Some(PageWindow::Off)));
+        let limit = UOCR2_UNWINDOWED_PAGE_LIMIT;
+        assert_eq!(
+            parse(&limit.to_string()),
+            Ok(Some(PageWindow::Pages(limit)))
+        );
+
+        let (kind, message) = parse(&(limit + 1).to_string()).expect_err("above the limit");
+        assert_eq!(kind, clap::error::ErrorKind::ValueValidation);
+        assert!(message.contains("at most 102 pages"), "{message}");
+        for bad in ["0", "many", "-3", "1.5", ""] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
     fn resume_flags_parse_and_a_stopped_document_names_its_checkpoint() {
         let resume = |flags: &[&str]| {
             let mut argv = vec!["focr", "ocr", "book.pdf", "--multi-page"];
@@ -4468,9 +5127,12 @@ mod tests {
                     pages: None,
                     split_spreads: false,
                     multi_page: false,
+                    page_window: None,
                     resume: None,
                     keep_checkpoint: false,
                     no_resident: false,
+                    threads: None,
+                    timing: false,
                     fail_on_low_yield: false,
                 },
                 json: false,
@@ -4478,6 +5140,8 @@ mod tests {
                 extract_figures: false,
                 figures_dir: None,
                 robot: true,
+                check: false,
+                raw: false,
             }),
         };
         assert_eq!(ErrorMode::from_cli(&cli), ErrorMode::Robot);
@@ -4505,9 +5169,12 @@ mod tests {
                         pages: None,
                         split_spreads: false,
                         multi_page: false,
+                        page_window: None,
                         resume: None,
                         keep_checkpoint: false,
                         no_resident: false,
+                        threads: None,
+                        timing: false,
                         fail_on_low_yield: false,
                     },
                 })),
@@ -4536,9 +5203,12 @@ mod tests {
                 pages: None,
                 split_spreads: false,
                 multi_page: false,
+                page_window: None,
                 resume: None,
                 keep_checkpoint: false,
                 no_resident: false,
+                threads: None,
+                timing: false,
                 fail_on_low_yield: false,
             },
             json: false,
@@ -4546,6 +5216,8 @@ mod tests {
             extract_figures: false,
             figures_dir: None,
             robot: false,
+            check: false,
+            raw: false,
         };
         let err = args.to_request().expect_err("negative base-size is usage");
         assert!(matches!(err, FocrError::Usage(_)), "got {err:?}");
@@ -4907,20 +5579,23 @@ mod tests {
     fn single_image_json_carries_markdown_and_bounding_boxes() {
         let rec = Recognition::Single(native_engine::RecognizedDocument {
             markdown: "# Title\n\nbody".to_string(),
+            raw: "<|ref|>title<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\n# Title\n\nbody".to_string(),
             layout: vec![
                 native_engine::LayoutSpan {
                     label: "title".to_string(),
                     boxes: vec![[10, 20, 110, 60]],
                     level: None,
+                    text: Some("# Title".to_string()),
                 },
                 native_engine::LayoutSpan {
                     label: "title".to_string(),
                     boxes: vec![[10, 70, 110, 90]],
                     level: Some(2),
+                    text: None,
                 },
             ],
         });
-        let json = rec.to_json(&[]);
+        let json = rec.to_json(&[], false);
         assert_eq!(json["schema_version"], robot::ROBOT_SCHEMA_VERSION);
         assert_eq!(json["markdown"], "# Title\n\nbody");
         assert_eq!(json["layout"][0]["label"], "title");
@@ -4931,18 +5606,49 @@ mod tests {
         // `level` only on a leveled v2 title (U2-E3b): v1 entries keep their shape.
         assert!(json["layout"][0].get("level").is_none());
         assert_eq!(json["layout"][1]["level"], 2);
+        // `text` only on a span with text, and the raw decode only when asked.
+        assert_eq!(json["layout"][0]["text"], "# Title");
+        assert!(json["layout"][1].get("text").is_none());
+        assert!(json.get("raw").is_none());
+        assert_eq!(rec.to_json(&[], true)["raw"], rec.raw());
         // A single image has no per-page `pages` array.
         assert!(json.get("pages").is_none());
     }
 
-    /// U2-E3b: the resident daemon's wire carries a span whole, `level` included.
+    /// `--raw` swaps a text output and adds to a JSON one; the markdown stays.
+    #[test]
+    fn raw_replaces_text_and_joins_json() {
+        let rec = Recognition::Document(DocumentRecognition {
+            markdown: "md".to_string(),
+            raw: "whole".to_string(),
+            pages: DocumentPageList::Layouts(vec![DocumentPageLayout {
+                page: 1,
+                half: None,
+                raw: "page one".to_string(),
+                layout: vec![],
+            }]),
+        });
+        assert_eq!(rec.text(false), "md");
+        assert_eq!(rec.text(true), "whole");
+        let plain = rec.to_json(&[], false);
+        assert!(plain.get("raw").is_none());
+        assert!(plain["pages"][0].get("raw").is_none());
+        let json = rec.to_json(&[], true);
+        assert_eq!(json["markdown"], "md");
+        assert_eq!(json["raw"], "whole");
+        assert_eq!(json["pages"][0]["raw"], "page one");
+    }
+
+    /// U2-E3b: the resident daemon's wire carries a span whole, `level` and
+    /// `text` included.
     #[test]
     fn a_layout_span_round_trips_its_json() {
-        for level in [None, Some(1)] {
+        for (level, text) in [(None, None), (Some(1), Some("body".to_string()))] {
             let span = native_engine::LayoutSpan {
                 label: "title".to_string(),
                 boxes: vec![[1, 2, 3, 4], [5, 6, 7, 8]],
                 level,
+                text,
             };
             let back = native_engine::LayoutSpan::from_json(&span.to_json());
             assert_eq!(back, Some(span));
@@ -4987,7 +5693,7 @@ mod tests {
     #[test]
     fn page_spec_parses_and_rejects() {
         // The `--pages` grammar the CLI hands its page source.
-        let parse = pdf::select_pages;
+        let parse = crate::page_source::select_pages;
         // None => every page.
         assert_eq!(parse(None, 3).unwrap(), vec![0, 1, 2]);
         assert_eq!(parse(Some("3"), 218).unwrap(), vec![2]);
@@ -5029,7 +5735,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("focr_cli_doc_figs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
-        let synth = crate::pdf::tests::synth_page;
+        let synth = crate::page_source::tests::synth_page;
         synth(200, 300, &[(40, 160)])
             .save(dir.join("1.png"))
             .expect("write page 1");
@@ -5068,7 +5774,9 @@ mod tests {
                     source_page: item.source_page,
                     half: item.half,
                     window: None,
+                    size: (640, 480),
                     text: format!("before\n{token}"),
+                    raw: String::new(),
                     layout: Vec::new(),
                     figures,
                     tokens: Some(1),
@@ -5170,24 +5878,28 @@ mod tests {
     fn pdf_json_carries_per_page_layout_with_one_based_page_numbers() {
         let rec = Recognition::Document(DocumentRecognition {
             markdown: "p1\n\np2".to_string(),
+            raw: "p1\n\np2".to_string(),
             pages: DocumentPageList::Layouts(vec![
                 DocumentPageLayout {
                     page: 1,
                     half: None,
+                    raw: "p1".to_string(),
                     layout: vec![native_engine::LayoutSpan {
                         label: "text".to_string(),
                         boxes: vec![[0, 0, 5, 5]],
                         level: None,
+                        text: None,
                     }],
                 },
                 DocumentPageLayout {
                     page: 2,
                     half: None,
+                    raw: "p2".to_string(),
                     layout: vec![],
                 },
             ]),
         });
-        let json = rec.to_json(&[]);
+        let json = rec.to_json(&[], false);
         assert_eq!(json["markdown"], "p1\n\np2");
         assert_eq!(json["pages"][0]["page"], 1);
         assert_eq!(
@@ -5218,13 +5930,16 @@ mod tests {
             label: "title".to_string(),
             boxes: vec![[1, 2, 3, 4]],
             level: Some(1),
+            text: None,
         };
         let page = |run_index, source_page, half, finish| native_engine::PageResult {
             run_index,
             source_page,
             half,
             window: None,
+            size: (640, 480),
             text: format!("page {source_page}"),
+            raw: format!("raw {run_index}"),
             layout: vec![span.clone()],
             figures: Vec::new(),
             tokens: Some(7),
@@ -5234,6 +5949,7 @@ mod tests {
         };
         let rec = Recognition::Document(DocumentRecognition {
             markdown: "<PAGE>\npage 1\n<PAGE>\npage 3\n<PAGE>\npage 3".to_string(),
+            raw: "<PAGE>\nraw 1\n<PAGE>\nraw 2\n<PAGE>\nraw 3".to_string(),
             pages: DocumentPageList::Read(vec![
                 page(1, 1, None, Some(native_engine::PageFinish::Marker)),
                 page(
@@ -5250,15 +5966,17 @@ mod tests {
                 ),
             ]),
         });
-        let json = rec.to_json(&[]);
+        let json = rec.to_json(&[], false);
         assert_eq!(
             json["pages"][0],
             serde_json::json!({
-                "page": 1, "run_index": 1, "text": "page 1", "tokens": 7, "finish": "marker",
+                "page": 1, "run_index": 1, "width": 640, "height": 480, "text": "page 1",
+                "tokens": 7, "finish": "marker",
                 "layout": [{"label": "title", "boxes": [[1, 2, 3, 4]], "level": 1}],
             }),
             "no half, no window, and elapsed_ms only on the robot event"
         );
+        assert_eq!(rec.to_json(&[], true)["pages"][1]["raw"], "raw 2");
         let sides: Vec<_> = json["pages"]
             .as_array()
             .expect("pages")
@@ -5276,9 +5994,10 @@ mod tests {
         // v1 without one body per page: `pages: []`, type-stable.
         let merged = Recognition::Document(DocumentRecognition {
             markdown: "<PAGE>\nall".to_string(),
+            raw: "<PAGE>\nall".to_string(),
             pages: DocumentPageList::Read(Vec::new()),
         });
-        assert_eq!(merged.to_json(&[])["pages"], serde_json::json!([]));
+        assert_eq!(merged.to_json(&[], false)["pages"], serde_json::json!([]));
     }
 
     #[test]
@@ -5287,17 +6006,34 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let rec = Recognition::Single(native_engine::RecognizedDocument {
             markdown: "hello world".to_string(),
+            raw: "<|ref|>text<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\nhello world".to_string(),
             layout: vec![native_engine::LayoutSpan {
                 label: "text".to_string(),
                 boxes: vec![[1, 2, 3, 4]],
                 level: None,
+                text: Some("hello world".to_string()),
             }],
         });
 
         // Markdown form: source lacks a trailing newline, so one is appended.
         let md_path = dir.join("out.md");
-        write_ocr_output(&md_path, &rec, false, &[], None, &[], None).expect("write md");
+        let text = OutputShape {
+            json: false,
+            raw: false,
+        };
+        write_ocr_output(&md_path, &rec, text, &[], None, &[], None).expect("write md");
         assert_eq!(std::fs::read_to_string(&md_path).unwrap(), "hello world\n");
+
+        // `--raw`: the same file holds the decode, markers and all.
+        let raw_shape = OutputShape {
+            json: false,
+            raw: true,
+        };
+        write_ocr_output(&md_path, &rec, raw_shape, &[], None, &[], None).expect("write raw");
+        assert_eq!(
+            std::fs::read_to_string(&md_path).unwrap(),
+            "<|ref|>text<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\nhello world\n"
+        );
 
         // JSON form: valid JSON, newline-terminated, carrying the bounding boxes.
         let json_path = dir.join("out.json");
@@ -5305,7 +6041,11 @@ mod tests {
             model_id: "unlimited-ocr",
             source_sha256: Some("cd".repeat(32)),
         };
-        write_ocr_output(&json_path, &rec, true, &[], None, &[], Some(&model)).expect("write json");
+        let json = OutputShape {
+            json: true,
+            raw: false,
+        };
+        write_ocr_output(&json_path, &rec, json, &[], None, &[], Some(&model)).expect("write json");
         let raw = std::fs::read_to_string(&json_path).unwrap();
         assert!(raw.ends_with('\n'), "json file should end with a newline");
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
@@ -5341,9 +6081,12 @@ mod tests {
                 pages: None,
                 split_spreads: false,
                 multi_page: false,
+                page_window: None,
                 resume: None,
                 keep_checkpoint: false,
                 no_resident: false,
+                threads: None,
+                timing: false,
                 fail_on_low_yield: false,
             },
             json: false,
@@ -5351,6 +6094,8 @@ mod tests {
             extract_figures: false,
             figures_dir: None,
             robot: false,
+            check: false,
+            raw: false,
         };
         f(&mut args);
         args
@@ -5520,6 +6265,7 @@ mod tests {
     fn json_appends_figures_array_only_when_present() {
         let rec = Recognition::Single(native_engine::RecognizedDocument {
             markdown: "see ![figure 1](figs/page1_figure_1.png)".to_string(),
+            raw: String::new(),
             layout: vec![],
         });
         let figures = vec![
@@ -5538,14 +6284,14 @@ mod tests {
                 path: "figs/page2r_figure_1.png".to_string(),
             },
         ];
-        let json = rec.to_json(&figures);
+        let json = rec.to_json(&figures, false);
         assert_eq!(json["figures"][0]["path"], "figs/page1_figure_1.png");
         assert_eq!(json["figures"][0]["page"], 1);
         assert_eq!(json["figures"][0]["bbox"], serde_json::json!([1, 2, 3, 4]));
         assert!(json["figures"][0].get("half").is_none(), "absent unsplit");
         assert_eq!(json["figures"][1]["half"], "right");
         // No figures ⇒ no `figures` key.
-        assert!(rec.to_json(&[]).get("figures").is_none());
+        assert!(rec.to_json(&[], false).get("figures").is_none());
     }
 
     #[test]

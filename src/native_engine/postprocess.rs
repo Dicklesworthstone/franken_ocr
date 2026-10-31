@@ -59,6 +59,8 @@ pub const PAGE_MARKER: &str = "<PAGE>";
 pub struct RefMatch {
     /// The exact matched substring, byte-for-byte (the `str.replace` key).
     pub full: String,
+    /// Where [`Self::full`] starts in the scanned text, in bytes.
+    pub offset: usize,
     /// The label between the ref (or det) tags, trimmed of surrounding
     /// whitespace for classification but stored as the captured group.
     pub label: String,
@@ -182,6 +184,7 @@ fn scan_ref_spans(text: &str) -> Vec<RefMatch> {
         let full = &text[rel..span_end];
         out.push(RefMatch {
             full: full.to_string(),
+            offset: rel,
             label: label.to_string(),
             boxes: parse_boxes(box_text),
             level: None,
@@ -256,6 +259,7 @@ fn scan_det_spans(text: &str) -> Vec<RefMatch> {
         let box_text = &text[box_start..box_end];
         out.push(RefMatch {
             full: full.to_string(),
+            offset: open,
             label: label.to_string(),
             boxes: parse_boxes(box_text),
             level: None,
@@ -272,13 +276,13 @@ const BLOCK_FORK: &str = "<FORK>";
 /// Opens a block's level, `<LEVEL1>`, `<LEVEL2>`, …: plain BPE text.
 const BLOCK_LEVEL: &str = "<LEVEL";
 
-/// Unlimited-OCR-2's block prefixes, left to right, each with its byte offset:
+/// Unlimited-OCR-2's block prefixes, left to right:
 /// `<BLOCK>{label}[<LEVELn>][x1, y1, x2, y2]<FORK>` with nothing between the
 /// parts, the label an identifier as in [`scan_det_spans`], and exactly four
 /// non-negative integers in the box. Every one of the nine oracle outputs
 /// (U2-A6) is in this form. A `<BLOCK>` not in it, such as one cut off by a
 /// page's token cap, is not a span and stays in the text as it was emitted.
-fn scan_block_spans(text: &str) -> Vec<(usize, RefMatch)> {
+fn scan_block_spans(text: &str) -> Vec<RefMatch> {
     let mut out = Vec::new();
     let bytes = text.as_bytes();
     let mut i = 0usize;
@@ -287,13 +291,13 @@ fn scan_block_spans(text: &str) -> Vec<(usize, RefMatch)> {
         let Some((label, level, quad, end)) = block_prefix(text, i) else {
             continue;
         };
-        let span = RefMatch {
+        out.push(RefMatch {
             full: text[open..end].to_string(),
+            offset: open,
             label: label.to_string(),
             boxes: vec![quad],
             level,
-        };
-        out.push((open, span));
+        });
         i = end;
     }
     out
@@ -496,14 +500,14 @@ fn assemble_page(text: &str, img_base: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut idx = images.len();
-    for (open, m) in scan_block_spans(text) {
-        out.push_str(&text[copied..open]);
+    for m in scan_block_spans(text) {
+        out.push_str(&text[copied..m.offset]);
         if m.is_image() {
             out.push_str(&image_md_token(img_base, idx));
             out.push('\n');
             idx += 1;
         }
-        copied = open + m.full.len();
+        copied = m.offset + m.full.len();
     }
     out.push_str(&text[copied..]);
 
@@ -523,8 +527,25 @@ fn assemble_page(text: &str, img_base: &str) -> String {
 /// emits no ref/det spans.
 fn grounding_spans(text: &str) -> Vec<RefMatch> {
     let mut spans = re_match(text);
-    spans.extend(scan_block_spans(text).into_iter().map(|(_, m)| m));
+    spans.extend(scan_block_spans(text));
     spans
+}
+
+/// The text the model wrote for `span`: from the end of its marker to the
+/// next span's start (`starts`, sorted) or the end of `text`, trimmed and
+/// normalized as the markdown is. Both grammars write a region's marker and
+/// then its text, so this is that region's own output. `None` for an image
+/// span, which the markdown renders as a reference, and for a marker with no
+/// text after it. Text before a page's first span belongs to no span.
+fn span_text(text: &str, span: &RefMatch, starts: &[usize]) -> Option<String> {
+    if span.is_image() {
+        return None;
+    }
+    let from = span.offset + span.full.len();
+    let next = starts.partition_point(|&start| start < from);
+    let to = starts.get(next).copied().unwrap_or(text.len());
+    let body = normalize_colon_equals(text[from..to].trim());
+    (!body.is_empty()).then_some(body)
 }
 
 /// The exact markdown image token `assemble_page` emits for the `idx`-th image
@@ -1006,11 +1027,15 @@ impl PageStream {
 #[must_use]
 pub fn parse_layout(decoded: &str, image_w: u32, image_h: u32) -> Vec<super::LayoutSpan> {
     let stripped = strip_eos(decoded);
-    grounding_spans(&stripped)
-        .into_iter()
+    let spans = grounding_spans(&stripped);
+    let mut starts: Vec<usize> = spans.iter().map(|m| m.offset).collect();
+    starts.sort_unstable();
+    spans
+        .iter()
         .map(|m| super::LayoutSpan {
             boxes: m.rescaled_boxes(image_w, image_h),
-            label: m.label,
+            text: span_text(&stripped, m, &starts),
+            label: m.label.clone(),
             level: m.level,
         })
         .collect()
@@ -1163,6 +1188,7 @@ mod tests {
     fn is_image_predicate() {
         let m = RefMatch {
             full: "<|ref|>image<|/ref|><|det|>[1,2,3,4]<|/det|>".into(),
+            offset: 0,
             label: "image".into(),
             boxes: vec![[1, 2, 3, 4]],
             level: None,
@@ -1170,6 +1196,7 @@ mod tests {
         assert!(m.is_image());
         let m2 = RefMatch {
             full: "<|ref|>title<|/ref|><|det|>[1,2,3,4]<|/det|>".into(),
+            offset: 0,
             label: "title".into(),
             boxes: vec![[1, 2, 3, 4]],
             level: None,
@@ -1692,7 +1719,10 @@ mod tests {
             boxes(&pages[1]),
             [("image".to_string(), vec![[100, 600, 500, 2997]])]
         );
-        for (page, want) in pages.iter().zip([[200, 200, 1000, 999], [100, 600, 500, 2997]]) {
+        for (page, want) in pages
+            .iter()
+            .zip([[200, 200, 1000, 999], [100, 600, 500, 2997]])
+        {
             let [figure] = page.figures.as_slice() else {
                 panic!("one figure per page: {:?}", page.figures);
             };
@@ -1790,7 +1820,7 @@ mod tests {
             outputs += 1;
             let name = path.display().to_string();
             let raw = std::fs::read_to_string(&path).unwrap();
-            let spans: Vec<_> = scan_block_spans(&raw).into_iter().map(|(_, m)| m).collect();
+            let spans = scan_block_spans(&raw);
             assert_eq!(spans.len(), raw.matches(BLOCK_OPEN).count(), "{name}");
             assert!(re_match(&raw).is_empty(), "{name}");
             for s in &spans {
@@ -1833,5 +1863,103 @@ mod tests {
             ),
             "{md}"
         );
+    }
+
+    fn span_texts_of(decoded: &str) -> Vec<(String, Option<String>)> {
+        parse_layout(decoded, 999, 999)
+            .into_iter()
+            .map(|span| (span.label, span.text))
+            .collect()
+    }
+
+    fn pair(label: &str, text: Option<&str>) -> (String, Option<String>) {
+        (label.to_owned(), text.map(str::to_owned))
+    }
+
+    /// A span's text runs from its marker to the next marker. An image has
+    /// none, nor does a marker with nothing after it, and the text before the
+    /// first span belongs to no span.
+    #[test]
+    fn a_span_holds_what_the_model_wrote_after_its_marker() {
+        let v2 = "lead\n<BLOCK>title<LEVEL1>[1, 2, 3, 4]<FORK># Head\n\
+                  <BLOCK>image[5, 6, 7, 8]<FORK>\
+                  <BLOCK>text[1, 1, 2, 2]<FORK>a \\coloneqq b\n\
+                  <BLOCK>text[1, 1, 2, 2]<FORK>second\n\
+                  <BLOCK>footer[3, 3, 4, 4]<FORK>";
+        assert_eq!(
+            span_texts_of(v2),
+            [
+                pair("title", Some("# Head")),
+                pair("image", None),
+                pair("text", Some("a := b")),
+                pair("text", Some("second")),
+                pair("footer", None),
+            ]
+        );
+
+        let v1 = "<|ref|>title<|/ref|><|det|>[[1, 2, 3, 4]]<|/det|>\n# Head\n\n\
+                  <|ref|>image<|/ref|><|det|>[[5, 6, 7, 8]]<|/det|>\n\
+                  <|det|>text [1, 1, 2, 2]<|/det|>\nbare det\n\
+                  <|ref|>text<|/ref|><|det|>[[3, 3, 4, 4]]<|/det|>\nlast";
+        let spans = span_texts_of(v1);
+        assert_eq!(
+            spans,
+            [
+                pair("title", Some("# Head")),
+                pair("image", None),
+                pair("text", Some("last")),
+                pair("text", Some("bare det")),
+            ],
+            "reference order, which puts bare det spans last"
+        );
+
+        // Cut off by a token cap: not a span, and in its neighbour's text as
+        // it is in the markdown.
+        let cut = "<BLOCK>text[1, 2, 3, 4]<FORK>a\n<BLOCK>image[12, 3";
+        assert_eq!(
+            span_texts_of(cut),
+            [pair("text", Some("a\n<BLOCK>image[12, 3"))]
+        );
+    }
+
+    /// bd-json-per-span-text-wbbu's measurement, over every committed U2-A6
+    /// oracle page: the spans partition the page. Their texts, in order, are
+    /// the page's markdown with its image references removed, so no text is
+    /// lost, doubled or moved between regions.
+    #[test]
+    fn oracle_span_texts_partition_each_page() {
+        let words =
+            |text: &str| -> Vec<String> { text.split_whitespace().map(str::to_owned).collect() };
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uocr2_oracle");
+        let mut pages = 0;
+        let mut spans = 0;
+        let mut with_text = 0;
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            let raw = std::fs::read_to_string(&path).unwrap();
+            for (page, body) in raw.split(PAGE_MARKER).skip(1).enumerate() {
+                let name = format!("{} page {page}", path.display());
+                let out = finalize_page(body, page, (999, 999));
+                pages += 1;
+                spans += out.layout.len();
+                let texts: Vec<&str> = out
+                    .layout
+                    .iter()
+                    .filter_map(|span| span.text.as_deref())
+                    .collect();
+                with_text += texts.len();
+                let mut markdown = out.text.clone();
+                for figure in &out.figures {
+                    markdown = markdown.replace(&figure.markdown_ref, "");
+                }
+                assert_eq!(words(&texts.join("\n")), words(&markdown), "{name}");
+            }
+        }
+        // The 11 without text: 5 `image` and 6 `other` regions on S3.
+        assert_eq!((pages, spans, with_text), (40, 431, 420));
     }
 }

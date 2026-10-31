@@ -1121,10 +1121,17 @@ impl Weights {
         })
     }
 
-    /// Test-only probe: did this load take the mmap backing?
-    #[cfg(test)]
+    /// Whether this load took the mmap backing, whose pages the kernel can
+    /// take back.
     pub(super) fn is_mapped(&self) -> bool {
-        matches!(*self.bytes, Backing::Mapped(_))
+        #[cfg(feature = "mmap")]
+        {
+            matches!(*self.bytes, Backing::Mapped(_))
+        }
+        #[cfg(not(feature = "mmap"))]
+        {
+            false
+        }
     }
 
     /// Parse + index a blob in either backing (the shared core of

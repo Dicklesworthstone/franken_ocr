@@ -84,7 +84,7 @@ use Decision::{AllowListed, Ignored, NotApplicable, Refuse, Supported};
 const R_SWA_ONLY: &str = "it reaches only v1's R-SWA attention";
 const INT8_DECODER_ONLY: &str = "it reaches only the all-int8 decoder, which this model refuses";
 const UNDER_SPINE: &str = "it takes effect only under FOCR_BATCH_SPINE, which this model refuses";
-const RESIDENT: &str = "the resident daemon does not serve this model until bd-fuh2";
+const RESIDENT: &str = "the resident daemon does not serve this model";
 
 /// Unlimited-OCR-2's table, sorted by name.
 pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
@@ -161,6 +161,10 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
         lever(
             "FOCR_MAX_NEW_TOKENS",
             Supported("a per-page generated-token cap for this model (U2-B6)"),
+        ),
+        lever(
+            "FOCR_MEMORY_BUDGET",
+            Supported("sizes a memory-sized page window (U2-D3)"),
         ),
         lever(
             "FOCR_MMAP",
@@ -356,8 +360,9 @@ pub(crate) fn policy_for(arch: &dyn ModelArch) -> Option<&'static LeverPolicy> {
     }
 }
 
-/// Whether the resident daemon may serve `arch`. Its protocol carries no
-/// per-model flags yet (bd-fuh2), so a model with a lever table runs inline.
+/// Whether the resident daemon may serve `arch`. Its reply carries no decode
+/// report or lever warnings yet (bd-u77k), so a model with a lever table runs
+/// inline.
 pub(crate) fn resident_daemon_serves(arch: &dyn ModelArch) -> bool {
     policy_for(arch).is_none()
 }
@@ -660,6 +665,7 @@ mod tests {
         ("FOCR_DECODE_F32", "1", Expect::Silent),
         ("FOCR_STAGE_BUDGET_FORWARD_MS", "0", Expect::Silent),
         ("FOCR_UNLIMITED_VISION_CACHE", "0", Expect::Silent),
+        ("FOCR_MEMORY_BUDGET", "12GiB", Expect::Silent),
         ("FOCR_MMAP", "1", Expect::Silent),
         ("FOCR_SRSWA_RETIRE", "0", Expect::Silent),
         ("FOCR_SRSWA_DENSE", "1", Expect::Silent),

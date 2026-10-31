@@ -381,10 +381,12 @@ fn run_case(model: &OcrModel, case: &Case, pages: &[PathBuf]) -> Result<Observed
             let mut source = franken_ocr::page_source::PageSource::images(pages.to_vec())
                 .map_err(|e| format!("open the page source: {e}"))?;
             let mut seen = Vec::new();
-            let mut sink = |page: &franken_ocr::StreamedPage<'_>| {
-                seen.push(franken_ocr::robot::page_decoded_event(
-                    page.index, page.body,
-                ));
+            let mut sink = |event: &franken_ocr::DocumentEvent<'_>| {
+                if let franken_ocr::DocumentEvent::Page(page) = event {
+                    seen.push(franken_ocr::robot::page_decoded_event(
+                        page.index, page.body,
+                    ));
+                }
             };
             let streaming = matches!(case.kind, Kind::Stream(_));
             let document = model
@@ -393,7 +395,7 @@ fn run_case(model: &OcrModel, case: &Case, pages: &[PathBuf]) -> Result<Observed
                     &franken_ocr::DocumentOptions::default(),
                     &mut |_| {},
                     streaming
-                        .then_some(&mut sink as &mut dyn FnMut(&franken_ocr::StreamedPage<'_>)),
+                        .then_some(&mut sink as &mut dyn FnMut(&franken_ocr::DocumentEvent<'_>)),
                 )
                 .map_err(failed)?;
             if !document.skipped.is_empty() {

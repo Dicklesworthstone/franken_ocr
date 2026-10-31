@@ -1761,7 +1761,7 @@ fn generate_greedy_kvcache_with(
     let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
         .map(|_| Qwen2KvCache::new(cfg.kv_dim(), n + max_new))
         .collect();
-    let timing = std::env::var_os("FOCR_TIMING").is_some();
+    let timing = crate::timing_enabled();
     if timing {
         DECODE_ATTN_NS.store(0, Ordering::Relaxed);
         DECODE_GEMV_NS.store(0, Ordering::Relaxed);
@@ -2294,7 +2294,7 @@ mod tests {
     /// * given the **f32 reference** (`model.safetensors`): the O(n²)
     ///   [`generate_greedy`] path (f32 GEMMs via [`linear_auto`]) must match
     ///   the f32 oracle's greedy id-stream EXACTLY — apples-to-apples;
-    /// * given the **int8 artifact** (`.focrq`): [`generate_greedy_kvcache`]
+    /// * given **int8 weights**: [`generate_greedy_kvcache`]
     ///   must match [`generate_greedy`] on the SAME weights EXACTLY (both
     ///   decode int8 — the B9 bit-identity contract). The int8-vs-f32-oracle
     ///   stream may legitimately flip a near-tied token (int8 logit
@@ -2302,16 +2302,13 @@ mod tests {
     ///   both coherent) — that cross-precision delta is DISCREPANCIES
     ///   territory, not an exact gate.
     ///
-    /// Expected ids come from the COMMITTED
-    /// `tests/fixtures/smolvlm2/oracle_fixtures.json` (`l4_greedy.ids`), read
-    /// at runtime so the cert self-arms once the oracle has been generated;
-    /// skips-with-success while any artifact is absent.
+    /// The expected ids and the prompt both come from the COMMITTED
+    /// `tests/fixtures/smolvlm2/oracle_fixtures.json`: `hidden_states[0]` is the
+    /// plain `embed_tokens` lookup of `l0c_prompt.ids`, so `FOCR_SMOLVLM2_MODEL`
+    /// alone arms this cert. Skips-with-success without it.
     #[test]
     fn smolvlm2_kvcache_greedy_matches_oracle_l4() {
-        let (Ok(model), Ok(h0)) = (
-            std::env::var("FOCR_SMOLVLM2_MODEL"),
-            std::env::var("FOCR_SMOLVLM2_ORACLE_HIDDEN0"),
-        ) else {
+        let Ok(model) = std::env::var("FOCR_SMOLVLM2_MODEL") else {
             return;
         };
         let fixture_path = concat!(
@@ -2322,28 +2319,37 @@ mod tests {
             eprintln!("skip-with-SUCCESS: {fixture_path} absent (oracle not yet generated)");
             return;
         };
-        // Minimal, dependency-free extraction of l4_greedy.ids from the fixture.
-        let ids_json = raw
-            .split("\"l4_greedy\"")
-            .nth(1)
-            .and_then(|s| s.split("\"ids\"").nth(1))
-            .and_then(|s| s.split('[').nth(1))
-            .and_then(|s| s.split(']').next())
-            .expect("l4_greedy.ids present in the fixture");
-        let expected: Vec<u32> = ids_json
-            .split(',')
-            .map(|t| t.trim().parse().expect("id parses"))
-            .collect();
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture parses");
+        let ids_at = |section: &str| -> Vec<u32> {
+            fixture[section]["ids"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{section}.ids present in the fixture"))
+                .iter()
+                .map(|id| u32::try_from(id.as_u64().expect("id")).expect("id fits"))
+                .collect()
+        };
+        let expected = ids_at("l4_greedy");
+        let prompt = ids_at("l0c_prompt");
         assert!(!expected.is_empty(), "fixture carries a greedy stream");
 
         let cfg = DecoderConfig::smolvlm2();
         let weights = Weights::load(std::path::Path::new(&model)).expect("load smolvlm2 weights");
-        let h0_flat = read_f32_le(&h0);
-        let n = h0_flat.len() / cfg.hidden_size;
-        let inputs = Mat::from_vec(n, cfg.hidden_size, h0_flat);
+        let embed = weights.mat(cfg.embed_tokens).expect("embed table");
+        let inputs = Mat::from_vec(
+            prompt.len(),
+            cfg.hidden_size,
+            prompt
+                .iter()
+                .flat_map(|&id| embed.row(id as usize))
+                .copied()
+                .collect(),
+        );
 
-        if model.ends_with(".focrq") {
-            // int8 artifact: kvcache decode == the O(n²) re-prefill oracle on
+        // The stored dtype picks the contract: a `.focrq` can hold f32 weights.
+        let ffn = format!("{}0.mlp.up_proj.weight", cfg.layers_prefix);
+        let ffn = weights.record(&ffn).expect("the decoder FFN tensor");
+        if ffn.dtype == crate::native_engine::weights::DType::QInt8PerChan {
+            // int8 weights: kvcache decode == the O(n²) re-prefill oracle on
             // the SAME int8 weights (the B9 bit-identity contract).
             let slow = generate_greedy(&weights, &cfg, &inputs, expected.len(), 49_279)
                 .expect("re-prefill greedy decode");

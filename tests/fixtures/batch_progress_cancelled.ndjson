@@ -1,0 +1,4 @@
+{"schema_version":1,"event":"batch_start","mode":"images","independent_images":true,"total":3,"threads":"<threads>","model_path":"/nonexistent/model.focrq","model_id":null,"backend":"<backend>","decode_mode":"conservative_recipe"}
+{"schema_version":1,"event":"image_error","ordinal":1,"image":"a.png","total":3,"cumulative_ms":"<ms>","ok_images":0,"failed_images":1,"elapsed_ms":"<ms>","pages_per_hour":"<rate>","eta_ms":"<number>","error":"model not found / not resolvable: no model artifact at /nonexistent/model.focrq (resolver lands in Phase 0/1, bd-223.7)","exit_code":3}
+{"schema_version":1,"event":"batch_cancelled","image":"b.png","total":3,"cumulative_ms":"<ms>","ok_images":0,"failed_images":1}
+{"schema_version":1,"event":"batch_end","outcome":"cancelled","exit_code":6,"error":null,"total":3,"cumulative_ms":"<ms>","ok_images":0,"failed_images":1,"pages_per_hour":"<rate>"}

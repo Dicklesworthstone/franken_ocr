@@ -28,6 +28,7 @@ pub mod decoder;
 pub mod decoder_qwen2;
 pub mod got;
 pub(crate) mod lever_policy;
+pub mod memory;
 pub mod model_arch;
 pub mod moe;
 pub mod nn;
@@ -1082,7 +1083,6 @@ fn v1_page_warnings(report: &DecodeReport) -> Vec<RunWarning> {
 
 /// A document that continued with a recomputed window from run page
 /// `from_page` (U2-D4).
-#[cfg(feature = "pdf")]
 fn resume_recompute_warning(from_page: usize) -> RunWarning {
     let mut fields = serde_json::Map::new();
     fields.insert("from_page".into(), from_page.into());
@@ -1098,7 +1098,6 @@ fn resume_recompute_warning(from_page: usize) -> RunWarning {
 }
 
 /// A run that stopped writing its files because of `cause` (U2-D4).
-#[cfg(feature = "pdf")]
 fn checkpoint_failed_warning(cause: &str) -> RunWarning {
     let mut fields = serde_json::Map::new();
     fields.insert("cause".into(), cause.into());
@@ -1205,10 +1204,9 @@ pub fn partial_output(
     })))
 }
 
-/// Streaming sink for completed multi-page bodies (bd-2z0y): called with
-/// each [`StreamedPage`] as its `<PAGE>` boundary is crossed in the token
-/// stream.
-type PageSink<'a> = &'a mut dyn FnMut(&StreamedPage<'_>);
+/// Streaming sink for a document decode (bd-2z0y, U2-D5): called with each
+/// [`DocumentEvent`] as the decode reaches it.
+type DocumentSink<'a> = &'a mut dyn FnMut(&DocumentEvent<'_>);
 
 /// A page body an Unlimited-OCR-2 document decode closed (U2-E3), as it
 /// streams: [`StreamedPage`]'s facts before the page's origin is known.
@@ -1744,9 +1742,10 @@ fn spec_decode_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os(SPEC_DECODE_ENV).is_some())
 }
 
-/// Emit a stage-timing line to stderr when `FOCR_TIMING` is set (perf bring-up).
+/// Emit a stage-timing line to stderr under `--timing` or `FOCR_TIMING` (perf
+/// bring-up).
 pub(crate) fn timing_log(msg: &str) {
-    if std::env::var_os("FOCR_TIMING").is_some() {
+    if crate::timing_enabled() {
         crate::progress::stderr_message(format_args!("[focr-timing] {msg}"));
     }
 }
@@ -1972,10 +1971,10 @@ fn model_search_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-/// The model cache's search dirs: the flat root FIRST (the layout every
-/// released binary knows), then one level of per-model subdirectories,
-/// name-sorted for determinism. `focr pull <model>` installs non-primary
-/// models into their own subdir so same-named sidecars (e.g. two different
+/// The model cache's search dirs: one level of per-model packages FIRST,
+/// name-sorted for determinism, then the root, where a file dropped in by hand
+/// can still be found but never shadows what `focr pull` installed. Every model
+/// has its own package so same-named sidecars (e.g. two different
 /// tokenizer.json) cannot clobber each other (bd-av64.7). Hidden directories
 /// are pull state, never a package: the next package being assembled
 /// (`.focr-stage-…`, partial files under their final names) and the previous
@@ -1990,9 +1989,8 @@ fn cache_search_dirs(models: PathBuf) -> Vec<PathBuf> {
         .filter(|p| p.is_dir())
         .collect();
     subdirs.sort();
-    let mut dirs = vec![models];
-    dirs.extend(subdirs);
-    dirs
+    subdirs.push(models);
+    subdirs
 }
 
 /// Directories the model resolver searches for missing relative model specs.
@@ -2033,23 +2031,30 @@ pub struct LayoutSpan {
     /// The heading level of an Unlimited-OCR-2 `title` block (`<LEVELn>`, U2-E3b);
     /// `None` for v1 spans and unleveled blocks.
     pub level: Option<u8>,
+    /// What the model wrote for the span: the text after its marker, up to the
+    /// next span, normalized as the markdown is. `None` for an image span and
+    /// for a marker with no text after it.
+    pub text: Option<String>,
 }
 
 impl LayoutSpan {
-    /// The span as `{label, boxes}`, plus `level` when it has one: the
-    /// `--json` layout entry and the resident daemon's wire form.
+    /// The span as `{label, boxes}`, plus `level` and `text` when it has them:
+    /// the `--json` layout entry and the resident daemon's wire form.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         let mut value = serde_json::json!({ "label": self.label, "boxes": self.boxes });
         if let Some(level) = self.level {
             value["level"] = level.into();
         }
+        if let Some(text) = &self.text {
+            value["text"] = text.as_str().into();
+        }
         value
     }
 
     /// The inverse of [`Self::to_json`]; `None` without a string `label` or a
     /// `boxes` array. A box that is not four integers is skipped, as is a
-    /// `level` that is not a `u8`.
+    /// `level` that is not a `u8` and a `text` that is not a string.
     #[must_use]
     pub fn from_json(value: &serde_json::Value) -> Option<Self> {
         let label = value.get("label")?.as_str()?.to_owned();
@@ -2073,10 +2078,15 @@ impl LayoutSpan {
             .get("level")
             .and_then(serde_json::Value::as_u64)
             .and_then(|l| u8::try_from(l).ok());
+        let text = value
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
         Some(Self {
             label,
             boxes,
             level,
+            text,
         })
     }
 }
@@ -2141,6 +2151,13 @@ pub struct PageResult {
     /// with `i = run_index − 1`. The document's markdown joins these
     /// ([`postprocess::join_page_texts`]).
     pub text: String,
+    /// The page's `.trim()`-ed body as the model wrote it, grounding markers
+    /// included, boxes on the model's 0–999 grid. Windowed runs rebuild it
+    /// from the journal, so a resumed page carries it too.
+    pub raw: String,
+    /// The page's raster `(width, height)` in pixels, the frame of `layout`
+    /// and `figures`.
+    pub size: (u32, u32),
     /// The page's layout, boxes in its own pixels.
     pub layout: Vec<LayoutSpan>,
     /// The page's figure boxes, numbered as its markdown numbers them.
@@ -2179,6 +2196,8 @@ impl PageResult {
             half: origin.half,
             window: None,
             text,
+            raw: body.trim().to_owned(),
+            size,
             layout,
             figures,
             tokens: None,
@@ -2189,8 +2208,8 @@ impl PageResult {
     }
 
     /// The page's `--json` `pages[]` entry: `page` (the source page), `half`
-    /// when split, `run_index`, `window` when windowed, `text`, `layout`,
-    /// then `tokens` and `finish` when the model counts them. Its figures go
+    /// when split, `run_index`, `window` when windowed, `width` and `height`,
+    /// `text`, `layout`, then `tokens` and `finish` when the model counts them. Its figures go
     /// in the run's `figures[]`, and `elapsed_ms`, which differs run to run,
     /// only in the robot `page` event.
     #[must_use]
@@ -2203,6 +2222,8 @@ impl PageResult {
         if let Some(window) = self.window {
             value["window"] = window.into();
         }
+        value["width"] = self.size.0.into();
+        value["height"] = self.size.1.into();
         value["text"] = self.text.as_str().into();
         value["layout"] = self.layout.iter().map(LayoutSpan::to_json).collect();
         if let Some(tokens) = self.tokens {
@@ -2228,11 +2249,34 @@ pub struct StreamedPage<'a> {
     pub page: Option<&'a PageResult>,
 }
 
+/// What a document decode streams as it goes, in order. Streaming never
+/// changes the result.
+#[derive(Debug, Clone, Copy)]
+pub enum DocumentEvent<'a> {
+    /// A page ended (bd-2z0y).
+    Page(StreamedPage<'a>),
+    /// A decode window ended, after its pages and its checkpoint (U2-D5). A
+    /// resumed run streams the windows it decodes, not those it picks up.
+    Window(&'a window::WindowStats),
+}
+
 /// A document parse's markdown and pages (U2-E3), before the run's facts.
 #[derive(Debug)]
 struct DocumentPages {
     markdown: String,
+    raw: String,
     pages: Vec<PageResult>,
+}
+
+impl DocumentPages {
+    /// A document read page by page: its text joins its pages'.
+    fn joined(pages: Vec<PageResult>) -> Self {
+        Self {
+            markdown: postprocess::join_page_texts(pages.iter().map(|p| &p.text)),
+            raw: postprocess::join_page_texts(pages.iter().map(|p| &p.raw)),
+            pages,
+        }
+    }
 }
 
 /// How a document's pages are split into decode windows (U2-E2, plan
@@ -2244,12 +2288,43 @@ pub enum PageWindow {
     /// [`UOCR2_UNWINDOWED_PAGE_LIMIT`]). A document that fits one window
     /// decodes in one pass.
     Pages(usize),
-    /// A window sized to the machine's memory (U2-D3); refused until then.
+    /// The largest window, up to the default, whose estimated memory fits
+    /// [`memory::memory_budget`] (U2-D3). A model without windows reads in
+    /// one pass; a machine that cannot hold even one page is refused.
     Auto,
     /// One pass over every page, however many: an Unlimited-OCR-2 document
     /// past [`UOCR2_UNWINDOWED_PAGE_LIMIT`] pages may then stop at the
     /// position limit (`finish_reason: length`).
     Off,
+}
+
+impl PageWindow {
+    /// Why no model decodes this window, when none can.
+    fn refusal(self) -> Option<String> {
+        match self {
+            Self::Pages(0) => Some("a page window needs at least one page".into()),
+            Self::Pages(pages) if pages > UOCR2_UNWINDOWED_PAGE_LIMIT => Some(format!(
+                "a page window holds at most {UOCR2_UNWINDOWED_PAGE_LIMIT} pages, not {pages}"
+            )),
+            _ => None,
+        }
+    }
+}
+
+impl std::str::FromStr for PageWindow {
+    type Err = String;
+
+    /// A number of pages, `auto` or `off`, as `--page-window` takes it.
+    fn from_str(value: &str) -> Result<Self, String> {
+        let window = match value {
+            "auto" => Self::Auto,
+            "off" => Self::Off,
+            pages => Self::Pages(pages.parse().map_err(|_| {
+                format!("expected a number of pages, `auto` or `off`, not `{pages}`")
+            })?),
+        };
+        window.refusal().map_or(Ok(window), Err)
+    }
 }
 
 /// Whether a document run picks up an interrupted run's files
@@ -2319,8 +2394,14 @@ impl DocumentOptions {
     /// [`FocrError::Usage`] for a window `model` cannot decode, a resume with
     /// no files or no windows, or an option this build cannot honor yet:
     /// refused, never ignored.
-    fn plan(&self, model: &str, windowed: bool, pages: usize) -> FocrResult<DocumentPlan> {
-        let plan = self.window_plan(model, windowed, pages)?;
+    fn plan(
+        &self,
+        model: &str,
+        windowed: bool,
+        pages: usize,
+        auto: impl FnOnce() -> FocrResult<usize>,
+    ) -> FocrResult<DocumentPlan> {
+        let plan = self.window_plan(model, windowed, pages, auto)?;
         if self.resume != ResumePolicy::Never {
             if self.run.is_none() {
                 return Err(FocrError::Usage(
@@ -2338,17 +2419,19 @@ impl DocumentOptions {
     }
 
     /// [`Self::plan`]'s window policy.
-    fn window_plan(&self, model: &str, windowed: bool, pages: usize) -> FocrResult<DocumentPlan> {
+    fn window_plan(
+        &self,
+        model: &str,
+        windowed: bool,
+        pages: usize,
+        auto: impl FnOnce() -> FocrResult<usize>,
+    ) -> FocrResult<DocumentPlan> {
+        if let Some(refusal) = self.page_window.and_then(PageWindow::refusal) {
+            return Err(FocrError::Usage(refusal));
+        }
         match self.page_window {
-            Some(PageWindow::Pages(0)) => Err(FocrError::Usage(
-                "a page window needs at least one page".into(),
-            )),
-            Some(PageWindow::Auto) => Err(FocrError::Usage(
-                "a page window sized to memory (PageWindow::Auto) is not yet available; give \
-                 a page count, or PageWindow::Off"
-                    .into(),
-            )),
-            Some(PageWindow::Off) => Ok(DocumentPlan::OnePass),
+            Some(PageWindow::Auto) if windowed => Ok(DocumentPlan::Windows(auto()?)),
+            Some(PageWindow::Auto | PageWindow::Off) => Ok(DocumentPlan::OnePass),
             None if windowed => Ok(DocumentPlan::Windows(window::DEFAULT_PAGE_WINDOW)),
             Some(PageWindow::Pages(n)) if windowed => Ok(DocumentPlan::Windows(n)),
             None => Ok(DocumentPlan::OnePass),
@@ -2372,9 +2455,46 @@ enum DocumentPlan {
     Windows(usize),
 }
 
+/// A windowed document's pages as they end: kept here and streamed.
+struct WindowedStream<'a> {
+    model_id: &'static str,
+    pages: Vec<PageResult>,
+    on_event: Option<DocumentSink<'a>>,
+}
+
+impl WindowedStream<'_> {
+    fn add_page(&mut self, page: &checkpoint::JournalPage, body: &str) {
+        let result = PageResult {
+            window: Some(page.window),
+            tokens: page.tokens,
+            finish: page.finish,
+            ..PageResult::read(
+                page.run_index,
+                body,
+                page.read.size,
+                page.read.origin,
+                self.model_id,
+            )
+        };
+        if let Some(sink) = self.on_event.as_deref_mut() {
+            sink(&DocumentEvent::Page(StreamedPage {
+                index: page.run_index,
+                body: body.trim(),
+                page: Some(&result),
+            }));
+        }
+        self.pages.push(result);
+    }
+
+    fn window_ended(&mut self, window: &window::WindowStats) {
+        if let Some(sink) = self.on_event.as_deref_mut() {
+            sink(&DocumentEvent::Window(window));
+        }
+    }
+}
+
 /// What a planned document read gives back: the preprocessed pages for one
 /// pass, or the windowed document already parsed with its windows.
-#[cfg(feature = "pdf")]
 enum DocumentParse {
     OnePass(Vec<Preprocessed>),
     Windowed(DocumentPages, Vec<window::WindowStats>),
@@ -2383,12 +2503,14 @@ enum DocumentParse {
 /// A parsed document (U2-E2, D23): its markdown and pages, and how the
 /// parse ended. A document that stopped early (the position limit, the
 /// stage budget or a cancel) is a result too, with the pages it completed.
-#[cfg(feature = "pdf")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct DocumentResult {
     /// The document's markdown, pages joined by `<PAGE>`.
     pub markdown: String,
+    /// The document as the model wrote it, grounding markers included, pages
+    /// joined by `<PAGE>`.
+    pub raw: String,
     /// One entry per page read, in run order (U2-E3). Empty for a v1
     /// document whose text did not split into one body per page (its
     /// `v1_page_merge` warning says so).
@@ -2396,7 +2518,7 @@ pub struct DocumentResult {
     /// Page bodies the model wrote, the interrupted page's included.
     pub pages_out: usize,
     /// Source pages that did not rasterize, left out of the prompt (D24).
-    pub skipped: Vec<crate::pdf::SkippedPage>,
+    pub skipped: Vec<crate::page_source::SkippedPage>,
     /// How the decode ended.
     pub finish_reason: FinishReason,
     /// `<PAGE>` markers past the page count, merged into the last page.
@@ -2422,6 +2544,9 @@ pub struct DocumentResult {
 pub struct RecognizedDocument {
     /// The markdown body (identical to what [`OcrModel::recognize`] returns).
     pub markdown: String,
+    /// The decode as the model wrote it, EOS dropped and grounding markers
+    /// kept, boxes on the model's 0–999 grid.
+    pub raw: String,
     /// The per-span layout (labels + pixel bounding boxes).
     pub layout: Vec<LayoutSpan>,
 }
@@ -3249,6 +3374,22 @@ pub fn model_id_at(path: &Path) -> Option<&'static str> {
         .map(model_arch::ModelArch::id)
 }
 
+/// Every check a load makes before its first weight byte, for `focr ocr
+/// --check`: resolve `path`, read the header, admit the model, verify its
+/// tokenizer sidecar. Returns the artifact and its model's id.
+///
+/// # Errors
+/// What the load would return: [`FocrError::ModelNotFound`] for a path that
+/// does not resolve, [`FocrError::FormatMismatch`] for a header or sidecar
+/// this binary refuses, and the admission's own refusals.
+pub fn preflight_model(path: &Path) -> FocrResult<(PathBuf, &'static str)> {
+    let resolved = OcrModel::resolve_model(path)?;
+    let arch = validate_model_header_file(&resolved)?;
+    admit_for_inference(arch)?;
+    eager_sidecar_tokenizer(arch, &resolved)?;
+    Ok((resolved, arch.id()))
+}
+
 /// A filesystem model open: the model the header identified, its tokenizer
 /// when the sidecar was verified at open, and the weights.
 struct OpenedModel {
@@ -3904,6 +4045,15 @@ impl OcrModel {
     /// policy refuses a set `FOCR_*` lever, or the model is registered but not
     /// implemented (U2-A7) — both before a weight byte is read.
     pub fn load(path: &Path) -> FocrResult<Arc<Self>> {
+        Self::load_observed(path, || {})
+    }
+
+    /// [`Self::load`], calling `before_read` just before the first weight byte
+    /// is read: not on a cache hit, and not for a model that is refused.
+    ///
+    /// # Errors
+    /// As [`Self::load`].
+    pub(crate) fn load_observed(path: &Path, before_read: impl FnOnce()) -> FocrResult<Arc<Self>> {
         let resolved = Self::resolve_model(path)?;
         let _load_permit = model_load_admission().acquire();
 
@@ -3926,7 +4076,7 @@ impl OcrModel {
         let opened = load_weights_from_resolved_model_after_validation(
             &resolved,
             admit_for_inference,
-            || {},
+            before_read,
         )?;
         let model = Arc::new(Self::assemble(
             resolved.clone(),
@@ -3996,6 +4146,7 @@ impl OcrModel {
         weights: Weights,
         tokenizer: Option<crate::tokenizer::Tokenizer>,
     ) -> Self {
+        memory::log_peak_rss("weights loaded");
         Self {
             path,
             sidecars,
@@ -4477,9 +4628,11 @@ impl OcrModel {
         image_w: u32,
         image_h: u32,
     ) -> FocrResult<RecognizedDocument> {
-        let markdown = postprocess::finalize(decoded, image_w, image_h)?;
-        let layout = postprocess::parse_layout(decoded, image_w, image_h);
-        Ok(RecognizedDocument { markdown, layout })
+        Ok(RecognizedDocument {
+            markdown: postprocess::finalize(decoded, image_w, image_h)?,
+            raw: postprocess::strip_eos(decoded),
+            layout: postprocess::parse_layout(decoded, image_w, image_h),
+        })
     }
 
     /// Recognize one document image AND crop the figure regions it grounds but
@@ -4565,10 +4718,11 @@ impl OcrModel {
     /// page reaches `on_item` before it is read; a page that did not
     /// rasterize is left out of the prompt and listed in
     /// [`DocumentResult::skipped`] (D24), and keeps its source page, so
-    /// later pages are numbered as in the source. `on_page` gets each page
+    /// later pages are numbered as in the source. `on_event` gets each page
     /// body as its `<PAGE>` boundary is crossed in the token stream
     /// (bd-2z0y), or as its window ends, with its [`PageResult`] when the
-    /// model splits pages exactly; it never changes the result.
+    /// model splits pages exactly, and each window as it ends
+    /// ([`DocumentEvent`]); it never changes the result.
     ///
     /// A document that stops early is a result, not an error: its
     /// `finish_reason` says why and its pages are those it completed. The
@@ -4584,16 +4738,20 @@ impl OcrModel {
     /// * The first page's raster error when no page rasterized.
     /// * A prompt with no room to generate, or any preprocess, vision or
     ///   decode error; v1 also stops with [`FocrError::Cancelled`].
-    #[cfg(feature = "pdf")]
     pub fn recognize_document(
         &self,
         source: &mut crate::page_source::PageSource,
         options: &DocumentOptions,
         on_item: &mut dyn FnMut(&crate::page_source::PageItem),
-        on_page: Option<PageSink<'_>>,
+        on_event: Option<DocumentSink<'_>>,
     ) -> FocrResult<DocumentResult> {
         multi_page_route(self.arch())?;
-        let plan = options.plan(self.arch().id(), self.decodes_windows(), source.len())?;
+        let plan = options.plan(
+            self.arch().id(),
+            self.decodes_windows(),
+            source.len(),
+            || self.fitting_page_window(),
+        )?;
         let (mut run, resumed) = match (plan, &options.run) {
             (DocumentPlan::Windows(window), Some(files)) => {
                 let key = self.resume_key(window, &files.key)?;
@@ -4618,7 +4776,7 @@ impl OcrModel {
                 .collect();
             source.seek(last.walk, map)?;
         }
-        let mut skipped: Vec<crate::pdf::SkippedPage> = read_before
+        let mut skipped: Vec<crate::page_source::SkippedPage> = read_before
             .iter()
             .flat_map(|page| page.skipped.iter().cloned())
             .collect();
@@ -4649,7 +4807,7 @@ impl OcrModel {
                         return Some(pre);
                     }
                     Err(e) => {
-                        let page = crate::pdf::SkippedPage {
+                        let page = crate::page_source::SkippedPage {
                             page: item.source_page,
                             reason: e.to_string(),
                         };
@@ -4661,17 +4819,26 @@ impl OcrModel {
             }
             None
         });
-        let mut on_page = on_page;
+        let mut on_event = on_event;
         let parsed = match plan {
             DocumentPlan::OnePass => {
                 DocumentParse::OnePass(pages.by_ref().collect::<FocrResult<Vec<_>>>()?)
             }
             DocumentPlan::Windows(window) => {
-                let sink = on_page.as_mut().map(|sink| &mut **sink as PageSink<'_>);
+                let sink = on_event
+                    .as_mut()
+                    .map(|sink| &mut **sink as DocumentSink<'_>);
                 self.parse_windowed(&mut pages, window, &read, resumed, run.as_mut(), sink)?
             }
         };
-        let (DocumentPages { markdown, pages }, windows) = match parsed {
+        let (
+            DocumentPages {
+                markdown,
+                raw,
+                pages,
+            },
+            windows,
+        ) = match parsed {
             DocumentParse::OnePass(pres) => {
                 if pres.is_empty() {
                     return Err(first_error.unwrap_or_else(|| {
@@ -4679,9 +4846,11 @@ impl OcrModel {
                     }));
                 }
                 // Split spreads can make more logical pages than source pages.
-                options.plan(self.arch().id(), self.decodes_windows(), pres.len())?;
+                options.plan(self.arch().id(), self.decodes_windows(), pres.len(), || {
+                    self.fitting_page_window()
+                })?;
                 let origins: Vec<PageOrigin> = read.borrow().iter().map(|p| p.origin).collect();
-                (self.parse_document(pres, &origins, on_page)?, Vec::new())
+                (self.parse_document(pres, &origins, on_event)?, Vec::new())
             }
             DocumentParse::Windowed(pages, windows) => {
                 // A stopped document left pages unread; it still expected them.
@@ -4720,8 +4889,10 @@ impl OcrModel {
                 .and_then(checkpoint::DocumentRun::failure)
                 .map(checkpoint_failed_warning),
         );
+        self.log_memory_summary(plan, pages.len());
         Ok(DocumentResult {
             markdown,
+            raw,
             pages_out: report
                 .as_ref()
                 .and_then(|r| r.pages)
@@ -4742,6 +4913,16 @@ impl OcrModel {
         })
     }
 
+    /// The run summary's estimate against the real peak (U2-D3).
+    fn log_memory_summary(&self, plan: DocumentPlan, pages: usize) {
+        if let DocumentPlan::Windows(window) = plan
+            && let Ok(estimate) =
+                self.estimate_peak_bytes(window.min(pages), memory::DEFAULT_TOKENS_PER_PAGE)
+        {
+            memory::log_against_estimate(&estimate);
+        }
+    }
+
     /// The resume key of a document in windows of `window` own pages on this
     /// model (U2-D4, plan D14): the caller's fields, then everything that
     /// shapes the decode. Thread width is no part of it: the decode does not
@@ -4749,7 +4930,6 @@ impl OcrModel {
     ///
     /// # Errors
     /// An invalid decoder-precision setting.
-    #[cfg(feature = "pdf")]
     fn resume_key(
         &self,
         window: usize,
@@ -4783,14 +4963,13 @@ impl OcrModel {
     /// A document in windows of `window` own pages (U2-D1b): the windowed
     /// decode over `pages` as they stream in ([`Self::decode_document_windowed`]),
     /// or the pages back for one pass when they fit one window. `read` holds
-    /// each page read so far; each window's pages stream to `on_page` as the
-    /// window ends, their boxes in their own pixels, and each boundary goes
-    /// to `run` (U2-D4). `resumed` picks up an interrupted run, whose pages
-    /// stream first, from its journal.
+    /// each page read so far; each window's pages stream to `on_event` as the
+    /// window ends, their boxes in their own pixels, then the window itself,
+    /// and each boundary goes to `run` (U2-D4). `resumed` picks up an
+    /// interrupted run, whose pages stream first, from its journal.
     ///
     /// # Errors
     /// Any page, vision or decode error.
-    #[cfg(feature = "pdf")]
     fn parse_windowed(
         &self,
         pages: &mut dyn Iterator<Item = FocrResult<Preprocessed>>,
@@ -4798,40 +4977,21 @@ impl OcrModel {
         read: &std::cell::RefCell<Vec<checkpoint::ReadPage>>,
         resumed: Option<checkpoint::Resumed>,
         mut run: Option<&mut checkpoint::DocumentRun>,
-        mut on_page: Option<PageSink<'_>>,
+        on_event: Option<DocumentSink<'_>>,
     ) -> FocrResult<DocumentParse> {
         let opts = window::WindowedOptions {
             window,
             ..window::WindowedOptions::default()
         };
-        let model_id = self.arch().id();
-        let mut results: Vec<PageResult> = Vec::new();
-        let mut add_page = |page: &checkpoint::JournalPage, body: &str| {
-            let result = PageResult {
-                window: Some(page.window),
-                tokens: page.tokens,
-                finish: page.finish,
-                ..PageResult::read(
-                    page.run_index,
-                    body,
-                    page.read.size,
-                    page.read.origin,
-                    model_id,
-                )
-            };
-            if let Some(sink) = on_page.as_deref_mut() {
-                sink(&StreamedPage {
-                    index: page.run_index,
-                    body: body.trim(),
-                    page: Some(&result),
-                });
-            }
-            results.push(result);
+        let mut stream = WindowedStream {
+            model_id: self.arch().id(),
+            pages: Vec::new(),
+            on_event,
         };
         let from = resumed.map(|resumed| {
             for page in &resumed.pages {
                 if let Some(body) = &page.body {
-                    add_page(page, body);
+                    stream.add_page(page, body);
                 }
             }
             resumed.from
@@ -4855,12 +5015,13 @@ impl OcrModel {
                 .collect();
             for page in &own {
                 if let Some(body) = &page.body {
-                    add_page(page, body);
+                    stream.add_page(page, body);
                 }
             }
             if let (Some(run), Some(boundary)) = (run.as_deref_mut(), boundary) {
                 run.window_end(own, record, boundary, &read[boundary.next_page()]);
             }
+            stream.window_ended(w);
         };
         let _admission = forward_admission().acquire();
         let decoded =
@@ -4873,14 +5034,7 @@ impl OcrModel {
         Ok(match decoded {
             window::Windowing::Fits(pres) => DocumentParse::OnePass(pres),
             window::Windowing::Windowed(doc) => {
-                let markdown = postprocess::join_page_texts(results.iter().map(|p| &p.text));
-                DocumentParse::Windowed(
-                    DocumentPages {
-                        markdown,
-                        pages: results,
-                    },
-                    doc.windows,
-                )
+                DocumentParse::Windowed(DocumentPages::joined(stream.pages), doc.windows)
             }
         })
     }
@@ -4906,7 +5060,7 @@ impl OcrModel {
     }
 
     /// A document's parse (bd-1gv.25): per-page vision, ONE fused cross-page
-    /// prefill, ONE decode, `finalize_multi` assembly. `on_page` (bd-2z0y)
+    /// prefill, ONE decode, `finalize_multi` assembly. `on_event` (bd-2z0y)
     /// streams each completed page body as its boundary is crossed.
     /// `origins[k]` is where page `k + 1` of the prompt came from.
     ///
@@ -4918,7 +5072,7 @@ impl OcrModel {
         &self,
         pres: Vec<Preprocessed>,
         origins: &[PageOrigin],
-        mut on_page: Option<PageSink<'_>>,
+        mut on_event: Option<DocumentSink<'_>>,
     ) -> FocrResult<DocumentPages> {
         let _admission = forward_admission().acquire();
         let frame = PageFrame {
@@ -4928,21 +5082,17 @@ impl OcrModel {
         };
         if self.arch().decode_contract().pages.is_some() {
             let mut closed = |page: &ClosedPage<'_>| {
-                if let Some(sink) = on_page.as_deref_mut() {
+                if let Some(sink) = on_event.as_deref_mut() {
                     let result = frame.closed_page(page);
-                    sink(&StreamedPage {
+                    sink(&DocumentEvent::Page(StreamedPage {
                         index: page.index,
                         body: page.body,
                         page: Some(&result),
-                    });
+                    }));
                 }
             };
             let decoded = self.decode_document(&pres, Some(&mut closed))?;
-            let pages = frame.token_pages(&decoded);
-            return Ok(DocumentPages {
-                markdown: postprocess::join_page_texts(pages.iter().map(|p| &p.text)),
-                pages,
-            });
+            return Ok(DocumentPages::joined(frame.token_pages(&decoded)));
         }
         // ── vision tower per page, sequential (§6.5: one live forward) ──────
         let tv = Instant::now();
@@ -5001,9 +5151,9 @@ impl OcrModel {
             ..self.decode_params.clone()
         };
         let td = Instant::now();
-        let generated = match on_page {
+        let generated = match on_event {
             None => self.generate_with(inputs_embeds, &prompt_ids, &params)?,
-            Some(on_page) => {
+            Some(on_event) => {
                 // Streaming (bd-2z0y): a per-committed-token observer decodes
                 // each id with a UTF-8-safe incremental decoder (U2-X1), which
                 // holds back a character split across byte-level tokens
@@ -5020,11 +5170,11 @@ impl OcrModel {
                 let mut seen = 0usize;
                 // v1 merges pages, so a streamed body names no page.
                 let mut on_body = |index: usize, body: &str| {
-                    on_page(&StreamedPage {
+                    on_event(&DocumentEvent::Page(StreamedPage {
                         index,
                         body,
                         page: None,
-                    });
+                    }));
                 };
                 let mut observer = |id: u32| {
                     seen += 1;
@@ -5073,6 +5223,7 @@ impl OcrModel {
         Ok(DocumentPages {
             markdown: postprocess::finalize_multi(&decoded, pres.len())?,
             pages: frame.text_pages(&stripped),
+            raw: stripped,
         })
     }
 
@@ -5948,20 +6099,69 @@ impl OcrModel {
         require_experimental_full_int8_recipe()
     }
 
+    /// What this model's weights take in memory.
+    fn model_memory(&self) -> FocrResult<memory::ModelMemory> {
+        let artifact = std::fs::metadata(&self.path)
+            .map_err(|e| FocrError::Other(anyhow::anyhow!("{}: {e}", self.path.display())))?
+            .len();
+        Ok(memory::ModelMemory::of(&self.weights, artifact))
+    }
+
+    /// This model's estimated peak for a document in windows of `page_window`
+    /// pages, each reaching `tokens_per_page` (U2-D3, plan §6.3).
+    ///
+    /// # Errors
+    /// The artifact's size cannot be read.
+    pub fn estimate_peak_bytes(
+        &self,
+        page_window: usize,
+        tokens_per_page: usize,
+    ) -> FocrResult<memory::Estimate> {
+        Ok(memory::estimate_peak_bytes(
+            &self.model_memory()?,
+            memory::EstimateAssumptions {
+                page_window,
+                tokens_per_page,
+                retirement: srswa::retire_enabled(),
+            },
+        ))
+    }
+
+    /// The page window [`PageWindow::Auto`] means on this machine.
+    fn fitting_page_window(&self) -> FocrResult<usize> {
+        let budget = memory::memory_budget()?;
+        let model = self.model_memory()?;
+        let at = |page_window| {
+            memory::estimate_peak_bytes(
+                &model,
+                memory::EstimateAssumptions {
+                    page_window,
+                    tokens_per_page: memory::DEFAULT_TOKENS_PER_PAGE,
+                    retirement: srswa::retire_enabled(),
+                },
+            )
+        };
+        memory::fitting_window(window::DEFAULT_PAGE_WINDOW, budget, at)
+            .map_err(|estimate| memory::refusal(&estimate, budget))
+    }
+
     /// Build or fetch the conservative mixed-precision decoder cache. Unlike
     /// the legacy all-f32 cache, this keeps the 2,148 recipe FFN/expert matrices
     /// in int8 storage, so it is practical to retain across pages. For
     /// Unlimited-OCR-2 it also holds the f32 router weights (U2-B5).
     fn decoder_cache(&self) -> FocrResult<&decoder::DecoderWeightCache> {
-        self.decoder_cache
-            .get_or_try_init(|| match self.arch().unlimited_variant() {
+        self.decoder_cache.get_or_try_init(|| {
+            let built = match self.arch().unlimited_variant() {
                 Some(model_arch::UnlimitedVariant::V2SrSwa) => {
                     decoder::DecoderWeightCache::build_srswa(&self.weights)
                 }
                 Some(model_arch::UnlimitedVariant::V1Rswa) | None => {
                     decoder::DecoderWeightCache::build(&self.weights)
                 }
-            })
+            };
+            memory::log_peak_rss("decoder weights");
+            built
+        })
     }
 
     /// The all-f32 cache ([`DECODE_F32_ENV`]), built once: v2's carries the
@@ -6011,6 +6211,7 @@ impl OcrModel {
                 "    clip.hydrate(cached) {:.2}s",
                 th.elapsed().as_secs_f64()
             ));
+            memory::log_peak_rss("clip weights");
             Ok(built)
         })
     }
@@ -6026,6 +6227,7 @@ impl OcrModel {
                 "    unlimited_vision.hydrate(cached) {:.2}s",
                 started.elapsed().as_secs_f64()
             ));
+            memory::log_peak_rss("vision statics");
             Ok(built)
         })
     }
@@ -6206,6 +6408,7 @@ impl OcrModel {
                 vision_sam::forward(&self.weights, &view)?
             };
             timing_log(&format!("  vision.sam {:.2}s", ts.elapsed().as_secs_f64()));
+            memory::log_peak_rss("sam forward");
             // CLIP tower fed SAM's x3 as patch_embeds -> [N+1, 1024] (CLS at 0).
             let tc = Instant::now();
             let clip = if wasm_residency {
@@ -6222,6 +6425,7 @@ impl OcrModel {
                 )?
             };
             timing_log(&format!("  vision.clip {:.2}s", tc.elapsed().as_secs_f64()));
+            memory::log_peak_rss("clip forward");
             // Bridge: concat CLIP[:,1:] ++ SAM (2048) -> projector -> [N, 1280].
             let tb = Instant::now();
             let projected = if let Some(statics) = statics {
@@ -6971,6 +7175,9 @@ impl OcrModel {
         // runs when spec decode is OFF). Each commit replaces this with the freshly
         // decoded row, exactly as the sequential loop reassigns its `last_hidden`.
         let mut last_hidden = last_hidden.clone();
+        // What `scripts/spec_gate_e2e.sh` reads: byte identity says nothing about
+        // a verifier that never ran.
+        let (mut rounds, mut accepted) = (0_usize, 0_usize);
         while emitted.len() < params.max_length {
             crate::cancel_checkpoint()?;
             progress::emit("decode", emitted.len() as u64, params.max_length as u64);
@@ -7020,6 +7227,8 @@ impl OcrModel {
             // ACCEPT the longest greedy-matching prefix + choose the correction with
             // the SAME chooser the sequential loop runs.
             let emit = spec::resolve_round(generated, &draft, &verify_logits, params)?;
+            rounds += 1;
+            accepted += emit.accepted;
             // COMMIT the accepted tokens by replaying each through the real decode
             // step (byte-for-byte the sequential KV writes), honoring EOS/max_length
             // exactly: a token is emitted only while `emitted.len() < max_length`,
@@ -7082,6 +7291,7 @@ impl OcrModel {
                 correction.token_id,
             )?;
         }
+        timing_log(&format!("spec_decode rounds={rounds} accepted={accepted}"));
         Ok(())
     }
 
@@ -8210,9 +8420,10 @@ mod tests {
         assert_eq!(resolved, subdir.join(shards::SHARD_INDEX_NAME));
     }
 
-    /// bd-jprb: the cache's search dirs are its root, then its per-model
-    /// packages, never the hidden pull state beside them. A package being
-    /// assembled holds a partial artifact under its final name and sorts first.
+    /// bd-jprb: the cache's search dirs are its per-model packages, then its
+    /// root, never the hidden pull state beside them. A package being assembled
+    /// holds a partial artifact under its final name and sorts first, and a
+    /// file in the root must not shadow the package a pull installed.
     #[test]
     fn the_model_cache_search_skips_pull_state() {
         let models = temp_model_dir("cache_search_pull_state");
@@ -8224,13 +8435,13 @@ mod tests {
         ] {
             std::fs::create_dir_all(models.join(name)).expect("create cache entry");
         }
-        std::fs::write(models.join("unlimited-ocr.int8.focrq"), b"flat").expect("flat file");
+        std::fs::write(models.join("unlimited-ocr.int8.focrq"), b"by hand").expect("root file");
         assert_eq!(
             cache_search_dirs(models.clone()),
             [
-                models.clone(),
                 models.join("got-ocr2"),
                 models.join("unlimited-ocr-2"),
+                models.clone(),
             ]
         );
         std::fs::remove_dir_all(models).expect("remove test cache");
@@ -9719,7 +9930,7 @@ mod tests {
             None,
             Some(PageWindow::Off),
             Some(PageWindow::Pages(3)),
-            Some(PageWindow::Pages(over)),
+            Some(PageWindow::Pages(UOCR2_UNWINDOWED_PAGE_LIMIT)),
         ] {
             let options = DocumentOptions {
                 page_window: window,
@@ -9733,7 +9944,7 @@ mod tests {
                 &mut source,
                 &options,
                 &mut |_| {},
-                Some(&mut |_: &StreamedPage<'_>| panic!("no page decodes")),
+                Some(&mut |_: &DocumentEvent<'_>| panic!("no page decodes")),
             )
             .expect_err("no weights");
         assert!(!matches!(error, FocrError::Usage(_)), "{error:?}");
@@ -9800,19 +10011,21 @@ mod tests {
     /// U2-E2, U2-D1b: how each document option plans on a windowed model
     /// (v2) and on one without windows (v1). What a model cannot decode (a
     /// v1 window smaller than the document) or this build cannot honor yet
-    /// (a memory-sized window, before U2-D3; resume, before U2-D4) is
-    /// refused before any page is read, never ignored.
+    /// (resume without files or windows) is refused before any page is read,
+    /// never ignored.
     #[test]
     fn document_options_plan_what_the_model_decodes_and_refuse_the_rest() {
         let v1 = model_arch::UNLIMITED_OCR_V1_ID;
         let refused = |options: DocumentOptions, windowed: bool, pages: usize, says: &str| {
-            let error = options.plan(v1, windowed, pages).expect_err(says);
+            let error = options.plan(v1, windowed, pages, || Ok(7)).expect_err(says);
             assert!(matches!(error, FocrError::Usage(_)), "{error:?}");
             assert!(error.to_string().contains(says), "{error}");
         };
         let window = |page_window| DocumentOptions::default().page_window(page_window);
         let plan = |options: DocumentOptions, windowed: bool, pages: usize| {
-            options.plan(v1, windowed, pages).expect("planned")
+            options
+                .plan(v1, windowed, pages, || Ok(7))
+                .expect("planned")
         };
         let default = DocumentOptions::default;
         assert_eq!(
@@ -9831,7 +10044,19 @@ mod tests {
                 3,
                 "at least one page",
             );
-            refused(window(PageWindow::Auto), windowed, 3, "not yet available");
+            // The machine sizes a window; a model without windows has none.
+            assert_eq!(
+                plan(window(PageWindow::Auto), windowed, 500),
+                if windowed {
+                    DocumentPlan::Windows(7)
+                } else {
+                    DocumentPlan::OnePass
+                }
+            );
+            let no_room = window(PageWindow::Auto).plan(v1, windowed, 500, || {
+                Err(FocrError::Usage("no room".into()))
+            });
+            assert_eq!(no_room.is_err(), windowed, "only a window can be refused");
             for resume in [ResumePolicy::IfMatching, ResumePolicy::Recompute] {
                 refused(default().resume(resume), windowed, 1, "resume");
                 let files = checkpoint::RunFiles::beside(

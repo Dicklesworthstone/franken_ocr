@@ -10,6 +10,8 @@ use crate::{
     error::{EXIT_CODE_TABLE, FocrError},
 };
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// The robot event-stream schema version. Bumped on any breaking contract change.
 pub const ROBOT_SCHEMA_VERSION: u32 = 1;
@@ -19,6 +21,7 @@ pub const EVENT_KINDS: &[&str] = &[
     "run_start",
     "stage",
     "page",
+    "window",
     "staff",
     "music_warning",
     "run_complete",
@@ -64,6 +67,10 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
     (
         "FOCR_MMAP",
         "opt trusted immutable artifacts into read-only mmap",
+    ),
+    (
+        "FOCR_MEMORY_BUDGET",
+        "memory a memory-sized page window may use: bytes, or a whole number of KiB/MiB/GiB/TiB",
     ),
     (
         "FOCR_FORCE_ARCH",
@@ -113,22 +120,37 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
 /// Required and optional fields per event kind, so a consumer can validate an
 /// event and not only its kind (U2-X2). A change that adds a field extends this
 /// table in the same change; `tests/cli_robot_golden.rs` validates every event
-/// it sees against it. `stage` has no emitter yet.
+/// it sees against it.
 pub fn event_fields() -> Value {
     json!({
         "run_start": {
             "required": ["schema_version", "event", "command"],
             "optional": [],
         },
-        "stage": { "reserved": true },
+        "stage": {
+            "required": ["schema_version", "event", "name", "seq", "elapsed_ms"],
+            // `budget_ms` on a stage with a time budget (`forward`).
+            "optional": ["budget_ms"],
+        },
         "page": {
             "required": ["schema_version", "event", "status", "page"],
             // The source-page fields are on Unlimited-OCR-2 runs (U2-E3);
-            // `tokens`, `finish` and `elapsed_ms` on its decoded pages.
+            // `tokens`, `finish`, `elapsed_ms` and `window` (null in one
+            // pass, U2-D5) on its decoded pages.
             "optional": [
                 "chars", "text", "error_kind", "message", "source_page", "half", "model_id",
-                "tokens", "finish", "elapsed_ms",
+                "tokens", "finish", "elapsed_ms", "window",
             ],
+        },
+        // One decode window ended (U2-D5). `pages` is `[lo, hi)`, 0-based;
+        // `fallback_reason`, `rss_bytes_peak` and `eta_ms` can be null.
+        "window": {
+            "required": [
+                "schema_version", "event", "index", "pages", "lookahead", "reused",
+                "fallback_reason", "prefill_tokens", "generated_tokens", "kv_bytes_peak",
+                "rss_bytes_peak", "elapsed_ms", "eta_ms",
+            ],
+            "optional": [],
         },
         "staff": {
             "required": ["schema_version", "event", "staff", "total", "bbox", "status"],
@@ -144,10 +166,13 @@ pub fn event_fields() -> Value {
             // report (every Unlimited-OCR run); `warnings` only when non-empty;
             // `model_id` and `source_sha256` (null for a raw checkpoint)
             // whenever the model that ran is known; `resumed_from` when the
-            // run picked up an interrupted document (U2-D4).
+            // run picked up an interrupted document (U2-D4); `pages_out`,
+            // `pages_skipped`, `windows` and `extra_markers` on an
+            // Unlimited-OCR-2 document (U2-D5).
             "optional": [
                 "finish_reason", "warnings", "low_yield", "yield_chars", "input_megapixels",
-                "model_id", "source_sha256", "resumed_from",
+                "model_id", "source_sha256", "resumed_from", "pages_out", "pages_skipped",
+                "windows", "extra_markers",
             ],
         },
         "run_error": {
@@ -177,6 +202,8 @@ pub fn robot_schema() -> Value {
         "environment_variables": environment,
         // Every machine-stable `warnings[].kind` (U2-X2, U2-A7): additive.
         "warning_kinds": crate::native_engine::RUN_WARNING_KINDS,
+        // `ocr-batch --progress-events` (bd-mgd3), versioned on its own.
+        "batch_progress": crate::batch_events::schema(),
         // How an agent orients in one round-trip each (the franken_whisper
         // `agent_discovery` pattern): additive keys, schema stays v1.
         "agent_discovery": {
@@ -203,6 +230,42 @@ pub fn run_start_event(command: &str) -> Value {
         "event": "run_start",
         "command": command,
     })
+}
+
+/// A run's `stage` events (plan §7.3), numbered from 1 and timed from the run's
+/// start. An event says the run ENTERED the stage, which lasts until the next
+/// one or the run's end. A warm resident run has no `load`, and a document read
+/// page by page has a `forward` per page.
+pub struct StageClock {
+    started: Instant,
+    entered: AtomicU64,
+}
+
+impl StageClock {
+    /// A clock for a run starting now.
+    #[must_use]
+    pub fn start() -> Self {
+        Self {
+            started: Instant::now(),
+            entered: AtomicU64::new(0),
+        }
+    }
+
+    /// The event for entering stage `name`, bound by `budget` if it has one.
+    pub fn entered(&self, name: &str, budget: Option<Duration>) -> Value {
+        let millis = |time: Duration| u64::try_from(time.as_millis()).unwrap_or(u64::MAX);
+        let mut event = json!({
+            "schema_version": ROBOT_SCHEMA_VERSION,
+            "event": "stage",
+            "name": name,
+            "seq": self.entered.fetch_add(1, Ordering::Relaxed) + 1,
+            "elapsed_ms": millis(self.started.elapsed()),
+        });
+        if let Some(budget) = budget {
+            event["budget_ms"] = millis(budget).into();
+        }
+        event
+    }
 }
 
 /// Build the robot-mode terminal `run_complete` event carrying the recognized
@@ -329,6 +392,7 @@ pub fn document_page_decoded_event(page: &crate::PageResult, body: &str) -> Valu
     if let Some(half) = page.half {
         event["half"] = half.as_str().into();
     }
+    event["window"] = page.window.into();
     event["model_id"] = page.model_id.into();
     if let Some(tokens) = page.tokens {
         event["tokens"] = tokens.into();
@@ -340,6 +404,30 @@ pub fn document_page_decoded_event(page: &crate::PageResult, body: &str) -> Valu
         event["elapsed_ms"] = elapsed_ms.into();
     }
     event
+}
+
+/// Build a robot-mode `window` event (U2-D5): one decode window ended.
+/// `eta_ms` is the running estimate of the time left in the run.
+#[must_use]
+pub fn window_event(
+    window: &crate::native_engine::window::WindowStats,
+    eta_ms: Option<u64>,
+) -> Value {
+    json!({
+        "schema_version": ROBOT_SCHEMA_VERSION,
+        "event": "window",
+        "index": window.index,
+        "pages": [window.pages.start, window.pages.end],
+        "lookahead": u8::from(window.lookahead),
+        "reused": window.reused,
+        "fallback_reason": window.fallback_reason.map(|reason| reason.as_str()),
+        "prefill_tokens": window.prefill_tokens,
+        "generated_tokens": window.generated_tokens,
+        "kv_bytes_peak": window.kv_bytes_peak,
+        "rss_bytes_peak": window.rss_bytes_peak,
+        "elapsed_ms": window.elapsed_ms,
+        "eta_ms": eta_ms,
+    })
 }
 
 /// Build a robot-mode `page` event recording that one document page was SKIPPED
@@ -563,6 +651,63 @@ mod tests {
     }
 
     #[test]
+    fn window_event_reports_a_window_and_declares_every_field() {
+        use crate::native_engine::window::{FallbackReason, WindowStats};
+        let window = WindowStats {
+            index: 2,
+            pages: 20..30,
+            lookahead: true,
+            reused: false,
+            fallback_reason: Some(FallbackReason::PageMismatch),
+            straddle: false,
+            prefill_tokens: 3019,
+            copied_rows: 0,
+            forced_tokens: 0,
+            generated_tokens: 6293,
+            finish: crate::native_engine::FinishReason::Stop,
+            kv_bytes_peak: 396_963_072,
+            rss_bytes_peak: Some(11_133_009_920),
+            retire_fallbacks: 0,
+            elapsed_ms: 851_950,
+        };
+        let event = window_event(&window, Some(1_703_900));
+        assert_eq!(
+            event,
+            json!({
+                "schema_version": ROBOT_SCHEMA_VERSION, "event": "window", "index": 2,
+                "pages": [20, 30], "lookahead": 1, "reused": false,
+                "fallback_reason": "page_mismatch", "prefill_tokens": 3019,
+                "generated_tokens": 6293, "kv_bytes_peak": 396_963_072_u64,
+                "rss_bytes_peak": 11_133_009_920_u64, "elapsed_ms": 851_950,
+                "eta_ms": 1_703_900,
+            })
+        );
+        let spec = &event_fields()["window"];
+        let required: Vec<&str> = spec["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        let keys = event.as_object().expect("an object");
+        assert_eq!(keys.len(), required.len());
+        assert!(required.iter().all(|field| keys.contains_key(*field)));
+        assert!(EVENT_KINDS.contains(&"window"));
+
+        let plain = WindowStats {
+            lookahead: false,
+            fallback_reason: None,
+            rss_bytes_peak: None,
+            ..window
+        };
+        let event = window_event(&plain, None);
+        assert_eq!(event["lookahead"], 0);
+        for nullable in ["fallback_reason", "rss_bytes_peak", "eta_ms"] {
+            assert!(event[nullable].is_null(), "{nullable}");
+        }
+    }
+
+    #[test]
     fn page_skipped_event_classifies_the_skip() {
         let event = page_skipped_event(7, &FocrError::InputDecode("bad xobject".into()));
         assert_eq!(event["schema_version"], ROBOT_SCHEMA_VERSION);
@@ -610,7 +755,9 @@ mod tests {
             source_page: 3,
             half: Some(crate::Half::Left),
             window: None,
+            size: (640, 480),
             text: "markdown".into(),
+            raw: "raw body".into(),
             layout: Vec::new(),
             figures: Vec::new(),
             tokens: Some(41),
@@ -624,14 +771,22 @@ mod tests {
             json!({
                 "schema_version": ROBOT_SCHEMA_VERSION, "event": "page", "status": "decoded",
                 "page": 2, "chars": 8, "text": "raw body", "source_page": 3, "half": "left",
-                "model_id": "unlimited-ocr-2", "tokens": 41, "finish": "page_cap",
-                "elapsed_ms": 950,
+                "window": null, "model_id": "unlimited-ocr-2", "tokens": 41,
+                "finish": "page_cap", "elapsed_ms": 950,
             })
         );
         assert_page_fields(&decoded);
-        let whole =
-            document_page_decoded_event(&crate::PageResult { half: None, ..page }, "raw body");
+        let whole = document_page_decoded_event(
+            &crate::PageResult {
+                half: None,
+                window: Some(4),
+                ..page
+            },
+            "raw body",
+        );
         assert!(whole.get("half").is_none(), "absent on a whole page");
+        assert_eq!(whole["window"], 4, "the window that read it");
+        assert_page_fields(&whole);
 
         let skipped = document_page_skipped_event(
             4,

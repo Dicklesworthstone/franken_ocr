@@ -30,8 +30,8 @@ use super::{
     DecodeParams, DecodeReport, DocumentDecode, DocumentDecoder, DocumentLoop, DocumentPass,
     DocumentPrecision, DocumentStats, FinishReason, LengthCap, MULTI_PAGE_PROMPT_TEXT, OcrModel,
     PageBodies, PageFinish, UOCR2_UNWINDOWED_PAGE_LIMIT, checkpoint, connector,
-    decode_with_retire_fallback, decoder, document_guard, lever_policy, paged_prompt, postprocess,
-    sampler, srswa, timing_log,
+    decode_with_retire_fallback, decoder, document_guard, lever_policy, memory, paged_prompt,
+    postprocess, sampler, srswa, timing_log,
 };
 use crate::error::{FocrError, FocrResult};
 use crate::preprocess::Preprocessed;
@@ -689,6 +689,10 @@ pub struct WindowStats {
     pub finish: FinishReason,
     /// Peak resident KV bytes.
     pub kv_bytes_peak: usize,
+    /// The process's peak resident set when the window ended, a high-water
+    /// mark of the whole process ([`memory::peak_rss_bytes`]); `None` where
+    /// it cannot be read.
+    pub rss_bytes_peak: Option<u64>,
     /// Reruns without block retirement.
     pub retire_fallbacks: usize,
     /// Wall time, vision included.
@@ -1206,6 +1210,7 @@ impl OcrModel {
                         generated_tokens: 0,
                         finish: FinishReason::Budget,
                         kv_bytes_peak: 0,
+                        rss_bytes_peak: memory::peak_rss_bytes(),
                         retire_fallbacks: 0,
                         elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
                     },
@@ -1281,12 +1286,14 @@ impl OcrModel {
                 generated_tokens: visible.len(),
                 finish: decode.finish_reason,
                 kv_bytes_peak: decode.stats.peak_kv_bytes,
+                rss_bytes_peak: memory::peak_rss_bytes(),
                 retire_fallbacks: decode.stats.retire_fallbacks,
                 elapsed_ms: u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
             };
             timing_log(&format!(
                 "window {} pages [{}, {}){}: {}{}, prefill {}, copied {}, forced {}, \
-                 generated {}, finish {}, bodies {}, extra markers {}, kv peak {} bytes, {:.2}s",
+                 generated {}, finish {}, bodies {}, extra markers {}, kv peak {} bytes, \
+                 rss peak {} bytes, {:.2}s",
                 span.index,
                 span.lo,
                 span.hi,
@@ -1301,6 +1308,7 @@ impl OcrModel {
                 split.bodies.len(),
                 split.extra_markers,
                 stats.kv_bytes_peak,
+                stats.rss_bytes_peak.unwrap_or(0),
                 t0.elapsed().as_secs_f64(),
             ));
             // A stop inside a window ends the document with its completed
