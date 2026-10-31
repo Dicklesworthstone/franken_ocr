@@ -1249,7 +1249,7 @@ fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
 /// Single-token GEMV: `y[o] = dot(x[0..k], w[o*k .. o*k+k])` for `o in 0..n`,
 /// over `w` in `[n, k]` row-major layout. The `n` output rows are independent →
 /// fanned across the rayon pool. Returns the `[n]` result.
-fn gemv(x: &[f32], w: &[f32], n: usize, k: usize) -> Vec<f32> {
+pub(crate) fn gemv(x: &[f32], w: &[f32], n: usize, k: usize) -> Vec<f32> {
     debug_assert_eq!(x.len(), k);
     debug_assert_eq!(w.len(), n * k);
     let mut y = vec![0.0f32; n];

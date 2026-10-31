@@ -462,9 +462,10 @@ mod tests {
         };
 
         let statics = hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
-        // `recognize` decodes int8 whatever the file holds: its KV-cache weights
-        // quantize f32 at build. The re-prefill path is the f32 one, so f32 weights
-        // take it, and a safetensors run tells a model limit from an int8 loss.
+        // `recognize` quantizes the decoder FFN at build whatever the file holds
+        // (attention it keeps as stored, bd-kd75). The re-prefill path is the f32
+        // one, so f32 weights take it, and a safetensors run tells a model limit
+        // from an int8 loss.
         let ffn = weights
             .record("model.layers.0.mlp.up_proj.weight")
             .expect("the decoder FFN tensor");

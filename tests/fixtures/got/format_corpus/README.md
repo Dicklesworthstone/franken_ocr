@@ -41,7 +41,8 @@ the image to a square:
 - `<asset>.got.txt`: the published int8 artifact, through the shipped KV-cache decode.
 - `<asset>.f32.got.txt`: the upstream checkpoint
   (`stepfun-ai/GOT-OCR2_0@979938bf`), through the re-prefill decode. This is the only
-  true f32 path: `got::recognize` quantizes at build, whatever the file holds.
+  true f32 path: `got::recognize` keeps attention as the file stores it but quantizes
+  the decoder FFN at build, whatever the file holds.
 
 `chart.task.got.txt` and `chart.task.f32.got.txt` are the same two arms on what
 `--task chart` feeds the model, the image padded to a white square. `--task formula`

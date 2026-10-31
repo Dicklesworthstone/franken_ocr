@@ -820,14 +820,14 @@ fn decode_attn_head(
 struct GotLayerW {
     input_ln: Vec<f32>,
     post_attn_ln: Vec<f32>,
-    /// Fused q|k|v projection `[q_dim + 2·kv_dim, hidden]` (one int8 panel) so the decode
+    /// Fused q|k|v projection `[q_dim + 2·kv_dim, hidden]` (one panel) so the decode
     /// quantizes the normed row ONCE and runs ONE n-parallel GEMV for all three.
-    qkv: QInt8,
+    qkv: AttnW,
     /// Fused q|k|v bias, `None` for a bias-free arch (SmolVLM2; C5/D4) —
     /// [`decoder::gemv_i8_bias_prequant`] and [`nn::linear_int8_dynamic`] both
     /// skip the add on `None`.
     qkv_bias: Option<Vec<f32>>,
-    o: QInt8,
+    o: AttnW,
     /// out_proj bias — `Some` only for the Opt family (every linear biased).
     o_bias: Option<Vec<f32>>,
     /// LayerNorm biases `(input_ln.bias, pre_mlp_ln.bias)` — `Some` selects
@@ -851,6 +851,121 @@ enum MlpW {
         fc2: QInt8,
         fc2_b: Vec<f32>,
     },
+}
+
+/// An attention projection in the precision its file stores (bd-kd75): int8
+/// for a `QInt8PerChan` record, else the checkpoint's own weights widened to
+/// row-major f32 `[n, k]`, the form and kernels v1's decoder keeps its
+/// attention in. Quantizing high-precision attention at build would make an
+/// artifact that keeps attention high precision decode exactly like the int8
+/// one, so the KV-cache path honours the file as [`linear_auto`] does.
+enum AttnW {
+    I8(QInt8),
+    F32(Mat),
+}
+
+impl AttnW {
+    /// `name` (`[out, in_]`) as its record stores it.
+    fn loaded(weights: &Weights, name: &str, out: usize, in_: usize) -> FocrResult<Self> {
+        let high = matches!(
+            weights.record(name).map(|r| r.dtype),
+            Some(DType::F32 | DType::F16 | DType::BF16)
+        );
+        let w = if high {
+            let m = weights.mat(name)?;
+            if m.rows != out {
+                return Err(FocrError::FormatMismatch(format!(
+                    "tensor {name:?} has {} output rows; expected {out}",
+                    m.rows
+                )));
+            }
+            Self::F32(m)
+        } else {
+            Self::I8(decoder::quant_oc_loaded(weights, name, out)?)
+        };
+        let k = match &w {
+            Self::I8(q) => q.k,
+            Self::F32(m) => m.cols,
+        };
+        if k != in_ {
+            return Err(FocrError::FormatMismatch(format!(
+                "tensor {name:?} has {k} input columns; expected {in_}"
+            )));
+        }
+        Ok(w)
+    }
+
+    /// q|k|v fused into one `[q_dim + 2·kv_dim, hidden]` projection. All three
+    /// must share a precision: no recipe stores them apart, and a mixed layer
+    /// has no single GEMM.
+    fn fused_qkv(q: Self, k: Self, v: Self, layer: &str) -> FocrResult<Self> {
+        match (q, k, v) {
+            (Self::I8(q), Self::I8(k), Self::I8(v)) => Ok(Self::I8(concat_qkv(&q, &k, &v))),
+            (Self::F32(q), Self::F32(k), Self::F32(v)) => {
+                let rows = q.rows + k.rows + v.rows;
+                let mut w = q.data;
+                w.extend_from_slice(&k.data);
+                w.extend_from_slice(&v.data);
+                Ok(Self::F32(Mat::from_vec(rows, q.cols, w)))
+            }
+            _ => Err(FocrError::FormatMismatch(format!(
+                "{layer}: q, k and v projections are stored in different precisions; \
+                 the fused projection needs all three int8 or all three high precision"
+            ))),
+        }
+    }
+
+    /// `x · Wᵀ + bias` over every row of `x`: the prefill GEMM, the same math
+    /// as [`linear_auto`] for the same record.
+    fn forward(&self, x: &Mat, bias: Option<&[f32]>) -> FocrResult<Mat> {
+        match self {
+            Self::I8(q) => nn::linear_int8_dynamic(x, q, bias),
+            Self::F32(w) => {
+                let mut y = decoder::linear_no_bias(x, &w.data, w.cols, w.rows)?;
+                if let Some(b) = bias {
+                    add_bias(&mut y, b);
+                }
+                Ok(y)
+            }
+        }
+    }
+
+    /// One row through the projection, the decode-step GEMV: the int8 arm
+    /// quantizes the row once and fans its output channels across the pool.
+    fn row(&self, x: &[f32], bias: Option<&[f32]>) -> Vec<f32> {
+        match self {
+            Self::I8(q) => {
+                let (xq, a) = decoder::quantize_row_i8_te(x);
+                decoder::gemv_i8_bias_prequant(&xq, a, q, bias)
+            }
+            Self::F32(w) => {
+                let mut y = decoder::gemv(x, &w.data, w.rows, w.cols);
+                if let Some(b) = bias {
+                    for (v, &bb) in y.iter_mut().zip(b) {
+                        *v += bb;
+                    }
+                }
+                y
+            }
+        }
+    }
+
+    /// Each of `rows` through the projection, bit-identical per row to
+    /// [`Self::row`]: one M=B GEMM for int8, a row at a time for f32.
+    fn rows(&self, rows: &[Vec<f32>], bias: Option<&[f32]>) -> Vec<Vec<f32>> {
+        match self {
+            Self::I8(q) => {
+                let prequant: Vec<(Vec<i8>, f32)> = rows
+                    .iter()
+                    .map(|r| decoder::quantize_row_i8_te(r))
+                    .collect();
+                let prequant: Vec<(&[i8], f32)> =
+                    prequant.iter().map(|(q, a)| (q.as_slice(), *a)).collect();
+                decoder::gemm_i8_bias_prequant_batched(&prequant, q, bias)
+            }
+            Self::F32(_) => rows.iter().map(|r| self.row(r, bias)).collect(),
+        }
+    }
 }
 
 /// Add the learned absolute-position rows (Opt) to `x` in place: token `i`
@@ -962,12 +1077,15 @@ impl GotDecodeWeights {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let p = format!("{}{l}", cfg.layers_prefix);
-            let q =
-                decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.q_proj.weight"), q_dim)?;
-            let k =
-                decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.k_proj.weight"), kv_dim)?;
-            let v =
-                decoder::quant_oc_loaded(weights, &format!("{p}.self_attn.v_proj.weight"), kv_dim)?;
+            let attn = |name: &str, out: usize, in_: usize| {
+                AttnW::loaded(weights, &format!("{p}.self_attn.{name}.weight"), out, in_)
+            };
+            let qkv = AttnW::fused_qkv(
+                attn("q_proj", q_dim, hidden)?,
+                attn("k_proj", kv_dim, hidden)?,
+                attn("v_proj", kv_dim, hidden)?,
+                &p,
+            )?;
             let qkv_bias = if cfg.attn_qkv_bias {
                 let mut b = weights.vec(&format!("{p}.self_attn.q_proj.bias"))?;
                 b.extend(weights.vec(&format!("{p}.self_attn.k_proj.bias"))?);
@@ -980,13 +1098,9 @@ impl GotDecodeWeights {
                 layers.push(GotLayerW {
                     input_ln: weights.vec(&format!("{p}.self_attn_layer_norm.weight"))?,
                     post_attn_ln: weights.vec(&format!("{p}.final_layer_norm.weight"))?,
-                    qkv: concat_qkv(&q, &k, &v),
+                    qkv,
                     qkv_bias,
-                    o: decoder::quant_oc_loaded(
-                        weights,
-                        &format!("{p}.self_attn.out_proj.weight"),
-                        hidden,
-                    )?,
+                    o: attn("out_proj", hidden, q_dim)?,
                     o_bias: Some(weights.vec(&format!("{p}.self_attn.out_proj.bias"))?),
                     ln_bias: Some((
                         weights.vec(&format!("{p}.self_attn_layer_norm.bias"))?,
@@ -1004,13 +1118,9 @@ impl GotDecodeWeights {
             layers.push(GotLayerW {
                 input_ln: weights.vec(&format!("{p}.input_layernorm.weight"))?,
                 post_attn_ln: weights.vec(&format!("{p}.post_attention_layernorm.weight"))?,
-                qkv: concat_qkv(&q, &k, &v),
+                qkv,
                 qkv_bias,
-                o: decoder::quant_oc_loaded(
-                    weights,
-                    &format!("{p}.self_attn.o_proj.weight"),
-                    hidden,
-                )?,
+                o: attn("o_proj", hidden, q_dim)?,
                 o_bias: None,
                 ln_bias: None,
                 mlp: MlpW::SwiGlu {
@@ -1194,7 +1304,7 @@ fn forward_prefill_seed(
         let ln1_b = cl.ln_bias.as_ref().map(|(a, _)| a.as_slice());
         let normed = family_norm(&x, &cl.input_ln, ln1_b, eps)?;
         // one fused q|k|v GEMM (m=N, row-parallel), then split the columns.
-        let qkv = nn::linear_int8_dynamic(&normed, &cl.qkv, cl.qkv_bias.as_deref())?;
+        let qkv = cl.qkv.forward(&normed, cl.qkv_bias.as_deref())?;
         let (mut q, mut k, v) = split_qkv_rows(&qkv, q_dim, kv_dim);
         if w.embed_positions.is_none() {
             decoder::apply_rope(&mut q, &rope)?;
@@ -1204,7 +1314,7 @@ fn forward_prefill_seed(
         // per-head kv mapping reads it at kv_dim stride.
         caches[l].seed(&k.data, &v.data);
         let ctx = prefill_attention_gqa(&q, &k, &v, cfg)?;
-        let attn = nn::linear_int8_dynamic(&ctx, &cl.o, cl.o_bias.as_deref())?;
+        let attn = cl.o.forward(&ctx, cl.o_bias.as_deref())?;
         let h = decoder::add_residual(&x, &attn)?;
         let ln2_b = cl.ln_bias.as_ref().map(|(_, b)| b.as_slice());
         let normed2 = family_norm(&h, &cl.post_attn_ln, ln2_b, eps)?;
@@ -1313,11 +1423,10 @@ fn qwen2_decode_step(
     add_learned_positions(&mut x, w, position)?;
     let tlayers = Instant::now();
     for (l, cl) in w.layers.iter().enumerate() {
-        // ── attention: quantize the normed row ONCE, fused q|k|v GEMV (n-parallel) ──
+        // ── attention: one fused q|k|v GEMV (n-parallel) over the normed row ──
         let ln1_b = cl.ln_bias.as_ref().map(|(a, _)| a.as_slice());
         let normed = family_norm(&x, &cl.input_ln, ln1_b, eps)?;
-        let (xq, a) = decoder::quantize_row_i8_te(&normed.data);
-        let qkv = decoder::gemv_i8_bias_prequant(&xq, a, &cl.qkv, cl.qkv_bias.as_deref());
+        let qkv = cl.qkv.row(&normed.data, cl.qkv_bias.as_deref());
         let mut q = Mat::from_vec(1, q_dim, qkv[0..q_dim].to_vec());
         let mut k = Mat::from_vec(1, kv_dim, qkv[q_dim..q_dim + kv_dim].to_vec());
         let v = &qkv[q_dim + kv_dim..q_dim + 2 * kv_dim];
@@ -1329,8 +1438,7 @@ fn qwen2_decode_step(
         let ta = Instant::now();
         let ctx = qwen2_decode_attention(&caches[l], &q.data, num_heads, head_dim, kv_group);
         DECODE_ATTN_NS.fetch_add(ta.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        let (xqc, ac) = decoder::quantize_row_i8_te(&ctx);
-        let attn = decoder::gemv_i8_bias_prequant(&xqc, ac, &cl.o, cl.o_bias.as_deref());
+        let attn = cl.o.row(&ctx, cl.o_bias.as_deref());
         let h = decoder::add_residual(&x, &Mat::from_vec(1, hidden, attn))?;
         // ── MLP: quantize normed2 ONCE (SwiGLU shares it for gate + up) ──────────
         let ln2_b = cl.ln_bias.as_ref().map(|(_, b)| b.as_slice());
@@ -1457,19 +1565,16 @@ fn qwen2_batched_decode_step(
     }
 
     for (l, cl) in w.layers.iter().enumerate() {
-        // ── attention: per-stream norm + ties-to-even quantize, ONE M=B qkv GEMM ──
+        // ── attention: per-stream norm, ONE M=B qkv GEMM ──
         let ln1_b = cl.ln_bias.as_ref().map(|(a, _)| a.as_slice());
-        let mut prequant: Vec<(Vec<i8>, f32)> = Vec::with_capacity(b);
+        let mut normed_rows: Vec<Vec<f32>> = Vec::with_capacity(b);
         for xs_row in &x {
-            let normed = family_norm(xs_row, &cl.input_ln, ln1_b, eps)?;
-            prequant.push(decoder::quantize_row_i8_te(&normed.data));
+            normed_rows.push(family_norm(xs_row, &cl.input_ln, ln1_b, eps)?.data);
         }
-        let rows: Vec<(&[i8], f32)> = prequant.iter().map(|(q, a)| (q.as_slice(), *a)).collect();
-        let qkv_rows =
-            decoder::gemm_i8_bias_prequant_batched(&rows, &cl.qkv, cl.qkv_bias.as_deref());
+        let qkv_rows = cl.qkv.rows(&normed_rows, cl.qkv_bias.as_deref());
 
         // ── per-stream: split/RoPE/append/attend, then ONE M=B o_proj ──
-        let mut ctx_prequant: Vec<(Vec<i8>, f32)> = Vec::with_capacity(b);
+        let mut ctx_rows: Vec<Vec<f32>> = Vec::with_capacity(b);
         for (s, qkv) in qkv_rows.iter().enumerate() {
             let mut q = Mat::from_vec(1, q_dim, qkv[0..q_dim].to_vec());
             let mut k = Mat::from_vec(1, kv_dim, qkv[q_dim..q_dim + kv_dim].to_vec());
@@ -1486,14 +1591,9 @@ fn qwen2_batched_decode_step(
                 head_dim,
                 kv_group,
             );
-            ctx_prequant.push(decoder::quantize_row_i8_te(&ctx));
+            ctx_rows.push(ctx);
         }
-        let ctx_rows: Vec<(&[i8], f32)> = ctx_prequant
-            .iter()
-            .map(|(q, a)| (q.as_slice(), *a))
-            .collect();
-        let attn_rows =
-            decoder::gemm_i8_bias_prequant_batched(&ctx_rows, &cl.o, cl.o_bias.as_deref());
+        let attn_rows = cl.o.rows(&ctx_rows, cl.o_bias.as_deref());
         let mut h: Vec<Mat> = Vec::with_capacity(b);
         for (s, attn) in attn_rows.into_iter().enumerate() {
             h.push(decoder::add_residual(
@@ -1917,10 +2017,24 @@ mod tests {
         QInt8::new(w, scales, n, k)
     }
 
+    /// An attention projection: [`synth_q`]'s int8, or with `f32_attn` the
+    /// same values dequantized, as an artifact that keeps attention high
+    /// precision loads it (bd-kd75).
+    fn synth_attn(n: usize, k: usize, seed: usize, f32_attn: bool) -> AttnW {
+        let q = synth_q(n, k, seed);
+        if !f32_attn {
+            return AttnW::I8(q);
+        }
+        let w = (0..n * k)
+            .map(|i| f32::from(q.w[i]) * q.scales[i / k])
+            .collect();
+        AttnW::F32(Mat::from_vec(n, k, w))
+    }
+
     /// A tiny synthetic dense model for a family: 2 layers, hidden 8, 2 heads,
     /// head_dim 4, inner 16, vocab 12 — every code path of the real shapes at
-    /// unit-test cost.
-    fn synth_weights(family: DecoderFamily) -> GotDecodeWeights {
+    /// unit-test cost. `f32_attn` keeps its attention high precision.
+    fn synth_weights(family: DecoderFamily, f32_attn: bool) -> GotDecodeWeights {
         let (hidden, inter, vocab, layers_n) = (8usize, 16usize, 12usize, 2usize);
         let opt = matches!(family, DecoderFamily::Opt);
         let layers = (0..layers_n)
@@ -1933,13 +2047,13 @@ mod tests {
                     post_attn_ln: (0..hidden)
                         .map(|i| 1.0 + det_f32(i + seed + 77) * 0.01)
                         .collect(),
-                    qkv: synth_q(3 * hidden, hidden, seed + 1),
+                    qkv: synth_attn(3 * hidden, hidden, seed + 1, f32_attn),
                     qkv_bias: Some(
                         (0..3 * hidden)
                             .map(|i| det_f32(i + seed + 2) * 0.05)
                             .collect(),
                     ),
-                    o: synth_q(hidden, hidden, seed + 3),
+                    o: synth_attn(hidden, hidden, seed + 3, f32_attn),
                     o_bias: opt
                         .then(|| (0..hidden).map(|i| det_f32(i + seed + 4) * 0.05).collect()),
                     ln_bias: opt.then(|| {
@@ -2035,11 +2149,14 @@ mod tests {
     /// step's logits from [`qwen2_batched_decode_step`] are BIT-IDENTICAL
     /// (`f32::to_bits` equality) to [`qwen2_decode_step`] run per stream alone —
     /// for BOTH dense families (QwenLlama incl RoPE; Opt incl learned positions,
-    /// LayerNorm biases, biased ReLU MLP).
+    /// LayerNorm biases, biased ReLU MLP), with int8 and with f32 attention.
     #[test]
     fn batched_dense_decode_step_is_bit_identical_per_stream() {
-        for family in [DecoderFamily::QwenLlama, DecoderFamily::Opt] {
-            let w = synth_weights(family);
+        let cases = [DecoderFamily::QwenLlama, DecoderFamily::Opt]
+            .into_iter()
+            .flat_map(|family| [(family, false), (family, true)]);
+        for (family, f32_attn) in cases {
+            let w = synth_weights(family, f32_attn);
             let hidden = w.cfg.hidden_size;
             let prefill_lens = [3usize, 5, 8];
             let b = prefill_lens.len();
@@ -2087,25 +2204,29 @@ mod tests {
                             .all(|(a, bb)| a.to_bits() == bb.to_bits());
                     assert!(
                         identical,
-                        "family {family:?} stream {s} step {step}: batched logits != solo (LOSSLESS contract broken)"
+                        "family {family:?} f32_attn {f32_attn} stream {s} step {step}: batched logits != solo (LOSSLESS contract broken)"
                     );
                 }
             }
             println!(
-                "{{\"check\":\"batched_dense_decode_bit_identity\",\"family\":\"{family:?}\",\"streams\":{b},\"steps\":4,\"result\":\"pass\"}}"
+                "{{\"check\":\"batched_dense_decode_bit_identity\",\"family\":\"{family:?}\",\"f32_attn\":{f32_attn},\"streams\":{b},\"steps\":4,\"result\":\"pass\"}}"
             );
         }
     }
 
     /// THE scheduler-level lossless gate: [`generate_greedy_batched_with`]'s
     /// id-stream per page is IDENTICAL to [`generate_greedy_kvcache_with`] run
-    /// per page alone — mixed prefill lengths, both dense families, and BOTH
-    /// termination shapes (cap-bounded with an unreachable EOS; genuine EOS
-    /// retirement mid-batch with backfill-order preserved).
+    /// per page alone — mixed prefill lengths, both dense families, int8 and
+    /// f32 attention, and BOTH termination shapes (cap-bounded with an
+    /// unreachable EOS; genuine EOS retirement mid-batch with backfill-order
+    /// preserved).
     #[test]
     fn batched_generate_ids_match_solo_per_page() {
-        for family in [DecoderFamily::QwenLlama, DecoderFamily::Opt] {
-            let w = synth_weights(family);
+        let cases = [DecoderFamily::QwenLlama, DecoderFamily::Opt]
+            .into_iter()
+            .flat_map(|family| [(family, false), (family, true)]);
+        for (family, f32_attn) in cases {
+            let w = synth_weights(family, f32_attn);
             let hidden = w.cfg.hidden_size;
             // Three pages with DIFFERENT prompt lengths (deterministic embeds).
             let pages: Vec<Mat> = [3usize, 6, 4]
@@ -2131,7 +2252,8 @@ mod tests {
             let caps = vec![max_new; pages.len()];
             let batched =
                 generate_greedy_batched_with(&w, &pages, &caps, u32::MAX).expect("batched");
-            assert_eq!(solo, batched, "family {family:?}: cap-bounded ids diverged");
+            let case = format!("family {family:?} f32_attn {f32_attn}");
+            assert_eq!(solo, batched, "{case}: cap-bounded ids diverged");
 
             // Mixed PER-STREAM caps: each page must emit exactly its own
             // solo-run stream under its own cap (the position-budget case).
@@ -2145,7 +2267,7 @@ mod tests {
                 generate_greedy_batched_with(&w, &pages, &mixed, u32::MAX).expect("batched");
             assert_eq!(
                 solo_mixed, batched_mixed,
-                "family {family:?}: mixed per-stream caps diverged"
+                "{case}: mixed per-stream caps diverged"
             );
 
             // Case 2: a REAL mid-stream EOS — pick page 1's 3rd solo token as
@@ -2157,20 +2279,187 @@ mod tests {
                 .collect();
             let batched_eos =
                 generate_greedy_batched_with(&w, &pages, &caps, eos).expect("batched");
-            assert_eq!(
-                solo_eos, batched_eos,
-                "family {family:?}: EOS-retirement ids diverged"
-            );
+            assert_eq!(solo_eos, batched_eos, "{case}: EOS-retirement ids diverged");
             assert!(
                 solo_eos
                     .iter()
                     .any(|ids| ids.last() == Some(&eos) && ids.len() < max_new),
-                "family {family:?}: the EOS case never actually retired early — test defanged"
+                "{case}: the EOS case never actually retired early — test defanged"
             );
             println!(
-                r#"{{"check":"batched_generate_ids_match_solo","family":"{family:?}","pages":3,"result":"pass"}}"#
+                r#"{{"check":"batched_generate_ids_match_solo","family":"{family:?}","f32_attn":{f32_attn},"pages":3,"result":"pass"}}"#
             );
         }
+    }
+
+    /// A tiny GOT-shaped `.focrq` with [`synth_weights`]' shapes: the decoder
+    /// FFN stored int8, each attention projection stored as `attn` says.
+    fn tiny_got_blob(attn: impl Fn(&str) -> crate::quant::focrq::WriteDType) -> Vec<u8> {
+        use crate::quant::focrq::{FocrqBuilder, WriteDType};
+        fn put(b: &mut FocrqBuilder, name: &str, shape: Vec<usize>, v: &[f32], dt: WriteDType) {
+            if dt == WriteDType::QInt8PerChan {
+                let q = nn::quantize_int8(v, shape[0], shape[1]);
+                let w = q.w.iter().map(|&x| x as u8).collect();
+                let s = q.scales.iter().flat_map(|x| x.to_le_bytes()).collect();
+                b.add_quantized(name, dt, shape, w, s, 0, 0)
+                    .expect("int8 tensor");
+            } else {
+                let bf16 = v
+                    .iter()
+                    .flat_map(|x| ((x.to_bits() >> 16) as u16).to_le_bytes())
+                    .collect();
+                b.add_tensor(name, WriteDType::Bf16, shape, bf16)
+                    .expect("bf16 tensor");
+            }
+        }
+        let (hidden, inter, vocab) = (8usize, 16usize, 12usize);
+        let vals = |n: usize, seed: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| det_f32(i + seed) * scale).collect()
+        };
+        let norm = |seed: usize| -> Vec<f32> {
+            (0..hidden)
+                .map(|i| 1.0 + det_f32(i + seed) * 0.01)
+                .collect()
+        };
+        let mut b = FocrqBuilder::new();
+        for l in 0..2 {
+            let (p, seed) = (format!("model.layers.{l}"), l * 10_000);
+            put(
+                &mut b,
+                &format!("{p}.input_layernorm.weight"),
+                vec![hidden],
+                &norm(seed),
+                WriteDType::Bf16,
+            );
+            put(
+                &mut b,
+                &format!("{p}.post_attention_layernorm.weight"),
+                vec![hidden],
+                &norm(seed + 77),
+                WriteDType::Bf16,
+            );
+            for (i, proj) in ["q_proj", "k_proj", "v_proj", "o_proj"].iter().enumerate() {
+                let name = format!("{p}.self_attn.{proj}.weight");
+                let w = vals(hidden * hidden, seed + 100 * i, 0.3);
+                put(&mut b, &name, vec![hidden, hidden], &w, attn(&name));
+                if i < 3 {
+                    let bias = vals(hidden, seed + 100 * i + 50, 0.05);
+                    put(
+                        &mut b,
+                        &format!("{p}.self_attn.{proj}.bias"),
+                        vec![hidden],
+                        &bias,
+                        WriteDType::Bf16,
+                    );
+                }
+            }
+            for (i, (proj, shape)) in [
+                ("gate_proj", vec![inter, hidden]),
+                ("up_proj", vec![inter, hidden]),
+                ("down_proj", vec![hidden, inter]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let w = vals(inter * hidden, seed + 1_000 + 100 * i, 0.3);
+                put(
+                    &mut b,
+                    &format!("{p}.mlp.{proj}.weight"),
+                    shape,
+                    &w,
+                    WriteDType::QInt8PerChan,
+                );
+            }
+        }
+        put(
+            &mut b,
+            "model.embed_tokens.weight",
+            vec![vocab, hidden],
+            &vals(vocab * hidden, 555, 0.2),
+            WriteDType::Bf16,
+        );
+        put(
+            &mut b,
+            "model.norm.weight",
+            vec![hidden],
+            &norm(999),
+            WriteDType::Bf16,
+        );
+        b.build()
+    }
+
+    /// bd-kd75: the KV-cache decode keeps attention in the precision its file
+    /// stores. On a tiny GOT-shaped artifact with BF16 attention and int8 FFN
+    /// it emits the re-prefill reference's ids ([`linear_auto`] honours stored
+    /// dtypes), and its first logits sit on the reference's, where the same
+    /// values with attention stored int8, which is what building with
+    /// attention quantized whatever the file held decodes, land far off.
+    #[test]
+    fn kvcache_decode_keeps_attention_in_its_stored_precision() {
+        use crate::quant::focrq::WriteDType;
+        let cfg = synth_weights(DecoderFamily::QwenLlama, false).cfg;
+        let load = |attn: fn(&str) -> WriteDType| {
+            Weights::from_bytes(tiny_got_blob(attn)).expect("tiny GOT artifact")
+        };
+        let hybrid = load(|_| WriteDType::Bf16);
+        let shipped = load(|_| WriteDType::QInt8PerChan);
+        let wh = GotDecodeWeights::build(&hybrid, &cfg).expect("hybrid build");
+        let ws = GotDecodeWeights::build(&shipped, &cfg).expect("shipped build");
+        assert!(
+            wh.layers
+                .iter()
+                .all(|l| matches!((&l.qkv, &l.o), (AttnW::F32(_), AttnW::F32(_))))
+        );
+        assert!(
+            ws.layers
+                .iter()
+                .all(|l| matches!((&l.qkv, &l.o), (AttnW::I8(_), AttnW::I8(_))))
+        );
+
+        let prompt = Mat::from_vec(5, 8, (0..40).map(|i| det_f32(i + 31_337) * 0.3).collect());
+        let reference = forward_prefill(&hybrid, &cfg, &prompt).expect("reference");
+        let reference = &reference.data[(reference.rows - 1) * reference.cols..];
+        let gap = |w: &GotDecodeWeights| {
+            let mut caches: Vec<Qwen2KvCache> = (0..cfg.num_hidden_layers)
+                .map(|_| Qwen2KvCache::new(cfg.kv_dim(), prompt.rows))
+                .collect();
+            let logits = forward_prefill_seed(w, &prompt, &mut caches).expect("seed");
+            logits
+                .iter()
+                .zip(reference)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max)
+        };
+        let (kept, quantized) = (gap(&wh), gap(&ws));
+        println!(
+            r#"{{"check":"kvcache_attention_precision","kept_gap":{kept},"quantized_gap":{quantized}}}"#
+        );
+        assert!(
+            kept < 1e-4,
+            "BF16 attention decoded {kept} off the reference"
+        );
+        assert!(
+            quantized > 100.0 * kept.max(1e-6),
+            "int8 attention landed only {quantized} off the reference: test defanged"
+        );
+
+        for (name, weights) in [("bf16 attention", &hybrid), ("int8 attention", &shipped)] {
+            let kv = generate_greedy_kvcache(weights, &cfg, &prompt, 8, u32::MAX).expect("kv");
+            let re = generate_greedy(weights, &cfg, &prompt, 8, u32::MAX).expect("re-prefill");
+            assert_eq!(kv, re, "{name}: KV-cache ids diverged from the reference");
+        }
+
+        let mixed = load(|name| {
+            if name.ends_with("layers.0.self_attn.k_proj.weight") {
+                WriteDType::QInt8PerChan
+            } else {
+                WriteDType::Bf16
+            }
+        });
+        let err = GotDecodeWeights::build(&mixed, &cfg)
+            .err()
+            .expect("mixed q/k/v refused");
+        assert!(err.to_string().contains("different precisions"), "{err}");
     }
 
     /// The batched prequant GEMM helper equals the m=1 kernel per row (with and
