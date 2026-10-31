@@ -142,3 +142,6 @@ Checks run:
   differ from the pin only in `README.md`, `.gitattributes` and the wheel (dev10
   removed, dev13 added with LFS oid `576c71da…`, the SHA-256 above): the delta
   already reviewed. Every model, code, tokenizer and weight file is unchanged.
+- 2026-10-30 (U2-E4, before publishing): HEAD still `c14071b5`. The same 28-entry
+  listings, the same delta (`README.md`, `.gitattributes`, the dev10 → dev13 wheel).
+  Every model, code, tokenizer and weight file is unchanged.

@@ -478,6 +478,24 @@ sections as they land.
   Like v2's, it needs the raw checkpoint. Before, v1 ignored the variable and
   ran the int8 path. Setting it together with the full-int8 decoder
   (`FOCR_DECODE_INT8` or the library override) is now a usage error.
+- **`focr pull <model>` installs a model as one package** (U2-E4, bd-jprb).
+  A model that lives in its own cache directory (`models/<model>/`) is
+  assembled in a hidden sibling directory, verified, and swapped in whole, so
+  its artifact and tokenizer always come from the same pull. Files already in
+  place are hard-linked into the new package, not downloaded again. If a pull
+  is interrupted mid-swap, the next pull of that model restores the previous
+  package before it does anything else, and `focr doctor` reports the state
+  (`interrupted_package_install`, `superseded_package_left`,
+  `abandoned_package_stage`) with that pull as the repair. The default
+  model's flat files are renamed in only after all of them have verified, so a
+  failed download no longer leaves a new artifact beside an old tokenizer. The
+  model search no longer reads hidden directories. `focr pull --json` writes
+  one NDJSON line per step on stderr: each part with its expected and computed
+  SHA-256, each whole-file check, and the install outcome (`installed`,
+  `cached`, `rolled_back`, `refused`, `recovered`). A manifest model entry may
+  carry a `version`, which every artifact filename must contain and which
+  must match the version this runtime runs. A missing `--model <id>` names
+  `focr pull <id>` when this release publishes that model.
 
 ### Fixed
 

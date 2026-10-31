@@ -947,7 +947,7 @@ export FOCR_MODEL_PATH=/path/to/Unlimited-OCR
 focr ocr page.png
 ```
 
-Run `focr pull` to install the v0.7.0 conservative exact-recipe artifact. If a download is interrupted, rerun the command: the pull lock is process-scoped, orphan staging files are diagnosed by `focr doctor`, and no artifact becomes visible until every part and the final reassembled hash verify. Use `focr models` to inspect the complete model zoo.
+Run `focr pull` to install the v0.7.0 conservative exact-recipe artifact. If a download is interrupted, rerun the command: the pull lock is process-scoped, orphan staging files are diagnosed by `focr doctor`, and no file becomes visible until every part and the final reassembled hash verify. A pull renames nothing into place until all of the model's files have verified. A model installed in its own directory (`focr pull <model>`, under `models/<model>/`) is replaced as one package, so its artifact and tokenizer always match. If a pull is interrupted mid-swap, the next pull of that model restores the previous package, and `focr doctor` reports it. `focr pull --json` reports each part's SHA-256 and the install outcome as NDJSON lines on stderr. Use `focr models` to inspect the complete model zoo.
 
 ### Wrong or missing SIMD tier
 
