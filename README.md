@@ -336,7 +336,7 @@ The same engine exposes the surfaces the CLI uses:
 | `recognize_with_figures(path)` | Return Markdown/layout plus cropped figure regions, matching `--extract-figures`. |
 | `recognize_dynamic(image)` | Run an already-decoded `image::DynamicImage`, the same in-memory path used by PDF rasterization. |
 | `recognize_batch(&[paths])` | Load weights once and return one result per input path, in order. |
-| `recognize_document(model, source, &options, on_item, on_page)` | Parse a PDF, a directory or a list of pages as ONE cross-page document, matching `--multi-page`. The `PageSource` is read one page at a time; `on_page` streams each page as it ends. The `DocumentResult` has the markdown, the pages, the skipped pages and the `finish_reason`. A document that stops early returns the pages it completed. |
+| `recognize_document(model, source, &options, on_item, on_page)` | Parse a PDF, a directory or a list of pages as ONE cross-page document, matching `--multi-page`. The `PageSource` is read one page at a time; `on_page` streams each page as it ends. `DocumentOptions` picks the decode windows (Unlimited-OCR-2 reads windows of 10 pages by default; `PageWindow::Off` is one pass). The `DocumentResult` has the markdown, the pages, the skipped pages, the windows and the `finish_reason`. A document that stops early returns the pages it completed. |
 | `request_shutdown()` / `reset_shutdown()` | Drive cooperative cancellation for long-running embedders. |
 
 A document parse, using the pages of a PDF:
@@ -441,9 +441,9 @@ at a time as the run reaches them, so a long book never holds every page image
 in memory.
 
 **Multi-page cross-page parsing (`--multi-page`).** By default every page is
-parsed independently. `--multi-page` instead runs ONE pass over the whole
-document using the Unlimited-OCR `infer_multi` contract, so page N can reference
-content on pages 1..N-1, and the output is a single Markdown document with
+parsed independently. `--multi-page` instead parses the whole document across
+pages using the Unlimited-OCR `infer_multi` contract, so page N can reference
+content on the pages before it, and the output is a single Markdown document with
 `<PAGE>` separators. On `focr ocr` it takes a PDF or a directory of page
 images and composes with `--pages`; for an image list use `focr ocr-batch
 page1.png page2.png --multi-page`. v1 has
@@ -456,15 +456,19 @@ boundaries are unreliable. On v1 it does not compose with `--split-spreads` or
 when the text has exactly one body per page (otherwise `pages: []`).
 
 Unlimited-OCR-2 (`--model unlimited-ocr-2`) emits exactly one `<PAGE>` per page,
-so its document mode has real pages. `--json` lists one `pages[]` entry per page
-read: `page` (the source page), `half` on a split spread, `run_index`, `text`,
-`layout` (boxes in that page's own pixels), `tokens` and `finish` (`marker`,
-`eos`, `page_cap`, `length`, `budget` or `cancelled`). It composes with `--split-spreads`
+so its document mode has real pages. A document of more than 10 pages is read
+in windows of 10: each window's prompt holds its own pages and the next
+window's first, a page sees the pages before it in its window, and memory stays
+bounded at any length. A window that stops early ends the document with its
+completed pages. `--json` lists one `pages[]` entry per page
+read: `page` (the source page), `half` on a split spread, `run_index`, `window`
+when windowed, `text`, `layout` (boxes in that page's own pixels), `tokens` and
+`finish` (`marker`, `eos`, `page_cap`, `length`, `budget` or `cancelled`). It composes with `--split-spreads`
 (each half is one page of the prompt) and with `--extract-figures`: figures are
 cropped from their page after the decode and named `page{N}_figure_{M}`, or
 `page{N}l_figure_{M}` / `page{N}r_figure_{M}` on a half. Robot `page` events add
-`source_page`, `half`, `model_id`, and for decoded pages `tokens`, `finish` and
-`elapsed_ms`.
+`source_page`, `half`, `model_id`, and for decoded pages `tokens`, `finish` and,
+for a page read in one pass, `elapsed_ms`.
 
 **Tall captures (full-page screenshots).** A full-page browser capture (e.g. the
 Awesome Screenshot extension) is one extremely tall image — 1:4 to 1:10 aspect.
@@ -577,7 +581,7 @@ focr models --json                          # machine-readable list
 | **`smolvlm2`** | ready | Photo description and VQA through `--task describe [--question "..."]`. | `focr pull smolvlm2` installs `smolvlm2.int8.focrq` plus `tokenizer.json` in the model subdirectory. |
 | **`onechart`** | ready | Chart-to-data extraction through `--task chart-data`. | `focr pull onechart` installs `onechart.int8.focrq`, `vocab.json`, `merges.txt`, and `added_tokens.json`. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. |
 | **`tromr`** | ready | Polyphonic sheet-music OMR through `--task music`. | `focr pull tromr` installs `tromr.int8.focrq` plus the rhythm, pitch, lift, and note tokenizer tables; `focr pull tromr --quant f32` installs the bit-exact `tromr.focrq` reference artifact. Staff crops and full pages both run; bad staves are skipped with reasons when at least one staff recognizes, and over-budget systems can split at detected barlines. |
-| **`unlimited-ocr-2`** | experimental | Baidu's long-document successor to the default model (sparse routed attention across pages). | Runs from its raw checkpoint directory (`--model <dir>`) on single pages and on documents of up to 60 pages (`--multi-page`). A document that stops early at its position limit or forward budget writes its pages, then exits 5. Not yet certified against the reference, so use `unlimited-ocr` for production. |
+| **`unlimited-ocr-2`** | experimental | Baidu's long-document successor to the default model (sparse routed attention across pages). | Runs from its raw checkpoint directory (`--model <dir>`) on single pages and on documents of any length (`--multi-page`, read in windows of 10 pages). A document that stops early at its position limit or forward budget writes its pages, then exits 5. Not yet certified against the reference, so use `unlimited-ocr` for production. |
 | **`trocr`**, **`pix2tex`** | planned | Handwriting and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
 
 `unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` only when you need format extraction (formulas, tables, charts, etc.); it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:

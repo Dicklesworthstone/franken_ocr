@@ -249,8 +249,8 @@ sections as they land.
   - Pages split on the marker's token id. Text before the first marker is
     prepended to page 1 with a `leading_text` warning, so N pages always give N
     bodies (DISC-U2-9).
-  - A document holds at most 60 pages in one pass. A larger one exits 2 before
-    any page is read, naming `--pages`.
+  - One pass is sized for at most 60 pages; a longer document reads in
+    windows (U2-D1b, below).
   - A document that stops early is not silently truncated. At the 131,072
     position limit, or when `FOCR_STAGE_BUDGET_FORWARD_MS` (scaled by the page
     count) runs out, the pages produced are written first. The run then exits 5
@@ -305,6 +305,31 @@ sections as they land.
     equal to the oracle's. With the v2 tokenizer present, the stitched page
     bodies must equal the wheel's byte for byte. One difference remains, on a
     path only a test hook reaches (DISC-U2-12).
+- **Unlimited-OCR-2 reads documents of any length** (bead U2-D1b).
+  `recognize_document`, and so `focr ocr --multi-page` and `ocr-batch
+  --multi-page`, read a v2 document of more than 10 pages in windows of 10
+  (U2-D1a's core) instead of refusing one over 60 pages. A document of 10
+  pages or fewer still reads in one pass.
+  - Pages are read as each window starts, and each raster is dropped once
+    preprocessed. At most one window and its lookahead, 11 pages, are held
+    between being read and being written out, and vision runs once per page.
+  - A page that does not read is skipped and keeps its number. The windows
+    are planned over the pages that read.
+  - Each window's pages stream to the page sink as the window ends. Every
+    windowed `PageResult` names its `window`, and `DocumentResult.windows`
+    holds each window's statistics. `FOCR_TIMING` gains a `document:` row
+    with pages read, pages skipped, windows, vision encodes and fallback
+    recomputes, and the human `ocr-batch --multi-page` summary names the
+    windows.
+  - A window that stops at its position limit now ends the document, as a
+    spent budget or a cancel does, with its completed pages (exit 5, or 6
+    for a cancel). Before, the next window ran and the stopped window's
+    remaining pages were missing from the middle of the output. The
+    `v2_length` and `v2_budget` warnings name the page the stop fell in, or
+    "before page N" when a window's budget ran out before its prefill.
+  - `PageWindow::Pages(n)` reads in windows of n pages (at most 60), and
+    `PageWindow::Off` reads every page in one pass. v1 still reads a document
+    in one pass and refuses a window smaller than the document.
 - **Directory input, and documents read one page at a time** (bead U2-D0).
   - `focr ocr ./pages/` reads a directory of page images as one document, in
     natural order (`p2.png` before `p10.png`). `--pages`, `--split-spreads`
@@ -413,11 +438,11 @@ sections as they land.
     or 6 for a cancel, with a `run_error` carrying `finish_reason` and
     `pages_out`. Ctrl+C on an Unlimited-OCR-2 document now keeps its pages.
   - `DocumentOptions` (`page_window`, `resume`, with chaining setters) refuses
-    what this build cannot honor rather than ignoring it: a window smaller
-    than the document and `PageWindow::Auto` until windowed documents land
-    (U2-D1b), and resume until checkpoints land (U2-D4).
-    `PageWindow::Off`, or a window as large as the document, reads past
-    Unlimited-OCR-2's 60-page limit, and the position limit then stops it.
+    what this build cannot honor rather than ignoring it: `PageWindow::Auto`
+    until memory sizing lands (U2-D3), a v1 window smaller than the document
+    (v1 has no windowed decoding), and resume until checkpoints land (U2-D4).
+    `PageWindow::Off` reads an Unlimited-OCR-2 document in one pass, however
+    long, and the position limit then stops it.
   - `ocr-batch --multi-page` skips an image that does not decode instead of
     failing the run, names it on stderr and lists it in the JSON `skipped`
     (`page`, `image`, `reason`); the run fails only when no image decodes.
