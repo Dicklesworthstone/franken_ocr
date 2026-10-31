@@ -470,6 +470,23 @@ cropped from their page after the decode and named `page{N}_figure_{M}`, or
 `source_page`, `half`, `model_id`, and for decoded pages `tokens`, `finish` and,
 for a page read in one pass, `elapsed_ms`.
 
+**Stopping and resuming a long document.** After each window, a windowed
+Unlimited-OCR-2 run appends its pages to a journal and replaces a checkpoint:
+`<out>.partial` and `<out>.focr-ckpt` beside `-o`, or
+`~/.cache/franken_ocr/document-runs/<key>/` when the output goes to stdout.
+Ctrl+C or a spent stage budget writes the completed pages and exits 6 or 5, and
+the terminal `run_error` names the `checkpoint`. Re-running the same command
+(`--resume` says so explicitly) continues from the last completed window, and
+the result is byte-identical to an uninterrupted run; `resumed_from` on the
+terminal event gives the page decoding restarted at, and a stdout run prints the
+whole document again. The pages of a window that was interrupted are decoded
+again. A run whose input, page selection or decode settings differ is refused,
+with the fields named. `--resume=recompute` then keeps the completed pages and
+recomputes the next window: the pages after it can differ, so a
+`resume_recompute` warning says so. Both files are removed when the document
+finishes (`--keep-checkpoint` keeps the checkpoint), and `focr doctor` lists a
+stale stdout run with the command that continues it.
+
 **Tall captures (full-page screenshots).** A full-page browser capture (e.g. the
 Awesome Screenshot extension) is one extremely tall image — 1:4 to 1:10 aspect.
 A single model pass over such an image squashes glyphs below legibility and used

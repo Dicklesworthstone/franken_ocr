@@ -28,6 +28,21 @@ sections as they land.
 
 ### Added
 
+- **Durable resume for long documents** (bead U2-D4). A windowed Unlimited-OCR-2
+  `--multi-page` run keeps a journal of its completed pages and a checkpoint of
+  the last window boundary (`<out>.partial`, `<out>.focr-ckpt`, or
+  `<cache_root>/document-runs/<key digest>/` for stdout). Re-running the same
+  command or passing `--resume` continues byte-identically to an uninterrupted
+  run; a run whose resume key differs is refused by field name, and
+  `--resume=recompute` keeps the completed pages with a `resume_recompute`
+  warning. `--keep-checkpoint` keeps the checkpoint after a finished run.
+  `run_complete` and a partial `run_error` carry `resumed_from`, a partial
+  `run_error` carries `checkpoint`, and a write that fails adds a
+  `checkpoint_failed` warning without stopping the decode. `focr doctor` adds
+  the read-only `interrupted_document_run` and `kept_document_checkpoint`
+  detectors. The library gains `DocumentOptions::run`, `RunFiles`, `ResumeKey`
+  and `DocumentResult::resumed_from`, and `DocumentOptions` is no longer `Copy`.
+
 - **Honest v1 multi-page reporting** (bead U2-X2). `run_complete` now carries
   `finish_reason` (`stop` or `length`). A `--multi-page` run that ends with fewer
   page bodies than pages adds a `warnings[]` entry `{kind, message, recovery, ...}`:

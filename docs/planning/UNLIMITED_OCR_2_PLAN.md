@@ -401,6 +401,23 @@ default is 1).
   - Re-running the same command with a matching interrupted run resumes it. The terminal event
     carries `resumed_from`.
 
+*As built (U2-D4, 2026-10-31).* `src/native_engine/checkpoint.rs` holds the key, the checkpoint codec,
+the journal and `DocumentRun`; `DocumentOptions::run` takes the `RunFiles`. Where it departs from the
+text above:
+- **Journal.** A key line, then per window one line per own page and a closing window line, in one
+  fsynced append. A page line holds the raw body, not the derived text, layout and figure boxes, which
+  `PageResult::read` rebuilds from the body and the page's size. The window line holds its ids and
+  counters, so the journal alone rebuilds the document, and the checkpoint stays one boundary's size.
+- **A stop inside a window** writes that window's pages to the output but not to the journal: the
+  checkpoint is the boundary before it, and a resume decodes the window again.
+- **Stdout runs.** The directory digest covers the caller's key fields (input, selection, decode flags).
+  The full key is checked on open, so a differing artifact or binary is refused by name.
+- **Recompute** refuses a journal whose input or page selection differs: those pages are another
+  document's.
+- **`checkpoint_failed`** is a new warning: a failed write stops the writing and not the decode.
+- **Doctor** reads `document-runs/` only, and reports `interrupted_document_run` with its command and
+  `kept_document_checkpoint`; neither has a fixer.
+
 *Why:*
 - `RunStore` (`src/storage.rs:68`, `FOCR_RUN_STORE` at `:34`) is best-effort telemetry: a failed write
   only prints a stderr line. Its schema is frozen (`SCHEMA_VERSION = 1`, `:31`;
@@ -2145,7 +2162,7 @@ ends with `run_error`. A nonzero exit never follows `run_complete`.
   - `v1_truncated`, `v1_page_merge` (U2-X2);
   - `v2_length`, `leading_text` (U2-B6);
   - `pull_hint` (U2-E1, U2-E4);
-  - `resume_recompute` (U2-D4);
+  - `resume_recompute`, `checkpoint_failed` (U2-D4);
   - `ignored_files` (U2-D0);
   - `ignored_lever` (U2-A7);
   - `uncertified_crop_mode` (U2-E1).
@@ -2257,18 +2274,18 @@ let doc = engine.recognize_document(
 `OcrModel::recognize_document(&mut source, &options, on_item, on_page)`. Version 0.10.0; the CHANGELOG
 holds the migration table. Where it departs from the sketch above:
 - **Model.** The model is the explicit `model_path` (D25 resolves it first), not a `ModelChoice` option.
-- **Options.** `DocumentOptions { page_window, resume }` is `#[non_exhaustive]` with chaining setters,
-  not a builder. `max_page_tokens` and `entmax_domain` are left out because they already have one
+- **Options.** `DocumentOptions { page_window, resume, run }` is `#[non_exhaustive]` with chaining
+  setters, not a builder; `run` (U2-D4) names the journal and checkpoint files. `max_page_tokens` and `entmax_domain` are left out because they already have one
   route each (`DecodeOverrides`, `--max-page-tokens`; `FOCR_SRSWA_ENTMAX`), and a second would
   duplicate config. `crop_mode` is left out because a document reads base views only (DISC-U2-6).
 - **Sink.** `on_page` streams `StreamedPage` (a body, and its `PageResult` when the model splits pages
   exactly), because v1's bodies can merge pages and have none. `on_item` sees every page before it is
   read, a skipped one included.
 - **Result.** `DocumentResult { markdown, pages, pages_out, skipped, finish_reason, extra_markers,
-  windows, warnings, model }`. `skipped` lists the pages (with reasons), not a count; `model` is
-  `ModelIdentity { model_id, source_sha256 }`. `windows` (U2-D1b) is one `WindowStats` per decode
-  window, empty for one pass, and each windowed `PageResult` names its `window`. `resumed_from`
-  arrives with U2-D4.
+  windows, warnings, model, resumed_from }`. `skipped` lists the pages (with reasons), not a count;
+  `model` is `ModelIdentity { model_id, source_sha256 }`. `windows` (U2-D1b) is one `WindowStats` per
+  decode window, empty for one pass, and each windowed `PageResult` names its `window`. `resumed_from`
+  (U2-D4) names the page a run continued from, `None` for a run from the start.
 - **Cancellation.** Ctrl+C or `request_shutdown()` stops Unlimited-OCR-2's document loop at its next
   step with `finish_reason: cancelled`; the CLI writes the pages, then exits 6. v1 still fails with
   `Cancelled`.
