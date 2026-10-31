@@ -49,8 +49,7 @@ use crate::error::{
 };
 use crate::native_engine::tromr::{MusicWarning, StaffBBox, StaffSkip};
 use crate::native_engine::{
-    ChartPageMeta, DecodeOverrides, DecodeReport, ModelIdentity, MusicPageMeta,
-    PreprocessOverrides,
+    ChartPageMeta, DecodeOverrides, DecodeReport, ModelIdentity, MusicPageMeta, PreprocessOverrides,
 };
 use crate::{LayoutSpan, OcrEngine, RecognizedDocument};
 
@@ -1393,6 +1392,9 @@ mod tests {
     fn client_of(daemon: impl FnOnce(TcpStream) + Send + 'static) -> TcpStream {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
+        // Detached: a test's daemon may outlive the wait under test (`HOLD`),
+        // and joining it would only add that time to the test.
+        // ubs:ignore[rust.resource-lifecycle.thread_join]
         std::thread::spawn(move || daemon(listener.accept().unwrap().0));
         let stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         stream
@@ -1629,6 +1631,9 @@ mod tests {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (queue, _connections) = std::sync::mpsc::sync_channel(ACCEPT_QUEUE);
+        // Detached: the acceptor loops for the life of its listener, as in
+        // the daemon, so there is nothing to join.
+        // ubs:ignore[rust.resource-lifecycle.thread_join]
         std::thread::spawn(move || accept_connections(&listener, &queue));
         for _ in 0..2 {
             let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();

@@ -1572,7 +1572,7 @@ It reuses the domain-agnostic per-token sampling primitives from `sampler.rs`.
 | `FOCR_LMHEAD_SHARD`, `FOCR_LMHEAD_SHARD_TILES` (presence-based, `decoder.rs:2098,2105,2115`; reach `lm_head_cached`, `decoder.rs:1088-1090`, on the conservative path) | Refuse | Supported-exact since U2-C2 (L4 with the lever on, §6.2) |
 | `FOCR_INT8_KV`, `FOCR_ATTN_GEMM`, `FOCR_RSWA_PARALLEL_ATTN` (read only in `rswa::decode_attention`/`RingCache::new`, which the SR-SWA arm never calls); `FOCR_QKV_FUSED` (default ON, `_i8` only); `FOCR_FUSE_NORM_QUANT` (`decoder.rs:2990`, `_i8` only); `FOCR_FUSE_NGRAM_LMHEAD`, `FOCR_SPEC_DECODE` (`generate_cached_i8` only, `mod.rs:3939,3949`); `FOCR_SPEC_VERIFY` (no production reader); `FOCR_INT8_ATTN`, `FOCR_INT8_LMHEAD` (full-int8 recipe only, `mod.rs:480`); `FOCR_RESAMPLE` | Ignored, with `warnings[{kind:"ignored_lever"}]` | — |
 | `RunawayGuard`, `FOCR_RUNAWAY_GUARD` (`sampler.rs:53`) | Ignored, **once U2-B5/B6 stop building it on the v2 arm**: today it is built for every path (`mod.rs:3727`) and checked in `generate_cached` (`:3830`) and `generate_stateless` (`:4284`). The page guard plus the per-page cap replace it | — |
-| Resident daemon (`cli.rs:1650`, `resident.rs`) | Refuse for v2 until its protocol carries the v2 flags | Backlog (bd-fuh2) |
+| Resident daemon (`cli.rs`, `resident.rs`) | Served: the reply carries the decode report, and the client admits the model in its own environment, so the exit code, `warnings[]` and the note match an inline run | Done (bd-u77k); a cancelled served page is bd-toeb |
 
 Parity tests that must gain v2 lanes or explicit v2 skips:
 - `batched_attention_parity`;
@@ -3052,7 +3052,7 @@ Unlimited-OCR-2.pdf           1eb5885f4ddfa4ec6fbff375092377f30b5d6a5e034ec49362
 | bd-3p8y, bd-aio5, bd-we84, bd-b8cg (HF mirror) | closed 2026-10-30 (mirror verified) | U2-E4 |
 | bd-jprb (atomic pull) | in progress (per-model packages done in U2-E4) | U2-E4 |
 | bd-3ryl task-vs-arch guard | open | U2-A7 is the v2 case |
-| bd-fuh2 resident daemon follow-ups | open | The daemon refuses v2 until its protocol carries the v2 flags |
+| bd-fuh2, bd-u77k resident daemon | closed | The daemon serves v2 single-image runs (bd-u77k); bd-toeb is the cancelled served page |
 | bd-1azu.12 (shared-prefix KV), bd-1azu.34/38/40/41/44 (spec decode/spine), bd-1azu.55/56 (megakernel) | open | Levers that refuse v2 (D18) |
 | bd-5k7a iOS multi-page | in progress | U2-H1 |
 | bd-322.18 40+ page benchmark cells | open | U2-C5b evidence |

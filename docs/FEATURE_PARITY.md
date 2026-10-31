@@ -31,8 +31,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
 | Total enumerated rows | **128** | **91** | **219** |
-| `present` | 115 † | 77 | 192 |
-| `partial` | 7 † | 11 | 18 |
+| `present` | 115 † | 78 | 193 |
+| `partial` | 7 † | 10 | 17 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
 | `n/a` | 0 | 0 | 0 |
@@ -276,7 +276,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | frozen contract `runs_schema.json` + populated-store matrix through the real binary (json/ndjson/--id/--limit/plain); empty history = exit 0 |
 | `focr sync export-jsonl\|import-jsonl` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | locked atomic temp+fsync+rename, byte-identical re-export, one-way contract documented; migration + exit-7 refusal tested (bd-223.4) |
 | `focr doctor` (idempotent self-check/repair) | §7.2 | SHOULD | present | SURF | bd-wp8.4 | LIVE: detect-then-fix, single-chokepoint mutation (backup-first, hash-logged), undo byte-identical, dry-run zero-blast, capabilities/robot-docs/robot-triage; 8/8 fixture roundtrips (`tests/doctor_fixtures.rs`) |
-| `focr resident-daemon` (hidden; the warm-model resident process, GH #9) | §7.2 | SHOULD | partial | SURF | bd-u77k | v0.8.0: loopback-TCP daemon w/ 0600 token state file, idle exit, version/artifact/env re-verification, inline fallback; `tests/resident_e2e.rs` proves byte identity on v1 weights, and a warm page measured 1.16× an inline one (`RESIDENT-warm-0009-20261031`), about 2 s saved. Partial because Unlimited-OCR-2 runs inline (bd-u77k) and the music path has wire tests only, no run on TrOMR weights. `ocr-batch` stays inline: measured no gain (`CLAIM-resident-ocr-batch`) |
+| `focr resident-daemon` (hidden; the warm-model resident process, GH #9) | §7.2 | SHOULD | present | SURF | bd-u77k | v0.8.0: loopback-TCP daemon w/ 0600 token state file, idle exit, version/artifact/env re-verification, inline fallback; `tests/resident_e2e.rs` proves byte identity on v1 and Unlimited-OCR-2 weights, the v2 test including `warnings[]` and exit 5 at the position limit; a warm page measured 1.16× an inline one on both (`RESIDENT-warm-0009-20261031`, `RESIDENT-warm-v2-0009-20261031`), about 2 s saved. Music served on real TrOMR weights (bd-fuh2). A cancelled served v2 page writes nothing (bd-toeb). `ocr-batch` stays inline: measured no gain (`CLAIM-resident-ocr-batch`) |
 | Exit codes 0..8 (stable, documented) | §7.4 | MUST | present | SURF | bd-223.5 | error.rs mapping + schema `exit_codes` + contract tests (8 = `low_yield`, GH #15; 5 also covers a document that stopped early, U2-B6) |
 | Env overrides (FOCR_MODEL_DIR/THREADS/STAGE_BUDGET/QUANT/NUMA…) | §7.5 | MUST | present | SURF | bd-223.7 | OnceLock; FOCR_THREADS physical-core budget (bd-223.2) |
 | Model resolution (no network at runtime) + header sniff | §7.5 | MUST | present | SURF | bd-223.7 | default auto-resolves pulled int8 (bd-3u6x); dotfile-safe shard globs |

@@ -240,7 +240,9 @@ fn a_resident_v2_run_matches_an_inline_run() {
         .unwrap_or_else(|| panic!("no prompt length in {:?}", probe.said));
     let limit = (prompt + 40).to_string();
 
-    let cases: [(&str, &[&str], &[(&str, &str)], i32); 2] = [
+    // (case, extra args, extra env, exit code)
+    type Case<'a> = (&'a str, &'a [&'a str], &'a [(&'a str, &'a str)], i32);
+    let cases: [Case; 2] = [
         ("page_cap", &["--json", "--max-page-tokens", "48"], &[], 0),
         (
             "positions",
@@ -264,7 +266,10 @@ fn a_resident_v2_run_matches_an_inline_run() {
         };
         let inline = run(None);
         assert_eq!(inline.code, Some(code), "{case}: {:?}", inline.said);
-        assert!(inline.peak > SERVED_PEAK_BYTES, "{case}: inline holds the model");
+        assert!(
+            inline.peak > SERVED_PEAK_BYTES,
+            "{case}: inline holds the model"
+        );
         let json: Value = serde_json::from_str(&inline.stdout).expect("--json");
         let kinds: Vec<&str> = json["warnings"]
             .as_array()

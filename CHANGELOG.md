@@ -39,6 +39,19 @@ sections as they land.
   reports the same `staff` and `music_warning` events and `--json` fields. On
   real TrOMR weights, two pages matched an inline run byte for byte, cold and
   warm, with 28 MB client peaks showing that the daemon served them.
+- **`focr ocr --model unlimited-ocr-2` uses the resident daemon** (bead bd-u77k).
+  The reply now carries the run's decode report, so a served page reports what an
+  inline one does: `finish_reason`, `warnings[]`, and exit 5 for a page stopped at
+  its position limit. The client admits the model in its own environment before
+  it connects, so a refused lever still exits 2 at once, and an ignored lever's
+  warning and the experimental note print once. On real v2 weights, a page closed
+  by `--max-page-tokens` and one stopped at its position limit matched an inline
+  run byte for byte, cold and warm. A warm page saved about 1.9 s over 9 paired
+  runs (`RESIDENT-warm-v2-0009-20261031`). The client also waits as long as the
+  daemon's forward stage can run. It used to give up at 600 s, just before a page
+  stopped at the default budget was answered, and then read that page again
+  inline. A failed request no longer leaves its decode report or chart and music
+  metadata to the next request's reply. The daemon protocol moves to 5.
 - **`focr ocr --check`** (bead bd-m76g). A preflight that runs the checks a run
   makes before its decode, then stops: arguments, the input's header or page
   list, `--pages`, the model's header and tokenizer, and `-o`'s directory. About
@@ -231,8 +244,9 @@ sections as they land.
     so v2 can never reach v1's R-SWA forward or multi-page loop.
   - `ocr-batch` admits a v2 model once, so its refusal is the run's exit code,
     not a per-image failure.
-  - The resident daemon never serves v2: the client runs it inline and the
-    daemon refuses it.
+  - A refused v2 run never starts the resident daemon: the client admits the
+    model in its own environment before it connects (bead bd-u77k serves the
+    admitted ones).
   - `focr convert --quant int4` refuses v2, and every other model without an
     int4 recipe, as soon as `--model-id` resolves.
 - **Unlimited-OCR-2 decoder wired, not yet reachable** (bead U2-B5).

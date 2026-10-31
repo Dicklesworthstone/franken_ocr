@@ -99,7 +99,8 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "FOCR_RESIDENT_CLIENT_TIMEOUT_SECS",
-        "client-side reply timeout for a resident request (default 600)",
+        "a fixed wait for a resident reply; unset, the client waits 600 s or until the \
+         daemon's forward stage must have ended (budget plus stop grace), whichever is later",
     ),
     (
         "FOCR_TEST_MAX_POSITIONS",

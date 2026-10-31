@@ -211,7 +211,7 @@
     },
     {
       "name": "FOCR_RESIDENT_CLIENT_TIMEOUT_SECS",
-      "summary": "client-side reply timeout for a resident request (default 600)"
+      "summary": "a fixed wait for a resident reply; unset, the client waits 600 s or until the daemon's forward stage must have ended (budget plus stop grace), whichever is later"
     },
     {
       "name": "FOCR_TEST_MAX_POSITIONS",
