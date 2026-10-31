@@ -122,9 +122,38 @@ From `sahilchachra/Unlimited-OCR-NVFP4` obtain and dump:
 > `quantization_config` + safetensors headers dumped per above. UNBLOCKS the NVFP4
 > dequant kernel bead and the quant-loader bead.
 
+### The NVFP4 set, dumped (2026-10-31): RESOLVED
+
+Source: `sahilchachra/Unlimited-OCR-NVFP4@2ac0aa28a3509c7056648ffc0d4f9fdb79a454d0`, its
+`config.json` and the header of `model-00001-of-000001.safetensors` (7,102 tensors).
+
+`quantization_config`: `quant_method: compressed-tensors` 0.16.0, `format:
+nvfp4-pack-quantized`, targets `Linear`; weights only (`input_activations: null`), float
+4-bit, symmetric, `strategy: tensor_group`, `group_size: 16`, scales `float8_e4m3fn`, no
+KV-cache scheme. `ignore`: `lm_head`, `embed_tokens`, `sam_model`, `vision_model`,
+`projector`, `image_newline`, `view_seperator`, the router `mlp.gate`, and every `norm`.
+
+**Quantized: exactly 2,196 modules**, each stored as a `U8` packed weight, an `F8_E4M3`
+`weight_scale` and an `F32` global scale:
+
+| Bucket | Count |
+|---|---:|
+| Routed experts `{gate,up,down}_proj` | 2,112 |
+| Shared experts `{gate,up,down}_proj` | 33 |
+| Dense layer-0 MLP `{gate,up,down}_proj` | 3 |
+| Language attention `{q,k,v,o}_proj` | 48 |
+
+**Kept BF16:** `lm_head`, `embed_tokens`, the 11 router gates `mlp.gate`, and the whole
+vision tower and projector (SAM, the CLIP `qkv_proj`/`out_proj`, embeddings).
+
+Against our 2,245 candidates, NVFP4 leaves out the 48 vision projections and `lm_head`, and
+quantizes the 48 attention projections our conservative recipe keeps high. So NVFP4
+validates our router, `lm_head`, embedding and vision choices, and does **not** validate
+keeping attention high: that choice rests on our own measurements (`NEGATIVE_EVIDENCE.md`).
+
 ---
 
-## OQ-10 / OQ-11 / OQ-12 — DEFERRED (non-blocking)
+## OQ-10 / OQ-11 / OQ-12 — DEFERRED (non-blocking); OQ-10 and OQ-12 since resolved below
 
 ### Status
 
@@ -187,3 +216,67 @@ bead tracker). Given likely topics, the resolving source is already local:
 
 > **Status: DEFERRED, non-blocking.** Needs only the verbatim question text; the backing
 > source files are already in `snapshots/`. Does NOT block the census bead.
+
+## OQ-10 — RESOLVED (2026-10-31, bead bd-322.16)
+
+> **Question (plan §13):** does the community GGUF (llama.cpp PR #17400) quantize the
+> router and experts identically to NVFP4, and in particular keep the router gate in f32?
+
+Source: `sahilchachra/Unlimited-OCR-GGUF@0dc781d8a23f52963918ebd5b2d1b9fe61504661`, the GGUF
+headers of `Q4_K_M` (the recommended file), `IQ2_M` (the smallest) and `Q8_0`, and
+`mmproj-Unlimited-OCR-F16.gguf`. Architecture `deepseek2-ocr`, 155 language tensors,
+imatrix-calibrated.
+
+**The router gate stays F32 in all three:** `blk.N.ffn_gate_inp.weight` is F32 in all 11 MoE
+layers. NVFP4 keeps it BF16, the stored precision. So both leave the router unquantized,
+in different float formats. llama.cpp's quantizer skips `ffn_gate_inp` by default, so this
+is the tool's rule, not a choice made for this model.
+
+The rest is **not** identical to NVFP4:
+
+| Tensor | Q4_K_M | IQ2_M | Q8_0 | NVFP4 |
+|---|---|---|---|---|
+| routed experts gate/up | Q4_K | IQ2_S | Q8_0 | FP4 |
+| routed experts down | Q5_0 ×6, Q8_0 ×5 | IQ4_NL | Q8_0 | FP4 |
+| shared experts | Q4_K, down Q4_K/Q6_K | IQ2_S | Q8_0 | FP4 |
+| attention q/k | Q4_K | IQ2_S | Q8_0 | FP4 |
+| attention o | Q4_K | IQ3_S | Q8_0 | FP4 |
+| attention v | Q4_K ×6, Q6_K ×6 | Q4_K | Q8_0 | FP4 |
+| `lm_head` (`output`) | Q6_K | Q5_K | Q8_0 | BF16 |
+| `embed_tokens` | Q4_K | IQ3_S | Q8_0 | BF16 |
+| router gate | F32 | F32 | F32 | BF16 |
+| vision + projector | F16/F32 in `mmproj` | same | same | BF16 |
+
+GGUF quantizes `lm_head` and the embeddings as well, which NVFP4 does not. Both keep vision
+and the router high, which matches our recipe. Neither keeps attention high.
+
+## OQ-12 — RESOLVED (2026-10-31, bead bd-322.18)
+
+> **Question (plan §13):** confirm the benchmark cells (TPS, v1.6 peers, 40+pg edit
+> distances) from the PDF tables, against the secondary sources §2.5 cites.
+
+Source: `Unlimited-OCR.pdf`, sha256 `d4cc0b2e…74a8b` (`SOURCE_HASHES.md`), 14 pages. The
+pinned HF revision `3a7f4db` and the pinned GitHub commit `7e98aff` serve byte-identical
+copies.
+
+| Plan §2.5 cell | Paper | Verdict |
+|---|---|---|
+| v1.5 overall 93.23, DeepSeek-OCR 87.01, +6.22 | Table 1 | VERIFIED |
+| v1.5 Text-Edit 0.038, Formula-CDM 92.61, TEDS 90.93, TEDS-S 94.07, Read-order 0.045 | Table 1 | VERIFIED |
+| v1.6 overall 93.92 | Table 1 | VERIFIED |
+| v1.6 peers: PaddleOCR-VL 1.6 96.33, MinerU 2.5-Pro 95.69, PaddleOCR-VL 1.5 94.50 | absent | NOT IN THE PAPER. Stays REPORTED. |
+| v1.6 peers: Qianfan-OCR 93.12, DeepSeek-OCR-2 91.09 | Table 1: 93.90 and 90.25 | CONTRADICTED. The plan's figures come from another source. |
+| Long-horizon edit 2pg 0.0362, 10pg 0.0526, 40+pg 0.1069 | Table 3 | VERIFIED |
+| ~5580 TPS, +12.7% vs DeepSeek-OCR | §5.2: 5580 vs 4951 | VERIFIED, with scope: GPU tokens/s at 512 concurrency, "Base" mode |
+| +35% at 6144 out-tokens | Table 4: 7847.71 vs 5822.87 | VERIFIED, with scope: a theoretical ceiling with a 10-token prefill, not a document run |
+
+What the plan left out:
+- Table 1's v1.6 block lists end-to-end VLMs only (HunyuanOCR 89.95, DeepSeek-OCR 2 90.25,
+  dots.ocr 90.77, FireRed-OCR 93.26, Logics-Parsing-v2 93.33, Qianfan-OCR 93.90), and on
+  it Unlimited-OCR is first at 93.92. That ranking is the paper's "end-to-end SOTA" claim.
+  The plan's "behind PaddleOCR-VL 1.6 and MinerU 2.5-Pro" compares against models the
+  paper did not include. Both statements can be true. Neither is wrong to quote, as long as
+  its source is named.
+- Table 3 is not monotonic: 15 pages 0.0787, 20 pages 0.0572. At 40+ pages, Distinct-35
+  falls to 96.90%. The paper attributes the 40+ errors to small text under "Base" mode.
+- No TPS figure in the paper is a CPU figure, so none of them bounds this port.

@@ -58,7 +58,7 @@ The engine is built on **frankentorch** (custom tensors / CPU kernels — consum
 ### 1.2 Explicit non-goals (v1)
 
 - **Not** a general OCR framework, not a detect+recognize pipeline, not a multi-model zoo. One model, end-to-end.
-- **Not** leaderboard SOTA. Unlimited-OCR sits ~93.9% on OmniDocBench v1.6, **behind** PaddleOCR-VL 1.6 (96.33) and MinerU 2.5-Pro (95.69) **[REPORTED]**. Our pitch is *fidelity to this model* + *bounded generated-token KV for long-document parsing on CPU* + *speed*, not beating the benchmark.
+- **Not** leaderboard SOTA. Unlimited-OCR sits ~93.9% on OmniDocBench v1.6, **behind** PaddleOCR-VL 1.6 (96.33) and MinerU 2.5-Pro (95.69) **[REPORTED]**, neither of which the paper's end-to-end table includes. Our pitch is *fidelity to this model* + *bounded generated-token KV for long-document parsing on CPU* + *speed*, not beating the benchmark.
 - **Not** training or fine-tuning. Inference only. We never need autograd, optimizers, or backward kernels.
 - **No GPU in v1.** CUDA is Phase 6 and clearly stretch.
 
@@ -171,9 +171,9 @@ Unlimited-OCR is an **end-to-end vision-language model (VLM)**, *not* a detect+r
 
 - **Strong**: printed text (Text-Edit 0.038 on OmniDocBench v1.5), tables (TEDS 90.93 / TEDS-S 94.07), math/LaTeX (Formula-CDM 92.61), layout & reading order (Reading-Order-Edit 0.045). CJK + "40+ languages" **[OPEN, unverified count]**.
 - **Weak**: handwriting ("limited but improving"), charts (not a headline strength).
-- **OmniDocBench**: v1.5 overall **93.23** (vs DeepSeek-OCR 87.01, +6.22); v1.6 **93.92**. Peers (Jun-2026): PaddleOCR-VL 1.6 96.33, MinerU 2.5-Pro 95.69, PaddleOCR-VL 1.5 94.50, **Unlimited-OCR 93.92**, Qianfan-OCR 93.12, DeepSeek-OCR-2 91.09. → **We are not SOTA; we are a strong, long-horizon, constant-memory model.**
-- **Long-horizon quality**: edit distance 2pg 0.0362 / 10pg 0.0526 / 40+pg 0.1069 (graceful).
-- **Throughput**: ~5580 TPS on OmniDocBench (+12.7% vs DeepSeek-OCR), advantage growing with output length (+35% at 6144 out-tokens) because constant KV cache avoids long-context decode slowdown.
+- **OmniDocBench**: v1.5 overall **93.23** (vs DeepSeek-OCR 87.01, +6.22); v1.6 **93.92** **[VERIFIED, paper Table 1]**. Peers (Jun-2026): PaddleOCR-VL 1.6 96.33, MinerU 2.5-Pro 95.69, PaddleOCR-VL 1.5 94.50, **Unlimited-OCR 93.92**, Qianfan-OCR 93.12, DeepSeek-OCR-2 91.09 **[REPORTED, not from the paper]**. The paper's own v1.6 table lists end-to-end VLMs only, ranks Unlimited-OCR first among them, and gives Qianfan-OCR 93.90 and DeepSeek-OCR 2 90.25 (OQ-12). → **We are not SOTA; we are a strong, long-horizon, constant-memory model.**
+- **Long-horizon quality**: edit distance 2pg 0.0362 / 10pg 0.0526 / 40+pg 0.1069 **[VERIFIED, Table 3]**. Not monotonic: 15pg 0.0787, 20pg 0.0572.
+- **Throughput**: ~5580 TPS on OmniDocBench (+12.7% vs DeepSeek-OCR's 4951), advantage growing with output length (+35% at 6144 out-tokens) because constant KV cache avoids long-context decode slowdown **[VERIFIED, §5.2 and Table 4]**. Both are GPU figures: 5580 is tokens/s at 512 concurrency, and +35% is Table 4's ceiling with a 10-token prefill, not a document run.
 
 ### 2.6 Prior-art quantizations — **[REPORTED, decisive for our recipe]**
 
@@ -181,9 +181,10 @@ Unlimited-OCR is an **end-to-end vision-language model (VLM)**, *not* a detect+r
 
 1. **GGUF** (`sahilchachra/Unlimited-OCR-GGUF`): full K-quant ladder (BF16…IQ2_M, 1.15–5.47 GB), recommended **Q4_K_M (~1.82 GiB)**. **Vision/mmproj kept F16 (774 MiB)** — author states explicitly that quantizing the vision encoder hurts OCR. Requires llama.cpp **PR #17400 (not upstream)**. No published perplexity/CER.
 2. **NVFP4** (`sahilchachra/Unlimited-OCR-NVFP4`): quantizes **only ~2196 linear modules of the MoE decoder** to FP4 (group size 16, NVFP4A16, **data-free PTQ**), keeping **vision tower, projector, embeddings, output layer, MoE router gate, and ALL norms in BF16**. ~2.93 GB. **Reports OCR output identical to BF16** — on the author's tested docs only; no published CER.
-   - **⚠️ Module-count reconciliation — [OPEN, OQ-14].** "2196" does **not** reconcile with our census of quantizable decoder linears: experts `11·64·3 = 2112` + attention `12·4 = 48` + shared `11·2·3 = 66` + dense-layer-0 `3` (+ `lm_head` `1`) ≈ **2229–2230**, ~33 more than 2196. So NVFP4 is **not** quantizing the set we assume — it likely **skips attention `q/k/v/o` and/or `lm_head` and/or the shared experts**. We must dump NVFP4's scale keys to enumerate its exact set (OQ-14) before leaning on it.
+   - **Module-count reconciliation — [VERIFIED, OQ-14, 2026-10-31].** The checkpoint's `config.json` and safetensors header give exactly 2196: experts `11·64·3 = 2112` + attention `12·4 = 48` + shared `11·3 = 33` + dense-layer-0 `3`. The census above over-counted shared experts (66): there is one shared expert per MoE layer. So NVFP4 **does** quantize attention `q/k/v/o`, and skips only `lm_head`, `embed_tokens`, the router gate, the norms and vision.
+   - **GGUF router [VERIFIED, OQ-10].** `ffn_gate_inp` is F32 in Q4_K_M, IQ2_M and Q8_0. GGUF also quantizes attention, `lm_head` (Q6_K in Q4_K_M) and `embed_tokens`.
 
-→ **The core recipe is converged and validated for the EXPERT/MLP FFNs**: weight-only quant of the **decoder expert + dense FFN GEMMs**; **full precision** (or near) for vision encoder, projector, embeddings, **router gate**, and **all norms**. We adopt that core recipe (§5, §6). **But two of our choices go BEYOND the validated set and are explicitly OUR risk to retire by measurement (OQ-14): int8 on the attention `q/k/v/o` projections, and int8 on `lm_head`** — both gated behind a measured-CER kill-switch, neither assumed lossless "because NVFP4 did it." We may also use these artifacts as **golden oracles** during bring-up (dump their per-layer activations) without any framework runtime dependency.
+→ **The core recipe is converged and validated for the EXPERT/MLP FFNs**: weight-only quant of the **decoder expert + dense FFN GEMMs**; **full precision** (or near) for vision encoder, projector, embeddings, **router gate**, and **all norms**. We adopt that core recipe (§5, §6). **Two of our levers need our own measurement: int8 on the attention `q/k/v/o` projections (NVFP4 and GGUF both quantize them, but neither publishes a CER), and int8 on `lm_head` (NVFP4 keeps it BF16)** — both gated behind a measured-CER kill-switch, neither assumed lossless "because a prior-art quant did it." We may also use these artifacts as **golden oracles** during bring-up (dump their per-layer activations) without any framework runtime dependency.
 
 ### 2.7 Required neural-op set (the complete kernel surface)
 

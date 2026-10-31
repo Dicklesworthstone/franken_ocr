@@ -25,6 +25,7 @@
 | SHA-256 | File | Bytes | Role |
 |---------|------|-------|------|
 | `a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4` | `tokenizer.json` | 9979544 | byte-level **BPE** (base vocab 128000 + 830 added tokens), merges, pre-tokenizer `Sequence` (OQ-16) |
+| `d4cc0b2e98f53d9165e63af925519cccbf80ecc6f047973e3f9b2bdd84474a8b` | `Unlimited-OCR.pdf` | 460324 | the technical report: Tables 1-4 (OQ-12); byte-identical at GitHub `7e98aff` |
 | `2bc48a7a110061ea58fff65d3169367eebe3aee371ca6968dc2219c1b2855fc6` | `model-00001-of-000001.safetensors` | 6672547120 | pinned bf16 weight shard used by parity fixtures and conservative `.focrq` conversion |
 
 ## Verify
