@@ -351,6 +351,9 @@ is a separate lossy lever.**
     - U2-C4 re-derives it from the measured distribution, as the largest N with
       `64 + 274·N + (N − 1)·p90 + p99 ≤ 131,072`, where p90 and p99 are generated tokens per page. Using
       per-page p99 for every page would be far too strict: page_0590 alone emits ~4,033 tokens.
+      Measured 2026-10-30 over 55 pages (the 20 corpus pages and every S2/S3 page): the f32
+      reference's p90 982 and p99 2,892 give **102**, the int8 decoder's (p90 852) 114. The limit
+      takes the stricter 102 (DISC-019), and the corpus gate fails if a remeasure supports fewer.
     - An explicit unwindowed request (`Some(PageWindow::Off)`, or `--page-window off` once U2-D5
       lands) reads every page in one pass, however many, and relies on the exit-5 position stop.
     - A window that stops (its position limit, the budget, a cancel) ends the document with its
@@ -1007,8 +1010,8 @@ out       = softmax over {j : local(j) ∨ remote(j)} of logit_j, applied to v_j
   is cast to the activation dtype before `o_proj` (`MD:530`).
 - **Logits:** `lm_head(h)` in the activation dtype, then `.float()` (`MU:1165-1167`).
 
-franken_ocr computes in f32 throughout. The parity target is the f32 oracle (D4). Against bf16, the
-tolerance is measured (OQ-V2-3).
+franken_ocr computes in f32 throughout. The parity target is the f32 oracle (D4). No gate compares
+against bf16; a bf16 run is ledger evidence only (OQ-V2-3).
 
 ### 5.8 Prefill vs decode
 
@@ -1321,7 +1324,7 @@ Retirement is also suspended on every guard-forced step (U2-B4 mechanism, U2-D1a
 | DISC-U2-8 | guard lag | none | can lag one step under overlap scheduling | None; SGLang comparisons tolerate it |
 | DISC-U2-9 | non-blank text before the first `<PAGE>` (leading head) | `_uocr_save_results` drops it (`MU:1210`, `split('<PAGE>')[1:]`) | a recomputed window keeps it as body 0 with front-anchored ownership, which shifts pages and drops the last one (`doc_split.py:251-255`) | Prepend it to the first own page's body with `warnings[{kind:"leading_text"}]`, unwindowed and windowed alike (U2-B6, U2-D1a) |
 | DISC-U2-10 | EXIF orientation | ignored: `Image.open(f).convert('RGB')` (`MU:1070`) | ignored: `smart_rgb_conversion = False` (`base_processor.py:215`), so a plain `convert("RGB")` | Applied, as for v1 (the shared decoder, `src/preprocess/mod.rs` `decode_path`). Only an image with a non-identity Orientation tag differs, and the oracle corpus has none (U2-B7) |
-| DISC-U2-11 | FFN/expert weight storage in the default decoder | f32 parity oracle over the bf16 checkpoint | bf16 | The shipping cache keeps the 2,148 FFN/expert matrices per-channel int8 (the fixed recipe); attention, router, norms and `lm_head` stay f32. Its greedy ids leave the f32 oracle's at a near-tie, where the all-f32 cache (`FOCR_DECODE_F32`, otherwise the same ops) keeps the oracle's token: S1 page_0014 at step 47 (the oracle's token 0.214 below the int8-FFN pick), page_0590 at step 32 (0.156), S2 at step 44 (0.156), S3 p9_p14 at step 73 (0.065); page_0009 is exact. On the long lane the f32 cache is exact over S3-p10 (6,272 ids) and S3-p20 (16,880 ids), with block retirement on and off, while the int8-FFN path leaves at S3-p10 step 203 (0.017) and S3-p20 step 118 (0.056). It still ends at `stop` with one body per page, 6,277 and 17,165 ids long. No layer routes differently at any of them (U2-C2). U2-C4 measures the impact at L5 and files the entry |
+| DISC-U2-11 | FFN/expert weight storage in the default decoder | f32 parity oracle over the bf16 checkpoint | bf16 | The shipping cache keeps the 2,148 FFN/expert matrices per-channel int8 (the fixed recipe); attention, router, norms and `lm_head` stay f32. Its greedy ids leave the f32 oracle's at a near-tie, where the all-f32 cache (`FOCR_DECODE_F32`, otherwise the same ops) keeps the oracle's token: S1 page_0014 at step 47 (the oracle's token 0.214 below the int8-FFN pick), page_0590 at step 32 (0.156), S2 at step 44 (0.156), S3 p9_p14 at step 73 (0.065); page_0009 is exact. On the long lane the f32 cache is exact over S3-p10 (6,272 ids) and S3-p20 (16,880 ids), with block retirement on and off, while the int8-FFN path leaves at S3-p10 step 203 (0.017) and S3-p20 step 118 (0.056). It still ends at `stop` with one body per page, 6,277 and 17,165 ids long. No layer routes differently at any of them (U2-C2). At L5 (U2-C4, **DISC-019**, ACCEPTED): 20/20 corpus pages within 0.45 CER, aggregate 0.0685; page_0590 at 0.44996; document CERs S2 0.5272, S3-p9_p14 0.0916, S3-p10 0.0013, S3-p20 0.0199 |
 | DISC-U2-12 | page state of a reused window's last prompt row when no text is spliced (the text KV allocation failed) | n/a (no windows) | the first decode step's carry is written into that row's slot (`_seed_continuation`, `W/session/uocr_doc_reuse.py:490-497`), so its image page reads −1 | The reused-window seed (`DecodePageState::reused_window`) carries the step and the row keeps its page. Both stacks read a row's page only through its 32-row block's (min, max), which skips −1, so they differ only when that row opens its block (rewritten prompt length ≡ 1 mod 32). franken_ocr's KV is never pool-allocated, so only the `marker_only_splice` test hook reaches the path; `w2-n5-markeronly-t12` (prompt 956 rows) is token-exact (U2-D1a) |
 | DISC-U2-13 | rendering of the block grammar (`<BLOCK>label[<LEVELn>][box]<FORK>text`, §5.1) | `result.md` keeps every prefix raw: `re_match` (`MU:44-59`) knows only v1's spans | no postprocess (returns the generated text) | Each block prefix is a span under v1's rule (`postprocess.rs` `scan_block_spans`): an `image` block becomes `![](images/…)` and is a figure, every other prefix is deleted. The text so has v1's shape (titles unmarked, one newline between blocks, tables as HTML). `layout` keeps each block's label, its `level` and its box rescaled as v1's are. A prefix off the grammar, such as one cut off by a page's token cap, stays in the text. `cross_text`/`append_text` continuations stay on their own pages. Measured: all 431 blocks of the nine oracle outputs parse, and none of the grammar reaches the markdown (U2-E3b) |
 
@@ -1787,6 +1790,16 @@ HF reference.
 
 **Multi-page.** S2 and S3 against the v2 reference: per-document CER, page-count equality, and the
 per-page generated-token distribution (which feeds D11 and the re-derived pre-windowing page limit).
+
+**Result (2026-10-30, 5,179 s, DISC-019).** The gate passed with the budget pre-registered at 0.45.
+- v2: 20/20 pages (19 at CER ≤ 0.032, page_0590 at 0.44996), aggregate 0.0685. v1 in the same
+  invocation: 19/20 (page_0590 at 0.9504), aggregate 0.1328.
+- Ratchet, category `all` (conformal, n = 20): v2's lower bound 0.726333 holds v1's floor 0.676333,
+  and would at 19/20 too. The sparse, prose and dense fallback cards hold.
+- S2, S3-p9_p14, S3-p10 and S3-p20: one body per page, `stop`, no extra marker; document CER 0.5272,
+  0.0916, 0.0013 and 0.0199.
+- Generated ids per page over 55 pages: f32 p90 982, p99 2,892; int8 p90 852. No page reached
+  16,000. The page limit becomes 102.
 
 Every accepted divergence is recorded in `docs/DISCREPANCIES.md` with the artifact SHA, under a numeric
 `## DISC-NNN: U2-k — …` heading (§5.11). C4 also declares `tests/fixtures/uocr2_v2_goldens/` in
@@ -2603,7 +2616,7 @@ evidence-gated defaults [uocr2,epic].
 |---|---|---|---|
 | OQ-V2-1 | SR-SWA candidate semantics | RESOLVED | §5.6.4 |
 | OQ-V2-2 | Router constants at inference | RESOLVED | §5.6 |
-| OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | PARTIAL: U2-C1 set the f32 gate (every stage of every layer at cosine ≥ 0.9999; coordinates, Page Gate and teacher-forced routing exact; chained flips only within 2× the layer's score noise; measured: 5 single-row tie-flips over S1–S4). The bf16 ledger tolerance remains | U2-A6 floor + U2-C1; bf16 at U2-C4 (`docs/truth-pack/OQ_INDEX.md`) |
+| OQ-V2-3 | Parity tolerance: f32 native vs the f32 oracle; bf16 ledger tolerance | RESOLVED: U2-C1 set the f32 gate (every stage of every layer at cosine ≥ 0.9999; coordinates, Page Gate and teacher-forced routing exact; chained flips only within 2× the layer's score noise; measured: 5 single-row tie-flips over S1–S4). U2-C4 gates both L5 lanes on f32 references, so no bf16 tolerance is set; bf16 runs are ledger evidence only | U2-A6 floor + U2-C1; bf16 at U2-C4 (`docs/truth-pack/OQ_INDEX.md`) |
 | OQ-V2-4 | Does HF v2 run in f32 on CPU (dense SDPA path), and is a ported dense fallback needed? | RESOLVED (yes; no port: prefill `_forward_dense`, decode `_decode_attend`, deterministic algorithms on) | U2-A6 (`OQ_INDEX.md`) |
 | OQ-V2-5 | Are the `indexer.*` projections used at inference? | RESOLVED (no) | §5.6.7, D8 |
 | OQ-V2-6 | 1-D RoPE fallback | RESOLVED (franken builds `<PAGE>` prompts; no fallback) | §5.5 |
@@ -2613,7 +2626,7 @@ evidence-gated defaults [uocr2,epic].
 | OQ-V2-10 | v2 single-page base vs gundam | OPEN | U2-G2 |
 | OQ-V2-11 | Block-granular retirement is output-exact under the guard | RESOLVED (mechanism, 2026-10-29): retired and unretired synthetic S1–S3-shaped runs agree bit for bit; the detector passes only guard-forced open rows; pinned rows survive; fixture equality is U2-C2's | U2-B4 (`srswa.rs` cache tests) |
 | OQ-V2-12 | Licenses of evaluation sets beyond MarathonDocBench (MPDocBench, OmniDocBench) | OPEN | U2-C5a |
-| OQ-V2-13 | Does the conservative int8 recipe hold v2 CER within budget? | OPEN | U2-C4 |
+| OQ-V2-13 | Does the conservative int8 recipe hold v2 CER within budget? | RESOLVED: yes. U2-C4's pre-registered L5 gate passed: 20/20 corpus pages within 0.45 per-page CER (page_0590 at 0.44996), aggregate 0.0685 (v1 same invocation 0.1328), ratchet lower bound 0.726333 against v1's floor 0.676333; S2/S3 one body per page. Near-tie cost and document CERs in DISC-019 | U2-C4 |
 | OQ-V2-14 | Document-mode crop mode: Baidu's long-document numbers are plausibly gundam (the SGLang default) | OPEN | U2-C5b resolves it, or defers its gundam cells to U2-G2, which runs them on C5b's long-document subset (same harness and invocation) and resolves it |
 | OQ-V2-15 | Non-Baidu ground-truth documents for the head-to-head (sources, licenses, normalization) | OPEN | U2-C5a |
 | OQ-V2-16 | Entmax domain for long documents (TopM vs AllCandidates) | OPEN | U2-C5b |

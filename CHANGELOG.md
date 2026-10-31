@@ -249,8 +249,8 @@ sections as they land.
   - Pages split on the marker's token id. Text before the first marker is
     prepended to page 1 with a `leading_text` warning, so N pages always give N
     bodies (DISC-U2-9).
-  - One pass is sized for at most 60 pages; a longer document reads in
-    windows (U2-D1b, below).
+  - One pass is sized for at most 102 pages (U2-C4, from measured page
+    lengths); a longer document reads in windows (U2-D1b, below).
   - A document that stops early is not silently truncated. At the 131,072
     position limit, or when `FOCR_STAGE_BUDGET_FORWARD_MS` (scaled by the page
     count) runs out, the pages produced are written first. The run then exits 5
@@ -327,7 +327,7 @@ sections as they land.
     remaining pages were missing from the middle of the output. The
     `v2_length` and `v2_budget` warnings name the page the stop fell in, or
     "before page N" when a window's budget ran out before its prefill.
-  - `PageWindow::Pages(n)` reads in windows of n pages (at most 60), and
+  - `PageWindow::Pages(n)` reads in windows of n pages (at most 102), and
     `PageWindow::Off` reads every page in one pass. v1 still reads a document
     in one pass and refuses a window smaller than the document.
 - **Directory input, and documents read one page at a time** (bead U2-D0).
@@ -455,6 +455,13 @@ sections as they land.
   | `OcrEngine::recognize_multi_page_source_with_model(m, source, on_item, sink)` | `engine.recognize_document(m, source, &DocumentOptions::default(), on_item, sink)` |
   | `OcrModel::recognize_multi_page`, `_dynamic`, `_dynamic_streaming`, `recognize_multi_page_source` | `model.recognize_document(&mut source, &options, &mut on_item, on_page)` |
   | `DocumentPages { markdown, pages }` | `DocumentResult`, whose `markdown` and `pages` are the same |
+- **`FOCR_DECODE_F32` decodes v1 too** (found in bd-1jx0). Unlimited-OCR v1
+  now has the all-f32 cache that v2 gained in U2-C2: the cached decode with
+  the FFN/expert weights widened to f32 instead of int8. It reproduces the f32
+  reference on the CJK stream pages, which the shipping int8 path misreads.
+  Like v2's, it needs the raw checkpoint. Before, v1 ignored the variable and
+  ran the int8 path. Setting it together with the full-int8 decoder
+  (`FOCR_DECODE_INT8` or the library override) is now a usage error.
 
 ### Fixed
 

@@ -625,14 +625,18 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
     against the f32 reference; pre-registered budgets 0.45 per page and 0.25 aggregate, documents
     exact in page count with `stop` and no extra marker.
     * 20 corpus pages: 19 at CER ≤ 0.032 (10 exactly 0; page_0014 0.0272 at 441 ids against 256,
-      page_0358 0.0318); aggregate **0.0685**. page_0590 (the one dense table page) reads at
+      page_0358 0.0318); aggregate **0.0685** (v1's lane in the same invocation: 0.1328 against
+      its f32 references; its recorded 0.1931 is against bf16). page_0590 (the one dense table page) reads at
       **0.44996**, inside its 0.45 budget by 0.00004, stopping at 1,644 ids against the reference's
       2,329. The v1 baseline lane on the same page, with the same recipe class, is 0.9504 (4,032 ids
       against 2,327).
     * Documents: S2 (3 pages), S3-p9_p14, S3-p10 and S3-p20 each give exactly one body per page,
-      `stop`, no extra marker. Their id counts differ where the trajectory left the reference: S2
-      1,232 against 2,152, S3-p9_p14 314 against 538, S3-p10 6,277 against 6,272, S3-p20 17,165
-      against 16,880.
+      `stop`, no extra marker (the gate). Their CER, recorded and not gated: S2 **0.5272** (1,232
+      ids against 2,152), S3-p9_p14 0.0916 (314 against 538), S3-p10 0.0013 (6,277 against 6,272),
+      S3-p20 0.0199 (17,165 against 16,880). S2 and S3-p9_p14 leave the reference at a near-tie
+      (steps 44 and 73). Most of S2's edits fall on its third page, page_0019 (a list of
+      illustrations with dot leaders): the reference reads it at 1,841 ids in this document and at
+      802 alone; int8 reads it at 694.
     * Generated ids per page over the 55 measured pages: int8 p50 735, p90 852, p99 2,892; f32 p50
       740, p90 982, p99 2,892. No page reached 16,000. The one-pass page limit this supports is 102
       (`64 + 274·N + (N − 1)·p90 + p99 ≤ 131,072` on the stricter f32 distribution; 114 on int8).
@@ -1091,6 +1095,21 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
       CER gate is meaningful against a degenerate oracle, so the committed
       rungs stop at the 10-page leg and the 20-page fixture stands as the
       upper-bound evidence.
+    * THE SHIPPING INT8 FFN PATH LOST A PAGE ON SPARSE CJK PAGES (bd-1jx0,
+      2026-10-30). The first `tests/fixtures/cjk_stream` layout (two 1024²
+      pages of four lines, 56 px glyphs on a 120 px pitch; sha256
+      `5ba337cd…`, `ef01486a…`) reads as the same two pages in the f32
+      reference, in the stateless decode (over the bf16 checkpoint, and over
+      the int8 artifact's dequantized weights), and in the cached decode on
+      the all-f32 cache (`FOCR_DECODE_F32`). The shipping cache, int8 weights
+      times activations quantized to int8 per row, reads the title, then line
+      4, then lines 2–4, and stops after one page (`v1_page_merge`). A second
+      text in the same layout fails the same way. The two cached decodes
+      differ only in FFN/expert storage and GEMM, so the flip is that path's;
+      that the stateless decode over the same int8 weight values reads
+      correctly points at the activation quantization. The same text at 40 px
+      on a 64 px pitch (the committed fixture since bd-1jx0) reads as the
+      reference's two pages, character for character, on every path.
     The remaining fork is the same precision-trajectory class as DISC-003
     (greedy path divergence at a near-tie under a different
     summation/precision), amplified by the lossy 640 squash making footer
@@ -1099,6 +1118,8 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
     for tighter comparisons; the multi-page squash kernel itself has NO env
     (PIL-bicubic is parity-mandatory at this site — the shipped-default
     CatmullRom of DISC-001 applies only to the single-image/base sites).
+    `FOCR_DECODE_F32=1` (v1 since bd-1jx0) decodes on the all-f32 cache from
+    the raw checkpoint: the exact path for the CJK case above.
 - Resolution: ACCEPTED as precision-trajectory divergence (reordered/precision
     math, not wrong math — the plate anchor, the probe's measured near-tie and
     the DISC-003 attribution precedent bound the class). Per this entry's
@@ -1108,7 +1129,9 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
     CER ≤ 0.10); `l5_multi_page_10p_long_horizon` (2-line plate + CER ≤
     0.40); `multi_page_streaming_matches_terminal_assembly_when_armed`;
     `recognize_document_real_model_when_present_else_skip_with_success`
-    (`recognize_multi_page_…` until U2-E2).
+    (`recognize_multi_page_…` until U2-E2);
+    `multi_page_streaming_survives_split_cjk_characters_when_armed` (its
+    fixture re-rendered for bd-1jx0, the two-marker precondition kept).
 - Review date: when an int8 or bf16-matched decode variant lands for the
     multi-page path — re-measure the fork point and the near-tie margins.
 
