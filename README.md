@@ -985,7 +985,7 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_RESIDENT_DIR` | Override the directory holding resident daemon state files (default: the model cache root). |
 | `FOCR_RESIDENT_LOG` | Append resident daemon diagnostics to this file (its stderr is discarded by default). |
 | `FOCR_RESIDENT_SPAWN_WAIT_SECS` | How long a client waits for a freshly spawned daemon to accept (default 30). |
-| `FOCR_RESIDENT_CLIENT_TIMEOUT_SECS` | Client-side reply timeout for a resident request (default 600). |
+| `FOCR_RESIDENT_CLIENT_TIMEOUT_SECS` | How long a resident client waits for its reply before it runs the page inline. Set, it is a fixed wait. Unset, the client waits 600 s or until the daemon's forward stage must have ended (its budget plus the stop grace), whichever is later, so a page stopped at its budget is answered, not read again inline. With `FOCR_STAGE_BUDGET_FORWARD_MS=0` it waits as long as the stage runs. |
 | `HOME` | Required for cache resolution; the model cache installs to `~/.cache/franken_ocr/models`. |
 
 ### Exit codes

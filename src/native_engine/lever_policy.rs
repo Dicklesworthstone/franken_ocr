@@ -84,7 +84,7 @@ use Decision::{AllowListed, Ignored, NotApplicable, Refuse, Supported};
 const R_SWA_ONLY: &str = "it reaches only v1's R-SWA attention";
 const INT8_DECODER_ONLY: &str = "it reaches only the all-int8 decoder, which this model refuses";
 const UNDER_SPINE: &str = "it takes effect only under FOCR_BATCH_SPINE, which this model refuses";
-const RESIDENT: &str = "the resident daemon does not serve this model";
+const RESIDENT: &str = "it steers the resident daemon, which serves this model's single-image runs";
 
 /// Unlimited-OCR-2's table, sorted by name.
 pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
@@ -189,7 +189,7 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             "FOCR_NO_REPEAT_NGRAM",
             Supported("a per-page generated-only ban for this model (U2-B6)"),
         ),
-        lever("FOCR_NO_RESIDENT", NotApplicable(RESIDENT)),
+        lever("FOCR_NO_RESIDENT", Supported(RESIDENT)),
         lever(
             "FOCR_ONECHART_DIR",
             AllowListed("OneChart model-gated tests"),
@@ -215,11 +215,11 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
             "FOCR_RESAMPLE",
             Ignored("this model's preprocessing fixes its own resampling (U2-B7)"),
         ),
-        lever("FOCR_RESIDENT_CLIENT_TIMEOUT_SECS", NotApplicable(RESIDENT)),
-        lever("FOCR_RESIDENT_DIR", NotApplicable(RESIDENT)),
-        lever("FOCR_RESIDENT_IDLE_SECS", NotApplicable(RESIDENT)),
-        lever("FOCR_RESIDENT_LOG", NotApplicable(RESIDENT)),
-        lever("FOCR_RESIDENT_SPAWN_WAIT_SECS", NotApplicable(RESIDENT)),
+        lever("FOCR_RESIDENT_CLIENT_TIMEOUT_SECS", Supported(RESIDENT)),
+        lever("FOCR_RESIDENT_DIR", Supported(RESIDENT)),
+        lever("FOCR_RESIDENT_IDLE_SECS", Supported(RESIDENT)),
+        lever("FOCR_RESIDENT_LOG", Supported(RESIDENT)),
+        lever("FOCR_RESIDENT_SPAWN_WAIT_SECS", Supported(RESIDENT)),
         lever("FOCR_RSWA_PARALLEL_ATTN", Ignored(R_SWA_ONLY)),
         lever(
             "FOCR_RUNAWAY_GUARD",
@@ -358,13 +358,6 @@ pub(crate) fn policy_for(arch: &dyn ModelArch) -> Option<&'static LeverPolicy> {
         None | Some(UnlimitedVariant::V1Rswa) => None,
         Some(UnlimitedVariant::V2SrSwa) => Some(&UOCR2_LEVER_POLICY),
     }
-}
-
-/// Whether the resident daemon may serve `arch`. Its reply carries no decode
-/// report or lever warnings yet (bd-u77k), so a model with a lever table runs
-/// inline.
-pub(crate) fn resident_daemon_serves(arch: &dyn ModelArch) -> bool {
-    policy_for(arch).is_none()
 }
 
 /// What the check reads: one environment lookup and the process-wide
@@ -778,9 +771,7 @@ mod tests {
                 );
                 assert!(pass, "{}: {admission:?}", arch.id());
             }
-            assert!(resident_daemon_serves(*arch), "{}", arch.id());
         }
-        assert!(!resident_daemon_serves(v2()));
     }
 
     #[test]

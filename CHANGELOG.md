@@ -630,7 +630,9 @@ sections as they land.
   `ok: true`, so a page the stage budget cut off looked like a clean one, and the
   warnings `focr ocr` gives for the same stop were dropped. Rows now carry `finish_reason`
   and `warnings`, and a stopped Unlimited-OCR-2 page keeps its text but reads `ok: false`
-  and counts as failed, including in `--progress-events`.
+  and counts as failed, including in `--progress-events`. `focr ocr --json` and `-o
+  out.json` gain `finish_reason` too: the README promised `finish_reason: length` for a
+  truncated document, and only the robot stream carried it.
 - **The GOT `--format` corpus has real scores** (bead bd-fqn1). The lenient smoke tests
   passed garbage: a formula read as SMILES contained `=`. Frozen readings on int8 and
   f32 now hold each asset to an exact score, and the README says which lanes misread.

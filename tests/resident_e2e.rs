@@ -1,7 +1,8 @@
-//! The resident daemon on real weights (beads bd-fuh2, bd-mapo).
+//! The resident daemon on real weights (beads bd-fuh2, bd-mapo, bd-u77k).
 //!
-//! Set `FOCR_RESIDENT_E2E_MODEL` to a v1 artifact. Without it the test logs
-//! `skip_no_model`. Corpus pages come from `FOCR_CORPUS_DIR`, or
+//! Set `FOCR_RESIDENT_E2E_MODEL` to a v1 artifact and
+//! `FOCR_RESIDENT_E2E_V2_MODEL` to an Unlimited-OCR-2 one. Without them the
+//! tests log `skip_no_model`. Corpus pages come from `FOCR_CORPUS_DIR`, or
 //! `~/.cache/franken_ocr/corpus/pages`.
 //!
 //! A run the daemon served never loads the model in the client, so the client's
@@ -172,4 +173,128 @@ fn a_resident_run_matches_an_inline_run() {
     let second = ocr(&page, &model, Some(&dir)).spawn().expect("focr");
     assert_eq!(served(&finish(first)), expected, "first of two");
     assert_eq!(served(&finish(second)), expected, "second of two");
+}
+
+const V2_MODEL_ENV: &str = "FOCR_RESIDENT_E2E_V2_MODEL";
+
+/// What one `focr ocr` run showed its caller.
+struct Seen {
+    code: Option<i32>,
+    stdout: String,
+    /// The run's own stderr lines: warnings, notes and the error.
+    said: Vec<String>,
+    peak: u64,
+    wall_s: f64,
+}
+
+fn seen(mut command: Command) -> Seen {
+    let started = std::time::Instant::now();
+    let out = command.output().expect("focr");
+    let wall_s = started.elapsed().as_secs_f64();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Seen {
+        code: out.status.code(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        said: stderr
+            .lines()
+            .filter(|line| line.starts_with("[focr] ") || line.starts_with("focr: "))
+            .map(str::to_owned)
+            .collect(),
+        peak: peak_bytes(&out),
+        wall_s,
+    }
+}
+
+/// bd-u77k: Unlimited-OCR-2 served cold and warm reports what it reports
+/// inline, byte for byte: `--json` with its `finish_reason` and `warnings[]`
+/// (an ignored lever's among them), the stderr warnings and experimental
+/// note, and the exit code, 0 for a page its `--max-page-tokens` cap closed
+/// and 5 for one stopped at its position limit. Set
+/// `FOCR_RESIDENT_E2E_V2_MODEL` to a v2 artifact beside its tokenizer.
+#[test]
+fn a_resident_v2_run_matches_an_inline_run() {
+    let Some(model) = std::env::var_os(V2_MODEL_ENV).map(PathBuf::from) else {
+        eprintln!("skip_no_model: {V2_MODEL_ENV} unset");
+        return;
+    };
+    let corpus = std::env::var_os(CORPUS_ENV).map_or_else(
+        || {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/franken_ocr/corpus/pages")
+        },
+        PathBuf::from,
+    );
+    let page = corpus.join(PAGE);
+    let root = std::env::temp_dir().join(format!("focr-resident-v2-e2e-{}", std::process::id()));
+
+    // A one-position limit refuses with the prompt's length.
+    let mut probe = ocr(&page, &model, None);
+    probe.env("FOCR_TEST_MAX_POSITIONS", "1");
+    let probe = seen(probe);
+    let prompt: usize = probe
+        .said
+        .iter()
+        .find_map(|line| line.split("prompt is ").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.replace(',', "").parse().ok())
+        .unwrap_or_else(|| panic!("no prompt length in {:?}", probe.said));
+    let limit = (prompt + 40).to_string();
+
+    let cases: [(&str, &[&str], &[(&str, &str)], i32); 2] = [
+        ("page_cap", &["--json", "--max-page-tokens", "48"], &[], 0),
+        (
+            "positions",
+            &["--json"],
+            &[("FOCR_TEST_MAX_POSITIONS", limit.as_str())],
+            5,
+        ),
+    ];
+    for (case, args, envs, code) in cases {
+        // Each case's environment is its daemon's, so each has its own.
+        let dir = root.join(case);
+        fs::create_dir_all(&dir).expect("state dir");
+        let _daemon = Daemon(dir.clone());
+        let run = |resident: Option<&Path>| {
+            let mut command = ocr(&page, &model, resident);
+            command.args(args).env("FOCR_QKV_FUSED", "0");
+            for (key, value) in envs {
+                command.env(key, value);
+            }
+            seen(command)
+        };
+        let inline = run(None);
+        assert_eq!(inline.code, Some(code), "{case}: {:?}", inline.said);
+        assert!(inline.peak > SERVED_PEAK_BYTES, "{case}: inline holds the model");
+        let json: Value = serde_json::from_str(&inline.stdout).expect("--json");
+        let kinds: Vec<&str> = json["warnings"]
+            .as_array()
+            .expect("warnings[]")
+            .iter()
+            .filter_map(|w| w["kind"].as_str())
+            .collect();
+        assert!(kinds.contains(&"ignored_lever"), "{case}: {kinds:?}");
+        assert_eq!(kinds.contains(&"v2_length"), code == 5, "{case}: {kinds:?}");
+        let cold = run(Some(&dir));
+        let warm = run(Some(&dir));
+        for (run, served) in [("cold", &cold), ("warm", &warm)] {
+            assert_eq!(served.code, inline.code, "{case} {run}: {:?}", served.said);
+            assert_eq!(served.stdout, inline.stdout, "{case} {run}");
+            assert_eq!(served.said, inline.said, "{case} {run}");
+            assert!(
+                served.peak < SERVED_PEAK_BYTES,
+                "{case} {run}: the client held {} bytes",
+                served.peak
+            );
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": "a_resident_v2_run_matches_an_inline_run", "case": case,
+                "exit_code": code, "finish_reason": json["finish_reason"],
+                "warning_kinds": kinds, "inline_s": inline.wall_s, "cold_s": cold.wall_s,
+                "warm_s": warm.wall_s, "inline_peak": inline.peak, "warm_peak": warm.peak,
+            })
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
 }

@@ -501,7 +501,8 @@ impl FinishReason {
 }
 
 /// The limit that ended a [`FinishReason::Length`] decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LengthCap {
     /// The generated-token cap (`--max-length` / `FOCR_MAX_NEW_TOKENS`).
     MaxLength,
@@ -514,9 +515,14 @@ pub enum LengthCap {
 /// did: every single-page, multi-page and streaming Unlimited-OCR forward.
 /// Taken by the CLI for `finish_reason` and the v1 truncation / page-merge
 /// warnings, and by the token-id golden gate (`tests/uocr2_goldens.rs`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Its serde form, which the resident daemon's reply carries (bd-u77k),
+/// leaves out `ids` and `admission_warnings`: the client needs no ids, and
+/// admits the model in its own environment.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DecodeReport {
     /// The generated token ids, before detokenize and postprocess.
+    #[serde(skip)]
     pub ids: Vec<u32>,
     /// EOS or a limit.
     pub finish_reason: FinishReason,
@@ -538,6 +544,7 @@ pub struct DecodeReport {
     pub document: Option<DocumentStats>,
     /// The `ignored_lever` warnings the model's lever policy raised for this
     /// run's environment (U2-A7), carried into the run's `warnings[]`.
+    #[serde(skip)]
     pub admission_warnings: Vec<RunWarning>,
 }
 
@@ -575,7 +582,7 @@ impl PageFinish {
 }
 
 /// An Unlimited-OCR-2 document decode's per-page facts and counters (U2-B6).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DocumentStats {
     /// Per page the output reached, how its body ended.
     pub page_finish: Vec<PageFinish>,
@@ -833,7 +840,7 @@ impl DecodeReport {
 }
 
 /// Expected pages vs page bodies of a multi-page decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PageBodies {
     /// Source pages.
     pub expected: usize,
@@ -3518,28 +3525,43 @@ fn load_weights_from_resolved_model_after_validation(
 /// then refuse an armed unsupported lever or an unimplemented model.
 fn admit_for_inference(arch: &'static dyn model_arch::ModelArch) -> FocrResult<()> {
     let admission = lever_policy::admit_from_process(arch);
-    for warning in &admission.warnings {
+    print_admission_warnings(&admission.warnings);
+    admission.verdict?;
+    check_entmax_domain(arch)?;
+    note_experimental(arch);
+    Ok(())
+}
+
+/// Each `ignored_lever` warning's stderr line.
+fn print_admission_warnings(warnings: &[RunWarning]) {
+    for warning in warnings {
         crate::progress::stderr_message(format_args!(
             "[focr] warning: {} — {}",
             warning.message, warning.recovery
         ));
     }
-    admission.verdict?;
-    // A paged model routes by `FOCR_SRSWA_ENTMAX`: an unknown value is a
-    // usage error before a weight byte is read, so the decode params can
-    // rely on it ([`decode_params_for`]).
+}
+
+/// A paged model routes by `FOCR_SRSWA_ENTMAX`: an unknown value is a usage
+/// error before a weight byte is read, so the decode params can rely on it
+/// ([`decode_params_for`]).
+fn check_entmax_domain(arch: &dyn model_arch::ModelArch) -> FocrResult<()> {
     if arch.decode_contract().pages.is_some() {
         srswa::entmax_domain()
             .as_ref()
             .map_err(|why| FocrError::Usage(why.clone()))?;
     }
+    Ok(())
+}
+
+/// The stderr note an experimental model's run carries.
+fn note_experimental(arch: &dyn model_arch::ModelArch) {
     if arch.maturity() == model_arch::Maturity::Experimental {
         crate::progress::stderr_message(format_args!(
             "[focr] note: {} is experimental: not yet certified against its reference",
             arch.id()
         ));
     }
-    Ok(())
 }
 
 /// The forward a model's single-image entry points run (U2-A7).
@@ -3673,13 +3695,39 @@ pub fn load_if_policed(spec: &Path) -> FocrResult<Option<Arc<OcrModel>>> {
     }
 }
 
-/// Whether the resident daemon may serve the model at `path` (U2-A7). A
-/// header the bounded probe refuses (a newer format, an unknown census) runs
-/// inline, which reports the same error, rather than starting a daemon that
-/// can never load the model and then idles for its full period.
+/// The resident client's admission of a model (bd-u77k): what an inline load
+/// would have printed and reported, from the client's own environment.
+pub struct ServedAdmission {
+    arch: &'static dyn model_arch::ModelArch,
+    /// The `ignored_lever` warnings ([`DecodeReport::admission_warnings`]).
+    pub warnings: Vec<RunWarning>,
+}
+
+impl ServedAdmission {
+    /// Print what an inline load prints once it admits the model: the
+    /// warnings, then the experimental note.
+    pub fn announce(&self) {
+        print_admission_warnings(&self.warnings);
+        note_experimental(self.arch);
+    }
+}
+
+/// Admit the model at `path` for the resident daemon, in this process's
+/// environment, before a connect or spawn (U2-A7, bd-u77k). `None` runs it
+/// inline: a header the bounded probe refuses (a newer format, an unknown
+/// census), an armed refused lever or an unknown `FOCR_SRSWA_ENTMAX`. The
+/// inline load reports the same error at once, where a daemon could never
+/// load the model and would idle for its full period.
 #[must_use]
-pub fn resident_daemon_serves(path: &Path) -> bool {
-    validate_model_header_file(path).is_ok_and(lever_policy::resident_daemon_serves)
+pub fn resident_admission(path: &Path) -> Option<ServedAdmission> {
+    let arch = validate_model_header_file(path).ok()?;
+    let admission = lever_policy::admit_from_process(arch);
+    admission.verdict.ok()?;
+    check_entmax_domain(arch).ok()?;
+    Some(ServedAdmission {
+        arch,
+        warnings: admission.warnings,
+    })
 }
 
 /// Whether `arch` pins anything about its `tokenizer.json` sidecar.
@@ -9815,13 +9863,17 @@ mod tests {
         let Err(public) = OcrModel::load(&dir) else {
             panic!("OcrModel::load refuses the foreign sidecar");
         };
-        if lever_policy::admit_from_process(arch).verdict.is_ok() {
+        let admitted = lever_policy::admit_from_process(arch).verdict.is_ok();
+        if admitted {
             assert_eq!(public.exit_code(), 7, "{public}");
             assert!(public.to_string().contains("tokenizer.json"), "{public}");
         } else {
             assert_eq!(public.exit_code(), 2, "{public}");
         }
-        assert!(!resident_daemon_serves(&index));
+        // The resident client admits it in the same environment, before any
+        // connect (bd-u77k).
+        let served = resident_admission(&index).is_some();
+        assert_eq!(served, admitted);
         v2_gated_line(
             test,
             started,
@@ -9832,19 +9884,20 @@ mod tests {
                 "assertion": "identified as v2; admission, then sidecar, before weights",
                 "pass": true, "exit_code": public.exit_code(), "message": message,
                 "sidecar_message": sidecar, "weights_touched": false,
-                "resident_daemon_serves": false,
+                "resident_admitted": served,
             }),
         );
 
         // Armed: the real artifacts identify from their headers alone, and
-        // only v2 is kept from the daemon.
+        // the resident client admits each as its load would.
         if let Some(v1) = std::env::var_os("FOCR_MODEL_PATH").map(PathBuf::from) {
             assert_eq!(model_id_at(&v1), Some(model_arch::UNLIMITED_OCR_V1_ID));
-            assert!(resident_daemon_serves(&v1));
+            assert!(resident_admission(&v1).is_some());
         }
         if let Some(v2) = std::env::var_os("FOCR_UOCR2_SOURCE_DIR").map(PathBuf::from) {
             assert_eq!(model_id_at(&v2), Some(model_arch::UNLIMITED_OCR_V2_ID));
-            assert!(!resident_daemon_serves(&v2.join(shards::SHARD_INDEX_NAME)));
+            let index = v2.join(shards::SHARD_INDEX_NAME);
+            assert_eq!(resident_admission(&index).is_some(), admitted);
         }
     }
 

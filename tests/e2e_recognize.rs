@@ -1981,7 +1981,9 @@ fn run_focr_only(bin: &Path, args: &[&str], envs: &[(&str, String)]) -> CliOut {
 /// and refused with exit 2; an ignored lever is a one-line stderr warning.
 /// An admitted run reaches the tokenizer sidecar check next, which refuses
 /// the stand-in's foreign sidecar with exit 7 — still before a weight byte
-/// is read. The resident daemon is never spawned.
+/// is read. An admitted `focr ocr` run goes to the resident daemon (bd-u77k)
+/// and reports the same exit code, warnings and note; a refused run never
+/// starts one.
 #[test]
 fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
     const TEST: &str = "cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights";
@@ -1999,8 +2001,22 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let dir = std::env::temp_dir().join(format!("focr_e2e_uocr2_{}_{nanos}", std::process::id()));
-    let resident_dir = dir.join("resident");
-    std::fs::create_dir_all(&resident_dir).expect("create temp dirs");
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+    // Each run's own daemon state and log: the client creates the log when it
+    // spawns a daemon, so the log alone says whether the run went to one.
+    let resident_envs = |case: &str| -> (Vec<(&'static str, String)>, PathBuf) {
+        let log = dir.join(format!("resident_{case}.log"));
+        let envs = vec![
+            (
+                "FOCR_RESIDENT_DIR",
+                dir.join(format!("resident_{case}")).display().to_string(),
+            ),
+            ("FOCR_RESIDENT_LOG", log.display().to_string()),
+            // A served run's daemon does not linger.
+            ("FOCR_RESIDENT_IDLE_SECS", "2".into()),
+        ];
+        (envs, log)
+    };
     let model = write_sparse_v2_stand_in(&dir);
     // A foreign sidecar: an admitted run stops at its check (exit 7), so the
     // sparse payload is never decoded.
@@ -2084,14 +2100,10 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
     for (case, command, levers, refused, warned) in cases {
         let mut args: Vec<&str> = command.to_vec();
         args.extend([image.as_str(), "--model", model.as_str()]);
-        let mut envs: Vec<(&str, String)> = vec![
-            ("FOCR_RESIDENT_DIR", resident_dir.display().to_string()),
-            // Were a daemon spawned anyway, it would not linger.
-            ("FOCR_RESIDENT_IDLE_SECS", "2".into()),
-            // A safety net only: were the gate bypassed, the sparse payload
-            // would be mapped, not copied into memory.
-            ("FOCR_MMAP", "1".into()),
-        ];
+        let (mut envs, log) = resident_envs(case);
+        // A safety net only: were the gate bypassed, the sparse payload would
+        // be mapped, not copied into memory.
+        envs.push(("FOCR_MMAP", "1".into()));
         envs.extend(
             levers
                 .iter()
@@ -2137,15 +2149,17 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
                 .iter()
                 .any(|l| l.contains(&format!("{lever} has no effect on unlimited-ocr-2")));
         }
+        let served = log.exists();
+        pass &= served == (refused.is_none() && command[0] == "ocr");
         println!(
             "{}",
             serde_json::json!({
                 "schema_version": 1, "ts": 0.0, "test": TEST, "case": case, "run_seq": 0,
                 "event": "assert", "result": if pass { "pass" } else { "fail" },
-                "assertion": "levers named (exit 2) or warned, then the sidecar (exit 7), before weights",
+                "assertion": "levers named (exit 2) or warned, then the sidecar (exit 7), before weights; only an admitted ocr run is served",
                 "pass": pass, "arch": "unlimited-ocr-2", "args": args, "levers": levers,
                 "expected_refused": refused, "expected_warned": warned,
-                "exit_code": out.code, "message": message.trim(),
+                "exit_code": out.code, "message": message.trim(), "served": served,
                 "warning_lines": warning_lines, "elapsed_us": elapsed_us,
                 "weights_touched": false,
             })
@@ -2161,12 +2175,9 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
     // stops at the sidecar (exit 7).
     for (value, code) in [("bogus", 2), ("all", 7)] {
         let args = ["ocr", image.as_str(), "--model", model.as_str()];
-        let envs: Vec<(&str, String)> = vec![
-            ("FOCR_RESIDENT_DIR", resident_dir.display().to_string()),
-            ("FOCR_RESIDENT_IDLE_SECS", "2".into()),
-            ("FOCR_MMAP", "1".into()),
-            ("FOCR_SRSWA_ENTMAX", value.to_owned()),
-        ];
+        let (mut envs, log) = resident_envs(&format!("entmax_{value}"));
+        envs.push(("FOCR_MMAP", "1".into()));
+        envs.push(("FOCR_SRSWA_ENTMAX", value.to_owned()));
         let out = run_focr_only(&bin, &args, &envs);
         let refused = out.stderr.contains(&format!(
             "FOCR_SRSWA_ENTMAX={value:?} is not an entmax domain"
@@ -2175,20 +2186,21 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
             .stderr
             .contains("[focr] note: unlimited-ocr-2 is experimental");
         let sidecar = out.stderr.contains(FOREIGN_SIDECAR);
+        let served = log.exists();
         let pass = out.code == Some(code)
             && if code == 2 {
-                refused && !labelled && !sidecar
+                refused && !labelled && !sidecar && !served
             } else {
-                !refused && labelled && sidecar
+                !refused && labelled && sidecar && served
             };
         println!(
             "{}",
             serde_json::json!({
                 "schema_version": 1, "ts": 0.0, "test": TEST, "case": format!("entmax_{value}"),
                 "run_seq": 0, "event": "assert", "result": if pass { "pass" } else { "fail" },
-                "assertion": "an unknown entmax domain exits 2 at admission; a known one is admitted",
+                "assertion": "an unknown entmax domain exits 2 at admission, unserved; a known one is admitted and served",
                 "pass": pass, "arch": "unlimited-ocr-2", "exit_code": out.code,
-                "expected_exit_code": code, "message": out.stderr.trim(),
+                "expected_exit_code": code, "message": out.stderr.trim(), "served": served,
             })
         );
         assert!(
@@ -2197,13 +2209,6 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
             out.code, out.stderr
         );
     }
-    let spawned: Vec<_> = std::fs::read_dir(&resident_dir)
-        .expect("read resident dir")
-        .collect();
-    assert!(
-        spawned.is_empty(),
-        "a resident daemon was spawned for v2: {spawned:?}"
-    );
 
     // The v1 wasm int4 recipe is refused for v2 by arch, before any shard is
     // read (exit 1, as for every model without a certified int4 recipe).

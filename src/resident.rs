@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use crate::error::{
@@ -48,7 +49,8 @@ use crate::error::{
 };
 use crate::native_engine::tromr::{MusicWarning, StaffBBox, StaffSkip};
 use crate::native_engine::{
-    ChartPageMeta, DecodeOverrides, FinishReason, ModelIdentity, MusicPageMeta, PreprocessOverrides,
+    ChartPageMeta, DecodeOverrides, DecodeReport, ModelIdentity, MusicPageMeta,
+    PreprocessOverrides,
 };
 use crate::{LayoutSpan, OcrEngine, RecognizedDocument};
 
@@ -56,10 +58,16 @@ use crate::{LayoutSpan, OcrEngine, RecognizedDocument};
 /// (sub-second daemons are for tests; the floor is 1 second).
 const DEFAULT_IDLE: Duration = Duration::from_secs(600);
 
-/// How long the client waits for a reply. A 3B-parameter VLM page on CPU is
-/// minutes, not seconds; the default mirrors the engine's own 10-minute
-/// forward-stage budget. `FOCR_RESIDENT_CLIENT_TIMEOUT_SECS` overrides it.
+/// How long the client waits for a reply at least. A 3B-parameter VLM page on
+/// CPU is minutes, not seconds; the default mirrors the engine's own 10-minute
+/// forward-stage budget, and each stage the daemon enters extends it to that
+/// stage's own bound ([`ReplyWait::Staged`]).
+/// `FOCR_RESIDENT_CLIENT_TIMEOUT_SECS` replaces it with a fixed wait.
 const DEFAULT_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// The time a reply takes to reach the client after its stage ends: past a
+/// stage's bound plus this, the daemon is wedged.
+const REPLY_SLACK: Duration = Duration::from_secs(30);
 
 /// How long the client waits for the daemon's acknowledgement. The daemon's
 /// acceptor thread answers at once, even while its model serves another
@@ -92,7 +100,7 @@ const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 /// Request size cap (pre-auth): paths + option scalars run a few KB.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
-const PROTOCOL: u64 = 4;
+const PROTOCOL: u64 = 5;
 
 /// Upper clamp for user-supplied second counts (one year). `Instant + Duration`
 /// PANICS on overflow, so an absurd `FOCR_RESIDENT_*_SECS` value must not reach
@@ -131,15 +139,63 @@ const ENV_FINGERPRINT_EXEMPT: &[&str] = &[
     "FOCR_TIMING",
 ];
 
-fn client_read_timeout() -> Duration {
+/// How long the client waits for the daemon's reply after its request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReplyWait {
+    /// `FOCR_RESIDENT_CLIENT_TIMEOUT_SECS`: this long, whatever the daemon
+    /// reports.
+    Fixed(Duration),
+    /// The default: this long, or until the stage the daemon last entered
+    /// must have ended, whichever is later. A stage's bound is its budget,
+    /// the grace the engine gives a stopped stage
+    /// ([`crate::native_engine::document_budget_grace`]) and [`REPLY_SLACK`].
+    /// A stage without a budget has no bound, and neither has the wait, as
+    /// inline: a v2 page that stops at its budget is answered, never read
+    /// again inline.
+    Staged(Duration),
+}
+
+impl ReplyWait {
+    /// The deadline (`None`: none) once the daemon enters a stage with
+    /// `budget` at `now`, for a request sent at `started` and waited on
+    /// until `current`. The bound is clamped like a configured wait, since
+    /// `Instant + Duration` panics on overflow.
+    fn after_stage(
+        self,
+        started: Instant,
+        now: Instant,
+        budget: Option<Duration>,
+        current: Option<Instant>,
+    ) -> Option<Instant> {
+        match self {
+            Self::Fixed(_) => current,
+            Self::Staged(floor) => budget.map(|budget| {
+                let bound = budget
+                    .saturating_add(crate::native_engine::document_budget_grace(budget))
+                    .saturating_add(REPLY_SLACK)
+                    .min(Duration::from_secs(MAX_CONFIG_SECS));
+                (now + bound).max(started + floor)
+            }),
+        }
+    }
+
+    /// The deadline before any stage.
+    fn first(self, started: Instant) -> Instant {
+        match self {
+            Self::Fixed(wait) | Self::Staged(wait) => started + wait,
+        }
+    }
+}
+
+fn client_reply_wait() -> ReplyWait {
     std::env::var("FOCR_RESIDENT_CLIENT_TIMEOUT_SECS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         // Zero is rejected rather than honored: `set_read_timeout(Some(ZERO))`
         // is an error in std, so a literal 0 would fail every connect.
         .filter(|&seconds| seconds > 0)
-        .map_or(DEFAULT_CLIENT_READ_TIMEOUT, |seconds| {
-            Duration::from_secs(seconds.min(MAX_CONFIG_SECS))
+        .map_or(ReplyWait::Staged(DEFAULT_CLIENT_READ_TIMEOUT), |seconds| {
+            ReplyWait::Fixed(Duration::from_secs(seconds.min(MAX_CONFIG_SECS)))
         })
 }
 
@@ -301,12 +357,14 @@ fn env_fingerprint() -> Value {
 
 /// A daemon's successful reply: the document plus how its decode ended
 /// (U2-X2) and which model ran (U2-E1), so a resident run reports the same
-/// `finish_reason` and `model_id` an inline one would.
+/// `finish_reason`, `warnings[]`, `model_id` and exit code an inline one
+/// would.
 pub struct ResidentReply {
     /// The recognized document.
     pub document: RecognizedDocument,
-    /// `None` when the daemon's model recorded no decode report.
-    pub finish_reason: Option<FinishReason>,
+    /// The daemon's decode report, with the client's own admission warnings
+    /// (bd-u77k) and no `ids`; `None` when its model recorded none.
+    pub report: Option<DecodeReport>,
     /// `None` when the reply names no model this binary registers.
     pub model: Option<ModelIdentity>,
     /// A TrOMR run's staves and musical-sanity warnings; `None` for every
@@ -513,16 +571,30 @@ fn options_value(request: &ResidentRequest<'_>) -> Value {
 /// Recognition errors reported by the daemon (`kind: "ocr"`), plus
 /// [`FocrError::Cancelled`] when cooperative shutdown fires while waiting for
 /// the reply (matching the inline decode loop's Ctrl+C contract); every
-/// transport-shaped failure is `Ok(None)`. A model the daemon does not serve
-/// (U2-A7) is `Ok(None)` before any connect or spawn.
+/// transport-shaped failure is `Ok(None)`. A model this process's
+/// environment does not admit (U2-A7) is `Ok(None)` before any connect or
+/// spawn, and the inline load refuses it.
+///
+/// A run the daemon answers prints what the inline load would have printed
+/// at admission (its `ignored_lever` warnings and the experimental note) once
+/// the answer arrives, so a fallback never prints them twice.
 pub fn try_recognize(request: &ResidentRequest<'_>) -> FocrResult<Option<ResidentReply>> {
-    if !crate::native_engine::resident_daemon_serves(&request.model) {
+    let Some(admission) = crate::native_engine::resident_admission(&request.model) else {
         return Ok(None);
-    }
-    match connect(&request.model) {
+    };
+    let outcome = match connect(&request.model) {
         Some(stream) => roundtrip(stream, request),
         None => Ok(None),
+    };
+    if !matches!(outcome, Ok(None)) {
+        admission.announce();
     }
+    Ok(outcome?.map(|mut reply| {
+        if let Some(report) = &mut reply.report {
+            report.admission_warnings = admission.warnings;
+        }
+        reply
+    }))
 }
 
 /// Why one connect attempt did not produce a stream — the state-file removal
@@ -665,7 +737,7 @@ fn roundtrip(
         return Ok(None);
     }
 
-    let waits = (CLIENT_ACK_WAIT, client_read_timeout());
+    let waits = (CLIENT_ACK_WAIT, client_reply_wait());
     let on_stage = |name: &str, budget: Option<Duration>| {
         if let Some(on_stage) = request.on_stage {
             on_stage(name, budget);
@@ -698,11 +770,14 @@ fn reply_from_wire(line: &[u8]) -> FocrResult<Option<ResidentReply>> {
             .and_then(Value::as_array)
             .map(|spans| spans.iter().filter_map(LayoutSpan::from_json).collect())
             .unwrap_or_default();
-        // Absent from an older daemon's reply: the run then reports none.
-        let finish_reason = match reply.get("finish_reason").and_then(Value::as_str) {
-            Some("stop") => Some(FinishReason::Stop),
-            Some("length") => Some(FinishReason::Length),
-            _ => None,
+        // A report that cannot be read is worse than an inline run: its
+        // warnings and exit code would be lost.
+        let report = match reply.get("report") {
+            None | Some(Value::Null) => None,
+            Some(wire) => match DecodeReport::deserialize(wire) {
+                Ok(report) => Some(report),
+                Err(_) => return Ok(None),
+            },
         };
         let music = match reply.get("music").map(music_from_wire) {
             None => None,
@@ -720,7 +795,7 @@ fn reply_from_wire(line: &[u8]) -> FocrResult<Option<ResidentReply>> {
                 raw: raw.to_owned(),
                 layout,
             },
-            finish_reason,
+            report,
             model: model_from_reply(&reply),
             music,
             chart,
@@ -751,18 +826,20 @@ fn reply_from_wire(line: &[u8]) -> FocrResult<Option<ResidentReply>> {
 ///
 /// A daemon that refuses a request answers with the refusal alone, so any first
 /// line but the acknowledgement or a stage is the reply, and `on_stage` hears
-/// each stage on the way to it. The reply is one JSON line; the cap refuses a
+/// each stage on the way to it, which also moves the deadline
+/// ([`ReplyWait::after_stage`]). The reply is one JSON line; the cap refuses a
 /// corrupt daemon before it sizes an allocation in this process. The socket's
 /// per-syscall timeout is short (see `connect_once`), so this loop can poll
 /// `checkpoint` between reads: Ctrl+C aborts the wait with the same
 /// Cancelled/exit-6 contract as the inline decode loop.
 fn read_reply(
     stream: &mut TcpStream,
-    (ack_wait, reply_wait): (Duration, Duration),
+    (ack_wait, reply_wait): (Duration, ReplyWait),
     checkpoint: impl Fn() -> FocrResult<()>,
     on_stage: impl Fn(&str, Option<Duration>),
 ) -> FocrResult<Option<Vec<u8>>> {
     let started = Instant::now();
+    let mut deadline = Some(reply_wait.first(started));
     let mut acknowledged = false;
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 65536];
@@ -776,6 +853,7 @@ fn read_reply(
                 continue;
             }
             if let Some((name, budget)) = stage_from_wire(&line) {
+                deadline = reply_wait.after_stage(started, Instant::now(), budget, deadline);
                 on_stage(&name, budget);
                 continue;
             }
@@ -784,8 +862,10 @@ fn read_reply(
         if buffer.len() >= MAX_REPLY_BYTES {
             return Ok(None);
         }
-        let waited = started.elapsed();
-        if waited >= reply_wait || (!acknowledged && waited >= ack_wait) {
+        let now = Instant::now();
+        if deadline.is_some_and(|deadline| now >= deadline)
+            || (!acknowledged && now.duration_since(started) >= ack_wait)
+        {
             return Ok(None);
         }
         match stream.read(&mut chunk) {
@@ -1127,18 +1207,6 @@ fn handle_connection(
         return;
     }
 
-    // A model with a lever policy (Unlimited-OCR-2), or one whose header the
-    // bounded probe refuses, runs inline until its reply carries the decode
-    // report and lever warnings (bd-u77k, U2-A7); the client falls back.
-    if !crate::native_engine::resident_daemon_serves(model_root) {
-        refuse(
-            &mut stream,
-            "model",
-            "the resident daemon does not serve this model; run inline",
-        );
-        return;
-    }
-
     // A re-pulled or re-converted artifact invalidates the resident weights.
     let stamp_now = artifact_stamp(model_root);
     if let Some(engine) = resident.as_ref()
@@ -1238,30 +1306,36 @@ fn handle_connection(
                 let _ = (&client).write_all(format!("{line}\n").as_bytes());
             })));
     }
+    // The warm model keeps a run's report and page metadata until they are
+    // taken, so each request takes them, whatever its outcome: what one left
+    // behind would join the next one's reply.
+    let take_run_meta = || {
+        (
+            engine.engine.take_last_decode_report(),
+            engine.engine.take_music_page_meta(),
+            engine.engine.take_chart_page_meta(),
+        )
+    };
+    drop(take_run_meta());
     let outcome = engine
         .engine
         .recognize_with_layout_model(model_root, &image);
     engine.engine.set_stage_sink(None);
+    let (report, music, chart) = take_run_meta();
     match outcome {
         Ok(document) => {
             let layout: Vec<Value> = document.layout.iter().map(LayoutSpan::to_json).collect();
-            // Taken per request: the warm model's report would otherwise
-            // accumulate across requests.
-            let finish_reason = engine
-                .engine
-                .take_last_decode_report()
-                .map(|report| report.run_finish_reason().as_str());
             let mut reply = json!({
                 "ok": true,
                 "markdown": document.markdown,
                 "raw": document.raw,
                 "layout": layout,
-                "finish_reason": finish_reason,
+                "report": report,
             });
-            if let Some(music) = engine.engine.take_music_page_meta() {
+            if let Some(music) = music {
                 reply["music"] = music_to_wire(&music);
             }
-            if let Some(chart) = engine.engine.take_chart_page_meta() {
+            if let Some(chart) = chart {
                 reply["chart"] = chart_to_wire(&chart);
             }
             if let Some(model) = engine.engine.loaded_model_identity() {
@@ -1306,11 +1380,12 @@ mod tests {
     const ACK: &[u8] = b"{\"ok\":true,\"kind\":\"accepted\"}\n";
     const LONG: Duration = Duration::from_secs(30);
     const SHORT: Duration = Duration::from_millis(500);
+    const LONG_WAIT: ReplyWait = ReplyWait::Fixed(LONG);
     /// How long a test's daemon outlives the wait it tests.
     const HOLD: Duration = Duration::from_secs(8);
 
     /// The test's read, with no cancel flag: another test sets the global one.
-    fn read(stream: &mut TcpStream, waits: (Duration, Duration)) -> Option<Vec<u8>> {
+    fn read(stream: &mut TcpStream, waits: (Duration, ReplyWait)) -> Option<Vec<u8>> {
         read_reply(stream, waits, || Ok(()), |_, _| {}).unwrap()
     }
 
@@ -1333,7 +1408,7 @@ mod tests {
             drop(stream);
         });
         let started = Instant::now();
-        assert_eq!(read(&mut stream, (SHORT, LONG)), None);
+        assert_eq!(read(&mut stream, (SHORT, LONG_WAIT)), None);
         assert!(started.elapsed() < HOLD);
     }
 
@@ -1345,7 +1420,7 @@ mod tests {
         });
         let out = read_reply(
             &mut stream,
-            (LONG, LONG),
+            (LONG, LONG_WAIT),
             || Err(FocrError::Cancelled),
             |_, _| {},
         );
@@ -1367,7 +1442,7 @@ mod tests {
         let heard = std::cell::RefCell::new(Vec::new());
         let reply = read_reply(
             &mut stream,
-            (LONG, LONG),
+            (LONG, LONG_WAIT),
             || Ok(()),
             |name, budget| heard.borrow_mut().push((name.to_owned(), budget)),
         )
@@ -1506,20 +1581,22 @@ mod tests {
             std::thread::sleep(SHORT * 2);
             stream.write_all(b"{\"ok\":true}\n").unwrap();
         });
-        let reply = read(&mut stream, (SHORT, LONG));
+        let reply = read(&mut stream, (SHORT, LONG_WAIT));
         assert_eq!(reply.as_deref(), Some(&b"{\"ok\":true}"[..]));
     }
 
     #[test]
     fn an_acknowledged_request_is_still_bounded_by_the_reply_wait() {
-        let mut stream = client_of(|mut stream| {
-            stream.write_all(ACK).unwrap();
-            std::thread::sleep(HOLD);
-            drop(stream);
-        });
-        let started = Instant::now();
-        assert_eq!(read(&mut stream, (SHORT, SHORT * 2)), None);
-        assert!(started.elapsed() < HOLD);
+        for wait in [ReplyWait::Fixed(SHORT * 2), ReplyWait::Staged(SHORT * 2)] {
+            let mut stream = client_of(|mut stream| {
+                stream.write_all(ACK).unwrap();
+                std::thread::sleep(HOLD);
+                drop(stream);
+            });
+            let started = Instant::now();
+            assert_eq!(read(&mut stream, (SHORT, wait)), None, "{wait:?}");
+            assert!(started.elapsed() < HOLD, "{wait:?}");
+        }
     }
 
     #[test]
@@ -1530,7 +1607,7 @@ mod tests {
                 .unwrap();
             std::thread::sleep(HOLD);
         });
-        let reply = read(&mut stream, (SHORT, LONG));
+        let reply = read(&mut stream, (SHORT, LONG_WAIT));
         assert_eq!(reply.as_deref(), Some(&b"{\"ok\":true}"[..]));
     }
 
@@ -1541,7 +1618,7 @@ mod tests {
             stream.write_all(refusal).unwrap();
             std::thread::sleep(HOLD);
         });
-        let reply = read(&mut stream, (SHORT, LONG));
+        let reply = read(&mut stream, (SHORT, LONG_WAIT));
         assert_eq!(reply.as_deref(), Some(&refusal[..refusal.len() - 1]));
     }
 
@@ -1710,46 +1787,138 @@ mod tests {
         handle.join().unwrap();
     }
 
-    /// U2-A7: a daemon keyed to an Unlimited-OCR-2 checkpoint refuses
-    /// transport-shaped, before building an engine; the client runs it
-    /// inline. (The client's own skip is pinned by the e2e CLI matrix: no
-    /// daemon state appears.)
+    /// An Unlimited-OCR-2 page stopped at its stage budget, as its decode
+    /// reports it.
+    fn budget_report() -> DecodeReport {
+        use crate::native_engine::{DocumentStats, FinishReason, PageBodies, PageFinish};
+        DecodeReport {
+            ids: vec![7, 8, 9],
+            finish_reason: FinishReason::Budget,
+            cap: None,
+            pages: Some(PageBodies {
+                expected: 1,
+                bodies: 1,
+            }),
+            max_length: 8192,
+            max_positions: 32768,
+            decodes: 1,
+            length_stops: 1,
+            document: Some(DocumentStats {
+                page_finish: vec![PageFinish::Budget],
+                page_tokens: vec![3],
+                leading_text: true,
+                ..DocumentStats::default()
+            }),
+            admission_warnings: Vec::new(),
+        }
+    }
+
+    /// bd-u77k: a served page reports what its inline run would, its
+    /// `finish_reason`, its warnings and its partial-output exit; only the
+    /// ids stay in the daemon.
     #[test]
-    fn daemon_refuses_unlimited_ocr_2_transport_shaped() {
-        use std::io::{BufRead, BufReader};
+    fn a_decode_report_crosses_the_wire_with_all_the_run_reports() {
+        use crate::native_engine::{FinishReason, decode_warnings, partial_output};
+        let inline = budget_report();
+        let reply = json!({ "ok": true, "markdown": "m", "raw": "r", "report": inline });
+        let served = reply_from_wire(reply.to_string().as_bytes())
+            .unwrap()
+            .expect("a whole reply");
+        let report = served.report.expect("the report");
+        assert_eq!(
+            report,
+            DecodeReport {
+                ids: Vec::new(),
+                ..budget_report()
+            }
+        );
+        assert_eq!(report.run_finish_reason(), FinishReason::Budget);
+        assert_eq!(decode_warnings(&report), decode_warnings(&inline));
+        let model = ModelIdentity {
+            model_id: "unlimited-ocr-2",
+            source_sha256: None,
+        };
+        let exit = |report: &DecodeReport| {
+            partial_output(report, &decode_warnings(report), &model).map(|e| e.exit_code())
+        };
+        assert_eq!(exit(&report), Some(5));
+    }
 
-        let dir =
-            std::env::temp_dir().join(format!("franken_ocr_resident_v2_{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let index = crate::native_engine::write_sparse_v2_stand_in(&dir);
-        assert!(!crate::native_engine::resident_daemon_serves(&index));
+    #[test]
+    fn a_report_that_cannot_be_read_runs_inline() {
+        let served = |report: Value| {
+            let reply = json!({ "ok": true, "markdown": "m", "raw": "r", "report": report });
+            reply_from_wire(reply.to_string().as_bytes()).unwrap()
+        };
+        let none = served(Value::Null).expect("a reply without a report");
+        assert!(none.report.is_none());
+        let mut wire = serde_json::to_value(budget_report()).unwrap();
+        wire["finish_reason"] = json!("sideways");
+        assert!(served(wire).is_none());
+        assert!(
+            served(json!({ "finish_reason": "stop" })).is_none(),
+            "half a report"
+        );
+    }
 
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let root = index.clone();
-        let handle = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            let mut resident = None;
-            handle_connection(stream, &root, "tok", 0, &mut resident);
-            assert!(resident.is_none(), "no engine was built for v2");
-        });
-        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
-        let request = json!({
-            "protocol": PROTOCOL,
-            "op": "ocr",
-            "token": "tok",
-            "version": env!("CARGO_PKG_VERSION"),
-            "model_root": index.display().to_string(),
-            "image": "/nonexistent/page.png",
-            "options": {},
-            "env": env_fingerprint(),
-        });
-        stream.write_all(format!("{request}\n").as_bytes()).unwrap();
-        let mut reply = String::new();
-        BufReader::new(&mut stream).read_line(&mut reply).unwrap();
-        let value: Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(value.get("ok").and_then(Value::as_bool), Some(false));
-        assert_eq!(value.get("kind").and_then(Value::as_str), Some("model"));
-        handle.join().unwrap();
+    #[test]
+    fn the_default_wait_lasts_as_long_as_the_daemon_stage_can() {
+        let started = Instant::now();
+        let now = started + Duration::from_secs(5);
+        let floor = DEFAULT_CLIENT_READ_TIMEOUT;
+        let first = Some(started + floor);
+        assert_eq!(
+            ReplyWait::Fixed(floor).after_stage(started, now, None, first),
+            first,
+            "a fixed wait ignores the daemon's stages"
+        );
+        let staged = ReplyWait::Staged(floor);
+        assert_eq!(
+            staged.after_stage(started, now, Some(Duration::from_secs(1)), first),
+            first,
+            "a short stage keeps the floor"
+        );
+        let budget = Duration::from_secs(750);
+        let bound = budget + crate::native_engine::document_budget_grace(budget) + REPLY_SLACK;
+        assert_eq!(
+            staged.after_stage(started, now, Some(budget), first),
+            Some(now + bound)
+        );
+        assert_eq!(
+            staged.after_stage(started, now, None, first),
+            None,
+            "a stage without a budget has no deadline, as inline"
+        );
+        assert!(
+            staged
+                .after_stage(started, now, Some(Duration::MAX), first)
+                .is_some(),
+            "an absurd budget is clamped, not an overflow panic"
+        );
+    }
+
+    /// The default wait outlasts its floor while the daemon's stage may still
+    /// run; a fixed wait gives up at its own.
+    #[test]
+    fn a_stage_holds_the_default_wait_past_its_floor() {
+        const BUDGETED: &[u8] = b"{\"budget_ms\":100,\"kind\":\"stage\",\"name\":\"forward\"}\n";
+        const UNBUDGETED: &[u8] = b"{\"kind\":\"stage\",\"name\":\"forward\"}\n";
+        const REPLY: &[u8] = b"{\"ok\":true,\"raw\":\"r\"}\n";
+        let daemon = |stage: &'static [u8]| {
+            move |mut stream: TcpStream| {
+                stream.write_all(ACK).unwrap();
+                stream.write_all(stage).unwrap();
+                std::thread::sleep(SHORT * 3);
+                // A client that gave up has closed its end.
+                let _ = stream.write_all(REPLY);
+            }
+        };
+        for stage in [BUDGETED, UNBUDGETED] {
+            let mut stream = client_of(daemon(stage));
+            let reply = read(&mut stream, (LONG, ReplyWait::Staged(SHORT)));
+            assert_eq!(reply.as_deref(), Some(&REPLY[..REPLY.len() - 1]));
+        }
+        let mut stream = client_of(daemon(BUDGETED));
+        assert_eq!(read(&mut stream, (LONG, ReplyWait::Fixed(SHORT))), None);
     }
 }

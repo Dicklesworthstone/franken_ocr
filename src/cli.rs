@@ -1936,10 +1936,10 @@ fn run_ocr_inner(
     if args.check {
         return report_check(&args, &request, source.as_ref(), &early_warnings);
     }
-    // A resident run decodes in the daemon, which reports its finish_reason
-    // (U2-X2) and model (U2-E1) in the reply; inline runs leave both on this
-    // engine's model.
-    let mut resident_finish: Option<native_engine::FinishReason> = None;
+    // A resident run decodes in the daemon, which reports its decode report
+    // (U2-X2, bd-u77k) and model (U2-E1) in the reply; inline runs leave both
+    // on this engine's model.
+    let mut resident_report: Option<native_engine::DecodeReport> = None;
     let mut resident_model: Option<native_engine::ModelIdentity> = None;
     let mut resident_music: Option<native_engine::MusicPageMeta> = None;
     let mut resident_chart: Option<native_engine::ChartPageMeta> = None;
@@ -2027,7 +2027,7 @@ fn run_ocr_inner(
                 // output contract is identical either way.
                 let doc = match resident_recognition(&args, &request, stages.as_deref())? {
                     Some(reply) => {
-                        resident_finish = reply.finish_reason;
+                        resident_report = reply.report;
                         resident_model = reply.model;
                         resident_music = reply.music;
                         resident_chart = reply.chart;
@@ -2049,11 +2049,10 @@ fn run_ocr_inner(
     // the v1 multi-page truncation / page-merge warnings, after the input's
     // own warnings. Absent when the model's arm records no decode report (the
     // zoo models).
-    let decode_report = engine.take_last_decode_report();
+    let decode_report = resident_report.or_else(|| engine.take_last_decode_report());
     let finish_reason = decode_report
         .as_ref()
-        .map(native_engine::DecodeReport::run_finish_reason)
-        .or(resident_finish);
+        .map(native_engine::DecodeReport::run_finish_reason);
     let model = resident_model.or_else(|| engine.loaded_model_identity());
     ran.clone_from(&model);
     let mut run_warnings = early_warnings;
@@ -2069,8 +2068,9 @@ fn run_ocr_inner(
     let resumed_from = document_outcome.resumed_from;
     // An Unlimited-OCR-2 document that stopped at its position limit or
     // stage budget writes what it produced below, then exits 5 (U2-B6). A
-    // decode report comes from this engine's loaded model, so `model` is
-    // known whenever there is one. Its journal and checkpoint stay (U2-D4).
+    // decode report comes with the model that ran it, here or in the daemon,
+    // so `model` is known whenever there is one. Its journal and checkpoint
+    // stay (U2-D4).
     let partial = decode_report
         .as_ref()
         .zip(model.as_ref())
@@ -2157,6 +2157,7 @@ fn run_ocr_inner(
         raw: args.raw,
     };
     let extras = RunExtras {
+        finish_reason,
         music: music_meta.as_ref(),
         chart: chart_meta.as_ref(),
         warnings: &run_warnings,
@@ -2231,6 +2232,7 @@ fn run_ocr_inner(
 /// What a JSON result carries beside the recognition itself.
 #[derive(Clone, Copy, Default)]
 struct RunExtras<'a> {
+    finish_reason: Option<native_engine::FinishReason>,
     music: Option<&'a native_engine::MusicPageMeta>,
     chart: Option<&'a native_engine::ChartPageMeta>,
     warnings: &'a [native_engine::RunWarning],
@@ -2239,6 +2241,9 @@ struct RunExtras<'a> {
 
 impl RunExtras<'_> {
     fn merge_into(self, value: &mut serde_json::Value) {
+        if let Some(reason) = self.finish_reason {
+            value["finish_reason"] = reason.as_str().into();
+        }
         if let Some(meta) = self.music {
             value["staves"] = music_meta_to_json(meta);
             value["warnings"] = music_warnings_to_json(meta);
@@ -3325,13 +3330,11 @@ fn emit_batch_result(
                 if let Some(saved) = saved {
                     result["output"] = saved.display().to_string().into();
                 }
-                if let Some(reason) = end.finish_reason {
-                    result["finish_reason"] = reason.as_str().into();
-                }
                 if let Some(err) = &end.partial {
                     result["error"] = err.to_string().into();
                 }
                 RunExtras {
+                    finish_reason: end.finish_reason,
                     chart: end.chart.as_ref(),
                     warnings: &end.warnings,
                     ..RunExtras::default()
@@ -6246,6 +6249,7 @@ mod tests {
         };
         let extras = RunExtras {
             model: Some(&model),
+            finish_reason: Some(native_engine::FinishReason::Length),
             ..RunExtras::default()
         };
         write_ocr_output(&json_path, &rec, json, &[], extras).expect("write json");
@@ -6257,9 +6261,10 @@ mod tests {
             parsed["layout"][0]["boxes"][0],
             serde_json::json!([1, 2, 3, 4])
         );
-        // U2-E1: the model that ran rides along.
+        // U2-E1: the model that ran rides along, and so does how it ended.
         assert_eq!(parsed["model_id"], "unlimited-ocr");
         assert_eq!(parsed["source_sha256"], "cd".repeat(32));
+        assert_eq!(parsed["finish_reason"], "length");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
