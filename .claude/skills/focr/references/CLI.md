@@ -465,8 +465,11 @@ FOCR_BATCH_SPINE=0 focr ocr-batch page-*.png --json
 Use batch mode when the caller has multiple document images and wants one setup
 cost. `ocr-batch` does not use the CLI's native PDF router; pass images, or
 rasterize PDFs first. Batch behavior may preserve per-page failure information rather than
-aborting the entire batch for every input failure. Confirm exact JSON shape from
-the current source or a golden test before binding a production parser.
+aborting the entire batch for every input failure. Each `--json` row carries
+`finish_reason` and any `warnings`. An Unlimited-OCR-2 page stopped early keeps its
+`markdown` but reads `ok: false`, so read `ok`, not whether `markdown` is present. Confirm
+exact JSON shape from the current source or a golden test before binding a production
+parser.
 
 Useful batch flags/env vars seen in source:
 

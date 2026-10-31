@@ -584,6 +584,11 @@ FOCR_INT8_ATTN=1 FOCR_INT8_LMHEAD=1 FOCR_BATCH_SPINE=1 \
 FOCR_BATCH_SPINE=0 focr ocr-batch *.png --json   # force the sequential oracle path
 ```
 
+With `--json`, each image's row says how its decode ended: `finish_reason`, any
+`warnings`, and `chart` on a OneChart run. An Unlimited-OCR-2 page stopped by its stage
+budget or position limit keeps its `markdown`, but reads `ok: false` with an `error`, the
+same stop that makes `focr ocr` exit 5. So check `ok`, not whether `markdown` is present.
+
 `ocr-batch` loads the model once either way. Unlimited-OCR defaults to the
 conservative recipe path. Its continuous-batch R-SWA spine currently belongs to
 the explicitly gated all-int8 experiment, so `FOCR_BATCH_SPINE=1` uses that
@@ -694,7 +699,7 @@ your documents. None of these lanes warns on a wrong reading except OneChart.
 | `--task chart` | 29 of 36 bar charts have every value right. The misses are plausible wrong numbers. | Check the numbers against the chart. |
 | `--task formula` | 3 of 8 formulas right. The rest come back as SMILES or TikZ, not as bad LaTeX. | Expect misses, and check each formula. |
 | `--task music` on GOT-OCR2 | One two-bar staff, misread. | Use TrOMR. |
-| `--task chart-data` | Text gave usable values on 0 of 36 charts. The number head averaged within 10% of the range on 31 of 36. | Read `pred_locs` from `--json`: bar heights from 0 to 1, in order. It does not say how many bars there are. |
+| `--task chart-data` | Text gave usable values on 0 of 36 charts. The number head averaged within 10% of the range on 31 of 36. | Read `chart.pred_locs` from `--json`: bar heights from 0 to 1, in order. It does not say how many bars there are. |
 
 Tables, the molecule, music and formulas read the same on the upstream f32 checkpoint.
 Charts do not: int8 costs a further margin there. Evidence:
@@ -974,7 +979,7 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | `FOCR_FORCE_ARCH` | Force an available SIMD tier (`sdot`/`smmla`/`scalar`/`avx2`/`avxvnni`/`avx512vnni`) for CPU dispatch; used by `robot selftest`, `robot backends`, and pinned perf runs. |
 | `FOCR_INT8_AUTOVEC` | Apple-only ordinary dense-int8 route switch. Default uses measured-faster LLVM autovec; `0`/`off`/`false`/`no` restores SDOT when no valid `FOCR_FORCE_ARCH` override is active. It does not affect packed-int4 or offline-packed SMMLA paths. |
 | `FOCR_RESAMPLE` | Preprocess resampling kernel. Unset (default): the `image` crate's CatmullRom. `pil-bicubic`: a Pillow-bit-exact fixed-point BICUBIC at every resize site, for reference-exact comparison against the PIL/torch oracle (DISC-001 in `docs/DISCREPANCIES.md`). |
-| `FOCR_STAGE_BUDGET_FORWARD_MS` | Override the forward stage budget in milliseconds (default 600000, i.e. 10 minutes). `0` (or `unlimited`) disables the stage timeout entirely — the run is then bounded only by cooperative cancellation (Ctrl+C). |
+| `FOCR_STAGE_BUDGET_FORWARD_MS` | Override the forward stage budget in milliseconds (default 600000, i.e. 10 minutes). `0` (or `unlimited`) disables the stage timeout entirely — the run is then bounded only by cooperative cancellation (Ctrl+C). A decode past its budget is stopped before the next input starts. Unlimited-OCR and the zoo models then fail that input with no text; Unlimited-OCR-2 keeps what it decoded and exits 5. |
 | `FOCR_NO_RESIDENT` | `1` or `true` disables the resident warm-model daemon (the flag analog is `--no-resident`). By default, eligible single-image `focr ocr` runs are served by a per-model background process that keeps the loaded weights in RAM between invocations. |
 | `FOCR_RESIDENT_IDLE_SECS` | How long the resident daemon stays alive with no requests before unloading the model and exiting (default 600 seconds). |
 | `FOCR_RESIDENT_DIR` | Override the directory holding resident daemon state files (default: the model cache root). |

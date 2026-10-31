@@ -977,6 +977,37 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
     envelope + SER over its crop corpus, and extend the alpha-variance rule
     if real rendered-PNG (transparent-background) staves appear there.
 
+## DISC-022: GOT `--task chart` and `--task formula` pad to a white square; upstream squashes every image
+- claim_id / evidence_id: CLAIM-GOT-SQUARE-PAD → `artifacts/accuracy/bd-kd75/` (bd-pi74)
+- Provenance (model commit + fixture hash): `stepfun-ai/GOT-OCR2_0@979938bf89ccdc949c0131ddd3841e24578a4742`;
+    published `got-ocr2.int8.focrq` sha256 4da43d79…; probe images `images.sha256` sha256
+    1251bdca…; `tests/fixtures/got/format_corpus/chart.png` sha256 ea4daacb…
+- CPU feature string: aarch64+neon+dotprod+i8mm (Apple M5 Ultra). The change is to the input
+    image, so it is not arch-specific.
+- Exact command + env: `FOCR_NO_RESIDENT=1 focr ocr --model got-ocr2.int8.focrq --task chart
+    <image>` and `--task formula`, against `--format` on the same image; scored by
+    `artifacts/accuracy/bd-kd75/score_probe.py truth.json readings/<dir>`.
+- Reference behavior: `GOTImageEvalProcessor(image_size=1024)` is a bicubic
+    `Resize((1024,1024))`: squash, no aspect preserve (`docs/zoo/got-ocr2-spec.md` §6).
+- Our impl: `OcrTask::pads_got_image` (src/cli.rs) is true only for `chart` and `formula`, and
+    `native_engine::got_input` then applies `preprocess::pad_to_white_square` before the
+    unchanged `got_view_tensor`. `--task tables` and `--format` stay on the upstream squash.
+    The browser and iOS lanes set only `force_got_format`, so they squash too.
+- Fallback / kill-switch state: no environment variable; `--format` alone is the reference
+    path on any image, byte-identical to the frozen squash readings, and restores upstream
+    behavior without touching the pad code.
+- Measured impact: int8 charts right of 36, squashed → padded: 20 → 29. By shape, of 12:
+    3:2 2 → 10, 16:9 12 → 11, 3:4 6 → 8, so one 16:9 chart (`wide05`) is lost. Formulas right
+    of 8: 1 → 3. `table.png` padded reads as SMILES where squashed it is exact, which is why
+    this is per task. A chart scores right or wrong, so the AF-2 tail figures do not apply;
+    these are synthetic images in one drawing style and do not bound real charts.
+- Resolution: ACCEPTED as a deliberate divergence, opt-in through `--task`.
+- Tests affected: `preprocess::tests::pad_to_white_square_centers_the_image`,
+    `cli::tests::only_chart_and_formula_pad_the_got_image`,
+    `native_engine::got::tests::format_corpus_chart_task_e2e`, and the `chart.task` row of
+    `scripts/got_cer.py --format-corpus`.
+- Review date: 2026-10-31. Re-measure when bd-kd75 changes the GOT recipe.
+
 ## DISC-008: the wasm-only int4 browser artifact — quantization tail on degraded newsprint + platform f32 decode drift
 - claim_id / evidence_id: CLAIM-WASM-INT4-V2 → scratchpad corpus receipts
     (`corpus/MANIFEST.json`, `cer_v1_vs_v2.tsv`, `corpus/browser/REPORT*.json`,

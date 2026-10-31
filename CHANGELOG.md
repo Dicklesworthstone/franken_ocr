@@ -615,9 +615,22 @@ sections as they land.
   daemon protocol moves to 4, so a stale daemon is restarted, not silently unpadded.
 - **`--task chart-data` says when its reading is unverified** (bead bd-a7zs). OneChart's
   text gave usable values on 0 of 36 clean charts, and its reliability check never
-  reached a verdict, yet nothing reported that. Such a run now gets a `chart_unverified`
-  warning carrying the number head as `pred_locs`, the part that does work: within 10%
-  of the range on 31 of 36. This holds through the daemon too.
+  reached a verdict, yet nothing reported that. JSON results now carry `chart:
+  {pred_locs, reliable_distance, reliable}`, and `pred_locs` is the number head, the part
+  that does work: within 10% of the range on 31 of 36. A run that did not verify also gets
+  a `chart_unverified` warning. This holds through the daemon too.
+- **A page past its budget no longer takes the next pages with it** (bead bd-3ttp). The
+  forward stage's timeout reported the failure and left the decode running, so in
+  `ocr-batch`, the daemon or a library the following inputs competed with it for every
+  core and timed out too. On real weights under a 45 s budget, a 30 s page after a 95 s
+  page failed on both old runs and read on both fixed runs, with the same text as alone.
+  A stage past its budget now stops at its next checkpoint before the timeout returns.
+  Unlimited-OCR-2 already stopped itself.
+- **`ocr-batch` says how each page ended** (bead bd-hntz). Every decoded page read
+  `ok: true`, so a page the stage budget cut off looked like a clean one, and the
+  warnings `focr ocr` gives for the same stop were dropped. Rows now carry `finish_reason`
+  and `warnings`, and a stopped Unlimited-OCR-2 page keeps its text but reads `ok: false`
+  and counts as failed, including in `--progress-events`.
 - **The GOT `--format` corpus has real scores** (bead bd-fqn1). The lenient smoke tests
   passed garbage: a formula read as SMILES contained `=`. Frozen readings on int8 and
   f32 now hold each asset to an exact score, and the README says which lanes misread.
