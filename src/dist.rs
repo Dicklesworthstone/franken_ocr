@@ -125,6 +125,13 @@ pub struct ModelEntry {
     /// License notice that must travel with this model's redistributed weights.
     #[serde(default)]
     pub license_notice: String,
+    /// The model's own release version (D22), for a model whose artifacts are
+    /// versioned apart from franken_ocr: every artifact filename carries it as
+    /// `.v<version>.` (`unlimited-ocr-2.v0.1.0.int8.focrq`), and it equals the
+    /// version this runtime's architecture expects. `None` for the unversioned
+    /// zoo entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     /// Per-quant artifacts, keyed by quant tag (`"int8"`, …).
     pub quants: BTreeMap<String, QuantEntry>,
     /// The tokenizer sidecar (e.g. `qwen.tiktoken`), installed beside the `.focrq`.
@@ -425,6 +432,37 @@ fn validate_quant_entries(
     Ok(())
 }
 
+/// A model entry's `version` (D22): a manifest atom that every artifact
+/// filename carries as `.v<version>.`, and, for a model this runtime knows,
+/// the version its architecture expects
+/// ([`ModelArch::artifact_version`](crate::model_arch::ModelArch::artifact_version)).
+fn validate_model_version(
+    model_id: &str,
+    version: &str,
+    quants: &BTreeMap<String, QuantEntry>,
+) -> FocrResult<()> {
+    validate_manifest_atom(version, &format!("version for {model_id}"), MAX_NAME_BYTES)?;
+    let tag = format!(".v{version}.");
+    for (quant, entry) in quants {
+        if !entry.focrq.filename.contains(&tag) {
+            return Err(FocrError::FormatMismatch(format!(
+                "manifest model {model_id:?} is version {version}, but its {quant} artifact \
+                 {:?} does not carry {tag:?}",
+                entry.focrq.filename
+            )));
+        }
+    }
+    if let Some(arch) = crate::model_arch::arch_by_id(model_id)
+        && arch.artifact_version() != version
+    {
+        return Err(FocrError::FormatMismatch(format!(
+            "manifest model {model_id:?} is version {version}, but this runtime runs version {}",
+            arch.artifact_version()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_manifest(manifest: &Manifest) -> FocrResult<()> {
     validate_filename(&manifest.model, "primary model id")?;
     if manifest.models.len() > MAX_MODELS {
@@ -457,6 +495,9 @@ fn validate_manifest(manifest: &Manifest) -> FocrResult<()> {
         validate_remote_file(&entry.tokenizer, &format!("{model_id} tokenizer"))?;
         names.insert(entry.tokenizer.filename.to_ascii_lowercase());
         validate_quant_entries(model_id, &entry.quants, &mut names)?;
+        if let Some(version) = &entry.version {
+            validate_model_version(model_id, version, &entry.quants)?;
+        }
         for (index, sidecar) in entry.sidecars.iter().enumerate() {
             validate_remote_file(sidecar, &format!("{model_id} sidecar {index}"))?;
             if !names.insert(sidecar.filename.to_ascii_lowercase()) {
@@ -1259,6 +1300,7 @@ mod tests {
     fn tiny_model_entry() -> ModelEntry {
         ModelEntry {
             license_notice: "test license".into(),
+            version: None,
             quants: BTreeMap::from([(
                 "int8".into(),
                 QuantEntry {
@@ -1290,6 +1332,61 @@ mod tests {
 
     fn parse_serialized(manifest: &Manifest) -> FocrResult<Manifest> {
         parse_manifest(&serde_json::to_vec(manifest).expect("serialize test manifest"))
+    }
+
+    /// U2-E4 (D22): a model entry's `version` survives a round trip, every
+    /// artifact filename must carry it, and a model this runtime knows must
+    /// be at the version its architecture runs. Without it the entry parses
+    /// as before and serializes without the key.
+    #[test]
+    fn model_version_round_trips_and_must_match_filenames_and_the_runtime() {
+        let versioned = |version: &str, filename: &str| {
+            let mut manifest = tiny_manifest();
+            let mut entry = tiny_model_entry();
+            entry.version = Some(version.into());
+            entry.quants.get_mut("int8").expect("int8").focrq = tiny_file(filename);
+            manifest.models.insert("unlimited-ocr-2".into(), entry);
+            manifest
+        };
+
+        let manifest = versioned("0.1.0", "unlimited-ocr-2.v0.1.0.int8.focrq");
+        let parsed = parse_serialized(&manifest).expect("a consistent version parses");
+        assert_eq!(
+            parsed.models["unlimited-ocr-2"].version.as_deref(),
+            Some("0.1.0")
+        );
+
+        let unversioned = serde_json::to_string(&tiny_manifest()).expect("serialize");
+        assert!(!unversioned.contains("\"version\""), "{unversioned}");
+        assert!(
+            parse_manifest(unversioned.as_bytes())
+                .expect("no version still parses")
+                .models
+                .values()
+                .all(|entry| entry.version.is_none())
+        );
+
+        for (manifest, needle) in [
+            (
+                versioned("0.1.0", "unlimited-ocr-2.int8.focrq"),
+                "does not carry",
+            ),
+            (
+                versioned("0.2.0", "unlimited-ocr-2.v0.2.0.int8.focrq"),
+                "this runtime runs version 0.1.0",
+            ),
+            (
+                versioned("0.1.0/../x", "unlimited-ocr-2.v0.1.0.int8.focrq"),
+                "version for unlimited-ocr-2",
+            ),
+        ] {
+            match parse_serialized(&manifest) {
+                Err(FocrError::FormatMismatch(message)) => {
+                    assert!(message.contains(needle), "{message}");
+                }
+                other => panic!("expected FormatMismatch containing {needle:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -1355,6 +1452,7 @@ mod tests {
                 "got-ocr2".to_string(),
                 ModelEntry {
                     license_notice: "Apache-2.0 (GOT-OCR2.0)".into(),
+                    version: None,
                     quants: BTreeMap::from([(
                         "int8".to_string(),
                         QuantEntry {
