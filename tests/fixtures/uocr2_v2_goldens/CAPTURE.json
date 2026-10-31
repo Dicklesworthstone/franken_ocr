@@ -1,0 +1,48 @@
+{
+  "model_id": "unlimited-ocr-2",
+  "artifact": {
+    "file_name": "unlimited-ocr-2.v0.1.0.int8.focrq",
+    "size": 4173206653,
+    "sha256": "54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398"
+  },
+  "cases": {
+    "page_0009": {
+      "kind": "single",
+      "long": false,
+      "inputs": {
+        "page_0009.png": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da"
+      },
+      "token_count": 50,
+      "artifact_sha256": "54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398",
+      "focr_version": "0.10.0",
+      "git_revision": "e8b9d097d0f2+dirty",
+      "threads": 36
+    },
+    "page_0014": {
+      "kind": "single",
+      "long": false,
+      "inputs": {
+        "page_0014.png": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2"
+      },
+      "token_count": 441,
+      "artifact_sha256": "54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398",
+      "focr_version": "0.10.0",
+      "git_revision": "e8b9d097d0f2+dirty",
+      "threads": 36
+    },
+    "s2": {
+      "kind": "multi",
+      "long": false,
+      "inputs": {
+        "page_0009.png": "62526eb02efd588005ba70eba171d0e4bf64f4a0f0d258f6e72e8a14830b74da",
+        "page_0014.png": "f1e35a58f673036b16302c86676f1ec6a89218fb4e666c477dbb4ae21b904df2",
+        "page_0019.png": "ad98fcc10f580bfa2271cc7ce3b581806d0392844d41201db95eaaa4713a1c1c"
+      },
+      "token_count": 1232,
+      "artifact_sha256": "54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398",
+      "focr_version": "0.10.0",
+      "git_revision": "e8b9d097d0f2+dirty",
+      "threads": 36
+    }
+  }
+}

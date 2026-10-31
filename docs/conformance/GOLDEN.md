@@ -235,7 +235,10 @@ per model lane: the generated ids, the final markdown, and (for one streamed
 case) the robot `page` events. One drifted token can survive detokenize and
 postprocess unchanged, so markdown goldens alone cannot catch it. The v1 lane
 (`tests/fixtures/uocr2_v1_goldens/`) is the safety net under every
-Unlimited-OCR-2 change to shared code; U2-C4 adds the v2 lane.
+Unlimited-OCR-2 change to shared code. The v2 lane
+(`tests/fixtures/uocr2_v2_goldens/`, U2-C4) pins the int8 artifact U2-C4
+certified, so every later change on the v2 path keeps its outputs or comes
+with a reviewed recapture.
 
 ```bash
 scripts/token_golden_gate.sh                    # fast subset; scripts/check.sh runs it
@@ -251,8 +254,12 @@ UPDATE_GOLDENS=1 FOCR_E2E_LONG=1 scripts/token_golden_gate.sh   # reviewed recap
   on the artifact SHA-256 that `CAPTURE.json` pins (a different artifact logs
   `skip_no_model`). Inputs come from `FOCR_CORPUS_DIR` (default
   `~/.cache/franken_ocr/corpus/pages`), checked against the captured SHA-256s.
-* **Fast subset:** `page_0009`, `page_0014`, the 2-page `p9_p14` document, and
-  `p9_p14` streamed. **Long:** `page_0590`, `p10`, `p20`.
+* **Fast subset:** v1: `page_0009`, `page_0014`, the 2-page `p9_p14` document, and
+  `p9_p14` streamed. v2: `page_0009`, `page_0014`, the 3-page S2 document, and S2
+  streamed. **Long** (v1 only): `page_0590`, `p10`, `p20`.
+* **One lane at a time on recapture.** A recapture takes the first artifact that
+  exists, `FOCR_MODEL_PATH` first, so it names the lane's artifact: for v2, the
+  `.focrq` in a directory that also holds v2's `tokenizer.json`.
 * **Robot events compare on a canonical projection:** each event on the golden's
   own fields, minus the shared volatile list (`parity_harness::is_scrub_key` —
   `SCRUB_KEYS` plus any `_ms`/`_us`/`_seconds`/`_utc` key). A field added later is

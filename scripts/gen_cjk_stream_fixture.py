@@ -36,9 +36,14 @@ PAGES = [
 ]
 
 SIZE = 1024
-FONT_PX = 56
+# 40 px glyphs on a 64 px pitch (bd-1jx0). The first layout, 56 px on 120,
+# read as two pages in the reference and in the all-f32 decode, but the
+# shipping int8 decode read page 1 out of order and never reached page 2
+# (DISC-004), which the test's two-marker precondition cannot allow. This
+# layout reads identically, two pages, in all three.
+FONT_PX = 40
 MARGIN = 96
-LINE = 120
+LINE = 64
 
 
 def glyph(font, ch):
