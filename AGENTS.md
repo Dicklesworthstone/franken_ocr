@@ -181,8 +181,10 @@ If any check fails, fix root causes before handing off.
 handed off or a bead is closed. `scripts/check.sh` is the one-command gate: it
 runs the repository validators and installer E2E before `cargo fmt --check`,
 locked check/clippy/test, and bounded `ubs --diff`, stopping on the first failure.
-CI exists and invokes this same script as its single test step, so the script is
-the source of truth rather than a duplicated workflow command list.
+There is no GitHub Actions CI: `634bfb9b` (2026-09-03) removed `.github/workflows`,
+and Apple validation runs through DSR (`scripts/dsr-apple-quality.sh`). The script
+is the source of truth, so a hand-off names the commands that actually ran, not
+"green in CI".
 
 Note on the build surface: both binaries (`focr`, `franken_ocr`) compile from thin
 shims over the shared `cli_main()` in the lib (doctrine #9). The
