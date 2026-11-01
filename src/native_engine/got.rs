@@ -174,31 +174,99 @@ pub fn build_inputs_embeds(
     Ok(inputs_embeds)
 }
 
+/// A region for GOT's fine-grained OCR, upstream `chat(ocr_box=…)` and
+/// `chat(ocr_color=…)`: the model reads the text inside it and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Region {
+    /// A box `[x1, y1, x2, y2]` in pixels of the image as given.
+    Box([f64; 4]),
+    /// A point `[x, y]` in pixels of the image as given.
+    Point([f64; 2]),
+    /// A frame of this colour drawn on the image around the text.
+    Color(FrameColor),
+}
+
+/// The frame colours GOT's fine-grained OCR was trained on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameColor {
+    Red,
+    Green,
+    Blue,
+}
+
+impl FrameColor {
+    /// The name `chat(ocr_color=…)` takes.
+    pub fn name(self) -> &'static str {
+        match self {
+            FrameColor::Red => "red",
+            FrameColor::Green => "green",
+            FrameColor::Blue => "blue",
+        }
+    }
+
+    /// The colour [`Self::name`] names.
+    pub fn from_name(name: &str) -> Option<Self> {
+        [FrameColor::Red, FrameColor::Green, FrameColor::Blue]
+            .into_iter()
+            .find(|color| color.name() == name)
+    }
+}
+
+impl Region {
+    /// The selector `chat()` puts before the instruction for an image of
+    /// `width`×`height` pixels: a box or point on GOT's 0-1000 grid, as
+    /// `[166, 125, 833, 875] `, or a colour, as `[red] `.
+    pub fn prefix(&self, width: u32, height: u32) -> String {
+        // Upstream's `int(v/w*1000)`: divide, scale, truncate toward zero.
+        let grid = |coords: &[f64]| {
+            let scaled: Vec<String> = coords
+                .iter()
+                .enumerate()
+                .map(|(k, &v)| {
+                    let side = f64::from(if k % 2 == 0 { width } else { height });
+                    format!("{}", (v / side * 1000.0) as i64)
+                })
+                .collect();
+            format!("[{}] ", scaled.join(", "))
+        };
+        match self {
+            Region::Box(coords) => grid(coords),
+            Region::Point(coords) => grid(coords),
+            Region::Color(color) => format!("[{}] ", color.name()),
+        }
+    }
+}
+
 /// Build the GOT OCR prompt id-stream (`GOTQwenForCausalLM.chat`): the MPT system
 /// turn, the `<img><imgpad>×256</img>` image splice, the instruction, and the
 /// assistant role marker. `format=false` → `OCR: ` (plain text); `format=true` →
-/// `OCR with format: ` (the layout/LaTeX/table `.mmd` mode). Encoded with all
+/// `OCR with format: ` (the layout/LaTeX/table `.mmd` mode). `region` is a
+/// [`Region::prefix`] for the image, or empty for the whole image. Encoded with all
 /// specials enabled — the plain form is token-id-EXACT to the torch oracle's 287-id
 /// `l0c_prompt_ids` (proven by `tiktoken::tests::prompt_id_oracle_cross_check`).
 ///
 /// # Errors
 /// A tokenizer encode error (impossible for this fixed ASCII prompt).
-pub fn ocr_prompt_ids(tk: &Tiktoken, format: bool) -> FocrResult<Vec<u32>> {
+pub fn ocr_prompt_ids(tk: &Tiktoken, format: bool, region: &str) -> FocrResult<Vec<u32>> {
+    tk.encode(&ocr_prompt(format, region))
+}
+
+/// The prompt [`ocr_prompt_ids`] encodes.
+fn ocr_prompt(format: bool, region: &str) -> String {
     let system = "<|im_start|>system\n        You should follow the instructions carefully and explain your answers in detail.";
     let imgpad = "<imgpad>".repeat(IMAGE_TOKEN_LEN);
     let instruction = if format { "OCR with format: " } else { "OCR: " };
-    let prompt = format!(
-        "{system}<|im_end|><|im_start|>user\n<img>{imgpad}</img>\n{instruction}<|im_end|><|im_start|>assistant\n"
-    );
-    tk.encode(&prompt)
+    format!(
+        "{system}<|im_end|><|im_start|>user\n<img>{imgpad}</img>\n{region}{instruction}<|im_end|><|im_start|>assistant\n"
+    )
 }
 
 /// End-to-end GOT-OCR2 recognition: squash-bicubic-1024/CLIP preprocess → SAM
 /// vision + connector + `<imgpad>` splice → Qwen2 dense decoder greedy generation
 /// (the O(n) KV-cache decode) → tiktoken decode (specials stripped). `prefix` is the
 /// arch's vision-tower tensor prefix (`model.vision_tower_high`); `max_new` caps the
-/// generated length; `format` selects plain vs `OCR with format:` (.mmd) mode. Stops
-/// early at `<|im_end|>`.
+/// generated length; `format` selects plain vs `OCR with format:` (.mmd) mode;
+/// `region` is a [`Region::prefix`] or empty. Stops early at `<|im_end|>`.
 ///
 /// # Errors
 /// A preprocess, vision, decode, or tokenizer error.
@@ -209,10 +277,11 @@ pub fn recognize(
     img: &DynamicImage,
     max_new: usize,
     format: bool,
+    region: &str,
 ) -> FocrResult<String> {
     let tv = Instant::now();
     let image = preprocess::got_view_tensor(img);
-    let prompt_ids = ocr_prompt_ids(tk, format)?;
+    let prompt_ids = ocr_prompt_ids(tk, format, region)?;
     let inputs_embeds = build_inputs_embeds(weights, statics, &image, &prompt_ids)?;
     super::timing_log(&format!(
         "  got.vision+splice {:.2}s",
@@ -238,7 +307,8 @@ pub fn recognize(
 /// then ONE continuous-batch greedy decode over every page's `inputs_embeds`
 /// ([`decoder_qwen2::generate_greedy_batched`] — per page byte-identical to
 /// [`recognize`], the scheduler-level gate proves it). Returns one decoded
-/// string per input page, in input order.
+/// string per input page, in input order. `regions` holds each page's
+/// [`Region::prefix`], or is empty when no page has one.
 ///
 /// # Errors
 /// As [`recognize`].
@@ -249,13 +319,15 @@ pub fn recognize_batch(
     imgs: &[&DynamicImage],
     max_new: usize,
     format: bool,
+    regions: &[String],
 ) -> FocrResult<Vec<String>> {
-    let prompt_ids = ocr_prompt_ids(tk, format)?;
     let tv = Instant::now();
     // The model-constant tensors arrive pre-hydrated from the OcrModel cache
     // (bd-av64.10): batches AND sequential pages share one hydration.
     let mut embeds_list: Vec<Mat> = Vec::with_capacity(imgs.len());
-    for img in imgs {
+    for (k, img) in imgs.iter().enumerate() {
+        let region = regions.get(k).map_or("", String::as_str);
+        let prompt_ids = ocr_prompt_ids(tk, format, region)?;
         let image = preprocess::got_view_tensor(img);
         embeds_list.push(build_inputs_embeds(weights, statics, &image, &prompt_ids)?);
     }
@@ -373,7 +445,7 @@ mod tests {
         .expect("sample image");
 
         let statics = hydrate_statics(&weights, "model.vision_tower_high", false).expect("statics");
-        let text = recognize(&weights, &statics, &tk, &img, 64, false).expect("recognize");
+        let text = recognize(&weights, &statics, &tk, &img, 64, false, "").expect("recognize");
         eprintln!("[B11 e2e] {text:?}");
         assert_eq!(
             text,
@@ -417,10 +489,10 @@ mod tests {
         let solo: Vec<String> = [&img1, &img2]
             .iter()
             .map(|im| {
-                recognize(&weights, &statics, &tk, im, 64, false).expect("sequential recognize")
+                recognize(&weights, &statics, &tk, im, 64, false, "").expect("sequential recognize")
             })
             .collect();
-        let batched = recognize_batch(&weights, &statics, &tk, &[&img1, &img2], 64, false)
+        let batched = recognize_batch(&weights, &statics, &tk, &[&img1, &img2], 64, false, &[])
             .expect("batched recognize");
         assert_eq!(
             solo, batched,
@@ -471,10 +543,10 @@ mod tests {
             .expect("the decoder FFN tensor");
         let int8 = ffn.dtype == crate::native_engine::weights::DType::QInt8PerChan;
         let text = if int8 {
-            recognize(&weights, &statics, &tk, &img, 512, true).expect("recognize --format")
+            recognize(&weights, &statics, &tk, &img, 512, true, "").expect("recognize --format")
         } else {
             let image = preprocess::got_view_tensor(&img);
-            let prompt = ocr_prompt_ids(&tk, true).expect("prompt");
+            let prompt = ocr_prompt_ids(&tk, true, "").expect("prompt");
             let embeds = build_inputs_embeds(&weights, &statics, &image, &prompt).expect("embeds");
             let cfg = DecoderConfig::got_ocr2();
             let ids = decoder_qwen2::generate_greedy(&weights, &cfg, &embeds, 512, EOS_ID)
@@ -552,8 +624,8 @@ mod tests {
         };
         let tk = Tiktoken::from_qwen_tiktoken(&std::fs::read(&tkp).expect("qwen.tiktoken"))
             .expect("tiktoken");
-        let plain = ocr_prompt_ids(&tk, false).unwrap();
-        let fmt = ocr_prompt_ids(&tk, true).unwrap();
+        let plain = ocr_prompt_ids(&tk, false, "").unwrap();
+        let fmt = ocr_prompt_ids(&tk, true, "").unwrap();
         assert_eq!(plain.len(), 287, "plain L0c prompt is 287 ids");
         assert_eq!(
             fmt.len(),
@@ -573,6 +645,50 @@ mod tests {
             fmt.windows(5).any(|w| w == [93495, 448, 3561, 25, 220]),
             "format instruction ids missing"
         );
+        // A region changes only the instruction: 280 ids of system turn and image
+        // splice before it, and `: ` plus the 4-id turn end after it.
+        let boxed = ocr_prompt_ids(&tk, false, "[166, 125, 833, 875] ").unwrap();
+        assert!(boxed.len() > plain.len());
+        assert_eq!(
+            boxed[..280],
+            plain[..280],
+            "the system turn and image splice"
+        );
+        assert_eq!(boxed[boxed.len() - 6..], plain[plain.len() - 6..]);
+    }
+
+    /// bd-1sj1: the selector `chat(ocr_box=…, ocr_color=…)` builds, from the pinned
+    /// `modeling_GOT.py` (`stepfun-ai/GOT-OCR2_0@979938bf`, lines 503-529). A box is
+    /// scaled by the image as given, `int(v/w*1000)`, and printed as a Python list.
+    /// The expected strings are Python's own output for the same arithmetic.
+    #[test]
+    fn a_region_prefixes_the_instruction_as_upstream_chat_does() {
+        let (w, h) = (600, 400);
+        let cases = [
+            (
+                Region::Box([100.0, 50.0, 500.0, 350.0]),
+                "[166, 125, 833, 875] ",
+            ),
+            (Region::Point([300.0, 200.0]), "[500, 500] "),
+            (
+                Region::Box([0.5, 399.9, 599.99, 400.0]),
+                "[0, 999, 999, 1000] ",
+            ),
+            // Off the image: upstream scales it past the grid, unclamped.
+            (Region::Box([700.0, 0.0, 0.0, 0.0]), "[1166, 0, 0, 0] "),
+            (Region::Color(FrameColor::Red), "[red] "),
+            (Region::Color(FrameColor::Green), "[green] "),
+            (Region::Color(FrameColor::Blue), "[blue] "),
+        ];
+        for (region, want) in cases {
+            assert_eq!(region.prefix(w, h), want, "{region:?}");
+        }
+        let prompt = ocr_prompt(true, &Region::Color(FrameColor::Red).prefix(w, h));
+        assert!(
+            prompt.ends_with("</img>\n[red] OCR with format: <|im_end|><|im_start|>assistant\n"),
+            "{prompt:?}"
+        );
+        assert!(ocr_prompt(false, "").ends_with("</img>\nOCR: <|im_end|><|im_start|>assistant\n"));
     }
 
     /// **B3 — the GOT vision/connector/splice parity gate.** Env-gated: `FOCR_GOT_MODEL`

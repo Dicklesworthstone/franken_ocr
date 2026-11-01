@@ -148,6 +148,7 @@ region text (no output coordinate decoding).
 - **OQ-5** vision LayerNorm + LayerNorm2d eps (likely 1e-6) — read from weights.
 - **OQ-6** RoPE: full (not partial) rotary over head_dim 64.
 - **OQ-7** exact bbox 0–1000 normalization (relative to original image vs the 1024 canvas).
+  **[RESOLVED below: the original image.]**
 - **OQ-8** `no_repeat_ngram_size=20` (HF builtin, GLOBAL not windowed) materially affects decode;
   interacts with the known int8 "repetition-runs on hard tables" failure mode — must implement to match.
 - **OQ-9** tile batching: row-major grid order, thumbnail LAST, one flat `<img>…</img>` block.
@@ -209,9 +210,16 @@ needed to inventory keys):
 - **OQ-6 RESOLVED.** head_dim 64 → full rotary over 64.
 - **OQ-8 RESOLVED.** `no_repeat_ngram_size=20` is hard-coded in `chat()` (HF builtin = global,
   window 0); `generation_config.json` sets `max_new_tokens=2048` (the `chat()` call overrides to 4096).
+- **OQ-7 RESOLVED (bd-1sj1).** `modeling_GOT.py@979938bf` (sha256 `68375b6b…`, lines
+  503-529) scales by the loaded image, not the 1024 canvas: `w, h = image.size`, then
+  `int(v/w*1000)` for x and `int(v/h*1000)` for y, truncated, unclamped. A 2-value point
+  scales the same way. `qs` becomes `str(bbox) + ' ' + 'OCR: '`, a Python list
+  (`[166, 125, 833, 875] OCR: `). `ocr_color` is applied after `ocr_box` and replaces it,
+  `'[' + color + '] '`. With `ocr_type == 'format'` both put `OCR with format: ` after the
+  selector. Implemented by `got::Region::prefix`, the `--box` and `--color` flags.
 - **Still open (code-level, not weight-resolvable):** OQ-5 (vision LayerNorm / LayerNorm2d eps —
-  SAM default 1e-6, confirm in `got_vision_b.py`), OQ-7 (exact 0–1000 bbox normalization basis),
-  OQ-9 (tile order: row-major, thumbnail last — from `run_ocr_2.0_crop.py`).
+  SAM default 1e-6, confirm in `got_vision_b.py`) and OQ-9 (tile order: row-major, thumbnail
+  last — from `run_ocr_2.0_crop.py`).
 
 **Exact tensor names (for the B2 convert map):**
 - Decoder (×24 layers): `model.embed_tokens.weight` [151860,1024]; `model.layers.{i}.input_layernorm.weight`

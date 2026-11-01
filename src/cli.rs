@@ -401,6 +401,19 @@ pub struct OcrRequestArgs {
     /// Requires `--task describe`.
     #[arg(long)]
     pub question: Option<String>,
+    /// GOT-OCR2 fine-grained OCR: read only the text inside this box, in pixels
+    /// of the input image, as `x1,y1,x2,y2` (top left, bottom right), or at a
+    /// point `x,y`. The model sees it on its 0-1000 grid, as upstream
+    /// `chat(ocr_box=…)` builds it. Needs a got-ocr2 model and composes with
+    /// `--format`, but not with `--task chart` or `--task formula`, which pad
+    /// the image first.
+    #[arg(long = "box", value_name = "X1,Y1,X2,Y2")]
+    pub region_box: Option<String>,
+    /// GOT-OCR2 fine-grained OCR: read only the text inside a frame of this
+    /// colour drawn on the image, as upstream `chat(ocr_color=…)` does. Needs a
+    /// got-ocr2 model and composes with `--format`.
+    #[arg(long, value_enum, value_name = "COLOR", conflicts_with = "region_box")]
+    pub color: Option<RegionColor>,
     /// Page selection: a comma list of 1-based pages and inclusive ranges
     /// ("3", "3-7", "1,5-9,218"). PDF and directory inputs only — on an image
     /// input this is a usage error. Out-of-range pages error naming the
@@ -497,6 +510,8 @@ pub struct OcrRequest {
     pub format: bool,
     /// Pad the image to a square before GOT sees it (per [`OcrTask::pads_got_image`]).
     pub square_pad: bool,
+    /// The region GOT reads, from `--box` or `--color`.
+    pub region: Option<native_engine::got::Region>,
     pub question: Option<String>,
     pub pages: Option<String>,
     pub split_spreads: bool,
@@ -562,6 +577,10 @@ impl OcrRequestArgs {
                 "--question is the smolvlm2 VQA prompt and requires --task describe".into(),
             ));
         }
+        let region = self.region()?;
+        if let Some(region) = region {
+            validate_region(region, self.task, self.effective_model_spec().as_deref())?;
+        }
         Ok(OcrRequest {
             image: self.image.clone(),
             model: self.model.clone(),
@@ -598,6 +617,7 @@ impl OcrRequestArgs {
             // explicit `--format` wins / is idempotent alongside `--task`.
             format: self.format || self.task.implies_got_format(),
             square_pad: self.task.pads_got_image(),
+            region,
             question: self.question.clone(),
             pages: self.pages.clone(),
             split_spreads: self.split_spreads,
@@ -617,6 +637,94 @@ impl OcrRequestArgs {
         self.model
             .clone()
             .or_else(|| std::env::var_os(crate::MODEL_PATH_ENV).map(PathBuf::from))
+    }
+
+    /// The region `--box` or `--color` names (clap refuses both at once).
+    fn region(&self) -> FocrResult<Option<native_engine::got::Region>> {
+        if let Some(color) = self.color {
+            return Ok(Some(native_engine::got::Region::Color(color.frame())));
+        }
+        self.region_box.as_deref().map(parse_region_box).transpose()
+    }
+}
+
+/// `--box`: `x1,y1,x2,y2` or a point `x,y`, in pixels, brackets optional.
+fn parse_region_box(text: &str) -> FocrResult<native_engine::got::Region> {
+    use native_engine::got::Region;
+    let usage = |why: String| {
+        FocrError::Usage(format!(
+            "--box {text:?}: {why}. It takes x1,y1,x2,y2 (top left, bottom right) or a point \
+             x,y, in pixels of the input image"
+        ))
+    };
+    let values = text
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(',')
+        .map(|v| {
+            v.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+        })
+        .collect::<Option<Vec<f64>>>()
+        .ok_or_else(|| usage("every value must be a non-negative number".into()))?;
+    match values[..] {
+        [x, y] => Ok(Region::Point([x, y])),
+        [x1, y1, x2, y2] if x1 < x2 && y1 < y2 => Ok(Region::Box([x1, y1, x2, y2])),
+        [_, _, _, _] => Err(usage(
+            "the second corner must be below and to the right of the first".into(),
+        )),
+        _ => Err(usage(format!("{} values, not 4 or 2", values.len()))),
+    }
+}
+
+/// `--box` and `--color` are got-ocr2's: refuse them where another model would
+/// run, and refuse a box where GOT would see a padded image, not the image the
+/// box was measured on. A colour frame survives the pad.
+fn validate_region(
+    region: native_engine::got::Region,
+    task: OcrTask,
+    model_spec: Option<&Path>,
+) -> FocrResult<()> {
+    if task.pads_got_image() && !matches!(region, native_engine::got::Region::Color(_)) {
+        return Err(FocrError::Usage(format!(
+            "--box names pixels of the image as given, and --task {task} pads it to a square \
+             first. Use --format for a region's structured output"
+        )));
+    }
+    if let Some(models) = task_models(task).filter(|models| !models.contains(&"got-ocr2")) {
+        return Err(FocrError::Usage(format!(
+            "--box and --color are got-ocr2's fine-grained OCR, and --task {task} runs {}",
+            models.join(" or ")
+        )));
+    }
+    if model_spec_is_knowably_not_got(model_spec) {
+        return Err(FocrError::Usage(
+            "--box and --color are got-ocr2's fine-grained OCR, but this run would use the \
+             plain-text unlimited-ocr model. Run `focr pull got-ocr2`, then re-run with \
+             `--model got-ocr2.int8.focrq` (see `focr models`)"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse `--box` or `--color` for a model that is not got-ocr2, judged by its
+/// header, as [`validate_task_for_header`] does for a task.
+fn validate_region_for_header(request: &OcrRequest) -> FocrResult<()> {
+    if request.region.is_none() {
+        return Ok(());
+    }
+    let spec = request.model.clone().unwrap_or_else(OcrEngine::model_path);
+    match native_engine::model_id_at(&spec) {
+        Some(id) if id != "got-ocr2" => Err(FocrError::Usage(format!(
+            "--box and --color are got-ocr2's fine-grained OCR, but {} holds {id}. Re-run \
+             with `--model got-ocr2.int8.focrq` (see `focr models`)",
+            spec.display()
+        ))),
+        _ => Ok(()),
     }
 }
 
@@ -774,6 +882,25 @@ pub enum ResumeMode {
     Matching,
     /// From the completed pages, recomputing the next window.
     Recompute,
+}
+
+/// The frame colours `--color` takes: the ones GOT's fine-grained OCR was
+/// trained on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RegionColor {
+    Red,
+    Green,
+    Blue,
+}
+
+impl RegionColor {
+    fn frame(self) -> native_engine::got::FrameColor {
+        match self {
+            Self::Red => native_engine::got::FrameColor::Red,
+            Self::Green => native_engine::got::FrameColor::Green,
+            Self::Blue => native_engine::got::FrameColor::Blue,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1827,6 +1954,7 @@ fn run_ocr_inner(
     // `OcrEngine::new()`: the decode params are resolved at model load.
     native_engine::force_got_format(request.format);
     native_engine::force_got_square_pad(request.square_pad);
+    native_engine::set_got_region(request.region);
     native_engine::set_smolvlm2_question(request.question.clone());
     native_engine::set_decode_overrides(decode_overrides_from(&request));
     native_engine::set_preprocess_overrides(preprocess_overrides_from(&request));
@@ -1869,6 +1997,7 @@ fn run_ocr_inner(
     let mode = RunMode::of_ocr(&request, is_document);
     let pull_hint = apply_mode_default(&mut request.model, mode, &MODE_DEFAULTS);
     validate_task_for_header(args.request.task, &request)?;
+    validate_region_for_header(&request)?;
     // A model that splits a document into pages exactly (Unlimited-OCR-2,
     // U2-E3) gives one cross-page pass real pages, so its document mode
     // composes with --split-spreads and --extract-figures. v1 merges pages.
@@ -2597,6 +2726,7 @@ fn resident_recognition(
         preprocess: preprocess_overrides_from(request),
         format: request.format,
         square_pad: request.square_pad,
+        region: request.region,
         question: request.question.as_deref(),
         on_stage: Some(&on_stage),
     })
@@ -5227,6 +5357,8 @@ mod tests {
                     format: false,
                     task: OcrTask::Ocr,
                     question: None,
+                    region_box: None,
+                    color: None,
                     pages: None,
                     split_spreads: false,
                     multi_page: false,
@@ -5269,6 +5401,8 @@ mod tests {
                         format: false,
                         task: OcrTask::Ocr,
                         question: None,
+                        region_box: None,
+                        color: None,
                         pages: None,
                         split_spreads: false,
                         multi_page: false,
@@ -5303,6 +5437,8 @@ mod tests {
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,
+                region_box: None,
+                color: None,
                 pages: None,
                 split_spreads: false,
                 multi_page: false,
@@ -5426,6 +5562,114 @@ mod tests {
         let req = ocr_request_from(&["scan.png", "--format", "--model", "got-ocr2.int8.focrq"])
             .expect("request builds");
         assert!(!req.square_pad, "`--format` alone is the upstream squash");
+    }
+
+    /// bd-1sj1: `--box` takes a box or a point in pixels, brackets and spaces
+    /// optional, and `--color` one of GOT's three frame colours.
+    #[test]
+    fn box_and_color_name_a_got_region() {
+        use native_engine::got::{FrameColor, Region};
+        let got = ["--model", "got-ocr2.int8.focrq"];
+        for (spec, want) in [
+            ("10,20,300,400", Region::Box([10.0, 20.0, 300.0, 400.0])),
+            (
+                "[10, 20.5, 300, 400]",
+                Region::Box([10.0, 20.5, 300.0, 400.0]),
+            ),
+            ("7,8", Region::Point([7.0, 8.0])),
+        ] {
+            let req = ocr_request_from(&[&["scan.png", "--box", spec][..], &got[..]].concat())
+                .expect("request builds");
+            assert_eq!(req.region, Some(want), "--box {spec}");
+        }
+        let argv = [&["scan.png", "--color", "blue", "--format"][..], &got[..]].concat();
+        let req = ocr_request_from(&argv).expect("request builds");
+        assert_eq!(req.region, Some(Region::Color(FrameColor::Blue)));
+        assert!(req.format, "a region composes with --format");
+        // A colour frame survives the pad; a box does not.
+        let argv = [
+            &["scan.png", "--color", "red", "--task", "chart"][..],
+            &got[..],
+        ]
+        .concat();
+        let req = ocr_request_from(&argv).expect("request builds");
+        assert!(req.square_pad && req.region.is_some());
+        assert_eq!(
+            ocr_request_from(&["scan.png"])
+                .expect("request builds")
+                .region,
+            None
+        );
+    }
+
+    #[test]
+    fn a_region_is_refused_where_got_would_not_read_it() {
+        let got = ["--model", "got-ocr2.int8.focrq"];
+        for (argv, says) in [
+            (vec!["--box", "1,2,3"], "3 values"),
+            (vec!["--box", "1,2,3,4,5"], "5 values"),
+            (vec!["--box", "10,20,5,40"], "below and to the right"),
+            (vec!["--box", "10,-1,20,40"], "non-negative"),
+            (vec!["--box", "a,b"], "non-negative"),
+            (vec!["--box", ""], "non-negative"),
+            (
+                vec!["--box", "1,2,3,4", "--task", "chart"],
+                "pads it to a square",
+            ),
+            (
+                vec!["--box", "1,2,3,4", "--task", "formula"],
+                "pads it to a square",
+            ),
+        ] {
+            let argv = [&["scan.png"][..], &argv[..], &got[..]].concat();
+            let err = ocr_request_from(&argv).expect_err("refused");
+            assert!(matches!(err, FocrError::Usage(_)), "{argv:?}: {err}");
+            assert!(err.to_string().contains(says), "{argv:?}: {err}");
+        }
+        for argv in [
+            vec!["scan.png", "--box", "1,2,3,4"],
+            vec![
+                "scan.png",
+                "--color",
+                "red",
+                "--model",
+                "unlimited-ocr.int8.focrq",
+            ],
+            vec![
+                "scan.png",
+                "--color",
+                "red",
+                "--task",
+                "describe",
+                "--model",
+                "smolvlm2.int8.focrq",
+            ],
+            vec![
+                "scan.png",
+                "--color",
+                "red",
+                "--task",
+                "chart-data",
+                "--model",
+                "onechart.int8.focrq",
+            ],
+        ] {
+            let err = ocr_request_from(&argv).expect_err("refused");
+            assert!(matches!(err, FocrError::Usage(_)), "{argv:?}: {err}");
+            assert!(err.to_string().contains("got-ocr2"), "{argv:?}: {err}");
+        }
+        // Both at once, or a colour GOT was not trained on, is clap's usage error.
+        for argv in [
+            vec![
+                "focr", "ocr", "scan.png", "--box", "1,2,3,4", "--color", "red",
+            ],
+            vec!["focr", "ocr", "scan.png", "--color", "purple"],
+        ] {
+            let Err(err) = Cli::try_parse_from(&argv) else {
+                panic!("{argv:?}: clap accepted it");
+            };
+            assert_eq!(err.exit_code(), 2, "{argv:?}");
+        }
     }
 
     #[test]
@@ -6286,6 +6530,8 @@ mod tests {
                 format: false,
                 task: OcrTask::Ocr,
                 question: None,
+                region_box: None,
+                color: None,
                 pages: None,
                 split_spreads: false,
                 multi_page: false,

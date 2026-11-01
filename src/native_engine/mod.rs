@@ -1487,6 +1487,25 @@ pub fn force_got_square_pad(on: bool) {
     FORCE_GOT_SQUARE_PAD.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Process-global GOT region selector, set by the CLI from `--box` / `--color`
+/// (same threading as [`FORCE_GOT_FORMAT`]). `None` ⇒ the whole image.
+static GOT_REGION: std::sync::Mutex<Option<got::Region>> = std::sync::Mutex::new(None);
+
+/// Set (or clear) the region GOT reads, process-wide (bd-1sj1). Only affects
+/// the `got-ocr2` arm.
+pub fn set_got_region(region: Option<got::Region>) {
+    *GOT_REGION.lock().unwrap_or_else(|e| e.into_inner()) = region;
+}
+
+/// The selector for a `width`×`height` input, or empty with no region set.
+fn got_region_prefix(width: u32, height: u32) -> String {
+    GOT_REGION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .map(|region| region.prefix(width, height))
+        .unwrap_or_default()
+}
+
 /// `img` as the GOT forward should see it, per [`crate::preprocess::pad_to_white_square`].
 fn got_input(img: &image::DynamicImage) -> std::borrow::Cow<'_, image::DynamicImage> {
     if FORCE_GOT_SQUARE_PAD.load(std::sync::atomic::Ordering::Relaxed) {
@@ -4400,6 +4419,8 @@ impl OcrModel {
         // charts/molecular/geometry/sheet-music); default plain `OCR: ` unchanged.
         let format = got_format_requested();
         let max_new = self.decode_params.max_length.min(got::MAX_NEW_TOKENS);
+        // A `--box` is in pixels of the input, so it scales by the input's size.
+        let region = got_region_prefix(w, h);
         let image = got_input(img);
         let text = got::recognize(
             &self.weights,
@@ -4408,6 +4429,7 @@ impl OcrModel {
             &image,
             max_new,
             format,
+            &region,
         )?;
         timing_log(&format!("got forward {:.2}s", t.elapsed().as_secs_f64()));
         Ok((text, w, h))
@@ -6014,6 +6036,8 @@ impl OcrModel {
                     let inputs: Vec<_> = refs.iter().map(|img| got_input(img)).collect();
                     let views: Vec<&image::DynamicImage> =
                         inputs.iter().map(std::borrow::Cow::as_ref).collect();
+                    let regions: Vec<String> =
+                        dims.iter().map(|&(w, h)| got_region_prefix(w, h)).collect();
                     got::recognize_batch(
                         &self.weights,
                         self.got_statics()?,
@@ -6021,6 +6045,7 @@ impl OcrModel {
                         &views,
                         max_new,
                         got_format_requested(),
+                        &regions,
                     )?
                 }
                 "smolvlm2" => smolvlm2::recognize_batch(

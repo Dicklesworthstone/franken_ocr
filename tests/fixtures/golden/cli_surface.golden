@@ -13,6 +13,8 @@ focr ocr --max-page-tokens Set value=MAX_PAGE_TOKENS
 focr ocr --format SetTrue
 focr ocr --task Set value=TASK possible=ocr,formula,tables,chart,molecular,geometry,music,describe,chart-data default=ocr
 focr ocr --question Set value=QUESTION
+focr ocr --box Set value=X1,Y1,X2,Y2
+focr ocr --color Set value=COLOR possible=red,green,blue
 focr ocr --pages Set value=PAGES
 focr ocr --split-spreads SetTrue
 focr ocr --multi-page SetTrue
@@ -72,6 +74,8 @@ focr robot run --max-page-tokens Set value=MAX_PAGE_TOKENS
 focr robot run --format SetTrue
 focr robot run --task Set value=TASK possible=ocr,formula,tables,chart,molecular,geometry,music,describe,chart-data default=ocr
 focr robot run --question Set value=QUESTION
+focr robot run --box Set value=X1,Y1,X2,Y2
+focr robot run --color Set value=COLOR possible=red,green,blue
 focr robot run --pages Set value=PAGES
 focr robot run --split-spreads SetTrue
 focr robot run --multi-page SetTrue

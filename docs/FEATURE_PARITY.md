@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **91** | **219** |
-| `present` | 115 † | 78 | 193 |
+| Total enumerated rows | **128** | **92** | **220** |
+| `present` | 115 † | 79 | 194 |
 | `partial` | 7 † | 10 | 17 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -255,6 +255,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr ocr -o/--output FILE` (.md / .json-with-boxes) | §7.2 | MUST | present | SURF | bd-sreb | v0.3.0; goldens |
 | `focr ocr --extract-figures [--figures-dir]` | §7.2 | SHOULD | present | SURF | bd-sreb | v0.3.0; figure PNG/JPG chosen by content |
 | `focr ocr --task format\|music\|describe\|vqa\|chart-data` (zoo lanes) | §7.2 | MUST | partial | SURF | bd-av64 | GOT/SmolVLM2/OneChart/TrOMR lanes shipped w/ armed certs; `music` partial on real-input hardening (bd-av64: duration crash, wide-staff abort). Certs prove parity, not accuracy: measured readings are in `artifacts/accuracy/bd-kd75/` (bd-kd75 open: GOT int8 chart loss) |
+| `focr ocr --box x1,y1,x2,y2\|x,y`, `--color red\|green\|blue` (GOT-OCR2 fine-grained OCR of one region, upstream `chat(ocr_box=…, ocr_color=…)`) | §7.2 | SHOULD | present | SURF | bd-1sj1 | `got::tests::a_region_prefixes_the_instruction_as_upstream_chat_does` (Python's own arithmetic), `cli::tests::box_and_color_name_a_got_region`, `a_region_is_refused_where_got_would_not_read_it`; on real int8 weights each block of a two-block page reads alone, inline and served byte for byte; carried on the resident wire (protocol 7) |
 | `focr ocr --robot` / `focr robot run` (NDJSON stream) | §7.2 | MUST | present | SURF | bd-223.3 | contract tests green (bd-zc1o); internals polish tracked bd-wp8.3 |
 | `focr ocr --check` (preflight: arguments, input header or page list, `--pages`, model header and tokenizer, output directory; no weights, no pixels, no `focr runs` row) | §7.2 | SHOULD | present | SURF | bd-m76g | `tests/cli_robot_golden.rs` `ocr_check_*`: exits as the run does on the requests that fail before a decode; about 0.5 s on the real artifacts |
 | `focr ocr -` (an image or a PDF on stdin, through a private file removed when the run ends) | §7.2 | SHOULD | present | SURF | bd-0pwb | `tests/cli_robot_golden.rs` `ocr_reads_stdin_*`, `ocr_refuses_stdin_*` |

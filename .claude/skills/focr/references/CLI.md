@@ -329,6 +329,8 @@ Important flags:
 | `--base-size`, `--image-size`, `--crop-mode` | Match reference image preprocessing knobs; default `base` is the certified single 1024-pixel global view |
 | `--max-length`, `--temperature`, `--no-repeat-ngram`, `--ngram-window` | Decode controls; `--temperature` and `--ngram-window` affect Unlimited-OCR only, while GOT stays greedy/global |
 | `--format` | GOT-OCR2 `OCR with format:` Mathpix-Markdown mode |
+| `--box x1,y1,x2,y2` / `--box x,y` | GOT-OCR2 fine-grained OCR of one region, in the input's pixels; scaled to GOT's 0-1000 grid as upstream `chat(ocr_box=…)` does; composes with `--format`, refused with `--task chart\|formula` (they pad) and with non-GOT models |
+| `--color red\|green\|blue` | GOT-OCR2 fine-grained OCR of the text inside a frame of that colour drawn on the image; exclusive with `--box` |
 | `--task <task>` | Convenience selector: `ocr`, `formula`, `tables`, `chart`, `molecular`, `geometry`, `music`, `describe`, or `chart-data` |
 
 Crop-mode rule: `base` is the default and certified current e2e path.
@@ -1011,6 +1013,8 @@ focr ocr receipt.jpg -o receipt.md --extract-figures
 focr ocr formula.png --model got-ocr2.int8.focrq
 focr ocr --model got-ocr2.int8.focrq --format formula.png
 focr ocr formula.png --task formula --model got-ocr2.int8.focrq
+focr ocr page.png --model got-ocr2.int8.focrq --box 288,416,617,472
+focr ocr framed.png --model got-ocr2.int8.focrq --color red
 focr ocr photo.jpg --task describe --model smolvlm2.int8.focrq --question "What is in the sky?"
 focr ocr-batch *.png --f32
 focr ocr page_0107.png --crop-mode gundam
