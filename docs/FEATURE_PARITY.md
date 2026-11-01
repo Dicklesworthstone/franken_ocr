@@ -354,7 +354,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | Family | §9.7 | Req | Status | Parity | Bead | Notes |
 |--------|------|-----|--------|--------|------|-------|
 | AF-1 rate-distortion water-filling bit allocation | §9.7 | SHOULD | partial | L5 | bd-ksps, bd-1xfa.1 | `scripts/af1_bit_allocator.py` + `src/quant/bit_allocator.rs` shipped; full table integration open |
-| AF-2 tail-risk CVaR + EVT worst-case CER gate | §9.7 | SHOULD | partial | L5 | bd-3upw, bd-1xfa.2 | `scripts/af2_tail_risk.py` math shipped; not yet wired as a release gate |
+| AF-2 tail-risk CVaR + EVT worst-case CER gate | §9.7 | SHOULD | partial | L5 | bd-3upw, bd-1xfa.2 | `scripts/af2_tail_risk.py` + `src/adaptive/tail_risk.rs` shipped; the U2-C5a head-to-head report (`scripts/uocr2_head_to_head.py report`) prints its mean/CVaR_0.1/EVT p99.9 rows per cell; not yet a release gate |
 | AF-3 conformal/SPRT early-exit + speculative decode | §9.7 | MAY | missing | L4 | bd-1xfa.3 | SPIKE open (spec-decode ring exists; safe-exit bound not) |
 | AF-4 submodular high-precision tensor selection | §9.7 | MAY | missing | L5 | bd-1xfa.4 | SPIKE open |
 | AF-5 USL many-core pool sizing | §9.7 | SHOULD | partial | n/a | bd-2mo.21, bd-1xfa.5 | `scripts/af5_usl_fit.py` + `src/adaptive/usl.rs` shipped; NUMA pool caps open |

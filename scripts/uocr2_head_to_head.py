@@ -11,7 +11,9 @@ Subcommands, in order:
     select   ground-truth files + PDFs -> items.json (the seeded sample, ids only)
     fetch    items.json -> page images and text-layer ground truth under DATA
     run      the focr cells -> raw outputs + runs.ndjson (wall, peak RSS, exit)
-    score    -> scores.ndjson, one line per item and cell
+    rerun    each single page an arm lost to the 600 s budget, alone and
+             unbudgeted -> rerun.ndjson (the registered sensitivity analysis)
+    score    -> scores.ndjson, one line per item and cell (reruns as <cell>_rerun)
     report   -> summary.json + report.md (bootstrap intervals, categories, cost)
     selftest the fast edit distance and TEDS against slow references
 
@@ -51,6 +53,7 @@ DELTA = 0.005
 TAU = 0.02
 CATEGORY_MIN_N = 15
 FURNITURE_NED = 0.25
+PAGE_BUDGET_S = 600  # focr's default FOCR_STAGE_BUDGET_FORWARD_MS, which the runs used
 RASTER_DPI = 150
 USER_AGENT = (
     "franken_ocr-c5a-eval/1.0 (https://github.com/Dicklesworthstone/franken_ocr; "
@@ -817,6 +820,53 @@ def cmd_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _budget_pages(items: dict, data: Path, runs: list[dict]) -> list[tuple[str, dict]]:
+    """(cell, item) for every single page an arm lost to the 600 s forward
+    budget as run: a v1 page that errored at it, or a v2 page that stopped at
+    it and kept what it had (`ok`, seconds ≥ the budget)."""
+    by_image = {str(data / "omni" / item["image_path"]): item for item in items["single_pages"]}
+    pages = []
+    for run in runs:
+        if not run["cell"].endswith("_single"):
+            continue
+        for result in (_load_json(Path(run["output"])) or {}).get("results", []):
+            item = by_image.get(result.get("image"))
+            if item is None:
+                continue
+            if result.get("ok"):
+                at_budget = (result.get("seconds") or 0) >= PAGE_BUDGET_S
+            else:
+                at_budget = "budget" in str(result.get("error", ""))
+            if at_budget:
+                pages.append((run["cell"], item))
+    return pages
+
+
+def cmd_rerun(args: argparse.Namespace) -> int:
+    """The sensitivity reruns (run-status note on the bead, 2026-10-31): every
+    page an arm lost to the budget, alone in its own process so no overrun can
+    cascade into it, with FOCR_STAGE_BUDGET_FORWARD_MS=0, on the run's binary."""
+    items = json.loads(Path(args.items).read_text(encoding="utf-8"))
+    data = Path(args.data)
+    runs = [json.loads(line) for line in (data / "runs.ndjson").read_text().splitlines() if line.strip()]
+    rerun_path = data / "rerun.ndjson"
+    done = _done(rerun_path)
+    env = dict(os.environ, FOCR_NO_RESIDENT="1", FOCR_MODEL_DIR=args.model_dir, FOCR_STAGE_BUDGET_FORWARD_MS="0")
+    for cell, item in _budget_pages(items, data, runs):
+        key = cell[:2]
+        run = f"rerun/{key}/{item['id']}"
+        if run in done:
+            continue
+        out = data / "runs" / "rerun" / key / f"{item['id']}.json"
+        argv = [args.focr, "ocr-batch", "--model", MODELS[key], "--json", str(data / "omni" / item["image_path"])]
+        result = _timed(argv, out, args.timeout, env)
+        with open(rerun_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"run": run, "cell": cell, "model": MODELS[key], "items": [item["id"]],
+                                     "output": str(out), **result}, ensure_ascii=False) + "\n")
+        print(run, result["exit"], result["wall_s"], flush=True)
+    return 0
+
+
 # --------------------------------------------------------------------------
 # score
 # --------------------------------------------------------------------------
@@ -901,6 +951,20 @@ def cmd_score(args: argparse.Namespace) -> int:
                     **_score_single(item, gt, markdown)}
             out.write(json.dumps(line) + "\n")
 
+    # The sensitivity reruns (`rerun`), scored by the same rules as cell "<cell>_rerun".
+    rerun_path = data / "rerun.ndjson"
+    reruns = rerun_path.read_text().splitlines() if rerun_path.exists() else []
+    single = {item["id"]: item for item in items["single_pages"]}
+    for run in (json.loads(line) for line in reruns if line.strip()):
+        item = single[run["items"][0]]
+        output = _load_json(Path(run["output"])) if run["exit"] == 0 else None
+        entry = ((output or {}).get("results") or [None])[0]
+        markdown = entry.get("markdown") if entry and entry.get("ok") else None
+        gt = layout_views(omni[item["image_path"]]["layout_dets"])
+        line = {"item": item["id"], "cell": f"{run['cell']}_rerun", "seconds": entry.get("seconds") if entry else None,
+                **_score_single(item, gt, markdown)}
+        out.write(json.dumps(line) + "\n")
+
     for doc in items["documents"]:
         truth = _doc_truth(doc, marathon, data)
         gt_all = "".join(page["all"] for page in truth)
@@ -967,11 +1031,34 @@ def cmd_report(args: argparse.Namespace) -> int:
     tables["non_inferior"] = tables["high"] < DELTA
     summary["single_page"] = {"cer_text": primary, "teds": tables,
                               "ed_all": _bootstrap(_paired(scores, "v2_single", "v1_single", "ed_all"))}
+    # Sensitivity, not pre-registered: a failed page scores 1.0 above, so a
+    # timeout counts as an accuracy loss. This is the same statistic over the
+    # pages both cells completed.
+    completed = set.intersection(*({s["item"] for s in scores if s["cell"] == cell and not s["failed"]}
+                                   for cell in ("v1_single", "v2_single")))
+    both = _paired(scores, "v2_single", "v1_single", "cer_text", lambda i: i in completed)
+    summary["single_page"]["cer_text_both_completed"] = _bootstrap(both) if both else {"n": 0}
+    # The registered sensitivity analysis: every budget page replaced by its
+    # rerun (alone, unbudgeted), the same statistics otherwise.
+    rerun_scores = [s for s in scores if s["cell"].endswith("_rerun")]
+    if rerun_scores:
+        substituted = _with_reruns(scores)
+        sens = _bootstrap(_paired(substituted, "v2_single", "v1_single", "cer_text"))
+        sens["non_inferior"] = sens["high"] < DELTA
+        sens_teds = _bootstrap(_paired(substituted, "v1_single", "v2_single", "teds"))
+        sens_teds["non_inferior"] = sens_teds["high"] < DELTA
+        summary["single_page"]["rerun"] = {
+            "cer_text": sens, "teds": sens_teds,
+            "reruns": dict(collections.Counter(s["cell"] for s in rerun_scores)),
+            "rerun_failed": dict(collections.Counter(s["cell"] for s in rerun_scores if s["failed"])),
+        }
     for cell in ("v1_single", "v2_single"):
         rows = [s for s in scores if s["cell"] == cell]
         summary["single_page"][cell] = {
             "pages": len(rows),
             "failed": sum(s["failed"] for s in rows),
+            "failed_by_source": dict(collections.Counter(
+                single[s["item"]]["data_source"] for s in rows if s["failed"])),
             "mean_cer_text": _mean([s["cer_text"] for s in rows if "cer_text" in s]),
             "mean_ed_all": _mean([s["ed_all"] for s in rows]),
             "mean_teds": _mean([s["teds"] for s in rows if "teds" in s]),
@@ -1037,6 +1124,15 @@ def cmd_report(args: argparse.Namespace) -> int:
     doc_summary["per_page_v1_multi_minus_v2"] = _bootstrap(page_pairs) if page_pairs else {"n": 0}
     summary["documents"] = doc_summary
 
+    # Tail risk (AF-2): not pre-registered, so it is reported and gates nothing.
+    summary["tail_risk"] = [
+        _tail_pair("single page, CER_text", scores, "v1_single", "v2_single", "cer_text"),
+        *([_tail_pair("single page, CER_text, budget pages rerun", _with_reruns(scores), "v1_single",
+                      "v2_single", "cer_text")] if rerun_scores else []),
+        _tail_pair("documents, ED_all", scores, "v1_multi", "v2_doc", "ed_all"),
+        _tail_pair("documents, ED_all", scores, "v1_pp", "v2_doc", "ed_all"),
+    ]
+
     # Cost: wall seconds per completed page and peak RSS, per cell.
     cost = {}
     for cell in ("v1_single", "v2_single", *DOC_CELLS):
@@ -1055,6 +1151,49 @@ def cmd_report(args: argparse.Namespace) -> int:
     (data / "report.md").write_text(_markdown(summary), encoding="utf-8")
     print(_markdown(summary))
     return 0
+
+
+def _with_reruns(scores) -> list[dict]:
+    """The as-run scores with each rerun page's score in place of its as-run
+    one (same cell name), and the `_rerun` lines themselves dropped."""
+    rerun = {(s["cell"].removesuffix("_rerun"), s["item"]): s for s in scores if s["cell"].endswith("_rerun")}
+    return [dict(rerun[(s["cell"], s["item"])], cell=s["cell"]) if (s["cell"], s["item"]) in rerun else s
+            for s in scores if not s["cell"].endswith("_rerun")]
+
+
+def _af2():
+    """scripts/af2_tail_risk.py, loaded by path: `python3 -I` keeps this
+    script's own directory off sys.path."""
+    import importlib.util  # noqa: PLC0415
+
+    if "af2_tail_risk" not in sys.modules:
+        spec = importlib.util.spec_from_file_location("af2_tail_risk", Path(__file__).resolve().parent / "af2_tail_risk.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["af2_tail_risk"] = module  # its dataclasses resolve annotations through sys.modules
+        spec.loader.exec_module(module)
+    return sys.modules["af2_tail_risk"]
+
+
+def _tail_pair(name: str, scores, baseline: str, candidate: str, metric: str) -> dict:
+    """AF-2's mean, VaR, CVaR_0.1 and EVT p99.9 of each cell's per-item `metric`
+    over the items both cells scored, and AF-2's gate: the candidate's CVaR and
+    EVT bound within τ of the baseline's."""
+    af2 = _af2()
+    a = {s["item"]: s[metric] for s in scores if s["cell"] == baseline and metric in s}
+    b = {s["item"]: s[metric] for s in scores if s["cell"] == candidate and metric in s}
+    common = sorted(a.keys() & b.keys())
+    row = {"set": name, "metric": metric, "baseline": baseline, "candidate": candidate, "n": len(common)}
+    if not common:
+        return row
+    keys = ("n", "mean", "var_0.1", "cvar_0.1", "evt_p999", "gpd_method", "gpd_n_exceed", "max_cer")
+    reports = {cell: af2.compute_report([values[i] for i in common])
+               for cell, values in ((baseline, a), (candidate, b))}
+    for cell, report in reports.items():
+        record = report.to_record()
+        row[cell] = {k: record[k] for k in keys}
+    base = reports[baseline]
+    row["gate"] = af2.apply_gate(reports[candidate], base.cvar_alpha, base.evt_pXXX, TAU)
+    return row
 
 
 def _paired_pages(scores) -> list[float]:
@@ -1085,6 +1224,15 @@ def _markdown(summary: dict) -> str:
     lines.append(f"- TEDS(v1) − TEDS(v2), single-table pages: {_fmt(sp['teds'])}; non-inferior: "
                  f"{sp['teds'].get('non_inferior')}")
     lines.append(f"- ED_all(v2) − ED_all(v1): {_fmt(sp['ed_all'])}")
+    lines.append(f"- Sensitivity (not pre-registered): CER_text(v2) − CER_text(v1) over the pages both "
+                 f"cells completed, so a timeout is not scored as 1.0: {_fmt(sp['cer_text_both_completed'])}")
+    if "rerun" in sp:
+        rr = sp["rerun"]
+        lines.append(f"- Sensitivity (registered in the run-status note): every page lost to the 600 s budget "
+                     f"rerun alone with no budget ({json.dumps(rr['reruns'])}; failed again: "
+                     f"{json.dumps(rr['rerun_failed'])}). CER_text(v2) − CER_text(v1): {_fmt(rr['cer_text'])}; "
+                     f"non-inferior: {rr['cer_text'].get('non_inferior')}. TEDS(v1) − TEDS(v2): "
+                     f"{_fmt(rr['teds'])}; non-inferior: {rr['teds'].get('non_inferior')}")
     for cell in ("v1_single", "v2_single"):
         lines.append(f"- {cell}: {json.dumps(sp[cell])}")
     lines += ["", "| category | metric | n | mean Δ (v2 worse > 0) | 95% interval | regression (τ = 0.02) |",
@@ -1103,6 +1251,23 @@ def _markdown(summary: dict) -> str:
     for cell in DOC_CELLS:
         lines.append(f"- {cell}: {json.dumps(doc[cell])}")
     lines.append(f"- per page, v1_multi − v2_doc (both split): {_fmt(doc['per_page_v1_multi_minus_v2'])}")
+    lines += ["", "## Tail risk (AF-2, `scripts/af2_tail_risk.py`; not pre-registered, gates nothing)", "",
+              "Per-item error over the items both cells scored: the mean, VaR and CVaR at α = 0.1 "
+              "(CVaR is the mean of the worst 10%), and the EVT p99.9 bound (a GPD tail fit, or the "
+              "empirical quantile below 8 exceedances). The gate is AF-2's: the v2 cell's CVaR and EVT "
+              f"bound within τ = {TAU} of the v1 cell's.", "",
+              "| set | cell | n | mean | VaR_0.1 | CVaR_0.1 | EVT p99.9 | max | gate |",
+              "|---|---|---|---|---|---|---|---|---|"]
+    for row in summary["tail_risk"]:
+        if not row["n"]:
+            lines.append(f"| {row['set']} | {row['candidate']} vs {row['baseline']} | 0 | | | | | | |")
+            continue
+        for cell in (row["baseline"], row["candidate"]):
+            t = row[cell]
+            gate = row["gate"]["verdict"] if cell == row["candidate"] else "baseline"
+            lines.append(f"| {row['set']} | {cell} | {t['n']} | {t['mean']:.4f} | {t['var_0.1']:.4f} | "
+                         f"{t['cvar_0.1']:.4f} | {t['evt_p999']:.4f} ({t['gpd_method']}) | "
+                         f"{t['max_cer']:.4f} | {gate} |")
     lines += ["", "## Cost", "", "| cell | pages | wall s/page | peak RSS GiB |", "|---|---|---|---|"]
     for cell, row in summary["cost"].items():
         per = f"{row['wall_s_per_page']:.1f}" if row["wall_s_per_page"] else "—"
@@ -1154,6 +1319,23 @@ def cmd_selftest(_args: argparse.Namespace) -> int:
     md = "intro\n\\[ E = mc^2 \\]\n<table><tr><td>x</td></tr></table>\nend"
     assert normalize(strip_tables_and_math(md)) == "introend"
     assert normalize("\n".join(predicted_display_math(md)), formula=True) == "E=mc^2"
+
+    # AF-2 tail rows: only common items count, and CVaR_0.1 of 20 items is the
+    # mean of the worst 2. A better mean with one bad page still fails the gate.
+    scores = [{"item": f"p{i}", "cell": "v1_single", "cer_text": i / 100} for i in range(20)]
+    scores += [{"item": f"p{i}", "cell": "v2_single", "cer_text": 0.5 if i == 0 else 0.0} for i in range(21)]
+    row = _tail_pair("t", scores, "v1_single", "v2_single", "cer_text")
+    assert row["n"] == 20 and abs(row["v1_single"]["cvar_0.1"] - 0.185) < 1e-9, row
+    assert row["v2_single"]["mean"] < row["v1_single"]["mean"], row
+    assert row["v2_single"]["cvar_0.1"] == 0.25 and row["gate"]["verdict"] == "fail", row
+    assert _tail_pair("t", scores, "v2_single", "v1_single", "cer_text")["gate"]["verdict"] == "pass"
+
+    # A rerun replaces its own cell's as-run score and nothing else.
+    asrun = [{"item": "a", "cell": "v1_single", "cer_text": 1.0, "failed": True},
+             {"item": "a", "cell": "v2_single", "cer_text": 0.2, "failed": False},
+             {"item": "a", "cell": "v1_single_rerun", "cer_text": 0.1, "failed": False}]
+    assert _with_reruns(asrun) == [{"item": "a", "cell": "v1_single", "cer_text": 0.1, "failed": False},
+                                   asrun[1]], _with_reruns(asrun)
     print("selftest ok")
     return 0
 
@@ -1186,6 +1368,15 @@ def main() -> int:
     # A chunk of 40 pages at the 600 s stage budget can take 24,000 s and be fine.
     p.add_argument("--timeout", type=int, default=7 * 3600)
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("rerun")
+    p.add_argument("--items", required=True)
+    p.add_argument("--data", required=True)
+    p.add_argument("--focr", required=True)
+    p.add_argument("--model-dir", required=True, help="FOCR_MODEL_DIR for both models")
+    # A safety net only: a page that decodes to the 32,768-token cap ends far sooner.
+    p.add_argument("--timeout", type=int, default=3 * 3600)
+    p.set_defaults(func=cmd_rerun)
 
     p = sub.add_parser("score")
     p.add_argument("--items", required=True)

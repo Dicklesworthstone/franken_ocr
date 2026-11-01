@@ -116,6 +116,7 @@ run python3 scripts/meta_tests.py --self-test
 run python3 scripts/check_fixture_manifest.py
 run python3 scripts/got_cer.py --selftest
 run python3 scripts/got_cer.py --format-corpus
+run python3 -I scripts/uocr2_head_to_head.py selftest
 run python3 scripts/check_focrq_format.py
 run python3 scripts/check_oracle_provenance.py --self-test
 run python3 scripts/check_oracle_provenance.py
