@@ -190,7 +190,10 @@ struct Seen {
 fn seen(mut command: Command) -> Seen {
     let started = std::time::Instant::now();
     let out = command.output().expect("focr");
-    let wall_s = started.elapsed().as_secs_f64();
+    seen_of(&out, started.elapsed().as_secs_f64())
+}
+
+fn seen_of(out: &Output, wall_s: f64) -> Seen {
     let stderr = String::from_utf8_lossy(&out.stderr);
     Seen {
         code: out.status.code(),
@@ -200,9 +203,39 @@ fn seen(mut command: Command) -> Seen {
             .filter(|line| line.starts_with("[focr] ") || line.starts_with("focr: "))
             .map(str::to_owned)
             .collect(),
-        peak: peak_bytes(&out),
+        peak: peak_bytes(out),
         wall_s,
     }
+}
+
+/// An [`ocr`] command sent one SIGINT `after` into its run, as Ctrl+C sends
+/// a bare `focr`. The signal goes to `focr` itself, not to its group: macOS
+/// `time` passes on a SIGINT it receives, so focr would get two, and a second
+/// is its hard exit 130.
+#[cfg(unix)]
+fn interrupted(mut command: Command, after: std::time::Duration) -> Seen {
+    let started = std::time::Instant::now();
+    let child = command.spawn().expect("focr");
+    std::thread::sleep(after);
+    let found = Command::new("pgrep")
+        .args(["-P", &child.id().to_string()])
+        .output()
+        .expect("pgrep");
+    let focr = String::from_utf8_lossy(&found.stdout).trim().to_owned();
+    let signalled = !focr.is_empty()
+        && Command::new("kill")
+            .args(["-INT", &focr])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    let out = child.wait_with_output().expect("focr");
+    let seen = seen_of(&out, started.elapsed().as_secs_f64());
+    assert!(
+        signalled,
+        "kill -INT {focr:?} after {after:?}: the run had ended, exit {:?}: {:?}",
+        seen.code, seen.said
+    );
+    seen
 }
 
 /// bd-u77k: Unlimited-OCR-2 served cold and warm reports what it reports
@@ -302,4 +335,103 @@ fn a_resident_v2_run_matches_an_inline_run() {
         );
     }
     let _ = fs::remove_dir_all(&root);
+}
+
+/// bd-toeb: Ctrl+C on a served Unlimited-OCR-2 page ends it as it ends
+/// inline: the text decoded so far is written and the run exits 6. The
+/// daemon is spawned by an earlier run, as in a shell, so the signal reaches
+/// the client alone and only the client's half-close can stop the daemon's
+/// decode. A cancel lands at a time, not a token, so the two runs stop at
+/// different points; each must write a prefix of the page the uncancelled
+/// run writes. The page is a dense one under a 300-token cap, so the decode
+/// outlasts the timing noise: a short page's served decode is over before a
+/// cancel aimed at its middle arrives.
+#[cfg(unix)]
+#[test]
+fn a_cancelled_resident_v2_page_writes_what_it_has() {
+    let Some(model) = std::env::var_os(V2_MODEL_ENV).map(PathBuf::from) else {
+        eprintln!("skip_no_model: {V2_MODEL_ENV} unset");
+        return;
+    };
+    let corpus = std::env::var_os(CORPUS_ENV).map_or_else(
+        || {
+            PathBuf::from(std::env::var_os("HOME").expect("HOME"))
+                .join(".cache/franken_ocr/corpus/pages")
+        },
+        PathBuf::from,
+    );
+    let page = corpus.join("page_0590.png");
+    let dir = std::env::temp_dir().join(format!("focr-resident-cancel-e2e-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("state dir");
+    let _daemon = Daemon(dir.clone());
+    let run = |resident: Option<&Path>, tokens: &str| {
+        let mut command = ocr(&page, &model, resident);
+        command
+            .args(["--raw", "--max-page-tokens", tokens])
+            .env("FOCR_QKV_FUSED", "0");
+        command
+    };
+
+    assert_eq!(seen(run(Some(&dir), "1")).code, Some(0), "cold");
+
+    let mut full_pages = Vec::new();
+    for (arm, resident) in [("inline", None), ("served", Some(dir.as_path()))] {
+        // A one-token run times all but the decode, a capped run the page.
+        let setup = seen(run(resident, "1"));
+        let full = seen(run(resident, "300"));
+        assert_eq!(full.code, Some(0), "{arm} full: {:?}", full.said);
+        let after = (setup.wall_s + full.wall_s) / 2.0;
+        let cancelled = interrupted(
+            run(resident, "300"),
+            std::time::Duration::from_secs_f64(after),
+        );
+        assert_eq!(cancelled.code, Some(6), "{arm}: {:?}", cancelled.said);
+        let partial = cancelled.stdout.trim_end();
+        let whole = full.stdout.trim_end();
+        assert!(!partial.is_empty(), "{arm}: the cancel wrote nothing");
+        assert!(
+            partial.len() < whole.len() && whole.starts_with(partial),
+            "{arm}: {partial:?} is not a cut of {whole:?}"
+        );
+        if resident.is_some() {
+            assert!(
+                cancelled.peak < SERVED_PEAK_BYTES,
+                "the cancelled client held {} bytes: it ran inline",
+                cancelled.peak
+            );
+            // The daemon serves on, its cancelled decode stopped: one still
+            // decoding the abandoned page would queue this run behind the rest.
+            let next = seen(run(resident, "1"));
+            assert_eq!(next.code, Some(0), "after the cancel: {:?}", next.said);
+            assert!(next.peak < SERVED_PEAK_BYTES, "after the cancel: inline");
+            let rest = full.wall_s - after;
+            assert!(
+                next.wall_s < setup.wall_s + rest / 2.0,
+                "the daemon decoded on after the cancel: {:.1}s for a {:.1}s run",
+                next.wall_s,
+                setup.wall_s
+            );
+            println!(
+                "{}",
+                serde_json::json!({
+                    "test": "a_cancelled_resident_v2_page_writes_what_it_has",
+                    "after_cancel_s": next.wall_s, "setup_s": setup.wall_s,
+                })
+            );
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "test": "a_cancelled_resident_v2_page_writes_what_it_has", "arm": arm,
+                "setup_s": setup.wall_s, "full_s": full.wall_s, "cancel_after_s": after,
+                "cancelled_s": cancelled.wall_s, "partial_chars": partial.chars().count(),
+                "page_chars": whole.chars().count(),
+            })
+        );
+        full_pages.push(full.stdout);
+    }
+    assert_eq!(
+        full_pages[0], full_pages[1],
+        "inline and served pages differ"
+    );
 }

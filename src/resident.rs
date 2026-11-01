@@ -38,6 +38,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::Deserialize as _;
@@ -47,6 +48,7 @@ use crate::error::{
     EXIT_CANCELLED, EXIT_FORMAT_MISMATCH, EXIT_INPUT_DECODE, EXIT_MODEL_NOT_FOUND, EXIT_TIMEOUT,
     EXIT_USAGE, FocrError, FocrResult,
 };
+use crate::native_engine::got::{FrameColor, Region};
 use crate::native_engine::tromr::{MusicWarning, StaffBBox, StaffSkip};
 use crate::native_engine::{
     ChartPageMeta, DecodeOverrides, DecodeReport, ModelIdentity, MusicPageMeta, PreprocessOverrides,
@@ -67,6 +69,15 @@ const DEFAULT_CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// The time a reply takes to reach the client after its stage ends: past a
 /// stage's bound plus this, the daemon is wedged.
 const REPLY_SLACK: Duration = Duration::from_secs(30);
+
+/// How long a client keeps waiting after Ctrl+C (bd-toeb). The client
+/// half-closes its connection, which stops the daemon's decode at its next
+/// step, and an Unlimited-OCR-2 page answers with the text it has, which the
+/// client writes as an inline run would.
+const CANCEL_GRACE: Duration = Duration::from_secs(5);
+
+/// How often the daemon looks for a client that hung up mid-request.
+const CLIENT_WATCH_TICK: Duration = Duration::from_millis(100);
 
 /// How long the client waits for the daemon's acknowledgement. The daemon's
 /// acceptor thread answers at once, even while its model serves another
@@ -99,7 +110,7 @@ const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 /// Request size cap (pre-auth): paths + option scalars run a few KB.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
-const PROTOCOL: u64 = 5;
+const PROTOCOL: u64 = 7;
 
 /// Upper clamp for user-supplied second counts (one year). `Instant + Duration`
 /// PANICS on overflow, so an absurd `FOCR_RESIDENT_*_SECS` value must not reach
@@ -528,6 +539,8 @@ pub struct ResidentRequest<'a> {
     pub format: bool,
     /// GOT-OCR2 square pad, from the task (forward-read; set per request).
     pub square_pad: bool,
+    /// GOT-OCR2 `--box` / `--color` region (forward-read; set per request).
+    pub region: Option<Region>,
     /// SmolVLM2 `--task describe` question (forward-read; set per request).
     pub question: Option<&'a str>,
     /// Told each stage the daemon enters for this request.
@@ -553,8 +566,39 @@ fn options_value(request: &ResidentRequest<'_>) -> Value {
         },
         "format": request.format,
         "square_pad": request.square_pad,
+        "region": region_to_wire(request.region),
         "question": request.question,
     })
+}
+
+/// A region as `{"box": [x1, y1, x2, y2]}`, `{"point": [x, y]}`,
+/// `{"color": "red"}`, or null.
+fn region_to_wire(region: Option<Region>) -> Value {
+    match region {
+        None => Value::Null,
+        Some(Region::Box(coords)) => json!({ "box": coords }),
+        Some(Region::Point(coords)) => json!({ "point": coords }),
+        Some(Region::Color(color)) => json!({ "color": color.name() }),
+    }
+}
+
+fn region_from_wire(value: Option<&Value>) -> Option<Region> {
+    let value = value?;
+    let coords = |key: &str| -> Option<Vec<f64>> {
+        value
+            .get(key)?
+            .as_array()?
+            .iter()
+            .map(Value::as_f64)
+            .collect()
+    };
+    if let Some(coords) = coords("box") {
+        return coords.try_into().ok().map(Region::Box);
+    }
+    if let Some(coords) = coords("point") {
+        return coords.try_into().ok().map(Region::Point);
+    }
+    FrameColor::from_name(value.get("color")?.as_str()?).map(Region::Color)
 }
 
 /// Try to recognize through a resident daemon, spawning one if none is
@@ -745,7 +789,30 @@ fn roundtrip(
     let Some(line) = read_reply(&mut stream, waits, crate::cancel_checkpoint, on_stage)? else {
         return Ok(None);
     };
-    reply_from_wire(&line)
+    let reply = reply_from_wire(&line);
+    if crate::shutdown_requested() {
+        return answer_after_cancel(reply);
+    }
+    reply
+}
+
+/// What a run cancelled while it waited makes of the daemon's answer
+/// (bd-toeb). A page whose decode the same Ctrl+C stopped stands: the run
+/// writes it and exits 6, as inline. Any other answer, a page the daemon
+/// finished first or one that cannot be read, ends the run cancelled.
+fn answer_after_cancel(
+    reply: FocrResult<Option<ResidentReply>>,
+) -> FocrResult<Option<ResidentReply>> {
+    match reply {
+        Ok(Some(reply))
+            if reply.report.as_ref().is_some_and(|report| {
+                report.run_finish_reason() == crate::native_engine::FinishReason::Cancelled
+            }) =>
+        {
+            Ok(Some(reply))
+        }
+        _ => Err(FocrError::Cancelled),
+    }
 }
 
 /// What the daemon's reply `line` means for this run; see [`try_recognize`].
@@ -829,8 +896,11 @@ fn reply_from_wire(line: &[u8]) -> FocrResult<Option<ResidentReply>> {
 /// ([`ReplyWait::after_stage`]). The reply is one JSON line; the cap refuses a
 /// corrupt daemon before it sizes an allocation in this process. The socket's
 /// per-syscall timeout is short (see `connect_once`), so this loop can poll
-/// `checkpoint` between reads: Ctrl+C aborts the wait with the same
-/// Cancelled/exit-6 contract as the inline decode loop.
+/// `checkpoint` between reads. Ctrl+C there gives the daemon, which the same
+/// signal reaches, [`CANCEL_GRACE`] to answer with what it has; the caller
+/// judges that answer ([`answer_after_cancel`]). A cancelled wait that ends
+/// without one is [`FocrError::Cancelled`], exit 6 as inline, never `None`:
+/// a run the user stopped must not start again inline.
 fn read_reply(
     stream: &mut TcpStream,
     (ack_wait, reply_wait): (Duration, ReplyWait),
@@ -840,10 +910,32 @@ fn read_reply(
     let started = Instant::now();
     let mut deadline = Some(reply_wait.first(started));
     let mut acknowledged = false;
+    let mut cancelled = false;
     let mut buffer: Vec<u8> = Vec::new();
     let mut chunk = [0_u8; 65536];
     loop {
-        checkpoint()?;
+        if !cancelled {
+            match checkpoint() {
+                Ok(()) => {}
+                // Half-closing tells the daemon its client stopped waiting,
+                // which stops its decode whatever process group the signal
+                // reached ([`stop_when_client_leaves`]); its answer can still
+                // come back on the other half.
+                Err(FocrError::Cancelled) => {
+                    cancelled = true;
+                    deadline = Some(Instant::now() + CANCEL_GRACE);
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let no_reply = || {
+            if cancelled {
+                Err(FocrError::Cancelled)
+            } else {
+                Ok(None)
+            }
+        };
         if let Some(end) = buffer.iter().position(|&byte| byte == b'\n') {
             let mut line: Vec<u8> = buffer.drain(..=end).collect();
             line.pop();
@@ -852,23 +944,25 @@ fn read_reply(
                 continue;
             }
             if let Some((name, budget)) = stage_from_wire(&line) {
-                deadline = reply_wait.after_stage(started, Instant::now(), budget, deadline);
-                on_stage(&name, budget);
+                if !cancelled {
+                    deadline = reply_wait.after_stage(started, Instant::now(), budget, deadline);
+                    on_stage(&name, budget);
+                }
                 continue;
             }
             return Ok(Some(line));
         }
         if buffer.len() >= MAX_REPLY_BYTES {
-            return Ok(None);
+            return no_reply();
         }
         let now = Instant::now();
         if deadline.is_some_and(|deadline| now >= deadline)
-            || (!acknowledged && now.duration_since(started) >= ack_wait)
+            || (!acknowledged && !cancelled && now.duration_since(started) >= ack_wait)
         {
-            return Ok(None);
+            return no_reply();
         }
         match stream.read(&mut chunk) {
-            Ok(0) => return Ok(None),
+            Ok(0) => return no_reply(),
             Ok(count) => buffer.extend_from_slice(&chunk[..count]),
             // A per-syscall timeout is the expected idle tick while the
             // daemon's forward runs; anything else is transport-shaped.
@@ -877,7 +971,7 @@ fn read_reply(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(_) => return Ok(None),
+            Err(_) => return no_reply(),
         }
     }
 }
@@ -1091,6 +1185,34 @@ fn load_fingerprint(options: &Value) -> String {
     .to_string()
 }
 
+/// Call `stop` once the client at the far end of `stream` hangs up or
+/// half-closes, unless `done` comes first. A client sends nothing after its
+/// request, so a read that ends the stream or fails is the client leaving; a
+/// read that only times out is the [`CLIENT_WATCH_TICK`] on which `done` is
+/// checked.
+fn stop_when_client_leaves(stream: &TcpStream, done: &AtomicBool, stop: impl Fn()) {
+    let _ = stream.set_read_timeout(Some(CLIENT_WATCH_TICK));
+    let mut reader = stream;
+    let mut byte = [0_u8; 1];
+    while !done.load(Ordering::Acquire) {
+        let gone = match reader.read(&mut byte) {
+            Ok(count) => count == 0,
+            Err(error) => !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            ),
+        };
+        if gone {
+            if !done.load(Ordering::Acquire) {
+                stop();
+            }
+            return;
+        }
+    }
+}
+
 fn handle_connection(
     stream: TcpStream,
     model_root: &Path,
@@ -1249,6 +1371,7 @@ fn handle_connection(
             .and_then(Value::as_bool)
             .unwrap_or(false),
     );
+    crate::native_engine::set_got_region(region_from_wire(options.get("region")));
     crate::native_engine::set_smolvlm2_question(
         options
             .get("question")
@@ -1316,9 +1439,29 @@ fn handle_connection(
         )
     };
     drop(take_run_meta());
-    let outcome = engine
-        .engine
-        .recognize_with_layout_model(model_root, &image);
+    // A client that leaves mid-request stopped waiting: Ctrl+C reached it,
+    // and it half-closed to wait for the page so far, or it was killed, or
+    // its reply wait ran out and it is running the page inline. A decode left
+    // running would take every core from that inline run and from the next
+    // request, so the client leaving stops it the way Ctrl+C does (bd-toeb).
+    // The watcher is joined before the reply, so it can never reach the next
+    // request, which clears the flag anyway.
+    let done = AtomicBool::new(false);
+    let watch = stream.try_clone().ok();
+    let outcome = std::thread::scope(|scope| {
+        if let Some(watch) = &watch {
+            scope.spawn(|| stop_when_client_leaves(watch, &done, crate::request_shutdown));
+        }
+        let outcome = engine
+            .engine
+            .recognize_with_layout_model(model_root, &image);
+        done.store(true, Ordering::Release);
+        // Wakes the watcher's read now rather than at its next tick.
+        if let Some(watch) = &watch {
+            let _ = watch.shutdown(std::net::Shutdown::Read);
+        }
+        outcome
+    });
     engine.engine.set_stage_sink(None);
     let (report, music, chart) = take_run_meta();
     match outcome {
@@ -1414,12 +1557,34 @@ mod tests {
         assert!(started.elapsed() < HOLD);
     }
 
+    /// bd-toeb: Ctrl+C gives the daemon [`CANCEL_GRACE`] to answer, a stage
+    /// it enters meanwhile does not stretch that, and a wait that ends without
+    /// an answer is cancelled, never `None`: the run must not start inline.
     #[test]
-    fn a_cancel_ends_the_wait() {
-        let mut stream = client_of(|stream| {
+    fn a_cancelled_wait_without_an_answer_ends_cancelled() {
+        let mut stream = client_of(|mut stream| {
+            stream.write_all(ACK).unwrap();
+            stream
+                .write_all(b"{\"budget_ms\":600000,\"kind\":\"stage\",\"name\":\"forward\"}\n")
+                .unwrap();
             std::thread::sleep(HOLD);
-            drop(stream);
         });
+        let started = Instant::now();
+        let out = read_reply(
+            &mut stream,
+            (LONG, ReplyWait::Staged(SHORT)),
+            || Err(FocrError::Cancelled),
+            |_, _| {},
+        );
+        let waited = started.elapsed();
+        assert!(matches!(out, Err(FocrError::Cancelled)), "{out:?}");
+        assert!(waited >= CANCEL_GRACE && waited < HOLD, "{waited:?}");
+    }
+
+    #[test]
+    fn a_daemon_that_hangs_up_on_a_cancelled_wait_leaves_it_cancelled() {
+        let mut stream = client_of(|mut stream| stream.write_all(ACK).unwrap());
+        let started = Instant::now();
         let out = read_reply(
             &mut stream,
             (LONG, LONG_WAIT),
@@ -1427,6 +1592,127 @@ mod tests {
             |_, _| {},
         );
         assert!(matches!(out, Err(FocrError::Cancelled)), "{out:?}");
+        assert!(started.elapsed() < CANCEL_GRACE);
+    }
+
+    /// A cancelled client half-closes, which is what stops the daemon's
+    /// decode, and reads the answer that produces; a stage after the cancel
+    /// does not reach the client.
+    #[test]
+    fn a_cancelled_wait_reads_the_answer_its_cancel_produced() {
+        let mut stream = client_of(|mut stream| {
+            stream.write_all(ACK).unwrap();
+            // The stand-in answers only once its client has half-closed.
+            stream.set_read_timeout(Some(HOLD)).unwrap();
+            assert_eq!(stream.read(&mut [0_u8; 1]).unwrap(), 0);
+            stream
+                .write_all(b"{\"kind\":\"stage\",\"name\":\"forward\"}\n")
+                .unwrap();
+            stream
+                .write_all(b"{\"ok\":true,\"raw\":\"so far\"}\n")
+                .unwrap();
+            std::thread::sleep(HOLD);
+        });
+        let heard = std::cell::RefCell::new(Vec::new());
+        let reply = read_reply(
+            &mut stream,
+            (LONG, LONG_WAIT),
+            || Err(FocrError::Cancelled),
+            |name, _| heard.borrow_mut().push(name.to_owned()),
+        );
+        assert_eq!(reply.unwrap().unwrap(), b"{\"ok\":true,\"raw\":\"so far\"}");
+        assert!(heard.into_inner().is_empty());
+    }
+
+    /// bd-toeb: after Ctrl+C, only an answer that reports the cancel stands,
+    /// and the run then writes its page and exits 6 as inline.
+    #[test]
+    fn only_a_cancelled_answer_stands_after_a_cancel() {
+        use crate::native_engine::{FinishReason, PageFinish, decode_warnings, partial_output};
+        let served = |report: DecodeReport| {
+            let reply = json!({ "ok": true, "markdown": "m", "raw": "so far", "report": report });
+            reply_from_wire(reply.to_string().as_bytes())
+        };
+        let mut cancelled = DecodeReport {
+            finish_reason: FinishReason::Cancelled,
+            ..budget_report()
+        };
+        if let Some(document) = &mut cancelled.document {
+            document.page_finish = vec![PageFinish::Cancelled];
+        }
+        let kept = answer_after_cancel(served(cancelled))
+            .unwrap()
+            .expect("the page so far");
+        assert_eq!(kept.document.raw, "so far");
+        let report = kept.report.expect("its report");
+        let model = ModelIdentity {
+            model_id: "unlimited-ocr-2",
+            source_sha256: None,
+        };
+        let exit =
+            partial_output(&report, &decode_warnings(&report), &model).map(|e| e.exit_code());
+        assert_eq!(exit, Some(EXIT_CANCELLED));
+
+        let finished = DecodeReport {
+            finish_reason: FinishReason::Stop,
+            length_stops: 0,
+            ..budget_report()
+        };
+        for (case, reply) in [
+            ("a page the daemon finished", served(finished)),
+            ("a page its budget stopped", served(budget_report())),
+            ("no answer", Ok(None)),
+            (
+                "a daemon error",
+                Err(FocrError::Other(anyhow::anyhow!("x"))),
+            ),
+        ] {
+            let out = answer_after_cancel(reply);
+            assert!(matches!(out, Err(FocrError::Cancelled)), "{case}");
+        }
+    }
+
+    /// The daemon end of a loopback connection, and its client.
+    fn connection() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        (listener.accept().unwrap().0, client)
+    }
+
+    /// bd-toeb: a client that hangs up mid-request stops the daemon's run.
+    #[test]
+    fn a_client_that_hangs_up_stops_the_request() {
+        let (daemon, client) = connection();
+        let (done, stopped) = (AtomicBool::new(false), AtomicBool::new(false));
+        let stopped_early = std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                stop_when_client_leaves(&daemon, &done, || stopped.store(true, Ordering::Release));
+            });
+            std::thread::sleep(3 * CLIENT_WATCH_TICK);
+            let early = stopped.load(Ordering::Acquire);
+            drop(client);
+            watcher.join().unwrap();
+            early
+        });
+        assert!(!stopped_early, "stopped while its client still waited");
+        assert!(stopped.load(Ordering::Acquire));
+    }
+
+    /// A run that ended is never stopped by its client leaving after it.
+    #[test]
+    fn a_finished_request_is_not_stopped_by_its_client_leaving() {
+        let (daemon, client) = connection();
+        let (done, stopped) = (AtomicBool::new(false), AtomicBool::new(false));
+        std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| {
+                stop_when_client_leaves(&daemon, &done, || stopped.store(true, Ordering::Release));
+            });
+            done.store(true, Ordering::Release);
+            let _ = daemon.shutdown(std::net::Shutdown::Read);
+            watcher.join().unwrap();
+        });
+        drop(client);
+        assert!(!stopped.load(Ordering::Acquire));
     }
 
     #[test]
@@ -1680,11 +1966,24 @@ mod tests {
             },
             format: true,
             square_pad: true,
+            region: Some(Region::Box([10.0, 20.5, 300.0, 400.0])),
             question: Some("what?"),
             on_stage: None,
         };
         let wire = options_value(&request);
         assert_eq!(wire["square_pad"], true);
+        assert_eq!(
+            region_from_wire(wire.get("region")),
+            Some(Region::Box([10.0, 20.5, 300.0, 400.0]))
+        );
+        for region in [
+            None,
+            Some(Region::Point([3.0, 4.0])),
+            Some(Region::Color(FrameColor::Green)),
+        ] {
+            let wire = json!({ "region": region_to_wire(region) });
+            assert_eq!(region_from_wire(wire.get("region")), region, "{region:?}");
+        }
         let decode = decode_overrides_from_wire(&wire);
         assert_eq!(decode.max_length, Some(4096));
         assert_eq!(decode.temperature, Some(0.5));
