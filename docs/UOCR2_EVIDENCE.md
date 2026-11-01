@@ -156,8 +156,8 @@ view) and 32 documents with 224 pages, 12 of them non-Baidu.
 ## Results
 
 The run ended 2026-11-01 06:25 EST with every process exit 0. These are the
-as-run results and the precision check (Deviation 4); the sensitivity reruns
-(Deviation 2) are added below when they finish.
+as-run results, the registered sensitivity reruns (Deviation 2, finished
+14:21 EST) and the precision check (Deviation 4).
 
 ### Pre-registered tests, as run
 
@@ -180,19 +180,79 @@ as-run results and the precision check (Deviation 4); the sensitivity reruns
   - The multi-page gate needs v2 to beat both v1 cells, and also needs the
     100+-page documents of U2-C5b.
 
+### Sensitivity reruns (Deviation 2, registered)
+
+All 42 budget pages (36 v1, 6 v2) were read again alone with no budget, and
+all finished. With the rerun scores in place of the failures:
+
+| test | n | mean | 95% interval | verdict |
+|---|---|---|---|---|
+| single page, CER_text(v2) − CER_text(v1) | 315 | −0.0166 | [−0.0325, +0.0003] | non-inferior |
+| tables, TEDS(v1) − TEDS(v2) | 66 | +0.0109 | [−0.0149, +0.0400] | not shown non-inferior |
+
+- **The two analyses agree on both verdicts.** Per Deviation 2, the rerun
+  describes the models.
+  - On text, v2's margin is about a quarter of the as-run one, and the
+    interval touches zero.
+  - On tables, v2 is slightly worse on average. 66 tables cannot show
+    non-inferiority either way.
+  - So the single-page gate fails on tables in both analyses.
+- **v1's 36 pages: at least 10 are v1's own runaways, and the rest were
+  cascade victims.**
+  - The 10 have output whose second half compresses to 12% of its size or
+    less, or ran for 1,000 s or more. Seven ran for 1,167–1,662 s. Five of
+    those wrote about 31,000–32,700 tokens (re-encoded from their text), at
+    v1's 32,768-token length limit.
+  - On those 10, v1's CER_text averages 0.900, against v2's 0.596.
+  - The other 26 finished in 26–761 s, with mean CER_text 0.396.
+- **One rerun row is corrected by hand.** The `b2cc5729` rerun was paused
+  for about three minutes during a host disk emergency (09:25 EST).
+  - The signal also reached its `/usr/bin/time` wrapper, which logged 376 s.
+  - focr itself ran for 1,597 s, and the next rerun started 1,598 s later.
+  - The row's `wall_s` is focr's own time, and it carries a note. Its score
+    comes from focr's output and is unaffected.
+- **v2's 6 pages still run away without a budget.**
+  - Five have repetitive output, `notes_…_50` among them: 46,063 characters
+    in 956 s.
+  - Their CER_text averages 0.912, so the budget was not what cost v2 these
+    pages.
+- **Tail (AF-2):** with the reruns, CVaR_0.1 is 0.809 for v1 and 0.697 for
+  v2, so the tail gate passes.
+
 ### What drives the results (read after scoring; not part of the protocol)
 
-- **Single page: the pass rests on v1's failures.**
-  - v1 lost 36 pages to the bd-3ttp cascade (Deviation 2), 23 of them
+- **Single page: the 36 budget pages decide the text result.**
+  - As run, v1 lost 36 pages to the bd-3ttp cascade (Deviation 2), 23 of them
     newspaper pages, and each scores 1.0. v2 lost none.
   - Over the 279 pages both completed, CER_text(v2) − CER_text(v1) is +0.0021
     [−0.0128, +0.0175]: a tie, and not non-inferior at δ = 0.005.
-  - The reruns decide whether those 36 failures belong to the model or to the
-    binary.
+  - The reruns (above) show that at least 10 of the 36 are v1's own
+    runaways, and the rest were cascade victims. Scored as the models wrote
+    them, v2 stays non-inferior (−0.0166).
+  - That margin comes from the 36 pages, split about evenly:
+    - v1's 10 runaways contribute −0.0097 to the mean over 315 pages;
+    - the 26 victims, mostly dense newspapers, contribute −0.0081 (v1
+      0.396, v2 0.297);
+    - the other 279 pages contribute +0.0019.
+- **Tables: one page decides the TEDS mean, and the test cannot pass on this
+  corpus.**
+  - On `yanbaor2_89c3718f…pdf_14`, v2 reads the 8 × 10 table cell for cell
+    correctly. It writes its check marks as ✓ (U+2713) and ✗ (U+2717). The
+    ground truth and v1 write them as √ (U+221A) and × (U+00D7). TEDS
+    compares characters, so v2 scores 0.315 against v1's 0.996.
+  - That page is 95% of the summed TEDS difference.
+  - Mapping v2's marks to the ground truth's glyphs and rescoring, with the
+    driver's scorer and bootstrap, is post hoc. It changes two pages and gives
+    TEDS(v1) − TEDS(v2) = −0.0005 [−0.0210, +0.0174]. That is still not
+    non-inferior, because the interval is wide.
+  - At δ = 0.005 a zero difference needs about 950 single-table pages.
+    OmniDocBench has 341, so the registered table test cannot pass here even
+    when the models tie.
 - **The two single-page category regressions rest on four pages:**
   - `notes_…_50`: v2 counted ordinals (1st … 267th) until the 600 s budget
     stopped it, 9,210 characters against 1,140. Each cell differs, so the
-    n-gram guard cannot stop the run. It is one of the six v2 rerun pages.
+    n-gram guard cannot stop the run. Rerun with no budget, it counted on
+    for 956 s.
   - `notes_…_69`: a two-column word list. v2 reads it row by row, with the
     words right (it reads "cage" where v1 reads "case"). Whole-page NED
     punishes the order: 0.732 against 0.024.
