@@ -1049,7 +1049,7 @@ mod tests {
             .map(|v| v.as_u64().unwrap() as u32)
             .collect();
         // B9 identity holds on the SAME quantization: the kvcache path
-        // pre-quantizes int8, so pair it with the int8 artifact (the C5
+        // quantizes the FFN at build, so pair it with the int8 artifact (the C5
         // precedent — on raw f32 safetensors `generate_greedy` runs f32 GEMMs
         // and near-ties may flip between precisions, DISC-002/DISC-003).
         let int8_path = format!("{dir}/onechart.int8.focrq");
