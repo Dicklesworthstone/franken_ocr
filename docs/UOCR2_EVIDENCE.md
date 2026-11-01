@@ -155,5 +155,121 @@ view) and 32 documents with 224 pages, 12 of them non-Baidu.
 
 ## Results
 
-The run is still in progress (2026-11-01). The as-run scoring and the
-sensitivity reruns are recorded here when they finish.
+The run ended 2026-11-01 06:25 EST with every process exit 0. These are the
+as-run results and the precision check (Deviation 4); the sensitivity reruns
+(Deviation 2) are added below when they finish.
+
+### Pre-registered tests, as run
+
+| test | n | mean | 95% interval | verdict |
+|---|---|---|---|---|
+| single page, CER_text(v2) − CER_text(v1) | 315 | −0.0694 | [−0.0985, −0.0414] | non-inferior |
+| tables, TEDS(v1) − TEDS(v2) | 66 | −0.0344 | [−0.0946, +0.0178] | not shown non-inferior |
+| documents, ED_all(v1 multi-page) − ED_all(v2) | 32 | +0.4146 | [+0.3075, +0.5177] | v2 better |
+| documents, ED_all(v1 per page) − ED_all(v2) | 32 | −0.0132 | [−0.0616, +0.0155] | v2 not better |
+
+- **Documents:** v2 had to beat both v1 cells, and it beat only v1 multi-page.
+  The document test fails.
+- **Category regressions (n ≥ 15, τ = 0.02):**
+  - single page `data_source=note` (n = 25): +0.0707 [+0.0029, +0.1654];
+  - single page `language=en_ch_mixed` (n = 23): +0.0936 [+0.0124, +0.2007];
+  - documents against v1 per page, MarathonDocBench (n = 20): v2 worse by
+    0.0222 [−0.1000, +0.0229].
+- **Plan §10:** neither default changes on this evidence.
+  - The single-page gate needs tables to pass too.
+  - The multi-page gate needs v2 to beat both v1 cells, and also needs the
+    100+-page documents of U2-C5b.
+
+### What drives the results (read after scoring; not part of the protocol)
+
+- **Single page: the pass rests on v1's failures.**
+  - v1 lost 36 pages to the bd-3ttp cascade (Deviation 2), 23 of them
+    newspaper pages, and each scores 1.0. v2 lost none.
+  - Over the 279 pages both completed, CER_text(v2) − CER_text(v1) is +0.0021
+    [−0.0128, +0.0175]: a tie, and not non-inferior at δ = 0.005.
+  - The reruns decide whether those 36 failures belong to the model or to the
+    binary.
+- **The two single-page category regressions rest on four pages:**
+  - `notes_…_50`: v2 counted ordinals (1st … 267th) until the 600 s budget
+    stopped it, 9,210 characters against 1,140. Each cell differs, so the
+    n-gram guard cannot stop the run. It is one of the six v2 rerun pages.
+  - `notes_…_69`: a two-column word list. v2 reads it row by row, with the
+    words right (it reads "cage" where v1 reads "case"). Whole-page NED
+    punishes the order: 0.732 against 0.024.
+  - `jiaocai_needrop_en_1118`: v2 writes the page number and footer on one
+    line ("110 高途课堂 · 秋季班"), so the furniture rule removes neither. The
+    page's text view is 19 characters ("Words and Expressions"), and the 11
+    left over score 0.367; v1 scores 0.
+  - `jiaocai_needrop_en_443`: `\underline` markup and options on one line,
+    and two words dropped.
+
+  Without the first two, the `note` mean Δ is about +0.009.
+- **Documents against v1 per page: one document.**
+  - On `marathon-mp3lan_0789-p223-227`, v2 ran page 3 (a numeric table) to the
+    20,000-token page cap, 33,404 characters.
+  - It then opened page 4 with 20 malformed `<BLOCK>title<LEVEL1>` prefixes.
+  - ED_all is 0.855 against 0.158 for v1 per page.
+  - The run exited 0 with no warning (bd-jem5).
+  - On the other 31 documents, v1 per page minus v2 averages +0.0089. v2 is
+    lower on 17, higher on 12, and tied on 2.
+  - Without it, the MarathonDocBench mean is +0.0134 (n = 19), so that
+    category regression is the same document.
+- **v1 multi-page** wrote one body per page on 6 of 32 documents.
+  - 19 had fewer bodies and were warned (`v1_page_merge`, `v1_truncated`).
+  - 7 had more bodies and were not warned (bd-17zw).
+  - Its mean ED_all is 0.519, against 0.105 for v2 and 0.092 for v1 per page.
+- **Precision:** whether int8 causes the v2 runaways on `notes_…_50` and
+  document 0789 is tested on the all-f32 path. That diagnostic is
+  post hoc and gates nothing.
+
+### Precision check (Deviation 4; not pre-registered, gates nothing)
+
+Both models read the 40 sampled pages again on the all-f32 path, from the raw
+checkpoints. No page failed. CER_text, mean over the 40 pages:
+
+| | v1 | v2 |
+|---|---|---|
+| int8, as run | 0.1403 | 0.1216 |
+| f32 | 0.1399 | 0.1198 |
+| f32 − int8 | −0.0004 [−0.0034, +0.0032] | −0.0018 [−0.0050, +0.0001] |
+
+- v2 − v1 is −0.0186 [−0.0472, +0.0072] at int8 and −0.0201 [−0.0468, +0.0030]
+  at f32. The int8 artifacts change neither model's error by more than about
+  0.002, and they do not change the comparison.
+- The sample comes from pages both int8 arms completed, so it covers typical
+  pages, not the runaways. Whether f32 also runs away on `notes_…_50` and on
+  document 0789 is a separate diagnostic.
+- f32 wall time was 3,157 s for v1 and 3,058 s for v2 over the 40 pages. No
+  other evaluation step ran beside them; the host flag of Deviation 5 still
+  applies.
+
+### Tail risk (AF-2; not pre-registered, gates nothing)
+
+| set | baseline cell | CVaR_0.1 base / v2 | EVT p99.9 base / v2 | gate |
+|---|---|---|---|---|
+| single page, CER_text | v1 | 1.000 / 0.700 | 1.000 / 1.000 | pass |
+| documents, ED_all | v1 multi-page | 0.933 / 0.634 | 0.976 / 0.854 | pass |
+| documents, ED_all | v1 per page | 0.452 / 0.634 | 0.804 / 0.854 | fail |
+
+The failing row is document 0789 again. The document bounds are the
+empirical quantile, because 32 documents give fewer than 8 exceedances.
+
+### Cost (contaminated host, Deviation 5)
+
+| cell | pages | wall s/page | peak RSS GiB |
+|---|---|---|---|
+| v1 single | 320 | 131.9 | 9.68 |
+| v2 single | 320 | 92.0 | 9.91 |
+| v2 document | 224 | 55.7 | 9.85 |
+| v1 multi-page | 224 | 100.9 | 8.08 |
+| v1 per page | 224 | 47.8 | 9.46 |
+
+- **Single page:** v1's figure includes its budget cascades.
+  - Over the 284 pages both completed, v2 takes 0.96× v1's mean time.
+  - Its median per-page ratio is 1.085, and its ratio of medians is 1.126.
+  - The bound is 1.1×. Peak RSS is +0.23 GiB, under the 0.5 GiB bound.
+- **Documents (≤ 10 pages):**
+  - v2 takes 1.17× v1 per page (bound 1.2×) and 0.55× v1 multi-page
+    (bound 1.5×).
+  - Peak RSS is 1.77 GiB above v1 multi-page. The bound is +1 GiB, and it
+    applies at 20 pages, which U2-F1 measures.
