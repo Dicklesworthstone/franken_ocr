@@ -141,7 +141,15 @@ view) and 32 documents with 224 pages, 12 of them non-Baidu.
    - CER_text over the pages both arms completed;
    - per-cell failure counts by `data_source`;
    - the AF-2 tail table (mean, VaR, CVaR_0.1, EVT p99.9, `scripts/af2_tail_risk.py`).
-4. **Wall-clock contamination.** Other work ran on the host during the
+4. **Precision check, added after the run (`precision`, gates nothing).** The
+   single-page tie raised the question whether int8 costs v2 more than v1.
+   - Sample: 40 pages, `random.Random(20261102)`, from those both int8 arms
+     completed.
+   - Both models read them again on the all-f32 cache from the raw checkpoints
+     (`FOCR_DECODE_F32=1`, no stage budget, same binary).
+   - Each page is scored against ground truth and paired with its as-run
+     int8 score.
+5. **Wall-clock contamination.** Other work ran on the host during the
    evaluation, and the default 36-thread budget spends most CPU time in the
    kernel (bd-zex4). Cost figures are reported with that flag.
 

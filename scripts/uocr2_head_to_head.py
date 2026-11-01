@@ -14,6 +14,8 @@ Subcommands, in order:
     rerun    each single page an arm lost to the 600 s budget, alone and
              unbudgeted -> rerun.ndjson (the registered sensitivity analysis)
     score    -> scores.ndjson, one line per item and cell (reruns as <cell>_rerun)
+    precision  after score: 40 completed pages read again by both models on
+             the all-f32 cache -> precision_summary.json (not pre-registered)
     report   -> summary.json + report.md (bootstrap intervals, categories, cost)
     selftest the fast edit distance and TEDS against slow references
 
@@ -54,6 +56,8 @@ TAU = 0.02
 CATEGORY_MIN_N = 15
 FURNITURE_NED = 0.25
 PAGE_BUDGET_S = 600  # focr's default FOCR_STAGE_BUDGET_FORWARD_MS, which the runs used
+SEED_PRECISION = 20261102  # `precision`, chosen after the run (not pre-registered)
+PRECISION_PAGES = 40
 RASTER_DPI = 150
 USER_AGENT = (
     "franken_ocr-c5a-eval/1.0 (https://github.com/Dicklesworthstone/franken_ocr; "
@@ -867,6 +871,72 @@ def cmd_rerun(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_precision(args: argparse.Namespace) -> int:
+    """Not pre-registered (asked after the run): does int8 cost v2 more accuracy
+    than v1? A seeded sample of the single pages both int8 arms completed, read
+    again by both models on the all-f32 cache from the raw checkpoints
+    (FOCR_DECODE_F32=1, no stage budget, same binary), scored against ground
+    truth by the same rules and paired with the as-run int8 scores."""
+    items = json.loads(Path(args.items).read_text(encoding="utf-8"))
+    data = Path(args.data)
+    single = {item["id"]: item for item in items["single_pages"]}
+    scores = [json.loads(line) for line in (data / "scores.ndjson").read_text().splitlines() if line.strip()]
+    int8 = {cell: {s["item"]: s for s in scores if s["cell"] == f"{cell}_single" and not s["failed"]}
+            for cell in ("v1", "v2")}
+    eligible = sorted(i for i in int8["v1"].keys() & int8["v2"].keys() if "cer_text" in int8["v1"][i])
+    picks = sorted(random.Random(SEED_PRECISION).sample(eligible, min(PRECISION_PAGES, len(eligible))))
+    images = [str(data / "omni" / single[i]["image_path"]) for i in picks]
+    env = dict(os.environ, FOCR_NO_RESIDENT="1", FOCR_DECODE_F32="1", FOCR_STAGE_BUDGET_FORWARD_MS="0")
+    runs_path = data / "precision.ndjson"
+    done = _done(runs_path)
+    outputs = {}
+    for key, model in (("v1", args.v1_raw), ("v2", args.v2_raw)):
+        out = data / "runs" / "precision" / f"{key}_f32.json"
+        outputs[key] = out
+        if f"precision/{key}" in done:
+            continue
+        result = _timed([args.focr, "ocr-batch", "--model", model, "--json", *images], out, args.timeout, env)
+        with open(runs_path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps({"run": f"precision/{key}", "model": model, "items": picks,
+                                     "output": str(out), **result}) + "\n")
+        print(f"precision/{key}", result["exit"], result["wall_s"], flush=True)
+
+    with open(args.omni_json, encoding="utf-8") as handle:
+        omni = {p["page_info"]["image_path"]: p for p in json.load(handle)}
+    f32 = {}
+    for key, out in outputs.items():
+        results = {r["image"]: r for r in (_load_json(out) or {}).get("results", [])}
+        f32[key] = {}
+        for item_id, image in zip(picks, images):
+            item = single[item_id]
+            entry = results.get(image)
+            markdown = entry.get("markdown") if entry and entry.get("ok") else None
+            f32[key][item_id] = _score_single(item, layout_views(omni[item["image_path"]]["layout_dets"]), markdown)
+
+    def deltas(a, b):
+        return [a[i]["cer_text"] - b[i]["cer_text"] for i in picks if "cer_text" in a[i] and "cer_text" in b[i]]
+
+    mean_cer = {}
+    for key in ("v1", "v2"):
+        mean_cer[f"{key}_int8"] = _mean([int8[key][i].get("cer_text") for i in picks])
+        mean_cer[f"{key}_f32"] = _mean([f32[key][i].get("cer_text") for i in picks])
+    summary = {
+        "pages": len(picks), "seed": SEED_PRECISION,
+        "f32_failed": {key: sum(s["failed"] for s in f32[key].values()) for key in f32},
+        "mean_cer_text": mean_cer,
+        "v1_f32_minus_int8": _bootstrap(deltas(f32["v1"], int8["v1"])),
+        "v2_f32_minus_int8": _bootstrap(deltas(f32["v2"], int8["v2"])),
+        "f32_v2_minus_v1": _bootstrap(deltas(f32["v2"], f32["v1"])),
+        "int8_v2_minus_v1": _bootstrap(deltas(int8["v2"], int8["v1"])),
+    }
+    (data / "precision_summary.json").write_text(json.dumps(summary, indent=1) + "\n", encoding="utf-8")
+    print(f"# Precision check (not pre-registered): {len(picks)} pages both int8 arms completed\n")
+    print(f"- f32 failures: {json.dumps(summary['f32_failed'])}; mean CER_text: {json.dumps(summary['mean_cer_text'])}")
+    for name in ("v1_f32_minus_int8", "v2_f32_minus_int8", "f32_v2_minus_v1", "int8_v2_minus_v1"):
+        print(f"- CER_text {name.replace('_', ' ')}: {_fmt(summary[name])}")
+    return 0
+
+
 # --------------------------------------------------------------------------
 # score
 # --------------------------------------------------------------------------
@@ -1377,6 +1447,16 @@ def main() -> int:
     # A safety net only: a page that decodes to the 32,768-token cap ends far sooner.
     p.add_argument("--timeout", type=int, default=3 * 3600)
     p.set_defaults(func=cmd_rerun)
+
+    p = sub.add_parser("precision")
+    p.add_argument("--items", required=True)
+    p.add_argument("--data", required=True)
+    p.add_argument("--focr", required=True)
+    p.add_argument("--omni-json", required=True)
+    p.add_argument("--v1-raw", required=True, help="v1 raw checkpoint (the bf16 shard, tokenizer beside it)")
+    p.add_argument("--v2-raw", required=True, help="v2 raw checkpoint directory")
+    p.add_argument("--timeout", type=int, default=12 * 3600)
+    p.set_defaults(func=cmd_precision)
 
     p = sub.add_parser("score")
     p.add_argument("--items", required=True)
