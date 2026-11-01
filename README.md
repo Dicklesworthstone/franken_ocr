@@ -554,7 +554,11 @@ implies `--format` (an explicit `--format` composes idempotently) and needs the
 got-ocr2 model: `focr pull got-ocr2`, then `--model got-ocr2.int8.focrq`. `--task chart`
 and `--task formula` also pad the image to a white square first, because GOT misreads
 both when upstream's square resize stretches them; `--format` alone keeps that resize,
-and so does every other task. `--task music`
+and so does every other task. GOT can also read one region of an image, as upstream's
+fine-grained mode does: `--box x1,y1,x2,y2` in the image's pixels (or a point `x,y`), or
+`--color red|green|blue` for a frame of that colour drawn around the text. Either composes
+with `--format`; a box does not compose with `--task chart` or `--task formula`, because
+they pad the image. `--task music`
 has two valid lanes: TrOMR is the native OMR path and returns MusicXML, while GOT-OCR2
 can still run its sheet-music format mode. Use `focr pull tromr`, then `--model tromr.int8.focrq --task music`
 for a full printed/scanned page or a staff crop. Use `focr pull tromr --quant f32`
@@ -702,7 +706,8 @@ your documents. None of these lanes warns on a wrong reading except OneChart.
 | `--task chart-data` | Text gave usable values on 0 of 36 charts. The number head averaged within 10% of the range on 31 of 36. | Read `chart.pred_locs` from `--json`: bar heights from 0 to 1, in order. It does not say how many bars there are. |
 
 Tables, the molecule, music and formulas read the same on the upstream f32 checkpoint.
-Charts do not: int8 costs a further margin there. Evidence:
+Charts do not, in both directions: at `--task chart`, int8 misses two charts that f32
+reads right and reads three that f32 misses, so f32 would not fix this lane. Evidence:
 [`artifacts/accuracy/bd-kd75/`](artifacts/accuracy/bd-kd75/README.md) and
 [`tests/fixtures/got/format_corpus/`](tests/fixtures/got/format_corpus/README.md).
 

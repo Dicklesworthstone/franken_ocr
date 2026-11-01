@@ -28,6 +28,15 @@ sections as they land.
 
 ### Added
 
+- **GOT-OCR2 reads one region: `--box` and `--color`** (bead bd-1sj1). `--box
+  x1,y1,x2,y2` (or a point `x,y`) in the input's pixels, or `--color red|green|blue`
+  for a frame drawn around the text, builds the prompt upstream `chat(ocr_box=…,
+  ocr_color=…)` builds: the box scaled by the input's size onto GOT's 0-1000 grid, as
+  read from the pinned `modeling_GOT.py` (this settles the spec's OQ-7). Either composes
+  with `--format`. A box is refused with `--task chart` and `--task formula`, which pad
+  the image, and both are refused for a model that is not got-ocr2. On the published
+  int8 artifact, each block of a two-block page read alone by box, by point and by a
+  red frame, inline and served byte for byte. The daemon protocol moves to 7.
 - **Robot `stage` events** (bead bd-fuh2). The stream now says when a run enters
   `load` and `forward`: `name`, `seq`, `elapsed_ms` from the run's start, and
   `budget_ms` on a stage with a time budget. `load` appears only when weights
@@ -633,6 +642,23 @@ sections as they land.
   {pred_locs, reliable_distance, reliable}`, and `pred_locs` is the number head, the part
   that does work: within 10% of the range on 31 of 36. A run that did not verify also gets
   a `chart_unverified` warning. This holds through the daemon too.
+- **Ctrl+C on a served page keeps its text and stops the daemon's decode** (bead
+  bd-toeb). A client cancelled while the resident daemon decoded its page exited 6
+  with nothing written, and the daemon decoded the abandoned page to its end, holding
+  the cores the next run needed. The client now half-closes its connection and waits
+  up to 5 s for the answer the cancel produces, and the daemon stops a request whose
+  client has gone. A served Unlimited-OCR-2 page then writes the text decoded so far
+  and exits 6, as it does inline. On real v2 weights, a dense page cancelled mid-decode
+  wrote 772 of its 1,029 characters, a prefix of the uncancelled page, about a second
+  after the signal, and the next served run took no longer than one on an idle daemon.
+  The daemon protocol moves to 6.
+- **GOT's KV-cache decode keeps attention in the precision the file stores** (bead
+  bd-kd75). It quantized every attention projection to int8 at load, so an artifact
+  that keeps attention BF16 decoded like an all-int8 one there and only the slow
+  re-prefill path read it as stored. The published all-int8 artifact reads as before,
+  byte for byte, on 51 frozen readings. An artifact with BF16 attention read 28 of 36
+  probe charts against the published artifact's 29, decoding 4% slower with 0.43 GB
+  more peak memory, so the published recipe stays (`artifacts/accuracy/bd-kd75/`).
 - **A page past its budget no longer takes the next pages with it** (bead bd-3ttp). The
   forward stage's timeout reported the failure and left the decode running, so in
   `ocr-batch`, the daemon or a library the following inputs competed with it for every
