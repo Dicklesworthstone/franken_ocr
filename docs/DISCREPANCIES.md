@@ -1066,6 +1066,22 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
     with per-expert GPTQ error compensation filed as the next quality lever
     (bd-50wo remainder). INVESTIGATING remains open only for the f32-glue drift
     class (bd-ajna).
+- Below int4 (bd-u8s2, 2026-10-31): not now. Byte math from the real tensor
+    table (2148 FFN/expert GEMMs, 2,524,200,960 weights; shipped groups `up_proj`
+    g32, `gate`/`down` g16, f32 scales per `docs/focrq-format.md`): the int4 set
+    is 1.788 GB of the 3.004 GB artifact (routed experts 1.716, layer-0 dense +
+    shared experts 0.072), of which **0.526 GB is f32 scales**. int3 at the same
+    groups saves 0.316 GB (10.5% of the artifact) and int2 0.631 GB (21%); both
+    need new packing (no nibble alignment at 3 bits) and an unpack in the hot
+    GEMV, and the bits come off the experts, where the degraded-newsprint tail
+    above already sits. Codebook/trellis formats (QuIP#/QTIP/AQLM/VPTQ) do not fit
+    the int8-GEMM unpack design at all. The cheaper size lever is f16 group
+    scales: 0.263 GB saved, 83% of int3's saving, at a scale rounding error of
+    about 2^-11 against an int4 rounding error more than 100x larger. That is still a
+    format change (a new scale dtype) and needs its own corpus CER gate. Order:
+    GPTQ at int4 (bd-7wq6) first; then f16 scales if size matters (e.g. device
+    memory); then int3 on `up_proj` alone (the least sensitive class, ~0.1 GB)
+    measured on this corpus.
 - Tests affected: `site/harness/differential.mjs` (browser-vs-native
     differential), `site/harness/persistence.mjs`; native corpus receipts in the
     scratchpad paths above.
