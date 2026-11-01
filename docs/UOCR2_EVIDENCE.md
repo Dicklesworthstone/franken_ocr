@@ -333,3 +333,15 @@ empirical quantile, because 32 documents give fewer than 8 exceedances.
     (bound 1.5×).
   - Peak RSS is 1.77 GiB above v1 multi-page. The bound is +1 GiB, and it
     applies at 20 pages, which U2-F1 measures.
+  - U2-F1 (post hoc, 12 threads, `artifacts/perf/bd-uocr2-epic-cgux.38`)
+    measured +2.21 GiB at 20 pages, so the bound fails.
+    - Most of the gap is v1 multi-page's 640-px vision, not v2's KV.
+    - The two wall bounds pass there, but those are single runs.
+- **Thread width (post hoc, bd-zex4):** every cell ran at the default 36
+  threads. The width sweep after the evaluation used the same binary and ran
+  under similar shared load (`artifacts/perf/bd-zex4`).
+  - It measured 36 threads at 2.6× (v1) and 2.4× (v2) the wall of 12, with
+    identical output.
+  - So the costs above, and the 600 s budget losses, came at a width that slows
+    both models alike. The pairing holds; the absolute times are not the
+    engine's best.

@@ -2017,6 +2017,16 @@ updating `warning_recovery`.
 - Documents vs per-page parsing: about the same per page, plus cross-page value (D17).
 - Documents vs v1 multi-page: more vision and prefill, less attention, and no length ceiling.
 
+**Measured (U2-F1, 2026-11-01; `artifacts/perf/bd-uocr2-epic-cgux.38/README.md`).**
+- **Decode is not at parity.** v2 costs 12–26% more per token than v1 on single pages, and 2–26%
+  more in every pairing. Neither MACs nor weight bytes explain this: the two weight files differ by
+  16 MB. The likely cause is SR-SWA's per-token router and gather work, which the `srswa.*` timing
+  rows (not yet built) would show.
+- **Vision matches the model.** v2 document mode is 2.5–2.6× v1 multi-page and equal to v1 per page.
+- **Prefill matches the model.** v2 prefills 274 tokens per page against v1's 111.
+- **Peak RSS at 20 pages** is v1 multi-page + 2.21 GiB, which fails §10's +1 GiB bound. Most of that
+  comes from 1024-px vision against v1 multi-page's 640 px, not from KV.
+
 The default-flip gates (§10) treat performance as a **budget, not a selling point**.
 
 ### 8.2 Exact levers (each with a bit-identity proof; U2-F2, U2-F3)
@@ -2056,8 +2066,19 @@ the same inputs. That is the suite rule: a win needs the incumbent live.
 - Rows go to `docs/PERF_LEDGER.md`, losing rows included. Each row fits `check_ledgers.py:149-218`: 21
   columns, with an `evidence_id` under `artifacts/perf/` that has a manifest.
 
-**Book wall time.** Estimate, to be replaced by U2-F1 numbers: 15–60 s per page on M-class hosts,
-which is roughly 4–17 hours per 1,000 pages. The docs say so, and progress output shows a live ETA.
+**Book wall time.** Measured by U2-F1 (`artifacts/perf/bd-uocr2-epic-cgux.38/`) on an M5 Ultra at
+12 threads, with other work on the host:
+- v2 document mode took 11.1, 15.2 and 21.4 s per page on 3-, 10- and 20-page documents. Those pages
+  averaged 411–881 generated tokens.
+- Per page, that is about 2 s of vision, 0.3–0.5 s of prefill, and 0.020–0.0215 s per generated
+  token. A page's text sets its cost.
+- At that rate, 1,000 pages like these take about 3–6 hours. Dense 2,000-token pages take about 44 s
+  each, or 12 hours per 1,000.
+- The 36-thread default is 2.4–2.6× slower than 12 threads (bd-zex4). U2-C5a's MarathonDocBench
+  documents averaged 55.7 s per page at that default (`docs/UOCR2_EVIDENCE.md`, Cost).
+- Runs past 20 pages are not yet measured.
+
+The docs say so, and progress output shows a live ETA.
 
 ---
 
