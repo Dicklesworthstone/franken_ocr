@@ -322,8 +322,21 @@ The records and scripts are in `artifacts/accuracy/bd-uocr2-epic-cgux.21/posthoc
   - The two precisions diverge within the first 50–85 characters of pages
     1–3, which is ordinary greedy divergence.
   - int8 can therefore tip a document page into a counting loop that f32
-    avoids. One document does not show how often; the other 31 documents
-    are being read at f32.
+    avoids.
+- **The other 31 documents at f32 show it only on 0789.** All 32 documents
+  were read as documents at f32 (`posthoc/score_f32_docs.out`, analysis fixed
+  before the results; readings hashed in `readings.sha256`).
+  - No f32 page reached the per-page cap; int8 reached it once, on 0789's
+    page 3.
+  - Per document, f32 − int8 is −0.0249 [−0.0757, +0.0007]. Without 0789 it
+    is +0.0004, and no document moves more than 0.0061: f32 is better on 8,
+    worse on 9 and equal on 14 (post hoc).
+  - f32 − v1 per page is −0.0117 [−0.0229, −0.0026], where int8 − v1 per page
+    is +0.0132 [−0.0155, +0.0615]. Against v1 multi-page it is −0.4395
+    [−0.5342, −0.3427] at f32 and −0.4146 [−0.5174, −0.3080] at int8.
+  - So the int8 artifact's document-level cost is this one runaway, which
+    decides the v2-vs-v1-per-page sign. The registered comparison stands
+    as run.
 - **Read alone, the int8 page closes too.**
   - v2 int8 reading 0789's page 3 by itself writes a 5,735-character table,
     within NED 0.031 of the f32 page.
