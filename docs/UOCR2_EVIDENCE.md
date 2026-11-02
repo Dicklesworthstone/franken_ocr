@@ -281,9 +281,9 @@ all finished. With the rerun scores in place of the failures:
   - 19 had fewer bodies and were warned (`v1_page_merge`, `v1_truncated`).
   - 7 had more bodies and were not warned (bd-17zw).
   - Its mean ED_all is 0.519, against 0.105 for v2 and 0.092 for v1 per page.
-- **Precision:** whether int8 causes the v2 runaways on `notes_…_50` and
-  document 0789 is tested on the all-f32 path. That diagnostic is
-  post hoc and gates nothing.
+- **Precision:** f32 does not explain `notes_…_50`, which runs away at f32
+  too. It does explain document 0789's page 3, which f32 reads as a table
+  (post hoc, under "Runaways after the run").
 
 ### Precision check (Deviation 4; not pre-registered, gates nothing)
 
@@ -300,11 +300,55 @@ checkpoints. No page failed. CER_text, mean over the 40 pages:
   at f32. The int8 artifacts change neither model's error by more than about
   0.002, and they do not change the comparison.
 - The sample comes from pages both int8 arms completed, so it covers typical
-  pages, not the runaways. Whether f32 also runs away on `notes_…_50` and on
-  document 0789 is a separate diagnostic.
+  pages, not the runaways. The runaways were read at f32 separately (below).
 - f32 wall time was 3,157 s for v1 and 3,058 s for v2 over the 40 pages. No
   other evaluation step ran beside them; the host flag of Deviation 5 still
   applies.
+
+### Runaways after the run (post hoc, gates nothing)
+
+The records and scripts are in `artifacts/accuracy/bd-uocr2-epic-cgux.21/posthoc/`.
+
+- **f32 behaves like int8 on the four category-regression pages.**
+  - `needrop_en_443` and `notes_…_69` are byte-identical.
+  - `needrop_en_1118` differs in its last few characters, at the same CER (0.367).
+  - On `notes_…_50`, f32 writes int8's whole output and keeps counting to
+    "1293rd" (46,064 characters, 1,704 s). CER is 0.909 at both precisions.
+  - These regressions are v2's own behaviour, not quantization.
+- **Document 0789 does not run away at f32.**
+  - Read as a document from the raw checkpoint, page 3 closes as a
+    5,789-character table. ED_all is 0.0467, against 0.8554 at int8 and
+    0.1585 for v1 per page.
+  - The two precisions diverge within the first 50–85 characters of pages
+    1–3, which is ordinary greedy divergence.
+  - int8 can therefore tip a document page into a counting loop that f32
+    avoids. One document does not show how often; the other 31 documents
+    are being read at f32.
+- **Read alone, the int8 page closes too.**
+  - v2 int8 reading 0789's page 3 by itself writes a 5,735-character table,
+    within NED 0.031 of the f32 page.
+  - With that page in place of the capped one, document ED_all is 0.1254.
+    The document mean v2 − v1 per page moves from +0.0132 [−0.0155, +0.0615]
+    to −0.0096 [−0.0189, −0.0022].
+  - Page 3 is the only `page_cap` page among v2's 224 document pages, so
+    "re-read a capped page alone" changes only this page.
+  - The policy was chosen after seeing 0789, so this is a sensitivity, not a
+    result (bd-yrr1).
+- **The opt-in runaway guard** (v1, `FOCR_RUNAWAY_GUARD=1`; bd-gftg):
+  - Replayed over every C5a output of 2,560 tokens or more, it fires on none
+    of 99 legitimate outputs. It catches 13 of 19 v1 runaways and, in replay
+    only, 6 of 8 v2 runaways; the guard is v1-only.
+  - On the ground truth itself it never fires on OmniDocBench. MarathonDocBench
+    gives 9 per-page fires at the 8,192-token floor: 7 on broken ground truth
+    and 2 on real chart data.
+  - Live, on the 7 v1 single pages the replay aborts, it fires on all 7. Each
+    fire comes at the replay's token or up to 2,816 tokens later, and together
+    they skip about 62% of those pages' decode tokens.
+  - An aborted page returns no text. With v1's reruns substituted, rejecting
+    the fired pages raises v1's mean CER_text from 0.1663 to 0.1681. Keeping
+    their prefixes lowers it to 0.1654.
+  - bd-gftg proposes the guard by default for v1 single pages once it returns
+    the prefix as partial output.
 
 ### Tail risk (AF-2; not pre-registered, gates nothing)
 
