@@ -297,7 +297,7 @@ pub enum RunawayDecision {
 /// once selected, every later observation returns the identical evidence. The
 /// token stream is caller-owned and read-only, so an armed guard cannot change
 /// sampling, token order, or EOS behavior before selecting Abort.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunawayGuard {
     enabled: bool,
     next_checkpoint: Option<usize>,
@@ -426,6 +426,75 @@ impl RunawayGuard {
 impl Default for RunawayGuard {
     fn default() -> Self {
         Self::new(false)
+    }
+}
+
+/// The id every numeral token reads as in [`PageRunaway`]'s stream: above
+/// any vocab, so it never equals a real id.
+const PAGE_RUNAWAY_NUMERAL: u32 = u32::MAX;
+
+/// Unlimited-OCR-2's per-page runaway detector (bd-gftg), armed by
+/// [`RUNAWAY_GUARD_ENV`]. It runs [`RunawayGuard`]'s test over the open
+/// page's ids with every numeral token read as one id, so a counting loop
+/// ("814 815 816 …") looks as periodic as a repeated phrase. Where v1's guard
+/// rejects the run, a fire here closes the page: [`PageGuard`] forces the
+/// next `<PAGE>` (EOS on the last page) and the page ends `runaway`, keeping
+/// its text so far.
+///
+/// Calibration on reference transcriptions re-encoded as ids (bd-gftg,
+/// 2026-11-01): it fires on none of OmniDocBench's 1,651 pages and on 13 of
+/// MarathonDocBench's 18,118. Seven of those are broken reference text. Six
+/// are long chart or numeric-table data, which would close 200–5,400 tokens
+/// before their end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageRunaway {
+    numerals: std::sync::Arc<[bool]>,
+    page: Vec<u32>,
+    guard: RunawayGuard,
+}
+
+impl PageRunaway {
+    /// A detector reading `numerals[id]` as "`id` is a numeral token". An id
+    /// past its end is not one.
+    #[must_use]
+    pub fn new(numerals: std::sync::Arc<[bool]>) -> Self {
+        Self {
+            numerals,
+            page: Vec::new(),
+            guard: RunawayGuard::new(true),
+        }
+    }
+
+    /// Whether a vocab piece is a numeral token: digits only, after any
+    /// byte-level (`Ġ`) or SentencePiece (`▁`) space.
+    #[must_use]
+    pub fn is_numeral_piece(piece: &str) -> bool {
+        let digits = piece.trim_start_matches(['Ġ', '▁', ' ']);
+        !digits.is_empty() && digits.chars().all(char::is_numeric)
+    }
+
+    /// Account for one generated id other than `<PAGE>`. Returns the
+    /// evidence once, when the open page turns runaway.
+    pub fn observe(&mut self, id: u32) -> Option<RunawayEvidence> {
+        let numeral = usize::try_from(id)
+            .ok()
+            .and_then(|i| self.numerals.get(i).copied())
+            .unwrap_or(false);
+        self.page
+            .push(if numeral { PAGE_RUNAWAY_NUMERAL } else { id });
+        if self.guard.terminal_evidence.is_some() {
+            return None;
+        }
+        match self.guard.observe(&self.page) {
+            RunawayDecision::Continue => None,
+            RunawayDecision::Abort(evidence) => Some(evidence),
+        }
+    }
+
+    /// Start a new page.
+    pub fn next_page(&mut self) {
+        self.page.clear();
+        self.guard = RunawayGuard::new(true);
     }
 }
 
@@ -943,6 +1012,8 @@ pub struct PageGuard {
     markers: usize,
     page_len: usize,
     ban_last_page: bool,
+    runaway: Option<Box<PageRunaway>>,
+    ran_away: bool,
 }
 
 impl PageGuard {
@@ -959,7 +1030,17 @@ impl PageGuard {
             markers: 0,
             page_len: 0,
             ban_last_page: false,
+            runaway: None,
+            ran_away: false,
         }
+    }
+
+    /// This guard with `runaway` watching each page (bd-gftg): when it
+    /// fires, the page closes as at the cap ([`Self::ran_away`]).
+    #[must_use]
+    pub fn with_runaway(mut self, runaway: Option<PageRunaway>) -> Self {
+        self.runaway = runaway.map(Box::new);
+        self
     }
 
     /// This guard with SGLang's last-page ban (W/`sampling/
@@ -987,8 +1068,15 @@ impl PageGuard {
         if id == self.page_id {
             self.markers += 1;
             self.page_len = 0;
+            self.ran_away = false;
+            if let Some(runaway) = &mut self.runaway {
+                runaway.next_page();
+            }
         } else {
             self.page_len += 1;
+            if let Some(runaway) = &mut self.runaway {
+                self.ran_away |= runaway.observe(id).is_some();
+            }
         }
     }
 
@@ -1014,6 +1102,14 @@ impl PageGuard {
             && self.page_len >= self.max_page_tokens
     }
 
+    /// Whether the runaway detector ([`Self::with_runaway`]) forces the next
+    /// step: it fired on this page and no extra marker came first. The close
+    /// is the cap's.
+    #[must_use]
+    pub fn ran_away(&self) -> bool {
+        self.expected > 0 && self.markers <= self.expected && self.ran_away
+    }
+
     /// What the next step may emit (MU:597-604, in the reference's order).
     #[must_use]
     pub fn verdict(&self) -> GuardVerdict {
@@ -1021,7 +1117,7 @@ impl PageGuard {
             GuardVerdict::Free
         } else if self.markers > self.expected {
             GuardVerdict::Force(self.eos_id)
-        } else if self.at_cap() {
+        } else if self.at_cap() || self.ran_away() {
             GuardVerdict::Force(if self.markers < self.expected {
                 self.page_id
             } else {
@@ -2384,6 +2480,68 @@ mod uocr2_guard_tests {
         for id in [PAGE, PAGE, 4, 4, 4, 4] {
             off.observe(id);
             assert_eq!(off.verdict(), GuardVerdict::Free);
+        }
+    }
+
+    /// bd-gftg: a counting loop never repeats a number's id, so v1's guard
+    /// misses it. With every numeral read as one id, the page runs away
+    /// three checkpoints past the floor and closes as at the cap: the next
+    /// marker is forced, that marker starts a fresh watch, and on the last
+    /// page EOS is forced.
+    #[test]
+    fn page_runaway_closes_a_counting_loop_the_raw_guard_misses() {
+        let numerals: std::sync::Arc<[bool]> =
+            (0..2_000).map(|id| (100..1_100).contains(&id)).collect();
+        let counting: Vec<u32> = (0..RUNAWAY_GUARD_MIN_TOKENS + 4 * RUNAWAY_GUARD_CHECK_INTERVAL)
+            .map(|k| if k % 2 == 0 { 100 + (k as u32 / 2) % 1_000 } else { 5 })
+            .collect();
+        let mut raw = RunawayGuard::new(true);
+        assert_eq!(
+            raw.observe(&counting),
+            RunawayDecision::Continue,
+            "every number is a new id"
+        );
+
+        let mut g = PageGuard::new(2, PAGE, EOS, 0)
+            .with_runaway(Some(PageRunaway::new(numerals.clone())));
+        let run_away = |g: &mut PageGuard| {
+            for (k, &id) in counting.iter().enumerate() {
+                g.observe(id);
+                if g.ran_away() {
+                    return Some(k + 1);
+                }
+            }
+            None
+        };
+        g.observe(PAGE);
+        assert_eq!(
+            run_away(&mut g),
+            Some(RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL)
+        );
+        assert!(!g.at_cap(), "no cap");
+        assert_eq!(g.verdict(), GuardVerdict::Force(PAGE));
+        g.observe(PAGE);
+        assert!(!g.ran_away(), "the marker opens a fresh page");
+        assert_eq!(g.verdict(), GuardVerdict::Free, "2 of 2 markers");
+        assert!(run_away(&mut g).is_some());
+        assert_eq!(g.verdict(), GuardVerdict::Force(EOS), "the last page");
+
+        let mut plain = PageGuard::new(2, PAGE, EOS, 0);
+        plain.observe(PAGE);
+        for &id in &counting {
+            plain.observe(id);
+        }
+        assert!(!plain.ran_away(), "unarmed, nothing watches");
+        assert_eq!(plain.verdict(), GuardVerdict::BanEos);
+    }
+
+    #[test]
+    fn page_runaway_numerals_are_digit_pieces() {
+        for piece in ["814", "Ġ814", "▁7", "0"] {
+            assert!(PageRunaway::is_numeral_piece(piece), "{piece}");
+        }
+        for piece in ["", "Ġ", "a1", "1.5", "8x", "Ġ-1"] {
+            assert!(!PageRunaway::is_numeral_piece(piece), "{piece}");
         }
     }
 
