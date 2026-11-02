@@ -294,7 +294,7 @@ cargo build --locked --release
 ## Quick Start
 
 1. **Install** the binary with the curl one-liner, or download and verify a release asset by hand.
-2. **Install compatible weights:** run `focr pull` for the versioned conservative Unlimited-OCR artifact. Specialized models use `focr pull got-ocr2`, `focr pull smolvlm2`, `focr pull onechart`, or `focr pull tromr`. Raw BF16 and locally converted exact-recipe artifacts remain available through `FOCR_MODEL_PATH`.
+2. **Install compatible weights:** run `focr pull` for the versioned conservative Unlimited-OCR artifact. Long documents can use `focr pull unlimited-ocr-2`; specialized models use `focr pull got-ocr2`, `focr pull smolvlm2`, `focr pull onechart`, or `focr pull tromr`. Raw BF16 and locally converted exact-recipe artifacts remain available through `FOCR_MODEL_PATH`.
 3. **Verify your CPU kernels** (optional but reassuring): `focr robot selftest`. Exit 0 means the dispatched int8 GEMM cases, including the model-specific rows for Unlimited-OCR, GOT-OCR2, SmolVLM2, and OneChart, are bit-identical to the scalar oracle on this host.
 4. **OCR a page:** `focr ocr page.png` for Markdown, add `--json` for structured output (markdown + bounding boxes), `-o out.md` / `-o out.json` to write a file, or `--robot` for an NDJSON event stream.
 5. **Batch many pages** in one process (model loaded once): `focr ocr-batch page1.png page2.png page3.png --json`. Add `--multi-page` to parse them as ONE cross-referencing document instead of independent pages.
@@ -648,6 +648,7 @@ full-int8 entry remains incompatible and is rejected.
 
 ```bash
 focr pull                                   # versioned conservative Unlimited-OCR artifact
+focr pull unlimited-ocr-2                   # long-document successor (4.17 GB, three parts)
 focr pull got-ocr2                          # structured OCR model
 focr pull smolvlm2                          # image description / VQA model
 focr pull onechart                          # chart-to-data model
@@ -686,7 +687,7 @@ focr models --json                          # machine-readable list
 | **`smolvlm2`** | ready | Photo description and VQA through `--task describe [--question "..."]`. | `focr pull smolvlm2` installs `smolvlm2.int8.focrq` plus `tokenizer.json` in the model subdirectory. |
 | **`onechart`** | ready | Chart-to-data extraction through `--task chart-data`. | `focr pull onechart` installs `onechart.int8.focrq`, `vocab.json`, `merges.txt`, and `added_tokens.json`. The native path runs the fixed chart prompt, SAM/projector splice, OPT KV-cache decode, `num_decoder`, JSON repair, and reliability distance check. Its number head is the part to trust; its text often is not, and an unverified reading warns. |
 | **`tromr`** | ready | Polyphonic sheet-music OMR through `--task music`. | `focr pull tromr` installs `tromr.int8.focrq` plus the rhythm, pitch, lift, and note tokenizer tables; `focr pull tromr --quant f32` installs the bit-exact `tromr.focrq` reference artifact. Staff crops and full pages both run; bad staves are skipped with reasons when at least one staff recognizes, and over-budget systems can split at detected barlines. |
-| **`unlimited-ocr-2`** | experimental | Baidu's long-document successor to the default model (sparse routed attention across pages). | Runs from its raw checkpoint directory (`--model <dir>`) on single pages and on documents of any length (`--multi-page`, read in windows of 10 pages). A document that stops early at its position limit or forward budget writes its pages, then exits 5. Not yet certified against the reference, so use `unlimited-ocr` for production. |
+| **`unlimited-ocr-2`** | ready | Baidu's long-document successor to the default model (sparse routed attention across pages). | `focr pull unlimited-ocr-2` installs the certified int8 artifact (4.17 GB) and its own tokenizer into `models/unlimited-ocr-2/`. `--model unlimited-ocr-2` then reads single pages and documents of any length (`--multi-page`, read in windows of 10 pages); `--model <dir>` also runs a raw checkpoint. A document that stops early at its position limit or forward budget writes its pages, then exits 5. `unlimited-ocr` stays the default until v2 passes its default gates. |
 | **`trocr`**, **`pix2tex`** | planned | Handwriting and LaTeX OCR lanes. | Registered descriptors only until their forward paths ship. |
 
 `unlimited-ocr` is the fast default for ordinary text. Reach for `got-ocr2` only when you need format extraction (formulas, tables, charts, etc.); it is a much larger decode and is not meant to replace the default for plain text. Install and run it with:

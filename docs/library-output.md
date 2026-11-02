@@ -174,7 +174,9 @@ change that: `DocumentOptions::run` keeps a journal and checkpoint where you poi
 and `FOCR_CALIB_OUT` writes calibration statistics.
 
 **Stderr.** An experimental model prints one note per load:
-`[focr] note: unlimited-ocr-2 is experimental: not yet certified against its reference`.
+`[focr] note: <id> is experimental: not yet certified against its reference`. No
+shipped model is experimental today; unlimited-ocr-2 has been ready since its
+certified artifact was published.
 
 **Environment.** The engine reads `FOCR_*` tuning variables from the process
 environment, as the CLI does. `src/native_engine/lever_policy.rs` lists each one and

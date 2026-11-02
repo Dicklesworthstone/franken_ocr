@@ -302,6 +302,61 @@
           ]
         }
       ]
+    },
+    "unlimited-ocr-2": {
+      "license_notice": "Baidu Unlimited-OCR-2 - Copyright (c) 2026 Baidu, MIT License",
+      "version": "0.1.0",
+      "quants": {
+        "int8": {
+          "recipe": "unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1",
+          "focrq": {
+            "filename": "unlimited-ocr-2.v0.1.0.int8.focrq",
+            "size": 4173206653,
+            "sha256": "54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398",
+            "parts": [
+              {
+                "size": 1391068885,
+                "sha256": "9e940a5891b6abcbfc87594c3dc943ed80cd835083d332758f62763606e0b227",
+                "urls": [
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr-2/unlimited-ocr-2.v0.1.0.int8.focrq.part00",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-unlimited-ocr-2-v1/unlimited-ocr-2.v0.1.0.int8.focrq.part00"
+                ]
+              },
+              {
+                "size": 1391068885,
+                "sha256": "111efd9e7f7b6fbdf1efbf7101438bf79c4222aacaef18f1a9c9a2bf92ba3cd6",
+                "urls": [
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr-2/unlimited-ocr-2.v0.1.0.int8.focrq.part01",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-unlimited-ocr-2-v1/unlimited-ocr-2.v0.1.0.int8.focrq.part01"
+                ]
+              },
+              {
+                "size": 1391068883,
+                "sha256": "34bd2eba13ce4afe75a90fd21710149476d0cc0f89c285449cd22b4466aeca02",
+                "urls": [
+                  "https://huggingface.co/Dicklesworthstone/franken_ocr-weights/resolve/main/unlimited-ocr-2/unlimited-ocr-2.v0.1.0.int8.focrq.part02",
+                  "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-unlimited-ocr-2-v1/unlimited-ocr-2.v0.1.0.int8.focrq.part02"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "tokenizer": {
+        "filename": "tokenizer.json",
+        "size": 9980278,
+        "sha256": "c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589",
+        "parts": [
+          {
+            "size": 9980278,
+            "sha256": "c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589",
+            "urls": [
+              "https://huggingface.co/baidu/Unlimited-OCR-2/resolve/5632329a32e103d5f1add270681e0f5c1233c6e4/tokenizer.json",
+              "https://github.com/Dicklesworthstone/franken_ocr/releases/download/models-unlimited-ocr-2-v1/tokenizer.json"
+            ]
+          }
+        ]
+      }
     }
   }
 }

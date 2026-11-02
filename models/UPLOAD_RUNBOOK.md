@@ -94,6 +94,54 @@ The tokenizer remains public at `baidu/Unlimited-OCR`; its manifest identity is
 9,979,544 bytes and SHA-256
 `a02f8fd5228c90256bb4f6554c34a579d48f909e5beb232dc4afad870b55a8b4`.
 
+## Unlimited-OCR-2 v0.1.0 artifact (U2-E4)
+
+Recipe: `unlimited-ocr-2-ffn-int8-attn-bf16-lmhead-bf16-v1`, converted from HF
+`baidu/Unlimited-OCR-2` at `5632329a32e103d5f1add270681e0f5c1233c6e4` and
+certified by U2-C4. GitHub release `models-unlimited-ocr-2-v1` (created
+2026-11-02 with `--latest=false`, so the newest binary release stays "Latest").
+
+| artifact | size | sha256 |
+|---|---:|---|
+| `unlimited-ocr-2.v0.1.0.int8.focrq` (reassembled install file) | 4 173 206 653 | `54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398` |
+| `unlimited-ocr-2.v0.1.0.int8.focrq.part00` | 1 391 068 885 | `9e940a5891b6abcbfc87594c3dc943ed80cd835083d332758f62763606e0b227` |
+| `unlimited-ocr-2.v0.1.0.int8.focrq.part01` | 1 391 068 885 | `111efd9e7f7b6fbdf1efbf7101438bf79c4222aacaef18f1a9c9a2bf92ba3cd6` |
+| `unlimited-ocr-2.v0.1.0.int8.focrq.part02` | 1 391 068 883 | `34bd2eba13ce4afe75a90fd21710149476d0cc0f89c285449cd22b4466aeca02` |
+| `tokenizer.json` (v2's own, not v1's) | 9 980 278 | `c55c165e32c5a67830362a53e1f548c8930dcc8469efa30ff3252a982799c589` |
+
+The parts are three consecutive byte ranges, so `cat part00 part01 part02`
+reproduces the whole file. They were cut by byte offset, not with `split`,
+because three equal parts keep each one well under 2 GiB. The staging directory
+is `~/.cache/franken_ocr_local_models/release_uocr2_v1/`, with `notes.md` (the
+release notes) and `manifest_entry.json`.
+
+```bash
+R=~/.cache/franken_ocr_local_models/release_uocr2_v1
+gh release create models-unlimited-ocr-2-v1 --repo Dicklesworthstone/franken_ocr \
+  --title "Unlimited-OCR-2 int8 weights (models-unlimited-ocr-2-v1)" \
+  --notes-file "$R/notes.md" --latest=false
+gh release upload models-unlimited-ocr-2-v1 --repo Dicklesworthstone/franken_ocr \
+  "$R/unlimited-ocr-2.v0.1.0.int8.focrq.part00" \
+  "$R/unlimited-ocr-2.v0.1.0.int8.focrq.part01" \
+  "$R/unlimited-ocr-2.v0.1.0.int8.focrq.part02" \
+  "$R/tokenizer.json"
+
+# HF mirror: the same parts under the model's subdirectory (the manifest lists
+# them first), plus the whole file, which HF can hold.
+for f in part00 part01 part02; do
+  hf upload Dicklesworthstone/franken_ocr-weights \
+    "$R/unlimited-ocr-2.v0.1.0.int8.focrq.$f" \
+    "unlimited-ocr-2/unlimited-ocr-2.v0.1.0.int8.focrq.$f"
+done
+hf upload Dicklesworthstone/franken_ocr-weights \
+  ~/.cache/franken_ocr_local_models/unlimited-ocr-2.v0.1.0.int8.focrq \
+  unlimited-ocr-2/unlimited-ocr-2.v0.1.0.int8.focrq
+```
+
+The manifest's tokenizer URLs are the upstream file at the pinned commit
+(`baidu/Unlimited-OCR-2/resolve/5632329a…/tokenizer.json`) and this release's
+copy.
+
 ## Historical Unlimited-OCR artifact (blocked)
 
 | artifact | size | sha256 |
