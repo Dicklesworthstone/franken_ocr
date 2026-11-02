@@ -157,7 +157,10 @@ view) and 32 documents with 224 pages, 12 of them non-Baidu.
 
 The run ended 2026-11-01 06:25 EST with every process exit 0. These are the
 as-run results, the registered sensitivity reruns (Deviation 2, finished
-14:21 EST) and the precision check (Deviation 4).
+14:21 EST) and the precision check (Deviation 4). The run records, scores and
+post-hoc outputs behind them are in `artifacts/accuracy/bd-uocr2-epic-cgux.21/`.
+Its README says where the raw readings are kept, outside the repository, because
+OmniDocBench may not be redistributed.
 
 ### Pre-registered tests, as run
 
