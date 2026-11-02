@@ -3108,7 +3108,7 @@ fn models_lists_the_registered_archs_human_and_json() {
         .iter()
         .find(|m| m["id"] == "unlimited-ocr-2")
         .expect("the v2 row");
-    assert_eq!(v2["status"], "experimental");
+    assert_eq!(v2["status"], "ready");
     assert_eq!(v2["tasks"], serde_json::json!(["ocr"]));
     assert_eq!(
         v2["recipe"],
@@ -3127,7 +3127,7 @@ fn models_lists_the_registered_archs_human_and_json() {
         .lines()
         .find(|l| l.starts_with("unlimited-ocr-2 "))
         .unwrap_or_else(|| panic!("the human table lists v2:\n{stdout}"));
-    assert!(row.contains("experimental"), "{row}");
+    assert!(row.contains("ready"), "{row}");
 }
 
 /// `(v1 installed, v2 installed)` as `focr models --json` reports them with

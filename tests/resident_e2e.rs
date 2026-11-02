@@ -240,9 +240,9 @@ fn interrupted(mut command: Command, after: std::time::Duration) -> Seen {
 
 /// bd-u77k: Unlimited-OCR-2 served cold and warm reports what it reports
 /// inline, byte for byte: `--json` with its `finish_reason` and `warnings[]`
-/// (an ignored lever's among them), the stderr warnings and experimental
-/// note, and the exit code, 0 for a page its `--max-page-tokens` cap closed
-/// and 5 for one stopped at its position limit. Set
+/// (an ignored lever's among them), the stderr warnings, and the exit code,
+/// 0 for a page its `--max-page-tokens` cap closed and 5 for one stopped at
+/// its position limit. Set
 /// `FOCR_RESIDENT_E2E_V2_MODEL` to a v2 artifact beside its tokenizer.
 #[test]
 fn a_resident_v2_run_matches_an_inline_run() {

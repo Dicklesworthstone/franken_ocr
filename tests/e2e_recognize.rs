@@ -2171,8 +2171,8 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
         );
     }
     // D21: an unknown `FOCR_SRSWA_ENTMAX` is refused at admission (exit 2),
-    // before the sidecar; a known one is admitted, labelled experimental, and
-    // stops at the sidecar (exit 7).
+    // before the sidecar; a known one is admitted and stops at the sidecar
+    // (exit 7). Neither carries the experimental note: v2 is Ready (U2-E4).
     for (value, code) in [("bogus", 2), ("all", 7)] {
         let args = ["ocr", image.as_str(), "--model", model.as_str()];
         let (mut envs, log) = resident_envs(&format!("entmax_{value}"));
@@ -2188,10 +2188,11 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
         let sidecar = out.stderr.contains(FOREIGN_SIDECAR);
         let served = log.exists();
         let pass = out.code == Some(code)
+            && !labelled
             && if code == 2 {
-                refused && !labelled && !sidecar && !served
+                refused && !sidecar && !served
             } else {
-                !refused && labelled && sidecar && served
+                !refused && sidecar && served
             };
         println!(
             "{}",
@@ -2566,9 +2567,9 @@ fn v2_cli_decodes_a_page_and_a_document_through_every_entry_point_when_armed() {
         assert!(!markdown.contains(grammar), "S1: {grammar} in:\n{markdown}");
     }
     assert!(
-        out.stderr
+        !out.stderr
             .contains("[focr] note: unlimited-ocr-2 is experimental"),
-        "S1: not labelled experimental:\n{}",
+        "S1: v2 is Ready (U2-E4) but labelled experimental:\n{}",
         out.stderr
     );
     log_line(
