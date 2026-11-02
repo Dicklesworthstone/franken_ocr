@@ -3039,7 +3039,7 @@ struct DocumentRecognition {
 /// when it fits one. The JSON `pages` are the pages the parse read (U2-E3):
 /// every page for a model that splits pages exactly, and for v1 only when
 /// its text holds one body per page; otherwise `pages: []`, which the run's
-/// `v1_page_merge` warning explains.
+/// `v1_page_merge` or `v1_extra_pages` warning explains.
 ///
 /// The pages are read lazily (U2-D0): the forward stage rasterizes each one,
 /// preprocesses it and drops the raster before reading the next, so a long
@@ -3098,6 +3098,7 @@ fn recognize_document_multi_page(
         None => native_engine::DocumentOptions::default(),
     };
     options.page_window = request.page_window;
+    options.reread_capped = native_engine::reread_capped_requested();
     let document = recognize_with_autodownload(request, robot_mode, |model| {
         let source = attempt_source(&opened, request)?;
         let model_path = model
@@ -3218,7 +3219,12 @@ fn recognize_document_multi_page(
             resumed_from,
             warnings: warnings
                 .into_iter()
-                .filter(|w| matches!(w.kind, "resume_recompute" | "checkpoint_failed"))
+                .filter(|w| {
+                    matches!(
+                        w.kind,
+                        "v2_page_reread" | "resume_recompute" | "checkpoint_failed"
+                    )
+                })
                 .collect(),
             counts,
         },
@@ -3704,7 +3710,8 @@ fn run_batch_images(
         let document = engine.recognize_document(
             &model_path,
             PageSource::images(images.to_vec())?,
-            &native_engine::DocumentOptions::default(),
+            &native_engine::DocumentOptions::default()
+                .reread_capped(native_engine::reread_capped_requested()),
             events.map_or_else(
                 || Box::new(|_: &PageItem| {}) as Box<dyn FnMut(&PageItem) + Send>,
                 |events| events.page_read_sink(images.to_vec()),
@@ -3733,6 +3740,13 @@ fn run_batch_images(
                 .as_ref()
                 .map(native_engine::decode_warnings)
                 .unwrap_or_default(),
+        );
+        // The capped pages' re-read (bd-yrr1) is the run's, not the decode's.
+        run_warnings.extend(
+            document
+                .warnings
+                .into_iter()
+                .filter(|w| w.kind == "v2_page_reread"),
         );
         let partial = report
             .as_ref()

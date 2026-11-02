@@ -83,8 +83,9 @@ window, not one by one. Models outside the Unlimited-OCR family return
 | `figures` | none | Figure boxes, numbered as `text` numbers them. |
 | `elapsed_ms` | none | Decode time. It differs run to run. |
 
-`pages` is empty for a v1 document whose text did not split into one body per page,
-and its `v1_page_merge` warning says so. Unlimited-OCR-2 always gives one entry per
+`pages` is empty for a v1 document whose text did not split into one body per page.
+Its `v1_page_merge` warning (fewer bodies than pages) or `v1_extra_pages` warning
+(more) says so. Unlimited-OCR-2 always gives one entry per
 page read.
 
 ## A span
@@ -151,7 +152,7 @@ not pixels.
 |---|---|
 | `marker` | The model opened the next page. |
 | `eos` | The model ended the document. |
-| `page_cap` | The per-page cap forced the page closed. The page is probably cut short. |
+| `page_cap` | The per-page cap forced the page closed. The page is probably cut short, and its text probably repeats; the run's `v2_page_cap` warning lists it. With `DocumentOptions::reread_capped`, the page is read again alone after the document; a re-read the model ends replaces the page, and the run's `v2_page_reread` warning lists it. |
 | `length` | The position limit stopped decoding inside this page. |
 | `budget` | The stage budget stopped decoding inside this page. |
 | `cancelled` | `request_shutdown` stopped decoding inside this page. |

@@ -312,6 +312,11 @@ fn a_resident_v2_run_matches_an_inline_run() {
             .collect();
         assert!(kinds.contains(&"ignored_lever"), "{case}: {kinds:?}");
         assert_eq!(kinds.contains(&"v2_length"), code == 5, "{case}: {kinds:?}");
+        // bd-jem5: a page the cap closed is named by a run warning.
+        let capped = json["pages"]
+            .as_array()
+            .is_some_and(|pages| pages.iter().any(|p| p["finish"] == "page_cap"));
+        assert_eq!(kinds.contains(&"v2_page_cap"), capped, "{case}: {kinds:?}");
         let cold = run(Some(&dir));
         let warm = run(Some(&dir));
         for (run, served) in [("cold", &cold), ("warm", &warm)] {

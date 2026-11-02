@@ -857,6 +857,8 @@ pub enum WarningKind {
     V1TruncatedUserCap,
     /// A v1 multi-page decode ended at EOS with fewer page bodies than pages.
     V1PageMerge,
+    /// A v1 multi-page decode wrote more page bodies than pages (bd-17zw).
+    V1ExtraPages,
     /// A multi-page prompt alone exceeds the position budget (an error, not a
     /// warning; it shares the recovery text).
     PromptTooLong,
@@ -866,6 +868,10 @@ pub enum WarningKind {
     V2Length,
     /// An Unlimited-OCR-2 document ran out of its stage budget (U2-B6).
     V2Budget,
+    /// The per-page token cap closed an Unlimited-OCR-2 page (bd-jem5).
+    V2PageCap,
+    /// A page the cap closed was read again alone (bd-yrr1).
+    V2PageReread,
     /// Text before the first generated `<PAGE>` joined page 1 (DISC-U2-9).
     LeadingText,
     /// A directory input held files that are not page images (U2-D0).
@@ -889,9 +895,12 @@ pub enum WarningKind {
 pub const RUN_WARNING_KINDS: &[&str] = &[
     "v1_truncated",
     "v1_page_merge",
+    "v1_extra_pages",
     "ignored_lever",
     "v2_length",
     "v2_budget",
+    "v2_page_cap",
+    "v2_page_reread",
     "leading_text",
     "ignored_files",
     "uncertified_crop_mode",
@@ -913,6 +922,7 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
         WarningKind::V1PageMerge => {
             "parse pages independently (omit `--multi-page`) when page boundaries matter"
         }
+        WarningKind::V1ExtraPages => "parse pages independently (omit `--multi-page`)",
         WarningKind::IgnoredLever => "unset it for this model's runs",
         WarningKind::V2Length => {
             "the completed pages were written; split the document with `--pages`, or parse \
@@ -922,6 +932,14 @@ pub fn warning_recovery(kind: WarningKind) -> &'static str {
             "the completed pages were written; re-run the same command to continue from the \
              last completed window, raise FOCR_STAGE_BUDGET_FORWARD_MS (0 = unlimited), or \
              select fewer pages with `--pages`"
+        }
+        WarningKind::V2PageCap => {
+            "the other pages were written; check the listed pages, whose text probably \
+             repeats, or lower `--max-page-tokens` so a runaway page closes sooner"
+        }
+        WarningKind::V2PageReread => {
+            "a replaced page needs nothing; check a kept page, whose capped text probably \
+             repeats"
         }
         WarningKind::LeadingText => {
             "check the start of page 1: the model wrote text before its first page marker"
@@ -1038,20 +1056,32 @@ pub fn decode_warnings(report: &DecodeReport) -> Vec<RunWarning> {
     warnings
 }
 
-/// The warnings a v1 decode earns (U2-X2): only multi-page decodes with fewer
-/// page bodies than pages warn. A length stop is a truncation, named by the
-/// limit that bound it; an EOS stop is a page merge. Single-page decodes
-/// report only their `finish_reason`.
+/// The warnings a v1 decode earns (U2-X2): only multi-page decodes whose page
+/// bodies do not match the page count warn. More bodies than pages means the
+/// decode repeated or invented pages, however it stopped (bd-17zw). Fewer: a
+/// length stop is a truncation, named by the limit that bound it, and an EOS
+/// stop is a page merge. Single-page decodes report only their `finish_reason`.
 fn v1_page_warnings(report: &DecodeReport) -> Vec<RunWarning> {
     let Some(PageBodies { expected, bodies }) = report.pages else {
         return Vec::new();
     };
-    if bodies >= expected {
+    if bodies == expected {
         return Vec::new();
     }
     let mut fields = serde_json::Map::new();
     fields.insert("expected".into(), expected.into());
     fields.insert("got".into(), bodies.into());
+    if bodies > expected {
+        return vec![RunWarning {
+            kind: "v1_extra_pages",
+            message: format!(
+                "v1 produced {bodies} page bodies for {expected} pages: it repeated or invented \
+                 pages, so this output is unreliable"
+            ),
+            recovery: warning_recovery(WarningKind::V1ExtraPages),
+            fields,
+        }];
+    }
     let warning = match (report.finish_reason, report.cap) {
         (FinishReason::Length, Some(LengthCap::MaxLength)) => {
             fields.insert("cause".into(), "user_cap".into());
@@ -1128,6 +1158,50 @@ fn checkpoint_failed_warning(cause: &str) -> RunWarning {
     }
 }
 
+/// The `v2_page_reread` warning (bd-yrr1): the capped pages a re-read alone
+/// replaced (`pages`) and those that kept the document's text (`kept`), by
+/// run index, each kept page with why; `None` when no page was re-read.
+fn page_reread_warning(replaced: &[usize], kept: &[(usize, String)]) -> Option<RunWarning> {
+    if replaced.is_empty() && kept.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !replaced.is_empty() {
+        let list = replaced
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (noun, verb) = if replaced.len() == 1 {
+            ("page", "was")
+        } else {
+            ("pages", "were")
+        };
+        parts.push(format!(
+            "{noun} {list} {verb} read again alone, and the re-read replaced the capped text"
+        ));
+    }
+    parts.extend(
+        kept.iter()
+            .map(|(page, why)| format!("page {page} kept its capped text: {why}")),
+    );
+    let mut fields = serde_json::Map::new();
+    fields.insert("pages".into(), replaced.into());
+    fields.insert(
+        "kept".into(),
+        kept.iter()
+            .map(|(page, _)| *page)
+            .collect::<Vec<_>>()
+            .into(),
+    );
+    Some(RunWarning {
+        kind: "v2_page_reread",
+        message: parts.join("; "),
+        recovery: warning_recovery(WarningKind::V2PageReread),
+        fields,
+    })
+}
+
 /// An Unlimited-OCR-2 document decode's warnings (U2-B6), never v1's: the
 /// head before the first `<PAGE>` joined to page 1 (DISC-U2-9), and a stop
 /// at the position limit or the stage budget, with the page bodies produced.
@@ -1152,6 +1226,36 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
         });
     }
     let (expected, got) = report.pages.map_or((1, 0), |p| (p.expected, p.bodies));
+    // A page that reaches the per-page cap is almost always a runaway; the run
+    // goes on, so only this warning says so (bd-jem5). Pages count in decode
+    // order, as `place` does below.
+    let capped: Vec<usize> = (1..)
+        .zip(&stats.page_finish)
+        .filter_map(|(page, finish)| (*finish == PageFinish::PageCap).then_some(page))
+        .collect();
+    if !capped.is_empty() {
+        let list = capped
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (noun, verb) = if capped.len() == 1 {
+            ("page", "was")
+        } else {
+            ("pages", "were")
+        };
+        let mut fields = serde_json::Map::new();
+        fields.insert("pages".into(), capped.into());
+        warnings.push(RunWarning {
+            kind: "v2_page_cap",
+            message: format!(
+                "{noun} {list} of {expected} reached the per-page token cap and {verb} closed: \
+                 the model probably repeated itself, so that text is unreliable"
+            ),
+            recovery: warning_recovery(WarningKind::V2PageCap),
+            fields,
+        });
+    }
     // A finish with no body is a stop before its page's prefill: the
     // document's, or a later window's (U2-D1b).
     let place = if got == 0 || stats.page_finish.len() > got {
@@ -1475,6 +1579,16 @@ pub fn force_got_format(on: bool) {
 fn got_format_requested() -> bool {
     FORCE_GOT_FORMAT.load(std::sync::atomic::Ordering::Relaxed)
         || std::env::var_os(GOT_FORMAT_ENV).is_some()
+}
+
+/// Truthy: the CLI reads each page the per-page cap closed again alone
+/// ([`DocumentOptions::reread_capped`], bd-yrr1).
+const REREAD_CAPPED_ENV: &str = "FOCR_REREAD_CAPPED_PAGES";
+
+/// Whether the environment asks for [`DocumentOptions::reread_capped`].
+#[must_use]
+pub fn reread_capped_requested() -> bool {
+    std::env::var(REREAD_CAPPED_ENV).is_ok_and(|value| is_truthy(&value))
 }
 
 /// Process-global "pad GOT's image to a square first" flag, set by the CLI from the
@@ -2450,6 +2564,15 @@ pub struct DocumentOptions {
     /// neither. The caller removes them once the output is written
     /// ([`checkpoint::RunFiles::remove`]).
     pub run: Option<checkpoint::RunFiles>,
+    /// Read again, alone, each page the per-page cap closed, once the
+    /// document is decoded (Unlimited-OCR-2, bd-yrr1); off by default. The
+    /// page is rasterized again and decoded as a document of one page, as
+    /// `focr ocr` reads it. A re-read the model ends itself replaces the
+    /// page, whose `tokens`, `finish`, `elapsed_ms` and `window` (`None`) are
+    /// then the re-read's; any other keeps the document's page. A
+    /// `v2_page_reread` warning lists both. A page streamed earlier is not
+    /// streamed again, and the decode report stays the document's.
+    pub reread_capped: bool,
 }
 
 impl DocumentOptions {
@@ -2471,6 +2594,14 @@ impl DocumentOptions {
     #[must_use]
     pub fn run(mut self, files: checkpoint::RunFiles) -> Self {
         self.run = Some(files);
+        self
+    }
+
+    /// These options with the capped pages read again alone when `on`
+    /// ([`Self::reread_capped`], bd-yrr1).
+    #[must_use]
+    pub fn reread_capped(mut self, on: bool) -> Self {
+        self.reread_capped = on;
         self
     }
 
@@ -2618,7 +2749,8 @@ pub struct DocumentResult {
     /// The source's warnings (`ignored_files`), then the decode's: the lever
     /// admission's `ignored_lever`, then the document's (`leading_text`,
     /// `v2_length`, `v2_budget`) or v1's (`v1_truncated`, `v1_page_merge`),
-    /// then the run's (`resume_recompute`, `checkpoint_failed`).
+    /// then the run's (`v2_page_reread`, `resume_recompute`,
+    /// `checkpoint_failed`).
     pub warnings: Vec<RunWarning>,
     /// The model that read the document.
     pub model: ModelIdentity,
@@ -4983,14 +5115,7 @@ impl OcrModel {
                 self.parse_windowed(&mut pages, window, &read, resumed, run.as_mut(), sink)?
             }
         };
-        let (
-            DocumentPages {
-                markdown,
-                raw,
-                pages,
-            },
-            windows,
-        ) = match parsed {
+        let (document, windows) = match parsed {
             DocumentParse::OnePass(pres) => {
                 if pres.is_empty() {
                     return Err(first_error.unwrap_or_else(|| {
@@ -5018,6 +5143,24 @@ impl OcrModel {
         };
         // Every parse records a report; a poisoned slot leaves an EOS default.
         let report = self.last_decode.lock().ok().and_then(|slot| slot.clone());
+        // The capped pages read again alone, when asked (bd-yrr1). Each
+        // re-read records its own report; the run's stays the document's.
+        let (
+            DocumentPages {
+                markdown,
+                raw,
+                pages,
+            },
+            reread,
+        ) = if options.reread_capped {
+            let reread = self.reread_capped_pages(source, document);
+            if let Ok(mut slot) = self.last_decode.lock() {
+                slot.clone_from(&report);
+            }
+            reread
+        } else {
+            (document, None)
+        };
         let pages_read = read.borrow().len();
         timing_log(&format!(
             "document: {pages_read} pages read, {} skipped, {} windows, {} vision encodes, {} \
@@ -5035,6 +5178,7 @@ impl OcrModel {
         ));
         let mut warnings = source.warnings();
         warnings.extend(report.as_ref().map(decode_warnings).unwrap_or_default());
+        warnings.extend(reread);
         warnings.extend(recompute_from.map(resume_recompute_warning));
         warnings.extend(
             run.as_ref()
@@ -5208,6 +5352,98 @@ impl OcrModel {
             )
         } else {
             preprocess::preprocess_dynamic_squash(img, MULTI_PAGE_BASE_SIZE)
+        }
+    }
+
+    /// Read again, alone, each page of `document` the per-page cap closed
+    /// ([`DocumentOptions::reread_capped`], bd-yrr1), and join the
+    /// document's text again when a re-read replaced one. A shutdown request
+    /// ends the re-reads, and the pages left keep their text. Returns the
+    /// document and its `v2_page_reread` warning, `None` when no page was
+    /// capped.
+    fn reread_capped_pages(
+        &self,
+        source: &crate::page_source::PageSource,
+        document: DocumentPages,
+    ) -> (DocumentPages, Option<RunWarning>) {
+        let DocumentPages {
+            markdown,
+            raw,
+            mut pages,
+        } = document;
+        let mut replaced = Vec::new();
+        let mut kept = Vec::new();
+        for page in pages
+            .iter_mut()
+            .filter(|page| page.finish == Some(PageFinish::PageCap))
+        {
+            let reread = if crate::shutdown_requested() {
+                Err("a shutdown was requested before its re-read".to_owned())
+            } else {
+                self.reread_page(source, page)
+            };
+            match reread {
+                Ok(fresh) => {
+                    replaced.push(page.run_index);
+                    *page = fresh;
+                }
+                Err(why) => kept.push((page.run_index, why)),
+            }
+        }
+        let warning = page_reread_warning(&replaced, &kept);
+        let document = if replaced.is_empty() {
+            DocumentPages {
+                markdown,
+                raw,
+                pages,
+            }
+        } else {
+            DocumentPages::joined(pages)
+        };
+        (document, warning)
+    }
+
+    /// `page` read again alone: rasterized again from `source` and decoded
+    /// as a document of one page, the way [`Self::forward_dynamic`] reads a
+    /// page. Its replacement when the model ended it, else why the
+    /// document's page stays.
+    fn reread_page(
+        &self,
+        source: &crate::page_source::PageSource,
+        page: &PageResult,
+    ) -> Result<PageResult, String> {
+        let origin = PageOrigin {
+            source_page: page.source_page,
+            half: page.half,
+        };
+        let failed = |e: FocrError| format!("its re-read failed: {e}");
+        let img = source
+            .fetch(origin.source_page, origin.half)
+            .map_err(failed)?;
+        let pre = self.document_page(img).map_err(failed)?;
+        let size = pre.original_size;
+        let decoded = {
+            let _admission = forward_admission().acquire();
+            self.decode_document(std::slice::from_ref(&pre), None)
+                .map_err(failed)?
+        };
+        let finish = decoded.finish.first().copied();
+        timing_log(&format!(
+            "reread page {}: {} tokens, finish {}",
+            page.run_index,
+            decoded.split.tokens.first().copied().unwrap_or(0),
+            finish.map_or("none", PageFinish::as_str),
+        ));
+        match (finish, decoded.split.bodies.first()) {
+            (Some(PageFinish::Eos), Some(body)) => Ok(PageResult {
+                tokens: decoded.split.tokens.first().copied(),
+                finish,
+                elapsed_ms: decoded.elapsed.first().copied().map(millis),
+                ..PageResult::read(page.run_index, body, size, origin, page.model_id)
+            }),
+            (Some(PageFinish::PageCap), _) => Err("its re-read reached the cap again".to_owned()),
+            (Some(finish), Some(_)) => Err(format!("its re-read ended `{}`", finish.as_str())),
+            _ => Err("its re-read wrote no page".to_owned()),
         }
     }
 
@@ -5821,6 +6057,7 @@ impl OcrModel {
         let mut stats = DocumentStats::default();
         let mut finish_reason = FinishReason::Length;
         let td = Instant::now();
+        decoder::prof::reset();
         loop {
             // A cancel ends the document as a stop, keeping the pages done
             // (U2-E2); like the budget, a rerun first repeats what was seen.
@@ -5919,6 +6156,14 @@ impl OcrModel {
             td.elapsed().as_secs_f64(),
             td.elapsed().as_secs_f64() / (generated.max(1) as f64)
         ));
+        // The same split as v1's `generate_cached`; `attn` holds the shared
+        // projections plus the SR-SWA attend, so the gap to v1's is the attend.
+        if decoder::prof::enabled() {
+            let (lmhead, attn, experts, route) = decoder::prof::snapshot_ms();
+            timing_log(&format!(
+                "decode phases (ms): lm_head {lmhead:.0}  attn {attn:.0}  experts {experts:.0}  route {route:.0}"
+            ));
+        }
         Ok((finish_reason, stats))
     }
 
@@ -7971,6 +8216,102 @@ mod tests {
         );
     }
 
+    /// bd-yrr1: the re-read's warning lists the pages it replaced in `pages`
+    /// and those it kept in `kept`, says why each kept page stayed, and is
+    /// absent when no page was re-read.
+    #[test]
+    fn page_reread_warning_lists_replaced_and_kept_pages() {
+        assert!(page_reread_warning(&[], &[]).is_none());
+
+        let one = page_reread_warning(&[3], &[]).expect("a replaced page warns");
+        let w = one.to_json();
+        assert_eq!(w["kind"], "v2_page_reread");
+        assert_eq!(w["pages"], serde_json::json!([3]));
+        assert_eq!(w["kept"], serde_json::json!([]));
+        assert_eq!(w["recovery"], warning_recovery(WarningKind::V2PageReread));
+        assert_eq!(
+            one.message,
+            "page 3 was read again alone, and the re-read replaced the capped text"
+        );
+
+        let mixed = page_reread_warning(
+            &[2, 5],
+            &[(7, "its re-read reached the cap again".to_owned())],
+        )
+        .expect("re-read pages warn");
+        let w = mixed.to_json();
+        assert_eq!(w["pages"], serde_json::json!([2, 5]));
+        assert_eq!(w["kept"], serde_json::json!([7]));
+        assert_eq!(
+            mixed.message,
+            "pages 2, 5 were read again alone, and the re-read replaced the capped text; \
+             page 7 kept its capped text: its re-read reached the cap again"
+        );
+
+        let kept = page_reread_warning(&[], &[(4, "its re-read ended `budget`".to_owned())])
+            .expect("a kept page warns");
+        assert_eq!(kept.to_json()["pages"], serde_json::json!([]));
+        assert_eq!(kept.to_json()["kept"], serde_json::json!([4]));
+        assert!(RUN_WARNING_KINDS.contains(&"v2_page_reread"));
+    }
+
+    /// bd-jem5: the pages the per-page cap closed earn one `v2_page_cap`
+    /// warning that lists them in decode order. The run still finishes `stop`,
+    /// so it is not a partial output, and a document with no capped page does
+    /// not warn. (U2-C5a's document 0789 ran page 3 to the cap with no warning.)
+    #[test]
+    fn page_capped_pages_warn_once_and_the_run_stays_complete() {
+        use PageFinish::{Eos, Marker, PageCap};
+        let report = |page_finish: Vec<PageFinish>| DecodeReport {
+            ids: Vec::new(),
+            finish_reason: FinishReason::Stop,
+            cap: None,
+            pages: Some(PageBodies {
+                expected: 5,
+                bodies: 5,
+            }),
+            max_length: 32_768,
+            max_positions: sampler::UOCR2_MAX_POSITIONS,
+            decodes: 1,
+            length_stops: 0,
+            document: Some(DocumentStats {
+                page_finish,
+                ..DocumentStats::default()
+            }),
+            admission_warnings: Vec::new(),
+        };
+
+        let capped = report(vec![Marker, Marker, PageCap, Marker, Eos]);
+        let warnings = decode_warnings(&capped);
+        assert_eq!(warnings.len(), 1);
+        let w = warnings[0].to_json();
+        assert_eq!(w["kind"], "v2_page_cap");
+        assert_eq!(w["pages"], serde_json::json!([3]));
+        assert_eq!(w["recovery"], warning_recovery(WarningKind::V2PageCap));
+        assert!(
+            warnings[0].message.starts_with("page 3 of 5 reached"),
+            "{}",
+            warnings[0].message
+        );
+        assert!(RUN_WARNING_KINDS.contains(&"v2_page_cap"));
+        let model = ModelIdentity {
+            model_id: model_arch::UNLIMITED_OCR_V2_ID,
+            source_sha256: None,
+        };
+        assert!(partial_output(&capped, &warnings, &model).is_none());
+
+        let two = decode_warnings(&report(vec![PageCap, Marker, Marker, PageCap, Eos]));
+        assert_eq!(two.len(), 1);
+        assert_eq!(two[0].to_json()["pages"], serde_json::json!([1, 4]));
+        assert!(
+            two[0].message.starts_with("pages 1, 4 of 5 reached"),
+            "{}",
+            two[0].message
+        );
+
+        assert!(decode_warnings(&report(vec![Marker, Marker, Marker, Marker, Eos])).is_empty());
+    }
+
     /// U2-X2: the frozen `infer_multi` oracle outputs end at EOS with fewer
     /// page bodies than pages, so each is a `v1_page_merge` with the exact
     /// counts.
@@ -8010,6 +8351,32 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// bd-17zw: more page bodies than pages warns however the decode stopped,
+    /// and an exact count does not (U2-C5a's v1 multi-page runaways wrote 9
+    /// bodies for 8 pages, 12 for 10, 10 for 7, with no warning).
+    #[test]
+    fn extra_page_bodies_warn_and_an_exact_count_does_not() {
+        let decoded = "<PAGE>a<PAGE>b<PAGE>c";
+        for (finish, cap) in [
+            (FinishReason::Stop, None),
+            (FinishReason::Length, None),
+            (FinishReason::Length, Some(LengthCap::MaxLength)),
+        ] {
+            let warnings = decode_warnings(&multi_page_report(finish, cap, 2, decoded));
+            assert_eq!(warnings.len(), 1, "{finish:?} {cap:?}");
+            let w = warnings[0].to_json();
+            assert_eq!(w["kind"], "v1_extra_pages");
+            assert_eq!(
+                (w["expected"].as_u64(), w["got"].as_u64()),
+                (Some(2), Some(3))
+            );
+            assert_eq!(w["recovery"], warning_recovery(WarningKind::V1ExtraPages));
+            assert!(RUN_WARNING_KINDS.contains(&"v1_extra_pages"));
+        }
+        let exact = multi_page_report(FinishReason::Stop, None, 3, decoded);
+        assert!(decode_warnings(&exact).is_empty());
     }
 
     /// U2-E3: v1's text has pages only when it holds one body per page, the

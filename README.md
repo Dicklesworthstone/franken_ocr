@@ -485,7 +485,8 @@ page1.png page2.png --multi-page`. v1 has
 stop early and report `finish_reason: length` with a `v1_truncated` warning (a
 prompt that alone exceeds the budget fails with an actionable error). When v1
 ends with fewer page bodies than pages, a `v1_page_merge` warning says the page
-boundaries are unreliable. On v1 it does not compose with `--split-spreads` or
+boundaries are unreliable; with more bodies than pages, a `v1_extra_pages`
+warning says it repeated or invented pages. On v1 it does not compose with `--split-spreads` or
 `--extract-figures` (per-page semantics), and `--json` lists real `pages[]` only
 when the text has exactly one body per page (otherwise `pages: []`).
 
@@ -506,7 +507,12 @@ bounded at any length. A window that stops early ends the document with its
 completed pages. `--json` lists one `pages[]` entry per page
 read: `page` (the source page), `half` on a split spread, `run_index`, `window`
 when windowed, `text`, `layout` (boxes in that page's own pixels), `tokens` and
-`finish` (`marker`, `eos`, `page_cap`, `length`, `budget` or `cancelled`), and `raw` under `--raw`. It composes with `--split-spreads`
+`finish` (`marker`, `eos`, `page_cap`, `length`, `budget` or `cancelled`), and `raw` under `--raw`. A
+`v2_page_cap` warning lists any page the per-page cap (`--max-page-tokens`, default 20,000)
+closed, which is almost always a runaway. With `FOCR_REREAD_CAPPED_PAGES=1` (off by
+default), each such page is read again alone once the document is decoded. The re-read
+replaces the page when the model ends it, and a `v2_page_reread` warning lists the pages
+replaced and the pages kept. Robot `page` events are not sent again. Document mode composes with `--split-spreads`
 (each half is one page of the prompt) and with `--extract-figures`: figures are
 cropped from their page after the decode and named `page{N}_figure_{M}`, or
 `page{N}l_figure_{M}` / `page{N}r_figure_{M}` on a half. Robot `page` events add

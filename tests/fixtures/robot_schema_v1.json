@@ -416,9 +416,12 @@
   "warning_kinds": [
     "v1_truncated",
     "v1_page_merge",
+    "v1_extra_pages",
     "ignored_lever",
     "v2_length",
     "v2_budget",
+    "v2_page_cap",
+    "v2_page_reread",
     "leading_text",
     "ignored_files",
     "uncertified_crop_mode",

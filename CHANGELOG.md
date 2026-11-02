@@ -28,6 +28,19 @@ sections as they land.
 
 ### Added
 
+- **Unlimited-OCR-2 can read a capped page again on its own** (bead bd-yrr1). With
+  `FOCR_REREAD_CAPPED_PAGES=1`, or `DocumentOptions::reread_capped` in the library, each
+  page the per-page cap closed is decoded again alone once the document is done, as `focr
+  ocr` reads a page. A re-read the model ends replaces the page, and the document's text is
+  joined again. One that reaches the cap again, stops or fails keeps the document's page. A
+  `v2_page_reread` warning lists the pages replaced (`pages`) and kept (`kept`, each with
+  why). Robot `page` events are not sent again, and `finish_reason` and the decode's
+  warnings stay the document's. It is off by default because the evidence is one page,
+  measured after the fact: on U2-C5a's document 0789, page 3 read alone closed as a
+  5,735-character table, and the document's edit distance fell from 0.855 to 0.125. That
+  was the only capped page of 224, and across the 32 documents v2 against v1 page by page
+  moved from +0.0132 [−0.0155, +0.0615] to −0.0096 [−0.0189, −0.0022]. The option itself
+  has not yet run on real weights.
 - **GOT-OCR2 reads one region: `--box` and `--color`** (bead bd-1sj1). `--box
   x1,y1,x2,y2` (or a point `x,y`) in the input's pixels, or `--color red|green|blue`
   for a frame drawn around the text, builds the prompt upstream `chat(ocr_box=…,
@@ -630,6 +643,19 @@ sections as they land.
 
 ### Fixed
 
+- **v1 `--multi-page` warns when it writes more pages than it was given** (bead bd-17zw).
+  A v1 document decode that wrote more page bodies than pages got no warning, and those
+  outputs are badly wrong: of 32 U2-C5a documents, 7 did it, with edit distance 0.25 to
+  0.86, and one wrote 99,896 characters against 5,955 in the ground truth. Such a run now
+  gets a `v1_extra_pages` warning with `expected` and `got`, however the decode stopped,
+  and its recovery says to parse the pages independently.
+- **Unlimited-OCR-2 `--multi-page` warns when the per-page cap closes a page** (bead
+  bd-jem5). A page that runs to `--max-page-tokens` (default 20,000) is almost always a
+  runaway, yet the run finished `stop` with no warning. U2-C5a's document 0789 counted
+  "814 815 816 …" on page 3 up to the cap, and the document scored edit distance 0.855
+  where v1 reading page by page scored 0.159. Such a run now gets a `v2_page_cap` warning
+  that lists the capped pages in decode order. The run still exits 0. A served run builds
+  its warnings from the decode report the daemon returns, so it reports this one too.
 - **`--task chart` and `--task formula` pad the image to a square** (bead bd-pi74).
   GOT's upstream resize stretches every image to a square, and on these two tasks that
   costs more than quantization does, on the f32 checkpoint too. Charts with every value

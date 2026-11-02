@@ -212,6 +212,10 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
         lever("FOCR_QKV_FUSED", Ignored(INT8_DECODER_ONLY)),
         lever("FOCR_QUANT", Supported("model resolution")),
         lever(
+            "FOCR_REREAD_CAPPED_PAGES",
+            Supported("a capped page is read again alone, as a single page reads (bd-yrr1)"),
+        ),
+        lever(
             "FOCR_RESAMPLE",
             Ignored("this model's preprocessing fixes its own resampling (U2-B7)"),
         ),
@@ -657,6 +661,7 @@ mod tests {
         ("FOCR_DECODE_STATELESS", "1", Expect::Silent),
         ("FOCR_DECODE_F32", "1", Expect::Silent),
         ("FOCR_STAGE_BUDGET_FORWARD_MS", "0", Expect::Silent),
+        ("FOCR_REREAD_CAPPED_PAGES", "1", Expect::Silent),
         ("FOCR_UNLIMITED_VISION_CACHE", "0", Expect::Silent),
         ("FOCR_MEMORY_BUDGET", "12GiB", Expect::Silent),
         ("FOCR_MMAP", "1", Expect::Silent),

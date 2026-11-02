@@ -111,6 +111,11 @@ fn validate(event: &Value, fields: &Value) {
 
 /// `focr ocr <root>/pages --multi-page --robot <args>` on `artifact`.
 fn focr(root: &Path, artifact: &Path, args: &[&str]) -> Run {
+    focr_with(root, artifact, args, &[])
+}
+
+/// [`focr`] with `envs` set.
+fn focr_with(root: &Path, artifact: &Path, args: &[&str], envs: &[(&str, &str)]) -> Run {
     let output = Command::new(env!("CARGO_BIN_EXE_focr"))
         .arg("ocr")
         .arg(root.join("pages"))
@@ -120,6 +125,7 @@ fn focr(root: &Path, artifact: &Path, args: &[&str]) -> Run {
         .args(args)
         .env("HOME", root.join("home"))
         .env("FOCR_NO_RESIDENT", "1")
+        .envs(envs.iter().copied())
         .stderr(Stdio::inherit())
         .output()
         .expect("run focr");
@@ -225,6 +231,57 @@ fn an_unwindowed_run_streams_no_window() {
         (&json!(3), &json!(0))
     );
     log.assertion("unwindowed_stream", true);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// bd-yrr1: under `FOCR_REREAD_CAPPED_PAGES`, each page the 32-token cap
+/// closed is read again alone, reaches the cap again and keeps its text. The
+/// stream and the markdown are the run's without it, the decode's warnings
+/// stay the document's, and `run_complete` adds one `v2_page_reread` warning
+/// that lists every capped page as kept.
+#[test]
+fn a_capped_page_read_again_that_caps_again_keeps_its_text() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut log = Logger::new(TEST, "reread_capped");
+    let artifact = match model() {
+        Ok(artifact) => artifact,
+        Err(why) => return log.skip_no_model(&why),
+    };
+    let root = document("reread", 3);
+    let args = ["--page-window", "2"];
+    let plain = focr(&root, &artifact, &args);
+    let reread = focr_with(
+        &root,
+        &artifact,
+        &args,
+        &[("FOCR_REREAD_CAPPED_PAGES", "1")],
+    );
+    assert_eq!(plain.exit, Some(0), "{:?}", plain.last());
+    assert_eq!(reread.exit, Some(0), "{:?}", reread.last());
+
+    let capped: Vec<u64> = plain
+        .of("page")
+        .iter()
+        .filter(|page| page["finish"] == "page_cap")
+        .map(|page| page["page"].as_u64().expect("a page index"))
+        .collect();
+    assert!(!capped.is_empty(), "a 32-token cap closes a corpus page");
+    assert_eq!(plain.of("page"), reread.of("page"), "nothing streams again");
+
+    let (plain_end, reread_end) = (plain.last(), reread.last());
+    assert_eq!(reread_end["event"], "run_complete");
+    assert_eq!(plain_end["markdown"], reread_end["markdown"]);
+    assert_eq!(plain_end["finish_reason"], reread_end["finish_reason"]);
+    let warnings =
+        |end: &Value| -> Vec<Value> { end["warnings"].as_array().cloned().unwrap_or_default() };
+    let (decode, rereads): (Vec<Value>, Vec<Value>) = warnings(reread_end)
+        .into_iter()
+        .partition(|warning| warning["kind"] != "v2_page_reread");
+    assert_eq!(decode, warnings(plain_end), "the decode's warnings stay");
+    assert_eq!(rereads.len(), 1, "{rereads:?}");
+    assert_eq!(rereads[0]["pages"], json!([]));
+    assert_eq!(rereads[0]["kept"], json!(capped));
+    log.assertion("reread_capped", true);
     let _ = std::fs::remove_dir_all(&root);
 }
 
