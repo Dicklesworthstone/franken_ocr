@@ -464,9 +464,9 @@ static UNLIMITED_OCR: UnlimitedOcr = UnlimitedOcr;
 
 /// Baidu Unlimited-OCR-2: v1's vision tower and MoE decoder with SR-SWA
 /// attention and page2d RoPE. Registered so its checkpoints and artifacts are
-/// identified, census-checked and reported. [`Maturity::Experimental`] since
-/// its document loop landed (U2-B6): it runs single pages and unwindowed
-/// documents; U2-C4 certifies it `Ready`.
+/// identified, census-checked and reported. [`Maturity::Ready`] since its
+/// int8 artifact was certified (U2-C4) and published (U2-E4); it runs single
+/// pages and documents of any length, in windows.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnlimitedOcr2;
 
@@ -516,7 +516,7 @@ impl ModelArch for UnlimitedOcr2 {
         &[Task::Ocr]
     }
     fn maturity(&self) -> Maturity {
-        Maturity::Experimental
+        Maturity::Ready
     }
     fn required_quant_recipe(&self, quant: &str) -> Option<&'static str> {
         (quant == "int8").then_some(crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID)
@@ -535,12 +535,6 @@ impl ModelArch for UnlimitedOcr2 {
     }
     fn required_token_ids(&self) -> &'static [(u32, &'static str)] {
         UNLIMITED_OCR_V2_TOKENS
-    }
-    fn tokenizer_source(&self) -> Option<&'static str> {
-        Some(
-            "https://huggingface.co/baidu/Unlimited-OCR-2/blob/\
-             5632329a32e103d5f1add270681e0f5c1233c6e4/tokenizer.json",
-        )
     }
 }
 
@@ -967,12 +961,11 @@ mod tests {
                 UNLIMITED_OCR_V2_ID
             ]
         );
-        // U2-B6: every model that ran before v2 is Ready, v2 is Experimental,
-        // and the remaining descriptors are Planned; `implemented()` is
-        // exactly "not Planned" for each.
+        // Every model that runs is Ready (v2 since U2-E4 published its
+        // certified artifact), and the remaining descriptors are Planned;
+        // `implemented()` is exactly "not Planned" for each.
         for a in archs {
             let want = match a.id() {
-                UNLIMITED_OCR_V2_ID => Maturity::Experimental,
                 "trocr" | "pix2tex" => Maturity::Planned,
                 _ => Maturity::Ready,
             };
@@ -1078,12 +1071,12 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_ocr_2_is_registered_with_its_capabilities_and_experimental() {
+    fn unlimited_ocr_2_is_registered_with_its_capabilities_and_ready() {
         let v2 = arch_by_id(UNLIMITED_OCR_V2_ID).expect("unlimited-ocr-2 registered");
         assert_eq!(
             v2.maturity(),
-            Maturity::Experimental,
-            "U2-C4 certifies Ready"
+            Maturity::Ready,
+            "U2-C4 certified the artifact and U2-E4 published it"
         );
         assert!(v2.implemented(), "the U2-B6 document loop runs it");
         assert_eq!(v2.display_name(), "Baidu Unlimited-OCR-2");
@@ -1119,13 +1112,10 @@ mod tests {
         ] {
             assert!(v2.required_token_ids().contains(&required), "{required:?}");
         }
-        let source = v2
-            .tokenizer_source()
-            .expect("v2 is not published by focr pull yet");
-        assert!(source.contains("baidu/Unlimited-OCR-2"), "{source}");
-        assert!(
-            source.contains("5632329a32e103d5f1add270681e0f5c1233c6e4"),
-            "{source}"
+        assert_eq!(
+            v2.tokenizer_source(),
+            None,
+            "focr pull publishes v2 (U2-E4)"
         );
         let c = v2.decode_contract();
         assert_eq!(

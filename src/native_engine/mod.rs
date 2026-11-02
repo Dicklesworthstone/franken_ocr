@@ -859,9 +859,12 @@ pub enum WarningKind {
     V1PageMerge,
     /// A v1 multi-page decode wrote more page bodies than pages (bd-17zw).
     V1ExtraPages,
-    /// A multi-page prompt alone exceeds the position budget (an error, not a
-    /// warning; it shares the recovery text).
+    /// A v1 multi-page prompt alone exceeds the position budget (an error,
+    /// not a warning; it shares the recovery text).
     PromptTooLong,
+    /// An Unlimited-OCR-2 prompt alone exceeds its position limit: one pass
+    /// over too many pages (an error, not a warning).
+    V2PromptTooLong,
     /// A `FOCR_*` lever that reaches no path of the loaded model (U2-A7).
     IgnoredLever,
     /// An Unlimited-OCR-2 document stopped at its position limit (U2-B6).
@@ -910,19 +913,27 @@ pub const RUN_WARNING_KINDS: &[&str] = &[
     "chart_unverified",
 ];
 
-/// The one actionable next step for each [`WarningKind`]: the single source
-/// U2-E4 extends with `focr pull unlimited-ocr-2` once v2 is published.
+/// The one actionable next step for each [`WarningKind`]. v1's position
+/// budget and page merging also name the published v2 pull (U2-E4).
 #[must_use]
 pub fn warning_recovery(kind: WarningKind) -> &'static str {
     match kind {
         WarningKind::V1TruncatedPositions | WarningKind::PromptTooLong => {
-            "split the document with `--pages`, or parse pages independently (omit `--multi-page`)"
+            "split the document with `--pages`, parse pages independently (omit `--multi-page`), \
+             or read it with Unlimited-OCR-2, which reads a document of any length in windows: \
+             `focr pull unlimited-ocr-2`, then `--model unlimited-ocr-2`"
         }
         WarningKind::V1TruncatedUserCap => "raise `--max-length`",
         WarningKind::V1PageMerge => {
-            "parse pages independently (omit `--multi-page`) when page boundaries matter"
+            "parse pages independently (omit `--multi-page`) when page boundaries matter, or read \
+             it with Unlimited-OCR-2, which writes exactly one page marker per page: \
+             `focr pull unlimited-ocr-2`, then `--model unlimited-ocr-2`"
         }
         WarningKind::V1ExtraPages => "parse pages independently (omit `--multi-page`)",
+        WarningKind::V2PromptTooLong => {
+            "read it in windows (`--page-window 10`, the default, or `auto`), or split the \
+             document with `--pages`"
+        }
         WarningKind::IgnoredLever => "unset it for this model's runs",
         WarningKind::V2Length => {
             "the completed pages were written; split the document with `--pages`, or parse \
@@ -5655,7 +5666,7 @@ impl OcrModel {
                 pres.len(),
                 thousands(layout.len()),
                 thousands(params.max_positions),
-                warning_recovery(WarningKind::PromptTooLong),
+                warning_recovery(WarningKind::V2PromptTooLong),
             )));
         }
         let (inputs_embeds, prompt_ids) = self.document_inputs(pres)?;
@@ -8574,7 +8585,9 @@ mod tests {
         );
         assert_eq!(
             w["recovery"],
-            "split the document with `--pages`, or parse pages independently (omit `--multi-page`)"
+            "split the document with `--pages`, parse pages independently (omit `--multi-page`), \
+             or read it with Unlimited-OCR-2, which reads a document of any length in windows: \
+             `focr pull unlimited-ocr-2`, then `--model unlimited-ocr-2`"
         );
         let mut capped = multi_page_report(
             FinishReason::Length,
@@ -11008,7 +11021,7 @@ mod tests {
         };
         let mut blocks = std::collections::BTreeMap::new();
         let fixtures = oracle["fixtures"].as_object().unwrap();
-        assert_eq!(fixtures.len(), 9);
+        assert_eq!(fixtures.len(), 10, "S1–S4 and the 40-page S5 (U2-A6b)");
         for (name, f) in fixtures {
             let mode = match f["mode"].as_str().unwrap() {
                 "base" => preprocess::PreprocessMode::Base { base_size: 1024 },
@@ -11053,10 +11066,12 @@ mod tests {
                     .all(|(&m, &id)| m == (id == special::IMAGE))
             );
         }
+        // Base pads every page to 1024, so S5's 1191×1810 pages cost what
+        // S1–S4's 1182×1837 pages do.
         assert_eq!(
             blocks.values().copied().collect::<Vec<_>>(),
-            [273, 273 + 630],
-            "base, then gundam"
+            [273, 273, 273 + 630],
+            "base 1182×1837, base 1191×1810, then gundam"
         );
     }
 
@@ -13165,6 +13180,7 @@ mod tests {
     struct SidecarArch {
         sha256: Option<&'static str>,
         tokens: &'static [(u32, &'static str)],
+        source: Option<&'static str>,
     }
 
     impl model_arch::ModelArch for SidecarArch {
@@ -13206,6 +13222,9 @@ mod tests {
         }
         fn required_token_ids(&self) -> &'static [(u32, &'static str)] {
             self.tokens
+        }
+        fn tokenizer_source(&self) -> Option<&'static str> {
+            self.source
         }
     }
 
@@ -13265,6 +13284,7 @@ mod tests {
         let pinned = SidecarArch {
             sha256: Some(sha256_hex(bytes)),
             tokens: &[(128815, "<image>")],
+            source: None,
         };
         let tokenizer = checked_tokenizer(&pinned, bytes, "t.json").expect("the pinned sidecar");
         assert_eq!(tokenizer.image_id(), 128815);
@@ -13282,6 +13302,7 @@ mod tests {
         let needs_page = SidecarArch {
             sha256: None,
             tokens: &[(128815, "<image>"), (128827, "<PAGE>")],
+            source: None,
         };
         let message = checked_tokenizer(&needs_page, bytes, "t.json")
             .expect_err("no <PAGE> id")
@@ -13294,20 +13315,33 @@ mod tests {
         let unpinned = SidecarArch {
             sha256: None,
             tokens: &[],
+            source: None,
         };
         assert!(!pins_tokenizer(&unpinned));
         checked_tokenizer(&unpinned, other.as_bytes(), "t.json").expect("nothing pinned");
 
         // A model `focr pull` does not publish names its pinned source instead.
+        let unpublished = SidecarArch {
+            sha256: Some(sha256_hex(bytes)),
+            tokens: &[],
+            source: Some("https://huggingface.co/example/model/blob/0123abc/tokenizer.json"),
+        };
+        let message = checked_tokenizer(&unpublished, other.as_bytes(), "t.json")
+            .expect_err("a different file")
+            .to_string();
+        assert!(
+            message.contains("fetch the pinned file from https://huggingface.co/example/model/"),
+            "{message}"
+        );
+        assert!(!message.contains("focr pull"), "{message}");
+
+        // v2 is published (U2-E4): its refusal names the pull.
         let v2 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V2_ID).expect("v2 registered");
         let message = checked_tokenizer(v2, bytes, "t.json")
             .expect_err("not the v2 tokenizer")
             .to_string();
-        assert!(
-            message.contains("huggingface.co/baidu/Unlimited-OCR-2/blob/"),
-            "{message}"
-        );
-        assert!(!message.contains("focr pull"), "{message}");
+        assert!(message.contains("`focr pull unlimited-ocr-2`"), "{message}");
+        assert!(!message.contains("huggingface.co"), "{message}");
     }
 
     #[test]

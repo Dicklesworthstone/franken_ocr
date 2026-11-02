@@ -1787,13 +1787,16 @@ mod tests {
         assert!(figure_refs(cut, 999, 999, "").is_empty());
     }
 
-    /// U2-E3b over every committed U2-A6 oracle output (S1–S4): every
+    /// U2-E3b over every committed U2-A6 oracle output (S1–S5): every
     /// `<BLOCK>` parses, none of the grammar reaches the markdown, the labels
     /// are the ones the oracle emits, only titles carry a level, and boxes are
-    /// ordered corners on the 0..=999 grid.
+    /// ordered corners on the 0..=999 grid. `equation` first appears in S5
+    /// (five display formulas in MarathonDocBench `mp3lan_0778`); the
+    /// reference code names no label set, so this list is what the oracle
+    /// has been seen to emit.
     #[test]
     fn every_oracle_v2_block_parses_and_none_reaches_the_markdown() {
-        const LABELS: [&str; 12] = [
+        const LABELS: [&str; 13] = [
             "text",
             "title",
             "header",
@@ -1806,6 +1809,7 @@ mod tests {
             "image",
             "image_caption",
             "other",
+            "equation",
         ];
         let dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/uocr2_oracle");
@@ -1851,8 +1855,9 @@ mod tests {
                 }
             }
         }
-        assert_eq!(outputs, 9);
-        assert_eq!((blocks, images), (431, 5));
+        // S1–S4 hold 431 blocks and 5 images; S5 adds 181 blocks and none.
+        assert_eq!(outputs, 10);
+        assert_eq!((blocks, images), (612, 5));
 
         let raw = std::fs::read_to_string(dir.join("S1-page_0590.md")).unwrap();
         let md = finalize_multi(&raw, 1).unwrap();
@@ -1959,7 +1964,8 @@ mod tests {
                 assert_eq!(words(&texts.join("\n")), words(&markdown), "{name}");
             }
         }
-        // The 11 without text: 5 `image` and 6 `other` regions on S3.
-        assert_eq!((pages, spans, with_text), (40, 431, 420));
+        // The 11 without text: 5 `image` and 6 `other` regions on S3. S1–S4
+        // give (40, 431, 420); S5's 40 pages add 181 spans, all with text.
+        assert_eq!((pages, spans, with_text), (80, 612, 601));
     }
 }

@@ -243,8 +243,8 @@ pub struct OcrBatchArgs {
     /// OCR model (unlimited-ocr). Pass a `got-ocr2.int8.focrq` for SPECIALIZED
     /// structured output — math (LaTeX), tables, charts, molecular, geometry,
     /// sheet music (heavier per page). `focr pull got-ocr2` first. With
-    /// `--multi-page`, `unlimited-ocr-2` (experimental) reads long documents;
-    /// see `focr models`.
+    /// `--multi-page`, `unlimited-ocr-2` (`focr pull unlimited-ocr-2`) reads
+    /// long documents; see `focr models`.
     #[arg(long)]
     pub model: Option<PathBuf>,
     /// Emit one machine-readable JSON object when the run ends: every image's
@@ -263,9 +263,9 @@ pub struct OcrBatchArgs {
     /// only; v1 reads the document in one pass over 32,768 positions shared
     /// by prompt and output (≈29 dense pages); longer documents stop early
     /// and report `finish_reason: length` with a `v1_truncated` warning.
-    /// unlimited-ocr-2 (experimental) reads it in windows of 10 pages, where
-    /// a page sees the pages before it in its window, so any length fits; a
-    /// document that stops early prints its pages, then exits 5.
+    /// unlimited-ocr-2 reads it in windows of 10 pages, where a page sees the
+    /// pages before it in its window, so any length fits; a document that
+    /// stops early prints its pages, then exits 5.
     #[arg(long)]
     pub multi_page: bool,
     /// Write one JSON object per line to PATH (`-` for stderr) as the run
@@ -327,10 +327,11 @@ pub struct OcrRequestArgs {
     /// The model to run: a model id (`unlimited-ocr`, `unlimited-ocr-2`, …)
     /// found in the model directories, or an artifact path. Default: the
     /// mode's default, unlimited-ocr for every mode today. unlimited-ocr-2 is
-    /// Baidu's experimental long-document successor: use it for documents and
-    /// long documents (a PDF or directory, with `--multi-page`). Single pages
-    /// work with either. unlimited-ocr stays the default until unlimited-ocr-2
-    /// passes its accuracy gates; see `focr models`.
+    /// Baidu's long-document successor (`focr pull unlimited-ocr-2`): use it
+    /// for documents and long documents (a PDF or directory, with
+    /// `--multi-page`). Single pages work with either. unlimited-ocr stays the
+    /// default until unlimited-ocr-2 passes its default gates; see `focr
+    /// models`.
     #[arg(long)]
     pub model: Option<PathBuf>,
     /// Global-view edge length. Default: the model's (1024, the reference
@@ -435,11 +436,10 @@ pub struct OcrRequestArgs {
     /// holds every raster. Composes with `--pages`. v1 reads the document in
     /// one pass over 32,768 positions shared by prompt and output (≈29 dense
     /// pages); longer documents stop early and report `finish_reason: length`
-    /// with a `v1_truncated` warning. unlimited-ocr-2 (experimental) reads it
-    /// in windows of 10 pages, where a page sees the pages before it in its
-    /// window, so any length fits; a document that stops early writes its
-    /// pages, then exits 5. Without this flag each page is parsed
-    /// independently.
+    /// with a `v1_truncated` warning. unlimited-ocr-2 reads it in windows of
+    /// 10 pages, where a page sees the pages before it in its window, so any
+    /// length fits; a document that stops early writes its pages, then exits
+    /// 5. Without this flag each page is parsed independently.
     #[arg(long)]
     pub multi_page: bool,
     /// How unlimited-ocr-2 splits a `--multi-page` document into decode
@@ -4373,7 +4373,7 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
             "models": models,
             "guidance": {
                 "unlimited-ocr": "default runtime; FAST plain-text OCR; `focr pull` installs the conservative exact-recipe int8 artifact",
-                "unlimited-ocr-2": "experimental; best for documents and long documents: Baidu's long-document successor (SR-SWA); runs from its raw checkpoint (`--model unlimited-ocr-2` once it is in a model directory, or `--model <dir>`) on single pages and on documents of any length (`--multi-page`, in windows of 10 pages), not yet certified against the reference — use unlimited-ocr for production",
+                "unlimited-ocr-2": "best for documents and long documents: Baidu's long-document successor (SR-SWA); `focr pull unlimited-ocr-2` installs its certified int8 artifact, then `--model unlimited-ocr-2` reads single pages and documents of any length (`--multi-page`, in windows of 10 pages); `--model <dir>` also runs a raw checkpoint; unlimited-ocr stays the default until unlimited-ocr-2 passes its default gates",
                 "got-ocr2": "specialized structured output the default can't produce — math (LaTeX), tables, charts, molecular (SMILES), geometry, sheet music; heavier per page, use when you need FORMAT not plain text; shorthand: `focr ocr --task formula|tables|chart|molecular|geometry|music` (implies `--format`)"
             },
         }));
@@ -4421,11 +4421,11 @@ fn run_models(args: &ModelsArgs) -> FocrResult<()> {
         println!("Choosing a model:");
         println!("  unlimited-ocr (default)  FAST plain-text OCR. `focr pull` installs the");
         println!("                           conservative exact-recipe int8 artifact.");
-        println!("  unlimited-ocr-2          EXPERIMENTAL. Best for documents and long documents");
+        println!("  unlimited-ocr-2          Best for documents and long documents");
         println!("                           (`--multi-page` over a PDF or a directory of pages).");
-        println!("                           Runs from its raw checkpoint; not yet certified");
-        println!("                           against the reference, so unlimited-ocr stays the");
-        println!("                           default.");
+        println!("                           `focr pull unlimited-ocr-2`, then");
+        println!("                           `--model unlimited-ocr-2`. unlimited-ocr stays the");
+        println!("                           default until it passes its default gates.");
         println!(
             "  got-ocr2                 SPECIALIZED structured output the default can't produce:"
         );
@@ -6846,6 +6846,36 @@ mod tests {
                     .contains("run `focr pull` to install the compatible conservative default"),
                 "{requested:?}"
             );
+        }
+    }
+
+    /// U2-E4: v1's position budget, page merging and prompt-too-long error
+    /// name the v2 pull exactly when the embedded manifest publishes a
+    /// compatible one; v2's own stops never send a v2 run to `focr pull`.
+    #[test]
+    fn v1_recoveries_name_the_v2_pull_exactly_when_it_is_published() {
+        use native_engine::{WarningKind, warning_recovery};
+        let manifest = crate::dist::builtin_manifest().expect("embedded manifest parses");
+        let published = !pull_availability(Some(&manifest), V2).compatible.is_empty();
+        for kind in [
+            WarningKind::V1TruncatedPositions,
+            WarningKind::V1PageMerge,
+            WarningKind::PromptTooLong,
+        ] {
+            let recovery = warning_recovery(kind);
+            assert_eq!(
+                recovery.contains("`focr pull unlimited-ocr-2`, then `--model unlimited-ocr-2`"),
+                published,
+                "{kind:?}: {recovery}"
+            );
+        }
+        for kind in [
+            WarningKind::V2PromptTooLong,
+            WarningKind::V2Length,
+            WarningKind::V2Budget,
+            WarningKind::V2PageCap,
+        ] {
+            assert!(!warning_recovery(kind).contains("focr pull"), "{kind:?}");
         }
     }
 

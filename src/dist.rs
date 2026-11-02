@@ -3283,7 +3283,13 @@ mod tests {
         legacy.recipe = UNLIMITED_OCR_LEGACY_FULL_INT8_RECIPE.into();
         validate_quant_compatibility(&m.model, DEFAULT_QUANT, &legacy)
             .expect_err("historical full-int8 artifacts must remain fail-closed");
-        for id in ["got-ocr2", "smolvlm2", "onechart", "tromr"] {
+        for id in [
+            "got-ocr2",
+            "smolvlm2",
+            "onechart",
+            "tromr",
+            crate::model_arch::UNLIMITED_OCR_V2_ID,
+        ] {
             assert!(m.models.contains_key(id), "manifest missing model {id}");
         }
         // Runtime-required sidecar sets (the anti-broken-pull contract; the
@@ -3318,6 +3324,64 @@ mod tests {
         assert_eq!(oc_sidecars, vec!["added_tokens.json", "merges.txt"]);
         assert_eq!(m.models["smolvlm2"].tokenizer.filename, "tokenizer.json");
         assert!(m.models["smolvlm2"].sidecars.is_empty());
+
+        // U2-E4: Unlimited-OCR-2's certified artifact (U2-C4), its three
+        // release parts and its own tokenizer, mirror first as for v1.
+        let v2 = &m.models[crate::model_arch::UNLIMITED_OCR_V2_ID];
+        assert_eq!(v2.version.as_deref(), Some("0.1.0"));
+        let v2_int8 = &v2.quants["int8"];
+        assert_eq!(
+            v2_int8.recipe,
+            crate::quant::convert::UNLIMITED_OCR_2_INT8_RECIPE_ID
+        );
+        assert_eq!(v2_int8.focrq.filename, "unlimited-ocr-2.v0.1.0.int8.focrq");
+        assert_eq!(v2_int8.focrq.size, 4_173_206_653);
+        assert_eq!(
+            v2_int8.focrq.sha256,
+            "54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398"
+        );
+        let v2_parts = [
+            (
+                1_391_068_885,
+                "9e940a5891b6abcbfc87594c3dc943ed80cd835083d332758f62763606e0b227",
+            ),
+            (
+                1_391_068_885,
+                "111efd9e7f7b6fbdf1efbf7101438bf79c4222aacaef18f1a9c9a2bf92ba3cd6",
+            ),
+            (
+                1_391_068_883,
+                "34bd2eba13ce4afe75a90fd21710149476d0cc0f89c285449cd22b4466aeca02",
+            ),
+        ];
+        assert_eq!(v2_int8.focrq.parts.len(), v2_parts.len());
+        for (index, (part, (size, sha256))) in v2_int8.focrq.parts.iter().zip(v2_parts).enumerate()
+        {
+            let filename = format!("unlimited-ocr-2.v0.1.0.int8.focrq.part{index:02}");
+            assert_eq!((part.size, part.sha256.as_str()), (size, sha256));
+            assert_eq!(part.urls.len(), 2);
+            assert!(part.urls.iter().all(|url| url.ends_with(&filename)));
+            assert!(
+                part.urls[0].starts_with("https://huggingface.co/")
+                    && part.urls[0].contains("/resolve/"),
+                "{filename}: primary url is not the HuggingFace mirror: {}",
+                part.urls[0]
+            );
+            assert!(
+                part.urls[1].contains("/releases/download/models-unlimited-ocr-2-v1/"),
+                "{filename}: fallback url is not the pinned GitHub release: {}",
+                part.urls[1]
+            );
+        }
+        // v2's tokenizer is the one its arch pins, never v1's.
+        assert_eq!(v2.tokenizer.filename, "tokenizer.json");
+        assert_eq!(v2.tokenizer.size, 9_980_278);
+        assert_eq!(
+            v2.tokenizer.sha256,
+            crate::model_arch::UNLIMITED_OCR_V2_TOKENIZER_SHA256
+        );
+        assert_ne!(v2.tokenizer.sha256, m.tokenizer.sha256);
+        assert!(v2.sidecars.is_empty());
 
         // The lint, over every file of every model.
         let lint = |file: &RemoteFile, ctx: &str| {

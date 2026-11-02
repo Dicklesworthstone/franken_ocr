@@ -2468,7 +2468,7 @@ mod uocr2_guard_tests {
         let oracle: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("ORACLE.json")).unwrap()).unwrap();
         let fixtures = oracle["fixtures"].as_object().unwrap();
-        assert_eq!(fixtures.len(), 9);
+        assert_eq!(fixtures.len(), 10, "S1–S4 and the 40-page S5 (U2-A6b)");
         let page = crate::tokenizer::special::PAGE;
         for (name, f) in fixtures {
             let ids: Vec<u32> = std::fs::read_to_string(dir.join(format!("{name}.ids.txt")))
