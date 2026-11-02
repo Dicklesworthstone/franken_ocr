@@ -182,8 +182,17 @@ CORPUS_PAGES = (
 )
 
 
-def fixture_sets() -> dict[str, list[Case]]:
-    return {
+def doc_dir_pages(directory: Path) -> list[Path]:
+    """A document directory's PNG pages in natural order (p2.png before p10.png)."""
+    def key(path: Path) -> list[Any]:
+        return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", path.name)]
+
+    return sorted(directory.glob("*.png"), key=key)
+
+
+def fixture_sets(s5: Case | None = None) -> dict[str, list[Case]]:
+    """The fixture sets. S5 (bead U2-A6b) exists only with `--doc-dir`."""
+    return ({"S5": [s5]} if s5 is not None else {}) | {
         "S1": [
             Case("S1-page_0590", ("page_0590.png",), False),
             Case("S1-page_0009", ("page_0009.png",), False),
@@ -201,6 +210,22 @@ def fixture_sets() -> dict[str, list[Case]]:
         ],
         "S1C": [Case(f"S1C-{page.removesuffix('.png')}", (page,), False) for page in CORPUS_PAGES],
     }
+
+
+def doc_dir_case(spec: str, corpus: Path) -> Case | None:
+    """`--doc-dir NAME=SUBDIR`: fixture S5-NAME, the PNG pages of `<corpus>/SUBDIR` in natural
+    order, or None when it is absent. The pages stay under the corpus and are named relative
+    to it, like every other fixture's, so the parity rungs and the provenance checker find
+    them by `corpus / name`. Nothing that lists the corpus descends into a subdirectory."""
+    if not spec:
+        return None
+    name, sep, subdir = spec.partition("=")
+    if not sep or not name or not subdir or Path(subdir).is_absolute() or ".." in Path(subdir).parts:
+        raise SystemExit(f"--doc-dir takes NAME=SUBDIR with SUBDIR under --corpus, not {spec!r}")
+    pages = doc_dir_pages(corpus / subdir)
+    if not pages:
+        raise SystemExit(f"--doc-dir: {corpus / subdir} has no PNG pages")
+    return Case(f"S5-{name}", tuple(f"{Path(subdir).as_posix()}/{p.name}" for p in pages), False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -359,6 +384,48 @@ def self_test(windowed: bool = False) -> int:
 
     body = ids_text("m", "f", list(range(20)))
     check("ids_text_matches_the_v1_golden_layout", body.splitlines()[0] == "# m generated token ids: f (20 ids)" and body.splitlines()[2] == "16 17 18 19")
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "doc").mkdir()
+        for name in ("p10.png", "p2.png", "p1.png", "notes.txt"):
+            (root / "doc" / name).write_bytes(b"")
+        check("doc_dir_pages_are_pngs_in_natural_order", [p.name for p in doc_dir_pages(root / "doc")] == ["p1.png", "p2.png", "p10.png"])
+        sets = fixture_sets(doc_dir_case("d=doc", root))
+        check(
+            "s5_exists_only_with_a_doc_dir_and_names_its_pages_relative_to_the_corpus",
+            "S5" not in fixture_sets() and [c.fixture for c in sets["S5"]] == ["S5-d"] and sets["S5"][0].pages == ("doc/p1.png", "doc/p2.png", "doc/p10.png"),
+        )
+        refused = []
+        for spec in (f"d={root / 'doc'}", "d=../doc", "d=", "doc"):
+            try:
+                doc_dir_case(spec, root)
+            except SystemExit:
+                refused.append(spec)
+        check("doc_dir_refuses_paths_outside_the_corpus", len(refused) == 4)
+
+        def reference(fixture: str, run: str) -> dict[str, Any]:
+            return {
+                "doc": fixture, "mode": "base", "pages": [], "params": {}, "prompt_token_ids": [1], "token_ids": [2],
+                "token_ids_sha256": ids_sha256([2]), "decoded_text": "x", "decoded_text_sha256": sha256_bytes(b"x"),
+                "finish_reason": "stop", "num_pages_out": 1, "expected_pages": 1, "counters": {}, "routing": {},
+                "provenance": {"exact_command": run},
+            }
+
+        line = {"dtype": "f32", "threads": 12, "tag": "t12", "wall_s": 1.0}
+        commit_case(root / "c", reference("S1-a", "first"), line)
+        commit_case(root / "c", reference("S1-b", "first"), line)
+        commit_case(root / "c", reference("S5-d", "second"), line)
+        oracle = json.loads((root / "c" / "ORACLE.json").read_text())
+        check(
+            "a_later_run_keeps_the_first_provenance_and_records_its_own_per_fixture",
+            oracle["provenance"] == {"exact_command": "first"}
+            and "provenance" not in oracle["fixtures"]["S1-a"]
+            and "provenance" not in oracle["fixtures"]["S1-b"]
+            and oracle["fixtures"]["S5-d"]["provenance"] == {"exact_command": "second"},
+        )
     if windowed:
         windowed_self_test(check)
     return 0 if ok else 1
@@ -880,9 +947,10 @@ def run_case(ctx: dict[str, Any], case: Case, args: argparse.Namespace) -> dict[
     inputs = []
     from PIL import Image
 
-    for p in paths:
+    # Named as the case names them, relative to the corpus (S5's carry their subdirectory).
+    for name, p in zip(case.pages, paths):
         with Image.open(p) as im:
-            inputs.append({"name": p.name, "sha256": sha256_file(p), "bytes": p.stat().st_size, "width": im.width, "height": im.height})
+            inputs.append({"name": name, "sha256": sha256_file(p), "bytes": p.stat().st_size, "width": im.width, "height": im.height})
 
     params = {
         "prompt": "",
@@ -1020,7 +1088,9 @@ def commit_case(commit_dir: Path, reference: dict[str, Any], line: dict[str, Any
     (commit_dir / f"{fixture}.md").write_text(reference["decoded_text"])
     path = commit_dir / "ORACLE.json"
     doc = json.loads(path.read_text()) if path.exists() else {"schema_version": 1, "fixtures": {}}
-    doc["provenance"] = reference["provenance"]
+    # The top-level provenance is the run that wrote the first fixtures. A fixture from
+    # another run (S5 came after S1-S4) carries its own, so neither is overwritten.
+    doc.setdefault("provenance", reference["provenance"])
     doc["fixtures"][fixture] = {
         "mode": reference["mode"],
         "pages": reference["pages"],
@@ -1037,6 +1107,8 @@ def commit_case(commit_dir: Path, reference: dict[str, Any], line: dict[str, Any
         "routing": reference["routing"],
         "run": {k: line[k] for k in ("dtype", "threads", "tag", "wall_s")},
     }
+    if reference["provenance"] != doc["provenance"]:
+        doc["fixtures"][fixture]["provenance"] = reference["provenance"]
     doc["fixtures"] = dict(sorted(doc["fixtures"].items()))
     path.write_text(json.dumps(doc, indent=1, ensure_ascii=False) + "\n")
 
@@ -3082,6 +3154,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out", type=Path, help="dump root (FOCR_FIXTURES_DIR/uocr2_oracle)")
     p.add_argument("--sets", default="S1,S2,S3,S4", help="comma-separated fixture sets")
     p.add_argument("--only", default="", help="comma-separated fixture ids within --sets")
+    p.add_argument("--doc-dir", default="", metavar="NAME=SUBDIR", help="set S5 (bead U2-A6b): fixture S5-NAME, one base-mode document of the PNG pages in <corpus>/SUBDIR, in natural order")
     p.add_argument("--dtype", choices=("f32", "bf16"), default="f32")
     p.add_argument("--threads", type=int, required=False, default=12)
     p.add_argument("--tag", default="", help="run tag (default t<threads>)")
@@ -3110,6 +3183,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                 p.error(f"--windowed-check: unknown checks {sorted(unknown)}")
     elif args.doc or args.force_fallback or args.windowed_check:
         p.error("--doc, --force-fallback and --windowed-check need --windowed")
+    if ("S5" in args.sets.split(",")) != bool(args.doc_dir) and args.windowed is None and not args.self_test:
+        p.error("set S5 and --doc-dir go together")
     if not args.self_test:
         if args.model_dir is None or (args.out is None and not args.gundam_grids):
             p.error("--model-dir and --out are required")
@@ -3204,7 +3279,7 @@ def main(argv: list[str] | None = None) -> int:
     cap.install()
     ctx = {"torch": torch, "np": np, "model": model, "tok": tok, "cap": cap, "provenance": provenance}
     args.out.mkdir(parents=True, exist_ok=True)
-    sets = fixture_sets()
+    sets = fixture_sets(doc_dir_case(args.doc_dir, args.corpus))
     only = {s for s in args.only.split(",") if s}
     cases = [c for name in args.sets.split(",") for c in sets[name] if not only or c.fixture in only]
     if only - {c.fixture for c in cases}:

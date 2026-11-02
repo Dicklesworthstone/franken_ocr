@@ -646,10 +646,29 @@ def uocr2_record_failures(
 ) -> list[str]:
     """Every problem with the committed v2 oracle twin. `files` maps the committed
     file names to their bytes; `corpus`, when present, holds the input pages."""
-    problems: list[str] = []
     prov = doc.get("provenance")
     if not isinstance(prov, dict):
         return ["ORACLE.json: missing provenance"]
+    problems = uocr2_provenance_failures(prov, source_pins)
+    fixtures = doc.get("fixtures")
+    if not isinstance(fixtures, dict) or not fixtures:
+        return problems + ["ORACLE.json: no fixtures"]
+    for fixture, entry in sorted(fixtures.items()):
+        where = f"{fixture}:"
+        # A fixture written by a later run than the top-level one carries its own provenance.
+        if "provenance" in entry:
+            own = entry["provenance"]
+            if not isinstance(own, dict):
+                problems.append(f"{where} provenance is not an object")
+            else:
+                problems += [f"{where} {p}" for p in uocr2_provenance_failures(own, source_pins)]
+        problems += uocr2_entry_failures(fixture, entry, files, corpus)
+    return problems
+
+
+def uocr2_provenance_failures(prov: dict[str, Any], source_pins: dict[str, str]) -> list[str]:
+    """Every problem with one run's provenance: stack, pins, dtype, determinism, model files."""
+    problems: list[str] = []
     pinned = {"python": UOCR2_PIN_PYTHON, "torch": UOCR2_PIN_TORCH, "transformers": UOCR2_PIN_TRANSFORMERS, "tokenizers": UOCR2_PIN_TOKENIZERS, "huggingface_hub": UOCR2_PIN_HF_HUB}
     if prov.get("pinned") != pinned:
         problems.append(f"provenance.pinned {prov.get('pinned')} != {pinned}")
@@ -680,62 +699,63 @@ def uocr2_record_failures(
                 problems.append(f"model file {name}: {got} is not the SOURCE_HASHES.md pin {source_pins.get(name)}")
         if not {"model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors", "modeling_unlimitedocr.py"} <= set(model_files):
             problems.append("provenance.model_files_sha256 must cover both shards and the remote code")
+    return problems
 
-    fixtures = doc.get("fixtures")
-    if not isinstance(fixtures, dict) or not fixtures:
-        return problems + ["ORACLE.json: no fixtures"]
-    for fixture, entry in sorted(fixtures.items()):
-        where = f"{fixture}:"
-        pages = entry.get("pages")
-        if not isinstance(pages, list) or not pages:
-            problems.append(f"{where} no pages")
-            continue
-        for page in pages:
-            if not (isinstance(page, dict) and isinstance(page.get("sha256"), str) and HEX64.match(page["sha256"])):
-                problems.append(f"{where} page without a sha256: {page}")
-            elif corpus is not None and (corpus / page["name"]).is_file() and sha256_file(corpus / page["name"]) != page["sha256"]:
-                problems.append(f"{where} input {page['name']} no longer matches its recorded sha256")
-        params = entry.get("params") if isinstance(entry.get("params"), dict) else {}
-        window = UOCR2_NGRAM_WINDOW_SINGLE if len(pages) == 1 else UOCR2_NGRAM_WINDOW_MULTI
-        want_params = {
-            "no_repeat_ngram_size": UOCR2_NGRAM_SIZE,
-            "ngram_window": window,
-            "max_page_tokens": UOCR2_MAX_PAGE_TOKENS,
-            "page_count_guard": True,
-            "temperature": 0.0,
-            "crop_mode": entry.get("mode") == "gundam",
-            "max_new_tokens": None,
-        }
-        for key, want in want_params.items():
-            if params.get(key, "absent") != want:
-                problems.append(f"{where} params.{key} {params.get(key, 'absent')!r} != {want!r}")
-        counters = entry.get("counters") if isinstance(entry.get("counters"), dict) else {}
-        hits = counters.get("disc_u2_2_all_neg_inf_steps")
-        if not is_json_int(hits) or hits != 0:
-            problems.append(f"{where} DISC-U2-2 all-(-inf) steps {hits!r} (must be recorded, and 0)")
-        routing = entry.get("routing") if isinstance(entry.get("routing"), dict) else {}
-        for key in ("route_replica_mismatches", "kbar_replica_mismatches"):
-            if routing.get(key) != 0:
-                problems.append(f"{where} routing.{key} {routing.get(key)!r} != 0")
-        if routing.get("stage0") != ["head_cls"]:
-            problems.append(f"{where} routing.stage0 {routing.get('stage0')!r} != ['head_cls']")
-        if entry.get("finish_reason") == "stop" and not (
-            is_json_int(entry.get("num_pages_out")) and is_json_int(entry.get("expected_pages")) and entry["num_pages_out"] >= entry["expected_pages"] == len(pages)
-        ):
-            problems.append(f"{where} stopped with {entry.get('num_pages_out')} of {entry.get('expected_pages')} pages")
-        ids_name, md_name = f"{fixture}.ids.txt", f"{fixture}.md"
-        if ids_name not in files:
-            problems.append(f"{where} {ids_name} missing")
-        else:
-            ids = uocr2_parse_ids(fixture, files[ids_name].decode("utf-8", errors="replace"))
-            if isinstance(ids, str):
-                problems.append(f"{where} {ids_name}: {ids}")
-            elif len(ids) != entry.get("token_count") or uocr2_ids_sha256(ids) != entry.get("token_ids_sha256"):
-                problems.append(f"{where} {ids_name} does not match token_count/token_ids_sha256")
-        if md_name not in files:
-            problems.append(f"{where} {md_name} missing")
-        elif hashlib.sha256(files[md_name]).hexdigest() != entry.get("decoded_text_sha256"):
-            problems.append(f"{where} {md_name} does not match decoded_text_sha256")
+
+def uocr2_entry_failures(fixture: str, entry: dict[str, Any], files: dict[str, bytes], corpus: Path | None) -> list[str]:
+    """Every problem with one fixture's ORACLE.json entry and its committed files."""
+    problems: list[str] = []
+    where = f"{fixture}:"
+    pages = entry.get("pages")
+    if not isinstance(pages, list) or not pages:
+        problems.append(f"{where} no pages")
+        return problems
+    for page in pages:
+        if not (isinstance(page, dict) and isinstance(page.get("sha256"), str) and HEX64.match(page["sha256"])):
+            problems.append(f"{where} page without a sha256: {page}")
+        elif corpus is not None and (corpus / page["name"]).is_file() and sha256_file(corpus / page["name"]) != page["sha256"]:
+            problems.append(f"{where} input {page['name']} no longer matches its recorded sha256")
+    params = entry.get("params") if isinstance(entry.get("params"), dict) else {}
+    window = UOCR2_NGRAM_WINDOW_SINGLE if len(pages) == 1 else UOCR2_NGRAM_WINDOW_MULTI
+    want_params = {
+        "no_repeat_ngram_size": UOCR2_NGRAM_SIZE,
+        "ngram_window": window,
+        "max_page_tokens": UOCR2_MAX_PAGE_TOKENS,
+        "page_count_guard": True,
+        "temperature": 0.0,
+        "crop_mode": entry.get("mode") == "gundam",
+        "max_new_tokens": None,
+    }
+    for key, want in want_params.items():
+        if params.get(key, "absent") != want:
+            problems.append(f"{where} params.{key} {params.get(key, 'absent')!r} != {want!r}")
+    counters = entry.get("counters") if isinstance(entry.get("counters"), dict) else {}
+    hits = counters.get("disc_u2_2_all_neg_inf_steps")
+    if not is_json_int(hits) or hits != 0:
+        problems.append(f"{where} DISC-U2-2 all-(-inf) steps {hits!r} (must be recorded, and 0)")
+    routing = entry.get("routing") if isinstance(entry.get("routing"), dict) else {}
+    for key in ("route_replica_mismatches", "kbar_replica_mismatches"):
+        if routing.get(key) != 0:
+            problems.append(f"{where} routing.{key} {routing.get(key)!r} != 0")
+    if routing.get("stage0") != ["head_cls"]:
+        problems.append(f"{where} routing.stage0 {routing.get('stage0')!r} != ['head_cls']")
+    if entry.get("finish_reason") == "stop" and not (
+        is_json_int(entry.get("num_pages_out")) and is_json_int(entry.get("expected_pages")) and entry["num_pages_out"] >= entry["expected_pages"] == len(pages)
+    ):
+        problems.append(f"{where} stopped with {entry.get('num_pages_out')} of {entry.get('expected_pages')} pages")
+    ids_name, md_name = f"{fixture}.ids.txt", f"{fixture}.md"
+    if ids_name not in files:
+        problems.append(f"{where} {ids_name} missing")
+    else:
+        ids = uocr2_parse_ids(fixture, files[ids_name].decode("utf-8", errors="replace"))
+        if isinstance(ids, str):
+            problems.append(f"{where} {ids_name}: {ids}")
+        elif len(ids) != entry.get("token_count") or uocr2_ids_sha256(ids) != entry.get("token_ids_sha256"):
+            problems.append(f"{where} {ids_name} does not match token_count/token_ids_sha256")
+    if md_name not in files:
+        problems.append(f"{where} {md_name} missing")
+    elif hashlib.sha256(files[md_name]).hexdigest() != entry.get("decoded_text_sha256"):
+        problems.append(f"{where} {md_name} does not match decoded_text_sha256")
     return problems
 
 
@@ -882,6 +902,11 @@ def uocr2_self_test() -> bool:
     good = uocr2_record_failures(doc, files, pins, None)
     emit("uocr2-oracle-self-test-good", not good, failures=good)
     ok = not good
+    later = copy.deepcopy(doc)
+    later["fixtures"]["S1-page_0009"]["provenance"] = dict(copy.deepcopy(doc["provenance"]), script_sha256="6" * 64)
+    good_later = uocr2_record_failures(later, files, pins, None)
+    emit("uocr2-oracle-self-test-good-fixture-provenance", not good_later, failures=good_later)
+    ok = ok and not good_later
     entry = ("fixtures", "S1-page_0009")
     bad_cases = [
         ("v1-torch-pin", lambda d, f: d["provenance"]["stack"].update(torch="2.10.0")),
@@ -901,6 +926,8 @@ def uocr2_self_test() -> bool:
         ("markdown-edited", lambda d, f: f.update({"S1-page_0009.md": b"<PAGE>"})),
         ("markdown-missing", lambda d, f: f.pop("S1-page_0009.md")),
         ("page-hash-missing", lambda d, f: d[entry[0]][entry[1]]["pages"][0].pop("sha256")),
+        ("fixture-provenance-bf16", lambda d, f: d[entry[0]][entry[1]].update(provenance=dict(copy.deepcopy(d["provenance"]), dtype="bf16"))),
+        ("fixture-provenance-not-an-object", lambda d, f: d[entry[0]][entry[1]].update(provenance="t12")),
     ]
     for case, mutate in bad_cases:
         d, f = copy.deepcopy(doc), dict(files)
