@@ -1213,6 +1213,54 @@ fn page_reread_warning(replaced: &[usize], kept: &[(usize, String)]) -> Option<R
     })
 }
 
+/// Read again, with `reread`, each page of `document` the per-page cap
+/// closed ([`DocumentOptions::reread_capped`], bd-yrr1), and join the
+/// document's text again when a re-read replaced one. `reread` returns the
+/// page's replacement, or why the document's page stays. A shutdown request
+/// ends the re-reads, and the pages left keep their text. Returns the
+/// document and its `v2_page_reread` warning, `None` when no page was
+/// capped.
+fn reread_capped_pages(
+    document: DocumentPages,
+    mut reread: impl FnMut(&PageResult) -> Result<PageResult, String>,
+) -> (DocumentPages, Option<RunWarning>) {
+    let DocumentPages {
+        markdown,
+        raw,
+        mut pages,
+    } = document;
+    let mut replaced = Vec::new();
+    let mut kept = Vec::new();
+    for page in pages
+        .iter_mut()
+        .filter(|page| page.finish == Some(PageFinish::PageCap))
+    {
+        let fresh = if crate::shutdown_requested() {
+            Err("a shutdown was requested before its re-read".to_owned())
+        } else {
+            reread(page)
+        };
+        match fresh {
+            Ok(fresh) => {
+                replaced.push(page.run_index);
+                *page = fresh;
+            }
+            Err(why) => kept.push((page.run_index, why)),
+        }
+    }
+    let warning = page_reread_warning(&replaced, &kept);
+    let document = if replaced.is_empty() {
+        DocumentPages {
+            markdown,
+            raw,
+            pages,
+        }
+    } else {
+        DocumentPages::joined(pages)
+    };
+    (document, warning)
+}
+
 /// An Unlimited-OCR-2 document decode's warnings (U2-B6), never v1's: the
 /// head before the first `<PAGE>` joined to page 1 (DISC-U2-9), and a stop
 /// at the position limit or the stage budget, with the page bodies produced.
@@ -5164,7 +5212,7 @@ impl OcrModel {
             },
             reread,
         ) = if options.reread_capped {
-            let reread = self.reread_capped_pages(source, document);
+            let reread = reread_capped_pages(document, |page| self.reread_page(source, page));
             if let Ok(mut slot) = self.last_decode.lock() {
                 slot.clone_from(&report);
             }
@@ -5364,54 +5412,6 @@ impl OcrModel {
         } else {
             preprocess::preprocess_dynamic_squash(img, MULTI_PAGE_BASE_SIZE)
         }
-    }
-
-    /// Read again, alone, each page of `document` the per-page cap closed
-    /// ([`DocumentOptions::reread_capped`], bd-yrr1), and join the
-    /// document's text again when a re-read replaced one. A shutdown request
-    /// ends the re-reads, and the pages left keep their text. Returns the
-    /// document and its `v2_page_reread` warning, `None` when no page was
-    /// capped.
-    fn reread_capped_pages(
-        &self,
-        source: &crate::page_source::PageSource,
-        document: DocumentPages,
-    ) -> (DocumentPages, Option<RunWarning>) {
-        let DocumentPages {
-            markdown,
-            raw,
-            mut pages,
-        } = document;
-        let mut replaced = Vec::new();
-        let mut kept = Vec::new();
-        for page in pages
-            .iter_mut()
-            .filter(|page| page.finish == Some(PageFinish::PageCap))
-        {
-            let reread = if crate::shutdown_requested() {
-                Err("a shutdown was requested before its re-read".to_owned())
-            } else {
-                self.reread_page(source, page)
-            };
-            match reread {
-                Ok(fresh) => {
-                    replaced.push(page.run_index);
-                    *page = fresh;
-                }
-                Err(why) => kept.push((page.run_index, why)),
-            }
-        }
-        let warning = page_reread_warning(&replaced, &kept);
-        let document = if replaced.is_empty() {
-            DocumentPages {
-                markdown,
-                raw,
-                pages,
-            }
-        } else {
-            DocumentPages::joined(pages)
-        };
-        (document, warning)
     }
 
     /// `page` read again alone: rasterized again from `source` and decoded
@@ -8264,6 +8264,76 @@ mod tests {
         assert_eq!(kept.to_json()["pages"], serde_json::json!([]));
         assert_eq!(kept.to_json()["kept"], serde_json::json!([4]));
         assert!(RUN_WARNING_KINDS.contains(&"v2_page_reread"));
+    }
+
+    /// bd-yrr1 acceptance: pages ending [marker, page_cap, marker] are read
+    /// again exactly once, page 2, and its re-read replaces page 2's text
+    /// alone, in its page and in the joined markdown and raw. A failed
+    /// re-read keeps the document as it was, and a document with no capped
+    /// page is never read again.
+    #[test]
+    fn only_the_capped_page_is_read_again_and_spliced_in() {
+        use PageFinish::{Eos, Marker, PageCap};
+        let page = |k: usize, body: &str, finish| PageResult {
+            finish: Some(finish),
+            ..PageResult::read(
+                k,
+                body,
+                (100, 100),
+                PageOrigin {
+                    source_page: k,
+                    half: None,
+                },
+                model_arch::UNLIMITED_OCR_V2_ID,
+            )
+        };
+        let capped = || {
+            DocumentPages::joined(vec![
+                page(1, "First page.", Marker),
+                page(2, "814 815 816 817 818", PageCap),
+                page(3, "Third page.", Marker),
+            ])
+        };
+
+        let mut calls = Vec::new();
+        let (document, warning) = reread_capped_pages(capped(), |p| {
+            calls.push(p.run_index);
+            Ok(page(p.run_index, "A table, read alone.", Eos))
+        });
+        assert_eq!(calls, [2], "one re-read, of page 2");
+        let before = capped();
+        assert_eq!(document.pages[0], before.pages[0]);
+        assert_eq!(document.pages[1], page(2, "A table, read alone.", Eos));
+        assert_eq!(document.pages[2], before.pages[2]);
+        let joined = DocumentPages::joined(document.pages.clone());
+        assert_eq!(document.markdown, joined.markdown);
+        assert_eq!(document.raw, joined.raw);
+        assert!(!document.markdown.contains("814") && !document.raw.contains("814"));
+        let w = warning.expect("a replaced page warns").to_json();
+        assert_eq!(
+            (&w["pages"], &w["kept"]),
+            (&serde_json::json!([2]), &serde_json::json!([]))
+        );
+
+        let (kept, warning) = reread_capped_pages(capped(), |_| {
+            Err("its re-read reached the cap again".to_owned())
+        });
+        assert_eq!(kept.pages, before.pages);
+        assert_eq!((kept.markdown, kept.raw), (before.markdown, before.raw));
+        let w = warning.expect("a kept page warns").to_json();
+        assert_eq!(
+            (&w["pages"], &w["kept"]),
+            (&serde_json::json!([]), &serde_json::json!([2]))
+        );
+
+        let plain =
+            || DocumentPages::joined(vec![page(1, "First page.", Marker), page(2, "Last.", Eos)]);
+        let (same, warning) = reread_capped_pages(plain(), |_| panic!("no capped page to read"));
+        assert_eq!(
+            (same.pages, same.markdown),
+            (plain().pages, plain().markdown)
+        );
+        assert!(warning.is_none());
     }
 
     /// bd-jem5: the pages the per-page cap closed earn one `v2_page_cap`
