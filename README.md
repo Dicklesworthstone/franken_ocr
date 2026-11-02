@@ -507,9 +507,12 @@ bounded at any length. A window that stops early ends the document with its
 completed pages. `--json` lists one `pages[]` entry per page
 read: `page` (the source page), `half` on a split spread, `run_index`, `window`
 when windowed, `text`, `layout` (boxes in that page's own pixels), `tokens` and
-`finish` (`marker`, `eos`, `page_cap`, `length`, `budget` or `cancelled`), and `raw` under `--raw`. A
+`finish` (`marker`, `eos`, `page_cap`, `runaway`, `length`, `budget` or `cancelled`), and `raw` under `--raw`. A
 `v2_page_cap` warning lists any page the per-page cap (`--max-page-tokens`, default 20,000)
-closed, which is almost always a runaway. With `FOCR_REREAD_CAPPED_PAGES=1` (off by
+closed, which is almost always a runaway. `FOCR_RUNAWAY_GUARD=1` (off by default) closes such
+a page sooner: once a page passes 8,192 tokens and its last 2,048 repeat (any number counts as
+the same token, so a counting loop repeats too), the next page opens. The page ends `runaway`,
+keeps its text so far, and is listed in the same warning. With `FOCR_REREAD_CAPPED_PAGES=1` (off by
 default), each such page is read again alone once the document is decoded. The re-read
 replaces the page when the model ends it, and a `v2_page_reread` warning lists the pages
 replaced and the pages kept. Robot `page` events are not sent again. Document mode composes with `--split-spreads`

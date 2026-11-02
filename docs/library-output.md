@@ -153,6 +153,7 @@ not pixels.
 | `marker` | The model opened the next page. |
 | `eos` | The model ended the document. |
 | `page_cap` | The per-page cap forced the page closed. The page is probably cut short, and its text probably repeats; the run's `v2_page_cap` warning lists it. With `DocumentOptions::reread_capped`, the page is read again alone after the document; a re-read the model ends replaces the page, and the run's `v2_page_reread` warning lists it. |
+| `runaway` | With `FOCR_RUNAWAY_GUARD=1`, the runaway guard found the page repeating and closed it as the cap does. The page keeps its text so far, which is cut short; the run's `v2_page_cap` warning lists it under `pages` and `runaway`. `DocumentOptions::reread_capped` reads it again as it does a `page_cap` page. |
 | `length` | The position limit stopped decoding inside this page. |
 | `budget` | The stage budget stopped decoding inside this page. |
 | `cancelled` | `request_shutdown` stopped decoding inside this page. |

@@ -350,7 +350,8 @@ The records and scripts are in `artifacts/accuracy/bd-uocr2-epic-cgux.21/posthoc
 - **The opt-in runaway guard** (v1, `FOCR_RUNAWAY_GUARD=1`; bd-gftg):
   - Replayed over every C5a output of 2,560 tokens or more, it fires on none
     of 99 legitimate outputs. It catches 13 of 19 v1 runaways and, in replay
-    only, 6 of 8 v2 runaways; the guard is v1-only.
+    only, 6 of 8 v2 runaways. At the time the guard was v1-only; v2 now runs
+    a per-page variant that closes the page as `runaway` (bd-gftg).
   - On the ground truth itself it never fires on OmniDocBench. MarathonDocBench
     gives 9 per-page fires at the 8,192-token floor: 7 on broken ground truth
     and 2 on real chart data.

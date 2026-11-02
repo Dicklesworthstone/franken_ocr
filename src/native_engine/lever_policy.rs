@@ -227,7 +227,7 @@ pub(crate) static UOCR2_LEVER_POLICY: LeverPolicy = LeverPolicy {
         lever("FOCR_RSWA_PARALLEL_ATTN", Ignored(R_SWA_ONLY)),
         lever(
             "FOCR_RUNAWAY_GUARD",
-            Ignored("the per-page cap and page guard replace it for this model (U2-B6)"),
+            Supported("closes a page found repeating, as the per-page cap does (bd-gftg)"),
         ),
         lever("FOCR_RUN_STORE", Supported("run telemetry only")),
         lever(
@@ -643,8 +643,8 @@ mod tests {
         ("FOCR_QKV_FUSED", "1", Expect::Ignored),
         ("FOCR_FUSE_NGRAM_LMHEAD", "1", Expect::Ignored),
         ("FOCR_FUSE_NORM_QUANT", "1", Expect::Ignored),
-        ("FOCR_RUNAWAY_GUARD", "1", Expect::Ignored),
-        ("FOCR_RUNAWAY_GUARD", "maybe", Expect::Ignored),
+        ("FOCR_RUNAWAY_GUARD", "1", Expect::Silent),
+        ("FOCR_RUNAWAY_GUARD", "maybe", Expect::Silent),
         ("FOCR_RESAMPLE", "pil-bicubic", Expect::Ignored),
         ("FOCR_LMHEAD_SHARD_TILES", "4", Expect::Silent),
         ("FOCR_BATCH_PACK", "1", Expect::Ignored),

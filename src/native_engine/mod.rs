@@ -558,6 +558,10 @@ pub enum PageFinish {
     Eos,
     /// The per-page cap forced the next `<PAGE>`, or EOS on the last page.
     PageCap,
+    /// The runaway detector ([`sampler::RUNAWAY_GUARD_ENV`], bd-gftg) found
+    /// the page repeating and forced the next `<PAGE>`, or EOS on the last
+    /// page, as the cap does.
+    Runaway,
     /// The position limit stopped decoding inside this page.
     Length,
     /// The cooperative stage budget stopped decoding inside this page.
@@ -574,6 +578,7 @@ impl PageFinish {
             Self::Marker => "marker",
             Self::Eos => "eos",
             Self::PageCap => "page_cap",
+            Self::Runaway => "runaway",
             Self::Length => "length",
             Self::Budget => "budget",
             Self::Cancelled => "cancelled",
@@ -724,6 +729,18 @@ fn document_guard(pages: usize, marker: u32, params: &DecodeParams) -> sampler::
         params.max_length
     };
     sampler::PageGuard::new(pages, marker, params.eos_token_id, page_cap)
+}
+
+/// How a page `guard` forces closed ends: at the per-page cap, or found
+/// repeating by its runaway detector (bd-gftg). `None` when nothing forces.
+fn forced_finish(guard: &sampler::PageGuard) -> Option<PageFinish> {
+    if guard.at_cap() {
+        Some(PageFinish::PageCap)
+    } else if guard.ran_away() {
+        Some(PageFinish::Runaway)
+    } else {
+        None
+    }
 }
 
 /// The decoder an Unlimited-OCR pass runs on: a v2 document pass, or a v1
@@ -1213,13 +1230,13 @@ fn page_reread_warning(replaced: &[usize], kept: &[(usize, String)]) -> Option<R
     })
 }
 
-/// Read again, with `reread`, each page of `document` the per-page cap
-/// closed ([`DocumentOptions::reread_capped`], bd-yrr1), and join the
-/// document's text again when a re-read replaced one. `reread` returns the
-/// page's replacement, or why the document's page stays. A shutdown request
-/// ends the re-reads, and the pages left keep their text. Returns the
-/// document and its `v2_page_reread` warning, `None` when no page was
-/// capped.
+/// Read again, with `reread`, each page of `document` the per-page cap or
+/// the runaway guard closed ([`DocumentOptions::reread_capped`], bd-yrr1,
+/// bd-gftg), and join the document's text again when a re-read replaced
+/// one. `reread` returns the page's replacement, or why the document's page
+/// stays. A shutdown request ends the re-reads, and the pages left keep
+/// their text. Returns the document and its `v2_page_reread` warning, `None`
+/// when no page was capped.
 fn reread_capped_pages(
     document: DocumentPages,
     mut reread: impl FnMut(&PageResult) -> Result<PageResult, String>,
@@ -1233,7 +1250,7 @@ fn reread_capped_pages(
     let mut kept = Vec::new();
     for page in pages
         .iter_mut()
-        .filter(|page| page.finish == Some(PageFinish::PageCap))
+        .filter(|page| matches!(page.finish, Some(PageFinish::PageCap | PageFinish::Runaway)))
     {
         let fresh = if crate::shutdown_requested() {
             Err("a shutdown was requested before its re-read".to_owned())
@@ -1285,31 +1302,55 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
         });
     }
     let (expected, got) = report.pages.map_or((1, 0), |p| (p.expected, p.bodies));
-    // A page that reaches the per-page cap is almost always a runaway; the run
-    // goes on, so only this warning says so (bd-jem5). Pages count in decode
-    // order, as `place` does below.
-    let capped: Vec<usize> = (1..)
-        .zip(&stats.page_finish)
-        .filter_map(|(page, finish)| (*finish == PageFinish::PageCap).then_some(page))
-        .collect();
-    if !capped.is_empty() {
-        let list = capped
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let (noun, verb) = if capped.len() == 1 {
-            ("page", "was")
-        } else {
-            ("pages", "were")
+    // A page that reaches the per-page cap is almost always a runaway, and
+    // one the runaway detector closes (bd-gftg) is one; the run goes on, so
+    // only this warning says so (bd-jem5). Pages count in decode order, as
+    // `place` does below.
+    let closed = |how: PageFinish| -> Vec<usize> {
+        (1..)
+            .zip(&stats.page_finish)
+            .filter_map(|(page, finish)| (*finish == how).then_some(page))
+            .collect()
+    };
+    let (capped, runaway) = (closed(PageFinish::PageCap), closed(PageFinish::Runaway));
+    if !capped.is_empty() || !runaway.is_empty() {
+        let listed = |pages: &[usize]| {
+            let list = pages
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            if pages.len() == 1 {
+                (format!("page {list}"), "was")
+            } else {
+                (format!("pages {list}"), "were")
+            }
         };
+        let mut said = Vec::new();
+        if !capped.is_empty() {
+            let (list, verb) = listed(&capped);
+            said.push(format!(
+                "{list} of {expected} reached the per-page token cap and {verb} closed"
+            ));
+        }
+        if !runaway.is_empty() {
+            let (list, verb) = listed(&runaway);
+            said.push(format!(
+                "{list} of {expected} {verb} closed by the runaway guard"
+            ));
+        }
+        let mut pages = [capped.as_slice(), runaway.as_slice()].concat();
+        pages.sort_unstable();
         let mut fields = serde_json::Map::new();
-        fields.insert("pages".into(), capped.into());
+        fields.insert("pages".into(), pages.into());
+        if !runaway.is_empty() {
+            fields.insert("runaway".into(), runaway.into());
+        }
         warnings.push(RunWarning {
             kind: "v2_page_cap",
             message: format!(
-                "{noun} {list} of {expected} reached the per-page token cap and {verb} closed: \
-                 the model probably repeated itself, so that text is unreliable"
+                "{}: the model probably repeated itself, so that text is unreliable",
+                said.join("; ")
             ),
             recovery: warning_recovery(WarningKind::V2PageCap),
             fields,
@@ -5669,6 +5710,8 @@ impl OcrModel {
                 warning_recovery(WarningKind::V2PromptTooLong),
             )));
         }
+        // A bad FOCR_RUNAWAY_GUARD fails here, before the vision encoder.
+        let runaway = self.page_runaway()?;
         let (inputs_embeds, prompt_ids) = self.document_inputs(pres)?;
         let tok = self.tokenizer()?;
         // The pages close as the ids stream in. A page's clock starts at its
@@ -5682,18 +5725,15 @@ impl OcrModel {
             if paging.guard { markers } else { 0 },
             paging.marker_id,
             &params,
-        );
+        )
+        .with_runaway(runaway);
         let mut elapsed = Vec::with_capacity(pres.len());
         let mut opened: Option<Instant> = None;
         let mut observer = |id: u32| {
             let now = Instant::now();
             let since = now - *opened.get_or_insert(now);
             // The decode loop's rule for a page a marker closes.
-            let finish = if mirror.at_cap() {
-                PageFinish::PageCap
-            } else {
-                PageFinish::Marker
-            };
+            let finish = forced_finish(&mirror).unwrap_or(PageFinish::Marker);
             mirror.observe(id);
             stream.push(id, |index, body, tokens| {
                 elapsed.push(since);
@@ -5719,8 +5759,7 @@ impl OcrModel {
         // The page in flight ends with the decode, by the loop's rule.
         let since = opened.map_or_else(std::time::Duration::default, |t| t.elapsed());
         let last = match decode.finish_reason {
-            FinishReason::Stop if mirror.at_cap() => PageFinish::PageCap,
-            FinishReason::Stop => PageFinish::Eos,
+            FinishReason::Stop => forced_finish(&mirror).unwrap_or(PageFinish::Eos),
             FinishReason::Length => PageFinish::Length,
             FinishReason::Budget => PageFinish::Budget,
             FinishReason::Cancelled => PageFinish::Cancelled,
@@ -5958,7 +5997,8 @@ impl OcrModel {
             if paging.guard { pages } else { 0 },
             paging.marker_id,
             params,
-        );
+        )
+        .with_runaway(self.page_runaway()?);
         ids.clear();
         // A budget already spent (by vision) skips the decoder cache and the
         // prefill: the document stops before its first id.
@@ -6094,17 +6134,13 @@ impl OcrModel {
                 ));
                 break;
             }
-            let at_cap = guard.at_cap();
+            let forced = forced_finish(guard);
             let step = sampler::decode_step_guarded(&logits, ids, guard, params)?;
             stats.forced_steps += usize::from(step.forced);
             stats.hf_all_neg_inf_steps += usize::from(step.hf_all_neg_inf);
             if step.is_eos {
                 if stats.page_finish.len() < pages.max(1) {
-                    stats.page_finish.push(if at_cap {
-                        PageFinish::PageCap
-                    } else {
-                        PageFinish::Eos
-                    });
+                    stats.page_finish.push(forced.unwrap_or(PageFinish::Eos));
                 }
                 finish_reason = FinishReason::Stop;
                 break;
@@ -6120,11 +6156,7 @@ impl OcrModel {
             guard.observe(id);
             // A marker after the first closes the page before it.
             if id == marker && guard.markers() >= 2 && stats.page_finish.len() < pages {
-                stats.page_finish.push(if at_cap {
-                    PageFinish::PageCap
-                } else {
-                    PageFinish::Marker
-                });
+                stats.page_finish.push(forced.unwrap_or(PageFinish::Marker));
             }
             progress::emit("decode", (ids.len() - forced_prefix) as u64, room as u64);
             if let Some(f) = observer.as_deref_mut() {
@@ -7136,6 +7168,27 @@ impl OcrModel {
     /// [`FocrError::FormatMismatch`] if the table is absent or malformed.
     fn embed_table(&self) -> FocrResult<EmbedTable<'_>> {
         embed_table_from(&self.weights)
+    }
+
+    /// The per-page runaway detector a document decode's page guards carry
+    /// when [`sampler::RUNAWAY_GUARD_ENV`] arms it (bd-gftg), or `None`. Its
+    /// numerals are the tokenizer's digit-only pieces.
+    ///
+    /// # Errors
+    /// The variable is set to anything but `0` or `1`, or no tokenizer.
+    fn page_runaway(&self) -> FocrResult<Option<sampler::PageRunaway>> {
+        if !sampler::RunawayGuard::from_env()?.enabled() {
+            return Ok(None);
+        }
+        let tok = self.tokenizer()?;
+        let ids = u32::try_from(tok.vocab_size()).unwrap_or(u32::MAX);
+        let numerals: Arc<[bool]> = (0..ids)
+            .map(|id| {
+                tok.id_to_token(id)
+                    .is_some_and(sampler::PageRunaway::is_numeral_piece)
+            })
+            .collect();
+        Ok(Some(sampler::PageRunaway::new(numerals)))
     }
 
     /// Embed the prompt id-stream into the decoder hidden rail ([SPEC-070]).
@@ -8334,6 +8387,23 @@ mod tests {
             (plain().pages, plain().markdown)
         );
         assert!(warning.is_none());
+
+        // bd-gftg: a page the runaway guard closed is read again the same way.
+        let ran_away = DocumentPages::joined(vec![
+            page(1, "First page.", Marker),
+            page(2, "814 815 816 817 818", PageFinish::Runaway),
+        ]);
+        let mut calls = Vec::new();
+        let (document, warning) = reread_capped_pages(ran_away, |p| {
+            calls.push(p.run_index);
+            Ok(page(p.run_index, "A table, read alone.", Eos))
+        });
+        assert_eq!(calls, [2]);
+        assert_eq!(document.pages[1], page(2, "A table, read alone.", Eos));
+        assert_eq!(
+            warning.expect("a replaced page warns").to_json()["pages"],
+            serde_json::json!([2])
+        );
     }
 
     /// bd-jem5: the pages the per-page cap closed earn one `v2_page_cap`
@@ -8388,6 +8458,27 @@ mod tests {
             two[0].message.starts_with("pages 1, 4 of 5 reached"),
             "{}",
             two[0].message
+        );
+        assert!(two[0].to_json()["runaway"].is_null());
+
+        // bd-gftg: a page the runaway guard closed joins the same warning.
+        let mixed = decode_warnings(&report(vec![
+            PageFinish::Runaway,
+            PageCap,
+            Marker,
+            Marker,
+            Eos,
+        ]));
+        assert_eq!(mixed.len(), 1);
+        let w = mixed[0].to_json();
+        assert_eq!(
+            (&w["pages"], &w["runaway"]),
+            (&serde_json::json!([1, 2]), &serde_json::json!([1]))
+        );
+        assert_eq!(
+            mixed[0].message,
+            "page 2 of 5 reached the per-page token cap and was closed; page 1 of 5 was closed \
+             by the runaway guard: the model probably repeated itself, so that text is unreliable"
         );
 
         assert!(decode_warnings(&report(vec![Marker, Marker, Marker, Marker, Eos])).is_empty());

@@ -2074,13 +2074,15 @@ fn cli_judges_unlimited_ocr_2_levers_then_its_sidecar_before_weights() {
         (
             "ignored_levers",
             &["ocr"],
+            // bd-gftg: v2 reads FOCR_RUNAWAY_GUARD (it closes a page found
+            // repeating), so the guard is admitted without a warning.
             &[
                 ("FOCR_QKV_FUSED", "0"),
-                ("FOCR_RUNAWAY_GUARD", "maybe"),
+                ("FOCR_RUNAWAY_GUARD", "1"),
                 ("FOCR_THREADS", "2"),
             ],
             None,
-            &["FOCR_QKV_FUSED", "FOCR_RUNAWAY_GUARD"],
+            &["FOCR_QKV_FUSED"],
         ),
         (
             "robot_batch_spine",

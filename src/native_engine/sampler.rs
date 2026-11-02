@@ -48,8 +48,10 @@ pub const DEFAULT_MAX_LENGTH: usize = 32_768;
 /// trajectories (bd-2mo.30.12). Unset and `0` are OFF; only `1` arms it.
 ///
 /// The guard remains default-off until its false-positive posterior and corpus
-/// tail impact have been calibrated. When armed, a trigger is a typed timeout,
-/// never a synthetic EOS or a successful truncated result.
+/// tail impact have been calibrated. When armed, a v1 trigger is a typed
+/// timeout, never a synthetic EOS or a successful truncated result. An
+/// Unlimited-OCR-2 trigger closes the page instead ([`PageRunaway`], bd-gftg):
+/// v2 already ends pages by force at its cap, and the page's end says so.
 pub const RUNAWAY_GUARD_ENV: &str = "FOCR_RUNAWAY_GUARD";
 
 /// Do not inspect ordinary short outputs. This provisional threshold has not
@@ -2493,7 +2495,13 @@ mod uocr2_guard_tests {
         let numerals: std::sync::Arc<[bool]> =
             (0..2_000).map(|id| (100..1_100).contains(&id)).collect();
         let counting: Vec<u32> = (0..RUNAWAY_GUARD_MIN_TOKENS + 4 * RUNAWAY_GUARD_CHECK_INTERVAL)
-            .map(|k| if k % 2 == 0 { 100 + (k as u32 / 2) % 1_000 } else { 5 })
+            .map(|k| {
+                if k % 2 == 0 {
+                    100 + (k as u32 / 2) % 1_000
+                } else {
+                    5
+                }
+            })
             .collect();
         let mut raw = RunawayGuard::new(true);
         assert_eq!(
@@ -2502,8 +2510,8 @@ mod uocr2_guard_tests {
             "every number is a new id"
         );
 
-        let mut g = PageGuard::new(2, PAGE, EOS, 0)
-            .with_runaway(Some(PageRunaway::new(numerals.clone())));
+        let mut g =
+            PageGuard::new(2, PAGE, EOS, 0).with_runaway(Some(PageRunaway::new(numerals.clone())));
         let run_away = |g: &mut PageGuard| {
             for (k, &id) in counting.iter().enumerate() {
                 g.observe(id);

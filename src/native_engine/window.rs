@@ -1419,7 +1419,7 @@ impl OcrModel {
         let router = wc.router()?;
         let table = self.embed_table()?;
         let reused = matches!(run.start, WindowStart::Reuse(_));
-        let mut guard = window_guard(&span, reused, params);
+        let mut guard = window_guard(&span, reused, params).with_runaway(self.page_runaway()?);
         let tp = Instant::now();
         let (prompt_ids, state, hidden, context_pages) = match &run.start {
             WindowStart::Recompute(_) => {

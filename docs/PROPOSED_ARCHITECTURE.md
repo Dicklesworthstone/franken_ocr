@@ -206,6 +206,11 @@ bounded finite-state monitor over **generated token ids**, never decoded strings
   suspicious checkpoints. All comparisons are integer-exact, and checkpoints
   are replayed at their fixed token prefix so polling cadence cannot change the
   verdict. Unset or `=0` is disabled and performs no analysis/allocation.
+- **Unlimited-OCR-2 (bd-gftg):** the same trigger runs per page, over the ids
+  since the last `<PAGE>`, with every numeral token read as one id so a
+  counting loop repeats too. A trigger does not abort. The page guard forces
+  the next `<PAGE>` (EOS on the last page), as at the per-page cap, and the page
+  ends `runaway` with its text so far.
 
 The failure-cost matrix uses ordinal decision units (not measured dollars):
 
