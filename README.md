@@ -842,7 +842,9 @@ applies only safe repairs through one mutation chokepoint: every touched file is
 backed up first under `.doctor/runs/<run-id>/backups/`, hashes and modes are
 logged to `actions.jsonl`, and `doctor undo <run-id>` restores from that log.
 Irreversible work, such as regenerating model artifacts, is refused with the
-exact command to run manually.
+exact command to run manually. That includes a model whose `tokenizer.json` is
+missing or is not the file that model pins, such as v1's beside a v2 artifact:
+doctor names the `focr pull <model>` that re-installs it.
 
 ```bash
 focr doctor                                 # human-readable detect-only report

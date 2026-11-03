@@ -115,6 +115,7 @@ pub fn detect(root: &DoctorRoot) -> Vec<Finding> {
     let mut findings = Vec::new();
     detect_model_not_resolvable(root, &mut findings);
     detect_stale_focrq_format(root, &mut findings);
+    detect_sidecar_tokenizers(root, &mut findings);
     detect_unreadable_cache_entries(root, &mut findings);
     detect_orphaned_partials(root, &mut findings);
     detect_package_transactions(root, &mut findings);
@@ -270,6 +271,48 @@ fn detect_stale_focrq_format(root: &DoctorRoot, out: &mut Vec<Finding>) {
                 });
             }
         }
+    }
+}
+
+/// An installed `.focrq` whose `tokenizer.json` is missing, or is not the file
+/// its model pins (U2-E7): chiefly v1's tokenizer beside a v2 artifact, or the
+/// reverse. The model refuses to open either way. `focr pull <model>`
+/// re-installs the package with its pinned tokenizer; the doctor never
+/// touches the file.
+fn detect_sidecar_tokenizers(root: &DoctorRoot, out: &mut Vec<Finding>) {
+    let entries = model_cache_dirs(root)
+        .into_iter()
+        .filter_map(|dir| std::fs::read_dir(dir).ok())
+        .flatten();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') || !name.ends_with(".focrq") {
+            continue;
+        }
+        let Some(fault) = crate::native_engine::sidecar_tokenizer_fault(&entry.path()) else {
+            continue;
+        };
+        let model = fault.model_id;
+        let (detector, message) = match (&fault.refusal, fault.owner) {
+            (None, _) => (
+                "missing_tokenizer",
+                format!("{name} ({model}) has no tokenizer.json beside it"),
+            ),
+            (Some(refusal), Some(owner)) => (
+                "tokenizer_mismatch",
+                format!("{name} ({model}) sits beside {owner}'s tokenizer.json: {refusal}"),
+            ),
+            (Some(refusal), None) => ("tokenizer_mismatch", format!("{name} ({model}): {refusal}")),
+        };
+        out.push(Finding {
+            detector,
+            severity: "error",
+            path: Some(fault.tokenizer_path.display().to_string()),
+            message,
+            fixability: Fixability::RefusedUnsafe {
+                recommended_command: fault.recommended_command,
+            },
+        });
     }
 }
 
@@ -879,6 +922,8 @@ pub fn capabilities() -> serde_json::Value {
         "detectors": [
             {"name": "model_not_resolvable", "fix": "advice_only"},
             {"name": "stale_focrq_format", "fix": "refused_unsafe (re-quantization is irreversible; exact command recommended)"},
+            {"name": "missing_tokenizer", "fix": "refused_unsafe (`focr pull <model>` re-installs the package with its pinned tokenizer)"},
+            {"name": "tokenizer_mismatch", "fix": "refused_unsafe (`focr pull <model>` re-installs the package with its pinned tokenizer)"},
             {"name": "unreadable_cache_entry", "fix": "auto (chmod_u_rw, mode+bytes backed up)", "platform": "unix"},
             {"name": "orphaned_partial_download", "fix": "auto (quarantine into the run's backups; reversible)"},
             {"name": "abandoned_package_stage", "fix": "refused_unsafe (`focr pull <model>` removes it under the package lock)"},

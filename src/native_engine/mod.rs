@@ -3086,8 +3086,6 @@ fn model_search_specs(spec: &Path) -> Vec<PathBuf> {
 /// skipped but selected, and its load gate refuses it by name (exit 7, U2-C3)
 /// rather than the search reporting no artifact at all.
 fn focrq_declares_wasm_recipe(path: &Path) -> bool {
-    const FOCRQ_PREAMBLE_LEN: usize = 6 + 4 + 1 + 32 + 8;
-
     let Ok(mut file) = std::fs::File::open(path) else {
         return false;
     };
@@ -3594,12 +3592,86 @@ pub(crate) fn conversion_arch(
     }
 }
 
+/// The bytes of a `.focrq`'s fixed preamble: magic, format version, arch
+/// target, source SHA-256 and header length.
+const FOCRQ_PREAMBLE_LEN: usize = 6 + 4 + 1 + 32 + 8;
+
+/// A `.focrq`'s preamble and header, as the bounded header probe reads them.
+struct FocrqHeaderRead {
+    preamble: [u8; FOCRQ_PREAMBLE_LEN],
+    version: u32,
+    header: FocrqHeaderProbe,
+    /// Where the tensor payload starts.
+    payload_base: usize,
+}
+
+/// Read a `.focrq`'s preamble and header JSON from `reader`, whose first
+/// eight bytes (`prefix`, from the magic on) are already read. Checks only
+/// what reading needs: this binary's format version, and a header within
+/// [`MODEL_HEADER_VALIDATION_MAX_BYTES`] and the file's `file_len` bytes.
+/// [`validate_model_header_from_reader`] checks the rest.
+fn read_focrq_header(
+    reader: &mut impl Read,
+    prefix: [u8; 8],
+    file_len: usize,
+) -> FocrResult<FocrqHeaderRead> {
+    let mut preamble = [0u8; FOCRQ_PREAMBLE_LEN];
+    preamble[..prefix.len()].copy_from_slice(&prefix);
+    reader
+        .read_exact(&mut preamble[prefix.len()..])
+        .map_err(|error| {
+            FocrError::FormatMismatch(format!(".focrq preamble truncated: {error}"))
+        })?;
+    let version = u32::from_le_bytes(
+        preamble[6..10]
+            .try_into()
+            .expect("fixed .focrq version slice"),
+    );
+    if version != weights::FOCRQ_FORMAT_VERSION {
+        return Err(FocrError::FormatMismatch(format!(
+            ".focrq format version {version} is unsupported; this binary requires exactly {}",
+            weights::FOCRQ_FORMAT_VERSION,
+        )));
+    }
+    let header_len_u64 = u64::from_le_bytes(
+        preamble[43..51]
+            .try_into()
+            .expect("fixed .focrq header length slice"),
+    );
+    let header_len = usize::try_from(header_len_u64)
+        .map_err(|_| FocrError::FormatMismatch(".focrq header length exceeds usize".into()))?;
+    if header_len == 0 || header_len > MODEL_HEADER_VALIDATION_MAX_BYTES {
+        return Err(FocrError::FormatMismatch(format!(
+            ".focrq header length {header_len} is outside the bounded validation limit"
+        )));
+    }
+    let payload_base = FOCRQ_PREAMBLE_LEN
+        .checked_add(header_len)
+        .ok_or_else(|| FocrError::FormatMismatch(".focrq header length overflows".into()))?;
+    if payload_base > file_len {
+        return Err(FocrError::FormatMismatch(
+            ".focrq header overruns the file".into(),
+        ));
+    }
+    let mut header_bytes = vec![0u8; header_len];
+    reader
+        .read_exact(&mut header_bytes)
+        .map_err(|error| FocrError::FormatMismatch(format!(".focrq header truncated: {error}")))?;
+    let header: FocrqHeaderProbe = serde_json::from_slice(&header_bytes).map_err(|error| {
+        FocrError::FormatMismatch(format!(".focrq header JSON invalid: {error}"))
+    })?;
+    Ok(FocrqHeaderRead {
+        preamble,
+        version,
+        header,
+        payload_base,
+    })
+}
+
 fn validate_model_header_from_reader(
     mut reader: impl Read,
     file_len: u64,
 ) -> FocrResult<&'static dyn model_arch::ModelArch> {
-    const FOCRQ_PREAMBLE_LEN: usize = 6 + 4 + 1 + 32 + 8;
-
     let file_len = usize::try_from(file_len).map_err(|_| {
         FocrError::FormatMismatch("model file exceeds this platform's addressable size".into())
     })?;
@@ -3609,51 +3681,12 @@ fn validate_model_header_from_reader(
         .map_err(|error| FocrError::FormatMismatch(format!("model header truncated: {error}")))?;
 
     if &prefix[..weights::FOCRQ_MAGIC.len()] == weights::FOCRQ_MAGIC {
-        let mut preamble = [0u8; FOCRQ_PREAMBLE_LEN];
-        preamble[..prefix.len()].copy_from_slice(&prefix);
-        reader
-            .read_exact(&mut preamble[prefix.len()..])
-            .map_err(|error| {
-                FocrError::FormatMismatch(format!(".focrq preamble truncated: {error}"))
-            })?;
-        let version = u32::from_le_bytes(
-            preamble[6..10]
-                .try_into()
-                .expect("fixed .focrq version slice"),
-        );
-        if version != weights::FOCRQ_FORMAT_VERSION {
-            return Err(FocrError::FormatMismatch(format!(
-                ".focrq format version {version} is unsupported; this binary requires exactly {}",
-                weights::FOCRQ_FORMAT_VERSION,
-            )));
-        }
-        let header_len_u64 = u64::from_le_bytes(
-            preamble[43..51]
-                .try_into()
-                .expect("fixed .focrq header length slice"),
-        );
-        let header_len = usize::try_from(header_len_u64)
-            .map_err(|_| FocrError::FormatMismatch(".focrq header length exceeds usize".into()))?;
-        if header_len == 0 || header_len > MODEL_HEADER_VALIDATION_MAX_BYTES {
-            return Err(FocrError::FormatMismatch(format!(
-                ".focrq header length {header_len} is outside the bounded validation limit"
-            )));
-        }
-        let payload_base = FOCRQ_PREAMBLE_LEN
-            .checked_add(header_len)
-            .ok_or_else(|| FocrError::FormatMismatch(".focrq header length overflows".into()))?;
-        if payload_base > file_len {
-            return Err(FocrError::FormatMismatch(
-                ".focrq header overruns the file".into(),
-            ));
-        }
-        let mut header_bytes = vec![0u8; header_len];
-        reader.read_exact(&mut header_bytes).map_err(|error| {
-            FocrError::FormatMismatch(format!(".focrq header truncated: {error}"))
-        })?;
-        let header: FocrqHeaderProbe = serde_json::from_slice(&header_bytes).map_err(|error| {
-            FocrError::FormatMismatch(format!(".focrq header JSON invalid: {error}"))
-        })?;
+        let FocrqHeaderRead {
+            preamble,
+            version,
+            header,
+            payload_base,
+        } = read_focrq_header(&mut reader, prefix, file_len)?;
         match header.format_version {
             Some(header_version) if header_version == version => {}
             Some(header_version) => {
@@ -4127,6 +4160,97 @@ fn eager_sidecar_tokenizer(
             path.display()
         ))),
     }
+}
+
+/// The model the `.focrq` at `path` declares in its header, read under the
+/// bounded header probe but without the provenance, census or recipe checks
+/// a load applies: `focr doctor` pairs each installed artifact with the
+/// tokenizer its model pins, whatever else may be wrong with it (U2-E7).
+fn focrq_declared_arch(path: &Path) -> FocrResult<&'static dyn model_arch::ModelArch> {
+    let (mut file, file_len) = open_model_file(path)?;
+    let file_len = usize::try_from(file_len).map_err(|_| {
+        FocrError::FormatMismatch("model file exceeds this platform's addressable size".into())
+    })?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|error| FocrError::FormatMismatch(format!("model header truncated: {error}")))?;
+    if &prefix[..weights::FOCRQ_MAGIC.len()] != weights::FOCRQ_MAGIC {
+        return Err(FocrError::FormatMismatch(format!(
+            "{} is not a .focrq artifact",
+            path.display()
+        )));
+    }
+    let read = read_focrq_header(&mut file, prefix, file_len)?;
+    compatible_arch(&read.header.model_id)
+}
+
+/// What is wrong with the `tokenizer.json` beside an installed `.focrq`, for
+/// `focr doctor` (U2-E7).
+#[derive(Debug)]
+pub(crate) struct SidecarFault {
+    /// The model the artifact declares.
+    pub model_id: &'static str,
+    /// Where its tokenizer is, or should be.
+    pub tokenizer_path: PathBuf,
+    /// Why the open-time check refuses the file; `None` when it is absent.
+    pub refusal: Option<String>,
+    /// The model whose pinned tokenizer the refused file is, if any: v1's
+    /// beside a v2 artifact, or the reverse.
+    pub owner: Option<&'static str>,
+    /// What puts the pinned file in place.
+    pub recommended_command: String,
+}
+
+/// Run the open-time sidecar check ([`checked_tokenizer`]) on the
+/// `tokenizer.json` beside the `.focrq` at `model_path`, without loading the
+/// model. `None` when the artifact declares no model this binary knows (its
+/// load reports that), its model pins no tokenizer, the file cannot be read
+/// (the doctor's unreadable-entry detector reports that), or it is the
+/// pinned file.
+pub(crate) fn sidecar_tokenizer_fault(model_path: &Path) -> Option<SidecarFault> {
+    use sha2::Digest as _;
+
+    let arch = focrq_declared_arch(model_path).ok()?;
+    if !pins_tokenizer(arch) {
+        return None;
+    }
+    let tokenizer_path = model_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tokenizer.json");
+    let (refusal, owner) = match std::fs::read(&tokenizer_path) {
+        Ok(bytes) => {
+            let origin = tokenizer_path.display().to_string();
+            let refusal = match checked_tokenizer(arch, &bytes, &origin).err()? {
+                FocrError::FormatMismatch(detail) => detail,
+                other => other.to_string(),
+            };
+            let owner = tokenizer_owner(&format!("{:x}", sha2::Sha256::digest(&bytes)));
+            (Some(refusal), owner.filter(|&owner| owner != arch.id()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(_) => return None,
+    };
+    let id = arch.id();
+    Some(SidecarFault {
+        model_id: id,
+        tokenizer_path,
+        refusal,
+        owner,
+        recommended_command: match arch.tokenizer_source() {
+            Some(source) => format!("fetch the pinned tokenizer.json from {source}"),
+            None => format!("focr pull {id}"),
+        },
+    })
+}
+
+/// The model whose pinned `tokenizer.json` has SHA-256 `sha256` (lowercase
+/// hex), if any.
+fn tokenizer_owner(sha256: &str) -> Option<&'static str> {
+    model_arch::registry()
+        .iter()
+        .find(|arch| arch.tokenizer_sha256() == Some(sha256))
+        .map(|arch| arch.id())
 }
 
 /// Reject Unlimited-OCR containers that violate the fixed default quantization
@@ -13848,6 +13972,84 @@ mod tests {
             .to_string();
         assert!(message.contains("`focr pull unlimited-ocr-2`"), "{message}");
         assert!(!message.contains("huggingface.co"), "{message}");
+    }
+
+    /// U2-E7: `focr doctor` judges an installed artifact's `tokenizer.json`
+    /// with the open-time check, for the model the artifact's header declares,
+    /// and names a refused file that another model pins as that model's.
+    #[test]
+    fn the_doctor_judges_a_sidecar_by_the_model_its_artifact_declares() {
+        for arch in model_arch::registry() {
+            if let Some(pin) = arch.tokenizer_sha256() {
+                assert_eq!(tokenizer_owner(pin), Some(arch.id()), "one owner per pin");
+            }
+        }
+        assert_eq!(tokenizer_owner(sha256_hex(SIDECAR_JSON.as_bytes())), None);
+
+        // One package per case: its artifact, and its tokenizer if any.
+        let package = |label: &str, model_id: Option<&str>, tokenizer: Option<&[u8]>| {
+            let dir = temp_model_dir(label);
+            let mut builder = crate::quant::focrq::FocrqBuilder::new();
+            if let Some(id) = model_id {
+                builder = builder.with_model_id(id);
+            }
+            builder
+                .add_tensor(
+                    "model.embed_tokens.weight",
+                    crate::quant::focrq::WriteDType::Bf16,
+                    vec![1, 1],
+                    vec![0; 2],
+                )
+                .expect("add tensor");
+            let artifact = dir.join("model.focrq");
+            std::fs::write(&artifact, builder.build()).expect("write artifact");
+            if let Some(bytes) = tokenizer {
+                std::fs::write(dir.join("tokenizer.json"), bytes).expect("write tokenizer");
+            }
+            artifact
+        };
+        let foreign = SIDECAR_JSON.as_bytes();
+        let v2 = model_arch::UNLIMITED_OCR_V2_ID;
+
+        let artifact = package("doctor_v2_bare", Some(v2), None);
+        let missing = sidecar_tokenizer_fault(&artifact).expect("no tokenizer");
+        assert_eq!(missing.model_id, v2);
+        assert_eq!(missing.refusal, None);
+        assert_eq!(missing.owner, None);
+        assert_eq!(
+            missing.tokenizer_path,
+            artifact.with_file_name("tokenizer.json")
+        );
+        assert_eq!(missing.recommended_command, "focr pull unlimited-ocr-2");
+
+        let artifact = package("doctor_v2_foreign", Some(v2), Some(foreign));
+        let mismatch = sidecar_tokenizer_fault(&artifact).expect("not v2's tokenizer");
+        let refusal = mismatch.refusal.expect("refused");
+        assert!(
+            refusal.contains(&format!("but {v2} requires"))
+                && refusal.contains(sha256_hex(foreign)),
+            "{refusal}"
+        );
+        assert_eq!(mismatch.owner, None, "no model pins this file");
+        assert_eq!(mismatch.recommended_command, "focr pull unlimited-ocr-2");
+
+        // A header without a model_id is v1's.
+        let artifact = package("doctor_v1_foreign", None, Some(foreign));
+        let v1 = sidecar_tokenizer_fault(&artifact).expect("not v1's tokenizer");
+        assert_eq!(v1.model_id, model_arch::UNLIMITED_OCR_V1_ID);
+        assert_eq!(v1.recommended_command, "focr pull unlimited-ocr");
+
+        // GOT pins no tokenizer.json, and an unknown model is the load's to report.
+        assert!(
+            sidecar_tokenizer_fault(&package("doctor_got_bare", Some("got-ocr2"), None)).is_none()
+        );
+        assert!(
+            sidecar_tokenizer_fault(&package("doctor_unknown", Some("no-such-model"), None))
+                .is_none()
+        );
+        let not_focrq = temp_model_dir("doctor_not_focrq").join("model.focrq");
+        std::fs::write(&not_focrq, unidentified_safetensors()).expect("write raw shard");
+        assert!(sidecar_tokenizer_fault(&not_focrq).is_none());
     }
 
     #[test]

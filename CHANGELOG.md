@@ -61,6 +61,16 @@ sections as they land.
 
 ### Added
 
+- **`focr doctor` checks each installed model's tokenizer** (bead
+  bd-uocr2-epic-cgux.37). Every `.focrq` in the model cache is paired with the
+  `tokenizer.json` beside it and judged by the loader's own sidecar check, for the model
+  its header declares, without loading weights. A missing file is `missing_tokenizer`,
+  and a file that is not the one that model pins is `tokenizer_mismatch`. When the file is
+  another model's pinned tokenizer, the usual case being v1's beside a v2 artifact, the
+  finding names that model. Both are errors, refused with the `focr pull <model>` that
+  re-installs the package, and `--fix` leaves the files as they are. Before this the
+  mistake surfaced only when a run opened the model.
+
 - **Unlimited-OCR-2 decode phase timings** (bead bd-uocr2-epic-cgux.38). With
   `FOCR_PROFILE_DECODE=1` and `FOCR_TIMING=1`, a v2 run's `decode phases (ms)` row
   (lm_head, attn, experts, route, as in v1) is now followed by an `srswa phases (ms)` row.

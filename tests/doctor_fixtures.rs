@@ -279,6 +279,89 @@ fn interrupted_package_install_is_refused_with_the_pull_that_restores_it() {
     );
 }
 
+/// Failure mode 5 (U2-E7): a v2 package whose `tokenizer.json` is not the one
+/// v2 pins, and a v1 package with none. Doctor reports each as an error naming
+/// the pull that re-installs that package, and `--fix` refuses both and leaves
+/// every file byte-identical.
+#[test]
+fn a_wrong_or_missing_tokenizer_is_refused_with_the_pull_that_reinstalls_it() {
+    use franken_ocr::quant::focrq::{FocrqBuilder, WriteDType};
+    let home = fresh_home("tokenizer");
+    let package = |id: &str, model_id: Option<&str>| {
+        let dir = models_dir(&home).join(id);
+        std::fs::create_dir_all(&dir).expect("seed package");
+        let mut builder = FocrqBuilder::new();
+        if let Some(model_id) = model_id {
+            builder = builder.with_model_id(model_id);
+        }
+        builder
+            .add_tensor(
+                "model.embed_tokens.weight",
+                WriteDType::Bf16,
+                vec![1, 1],
+                vec![0; 2],
+            )
+            .expect("add tensor");
+        std::fs::write(dir.join(format!("{id}.int8.focrq")), builder.build())
+            .expect("seed artifact");
+        dir
+    };
+    let v2 = package("unlimited-ocr-2", Some("unlimited-ocr-2"));
+    let foreign = v2.join("tokenizer.json");
+    std::fs::write(&foreign, b"{}").expect("seed a foreign tokenizer");
+    let v1 = package("unlimited-ocr", None);
+    let files = || {
+        let mut files: Vec<(PathBuf, Vec<u8>)> = [&v1, &v2]
+            .iter()
+            .flat_map(|dir| std::fs::read_dir(dir).expect("read package").flatten())
+            .map(|entry| {
+                (
+                    entry.path(),
+                    std::fs::read(entry.path()).expect("read file"),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let before = files();
+
+    let out = focr(&home, &["doctor", "--json"]);
+    let v = json_stdout(&out);
+    let findings = v["findings"].as_array().unwrap();
+    let finding = |detector: &str| {
+        findings
+            .iter()
+            .find(|f| f["detector"] == detector)
+            .cloned()
+            .unwrap_or_else(|| panic!("{detector} not reported: {v}"))
+    };
+    let mismatch = finding("tokenizer_mismatch");
+    let missing = finding("missing_tokenizer");
+    let names_pulls = mismatch["fixability"]["recommended_command"] == "focr pull unlimited-ocr-2"
+        && missing["fixability"]["recommended_command"] == "focr pull unlimited-ocr";
+    let names_files = mismatch["path"].as_str() == foreign.to_str()
+        && missing["path"].as_str() == v1.join("tokenizer.json").to_str();
+    let errors = mismatch["severity"] == "error" && missing["severity"] == "error";
+
+    let out = focr(&home, &["doctor", "--fix"]);
+    let v = json_stdout(&out);
+    let refused = v["refused_unsafe"].as_u64().unwrap() >= 2;
+    let untouched = files() == before;
+    let ok = names_pulls && names_files && errors && refused && untouched;
+    emit(
+        "tokenizer_refused",
+        ok,
+        &format!(
+            r#""names_pulls":{names_pulls},"names_files":{names_files},"errors":{errors},"refused":{refused},"untouched":{untouched}"#
+        ),
+    );
+    assert!(
+        ok,
+        "a wrong or missing tokenizer must be reported and left to the pull: {v}"
+    );
+}
+
 /// `--dry-run` mutates NOTHING and records NO run.
 #[test]
 fn dry_run_has_zero_blast_radius() {
