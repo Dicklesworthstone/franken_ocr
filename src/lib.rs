@@ -144,7 +144,7 @@ pub(crate) fn forward_stage_budget() -> Option<std::time::Duration> {
 /// one** `asupersync` [`Runtime`] and exposes a **synchronous, blocking** API:
 /// public methods run the heavy work via `runtime.block_on(...)`, so the async
 /// runtime is an implementation detail never leaked to the host (satisfies G6).
-/// The model forward fans out across all physical cores via the frankentorch
+/// The model forward fans out across the [`thread_budget`] cores via the frankentorch
 /// kernel's own rayon pool, driven from a **sequential** outer page loop — never
 /// nest rayon under a held lock, never nest a second runtime (doctrine #5).
 ///
@@ -276,10 +276,10 @@ impl Drop for RunningStage {
 static THREAD_BUDGET: OnceLock<usize> = OnceLock::new();
 
 /// The single process-wide thread budget, read ONCE: [`set_thread_budget`]
-/// (`--threads`), else `FOCR_THREADS` (env), else the PHYSICAL core count
-/// (hyperthreads oversubscribe the int8 GEMMs — never
-/// `available_parallelism`). Every pool-sizing consumer (the kernel rayon
-/// pool, the gauntlet fairness pins, `robot health`) reads THIS.
+/// (`--threads`), else `FOCR_THREADS` (env), else [`default_thread_budget`]:
+/// PHYSICAL cores of the fastest tier (hyperthreads oversubscribe the int8
+/// GEMMs — never `available_parallelism`). Every pool-sizing consumer (the
+/// kernel rayon pool, the gauntlet fairness pins, `robot health`) reads THIS.
 pub fn thread_budget() -> usize {
     *THREAD_BUDGET.get_or_init(|| {
         std::env::var("FOCR_THREADS")
@@ -320,18 +320,55 @@ pub fn timing_enabled() -> bool {
     TIMING.load(Ordering::Relaxed) || std::env::var_os("FOCR_TIMING").is_some()
 }
 
-/// The no-override default width. Physical cores everywhere (hyperthreads
-/// oversubscribe the int8 GEMMs) EXCEPT on iOS, where one core is left to the
-/// UI: an A-series part is 2 performance + 4 efficiency cores, the app's own
-/// main thread has to stay responsive during a minutes-long forward, and a
-/// team barrier waits for its slowest member — so claiming every core makes the
-/// forward contend with the UI thread that is drawing its own progress bar.
+/// The no-override default width. Physical cores (hyperthreads oversubscribe
+/// the int8 GEMMs), and on a two-tier Mac only the performance tier
+/// (bd-zex4): every parallel section is a fork-join over equal shares, so the
+/// efficiency cores set the pace while the fast ones spin in the kernel. On an
+/// M5 Ultra (12 performance + 24 efficiency cores) shared with other work, all
+/// 36 took 2.4-2.6x the wall of 12 and about 6x the CPU time, 81% of it in
+/// sys, for byte-identical output (`artifacts/perf/bd-zex4`).
+///
+/// iOS keeps its own rule, one core left to the UI: an A-series part is 2
+/// performance + 4 efficiency cores, the app's own main thread has to stay
+/// responsive during a minutes-long forward, and a team barrier waits for its
+/// slowest member — so claiming every core makes the forward contend with the
+/// UI thread that is drawing its own progress bar. It is unmeasured on device
+/// (bd-v7ry), so the macOS result does not carry over.
 fn default_thread_budget() -> usize {
     let physical = num_cpus::get_physical();
     if cfg!(target_os = "ios") {
         physical.saturating_sub(1).max(1)
     } else {
-        physical
+        performance_cores()
+            .filter(|&fast| fast <= physical)
+            .unwrap_or(physical)
+    }
+}
+
+/// Physical cores in the fastest tier (`hw.perflevel0.physicalcpu`), on a Mac
+/// that reports tiers; `None` off macOS. A one-tier Mac (Intel) reports every
+/// core there or nothing, so its default is unchanged either way. Read through
+/// `/usr/sbin/sysctl` like `hw.memsize`: the crate denies `unsafe`.
+fn performance_cores() -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/sysctl")
+            .args(["-n", "hw.perflevel0.physicalcpu"])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&n: &usize| n > 0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
@@ -1209,7 +1246,8 @@ mod tests {
         );
     }
 
-    /// bd-223.2 addendum: FOCR_THREADS wins, else the PHYSICAL core count.
+    /// bd-223.2 addendum: FOCR_THREADS wins, else the PHYSICAL core count
+    /// (of the fastest tier on a two-tier Mac, bd-zex4).
     #[test]
     fn thread_budget_reads_env_then_physical() {
         // The OnceLock latches per process; assert the resolved value is
@@ -1220,8 +1258,12 @@ mod tests {
             .and_then(|v| v.parse::<usize>().ok())
         {
             Some(env) if env > 0 => assert_eq!(budget, env, "env wins"),
-            _ => assert_eq!(budget, num_cpus::get_physical(), "physical cores"),
+            _ => assert_eq!(budget, default_thread_budget(), "the default"),
         }
+        assert!(
+            default_thread_budget() <= num_cpus::get_physical(),
+            "the default never exceeds the physical cores"
+        );
         assert!(budget > 0);
         assert!(
             budget
@@ -1235,6 +1277,31 @@ mod tests {
             "resolved",
             "pass",
             &format!("\"threads\":{budget}"),
+        );
+    }
+
+    /// bd-zex4: every Apple-silicon Mac reports its performance tier, and the
+    /// default follows it; other targets keep the physical core count.
+    #[test]
+    fn default_budget_is_the_performance_tier_on_apple_silicon() {
+        let fast = performance_cores();
+        if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            let fast = fast.expect("hw.perflevel0.physicalcpu on Apple silicon");
+            assert!(fast <= num_cpus::get_physical(), "{fast} fast cores");
+            assert_eq!(default_thread_budget(), fast);
+        } else if cfg!(not(any(target_os = "macos", target_os = "ios"))) {
+            assert_eq!(fast, None);
+            assert_eq!(default_thread_budget(), num_cpus::get_physical());
+        }
+        log_line(
+            "default_budget_is_the_performance_tier_on_apple_silicon",
+            "resolved",
+            "pass",
+            &format!(
+                "\"performance_cores\":{},\"default\":{}",
+                fast.map_or_else(|| "null".to_string(), |n| n.to_string()),
+                default_thread_budget()
+            ),
         );
     }
 

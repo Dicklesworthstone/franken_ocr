@@ -46,7 +46,7 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "FOCR_THREADS",
-        "kernel thread budget (default: physical cores)",
+        "kernel thread budget (default: physical cores; on Apple silicon the performance cores)",
     ),
     (
         "FOCR_MAX_NEW_TOKENS",
@@ -169,11 +169,12 @@ pub fn event_fields() -> Value {
             // whenever the model that ran is known; `resumed_from` when the
             // run picked up an interrupted document (U2-D4); `pages_out`,
             // `pages_skipped`, `windows` and `extra_markers` on an
-            // Unlimited-OCR-2 document (U2-D5); `chart` on a OneChart run.
+            // Unlimited-OCR-2 document (U2-D5); `chart` on a OneChart run;
+            // `raw`, the undecorated decode, under `--raw`.
             "optional": [
                 "finish_reason", "warnings", "low_yield", "yield_chars", "input_megapixels",
                 "model_id", "source_sha256", "resumed_from", "pages_out", "pages_skipped",
-                "windows", "extra_markers", "chart",
+                "windows", "extra_markers", "chart", "raw",
             ],
         },
         "run_error": {

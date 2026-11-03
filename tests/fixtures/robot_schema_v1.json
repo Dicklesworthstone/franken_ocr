@@ -155,7 +155,7 @@
     },
     {
       "name": "FOCR_THREADS",
-      "summary": "kernel thread budget (default: physical cores)"
+      "summary": "kernel thread budget (default: physical cores; on Apple silicon the performance cores)"
     },
     {
       "name": "FOCR_MAX_NEW_TOKENS",
@@ -273,7 +273,8 @@
         "pages_skipped",
         "windows",
         "extra_markers",
-        "chart"
+        "chart",
+        "raw"
       ],
       "required": [
         "schema_version",

@@ -1190,6 +1190,17 @@ pub mod prof {
     pub static EXPERTS_NS: AtomicU64 = AtomicU64::new(0);
     /// MoE top-k router (softmax over the 64-expert gate).
     pub static ROUTE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Unlimited-OCR-2 only, inside `ATTN_NS` (`SrSwaState::decode_layer`):
+    /// the Token Sieve index q/k projections with their norm and page2d RoPE.
+    pub static SRSWA_PROJECT_NS: AtomicU64 = AtomicU64::new(0);
+    /// The cache append: K, V and index-key rows plus the block summary `k̄`.
+    pub static SRSWA_APPEND_NS: AtomicU64 = AtomicU64::new(0);
+    /// Block scores, entmax and selection (`decode_route`).
+    pub static SRSWA_ROUTE_NS: AtomicU64 = AtomicU64::new(0);
+    /// The attend over the selected blocks and the local window.
+    pub static SRSWA_ATTEND_NS: AtomicU64 = AtomicU64::new(0);
+    /// Block retirement.
+    pub static SRSWA_RETIRE_NS: AtomicU64 = AtomicU64::new(0);
 
     pub fn enabled() -> bool {
         static FLAG: OnceLock<bool> = OnceLock::new();
@@ -1201,7 +1212,17 @@ pub mod prof {
     }
     /// Reset all counters (call before a timed decode loop).
     pub fn reset() {
-        for c in [&LMHEAD_NS, &ATTN_NS, &EXPERTS_NS, &ROUTE_NS] {
+        for c in [
+            &LMHEAD_NS,
+            &ATTN_NS,
+            &EXPERTS_NS,
+            &ROUTE_NS,
+            &SRSWA_PROJECT_NS,
+            &SRSWA_APPEND_NS,
+            &SRSWA_ROUTE_NS,
+            &SRSWA_ATTEND_NS,
+            &SRSWA_RETIRE_NS,
+        ] {
             c.store(0, Ordering::Relaxed);
         }
     }
@@ -1209,6 +1230,18 @@ pub mod prof {
     pub fn snapshot_ms() -> (f64, f64, f64, f64) {
         let ms = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1e6;
         (ms(&LMHEAD_NS), ms(&ATTN_NS), ms(&EXPERTS_NS), ms(&ROUTE_NS))
+    }
+    /// `[project, append, route, attend, retire]` accumulated milliseconds of
+    /// the SR-SWA share of `attn`.
+    pub fn srswa_snapshot_ms() -> [f64; 5] {
+        [
+            &SRSWA_PROJECT_NS,
+            &SRSWA_APPEND_NS,
+            &SRSWA_ROUTE_NS,
+            &SRSWA_ATTEND_NS,
+            &SRSWA_RETIRE_NS,
+        ]
+        .map(|c| c.load(Ordering::Relaxed) as f64 / 1e6)
     }
 }
 

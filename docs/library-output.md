@@ -193,7 +193,7 @@ what it does. Most change speed or memory only. `FOCR_THREADS`, `FOCR_MMAP`,
 
 **Threads.** The kernels run on rayon's global pool. franken_ocr builds that pool once
 at the thread budget: `set_thread_budget`, else `FOCR_THREADS`, else the physical core
-count. If your program built the global pool first, yours stands and the engine runs
+count, which on an Apple-silicon Mac is the performance cores only. If your program built the global pool first, yours stands and the engine runs
 at its width. The budget latches for the process, so set it before the first read.
 
 **Shutdown.** `request_shutdown` is process-wide and installs no signal handler. Wire

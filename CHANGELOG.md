@@ -28,6 +28,15 @@ sections as they land.
 
 ### Changed
 
+- **The default thread budget on an Apple-silicon Mac is the performance cores**
+  (bead bd-zex4). It was every physical core, and the efficiency cores set the pace of
+  each fork-join section while the fast ones spun in the kernel. On an M5 Ultra (12
+  performance + 24 efficiency cores) shared with other work, the old default of 36
+  took 2.4-2.6x the wall time of 12 and about 6x the CPU time, for byte-identical
+  output (`artifacts/perf/bd-zex4`). The budget comes from `hw.perflevel0.physicalcpu`.
+  Other platforms, Intel Macs and iOS are unchanged, and `--threads` / `FOCR_THREADS`
+  still override it.
+
 - **`--temperature` above 0 is refused before a model loads** (bead bd-d630). Every
   model decodes greedily, and each sampler refused `temperature > 0` at its first step,
   so the run loaded the weights and then exited 1. The request now fails with exit 2
@@ -51,6 +60,13 @@ sections as they land.
   daemon protocol moves to 8, so a stale daemon does not decode without the guard.
 
 ### Added
+
+- **Unlimited-OCR-2 decode phase timings** (bead bd-uocr2-epic-cgux.38). With
+  `FOCR_PROFILE_DECODE=1` and `FOCR_TIMING=1`, a v2 document prints the `decode phases
+  (ms)` row v1 prints (lm_head, attn, experts, route), then an `srswa phases (ms)` row
+  that splits SR-SWA's share of `attn` into its index projections, the cache append,
+  block routing, the attend and block retirement. On single pages v2 decodes 12-26% slower
+  per token than v1 with the same MoE and lm_head code, and these rows show where.
 
 - **Unlimited-OCR-2 can read a capped page again on its own** (bead bd-yrr1). With
   `FOCR_REREAD_CAPPED_PAGES=1`, or `DocumentOptions::reread_capped` in the library, each
@@ -666,6 +682,12 @@ sections as they land.
   `focr pull <id>` when this release publishes that model.
 
 ### Fixed
+
+- **`focr robot schema` declares `raw` on `run_complete`** (bead bd-86kj). `focr ocr
+  --robot --raw` adds the undecorated decode to `run_complete` as `raw`, but
+  `event_fields` did not list it, so a consumer validating the stream against the schema
+  rejected the event. The field is now optional on `run_complete`, in `robot.rs` and the
+  frozen `tests/fixtures/robot_schema_v1.json` alike.
 
 - **v1 `--multi-page` warns when it writes more pages than it was given** (bead bd-17zw).
   A v1 document decode that wrote more page bodies than pages got no warning, and those

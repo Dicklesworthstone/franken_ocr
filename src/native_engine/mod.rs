@@ -6236,11 +6236,16 @@ impl OcrModel {
             td.elapsed().as_secs_f64() / (generated.max(1) as f64)
         ));
         // The same split as v1's `generate_cached`; `attn` holds the shared
-        // projections plus the SR-SWA attend, so the gap to v1's is the attend.
+        // projections plus the SR-SWA layer, so the gap to v1's is SR-SWA's,
+        // and the second row splits that layer by phase.
         if decoder::prof::enabled() {
             let (lmhead, attn, experts, route) = decoder::prof::snapshot_ms();
             timing_log(&format!(
                 "decode phases (ms): lm_head {lmhead:.0}  attn {attn:.0}  experts {experts:.0}  route {route:.0}"
+            ));
+            let [project, append, sieve, attend, retire] = decoder::prof::srswa_snapshot_ms();
+            timing_log(&format!(
+                "srswa phases (ms): project {project:.0}  append {append:.0}  route {sieve:.0}  attend {attend:.0}  retire {retire:.0}"
             ));
         }
         Ok((finish_reason, stats))

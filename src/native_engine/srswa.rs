@@ -33,7 +33,7 @@
 //! any [`BlockKv`], and the per-layer cache that stores K/V and index keys in
 //! 32-row blocks and frees whole blocks no later query can read (plan §5.12).
 
-use super::decoder::{RopeTable, apply_rope, config as decoder_config};
+use super::decoder::{RopeTable, apply_rope, config as decoder_config, prof};
 use super::nn;
 use super::tensor::Mat;
 use super::weights::Weights;
@@ -41,6 +41,7 @@ use crate::error::{FocrError, FocrResult};
 use crate::tokenizer::special;
 use rayon::prelude::*;
 use std::ops::Range;
+use std::time::Instant;
 
 /// `<PAGE>`, the v2 page marker (`config.json` `page_token_id`, added token
 /// 128827).
@@ -1736,9 +1737,21 @@ impl SrSwaState {
         rows: LayerRows<'_>,
         step: &DecodeStep,
     ) -> FocrResult<Mat> {
+        // FOCR_PROFILE_DECODE splits this layer's share of `attn` by phase.
+        let profiling = prof::enabled();
+        let mut t = profiling.then(Instant::now);
+        let mut lap = |counter: &std::sync::atomic::AtomicU64| {
+            if let Some(start) = t {
+                let now = Instant::now();
+                prof::add(counter, (now - start).as_nanos() as u64);
+                t = Some(now);
+            }
+        };
         let (iq, ik) = project(rows.normed, w, &step.rope)?;
+        lap(&prof::SRSWA_PROJECT_NS);
         let cache = &mut self.layers[layer];
         cache.append(rows.k, rows.v, &ik, &[-1])?;
+        lap(&prof::SRSWA_APPEND_NS);
         let route = cache
             .decode_route(
                 iq.row(0),
@@ -1753,6 +1766,7 @@ impl SrSwaState {
         if let Some(trace) = &mut self.trace {
             trace.decode[layer] = Some(route.clone());
         }
+        lap(&prof::SRSWA_ROUTE_NS);
         let q_pos = cache.rows() - 1;
         let out = attend_with(
             rows.q,
@@ -1761,7 +1775,9 @@ impl SrSwaState {
             &*cache,
             self.dense,
         )?;
+        lap(&prof::SRSWA_ATTEND_NS);
         cache.retire_dead_blocks(step.query_page, q_pos, step.forced)?;
+        lap(&prof::SRSWA_RETIRE_NS);
         Ok(out)
     }
 }
