@@ -3445,8 +3445,20 @@ struct PageEnd {
 impl PageEnd {
     /// Consume what `engine`'s last decode recorded.
     fn take(engine: &OcrEngine) -> Self {
-        let report = engine.take_last_decode_report();
-        let chart = engine.take_chart_page_meta();
+        Self::from_report(
+            engine.take_last_decode_report(),
+            engine.take_chart_page_meta(),
+            engine,
+        )
+    }
+
+    /// How a page ended, from its decode `report` and `chart` page; the
+    /// spine driver has one of each per image (bd-iv8d, bd-v37k).
+    fn from_report(
+        report: Option<native_engine::DecodeReport>,
+        chart: Option<native_engine::ChartPageMeta>,
+        engine: &OcrEngine,
+    ) -> Self {
         let mut warnings = report
             .as_ref()
             .map(native_engine::decode_warnings)
@@ -3471,9 +3483,8 @@ impl PageEnd {
 /// pushed to `results` (with `--json`) or the `[focr] … =====` markdown block on
 /// stdout/stderr, or under `--output-dir` the line naming its `saved` file.
 /// Factored so the sequential and spine drivers render byte-for-byte
-/// identically; the spine records no per-image `end`, and otherwise only the
-/// source of `outcome` differs between them. Returns the image's failure, once
-/// reported.
+/// identically; only the source of `outcome` and `end` differs between them.
+/// Returns the image's failure, once reported.
 fn emit_batch_result(
     json: bool,
     image: &std::path::Path,
@@ -3839,13 +3850,19 @@ fn run_batch_images(
             None => engine.recognize_batch(&image_refs),
         }?;
         let per_image = total.elapsed().as_secs_f64() / (count.max(1) as f64);
+        // One decode report and chart verdict per image, so a page the
+        // runaway guard stopped is written and fails, and an unverified chart
+        // warns, as in the sequential loop (bd-iv8d, bd-v37k).
+        let mut reports = engine.take_batch_decode_reports().into_iter();
+        let mut charts = engine.take_batch_chart_page_metas().into_iter();
         for ((image, outcome), saved) in images.iter().zip(batch).zip(saved) {
             let saved = saved.as_deref();
             let outcome = outcome.and_then(|markdown| {
                 save_batch_markdown(saved, &markdown)?;
                 Ok(markdown)
             });
-            let end = PageEnd::default();
+            let end =
+                PageEnd::from_report(reports.next().flatten(), charts.next().flatten(), &engine);
             if let Some(err) = emit_batch_result(
                 args.json,
                 image,

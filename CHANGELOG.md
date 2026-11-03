@@ -684,6 +684,25 @@ sections as they land.
 
 ### Fixed
 
+- **`ocr-batch` under `FOCR_BATCH_SPINE=1` reports a runaway v1 page** (bead bd-iv8d).
+  The spine branch never read a decode report, so a page the runaway guard stopped came
+  back as a success: its text cut short, exit 0, no `finish_reason`. `FOCR_BATCH_SPINE=1`
+  alone was enough, since with the default v1 artifact the batch falls back to one decode
+  per image and that decode's guard fired unreported. The int8 spine itself (int8
+  requested) never consulted the guard, so a repeating page there decoded to the
+  32,768-token limit, unlike the sequential loop it is meant to match byte for byte. Each spine stream now carries the guard a single page
+  gets, and the batch keeps one decode report per image
+  (`OcrEngine::take_batch_decode_reports`). A runaway image is written, marked failed and
+  exits 5, as in the sequential loop. Its JSON now carries `finish_reason` and warnings as
+  well.
+
+- **`ocr-batch` under `FOCR_BATCH_SPINE=1` reports each OneChart page's chart verdict**
+  (bead bd-v37k). The dense OneChart batch worked out every page's verdict and then kept
+  only its text, so the JSON lost `chart` and an unverified chart came back without its
+  `chart_unverified` warning. The batch now keeps one verdict per image
+  (`OcrEngine::take_batch_chart_page_metas`), and the spine reports it as the sequential
+  loop does.
+
 - **`focr robot schema` declares `raw` on `run_complete`** (bead bd-86kj). `focr ocr
   --robot --raw` adds the undecorated decode to `run_complete` as `raw`, but
   `event_fields` did not list it, so a consumer validating the stream against the schema
