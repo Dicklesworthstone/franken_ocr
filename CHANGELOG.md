@@ -69,7 +69,18 @@ sections as they land.
   another model's pinned tokenizer, the usual case being v1's beside a v2 artifact, the
   finding names that model. Both are errors, refused with the `focr pull <model>` that
   re-installs the package, and `--fix` leaves the files as they are. Before this the
-  mistake surfaced only when a run opened the model.
+  mistake surfaced only when a run used the model: a foreign file at the open, a missing
+  one at the first page.
+
+- **`focr doctor` checks that each installed model loads** (bead bd-uocr2-epic-cgux.37).
+  For every package in the model cache named after a registered model, doctor resolves
+  the id as `focr ocr --model <id>` would and runs the bounded header checks on what it
+  finds. A package where nothing resolves, as after an upgrade that moves the artifact
+  version, or whose artifact the checks refuse, is the error
+  `installed_model_not_loadable`, with the loader's own reason. A published model's
+  remedy is `focr pull <model>`, which `--fix` refuses to run; any other gets advice. An
+  artifact already reported as a stale format or as unreadable is left to that finding.
+  The existing `model_not_resolvable` still asks only about the default model.
 
 - **Unlimited-OCR-2 decode phase timings** (bead bd-uocr2-epic-cgux.38). With
   `FOCR_PROFILE_DECODE=1` and `FOCR_TIMING=1`, a v2 run's `decode phases (ms)` row

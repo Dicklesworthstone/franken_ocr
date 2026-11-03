@@ -117,6 +117,7 @@ pub fn detect(root: &DoctorRoot) -> Vec<Finding> {
     detect_stale_focrq_format(root, &mut findings);
     detect_sidecar_tokenizers(root, &mut findings);
     detect_unreadable_cache_entries(root, &mut findings);
+    detect_unloadable_installed_models(root, &mut findings);
     detect_orphaned_partials(root, &mut findings);
     detect_package_transactions(root, &mut findings);
     detect_document_runs(root, &mut findings);
@@ -276,9 +277,9 @@ fn detect_stale_focrq_format(root: &DoctorRoot, out: &mut Vec<Finding>) {
 
 /// An installed `.focrq` whose `tokenizer.json` is missing, or is not the file
 /// its model pins (U2-E7): chiefly v1's tokenizer beside a v2 artifact, or the
-/// reverse. The model refuses to open either way. `focr pull <model>`
-/// re-installs the package with its pinned tokenizer; the doctor never
-/// touches the file.
+/// reverse. A foreign file refuses the open; a missing one fails the first
+/// page. `focr pull <model>` re-installs the package with its pinned
+/// tokenizer; the doctor never touches the file.
 fn detect_sidecar_tokenizers(root: &DoctorRoot, out: &mut Vec<Finding>) {
     let entries = model_cache_dirs(root)
         .into_iter()
@@ -311,6 +312,57 @@ fn detect_sidecar_tokenizers(root: &DoctorRoot, out: &mut Vec<Finding>) {
             message,
             fixability: Fixability::RefusedUnsafe {
                 recommended_command: fault.recommended_command,
+            },
+        });
+    }
+}
+
+/// Each installed model package that `focr ocr --model <id>` would not load
+/// (U2-E7): nothing in the cache resolves to it, as after an upgrade that moves
+/// the artifact version, or what it resolves to fails the header checks.
+/// [`detect_model_not_resolvable`] asks only about the default model. An
+/// artifact another detector already reports (a stale format, no read
+/// permission) is left to that finding.
+fn detect_unloadable_installed_models(root: &DoctorRoot, out: &mut Vec<Finding>) {
+    let models = root.models_dir();
+    let manifest = crate::dist::builtin_manifest().ok();
+    let published = |id: &str| {
+        manifest
+            .as_ref()
+            .is_some_and(|manifest| manifest.model == id || manifest.models.contains_key(id))
+    };
+    for package in model_cache_dirs(root)
+        .into_iter()
+        .filter(|dir| *dir != models)
+    {
+        let Some(id) = package.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(fault) = crate::native_engine::installed_model_fault(&models, id) else {
+            continue;
+        };
+        let artifact = fault
+            .artifact
+            .map(|artifact| artifact.display().to_string());
+        if artifact.is_some() && out.iter().any(|finding| finding.path == artifact) {
+            continue;
+        }
+        out.push(Finding {
+            detector: "installed_model_not_loadable",
+            severity: "error",
+            path: Some(artifact.unwrap_or_else(|| package.display().to_string())),
+            message: format!(
+                "{id} is installed but `focr ocr --model {id}` would not load it: {}",
+                fault.refusal
+            ),
+            fixability: if published(id) {
+                Fixability::RefusedUnsafe {
+                    recommended_command: format!("focr pull {id}"),
+                }
+            } else {
+                Fixability::AdviceOnly {
+                    hint: format!("`focr pull` does not publish {id}; re-install its artifact"),
+                }
             },
         });
     }
@@ -925,6 +977,7 @@ pub fn capabilities() -> serde_json::Value {
             {"name": "missing_tokenizer", "fix": "refused_unsafe (`focr pull <model>` re-installs the package with its pinned tokenizer)"},
             {"name": "tokenizer_mismatch", "fix": "refused_unsafe (`focr pull <model>` re-installs the package with its pinned tokenizer)"},
             {"name": "unreadable_cache_entry", "fix": "auto (chmod_u_rw, mode+bytes backed up)", "platform": "unix"},
+            {"name": "installed_model_not_loadable", "fix": "refused_unsafe (`focr pull <model>` re-installs a published model; advice_only otherwise)"},
             {"name": "orphaned_partial_download", "fix": "auto (quarantine into the run's backups; reversible)"},
             {"name": "abandoned_package_stage", "fix": "refused_unsafe (`focr pull <model>` removes it under the package lock)"},
             {"name": "superseded_package_left", "fix": "refused_unsafe (`focr pull <model>` removes it under the package lock)"},

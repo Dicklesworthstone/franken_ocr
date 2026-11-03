@@ -30,8 +30,8 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 
 | Metric | FeatureUniverse (§1–§11, numbered #1–#128) | SurfaceMatrix (§12–§15) | Total |
 |--------|-------------------------------------------:|------------------------:|------:|
-| Total enumerated rows | **128** | **92** | **220** |
-| `present` | 115 † | 79 | 194 |
+| Total enumerated rows | **128** | **94** | **222** |
+| `present` | 115 † | 81 | 196 |
 | `partial` | 7 † | 10 | 17 |
 | `missing` | 2 † | 3 | 5 |
 | `excluded` (coverage debt, reasoned) | 4 | 0 (`pdf` re-scored `partial` — scanned path shipped v0.2.0) | 4 |
@@ -292,6 +292,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `--keep-checkpoint`: keep the checkpoint when the document finishes | §7.2 | SHOULD | present | SURF | bd-uocr2-epic-cgux.27 | the journal is removed either way |
 | `doctor`: `interrupted_document_run` (with the resume command), `kept_document_checkpoint` | §7.2 | SHOULD | present | SURF | bd-uocr2-epic-cgux.27 | read-only; `document-runs/` is never quarantined |
 | `doctor`: `tokenizer_mismatch`, `missing_tokenizer` (each installed `.focrq`'s `tokenizer.json` against the file its declared model pins, e.g. v1's beside v2's) | §7.2 | SHOULD | present | SURF | bd-uocr2-epic-cgux.37 | the loader's own sidecar check, without loading weights; refused with `focr pull <model>`; `doctor_fixtures::a_wrong_or_missing_tokenizer_is_refused_with_the_pull_that_reinstalls_it` |
+| `doctor`: `installed_model_not_loadable` (each installed package named after a registered model, resolved as `focr ocr --model <id>` would and header-checked) | §7.2 | SHOULD | present | SURF | bd-uocr2-epic-cgux.37 | the resolver's or the header check's own refusal; a published model is refused with `focr pull <model>`, any other gets advice; `doctor_fixtures::an_installed_model_that_would_not_load_is_reported_with_its_remedy` |
 | `--page-window N\|auto\|off` on an Unlimited-OCR-2 `--multi-page` document | §7.2 | MUST | present | SURF | bd-uocr2-epic-cgux.28 | `N` above 102 exits 2 naming the limit; `auto` sizes to `FOCR_MEMORY_BUDGET` (bd-uocr2-epic-cgux.26); `off` is one pass with no checkpoint, and refuses `--resume` |
 | `--version` carries Baidu MIT attribution | §11 | MUST | present | SURF | bd-223.14 | license compliance |
 | `pdf` input (native scanned fast path) | §7.7 | SHOULD | partial | SURF | bd-0a7.4 | **moved from `excluded`**: scanned-PDF native path shipped v0.2.0 (lopdf, decompress-bomb bounded bd-2zpu); vector-page rasterization deferred |

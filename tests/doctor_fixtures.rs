@@ -362,6 +362,63 @@ fn a_wrong_or_missing_tokenizer_is_refused_with_the_pull_that_reinstalls_it() {
     );
 }
 
+/// Failure mode 6 (U2-E7): an installed model `focr ocr --model <id>` would
+/// not load. A v2 package holding only an older release's file resolves to
+/// nothing, and doctor names the pull that installs this release; a TrOCR
+/// artifact the header checks refuse gets advice, since `focr pull` does not
+/// publish TrOCR. `--fix` leaves both files as they are.
+#[test]
+fn an_installed_model_that_would_not_load_is_reported_with_its_remedy() {
+    let home = fresh_home("unloadable");
+    let v2 = models_dir(&home).join("unlimited-ocr-2");
+    let trocr = models_dir(&home).join("trocr");
+    std::fs::create_dir_all(&v2).expect("seed the v2 package");
+    std::fs::create_dir_all(&trocr).expect("seed the TrOCR package");
+    let older = v2.join("unlimited-ocr-2.v0.0.0.int8.focrq");
+    let refused = trocr.join("trocr.focrq");
+    std::fs::write(&older, b"an older release").expect("seed an older release");
+    std::fs::write(&refused, b"not an artifact").expect("seed a refused artifact");
+
+    let out = focr(&home, &["doctor", "--json"]);
+    let v = json_stdout(&out);
+    let findings: Vec<&serde_json::Value> = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["detector"] == "installed_model_not_loadable")
+        .collect();
+    let at = |path: &Path| {
+        findings
+            .iter()
+            .find(|f| f["path"].as_str() == path.to_str())
+            .copied()
+            .unwrap_or_else(|| panic!("nothing reported at {}: {v}", path.display()))
+    };
+    let unresolved = at(&v2);
+    let rejected = at(&refused);
+    let remedies = unresolved["fixability"]["recommended_command"] == "focr pull unlimited-ocr-2"
+        && rejected["fixability"]["kind"] == "advice_only";
+    let errors = findings.len() == 2 && findings.iter().all(|f| f["severity"] == "error");
+
+    let out = focr(&home, &["doctor", "--fix"]);
+    let v = json_stdout(&out);
+    let refused_fix = v["refused_unsafe"].as_u64().unwrap() >= 1;
+    let untouched = std::fs::read(&older).unwrap() == b"an older release"
+        && std::fs::read(&refused).unwrap() == b"not an artifact";
+    let ok = remedies && errors && refused_fix && untouched;
+    emit(
+        "installed_model_unloadable",
+        ok,
+        &format!(
+            r#""remedies":{remedies},"errors":{errors},"refused":{refused_fix},"untouched":{untouched}"#
+        ),
+    );
+    assert!(
+        ok,
+        "an installed model that would not load must be reported untouched: {v}"
+    );
+}
+
 /// `--dry-run` mutates NOTHING and records NO run.
 #[test]
 fn dry_run_has_zero_blast_radius() {
@@ -437,7 +494,7 @@ fn contract_surfaces_answer() {
     let caps_ok = caps["exit_codes"]["5"]
         .as_str()
         .is_some_and(|s| s.contains("lock"))
-        && caps["detectors"].as_array().is_some_and(|d| d.len() == 9);
+        && caps["detectors"].as_array().is_some_and(|d| d.len() == 12);
     let docs = focr(&home, &["doctor", "robot-docs"]);
     let docs_ok = String::from_utf8_lossy(&docs.stdout).contains("focr doctor undo");
     let triage = json_stdout(&focr(&home, &["doctor", "--robot-triage"]));

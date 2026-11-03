@@ -843,8 +843,10 @@ backed up first under `.doctor/runs/<run-id>/backups/`, hashes and modes are
 logged to `actions.jsonl`, and `doctor undo <run-id>` restores from that log.
 Irreversible work, such as regenerating model artifacts, is refused with the
 exact command to run manually. That includes a model whose `tokenizer.json` is
-missing or is not the file that model pins, such as v1's beside a v2 artifact:
-doctor names the `focr pull <model>` that re-installs it.
+missing or is not the file that model pins, such as v1's beside a v2 artifact,
+and an installed model that `focr ocr --model <id>` would not load, such as a
+package still holding the previous release after an upgrade: for a published
+model, doctor names the `focr pull <model>` that re-installs it.
 
 ```bash
 focr doctor                                 # human-readable detect-only report

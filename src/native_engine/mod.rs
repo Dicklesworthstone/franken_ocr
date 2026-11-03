@@ -4253,6 +4253,42 @@ fn tokenizer_owner(sha256: &str) -> Option<&'static str> {
         .map(|arch| arch.id())
 }
 
+/// Why an installed model does not load, for `focr doctor` (U2-E7).
+#[derive(Debug)]
+pub(crate) struct InstalledModelFault {
+    /// The artifact `--model <id>` resolves to; `None` when it finds none.
+    pub artifact: Option<PathBuf>,
+    /// The resolver's or the header check's refusal, as a load reports it.
+    pub refusal: String,
+}
+
+/// Why `focr ocr --model <id>` would not load model `id` from the model cache
+/// at `models`, searched as the resolver searches that cache (U2-E7). `None`
+/// when `id` names no registered model, or the artifact it resolves to passes
+/// the bounded header checks; the tokenizer beside it is
+/// [`sidecar_tokenizer_fault`]'s to judge.
+pub(crate) fn installed_model_fault(models: &Path, id: &str) -> Option<InstalledModelFault> {
+    let arch = model_arch::arch_by_id(id)?;
+    let resolved = match resolve_model_from_search_dirs_with_quant(
+        Path::new(arch.id()),
+        &cache_search_dirs(models.to_path_buf()),
+        model_quant_preference(),
+    ) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            return Some(InstalledModelFault {
+                artifact: None,
+                refusal: error.to_string(),
+            });
+        }
+    };
+    let refusal = validate_model_header_file(&resolved).err()?.to_string();
+    Some(InstalledModelFault {
+        artifact: Some(resolved),
+        refusal,
+    })
+}
+
 /// Reject Unlimited-OCR containers that violate the fixed default quantization
 /// recipe before any forward can silently consume them. Raw safetensors and
 /// other registered model families have separate storage contracts.
@@ -14050,6 +14086,64 @@ mod tests {
         let not_focrq = temp_model_dir("doctor_not_focrq").join("model.focrq");
         std::fs::write(&not_focrq, unidentified_safetensors()).expect("write raw shard");
         assert!(sidecar_tokenizer_fault(&not_focrq).is_none());
+    }
+
+    /// U2-E7: `focr doctor` asks of each installed package what `focr ocr
+    /// --model <id>` would: whether the cache resolves the id, and whether the
+    /// artifact it resolves to passes the header checks.
+    #[test]
+    fn an_installed_model_is_judged_by_what_its_id_resolves_to() {
+        let models = temp_model_dir("installed_models").join("models");
+        let v2 = model_arch::UNLIMITED_OCR_V2_ID;
+        let v2_package = models.join(v2);
+        std::fs::create_dir_all(&v2_package).expect("create the v2 package");
+
+        // An upgrade that moves the artifact version leaves the old file unnamed.
+        std::fs::write(
+            v2_package.join(format!("{v2}.v0.0.0.int8.focrq")),
+            b"an older release",
+        )
+        .expect("write an older release");
+        let unnamed = installed_model_fault(&models, v2).expect("nothing resolves");
+        assert_eq!(unnamed.artifact, None);
+        assert!(
+            unnamed
+                .refusal
+                .contains(&format!("no model artifact named {v2}")),
+            "{}",
+            unnamed.refusal
+        );
+
+        // The name this release installs, holding a header the checks refuse.
+        let current = versioned_quant_path(&v2_package.join(v2), ModelQuantPreference::Int8);
+        let mut builder = crate::quant::focrq::FocrqBuilder::new().with_model_id(v2);
+        builder
+            .add_tensor(
+                "model.embed_tokens.weight",
+                crate::quant::focrq::WriteDType::Bf16,
+                vec![1, 1],
+                vec![0; 2],
+            )
+            .expect("add tensor");
+        std::fs::write(&current, builder.build()).expect("write the current release");
+        let refused = installed_model_fault(&models, v2).expect("its header is refused");
+        assert_eq!(refused.artifact.as_deref(), Some(current.as_path()));
+        assert!(!refused.refusal.is_empty());
+
+        // A compatible artifact under the name `focr pull` installs loads.
+        let got = models.join("got-ocr2");
+        std::fs::create_dir_all(&got).expect("create the GOT package");
+        std::fs::write(
+            got.join("got-ocr2.int8.focrq"),
+            compatible_test_model_builder().build(),
+        )
+        .expect("write a compatible artifact");
+        assert!(installed_model_fault(&models, "got-ocr2").is_none());
+
+        assert!(
+            installed_model_fault(&models, "not-a-model").is_none(),
+            "only a registered model is judged"
+        );
     }
 
     #[test]
