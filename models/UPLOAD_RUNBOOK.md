@@ -142,6 +142,15 @@ The manifest's tokenizer URLs are the upstream file at the pinned commit
 (`baidu/Unlimited-OCR-2/resolve/5632329a…/tokenizer.json`) and this release's
 copy.
 
+The Hugging Face mirror was uploaded on 2026-11-02. On each resolve URL,
+`x-linked-etag` equals the sha256 in the table above and `x-linked-size` equals
+the size, for the three parts and the whole file. A clean-cache
+`focr pull unlimited-ocr-2` then took all three parts from Hugging Face, with no
+GitHub fallback, and verified each one and the reassembled file (U2-T1a's
+`i_pull` step). The parts were no longer in the staging directory by then, so
+they were cut again by byte offset from the whole file. Each matched its size
+and sha256 before upload.
+
 ## Historical Unlimited-OCR artifact (blocked)
 
 | artifact | size | sha256 |
