@@ -293,7 +293,8 @@ pub fn run_complete_event(markdown: &str) -> Value {
 /// runs, so existing consumers and goldens are unaffected and
 /// [`ROBOT_SCHEMA_VERSION`] is unchanged.
 ///
-/// U2-X2 adds `finish_reason` (`stop` | `length` | `budget`) whenever the decode
+/// U2-X2 adds `finish_reason` (`stop` | `length` | `budget`; later `cancelled`
+/// and `runaway`, bd-gftg) whenever the decode
 /// recorded one, and `warnings` (`{kind, message, recovery, ...}`) only when
 /// non-empty, so a healthy run differs from before only by `finish_reason`.
 /// U2-E1 adds `model_id` and `source_sha256` whenever the model that ran is

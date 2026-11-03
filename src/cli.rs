@@ -1283,6 +1283,28 @@ impl Recognition {
         if raw { self.raw() } else { self.markdown() }
     }
 
+    /// The robot `page` events that carry a run's text when its pages did not
+    /// stream: a single image is page 1, and a page-by-page document has one
+    /// per page. A cross-page parse streamed its pages as it read them.
+    fn unstreamed_page_events(&self) -> Vec<serde_json::Value> {
+        match self {
+            Recognition::Single(doc) => vec![robot::page_decoded_event(1, doc.raw.trim())],
+            Recognition::Document(document) => match &document.pages {
+                DocumentPageList::Layouts(pages) => pages
+                    .iter()
+                    .map(|page| {
+                        let mut event = robot::page_decoded_event(page.page, page.raw.trim());
+                        if let Some(half) = page.half {
+                            event["half"] = half.into();
+                        }
+                        event
+                    })
+                    .collect(),
+                DocumentPageList::Read(_) => Vec::new(),
+            },
+        }
+    }
+
     /// The structured JSON form. Always carries `schema_version` + `markdown`; a
     /// single image adds a top-level `layout` array, a document adds a `pages`
     /// array of `{page, layout}` (plus `half` on a split spread's halves). A
@@ -2337,6 +2359,13 @@ fn run_ocr_inner(
                 event["extra_markers"] = counts.extra_markers.into();
             }
             emit(&event);
+        } else if matches!(&partial, Some(FocrError::Partial(p)) if p.finish_reason == "runaway") {
+            // A v1 decode the runaway guard stopped streamed no page, so the
+            // text before the stop goes out as `page` events before the
+            // run_error (bd-gftg).
+            for event in recognition.unstreamed_page_events() {
+                emit(&event);
+            }
         }
     } else if let Some(path) = args.output.as_deref() {
         // Result already went to the file; don't also echo it to stdout. Confirm
@@ -6018,6 +6047,53 @@ mod tests {
         assert_eq!(json["markdown"], "md");
         assert_eq!(json["raw"], "whole");
         assert_eq!(json["pages"][0]["raw"], "page one");
+    }
+
+    /// bd-gftg: a run whose pages did not stream hands its text to a robot
+    /// consumer as decoded `page` events: page 1 for an image, one per page
+    /// (with its half) for a page-by-page document, none for a cross-page parse.
+    #[test]
+    fn unstreamed_pages_become_decoded_page_events() {
+        let single = Recognition::Single(native_engine::RecognizedDocument {
+            markdown: "so far".to_string(),
+            raw: " so far \n".to_string(),
+            layout: vec![],
+        });
+        let events = single.unstreamed_page_events();
+        assert_eq!(events, [robot::page_decoded_event(1, "so far")]);
+        assert_eq!(events[0]["status"], "decoded");
+
+        let pages = Recognition::Document(DocumentRecognition {
+            markdown: "md".to_string(),
+            raw: "whole".to_string(),
+            pages: DocumentPageList::Layouts(vec![
+                DocumentPageLayout {
+                    page: 3,
+                    half: None,
+                    raw: "page three".to_string(),
+                    layout: vec![],
+                },
+                DocumentPageLayout {
+                    page: 4,
+                    half: Some("left"),
+                    raw: "left half\n".to_string(),
+                    layout: vec![],
+                },
+            ]),
+        });
+        let mut left = robot::page_decoded_event(4, "left half");
+        left["half"] = "left".into();
+        assert_eq!(
+            pages.unstreamed_page_events(),
+            [robot::page_decoded_event(3, "page three"), left]
+        );
+
+        let read = Recognition::Document(DocumentRecognition {
+            markdown: "md".to_string(),
+            raw: "whole".to_string(),
+            pages: DocumentPageList::Read(Vec::new()),
+        });
+        assert!(read.unstreamed_page_events().is_empty());
     }
 
     /// U2-E3b: the resident daemon's wire carries a span whole, `level` and

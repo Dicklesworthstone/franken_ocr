@@ -180,7 +180,7 @@ MoEGate: `logits = linear(hidden.f32, gate.f32)` → softmax(f32) → top-6 gree
 ### 6.10 `decode.rs` — [SPEC-100..103]
 The frozen `DecodeParams`/`DecodeOutput` contract + AR loop. Greedy by default (`do_sample = temperature>0`, default 0.0 ⇒ argmax) [SPEC-100]; EOS=1, max_length 32768, use_cache [SPEC-101]; **`no_repeat_ngram_size=35`** with `ngram_window` **128 single / 1024 multi** [SPEC-102/103], OQ-18 — the custom `SlidingWindowNoRepeatNgramProcessor` (these are first-class generation semantics, not just CLI flags). lm_head→argmax-only fused under greedy (§6.10/bd-2mo.24). Delivered by bd-1gv.22, parity bd-1gv.22.1.
 
-#### Provisional runaway-token controller (bd-2mo.30.12; default OFF)
+#### Runaway-token controller (bd-2mo.30.12; default ON for a v1 single page since bd-gftg)
 
 The conservative FFN/expert-only int8 recipe can enter a no-EOS, repetitive
 table trajectory on the page_0590 sentinel. The diagnostic controller is a
@@ -194,18 +194,22 @@ bounded finite-state monitor over **generated token ids**, never decoded strings
   can transition back to Continue. No logits, markup, language, or
   precision-route state participates.
 - **Actions:** `Continue` leaves sampling and EOS behavior byte-for-byte
-  untouched; `Abort(evidence)` returns `FocrError::Timeout` (stable exit 5).
-  Abort never inserts EOS and never returns a truncated output as success. A
-  just-emitted real EOS observed before a terminal trigger bypasses the monitor
-  and retains reference stop semantics.
-- **Bounded deterministic trigger:** when explicitly armed with
-  `FOCR_RUNAWAY_GUARD=1`, inspect the last 2,048 tokens every 256 emitted tokens,
+  untouched; `Abort(evidence)` stops the decode and keeps the tokens emitted so
+  far (bd-gftg). The decode reports `finish_reason: runaway`, and the CLI writes
+  the text and then fails with `FocrError::Partial` (stable exit 5). Abort never
+  inserts EOS and never returns a truncated output as success. A just-emitted
+  real EOS observed before a terminal trigger bypasses the monitor and retains
+  reference stop semantics. (Before bd-gftg, Abort returned
+  `FocrError::Timeout` and discarded the text.)
+- **Bounded deterministic trigger:** when armed (by default for a v1 single
+  page; `FOCR_RUNAWAY_GUARD=1` for `--multi-page`; `=0` disarms it everywhere),
+  inspect the last 2,048 tokens every 256 emitted tokens,
   starting at token 8,192. Search periods `1..=256` (at least eight cycles).
   One checkpoint is suspicious only when lag agreement is at least `15/16` and
   exact token-4gram novelty is at most `1/4`; abort after three consecutive
   suspicious checkpoints. All comparisons are integer-exact, and checkpoints
   are replayed at their fixed token prefix so polling cadence cannot change the
-  verdict. Unset or `=0` is disabled and performs no analysis/allocation.
+  verdict. A disarmed guard performs no analysis/allocation.
 - **Unlimited-OCR-2 (bd-gftg):** the same trigger runs per page, over the ids
   since the last `<PAGE>`, with every numeral token read as one id so a
   counting loop repeats too. A trigger does not abort. The page guard forces
@@ -214,7 +218,7 @@ bounded finite-state monitor over **generated token ids**, never decoded strings
 
 The failure-cost matrix uses ordinal decision units (not measured dollars):
 
-| latent state | Continue | Abort with typed timeout |
+| latent state | Continue | Abort with typed timeout (before bd-gftg) |
 |---|---:|---:|
 | normal decode | 0 | 1000 (false abort / lost valid OCR) |
 | runaway decode | 100 (corrupt output + wasted decode) | 5 (explicit failed request) |
@@ -228,6 +232,22 @@ offline calibration ledger must report a Beta posterior for trigger precision
 CVaR/tail impact. Until the lower 95% precision bound clears the loss crossover,
 the normal corpus has zero observed triggers, and the CER/tail gates pass, the
 controller stays default-OFF and bd-2mo.30.12 stays open.
+
+**bd-gftg (2026-11-02, owner decision; DISC-023).** The owner turned the
+controller on by default for a v1 single page once Abort kept the text. That
+changes the matrix's false-abort cell: a false stop now loses only the page's
+text after the fire, at 8,192 tokens or later, not the page. Measured against
+the criteria above, the evidence falls short of the old bar:
+
+- U2-C5a gave 13 caught v1 runaways and 0 false fires, a lower 95% precision
+  bound of 0.81 (`Beta(14, 1)`), short of 0.913.
+- Ground truth has triggers: none on 1,651 OmniDocBench pages, but 9 on 18,118
+  MarathonDocBench pages. 7 are broken references and 2 are real long charts.
+
+With keep-prefix the crossover is `C/(95 + C)` for a false-stop cost `C`. A bound
+of 0.81 clears it while a false stop costs less than about 400 units. With the
+C5a reruns substituted, keeping the stopped pages' text moved v1's mean CER_text
+from 0.1663 to 0.1654. All of this is post hoc.
 
 The evidence artifact extends
 `artifacts/perf/bd-2mo.30/profile-recipe-5733407/pass13-page0590-precision-20260710T082044Z/`

@@ -1386,6 +1386,7 @@ impl OcrModel {
             max_positions: params.max_positions,
             decodes: decodes + 1,
             length_stops: length_stops + usize::from(stopped),
+            runaway_stops: 0,
             document: Some(doc.stats.clone()),
             admission_warnings: lever_policy::admit_from_process(self.arch()).warnings,
         });

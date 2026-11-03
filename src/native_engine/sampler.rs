@@ -44,19 +44,24 @@ pub const NGRAM_WINDOW_MULTI: usize = 1024;
 /// `modeling_unlimitedocr.py:787/1011/1139/1249`).
 pub const DEFAULT_MAX_LENGTH: usize = 32_768;
 
-/// Opt-in diagnostic guard for deterministic low-novelty periodic decode
-/// trajectories (bd-2mo.30.12). Unset and `0` are OFF; only `1` arms it.
+/// The guard for deterministic low-novelty periodic decode trajectories
+/// (bd-2mo.30.12): `0` turns it off, `1` arms it, and unset leaves each
+/// decode's default. Only a v1 single page is armed by default (bd-gftg,
+/// DISC-023). A v1 `--multi-page` decode and Unlimited-OCR-2 run it only
+/// under `1`.
 ///
-/// The guard remains default-off until its false-positive posterior and corpus
-/// tail impact have been calibrated. When armed, a v1 trigger is a typed
-/// timeout, never a synthetic EOS or a successful truncated result. An
-/// Unlimited-OCR-2 trigger closes the page instead ([`PageRunaway`], bd-gftg):
-/// v2 already ends pages by force at its cap, and the page's end says so.
+/// A v1 trigger stops the decode and keeps the text before it. That is never a
+/// synthetic EOS or a silent success: the decode reports `runaway`, which the
+/// CLI turns into exit 5 after writing the text. An Unlimited-OCR-2 trigger
+/// closes the page instead ([`PageRunaway`]): v2 already ends pages by force at
+/// its cap, and the page's end says so.
 pub const RUNAWAY_GUARD_ENV: &str = "FOCR_RUNAWAY_GUARD";
 
-/// Do not inspect ordinary short outputs. This provisional threshold has not
-/// yet been calibrated against the pinned BF16 token stream and cannot become a
-/// default until that evidence exists.
+/// Do not inspect ordinary short outputs. Calibrated post hoc (bd-gftg);
+/// `scripts/runaway_replay.py` replays the guard offline, and its self-test
+/// fails when one of these thresholds changes without it. At this floor the trigger fires on none of 99 legitimate long C5a outputs
+/// and none of OmniDocBench's 1,651 reference pages. On MarathonDocBench it
+/// fires on 2 of 18,118 reference pages that are real content (chart data).
 pub const RUNAWAY_GUARD_MIN_TOKENS: usize = 8_192;
 
 /// Inspect one fixed suffix every 256 emitted tokens. Sparse checkpoints bound
@@ -250,7 +255,7 @@ impl RunawayMetrics {
     }
 }
 
-/// Auditable witness carried by the typed timeout when hysteresis fires.
+/// Auditable witness of the trigger, kept when hysteresis fires.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunawayEvidence {
     /// Metrics at the checkpoint that completed the trigger.
@@ -260,16 +265,14 @@ pub struct RunawayEvidence {
 }
 
 impl RunawayEvidence {
-    /// Convert a trigger into the stable budget/timeout error class (exit 5).
-    ///
-    /// This intentionally does not return generated tokens or synthesize EOS:
-    /// the caller must reject the run rather than silently bless truncation.
+    /// The trigger's audit line: where it fired and the statistics that
+    /// fired it.
     #[must_use]
-    pub fn timeout_error(self) -> FocrError {
-        FocrError::Timeout(format!(
+    pub fn describe(self) -> String {
+        format!(
             "runaway token guard triggered at {} emitted tokens after {} consecutive \
              checkpoints: period={} match={}/{} ({} ppm), token-4gram novelty={}/{} \
-             ({} ppm); output rejected rather than silently truncated",
+             ({} ppm)",
             self.metrics.emitted_tokens,
             self.consecutive_hits,
             self.metrics.best_period,
@@ -279,7 +282,7 @@ impl RunawayEvidence {
             self.metrics.unique_ngrams,
             self.metrics.total_ngrams,
             self.metrics.ngram_novelty_ppm(),
-        ))
+        )
     }
 }
 
@@ -288,11 +291,11 @@ impl RunawayEvidence {
 pub enum RunawayDecision {
     /// Preserve the ordinary decode path unchanged.
     Continue,
-    /// Reject the run with [`RunawayEvidence::timeout_error`].
+    /// Stop the decode here, keeping what it emitted (bd-gftg).
     Abort(RunawayEvidence),
 }
 
-/// Opt-in finite-state detector for sustained periodic, low-novelty token tails.
+/// Finite-state detector for sustained periodic, low-novelty token tails.
 ///
 /// State is only the next fixed checkpoint, consecutive suspicious-hit count,
 /// last metrics, and an optional terminal evidence witness. Abort is sticky:
@@ -321,14 +324,16 @@ impl RunawayGuard {
         }
     }
 
-    /// Parse the strict public environment contract.
+    /// Parse the strict public environment contract for a decode whose guard
+    /// is `default_on` when the variable is unset (bd-gftg: a v1 single page).
     ///
-    /// `None` and `Some("0")` preserve today's exact token stream. Only
-    /// `Some("1")` arms the uncalibrated diagnostic controller; every other
-    /// value is a usage error rather than a silently guessed policy.
-    pub fn from_env_value(raw: Option<&str>) -> FocrResult<Self> {
+    /// `Some("0")` preserves the reference's exact token stream and
+    /// `Some("1")` arms the guard; every other value is a usage error rather
+    /// than a silently guessed policy.
+    pub fn from_env_value(raw: Option<&str>, default_on: bool) -> FocrResult<Self> {
         let enabled = match raw {
-            None | Some("0") => false,
+            None => default_on,
+            Some("0") => false,
             Some("1") => true,
             Some(other) => {
                 return Err(FocrError::Usage(format!(
@@ -339,11 +344,12 @@ impl RunawayGuard {
         Ok(Self::new(enabled))
     }
 
-    /// Read [`RUNAWAY_GUARD_ENV`] once for one decode invocation.
-    pub fn from_env() -> FocrResult<Self> {
+    /// Read [`RUNAWAY_GUARD_ENV`] once for one decode invocation, as
+    /// [`Self::from_env_value`].
+    pub fn from_env(default_on: bool) -> FocrResult<Self> {
         match std::env::var(RUNAWAY_GUARD_ENV) {
-            Ok(raw) => Self::from_env_value(Some(&raw)),
-            Err(std::env::VarError::NotPresent) => Self::from_env_value(None),
+            Ok(raw) => Self::from_env_value(Some(&raw), default_on),
+            Err(std::env::VarError::NotPresent) => Self::from_env_value(None, default_on),
             Err(std::env::VarError::NotUnicode(_)) => Err(FocrError::Usage(format!(
                 "{RUNAWAY_GUARD_ENV} must be valid UTF-8 containing exactly 0 or 1"
             ))),
@@ -360,6 +366,12 @@ impl RunawayGuard {
     #[must_use]
     pub fn last_metrics(&self) -> Option<RunawayMetrics> {
         self.last_metrics
+    }
+
+    /// The witness of the trigger that stopped the decode, if it fired.
+    #[must_use]
+    pub fn evidence(&self) -> Option<RunawayEvidence> {
+        self.terminal_evidence
     }
 
     /// Observe an append-only emitted-token history.
@@ -404,24 +416,20 @@ impl RunawayGuard {
         RunawayDecision::Continue
     }
 
-    /// Shared production commit hook: check one just-appended token and
-    /// propagate a terminal trigger as a typed timeout.
+    /// Shared production commit hook: check one just-appended token. `true`
+    /// stops the decode there, and the caller keeps `emitted` as the text
+    /// before the runaway (bd-gftg); [`Self::evidence`] says why.
     ///
     /// A real EOS observed before a terminal trigger bypasses analysis; the
     /// guard exists only for sustained **no-EOS** trajectories. Once selected,
     /// Abort remains sticky. Every production AR loop calls this after appending
     /// its token and before committing more decoder state.
-    pub fn check_after_emit(&mut self, emitted: &[u32], is_eos: bool) -> FocrResult<()> {
-        if let Some(evidence) = self.terminal_evidence {
-            return Err(evidence.timeout_error());
+    #[must_use]
+    pub fn stops_after_emit(&mut self, emitted: &[u32], is_eos: bool) -> bool {
+        if self.terminal_evidence.is_some() {
+            return true;
         }
-        if is_eos {
-            return Ok(());
-        }
-        match self.observe(emitted) {
-            RunawayDecision::Continue => Ok(()),
-            RunawayDecision::Abort(evidence) => Err(evidence.timeout_error()),
-        }
+        !is_eos && matches!(self.observe(emitted), RunawayDecision::Abort(_))
     }
 }
 
@@ -1316,19 +1324,33 @@ mod tests {
     }
 
     #[test]
-    fn runaway_guard_is_default_off_and_strictly_opt_in() {
+    fn runaway_guard_unset_takes_the_decode_default_and_set_overrides_it() {
         let default_guard = RunawayGuard::default();
         assert!(!default_guard.enabled());
-        assert!(!RunawayGuard::from_env_value(None).unwrap().enabled());
-        assert!(!RunawayGuard::from_env_value(Some("0")).unwrap().enabled());
-        assert!(RunawayGuard::from_env_value(Some("1")).unwrap().enabled());
-
-        for invalid in ["", "true", "on", "2", " 1 "] {
-            assert!(matches!(
-                RunawayGuard::from_env_value(Some(invalid)),
-                Err(FocrError::Usage(message))
-                    if message.contains("must be exactly 0 or 1")
-            ));
+        for default_on in [false, true] {
+            assert_eq!(
+                RunawayGuard::from_env_value(None, default_on)
+                    .unwrap()
+                    .enabled(),
+                default_on
+            );
+            assert!(
+                !RunawayGuard::from_env_value(Some("0"), default_on)
+                    .unwrap()
+                    .enabled()
+            );
+            assert!(
+                RunawayGuard::from_env_value(Some("1"), default_on)
+                    .unwrap()
+                    .enabled()
+            );
+            for invalid in ["", "true", "on", "2", " 1 "] {
+                assert!(matches!(
+                    RunawayGuard::from_env_value(Some(invalid), default_on),
+                    Err(FocrError::Usage(message))
+                        if message.contains("must be exactly 0 or 1")
+                ));
+            }
         }
     }
 
@@ -1389,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn runaway_guard_rejects_with_typed_timeout_not_synthetic_eos() {
+    fn runaway_evidence_describes_the_trigger_statistics() {
         let tokens = periodic_tokens(
             RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
             19,
@@ -1398,44 +1420,36 @@ mod tests {
         let RunawayDecision::Abort(evidence) = guard.observe(&tokens) else {
             unreachable!("periodic stream must produce an evidence witness");
         };
-        let error = evidence.timeout_error();
-        assert_eq!(error.kind(), "timeout");
-        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
-        let message = error.to_string();
-        assert!(message.contains("output rejected rather than silently truncated"));
+        let message = evidence.describe();
+        assert!(message.contains(&format!("triggered at {} emitted tokens", tokens.len())));
         assert!(message.contains("period=19"));
         assert!(message.contains("token-4gram novelty"));
+        assert_eq!(guard.evidence(), Some(evidence));
     }
 
     #[test]
-    fn shared_commit_hook_propagates_timeout_but_never_overrides_real_eos() {
+    fn shared_commit_hook_stops_a_runaway_but_never_overrides_real_eos() {
         let tokens = periodic_tokens(
             RUNAWAY_GUARD_MIN_TOKENS + 2 * RUNAWAY_GUARD_CHECK_INTERVAL,
             29,
         );
 
         let mut eos_guard = RunawayGuard::new(true);
-        assert!(
-            eos_guard
-                .check_after_emit(&tokens[..RUNAWAY_GUARD_MIN_TOKENS], false)
-                .is_ok()
-        );
-        assert!(
-            eos_guard
-                .check_after_emit(
-                    &tokens[..RUNAWAY_GUARD_MIN_TOKENS + RUNAWAY_GUARD_CHECK_INTERVAL],
-                    false,
-                )
-                .is_ok()
-        );
-        assert!(eos_guard.check_after_emit(&tokens, true).is_ok());
+        assert!(!eos_guard.stops_after_emit(&tokens[..RUNAWAY_GUARD_MIN_TOKENS], false));
+        assert!(!eos_guard.stops_after_emit(
+            &tokens[..RUNAWAY_GUARD_MIN_TOKENS + RUNAWAY_GUARD_CHECK_INTERVAL],
+            false,
+        ));
+        assert!(!eos_guard.stops_after_emit(&tokens, true));
+        assert_eq!(eos_guard.evidence(), None);
 
         let mut runaway_guard = RunawayGuard::new(true);
-        let error = runaway_guard
-            .check_after_emit(&tokens, false)
-            .expect_err("third no-EOS checkpoint must fail");
-        assert_eq!(error.kind(), "timeout");
-        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+        assert!(runaway_guard.stops_after_emit(&tokens, false));
+        assert!(runaway_guard.evidence().is_some());
+
+        let mut unarmed = RunawayGuard::new(false);
+        assert!(!unarmed.stops_after_emit(&tokens, false));
+        assert_eq!(unarmed.evidence(), None);
     }
 
     #[test]
@@ -1456,12 +1470,11 @@ mod tests {
             guard.observe(&tokens),
             RunawayDecision::Abort(first_evidence)
         );
-        let sticky_error = guard
-            .check_after_emit(&tokens, true)
-            .expect_err("a terminal Abort cannot transition back to Continue on later EOS");
-        let first_error = first_evidence.timeout_error();
-        assert_eq!(sticky_error.kind(), first_error.kind());
-        assert_eq!(sticky_error.to_string(), first_error.to_string());
+        assert!(
+            guard.stops_after_emit(&tokens, true),
+            "a terminal Abort cannot transition back to Continue on later EOS"
+        );
+        assert_eq!(guard.evidence(), Some(first_evidence));
     }
 
     #[test]

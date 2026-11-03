@@ -485,6 +485,9 @@ pub enum FinishReason {
     /// Cooperative shutdown ([`crate::request_shutdown`], Ctrl+C) stopped an
     /// Unlimited-OCR-2 document, which keeps the pages it completed (U2-E2).
     Cancelled,
+    /// The runaway guard ([`sampler::RUNAWAY_GUARD_ENV`]) found a v1 decode
+    /// repeating and stopped it, keeping the text before that point (bd-gftg).
+    Runaway,
 }
 
 impl FinishReason {
@@ -496,6 +499,7 @@ impl FinishReason {
             Self::Length => "length",
             Self::Budget => "budget",
             Self::Cancelled => "cancelled",
+            Self::Runaway => "runaway",
         }
     }
 }
@@ -540,6 +544,9 @@ pub struct DecodeReport {
     pub decodes: usize,
     /// How many of those decodes stopped at a limit.
     pub length_stops: usize,
+    /// How many of those limit stops were the runaway guard's (bd-gftg).
+    #[serde(default)]
+    pub runaway_stops: usize,
     /// An Unlimited-OCR-2 document decode's per-page facts and counters.
     pub document: Option<DocumentStats>,
     /// The `ignored_lever` warnings the model's lever policy raised for this
@@ -843,14 +850,16 @@ struct DocumentDecode {
 }
 
 impl DecodeReport {
-    /// The run-level `finish_reason`: `length` when any decode since the last
-    /// take stopped at a limit, or `budget` / `cancelled` when the last one
-    /// ran out of its stage budget or was cancelled (which ends the run).
+    /// The run-level `finish_reason`: `runaway` when the runaway guard stopped
+    /// any decode since the last take, else `length` when any stopped at a
+    /// limit, or `budget` / `cancelled` when the last one ran out of its stage
+    /// budget or was cancelled (which ends the run).
     #[must_use]
     pub fn run_finish_reason(&self) -> FinishReason {
         match (self.length_stops, self.finish_reason) {
             (0, _) => FinishReason::Stop,
             (_, stop @ (FinishReason::Budget | FinishReason::Cancelled)) => stop,
+            _ if self.runaway_stops > 0 => FinishReason::Runaway,
             _ => FinishReason::Length,
         }
     }
@@ -1152,8 +1161,11 @@ fn v1_page_warnings(report: &DecodeReport) -> Vec<RunWarning> {
             fields,
         },
         // Only Unlimited-OCR-2's document loop checks a budget or ends on a
-        // cancel, and its reports take `document_warnings`.
-        (FinishReason::Budget | FinishReason::Cancelled, _) => return Vec::new(),
+        // cancel, and its reports take `document_warnings`. A runaway stop is
+        // the run's own `finish_reason`, and exit 5 ([`partial_output`]).
+        (FinishReason::Budget | FinishReason::Cancelled | FinishReason::Runaway, _) => {
+            return Vec::new();
+        }
     };
     vec![warning]
 }
@@ -1367,8 +1379,9 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
     fields.insert("expected".into(), expected.into());
     fields.insert("got".into(), got.into());
     match report.finish_reason {
-        // A cancel is the run's own `finish_reason`, and exit 6.
-        FinishReason::Stop | FinishReason::Cancelled => {}
+        // A cancel is the run's own `finish_reason`, and exit 6. A v2 page the
+        // runaway guard closes ends the page, not the decode (`v2_page_cap`).
+        FinishReason::Stop | FinishReason::Cancelled | FinishReason::Runaway => {}
         FinishReason::Length => warnings.push(RunWarning {
             kind: "v2_length",
             message: format!(
@@ -1396,32 +1409,51 @@ fn document_warnings(report: &DecodeReport, stats: &DocumentStats) -> Vec<RunWar
 
 /// The partial-output error for a run whose Unlimited-OCR-2 decode stopped
 /// at its position limit or stage budget (exit 5) or on a cancel (exit 6),
-/// carrying `warnings` (the run's, in order) and the `model` that wrote the
-/// pages; `None` for every other run (U2-B6, U2-E2). The CLI returns it
-/// after writing the pages, so a short document never exits 0.
+/// or whose v1 decodes the runaway guard stopped (exit 5, bd-gftg), carrying
+/// `warnings` (the run's, in order) and the `model` that wrote the pages;
+/// `None` for every other run (U2-B6, U2-E2). The CLI returns it after
+/// writing the pages, so a short document never exits 0.
 #[must_use]
 pub fn partial_output(
     report: &DecodeReport,
     warnings: &[RunWarning],
     model: &ModelIdentity,
 ) -> Option<FocrError> {
-    report.document.as_ref()?;
     let finish = report.run_finish_reason();
-    if finish == FinishReason::Stop {
+    let runaway = report.document.is_none() && finish == FinishReason::Runaway;
+    if finish == FinishReason::Stop || (report.document.is_none() && !runaway) {
         return None;
     }
-    let (expected, pages_out) = report.pages.map_or((1, 0), |p| (p.expected, p.bodies));
+    let (expected, pages_out) = match report.pages {
+        Some(p) => (p.expected, p.bodies),
+        // A v1 run, unless it decoded its pages as one, writes one body per decode.
+        None if runaway => (report.decodes, report.decodes),
+        None => (1, 0),
+    };
+    let message = if !runaway {
+        format!(
+            "the document stopped early ({}) after {pages_out} of {expected} page bodies; the \
+             pages produced were written",
+            finish.as_str()
+        )
+    } else if report.decodes > 1 {
+        format!(
+            "the runaway guard stopped {} of {} decodes because their output kept repeating; \
+             the text before each stop was written",
+            report.runaway_stops, report.decodes
+        )
+    } else {
+        "the runaway guard stopped the decode because its output kept repeating; the text \
+         before that point was written"
+            .into()
+    };
     Some(FocrError::Partial(Box::new(crate::error::PartialOutput {
         finish_reason: finish.as_str(),
         pages_out,
         warnings: warnings.iter().map(RunWarning::to_json).collect(),
         model_id: model.model_id,
         source_sha256: model.source_sha256.clone(),
-        message: format!(
-            "the document stopped early ({}) after {pages_out} of {expected} page bodies; the \
-             pages produced were written",
-            finish.as_str()
-        ),
+        message,
         checkpoint: None,
         resumed_from: None,
     })))
@@ -5630,6 +5662,7 @@ impl OcrModel {
                     &prompt_ids,
                     &params,
                     Some(&mut observer),
+                    false,
                 )?;
                 // End of decode: flush the final in-flight page (EOS marker
                 // stripped, exactly as finalize_multi strips it before split).
@@ -5763,6 +5796,8 @@ impl OcrModel {
             FinishReason::Length => PageFinish::Length,
             FinishReason::Budget => PageFinish::Budget,
             FinishReason::Cancelled => PageFinish::Cancelled,
+            // A document's guard closes pages, never the decode.
+            FinishReason::Runaway => PageFinish::Runaway,
         };
         stream.finish(|index, body, tokens| {
             elapsed.push(since);
@@ -5822,6 +5857,7 @@ impl OcrModel {
                 max_positions: params.max_positions,
                 decodes: decodes + 1,
                 length_stops: length_stops + usize::from(stopped),
+                runaway_stops: 0,
                 document: Some(stats),
                 admission_warnings: lever_policy::admit_from_process(self.arch()).warnings,
             });
@@ -7177,7 +7213,7 @@ impl OcrModel {
     /// # Errors
     /// The variable is set to anything but `0` or `1`, or no tokenizer.
     fn page_runaway(&self) -> FocrResult<Option<sampler::PageRunaway>> {
-        if !sampler::RunawayGuard::from_env()?.enabled() {
+        if !sampler::RunawayGuard::from_env(false)?.enabled() {
             return Ok(None);
         }
         let tok = self.tokenizer()?;
@@ -7224,35 +7260,39 @@ impl OcrModel {
     /// The first decode-stage error — e.g. [`FocrError::FormatMismatch`] if the
     /// embedding table is absent, or a sampler/lm_head failure.
     fn generate(&self, inputs_embeds: Mat, prompt_ids: &[u32]) -> FocrResult<Vec<u32>> {
-        self.generate_with(inputs_embeds, prompt_ids, &self.decode_params)
+        // A single page arms the runaway guard by default (bd-gftg).
+        self.generate_with_observer(inputs_embeds, prompt_ids, &self.decode_params, None, true)
     }
 
     /// [`Self::generate`] with EXPLICIT decode params — the multi-page path
     /// (bd-1gv.25) selects `ngram_window = 1024` per OQ-18 while single-image
-    /// callers keep the engine's own params verbatim.
+    /// callers keep the engine's own params verbatim. Its runaway guard runs
+    /// only under `FOCR_RUNAWAY_GUARD=1`.
     fn generate_with(
         &self,
         inputs_embeds: Mat,
         prompt_ids: &[u32],
         params: &sampler::DecodeParams,
     ) -> FocrResult<Vec<u32>> {
-        self.generate_with_observer(inputs_embeds, prompt_ids, params, None)
+        self.generate_with_observer(inputs_embeds, prompt_ids, params, None, false)
     }
 
     /// [`Self::generate_with`] plus an optional PER-COMMITTED-TOKEN observer
     /// (bd-2z0y streaming): called synchronously from the sequential decode
     /// driver after each token joins `emitted`, in emission order — never
     /// from inside a rayon fan-out. `None` is byte-for-byte today's paths.
+    /// `guard_default` arms the runaway guard when its variable is unset.
     fn generate_with_observer(
         &self,
         inputs_embeds: Mat,
         prompt_ids: &[u32],
         params: &sampler::DecodeParams,
         observer: Option<&mut dyn FnMut(u32)>,
+        guard_default: bool,
     ) -> FocrResult<Vec<u32>> {
-        // One controller instance per decode invocation. Unset/0 is a no-op;
-        // invalid values fail before model work, and an armed trigger is sticky.
-        let mut runaway_guard = sampler::RunawayGuard::from_env()?;
+        // One controller instance per decode invocation. An unarmed guard is a
+        // no-op; invalid values fail before model work, and a trigger is sticky.
+        let mut runaway_guard = sampler::RunawayGuard::from_env(guard_default)?;
         let precision = DocumentPrecision::from_env()?;
         let generated = if precision == DocumentPrecision::Stateless {
             self.generate_stateless(
@@ -7286,24 +7326,29 @@ impl OcrModel {
                 &mut runaway_guard,
             )
         }?;
+        let runaway = runaway_guard.evidence();
+        if let Some(evidence) = runaway {
+            timing_log(&evidence.describe());
+        }
         if let Ok(mut slot) = self.last_decode.lock() {
             let stopped = generated.last() == Some(&params.eos_token_id);
-            let (decodes, length_stops) = slot
-                .as_ref()
-                .map_or((0, 0), |prior| (prior.decodes, prior.length_stops));
+            let (decodes, length_stops, runaway_stops) = slot.as_ref().map_or((0, 0, 0), |prior| {
+                (prior.decodes, prior.length_stops, prior.runaway_stops)
+            });
             *slot = Some(DecodeReport {
                 ids: generated.clone(),
-                finish_reason: if stopped {
-                    FinishReason::Stop
-                } else {
-                    FinishReason::Length
+                finish_reason: match (stopped, runaway) {
+                    (true, _) => FinishReason::Stop,
+                    (false, Some(_)) => FinishReason::Runaway,
+                    (false, None) => FinishReason::Length,
                 },
-                cap: (!stopped).then_some(LengthCap::MaxLength),
+                cap: (!stopped && runaway.is_none()).then_some(LengthCap::MaxLength),
                 pages: None,
                 max_length: params.max_length,
                 max_positions: params.max_positions,
                 decodes: decodes + 1,
                 length_stops: length_stops + usize::from(!stopped),
+                runaway_stops: runaway_stops + usize::from(!stopped && runaway.is_some()),
                 document: None,
                 admission_warnings: Vec::new(),
             });
@@ -7391,14 +7436,14 @@ impl OcrModel {
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token_id);
             emitted.push(step.token_id);
-            runaway_guard.check_after_emit(&emitted, step.is_eos)?;
             // Per-token progress. Sequential loop on the calling thread; the
             // hook is a relaxed atomic load when no sink is installed.
             progress::emit("decode", emitted.len() as u64, params.max_length as u64);
             if let Some(f) = observer.as_deref_mut() {
                 f(step.token_id);
             }
-            if step.is_eos {
+            // A runaway ends the decode too, keeping its text (bd-gftg).
+            if step.is_eos || runaway_guard.stops_after_emit(&emitted, false) {
                 break;
             }
             let next = step.token_id as usize;
@@ -7552,14 +7597,14 @@ impl OcrModel {
             };
             generated.push(step.token_id);
             emitted.push(step.token_id);
-            runaway_guard.check_after_emit(&emitted, step.is_eos)?;
             // Per-token progress. Sequential loop on the calling thread; the
             // hook is a relaxed atomic load when no sink is installed.
             progress::emit("decode", emitted.len() as u64, params.max_length as u64);
             if let Some(f) = observer.as_deref_mut() {
                 f(step.token_id);
             }
-            if step.is_eos {
+            // A runaway ends the decode too, keeping its text (bd-gftg).
+            if step.is_eos || runaway_guard.stops_after_emit(&emitted, false) {
                 break;
             }
             let next = step.token_id as usize;
@@ -7659,8 +7704,7 @@ impl OcrModel {
                 let step = sampler::decode_step(&logits, generated, params)?;
                 generated.push(step.token_id);
                 emitted.push(step.token_id);
-                runaway_guard.check_after_emit(emitted, step.is_eos)?;
-                if step.is_eos {
+                if step.is_eos || runaway_guard.stops_after_emit(emitted, false) {
                     break;
                 }
                 last_hidden = Self::commit_decode_token_i8(
@@ -7709,8 +7753,7 @@ impl OcrModel {
                 // `eos_token_id` on the left keeps the identifier off the left of `=`
                 // (dodges a ubs secrets-heuristic FP; these are vocabulary token ids).
                 let is_eos = params.eos_token_id == token;
-                runaway_guard.check_after_emit(emitted, is_eos)?;
-                if is_eos {
+                if is_eos || runaway_guard.stops_after_emit(emitted, false) {
                     stopped = true;
                     break;
                 }
@@ -7745,8 +7788,7 @@ impl OcrModel {
             };
             generated.push(correction.token_id);
             emitted.push(correction.token_id);
-            runaway_guard.check_after_emit(emitted, correction.is_eos)?;
-            if correction.is_eos {
+            if correction.is_eos || runaway_guard.stops_after_emit(emitted, false) {
                 break;
             }
             last_hidden = Self::commit_decode_token_i8(
@@ -7851,14 +7893,14 @@ impl OcrModel {
             let step: DecodeOutput = sampler::decode_step(&logits, &generated, params)?;
             generated.push(step.token_id);
             emitted.push(step.token_id);
-            runaway_guard.check_after_emit(&emitted, step.is_eos)?;
             // Per-token progress. Sequential loop on the calling thread; the
             // hook is a relaxed atomic load when no sink is installed.
             progress::emit("decode", emitted.len() as u64, params.max_length as u64);
             if let Some(f) = observer.as_deref_mut() {
                 f(step.token_id);
             }
-            if step.is_eos {
+            // A runaway ends the decode too, keeping its text (bd-gftg).
+            if step.is_eos || runaway_guard.stops_after_emit(&emitted, false) {
                 break;
             }
             // Append embed(next_token) as a new trailing row of `inputs_embeds`
@@ -8096,7 +8138,8 @@ mod tests {
             max_length: 32_768,
             max_positions: MAX_POSITION_EMBEDDINGS,
             decodes: 1,
-            length_stops: usize::from(finish_reason == FinishReason::Length),
+            length_stops: usize::from(finish_reason != FinishReason::Stop),
+            runaway_stops: usize::from(finish_reason == FinishReason::Runaway),
             document: None,
             admission_warnings: Vec::new(),
         }
@@ -8135,6 +8178,7 @@ mod tests {
             max_positions: sampler::UOCR2_MAX_POSITIONS,
             decodes: 1,
             length_stops: 0,
+            runaway_stops: 0,
             document: Some(DocumentStats {
                 gundam_view,
                 leading_text: true,
@@ -8186,6 +8230,7 @@ mod tests {
                 max_positions: sampler::UOCR2_MAX_POSITIONS,
                 decodes: 1,
                 length_stops: usize::from(finish_reason != FinishReason::Stop),
+                runaway_stops: 0,
                 document: Some(DocumentStats {
                     leading_text,
                     ..DocumentStats::default()
@@ -8278,6 +8323,76 @@ mod tests {
             partial_output(&v1, &warnings, &v1_model).is_none(),
             "v1 stays exit 0"
         );
+    }
+
+    /// bd-gftg: a v1 decode the runaway guard stopped is a partial output
+    /// (exit 5) naming the guard, its text written: a single page, one page
+    /// of a PDF read page by page, or a multi-page decode (guard armed by
+    /// `FOCR_RUNAWAY_GUARD=1`). A runaway outranks a token-cap stop.
+    #[test]
+    fn a_v1_runaway_is_a_partial_output_with_its_text_written() {
+        let v1_model = ModelIdentity {
+            model_id: model_arch::UNLIMITED_OCR_V1_ID,
+            source_sha256: None,
+        };
+        let single = DecodeReport {
+            pages: None,
+            ..multi_page_report(FinishReason::Runaway, None, 1, "")
+        };
+        assert_eq!(single.run_finish_reason(), FinishReason::Runaway);
+        let warnings = decode_warnings(&single);
+        assert!(warnings.is_empty());
+        let Some(error) = partial_output(&single, &warnings, &v1_model) else {
+            panic!("a runaway stop is a partial output");
+        };
+        assert_eq!(error.exit_code(), crate::error::EXIT_TIMEOUT);
+        assert!(error.remediation().contains("FOCR_RUNAWAY_GUARD=0"));
+        let FocrError::Partial(partial) = &error else {
+            panic!("{error:?}");
+        };
+        assert_eq!((partial.finish_reason, partial.pages_out), ("runaway", 1));
+        assert_eq!(
+            partial.message,
+            "the runaway guard stopped the decode because its output kept repeating; the text \
+             before that point was written"
+        );
+
+        let pdf = DecodeReport {
+            decodes: 4,
+            ..single.clone()
+        };
+        let Some(FocrError::Partial(partial)) = partial_output(&pdf, &[], &v1_model) else {
+            panic!("one runaway page of four is a partial output");
+        };
+        assert_eq!(partial.pages_out, 4);
+        assert!(
+            partial
+                .message
+                .starts_with("the runaway guard stopped 1 of 4 decodes"),
+            "{}",
+            partial.message
+        );
+
+        let mixed = DecodeReport {
+            decodes: 2,
+            length_stops: 2,
+            ..single.clone()
+        };
+        assert_eq!(mixed.run_finish_reason(), FinishReason::Runaway);
+        let capped = DecodeReport {
+            finish_reason: FinishReason::Length,
+            runaway_stops: 0,
+            ..mixed
+        };
+        assert_eq!(capped.run_finish_reason(), FinishReason::Length);
+        assert!(partial_output(&capped, &[], &v1_model).is_none());
+
+        let multi = multi_page_report(FinishReason::Runaway, None, 3, "<PAGE>\na\n<PAGE>\nb");
+        assert!(decode_warnings(&multi).is_empty());
+        let Some(FocrError::Partial(partial)) = partial_output(&multi, &[], &v1_model) else {
+            panic!("a multi-page runaway is a partial output");
+        };
+        assert_eq!((partial.finish_reason, partial.pages_out), ("runaway", 2));
     }
 
     /// bd-yrr1: the re-read's warning lists the pages it replaced in `pages`
@@ -8425,6 +8540,7 @@ mod tests {
             max_positions: sampler::UOCR2_MAX_POSITIONS,
             decodes: 1,
             length_stops: 0,
+            runaway_stops: 0,
             document: Some(DocumentStats {
                 page_finish,
                 ..DocumentStats::default()

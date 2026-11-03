@@ -65,6 +65,12 @@ NED(a, b) = lev(N(a), N(b)) / max(|N(a)|, |N(b)|), and 0 when both are empty.
 - The text view is the text-like categories.
 - The all view adds table cells (tags dropped) and display formulas (`latex`)
   in place.
+- MarathonDocBench leaves 2,185 of its 10,319 table annotations (21%) with no
+  html and no text, and none is marked `ignore`. On such a page the all view has
+  no table, so a table the model reads counts as inserted text. Here 21 of the
+  142 MarathonDocBench pages are affected, in 5 of the 20 documents. This was
+  found after scoring, in U2-D2b's interim (bd-uocr2-epic-cgux.25), and the
+  documents are not re-scored.
 
 Text-layer ground truth (non-Baidu): see Amendment 1.
 
@@ -347,7 +353,18 @@ The records and scripts are in `artifacts/accuracy/bd-uocr2-epic-cgux.21/posthoc
     "re-read a capped page alone" changes only this page.
   - The policy was chosen after seeing 0789, so this is a sensitivity, not a
     result (bd-yrr1).
-- **The opt-in runaway guard** (v1, `FOCR_RUNAWAY_GUARD=1`; bd-gftg):
+  - Live, with `FOCR_REREAD_CAPPED_PAGES=1` and the forward budget off, the
+    re-read lands on the same 1,759-token table, and ED_all is 0.1254
+    (bd-yrr1, 2026-11-02).
+  - Adding v2's per-page runaway guard (`FOCR_RUNAWAY_GUARD=1`, bd-gftg)
+    closes page 3 as `runaway` at about 8,700 tokens instead of 20,000. Decode
+    tokens fall from 24,094 to 12,697, and wall time from 3,494 s to 1,628 s
+    under different host load.
+    - Page 4 then loses the malformed `<BLOCK>title<LEVEL…` prefix that
+      followed the 20,000-token loop, and ED_all is 0.0877.
+    - The document mean v2 − v1 per page is −0.0108 [−0.0207, −0.0026].
+    - All of this is post hoc and n = 1.
+- **The runaway guard** (v1, opt-in when measured, `FOCR_RUNAWAY_GUARD=1`; bd-gftg):
   - Replayed over every C5a output of 2,560 tokens or more, it fires on none
     of 99 legitimate outputs. It catches 13 of 19 v1 runaways and, in replay
     only, 6 of 8 v2 runaways. At the time the guard was v1-only; v2 now runs
@@ -361,8 +378,9 @@ The records and scripts are in `artifacts/accuracy/bd-uocr2-epic-cgux.21/posthoc
   - An aborted page returns no text. With v1's reruns substituted, rejecting
     the fired pages raises v1's mean CER_text from 0.1663 to 0.1681. Keeping
     their prefixes lowers it to 0.1654.
-  - bd-gftg proposes the guard by default for v1 single pages once it returns
-    the prefix as partial output.
+  - Since bd-gftg (owner decision, 2026-11-02; DISC-023), the guard is on by
+    default for v1 single pages. A stopped page keeps its prefix and exits 5
+    with `finish_reason: runaway`; `FOCR_RUNAWAY_GUARD=0` turns it off.
 
 ### Tail risk (AF-2; not pre-registered, gates nothing)
 

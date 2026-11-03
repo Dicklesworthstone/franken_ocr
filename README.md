@@ -474,6 +474,16 @@ no qualifying gutter means the page remains unsplit. Pages are rasterized one
 at a time as the run reaches them, so a long book never holds every page image
 in memory.
 
+**Runaway pages (v1).** A v1 page that never ends would decode to the token limit
+(32,768) and come back mostly repetition. The runaway guard stops it instead: past
+8,192 tokens it checks the last 2,048 every 256, and three repeating checks in a row
+end the decode. The text before that point is written, the run reports
+`finish_reason: runaway` and exits 5, and `ocr-batch` marks that image failed and goes
+on. In robot mode the text arrives as `page` events (`status: decoded`) before the
+`run_error`. `FOCR_RUNAWAY_GUARD=0` turns it off and decodes to the limit, as the reference
+does. On ground truth it fires on no OmniDocBench page and on 9 of 18,118
+MarathonDocBench pages, 7 with broken references and 2 long charts (DISC-023).
+
 **Multi-page cross-page parsing (`--multi-page`).** By default every page is
 parsed independently. `--multi-page` instead parses the whole document across
 pages using the Unlimited-OCR `infer_multi` contract, so page N can reference
@@ -509,7 +519,7 @@ read: `page` (the source page), `half` on a split spread, `run_index`, `window`
 when windowed, `text`, `layout` (boxes in that page's own pixels), `tokens` and
 `finish` (`marker`, `eos`, `page_cap`, `runaway`, `length`, `budget` or `cancelled`), and `raw` under `--raw`. A
 `v2_page_cap` warning lists any page the per-page cap (`--max-page-tokens`, default 20,000)
-closed, which is almost always a runaway. `FOCR_RUNAWAY_GUARD=1` (off by default) closes such
+closed, which is almost always a runaway. `FOCR_RUNAWAY_GUARD=1` (off by default here) closes such
 a page sooner: once a page passes 8,192 tokens and its last 2,048 repeat (any number counts as
 the same token, so a counting loop repeats too), the next page opens. The page ends `runaway`,
 keeps its text so far, and is listed in the same warning. With `FOCR_REREAD_CAPPED_PAGES=1` (off by
@@ -599,8 +609,8 @@ FOCR_BATCH_SPINE=0 focr ocr-batch *.png --json   # force the sequential oracle p
 
 With `--json`, each image's row says how its decode ended: `finish_reason`, any
 `warnings`, and `chart` on a OneChart run. An Unlimited-OCR-2 page stopped by its stage
-budget or position limit keeps its `markdown`, but reads `ok: false` with an `error`, the
-same stop that makes `focr ocr` exit 5. So check `ok`, not whether `markdown` is present.
+budget or position limit, or a v1 page the runaway guard stopped, keeps its `markdown`,
+but reads `ok: false` with an `error`, the same stop that makes `focr ocr` exit 5. So check `ok`, not whether `markdown` is present.
 
 `ocr-batch` loads the model once either way. Unlimited-OCR defaults to the
 conservative recipe path. Its continuous-batch R-SWA spine currently belongs to
@@ -1012,7 +1022,7 @@ The committed gauntlet bundle stays conservative: its surface lower bound is not
 | 2 | Usage or CLI argument error |
 | 3 | Model artifact not found or could not be resolved |
 | 4 | Input image or page could not be decoded |
-| 5 | Budget, timeout or position limit exceeded (an Unlimited-OCR-2 document writes its completed pages first) |
+| 5 | Budget, timeout or position limit exceeded, or the runaway guard stopped a v1 page (an Unlimited-OCR-2 document writes its completed pages first, and a v1 page its text so far) |
 | 6 | Operation cancelled cooperatively (an Unlimited-OCR-2 document writes its completed pages first) |
 | 7 | Format or version mismatch |
 
@@ -1107,7 +1117,7 @@ focr ocr page.png
 
 ### Experimental all-int8 repetition on a dense table
 
-The legacy all-int8 experiment can repeat on a few hard, dense tables. The v0.7.0 conservative exact-recipe artifact with exact Torch routing terminates on `page0590` and clears the corpus budget without the optional runaway controller, though the hard-page CER tail remains high. When reproducing the rejected legacy experiment, one mitigation is a tighter n-gram guard; it is not a release certification:
+The legacy all-int8 experiment can repeat on a few hard, dense tables. The v0.7.0 conservative exact-recipe artifact with exact Torch routing terminates on `page0590` and clears the corpus budget with the runaway guard off, though the hard-page CER tail remains high. When reproducing the rejected legacy experiment, one mitigation is a tighter n-gram guard; it is not a release certification:
 
 ```bash
 # Reproduce the gated all-int8 path with a tighter guard.

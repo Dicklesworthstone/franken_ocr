@@ -153,14 +153,21 @@ not pixels.
 | `marker` | The model opened the next page. |
 | `eos` | The model ended the document. |
 | `page_cap` | The per-page cap forced the page closed. The page is probably cut short, and its text probably repeats; the run's `v2_page_cap` warning lists it. With `DocumentOptions::reread_capped`, the page is read again alone after the document; a re-read the model ends replaces the page, and the run's `v2_page_reread` warning lists it. |
-| `runaway` | With `FOCR_RUNAWAY_GUARD=1`, the runaway guard found the page repeating and closed it as the cap does. The page keeps its text so far, which is cut short; the run's `v2_page_cap` warning lists it under `pages` and `runaway`. `DocumentOptions::reread_capped` reads it again as it does a `page_cap` page. |
+| `runaway` | With `FOCR_RUNAWAY_GUARD=1` (off by default for Unlimited-OCR-2), the runaway guard found the page repeating and closed it as the cap does. The page keeps its text so far, which is cut short; the run's `v2_page_cap` warning lists it under `pages` and `runaway`. `DocumentOptions::reread_capped` reads it again as it does a `page_cap` page. |
 | `length` | The position limit stopped decoding inside this page. |
 | `budget` | The stage budget stopped decoding inside this page. |
 | `cancelled` | `request_shutdown` stopped decoding inside this page. |
 
 `DocumentResult::finish_reason` says how the whole decode ended: `stop`, `length`,
-`budget` or `cancelled`. Anything but `stop` means the document is partial, and
+`budget`, `cancelled`, or `runaway` (a v1 document decode the runaway guard stopped,
+under `FOCR_RUNAWAY_GUARD=1`). Anything but `stop` means the document is partial, and
 `pages` holds what was completed.
+
+A v1 single page (`OcrModel::recognize` and its siblings) runs the runaway guard by
+default (bd-gftg, DISC-023). Once the page passes 8,192 tokens and keeps repeating, the
+decode stops and the call returns the text before that point, and
+`OcrModel::take_last_decode` reports `finish_reason: runaway`. `FOCR_RUNAWAY_GUARD=0`
+decodes to the token limit, as the reference does.
 
 `skipped` lists source pages that did not rasterize, each with the engine's reason.
 The usual causes are JPEG 2000, JBIG2 and born-digital pages with no full-page image.

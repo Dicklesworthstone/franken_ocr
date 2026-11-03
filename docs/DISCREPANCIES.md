@@ -1008,6 +1008,68 @@ transformers 4.52.1), both in `docs/truth-pack/PINNED_SOURCES.md` under "Unlimit
     `scripts/got_cer.py --format-corpus`.
 - Review date: 2026-10-31. Re-measure when bd-kd75 changes the GOT recipe.
 
+## DISC-023: a v1 single page stops at a runaway by default; the reference decodes to the token limit
+- claim_id / evidence_id: CLAIM-V1-RUNAWAY-DEFAULT → `~/.local/share/franken_ocr/evidence/bd-gftg/calibration/`
+    (`guard_calib`, `truth_fp`, `guard_policy`, `guard_live`), kept out of the repo with the
+    OmniDocBench readings they contain (bd-gftg). The replay itself is
+    `scripts/runaway_replay.py` (bd-d1zo).
+- Provenance (model commit + fixture hash): baidu/Unlimited-OCR
+    `3a7f4dbbbffcc6f9282712c5b0d7cc31b3812da5`; `unlimited-ocr.int8.focrq` sha256
+    `573340…fb592`; U2-C5a's 315 OmniDocBench single pages; the OmniDocBench (1,651 pages) and
+    MarathonDocBench (18,118 pages) references re-encoded with v1's tokenizer.
+- CPU feature string: aarch64+neon+dotprod+i8mm (Apple M5 Ultra). The guard is integer
+    arithmetic over token ids, so it fires wherever the ids repeat, on any arch.
+- Exact command + env: live, `FOCR_NO_RESIDENT=1 FOCR_STAGE_BUDGET_FORWARD_MS=0
+    FOCR_RUNAWAY_GUARD=1 focr ocr-batch --model unlimited-ocr --json <page>` (`guard_live.sh`,
+    when the guard was opt-in) on the 7 pages the replay stops plus newspaper b615; offline,
+    `scripts/runaway_replay.py <c5a data> --v1-tokenizer <tokenizer.json> --v2-tokenizer
+    <tokenizer.json>`, and `truth_fp.py` and `guard_policy.py` in that directory. Since bd-gftg
+    `focr ocr <page> --model unlimited-ocr` runs the guard with no variable set.
+- Reference behavior: `infer` decodes greedily to EOS or `max_length` 32,768
+    (`modeling_unlimitedocr.py:787`). Nothing but the 35-gram ban checks for repetition.
+- Our impl: `RunawayGuard` (src/native_engine/sampler.rs) is armed by default only in
+    `OcrModel::generate`: a v1 single page, including each page of a PDF read page by page.
+    Past 8,192 emitted tokens it checks the last 2,048 every 256, and three suspicious checks
+    in a row stop the decode. A check is suspicious when some period up to 256 matches at least
+    15/16 of positions and token-4gram novelty is at most 1/4. The decode keeps its ids and
+    reports `finish_reason: runaway` (`DecodeReport::runaway_stops`). The CLI writes the text,
+    then exits 5 (`FocrError::Partial`). `--multi-page` and Unlimited-OCR-2 arm it only under
+    `=1`, and the experimental int8 `ocr-batch` spine never runs it.
+- Fallback / kill-switch state: FOCR_RUNAWAY_GUARD=0 disarms it everywhere and decodes to the
+    token limit as the reference does; `=1` arms it on every v1 and v2 decode; any other
+    value exits 2.
+- Measured impact: (post hoc, not pre-registered)
+    * U2-C5a outputs of 2,560 tokens or more, replayed from re-encoded text with checks from
+      2,048 tokens: 13 of 19 v1 runaways caught, and 0 of 99 legitimate outputs fired on. At
+      the 8,192 floor, 11 v1 outputs fire, all of them runaways.
+    * Live, on the 7 v1 single pages the replay stops, all 7 fire, at the replay's token or
+      up to 2,816 later. They stop at 75,776 of the reruns' 198,908 tokens, so about 62% of
+      their decode is skipped. Newspaper b615, a runaway the replay misses, does not fire,
+      and its output is byte-identical.
+    * v1 mean CER_text over the 315 single pages, with the registered reruns substituted:
+      0.1663 as decoded; 0.1681 rejecting the fired pages, as the opt-in guard did before
+      bd-gftg; 0.1654 keeping their prefixes.
+    * Ground truth at the 8,192 floor: 0 of 1,651 OmniDocBench pages fire (5 reach the
+      floor). 9 of 18,118 MarathonDocBench pages fire (29 reach it). 7 are broken reference
+      text: empty-cell runs, a leaked `<|LOC_119|>`, a word repeated about 13k times. 2 are
+      real chart data (0232 p129 and p130). They stop at 10,240 tokens and lose their last
+      1,456 and 1,253 tokens.
+    * Precision: 13 caught and 0 false fires give a lower 95% bound of 0.81
+      (`Beta(14, 1)`). That falls short of the 0.913 crossover PROPOSED_ARCHITECTURE.md §6.10
+      set for the abort-without-text design. The same section gives the keep-prefix matrix.
+- Resolution: ACCEPTED as a deliberate divergence by owner decision (2026-11-02), default on
+    for v1 single pages only.
+- Tests affected: `sampler::tests::runaway_guard_unset_takes_the_decode_default_and_set_overrides_it`,
+    `…::shared_commit_hook_stops_a_runaway_but_never_overrides_real_eos`,
+    `…::runaway_abort_is_terminal_and_preserves_its_first_witness`,
+    `…::runaway_evidence_describes_the_trigger_statistics`, and
+    `native_engine::tests::a_v1_runaway_is_a_partial_output_with_its_text_written`. No golden
+    moves: the v1 single-page goldens stop by 4,035 tokens, under the floor, and the
+    multi-page ones decode unguarded.
+- Review date: 2026-11-02. At the next v1 single-page benchmark, run it both armed and with
+    `=0`, and count fires on legitimate pages; `scripts/runaway_replay.py` replays the `=0`
+    outputs.
+
 ## DISC-008: the wasm-only int4 browser artifact — quantization tail on degraded newsprint + platform f32 decode drift
 - claim_id / evidence_id: CLAIM-WASM-INT4-V2 → scratchpad corpus receipts
     (`corpus/MANIFEST.json`, `cer_v1_vs_v2.tsv`, `corpus/browser/REPORT*.json`,

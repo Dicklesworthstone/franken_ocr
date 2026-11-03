@@ -110,7 +110,7 @@ const MAX_REPLY_BYTES: usize = 64 * 1024 * 1024;
 /// Request size cap (pre-auth): paths + option scalars run a few KB.
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
-const PROTOCOL: u64 = 7;
+const PROTOCOL: u64 = 8;
 
 /// Upper clamp for user-supplied second counts (one year). `Instant + Duration`
 /// PANICS on overflow, so an absurd `FOCR_RESIDENT_*_SECS` value must not reach
@@ -2107,6 +2107,7 @@ mod tests {
             max_positions: 32768,
             decodes: 1,
             length_stops: 1,
+            runaway_stops: 0,
             document: Some(DocumentStats {
                 page_finish: vec![PageFinish::Budget],
                 page_tokens: vec![3],

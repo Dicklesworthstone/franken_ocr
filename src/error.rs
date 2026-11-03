@@ -90,8 +90,8 @@ pub const EXIT_CODE_TABLE: &[ExitCodeSpec] = &[
 /// its robot `run_error`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PartialOutput {
-    /// `length` (the position limit), `budget` (the stage budget) or
-    /// `cancelled`.
+    /// `length` (the position limit), `budget` (the stage budget),
+    /// `cancelled`, or `runaway` (the runaway guard stopped a v1 decode).
     pub finish_reason: &'static str,
     /// Page bodies written, the interrupted page's included.
     pub pages_out: usize,
@@ -138,11 +138,11 @@ pub enum FocrError {
     #[error("budget/timeout exceeded: {0}")]
     Timeout(String),
 
-    /// A document run stopped early, at the position limit or its
-    /// cooperative stage budget (exit 5, like [`FocrError::Timeout`]) or on
-    /// a cancel (exit 6, like [`FocrError::Cancelled`]), after writing the
-    /// pages it produced (U2-B6, U2-E2). The robot `run_error` carries the
-    /// [`PartialOutput`] fields.
+    /// A document run stopped early, at the position limit, its cooperative
+    /// stage budget or the runaway guard (exit 5, like [`FocrError::Timeout`])
+    /// or on a cancel (exit 6, like [`FocrError::Cancelled`]), after writing
+    /// the pages it produced (U2-B6, U2-E2, bd-gftg). The robot `run_error`
+    /// carries the [`PartialOutput`] fields.
     #[error("{}", .0.message)]
     Partial(Box<PartialOutput>),
 
@@ -218,6 +218,11 @@ impl FocrError {
             FocrError::Partial(partial) if partial.cancelled() => {
                 "the run was interrupted after writing its completed pages; re-run the same \
                  command to continue from the last completed window"
+            }
+            FocrError::Partial(partial) if partial.finish_reason == "runaway" => {
+                "the text before the repetition was written; the rest of that page is probably \
+                 the model repeating itself, so treat the page as cut short, or set \
+                 FOCR_RUNAWAY_GUARD=0 to decode to the token limit instead"
             }
             FocrError::Partial(_) => {
                 "the completed pages were written; split the document with `--pages`, or parse \

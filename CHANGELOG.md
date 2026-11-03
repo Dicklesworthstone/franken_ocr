@@ -26,6 +26,25 @@ sections as they land.
 
 ## [Unreleased]
 
+### Changed
+
+- **The runaway guard is on by default for a v1 page, and keeps the text it stops**
+  (bead bd-gftg, DISC-023). A v1 page that never ends used to decode to the token limit
+  (32,768) and return mostly repetition with exit 0. Now, past 8,192 tokens, the guard
+  checks the last 2,048 every 256 tokens, and three repeating checks in a row end the
+  decode. The text before that point is written, the run reports `finish_reason:
+  runaway` and exits 5, and `ocr-batch` marks that image failed and goes on. In robot
+  mode the text arrives as `page` events before the `run_error`.
+  `FOCR_RUNAWAY_GUARD=0` decodes to the limit as before. Under `FOCR_RUNAWAY_GUARD=1`
+  the guard used to fail the page with exit 5 and no text; it keeps the text now too.
+  `--multi-page` and Unlimited-OCR-2 still run it only under `=1`. The evidence is post
+  hoc. Replayed over U2-C5a's long outputs, it caught 13 of 19 v1 runaways and fired on
+  none of 99 legitimate ones. Live, it stopped all 7 v1 single pages the replay stops,
+  skipping about 62% of their decode, and keeping their text moved v1's mean CER_text
+  from 0.1663 to 0.1654. On ground truth it fires on 0 of 1,651 OmniDocBench pages and 9
+  of 18,118 MarathonDocBench pages, 7 of them broken references and 2 long charts. The
+  daemon protocol moves to 8, so a stale daemon does not decode without the guard.
+
 ### Added
 
 - **Unlimited-OCR-2 can read a capped page again on its own** (bead bd-yrr1). With
