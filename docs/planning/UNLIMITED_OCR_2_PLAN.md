@@ -2711,7 +2711,7 @@ evidence-gated defaults [uocr2,epic].
 | OQ-V2-6 | 1-D RoPE fallback | RESOLVED (franken builds `<PAGE>` prompts; no fallback) | §5.5 |
 | OQ-V2-7 | n-gram vs guard order hazard | RESOLVED (the forced token wins) | DISC-U2-2 |
 | OQ-V2-8 | Tokenizer handling of non-special added tokens | RESOLVED: the splitter handles them (U2-A4's 227-case golden and fuzz), and the `unlimited-ocr-2` arch pins the sidecar and its required ids (U2-A5) | Closed by U2-A5 |
-| OQ-V2-9 | Windowed accuracy vs unwindowed | OPEN | U2-D2b |
+| OQ-V2-9 | Windowed accuracy vs unwindowed | RESOLVED (2026-11-03): the pre-registered verdict is FAIL at τ = 0.01. Over 25 MarathonDocBench documents at W=10 the document-ED delta (windowed − unwindowed) has mean +0.0243, 95% [−0.0210, +0.0752]; 19 of 25 are within ±0.02, and page-cap runaways in both arms carry the mean | U2-D2b (`OQ_INDEX.md`) |
 | OQ-V2-10 | v2 single-page base vs gundam | OPEN | U2-G2 |
 | OQ-V2-11 | Block-granular retirement is output-exact under the guard | RESOLVED (mechanism, 2026-10-29): retired and unretired synthetic S1–S3-shaped runs agree bit for bit; the detector passes only guard-forced open rows; pinned rows survive; fixture equality is U2-C2's | U2-B4 (`srswa.rs` cache tests) |
 | OQ-V2-12 | Licenses of evaluation sets beyond MarathonDocBench (MPDocBench, OmniDocBench) | OPEN | U2-C5a |

@@ -51,7 +51,7 @@
 | **OQ-V2-6** | RESOLVED | plan §5.5 | 1-D RoPE fallback: franken builds `<PAGE>` prompts, so none |
 | **OQ-V2-7** | RESOLVED | plan §5.9, DISC-U2-2 | n-gram vs guard order hazard: the forced token wins |
 | **OQ-V2-8** | RESOLVED | U2-A4 (`.5`): `tokenizer::tests::uocr2_token_id_conformance_gate` (227 cases, 0 mismatches against `tokenizers==0.21.4`), `uocr2_added_tokens_stay_whole_under_fuzz`, `uocr2_real_tokenizer_keeps_added_tokens_whole_under_fuzz`; `docs/truth-pack/oq/tokenizer.md` § Unlimited-OCR-2. U2-A5 (`.6`): `model_arch::tests::unlimited_ocr_2_is_registered_with_its_capabilities_and_unimplemented`, `checked_tokenizer_refuses_a_foreign_sidecar_or_a_missing_token`, and the model-gated `real_v2_checkpoint_loads_raw_and_matches_its_pins` (the real sidecar passes the pin and `<PAGE>` resolves to 128827) | Non-special added tokens: split whole and kept by skip-special decode. The `unlimited-ocr-2` arch pins the sidecar's SHA-256 and requires BOS, EOS, `<image>` and `<PAGE>` (`UNLIMITED_OCR_V2_TOKENS`) |
-| **OQ-V2-9** | OPEN | U2-D2b (`.25`) | Windowed accuracy vs unwindowed |
+| **OQ-V2-9** | RESOLVED (2026-11-03): pre-registered verdict FAIL at τ = 0.01 | U2-D2b (`.25`) | Windowed accuracy vs unwindowed. **Not shown to cost less than one point.** 25 MarathonDocBench documents (548 pages, S5 among them), int8, `--page-window 10` against `--page-window off`, scored by C5a's document scorer: d = ED_all(windowed) − ED_all(unwindowed) has mean +0.0243, paired bootstrap 95% [−0.0210, +0.0752], and PASS needed the upper bound below 0.01. 19 of 25 documents are within ±0.02 (six identical), and S5 is +0.0001. Page-cap runaways in both arms carry the mean (windowed 0128, 0601; unwindowed 0147, 0157), with two documents where the windowed text is worse (0805, 0955). Window-opening pages score no worse (page ED 0.2535 against 0.2606), and the 8 paragraphs that span a window boundary cost nothing (mean d −0.0014). Peak RSS 11.1 GB against 12.8 GB. U2-E5a gate 3 reads the verdict; the numbers are in the bead's comments |
 | **OQ-V2-10** | OPEN | U2-G2 (`.44`) | v2 single-page base vs gundam |
 | **OQ-V2-11** | RESOLVED (mechanism; fixtures at U2-C2) | U2-B4 (`.13`): `src/native_engine/srswa.rs` tests `retired_runs_equal_unretired_runs_bit_for_bit`, `the_detector_passes_guard_forced_steps_and_fires_otherwise`, `pinned_rows_survive_to_the_end_of_a_window` | Block-granular retirement is output-exact under the guard |
 | **OQ-V2-12** | OPEN | U2-C5a (`.21`) | Licenses of evaluation sets beyond MarathonDocBench (MPDocBench, OmniDocBench) |
@@ -60,7 +60,7 @@
 | **OQ-V2-15** | OPEN | U2-C5a (`.21`) | Non-Baidu ground-truth documents for the head-to-head |
 | **OQ-V2-16** | OPEN | U2-C5b (`.22`) | Entmax domain for long documents (TopM vs AllCandidates) |
 
-**Disposition:** 7 RESOLVED, 2 PARTIAL, 7 OPEN, each OPEN item owned by the bead named.
+**Disposition:** 11 RESOLVED, 5 OPEN, each OPEN item owned by the bead named.
 Kernel gates: OQ-V2-3/4 block parity sign-off (U2-A6, U2-C1). OQ-V2-11 no longer blocks
 block retirement; `FOCR_SRSWA_RETIRE` stays default-on only if U2-C2's fixtures also agree. The rest gate evaluation or defaults (C4, C5a/b, D2b, G2),
 not the f32 reference forward. Bead ids are children of epic `bd-uocr2-epic-cgux`.

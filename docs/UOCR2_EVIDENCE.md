@@ -65,12 +65,25 @@ NED(a, b) = lev(N(a), N(b)) / max(|N(a)|, |N(b)|), and 0 when both are empty.
 - The text view is the text-like categories.
 - The all view adds table cells (tags dropped) and display formulas (`latex`)
   in place.
-- MarathonDocBench leaves 2,185 of its 10,319 table annotations (21%) with no
-  html and no text, and none is marked `ignore`. On such a page the all view has
-  no table, so a table the model reads counts as inserted text. Here 21 of the
-  142 MarathonDocBench pages are affected, in 5 of the 20 documents. This was
-  found after scoring, in U2-D2b's interim (bd-uocr2-epic-cgux.25), and the
-  documents are not re-scored.
+- MarathonDocBench merges a table split across pages onto its first piece. 2,185
+  of its 10,319 table annotations (21%) have no html and no text. Each is a later
+  piece of a `truncated` chain whose first piece carries the merged table in its
+  html; all 1,341 `merged_html` fields equal their `html`.
+  - The page-ordered concatenation keeps those rows in reading order: 1,134 of the
+    1,215 cross-page first pieces are the last content on their page.
+  - Per-page views do not. A later piece's page has no table in truth, so a table
+    the model reads there counts as inserted text. The first piece's page carries
+    the later pages' rows.
+  - A span's edges cut chains, even for the document view. Here 5 pieces continue
+    past a span's last page, so their rows sit in truth but on no page read. 8
+    pieces open a span with their first piece before it, so their rows are in no
+    truth view. 4 of the 20 documents have such a cut.
+  - 21 of the 142 MarathonDocBench pages hold a later piece and 9 a first piece,
+    in 6 of the 20 documents.
+
+  This was found after scoring, in U2-D2b (bd-uocr2-epic-cgux.25). It was first
+  read as untranscribed tables and corrected on 2026-11-03
+  (bd-uocr2-epic-cgux.22). The documents are not re-scored.
 
 Text-layer ground truth (non-Baidu): see Amendment 1.
 
