@@ -595,6 +595,21 @@ impl OcrEngine {
             .unwrap_or_default()
     }
 
+    /// Take (consume) one [`native_engine::ChartPageMeta`] per image of the
+    /// last [`OcrEngine::recognize_batch`] on this engine's cached model, in
+    /// input order; `None` where an image has none (not a OneChart page, or
+    /// a page that failed). As with the reports, after a batch
+    /// `take_chart_page_meta` has nothing to return (bd-v37k).
+    #[must_use]
+    pub fn take_batch_chart_page_metas(&self) -> Vec<Option<native_engine::ChartPageMeta>> {
+        self.model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone))
+            .map(|model| model.take_batch_charts())
+            .unwrap_or_default()
+    }
+
     /// The identity of the model this engine last loaded (U2-E1); `None`
     /// before any load.
     #[must_use]

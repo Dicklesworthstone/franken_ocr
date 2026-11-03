@@ -354,6 +354,12 @@ pub struct OcrModel {
     /// `FOCR_BATCH_SPINE`, as its sequential loop takes `last_decode` after
     /// each image (bd-iv8d).
     batch_decodes: std::sync::Mutex<Vec<Option<DecodeReport>>>,
+    /// One [`ChartPageMeta`] per image of the last [`Self::recognize_batch`],
+    /// in input order (`None` where an image has none: not a OneChart page,
+    /// or a page that failed). `ocr-batch` takes them under
+    /// `FOCR_BATCH_SPINE`, as its sequential loop takes `chart_meta` after
+    /// each image (bd-v37k).
+    batch_charts: std::sync::Mutex<Vec<Option<ChartPageMeta>>>,
 }
 
 struct UnlimitedVisionStatics {
@@ -2363,6 +2369,19 @@ pub struct ChartPageMeta {
     /// [`onechart::ChartResult::reliable`]; `None` when the text gave no values
     /// to hold against the head.
     pub reliable: Option<bool>,
+}
+
+impl ChartPageMeta {
+    /// The verdict half of one OneChart page (the text half is
+    /// `res.json_text`); the single-page forward and the dense batch both
+    /// read a page's verdict here (bd-v37k).
+    fn from_result(res: &onechart::ChartResult) -> Self {
+        Self {
+            pred_locs: res.pred_locs.clone().unwrap_or_default(),
+            reliable_distance: res.reliable_distance,
+            reliable: res.reliable,
+        }
+    }
 }
 
 /// The `chart_unverified` warning, unless the page's text passed the head check.
@@ -4592,6 +4611,7 @@ impl OcrModel {
             chart_meta: std::sync::Mutex::new(None),
             last_decode: std::sync::Mutex::new(None),
             batch_decodes: std::sync::Mutex::new(Vec::new()),
+            batch_charts: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -4786,11 +4806,7 @@ impl OcrModel {
         if let Ok(mut slot) = self.chart_meta.lock()
             && slot.as_ref().is_none_or(|held| held.reliable == Some(true))
         {
-            *slot = Some(ChartPageMeta {
-                pred_locs: res.pred_locs.unwrap_or_default(),
-                reliable_distance: res.reliable_distance,
-                reliable: res.reliable,
-            });
+            *slot = Some(ChartPageMeta::from_result(&res));
         }
         Ok((res.json_text, w, h))
     }
@@ -4838,6 +4854,23 @@ impl OcrModel {
     fn set_batch_decodes(&self, reports: Vec<Option<DecodeReport>>) {
         if let Ok(mut slot) = self.batch_decodes.lock() {
             *slot = reports;
+        }
+    }
+
+    /// Take (consume) the per-image [`ChartPageMeta`]s of the last
+    /// [`Self::recognize_batch`], in input order; empty after a take or
+    /// before any batch.
+    pub fn take_batch_charts(&self) -> Vec<Option<ChartPageMeta>> {
+        self.batch_charts
+            .lock()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default()
+    }
+
+    /// Keep `charts` for [`Self::take_batch_charts`].
+    fn set_batch_charts(&self, charts: Vec<Option<ChartPageMeta>>) {
+        if let Ok(mut slot) = self.batch_charts.lock() {
+            *slot = charts;
         }
     }
 
@@ -6322,9 +6355,11 @@ impl OcrModel {
     /// whatever oracle is in force.
     ///
     /// Each image's [`DecodeReport`] is kept for [`Self::take_batch_decodes`]
-    /// (bd-iv8d). The sequential fallback takes [`Self::take_last_decode`]
-    /// after every image to keep them apart, and a report left from before
-    /// the batch is dropped, so after any batch `take_last_decode` is `None`.
+    /// (bd-iv8d) and its [`ChartPageMeta`] for [`Self::take_batch_charts`]
+    /// (bd-v37k). The sequential fallback takes [`Self::take_last_decode`]
+    /// and [`Self::take_chart_meta`] after every image to keep them apart,
+    /// and what was left from before the batch is dropped, so after any
+    /// batch both are `None`.
     #[must_use]
     pub fn recognize_batch(&self, image_paths: &[&Path]) -> Vec<FocrResult<String>> {
         // The spine reproduces the int8 R-SWA cached decode (`generate_cached_i8`),
@@ -6341,10 +6376,14 @@ impl OcrModel {
             && std::env::var_os(DECODE_STATELESS_ENV).is_none()
             && std::env::var_os(DECODE_F32_ENV).is_none()
             && self.arch().unlimited_variant() == Some(model_arch::UnlimitedVariant::V1Rswa);
-        // No report outlives the batch it came from, and none from an earlier
-        // single page survives into it (bd-iv8d).
-        self.set_batch_decodes(Vec::new());
+        // One empty slot per image, filled by whichever path below has that
+        // image's report or chart verdict: none outlives the batch it came
+        // from, and none from an earlier single page survives into it
+        // (bd-iv8d, bd-v37k).
+        self.set_batch_decodes(vec![None; image_paths.len()]);
+        self.set_batch_charts(vec![None; image_paths.len()]);
         let _ = self.take_last_decode();
+        let _ = self.take_chart_meta();
         // A7.5 (bd-3jo6.1.7.5): the DENSE continuous-batch spine. GOT decode is
         // int8 by construction (the QInt8 panels), so it needs only the master
         // spine switch; the per-page id-stream is byte-identical to the
@@ -6366,18 +6405,22 @@ impl OcrModel {
             }
         }
         if !spine {
-            // Each image's report is taken after its decode, so one image's
-            // runaway or short document is its own (bd-iv8d).
+            // Each image's report and chart verdict are taken after its
+            // decode, so one image's runaway, short document or unverified
+            // chart is its own (bd-iv8d, bd-v37k).
             let mut reports = Vec::with_capacity(image_paths.len());
+            let mut charts = Vec::with_capacity(image_paths.len());
             let results: Vec<FocrResult<String>> = image_paths
                 .iter()
                 .map(|p| {
                     let result = self.recognize(p);
                     reports.push(self.take_last_decode());
+                    charts.push(self.take_chart_meta());
                     result
                 })
                 .collect();
             self.set_batch_decodes(reports);
+            self.set_batch_charts(charts);
             return results;
         }
         let _admission = forward_admission().acquire();
@@ -6431,6 +6474,8 @@ impl OcrModel {
             use image::GenericImageView;
             let dims: Vec<(u32, u32)> = imgs.iter().map(|im| im.dimensions()).collect();
             let refs: Vec<&image::DynamicImage> = imgs.iter().collect();
+            // One verdict per live page, OneChart's only.
+            let mut charts: Vec<ChartPageMeta> = Vec::new();
             let texts: Vec<String> = match arch_id {
                 "got-ocr2" => {
                     let inputs: Vec<_> = refs.iter().map(|img| got_input(img)).collect();
@@ -6464,7 +6509,10 @@ impl OcrModel {
                     max_new,
                 )?
                 .into_iter()
-                .map(|r| r.json_text)
+                .map(|r| {
+                    charts.push(ChartPageMeta::from_result(&r));
+                    r.json_text
+                })
                 .collect(),
                 other => {
                     return Err(FocrError::Other(anyhow::anyhow!(
@@ -6473,10 +6521,15 @@ impl OcrModel {
                 }
             };
             // The SAME per-page finalize the sequential path applies
-            // (recognize -> forward_<arch> -> postprocess::finalize).
+            // (recognize -> forward_<arch> -> postprocess::finalize); a
+            // OneChart page's verdict goes to its own image (bd-v37k).
+            let mut charts = charts.into_iter();
+            let mut page_charts = vec![None; image_paths.len()];
             for ((slot, text), (iw, ih)) in live.into_iter().zip(texts).zip(dims) {
                 out[slot] = Some(postprocess::finalize(&text, iw, ih));
+                page_charts[slot] = charts.next();
             }
+            self.set_batch_charts(page_charts);
         }
         timing_log(&format!(
             "{arch_id} forward(batch of {}) {:.2}s",
@@ -10935,6 +10988,62 @@ mod tests {
             v1.recognize_document(&mut source, &options, &mut |_| {}, None),
             Err(FocrError::InputDecode(_))
         ));
+    }
+
+    /// bd-iv8d, bd-v37k: a batch keeps one decode report and one chart
+    /// verdict per image, `None` for an image that failed before its decode,
+    /// and drops what an earlier single page left untaken, so neither reaches
+    /// the batch's images nor outlives the batch.
+    #[test]
+    fn a_batch_keeps_one_end_per_image_and_nothing_from_before_it() {
+        let v1 = model_arch::arch_by_id(model_arch::UNLIMITED_OCR_V1_ID).expect("v1 registered");
+        let model = OcrModel::assemble(
+            PathBuf::from("<batch-ends-test>"),
+            SidecarBundle::default(),
+            v1,
+            Weights::default(),
+            None,
+        );
+        let leave_a_page_behind = || {
+            *model.last_decode.lock().expect("last_decode") = Some(DecodeReport::v1_decode(
+                vec![5, 6],
+                &model.decode_params,
+                true,
+            ));
+            *model.chart_meta.lock().expect("chart_meta") = Some(ChartPageMeta {
+                pred_locs: Vec::new(),
+                reliable_distance: None,
+                reliable: Some(false),
+            });
+        };
+        let missing = Path::new("/nonexistent/franken_ocr_batch_ends_test_page.png");
+
+        leave_a_page_behind();
+        let results = model.recognize_batch(&[missing, missing, missing]);
+        assert_eq!(results.len(), 3);
+        for result in results {
+            assert!(
+                matches!(result, Err(FocrError::InputDecode(_))),
+                "{result:?}"
+            );
+        }
+        assert_eq!(model.take_last_decode(), None, "the earlier page's report");
+        assert_eq!(model.take_chart_meta(), None, "the earlier page's verdict");
+        assert_eq!(model.take_batch_decodes(), vec![None, None, None]);
+        assert_eq!(model.take_batch_charts(), vec![None, None, None]);
+        assert!(
+            model.take_batch_decodes().is_empty(),
+            "a take consumes them"
+        );
+        assert!(model.take_batch_charts().is_empty(), "a take consumes them");
+
+        // An empty batch leaves nothing behind either, and keeps no slots.
+        leave_a_page_behind();
+        assert!(model.recognize_batch(&[]).is_empty());
+        assert_eq!(model.take_last_decode(), None);
+        assert_eq!(model.take_chart_meta(), None);
+        assert!(model.take_batch_decodes().is_empty());
+        assert!(model.take_batch_charts().is_empty());
     }
 
     /// bd-1jx0: the decoder variables pick one decoder each. Stateless
