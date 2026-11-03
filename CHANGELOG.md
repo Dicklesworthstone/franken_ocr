@@ -28,14 +28,14 @@ sections as they land.
 
 ### Changed
 
-- **The default thread budget on an Apple-silicon Mac is the performance cores**
-  (bead bd-zex4). It was every physical core, and the efficiency cores set the pace of
-  each fork-join section while the fast ones spun in the kernel. On an M5 Ultra (12
-  performance + 24 efficiency cores) shared with other work, the old default of 36
-  took 2.4-2.6x the wall time of 12 and about 6x the CPU time, for byte-identical
-  output (`artifacts/perf/bd-zex4`). The budget comes from `hw.perflevel0.physicalcpu`.
-  Other platforms, Intel Macs and iOS are unchanged, and `--threads` / `FOCR_THREADS`
-  still override it.
+- **The default thread budget on an Apple-silicon Mac is its fastest core tier**
+  (bead bd-zex4). It was every physical core, and the slower tier set the pace of each
+  fork-join section while the fast cores spun in the kernel. On an M5 Ultra (12 Super +
+  24 Performance cores, as macOS names its tiers) shared with other work, the old
+  default of 36 took 2.4-2.6x the wall time of 12 and about 6x the CPU time, for
+  byte-identical output (`artifacts/perf/bd-zex4`). The budget comes from
+  `hw.perflevel0.physicalcpu`. Other platforms, Intel Macs and iOS are unchanged, and
+  `--threads` / `FOCR_THREADS` still override it.
 
 - **`--temperature` above 0 is refused before a model loads** (bead bd-d630). Every
   model decodes greedily, and each sampler refused `temperature > 0` at its first step,
@@ -62,11 +62,12 @@ sections as they land.
 ### Added
 
 - **Unlimited-OCR-2 decode phase timings** (bead bd-uocr2-epic-cgux.38). With
-  `FOCR_PROFILE_DECODE=1` and `FOCR_TIMING=1`, a v2 document prints the `decode phases
-  (ms)` row v1 prints (lm_head, attn, experts, route), then an `srswa phases (ms)` row
-  that splits SR-SWA's share of `attn` into its index projections, the cache append,
-  block routing, the attend and block retirement. On single pages v2 decodes 12-26% slower
-  per token than v1 with the same MoE and lm_head code, and these rows show where.
+  `FOCR_PROFILE_DECODE=1` and `FOCR_TIMING=1`, a v2 run's `decode phases (ms)` row
+  (lm_head, attn, experts, route, as in v1) is now followed by an `srswa phases (ms)` row.
+  It splits SR-SWA's share of `attn` into the index projections, the cache append, block
+  routing, the attend and block retirement. On single pages v2 decodes 12-26% slower per
+  token than v1 with the same MoE and lm_head code, and these rows are there to find
+  where; that measurement has not run yet.
 
 - **Unlimited-OCR-2 can read a capped page again on its own** (bead bd-yrr1). With
   `FOCR_REREAD_CAPPED_PAGES=1`, or `DocumentOptions::reread_capped` in the library, each

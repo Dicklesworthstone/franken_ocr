@@ -46,7 +46,7 @@ pub const ENVIRONMENT_VARIABLES: &[(&str, &str)] = &[
     ),
     (
         "FOCR_THREADS",
-        "kernel thread budget (default: physical cores; on Apple silicon the performance cores)",
+        "kernel thread budget (default: physical cores, of the fastest tier on Apple silicon)",
     ),
     (
         "FOCR_MAX_NEW_TOKENS",

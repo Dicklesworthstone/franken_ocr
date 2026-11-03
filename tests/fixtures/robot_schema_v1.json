@@ -155,7 +155,7 @@
     },
     {
       "name": "FOCR_THREADS",
-      "summary": "kernel thread budget (default: physical cores; on Apple silicon the performance cores)"
+      "summary": "kernel thread budget (default: physical cores, of the fastest tier on Apple silicon)"
     },
     {
       "name": "FOCR_MAX_NEW_TOKENS",

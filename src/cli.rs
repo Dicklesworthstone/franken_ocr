@@ -276,7 +276,7 @@ pub struct OcrBatchArgs {
     #[arg(long, value_name = "PATH")]
     pub progress_events: Option<PathBuf>,
     /// The kernel thread budget for this run; outranks FOCR_THREADS. Default:
-    /// physical cores, on an Apple-silicon Mac the performance cores only.
+    /// physical cores, on an Apple-silicon Mac its fastest core tier only.
     #[arg(long, value_name = "N")]
     pub threads: Option<std::num::NonZeroUsize>,
     /// Print nested stage timings to stderr, as FOCR_TIMING=1 does.
@@ -478,7 +478,7 @@ pub struct OcrRequestArgs {
     #[arg(long)]
     pub no_resident: bool,
     /// The kernel thread budget for this run; outranks FOCR_THREADS. Default:
-    /// physical cores, on an Apple-silicon Mac the performance cores only. The
+    /// physical cores, on an Apple-silicon Mac its fastest core tier only. The
     /// run loads its own model: a resident daemon keeps the budget it started
     /// with.
     #[arg(long, value_name = "N")]
@@ -4959,7 +4959,7 @@ fn robot_backends_payload() -> serde_json::Value {
         },
         "logical_cpus": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
         // The ONE process-wide budget (bd-223.2 addendum: FOCR_THREADS else
-        // physical cores, of the performance tier on a two-tier Mac (bd-zex4)
+        // physical cores, of the fastest tier on a two-tier Mac (bd-zex4)
         // — pool-sizing consumers read this, never logical).
         "threads": crate::thread_budget()
     })

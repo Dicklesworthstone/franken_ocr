@@ -321,12 +321,12 @@ pub fn timing_enabled() -> bool {
 }
 
 /// The no-override default width. Physical cores (hyperthreads oversubscribe
-/// the int8 GEMMs), and on a two-tier Mac only the performance tier
-/// (bd-zex4): every parallel section is a fork-join over equal shares, so the
-/// efficiency cores set the pace while the fast ones spin in the kernel. On an
-/// M5 Ultra (12 performance + 24 efficiency cores) shared with other work, all
-/// 36 took 2.4-2.6x the wall of 12 and about 6x the CPU time, 81% of it in
-/// sys, for byte-identical output (`artifacts/perf/bd-zex4`).
+/// the int8 GEMMs), and on a two-tier Mac only the fastest tier (bd-zex4):
+/// every parallel section is a fork-join over equal shares, so the slower tier
+/// sets the pace while the fast cores spin in the kernel. On an M5 Ultra (12
+/// Super + 24 Performance cores, as macOS names its tiers) shared with other
+/// work, all 36 took 2.4-2.6x the wall of 12 and about 6x the CPU time, 81% of
+/// it in sys, for byte-identical output (`artifacts/perf/bd-zex4`).
 ///
 /// iOS keeps its own rule, one core left to the UI: an A-series part is 2
 /// performance + 4 efficiency cores, the app's own main thread has to stay
@@ -339,17 +339,20 @@ fn default_thread_budget() -> usize {
     if cfg!(target_os = "ios") {
         physical.saturating_sub(1).max(1)
     } else {
-        performance_cores()
+        fastest_tier_cores()
             .filter(|&fast| fast <= physical)
             .unwrap_or(physical)
     }
 }
 
 /// Physical cores in the fastest tier (`hw.perflevel0.physicalcpu`), on a Mac
-/// that reports tiers; `None` off macOS. A one-tier Mac (Intel) reports every
-/// core there or nothing, so its default is unchanged either way. Read through
-/// `/usr/sbin/sysctl` like `hw.memsize`: the crate denies `unsafe`.
-fn performance_cores() -> Option<usize> {
+/// that reports tiers; `None` off macOS. macOS does not call that tier the
+/// same thing everywhere: on the M5 Ultra it is Super and the slower tier is
+/// Performance, so "performance cores" would name the wrong ones. A one-tier
+/// Mac (Intel) reports every core there or nothing, so its default is
+/// unchanged either way. Read through `/usr/sbin/sysctl` like `hw.memsize`:
+/// the crate denies `unsafe`.
+fn fastest_tier_cores() -> Option<usize> {
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("/usr/sbin/sysctl")
@@ -1280,11 +1283,11 @@ mod tests {
         );
     }
 
-    /// bd-zex4: every Apple-silicon Mac reports its performance tier, and the
+    /// bd-zex4: every Apple-silicon Mac reports its fastest tier, and the
     /// default follows it; other targets keep the physical core count.
     #[test]
-    fn default_budget_is_the_performance_tier_on_apple_silicon() {
-        let fast = performance_cores();
+    fn default_budget_is_the_fastest_tier_on_apple_silicon() {
+        let fast = fastest_tier_cores();
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             let fast = fast.expect("hw.perflevel0.physicalcpu on Apple silicon");
             assert!(fast <= num_cpus::get_physical(), "{fast} fast cores");
@@ -1294,11 +1297,11 @@ mod tests {
             assert_eq!(default_thread_budget(), num_cpus::get_physical());
         }
         log_line(
-            "default_budget_is_the_performance_tier_on_apple_silicon",
+            "default_budget_is_the_fastest_tier_on_apple_silicon",
             "resolved",
             "pass",
             &format!(
-                "\"performance_cores\":{},\"default\":{}",
+                "\"fastest_tier_cores\":{},\"default\":{}",
                 fast.map_or_else(|| "null".to_string(), |n| n.to_string()),
                 default_thread_budget()
             ),
