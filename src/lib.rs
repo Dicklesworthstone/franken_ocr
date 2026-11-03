@@ -579,6 +579,22 @@ impl OcrEngine {
             .and_then(|model| model.take_last_decode())
     }
 
+    /// Take (consume) one [`native_engine::DecodeReport`] per image of the
+    /// last [`OcrEngine::recognize_batch`] on this engine's cached model, in
+    /// input order; `None` where an image has none (a dense-model batch, or a
+    /// page that failed before its decode). Each image's report is here
+    /// instead, so after a batch `take_last_decode_report` has nothing to
+    /// return (bd-iv8d).
+    #[must_use]
+    pub fn take_batch_decode_reports(&self) -> Vec<Option<native_engine::DecodeReport>> {
+        self.model
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(std::sync::Arc::clone))
+            .map(|model| model.take_batch_decodes())
+            .unwrap_or_default()
+    }
+
     /// The identity of the model this engine last loaded (U2-E1); `None`
     /// before any load.
     #[must_use]

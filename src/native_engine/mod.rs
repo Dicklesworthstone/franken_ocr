@@ -348,6 +348,12 @@ pub struct OcrModel {
     /// (`tests/uocr2_goldens.rs`), because one drifted token can survive
     /// detokenize + postprocess without changing the markdown.
     last_decode: std::sync::Mutex<Option<DecodeReport>>,
+    /// One [`DecodeReport`] per image of the last [`Self::recognize_batch`],
+    /// in input order (`None` where an image has none: a dense-model batch,
+    /// or a page that failed before its decode). `ocr-batch` takes them under
+    /// `FOCR_BATCH_SPINE`, as its sequential loop takes `last_decode` after
+    /// each image (bd-iv8d).
+    batch_decodes: std::sync::Mutex<Vec<Option<DecodeReport>>>,
 }
 
 struct UnlimitedVisionStatics {
@@ -861,6 +867,32 @@ impl DecodeReport {
             (_, stop @ (FinishReason::Budget | FinishReason::Cancelled)) => stop,
             _ if self.runaway_stops > 0 => FinishReason::Runaway,
             _ => FinishReason::Length,
+        }
+    }
+
+    /// One v1 decode's report: its `ids` ended on `params`' EOS, or the
+    /// runaway guard stopped it (`ran_away`, bd-gftg), or it ran to its
+    /// limit. The sequential driver and the batch spine both build theirs
+    /// here, so a page reports the same finish either way (bd-iv8d).
+    fn v1_decode(ids: Vec<u32>, params: &sampler::DecodeParams, ran_away: bool) -> Self {
+        let stopped = ids.last() == Some(&params.eos_token_id);
+        let runaway = !stopped && ran_away;
+        Self {
+            finish_reason: match (stopped, runaway) {
+                (true, _) => FinishReason::Stop,
+                (false, true) => FinishReason::Runaway,
+                (false, false) => FinishReason::Length,
+            },
+            cap: (!stopped && !runaway).then_some(LengthCap::MaxLength),
+            ids,
+            pages: None,
+            max_length: params.max_length,
+            max_positions: params.max_positions,
+            decodes: 1,
+            length_stops: usize::from(!stopped),
+            runaway_stops: usize::from(runaway),
+            document: None,
+            admission_warnings: Vec::new(),
         }
     }
 }
@@ -4559,6 +4591,7 @@ impl OcrModel {
             music_meta: std::sync::Mutex::new(None),
             chart_meta: std::sync::Mutex::new(None),
             last_decode: std::sync::Mutex::new(None),
+            batch_decodes: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -4789,6 +4822,23 @@ impl OcrModel {
             .lock()
             .ok()
             .and_then(|mut slot| slot.take())
+    }
+
+    /// Take (consume) the per-image [`DecodeReport`]s of the last
+    /// [`Self::recognize_batch`], in input order; empty after a take or
+    /// before any batch.
+    pub fn take_batch_decodes(&self) -> Vec<Option<DecodeReport>> {
+        self.batch_decodes
+            .lock()
+            .map(|mut slot| std::mem::take(&mut *slot))
+            .unwrap_or_default()
+    }
+
+    /// Keep `reports` for [`Self::take_batch_decodes`].
+    fn set_batch_decodes(&self, reports: Vec<Option<DecodeReport>>) {
+        if let Ok(mut slot) = self.batch_decodes.lock() {
+            *slot = reports;
+        }
     }
 
     fn forward_tromr(&self, img: &image::DynamicImage) -> FocrResult<(String, u32, u32)> {
@@ -6270,6 +6320,11 @@ impl OcrModel {
     /// path (the bd-1azu.13 gate). The spine is the int8 throughput path; if int8
     /// is not requested it stays on the sequential fallback so the result tracks
     /// whatever oracle is in force.
+    ///
+    /// Each image's [`DecodeReport`] is kept for [`Self::take_batch_decodes`]
+    /// (bd-iv8d). The sequential fallback takes [`Self::take_last_decode`]
+    /// after every image to keep them apart, and a report left from before
+    /// the batch is dropped, so after any batch `take_last_decode` is `None`.
     #[must_use]
     pub fn recognize_batch(&self, image_paths: &[&Path]) -> Vec<FocrResult<String>> {
         // The spine reproduces the int8 R-SWA cached decode (`generate_cached_i8`),
@@ -6286,6 +6341,10 @@ impl OcrModel {
             && std::env::var_os(DECODE_STATELESS_ENV).is_none()
             && std::env::var_os(DECODE_F32_ENV).is_none()
             && self.arch().unlimited_variant() == Some(model_arch::UnlimitedVariant::V1Rswa);
+        // No report outlives the batch it came from, and none from an earlier
+        // single page survives into it (bd-iv8d).
+        self.set_batch_decodes(Vec::new());
+        let _ = self.take_last_decode();
         // A7.5 (bd-3jo6.1.7.5): the DENSE continuous-batch spine. GOT decode is
         // int8 by construction (the QInt8 panels), so it needs only the master
         // spine switch; the per-page id-stream is byte-identical to the
@@ -6307,7 +6366,19 @@ impl OcrModel {
             }
         }
         if !spine {
-            return image_paths.iter().map(|p| self.recognize(p)).collect();
+            // Each image's report is taken after its decode, so one image's
+            // runaway or short document is its own (bd-iv8d).
+            let mut reports = Vec::with_capacity(image_paths.len());
+            let results: Vec<FocrResult<String>> = image_paths
+                .iter()
+                .map(|p| {
+                    let result = self.recognize(p);
+                    reports.push(self.take_last_decode());
+                    result
+                })
+                .collect();
+            self.set_batch_decodes(reports);
+            return results;
         }
         let _admission = forward_admission().acquire();
         match self.recognize_batch_spine(image_paths) {
@@ -6432,9 +6503,13 @@ impl OcrModel {
         let wc = self.decoder_cache_i8()?;
         let embed_table = self.embed_table()?;
         let tokenizer = self.tokenizer()?;
+        // Each page gets the runaway guard a sequential single page gets: on
+        // unless FOCR_RUNAWAY_GUARD=0 (bd-gftg, bd-iv8d).
+        let runaway_guard = sampler::RunawayGuard::from_env(true)?;
 
         // ── per-page prefill, staged so vision can batch ACROSS pages ────────────
         let mut out: Vec<Option<FocrResult<String>>> = (0..n).map(|_| None).collect();
+        let mut reports: Vec<Option<DecodeReport>> = (0..n).map(|_| None).collect();
 
         // Stage 1: preprocess every page (a per-page error records + skips it).
         // Same mode resolution as the single-page forward (bd-1e9n) — the
@@ -6506,12 +6581,15 @@ impl OcrModel {
             };
             match self.prefill_from_features(wc, &pre, &vf) {
                 Ok(p) => {
-                    streams.push(batch_scheduler::PageStream::new(
-                        gi,
-                        p.prefill_len,
-                        &p.prompt_ids,
-                        p.last_hidden,
-                    ));
+                    streams.push(
+                        batch_scheduler::PageStream::new(
+                            gi,
+                            p.prefill_len,
+                            &p.prompt_ids,
+                            p.last_hidden,
+                        )
+                        .with_runaway_guard(runaway_guard.clone()),
+                    );
                     stream_caches.push(p.caches);
                     scheduled.push((gi, p.image_w, p.image_h));
                 }
@@ -6537,9 +6615,16 @@ impl OcrModel {
                 let finalized = tokenizer
                     .decode(&tokens)
                     .and_then(|decoded| postprocess::finalize(&decoded, w, h));
+                let ran_away = scheduler.ran_away().binary_search(&gi).is_ok();
+                reports[gi] = Some(DecodeReport::v1_decode(
+                    tokens,
+                    &self.decode_params,
+                    ran_away,
+                ));
                 out[gi] = Some(finalized);
             }
         }
+        self.set_batch_decodes(reports);
 
         Ok(out
             .into_iter()
@@ -7336,27 +7421,14 @@ impl OcrModel {
             timing_log(&evidence.describe());
         }
         if let Ok(mut slot) = self.last_decode.lock() {
-            let stopped = generated.last() == Some(&params.eos_token_id);
-            let (decodes, length_stops, runaway_stops) = slot.as_ref().map_or((0, 0, 0), |prior| {
-                (prior.decodes, prior.length_stops, prior.runaway_stops)
-            });
-            *slot = Some(DecodeReport {
-                ids: generated.clone(),
-                finish_reason: match (stopped, runaway) {
-                    (true, _) => FinishReason::Stop,
-                    (false, Some(_)) => FinishReason::Runaway,
-                    (false, None) => FinishReason::Length,
-                },
-                cap: (!stopped && runaway.is_none()).then_some(LengthCap::MaxLength),
-                pages: None,
-                max_length: params.max_length,
-                max_positions: params.max_positions,
-                decodes: decodes + 1,
-                length_stops: length_stops + usize::from(!stopped),
-                runaway_stops: runaway_stops + usize::from(!stopped && runaway.is_some()),
-                document: None,
-                admission_warnings: Vec::new(),
-            });
+            // The counts run on from the decodes not yet taken.
+            let mut report = DecodeReport::v1_decode(generated.clone(), params, runaway.is_some());
+            if let Some(prior) = slot.as_ref() {
+                report.decodes += prior.decodes;
+                report.length_stops += prior.length_stops;
+                report.runaway_stops += prior.runaway_stops;
+            }
+            *slot = Some(report);
         }
         Ok(generated)
     }
@@ -8398,6 +8470,49 @@ mod tests {
             panic!("a multi-page runaway is a partial output");
         };
         assert_eq!((partial.finish_reason, partial.pages_out), ("runaway", 2));
+    }
+
+    /// bd-iv8d: the one v1 report the sequential driver and the batch spine
+    /// share. EOS is a stop even if the guard fired, a runaway without EOS
+    /// reports `runaway` and fails with exit 5, and anything else ran to its
+    /// limit.
+    #[test]
+    fn a_v1_decode_report_names_eos_runaway_and_limit_alike_for_both_drivers() {
+        let params = sampler::DecodeParams::single_image();
+        let eos = params.eos_token_id;
+        let v1_model = ModelIdentity {
+            model_id: model_arch::UNLIMITED_OCR_V1_ID,
+            source_sha256: None,
+        };
+
+        for ran_away in [false, true] {
+            let stop = DecodeReport::v1_decode(vec![5, 6, eos], &params, ran_away);
+            assert_eq!(stop.finish_reason, FinishReason::Stop);
+            assert_eq!(stop.cap, None);
+            assert_eq!(
+                (stop.decodes, stop.length_stops, stop.runaway_stops),
+                (1, 0, 0)
+            );
+            assert!(partial_output(&stop, &[], &v1_model).is_none());
+        }
+
+        let limit = DecodeReport::v1_decode(vec![5, 6, 7], &params, false);
+        assert_eq!(limit.finish_reason, FinishReason::Length);
+        assert_eq!(limit.cap, Some(LengthCap::MaxLength));
+        assert_eq!((limit.length_stops, limit.runaway_stops), (1, 0));
+        assert_eq!(limit.max_length, params.max_length);
+        assert!(partial_output(&limit, &[], &v1_model).is_none());
+
+        let runaway = DecodeReport::v1_decode(vec![5, 6, 7], &params, true);
+        assert_eq!(runaway.ids, vec![5, 6, 7]);
+        assert_eq!(runaway.finish_reason, FinishReason::Runaway);
+        assert_eq!(runaway.cap, None);
+        assert_eq!((runaway.length_stops, runaway.runaway_stops), (1, 1));
+        assert_eq!(runaway.run_finish_reason(), FinishReason::Runaway);
+        let Some(FocrError::Partial(partial)) = partial_output(&runaway, &[], &v1_model) else {
+            panic!("a runaway page fails after its text is written");
+        };
+        assert_eq!((partial.finish_reason, partial.pages_out), ("runaway", 1));
     }
 
     /// bd-yrr1: the re-read's warning lists the pages it replaced in `pages`

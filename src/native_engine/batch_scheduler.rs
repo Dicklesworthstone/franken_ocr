@@ -5,9 +5,9 @@
 //! stream's current decode hidden into ONE batched forward (composing the
 //! Wave-1 batched kernels: [`super::decoder::batched_lm_head_i8`] →
 //! [`super::sampler::batched_decode_step`] → [`super::decoder::batched_decode_step_i8`]).
-//! Streams that hit EOS / `max_length` retire and are backfilled from a pending
-//! queue so the active set stays saturated; outputs are RE-SORTED to input
-//! order via [`PageStream::input_index`].
+//! Streams that hit EOS / `max_length` (or their armed runaway guard) retire
+//! and are backfilled from a pending queue so the active set stays saturated;
+//! outputs are RE-SORTED to input order via [`PageStream::input_index`].
 //!
 //! ## Doctrine #5 (the heart)
 //! The scheduler is the SINGLE sequential driver — at every step EXACTLY ONE
@@ -41,7 +41,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use super::decoder::{self, DecoderWeightCacheI8};
 use super::rswa::BatchedRingCache;
-use super::sampler::{self, DecodeParams};
+use super::sampler::{self, DecodeParams, RunawayGuard};
 use super::tensor::Mat;
 use crate::error::FocrResult;
 
@@ -135,7 +135,7 @@ pub struct PageStream {
     /// Current decode hidden `[1, hidden]` the next token is predicted from
     /// (seeded from prefill's last hidden, then replaced each advance).
     pub last_hidden: Mat,
-    /// Retired (EOS or `max_length` reached).
+    /// Retired (EOS, `max_length` or a runaway).
     pub done: bool,
     /// Retired specifically because EOS was emitted.
     pub eos: bool,
@@ -143,6 +143,12 @@ pub struct PageStream {
     /// budget binds tighter than the batch cap). `None` = the scheduler's
     /// global `max_length` alone.
     pub max_emit: Option<usize>,
+    /// The stream's runaway guard (bd-gftg), disarmed unless the driver arms
+    /// it; the v1 spine arms one per page as the sequential decode does
+    /// (bd-iv8d), so a repeating page stops at the same token either way.
+    pub runaway_guard: RunawayGuard,
+    /// Retired because [`Self::runaway_guard`] fired.
+    pub ran_away: bool,
 }
 
 impl PageStream {
@@ -165,6 +171,8 @@ impl PageStream {
             done: false,
             eos: false,
             max_emit: None,
+            runaway_guard: RunawayGuard::default(),
+            ran_away: false,
         }
     }
 
@@ -172,6 +180,13 @@ impl PageStream {
     #[must_use]
     pub fn with_max_emit(mut self, cap: usize) -> Self {
         self.max_emit = Some(cap);
+        self
+    }
+
+    /// Give the stream its runaway guard (see [`Self::runaway_guard`]).
+    #[must_use]
+    pub fn with_runaway_guard(mut self, guard: RunawayGuard) -> Self {
+        self.runaway_guard = guard;
         self
     }
 
@@ -245,6 +260,7 @@ pub struct BatchScheduler {
     max_active: AtomicUsize,
     guard_violation: AtomicBool,
     steps: usize,
+    ran_away: Vec<usize>,
 }
 
 impl BatchScheduler {
@@ -260,6 +276,7 @@ impl BatchScheduler {
             max_active: AtomicUsize::new(0),
             guard_violation: AtomicBool::new(false),
             steps: 0,
+            ran_away: Vec::new(),
         }
     }
 
@@ -292,11 +309,19 @@ impl BatchScheduler {
         }
     }
 
+    /// The [`PageStream::input_index`]es whose runaway guard retired them in
+    /// the last [`run`](Self::run), ascending.
+    #[must_use]
+    pub fn ran_away(&self) -> &[usize] {
+        &self.ran_away
+    }
+
     /// Drive `streams` to completion through `step`, returning each stream's
     /// emitted tokens RE-SORTED to [`PageStream::input_index`] order.
     ///
     /// Continuous batching: up to `batch_size` streams are active in any single
-    /// forward; a stream retires on EOS or `max_length` and the active set is
+    /// forward; a stream retires on EOS, `max_length` or its armed runaway
+    /// guard ([`Self::ran_away`] lists those), and the active set is
     /// backfilled from the pending tail (admission of *new* pages mid-batch is
     /// bd-1azu.9). When the [`FOCR_BATCH_PACK`](BATCH_PACK_ENV) kill-switch is
     /// armed, pending streams are admitted in length-grouped order (Lever-F) so
@@ -368,7 +393,13 @@ impl BatchScheduler {
                 let cap = s
                     .max_emit
                     .map_or(self.max_length, |m| m.min(self.max_length));
-                if out.is_eos || s.emitted().len() >= cap {
+                // The sequential loop's order: an EOS ends the stream without
+                // asking the guard; otherwise a runaway ends it, keeping its
+                // tokens (bd-gftg).
+                s.ran_away = !out.is_eos
+                    && s.runaway_guard
+                        .stops_after_emit(&s.generated[s.prompt_len..], false);
+                if out.is_eos || s.ran_away || s.emitted().len() >= cap {
                     s.done = true;
                     s.eos = out.is_eos;
                     retire.push(k);
@@ -383,6 +414,13 @@ impl BatchScheduler {
             }
             Self::admit(&mut active, &mut pending, self.batch_size);
         }
+
+        self.ran_away = streams
+            .iter()
+            .filter(|s| s.ran_away)
+            .map(|s| s.input_index)
+            .collect();
+        self.ran_away.sort_unstable();
 
         // Re-sort emitted tokens to input order.
         let mut out: Vec<(usize, Vec<u32>)> = streams
@@ -674,6 +712,57 @@ mod tests {
         assert_eq!(out[0].len(), 5, "unbounded stream capped at max_length");
         assert_eq!(out[0], vec![0, 1, 2, 3, 4]);
         assert_eq!(out[1], vec![0, 1]);
+    }
+
+    /// A [`BatchStep`] whose streams repeat `0..period` and never end: a
+    /// runaway, as far as the guard can tell.
+    struct PeriodicStep {
+        period: u32,
+    }
+
+    impl BatchStep for PeriodicStep {
+        fn step(&mut self, slots: &[StreamSlot<'_>]) -> FocrResult<Vec<StreamOut>> {
+            Ok(slots
+                .iter()
+                .map(|s| StreamOut {
+                    token: s.history.len() as u32 % self.period,
+                    is_eos: false,
+                    new_hidden: s.hidden.clone(),
+                })
+                .collect())
+        }
+    }
+
+    /// bd-iv8d: an armed stream stops at the token where the sequential
+    /// loop's guard, fed the same tokens one at a time, stops; an unarmed
+    /// stream runs to its cap; `ran_away` names only the armed one.
+    #[test]
+    fn an_armed_guard_retires_its_stream_where_the_sequential_guard_stops() {
+        let period = 7;
+        let max_length =
+            sampler::RUNAWAY_GUARD_MIN_TOKENS + 8 * sampler::RUNAWAY_GUARD_CHECK_INTERVAL;
+        let tokens: Vec<u32> = (0..max_length as u32).map(|i| i % period).collect();
+        let mut sequential = RunawayGuard::new(true);
+        let stop = (1..=tokens.len())
+            .find(|&n| sequential.stops_after_emit(&tokens[..n], false))
+            .expect("a period-7 stream is a runaway");
+        assert!(stop < max_length, "the guard fires before the cap");
+
+        let mut sched = BatchScheduler::new(4, max_length);
+        let streams = vec![
+            stream(0, 0),
+            stream(1, 0).with_runaway_guard(RunawayGuard::new(true)),
+        ];
+        let out = sched
+            .run(streams, &mut PeriodicStep { period })
+            .expect("run");
+        assert_eq!(out[0], tokens, "an unarmed stream runs to its cap");
+        assert_eq!(
+            out[1],
+            tokens[..stop].to_vec(),
+            "the armed stream stops with the guard"
+        );
+        assert_eq!(sched.ran_away(), &[1_usize][..]);
     }
 
     #[test]
