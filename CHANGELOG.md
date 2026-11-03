@@ -705,6 +705,14 @@ sections as they land.
 
 ### Fixed
 
+- **v1 `--multi-page` refuses a prompt over the position budget before any vision
+  forward** (bead bd-ixl3). It ran the vision tower over every page and only then found
+  that the prompt alone left no position to generate, so a document of more than about
+  295 pages (111 prompt positions each at the 640-pixel multi-page size) spent every
+  page's vision forward on an error it was always going to get.
+  The prompt's length depends only on the page layout, so the check now comes first, as
+  it already did for Unlimited-OCR-2. The error text is unchanged.
+
 - **`ocr-batch` under `FOCR_BATCH_SPINE=1` reports a runaway v1 page** (bead bd-iv8d).
   The spine branch never read a decode report, so a page the runaway guard stopped came
   back as a success: its text cut short, exit 0, no `finish_reason`. `FOCR_BATCH_SPINE=1`

@@ -5809,6 +5809,22 @@ impl OcrModel {
             let decoded = self.decode_document(&pres, Some(&mut closed))?;
             return Ok(DocumentPages::joined(frame.token_pages(&decoded)));
         }
+        // ── ONE cross-page prompt (all blocks at the single <image>) ─────────
+        // The layout alone fixes its length, so a prompt over the budget is
+        // refused before the first page's vision forward (bd-ixl3).
+        let (prompt_ids, images_seq_mask) = self.build_prompt_multi(&pres)?;
+        let max_positions = self.decode_params.max_positions;
+        if prompt_ids.len() + 1 > max_positions {
+            return Err(FocrError::Other(anyhow::anyhow!(
+                "document: the assembled {}-page prefix is {} tokens — over the \
+                 {max_positions} position budget by {} with no room to generate; {}",
+                pres.len(),
+                prompt_ids.len(),
+                (prompt_ids.len() + 1).saturating_sub(max_positions),
+                warning_recovery(WarningKind::PromptTooLong),
+            )));
+        }
+
         // ── vision tower per page, sequential (§6.5: one live forward) ──────
         let tv = Instant::now();
         let mut globals: Vec<Mat> = Vec::with_capacity(pres.len());
@@ -5828,19 +5844,7 @@ impl OcrModel {
             tv.elapsed().as_secs_f64()
         ));
 
-        // ── ONE cross-page prompt + embeds (all blocks at the single <image>) ─
-        let (prompt_ids, images_seq_mask) = self.build_prompt_multi(&pres)?;
-        let max_positions = self.decode_params.max_positions;
-        if prompt_ids.len() + 1 > max_positions {
-            return Err(FocrError::Other(anyhow::anyhow!(
-                "document: the assembled {}-page prefix is {} tokens — over the \
-                 {max_positions} position budget by {} with no room to generate; {}",
-                pres.len(),
-                prompt_ids.len(),
-                (prompt_ids.len() + 1).saturating_sub(max_positions),
-                warning_recovery(WarningKind::PromptTooLong),
-            )));
-        }
+        // ── the prompt's embeds, the page blocks fused in ─────────────────────
         let mut inputs_embeds = self.embed_prompt(&prompt_ids)?;
         let image_newline = Self::image_newline(&self.weights)?;
         let view_seperator = Self::view_seperator(&self.weights)?;

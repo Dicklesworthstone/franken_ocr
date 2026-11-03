@@ -1729,12 +1729,16 @@ fn v1_multi_page_clamp_reports_truncation_when_armed() {
     let Some((model, bin, pages)) = x2_inputs(TEST) else {
         return;
     };
-    // Probe the prompt length: a 1-position budget fails with it in the message.
+    // Probe the prompt length: a 1-position budget fails with it in the message,
+    // before any page's vision forward (bd-ixl3).
     let (probe, _) = batch_multi_page(
         &bin,
         &model,
         &pages,
-        &[("FOCR_TEST_MAX_POSITIONS", "1".into())],
+        &[
+            ("FOCR_TEST_MAX_POSITIONS", "1".into()),
+            ("FOCR_TIMING", "1".into()),
+        ],
     );
     let text = format!("{}{}", probe.stdout, probe.stderr);
     let prompt_len: usize = text
@@ -1743,6 +1747,11 @@ fn v1_multi_page_clamp_reports_truncation_when_armed() {
         .and_then(|rest| rest.split(' ').next())
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("no prompt length in the over-budget error: {text}"));
+    assert!(
+        !probe.stderr.contains("multi_page.vision"),
+        "an over-budget prompt must be refused before the vision tower: {}",
+        probe.stderr
+    );
     let budget = prompt_len + 48;
     let (out, value) = batch_multi_page(
         &bin,
