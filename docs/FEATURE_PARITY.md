@@ -271,7 +271,7 @@ Two enumerated populations: the **FeatureUniverse** (numbered modeling-feature /
 | `focr models` (zoo discovery: id, tasks, status) | §7.2 | MUST | present | SURF | bd-3jo6.1.13 | CLI shipped + goldens; A13 docs/runbook half still open; U2-E1 adds the `unlimited-ocr-2` row (status from `maturity()`, `recipe`, `installed`/LOCAL, guidance "best for documents and long documents") |
 | `focr robot schema` (self-describing contract) | §7.2 | MUST | present | SURF | bd-wp8.2 | versioned; frozen fixture |
 | `focr robot health` (model/arch/threads diagnostics) | §7.2 | MUST | present | SURF | bd-223.3 | incl `threads` budget field (bd-223.2) |
-| `focr robot backends` (effective dense route + hardware tiers + USL pool sizing) | §7.2 | MUST | present | SURF | bd-2mo.2 | separates effective ordinary-dense route from hardware IsaTier; goldens |
+| `focr robot backends` (effective dense route + hardware tiers; USL pool sizing in `adaptive::usl` is not wired yet) | §7.2 | MUST | present | SURF | bd-2mo.2 | separates effective ordinary-dense route from hardware IsaTier; goldens |
 | `focr robot selftest` (runtime int8 kernel parity on host silicon) | §7.2 | MUST | present | SURF | bd-223.13 | 24/24 on native Win10; AVX2 ceiling proven on 5995WX |
 | `focr robot triage` (one-round-trip agent mega-command) | §7.2 | SHOULD | present | SURF | bd-wp8.7 | quick_ref + health + state-aware recommendations + exit codes in ONE JSON; pinned by agent_ergonomics_regression |
 | `focr runs [--id\|--limit\|--format]` | §7.2 | SHOULD | present | SURF | bd-wp8.11 | frozen contract `runs_schema.json` + populated-store matrix through the real binary (json/ndjson/--id/--limit/plain); empty history = exit 0 |

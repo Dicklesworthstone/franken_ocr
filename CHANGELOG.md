@@ -28,6 +28,11 @@ sections as they land.
 
 ### Changed
 
+- **`--temperature` above 0 is refused before a model loads** (bead bd-d630). Every
+  model decodes greedily, and each sampler refused `temperature > 0` at its first step,
+  so the run loaded the weights and then exited 1. The request now fails with exit 2
+  and says why. `--temperature 0` is accepted as before.
+
 - **The runaway guard is on by default for a v1 page, and keeps the text it stops**
   (bead bd-gftg, DISC-023). A v1 page that never ends used to decode to the token limit
   (32,768) and return mostly repetition with exit 0. Now, past 8,192 tokens, the guard

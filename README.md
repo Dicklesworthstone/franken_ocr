@@ -592,7 +592,7 @@ A reading that does not pass that check says so with a `chart_unverified` warnin
 specialized task at the wrong model family fails with usage guidance before any weights
 load.
 
-Tuning flags: `--base-size` and `--image-size` (preprocessing resolution), `--crop-mode` (`gundam` or `base`), `--max-length` (decode token cap), `--temperature` (sampling), `--no-repeat-ngram` and `--ngram-window` (the sliding no-repeat n-gram decode guard).
+Tuning flags: `--base-size` and `--image-size` (preprocessing resolution), `--crop-mode` (`gundam` or `base`), `--max-length` (decode token cap), `--temperature` (only 0: every model decodes greedily, and anything else exits 2 before a model loads), `--no-repeat-ngram` and `--ngram-window` (the sliding no-repeat n-gram decode guard).
 
 ### `focr ocr-batch <images...>`
 

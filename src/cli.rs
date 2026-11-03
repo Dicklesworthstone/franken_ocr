@@ -361,8 +361,9 @@ pub struct OcrRequestArgs {
     /// unlimited-ocr).
     #[arg(long)]
     pub max_length: Option<i64>,
-    /// Decode temperature; 0.0 (the default) means greedy. (unlimited-ocr only
-    /// — got-ocr2 decodes greedy.)
+    /// Decode temperature. Only 0 (greedy, the default) is accepted: every
+    /// model here decodes greedily, and a run asking for sampling is refused
+    /// before a model loads.
     #[arg(long)]
     pub temperature: Option<f32>,
     /// No-repeat n-gram size (env override: FOCR_NO_REPEAT_NGRAM; 0 disables).
@@ -597,10 +598,7 @@ impl OcrRequestArgs {
                 .max_length
                 .map(|v| positive_u32("max-length", v))
                 .transpose()?,
-            temperature: self
-                .temperature
-                .map(|v| non_negative_finite_f32("temperature", v))
-                .transpose()?,
+            temperature: self.temperature.map(greedy_temperature).transpose()?,
             no_repeat_ngram: self
                 .no_repeat_ngram
                 .map(|v| non_negative_u32("no-repeat-ngram", v))
@@ -940,7 +938,7 @@ pub enum OcrTask {
     Geometry,
     /// Sheet music → `**kern` (got-ocr2; implies `--format`).
     Music,
-    /// Photo description / VQA — planned (smolvlm2); errors cleanly today.
+    /// Photo description / VQA (smolvlm2; `--question` asks about the image).
     Describe,
     /// Chart → structured python-dict data + number-head self-verify
     /// (onechart; needs `--model onechart.int8.focrq`). Distinct from
@@ -1041,7 +1039,8 @@ pub struct RunsArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct SyncArgs {
-    /// Emit machine-readable scaffold JSON before the Phase-0 NotImplemented.
+    /// Report the result as one JSON object on stdout (subcommand, store,
+    /// file, records).
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
@@ -4705,10 +4704,13 @@ fn non_negative_u32(name: &str, value: i64) -> FocrResult<u32> {
         .map_err(|_| FocrError::Usage(format!("{name} is too large for u32: {value}")))
 }
 
-fn non_negative_finite_f32(name: &str, value: f32) -> FocrResult<f32> {
-    if !value.is_finite() || value < 0.0 {
+/// `--temperature`: every decode here is greedy (each model's sampler refuses
+/// `temperature > 0`), so 0 is the one value a run can honor. Anything else
+/// is a usage error now, not a failure after the model has loaded.
+fn greedy_temperature(value: f32) -> FocrResult<f32> {
+    if value != 0.0 {
         return Err(FocrError::Usage(format!(
-            "{name} must be finite and >= 0, got {value}"
+            "temperature must be 0: every model here decodes greedily, got {value}"
         )));
     }
     Ok(value)
@@ -5940,7 +5942,7 @@ mod tests {
             "--max-length",
             "700",
             "--temperature",
-            "0.5",
+            "0",
             "--no-repeat-ngram",
             "20",
             "--ngram-window",
@@ -5954,7 +5956,7 @@ mod tests {
         };
         let o = decode_overrides_from(&args.to_request().expect("request builds"));
         assert_eq!(o.max_length, Some(700));
-        assert_eq!(o.temperature, Some(0.5));
+        assert_eq!(o.temperature, Some(0.0));
         assert_eq!(o.no_repeat_ngram, Some(20));
         assert_eq!(o.ngram_window, Some(1024));
         assert_eq!(o.max_page_tokens, Some(0));
@@ -5983,6 +5985,26 @@ mod tests {
         assert_eq!(o.no_repeat_ngram, Some(35));
         assert_eq!(o.ngram_window, Some(128));
         assert_eq!(o.temperature, Some(0.0));
+    }
+
+    /// bd-d630: every sampler refuses `temperature > 0`, so the request does
+    /// too, before any model loads, instead of exiting 1 after the load.
+    #[test]
+    fn a_nonzero_temperature_is_refused_before_a_model_loads() {
+        for value in ["0.5", "1", "inf", "NaN"] {
+            let cli = Cli::try_parse_from(["focr", "ocr", "scan.png", "--temperature", value])
+                .expect("the flag parses as a number");
+            let Command::Ocr(args) = cli.command else {
+                unreachable!("expected ocr command");
+            };
+            assert!(
+                matches!(
+                    args.to_request(),
+                    Err(FocrError::Usage(message)) if message.contains("decodes greedily")
+                ),
+                "--temperature {value}"
+            );
+        }
     }
 
     #[test]

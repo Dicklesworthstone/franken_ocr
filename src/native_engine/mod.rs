@@ -2223,7 +2223,7 @@ enum ModelQuantPreference {
 
 impl ModelQuantPreference {
     /// Distributed quant variants, in resolver-preference order when no explicit
-    /// `FOCR_MODEL_QUANT` is set: int8 is the default `focr pull` installs;
+    /// `FOCR_QUANT` is set: int8 is the default `focr pull` installs;
     /// int4 is the smaller refinement variant.
     const ALL: [ModelQuantPreference; 2] = [Self::Int8, Self::Int4];
 
@@ -2968,7 +2968,7 @@ fn short_model_candidates(
     };
 
     if is_focrq_or_bare {
-        // 1. An explicit `FOCR_MODEL_QUANT` preference wins.
+        // 1. An explicit `FOCR_QUANT` preference wins.
         if let Some(quant) = quant {
             push_unique_path(&mut candidates, versioned_quant_path(&direct, quant));
             push_unique_path(
