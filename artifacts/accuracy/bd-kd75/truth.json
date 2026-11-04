@@ -1,0 +1,338 @@
+{
+  "charts": {
+    "chart00": {
+      "title": "Widget output",
+      "values": {
+        "A": "5",
+        "B": "4",
+        "C": "12",
+        "D": "7"
+      }
+    },
+    "chart01": {
+      "title": "Quarterly sales",
+      "values": {
+        "A": "2",
+        "B": "9",
+        "C": "1",
+        "D": "4"
+      }
+    },
+    "chart02": {
+      "title": "Plant yield",
+      "values": {
+        "A": "4",
+        "B": "8",
+        "C": "4",
+        "D": "11"
+      }
+    },
+    "chart03": {
+      "title": "Site visits",
+      "values": {
+        "A": "3",
+        "B": "2",
+        "C": "10",
+        "D": "10"
+      }
+    },
+    "chart04": {
+      "title": "Error counts",
+      "values": {
+        "A": "1",
+        "B": "5",
+        "C": "4",
+        "D": "2"
+      }
+    },
+    "chart05": {
+      "title": "Team budget",
+      "values": {
+        "A": "4",
+        "B": "10",
+        "C": "8",
+        "D": "3"
+      }
+    },
+    "chart06": {
+      "title": "Widget output",
+      "values": {
+        "A": "7",
+        "B": "11",
+        "C": "6",
+        "D": "10"
+      }
+    },
+    "chart07": {
+      "title": "Quarterly sales",
+      "values": {
+        "A": "4",
+        "B": "2",
+        "C": "1",
+        "D": "7"
+      }
+    },
+    "chart08": {
+      "title": "Plant yield",
+      "values": {
+        "A": "3",
+        "B": "11",
+        "C": "7",
+        "D": "8"
+      }
+    },
+    "chart09": {
+      "title": "Site visits",
+      "values": {
+        "A": "9",
+        "B": "6",
+        "C": "8",
+        "D": "6"
+      }
+    },
+    "chart10": {
+      "title": "Error counts",
+      "values": {
+        "A": "7",
+        "B": "6",
+        "C": "11",
+        "D": "7"
+      }
+    },
+    "chart11": {
+      "title": "Team budget",
+      "values": {
+        "A": "6",
+        "B": "2",
+        "C": "9",
+        "D": "11"
+      }
+    },
+    "wide00": {
+      "title": "Widget output",
+      "values": {
+        "A": "12",
+        "B": "2",
+        "C": "2",
+        "D": "7"
+      }
+    },
+    "wide01": {
+      "title": "Quarterly sales",
+      "values": {
+        "A": "1",
+        "B": "12",
+        "C": "1",
+        "D": "1"
+      }
+    },
+    "wide02": {
+      "title": "Plant yield",
+      "values": {
+        "A": "11",
+        "B": "4",
+        "C": "5",
+        "D": "6"
+      }
+    },
+    "wide03": {
+      "title": "Site visits",
+      "values": {
+        "A": "3",
+        "B": "3",
+        "C": "8",
+        "D": "9"
+      }
+    },
+    "wide04": {
+      "title": "Error counts",
+      "values": {
+        "A": "8",
+        "B": "2",
+        "C": "3",
+        "D": "10"
+      }
+    },
+    "wide05": {
+      "title": "Team budget",
+      "values": {
+        "A": "1",
+        "B": "6",
+        "C": "1",
+        "D": "8"
+      }
+    },
+    "wide06": {
+      "title": "Widget output",
+      "values": {
+        "A": "7",
+        "B": "2",
+        "C": "8",
+        "D": "1"
+      }
+    },
+    "wide07": {
+      "title": "Quarterly sales",
+      "values": {
+        "A": "3",
+        "B": "11",
+        "C": "2",
+        "D": "11"
+      }
+    },
+    "wide08": {
+      "title": "Plant yield",
+      "values": {
+        "A": "6",
+        "B": "4",
+        "C": "3",
+        "D": "5"
+      }
+    },
+    "wide09": {
+      "title": "Site visits",
+      "values": {
+        "A": "6",
+        "B": "1",
+        "C": "3",
+        "D": "4"
+      }
+    },
+    "wide10": {
+      "title": "Error counts",
+      "values": {
+        "A": "7",
+        "B": "5",
+        "C": "6",
+        "D": "4"
+      }
+    },
+    "wide11": {
+      "title": "Team budget",
+      "values": {
+        "A": "8",
+        "B": "7",
+        "C": "9",
+        "D": "1"
+      }
+    },
+    "tall00": {
+      "title": "Widget output",
+      "values": {
+        "A": "10",
+        "B": "2",
+        "C": "7",
+        "D": "11"
+      }
+    },
+    "tall01": {
+      "title": "Quarterly sales",
+      "values": {
+        "A": "11",
+        "B": "3",
+        "C": "2",
+        "D": "7"
+      }
+    },
+    "tall02": {
+      "title": "Plant yield",
+      "values": {
+        "A": "1",
+        "B": "11",
+        "C": "4",
+        "D": "7"
+      }
+    },
+    "tall03": {
+      "title": "Site visits",
+      "values": {
+        "A": "9",
+        "B": "10",
+        "C": "8",
+        "D": "4"
+      }
+    },
+    "tall04": {
+      "title": "Error counts",
+      "values": {
+        "A": "10",
+        "B": "3",
+        "C": "12",
+        "D": "9"
+      }
+    },
+    "tall05": {
+      "title": "Team budget",
+      "values": {
+        "A": "7",
+        "B": "10",
+        "C": "8",
+        "D": "10"
+      }
+    },
+    "tall06": {
+      "title": "Widget output",
+      "values": {
+        "A": "6",
+        "B": "4",
+        "C": "9",
+        "D": "11"
+      }
+    },
+    "tall07": {
+      "title": "Quarterly sales",
+      "values": {
+        "A": "9",
+        "B": "1",
+        "C": "11",
+        "D": "2"
+      }
+    },
+    "tall08": {
+      "title": "Plant yield",
+      "values": {
+        "A": "2",
+        "B": "11",
+        "C": "2",
+        "D": "9"
+      }
+    },
+    "tall09": {
+      "title": "Site visits",
+      "values": {
+        "A": "11",
+        "B": "9",
+        "C": "1",
+        "D": "1"
+      }
+    },
+    "tall10": {
+      "title": "Error counts",
+      "values": {
+        "A": "8",
+        "B": "6",
+        "C": "10",
+        "D": "9"
+      }
+    },
+    "tall11": {
+      "title": "Team budget",
+      "values": {
+        "A": "2",
+        "B": "7",
+        "C": "11",
+        "D": "12"
+      }
+    }
+  },
+  "formulas": {
+    "formula_energy_sans": "E = mc^2 + \\frac{1}{2}\\int_0^1 x^2 \\, dx",
+    "formula_pythagoras_sans": "a^2 + b^2 = c^2",
+    "formula_sum_sans": "\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}",
+    "formula_derivative_sans": "\\frac{d}{dx} \\sin x = \\cos x",
+    "formula_energy_cm": "E = mc^2 + \\frac{1}{2}\\int_0^1 x^2 \\, dx",
+    "formula_pythagoras_cm": "a^2 + b^2 = c^2",
+    "formula_sum_cm": "\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}",
+    "formula_derivative_cm": "\\frac{d}{dx} \\sin x = \\cos x"
+  }
+}

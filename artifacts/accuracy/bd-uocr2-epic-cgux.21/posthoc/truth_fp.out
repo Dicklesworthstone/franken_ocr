@@ -1,0 +1,24 @@
+
+omni: 1651 streams
+  v1: streams reaching 2,048/2,560/8,192 tokens: 167/119/5
+    raw    fires (floor 2,048/2,560/8,192): 0/0/0
+    masked fires (floor 2,048/2,560/8,192): 0/0/0
+  v2: streams reaching 2,048/2,560/8,192 tokens: 167/119/5
+    raw    fires (floor 2,048/2,560/8,192): 0/0/0
+    masked fires (floor 2,048/2,560/8,192): 0/0/0
+
+mpage: 18118 streams
+  v1: streams reaching 2,048/2,560/8,192 tokens: 606/336/29
+    raw    fires (floor 2,048/2,560/8,192): 22/22/9  e.g. ['mp3lan_0881.pdf#p133', 'mp3lan_0821.pdf#p43', 'mp3lan_0821.pdf#p87', 'mp3lan_0821.pdf#p115']
+    masked fires (floor 2,048/2,560/8,192): 56/56/13  e.g. ['mp3lan_0867.pdf#p132', 'mp3lan_0867.pdf#p135', 'mp3lan_0881.pdf#p93', 'mp3lan_0881.pdf#p94']
+  v2: streams reaching 2,048/2,560/8,192 tokens: 606/336/29
+    raw    fires (floor 2,048/2,560/8,192): 22/22/9  e.g. ['mp3lan_0881.pdf#p133', 'mp3lan_0821.pdf#p43', 'mp3lan_0821.pdf#p87', 'mp3lan_0821.pdf#p115']
+    masked fires (floor 2,048/2,560/8,192): 56/56/13  e.g. ['mp3lan_0867.pdf#p132', 'mp3lan_0867.pdf#p135', 'mp3lan_0881.pdf#p93', 'mp3lan_0881.pdf#p94']
+
+mdoc: 100 streams
+  v1: streams reaching 2,048/2,560/8,192 tokens: 100/100/100
+    raw    fires (floor 2,048/2,560/8,192): 9/9/9  e.g. ['mp3lan_0881.pdf', 'mp3lan_0821.pdf', 'mp3lan_0943.pdf', 'mp3lan_0792.pdf']
+    masked fires (floor 2,048/2,560/8,192): 18/18/18  e.g. ['mp3lan_0867.pdf', 'mp3lan_0638.pdf', 'mp3lan_0881.pdf', 'mp3lan_0821.pdf']
+  v2: streams reaching 2,048/2,560/8,192 tokens: 100/100/100
+    raw    fires (floor 2,048/2,560/8,192): 9/9/9  e.g. ['mp3lan_0881.pdf', 'mp3lan_0821.pdf', 'mp3lan_0943.pdf', 'mp3lan_0792.pdf']
+    masked fires (floor 2,048/2,560/8,192): 18/18/18  e.g. ['mp3lan_0867.pdf', 'mp3lan_0638.pdf', 'mp3lan_0881.pdf', 'mp3lan_0821.pdf']

@@ -1,0 +1,4317 @@
+{
+ "schema_version": 1,
+ "bead": "bd-uocr2-epic-cgux.21",
+ "seeds": {
+  "omni": 20261030,
+  "marathon": 20261031,
+  "nonbaidu": 20261101
+ },
+ "sources": {
+  "omnidocbench": {
+   "repo": "opendatalab/OmniDocBench",
+   "revision": "aa1ee96d106dbe53d0ae59474d75c6e6d9b53fec",
+   "ground_truth": "OmniDocBench.json",
+   "ground_truth_sha256": "a45cd84b04ad8b793e775089640e6b681209abea33ead54c1828ddca35fae496",
+   "pages": 1651,
+   "frame_pages": 1525,
+   "licence": "research use only, non-commercial; local evaluation, nothing redistributed"
+  },
+  "marathondocbench": {
+   "repo": "baidu/MarathonDocBench",
+   "revision": "fa05fccbe82ee6ec628006a1d58bb153954c3ee3",
+   "ground_truth": "MarathonDocBench.json",
+   "ground_truth_sha256": "7db0e659c76661ce87d4e1b3d47e010edbd48adfb446e3e2ee37260c60adf51c",
+   "documents": 100,
+   "licence": "Apache-2.0",
+   "builder": "Baidu"
+  },
+  "nonbaidu": {
+   "ground_truth": "PDF text layer (pdftotext -enc UTF-8), born-digital",
+   "raster": "pdftoppm -r 150 -png"
+  }
+ },
+ "single_pages": [
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_1825",
+   "image_path": "yanbaopptmerge_yanbaoPPT_1825.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_The Right Moves_page_016",
+   "image_path": "PPT_The Right Moves_page_016.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_2825",
+   "image_path": "yanbaopptmerge_yanbaoPPT_2825.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_lay_linalg5_01_05_page_008",
+   "image_path": "PPT_lay_linalg5_01_05_page_008.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_870",
+   "image_path": "yanbaopptmerge_yanbaoPPT_870.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-b1b8cc79-a7b3-4ac5-a7c2-49416b195ccb",
+   "image_path": "page-b1b8cc79-a7b3-4ac5-a7c2-49416b195ccb.png",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "with_watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_1637904769_page_002",
+   "image_path": "PPT_1637904769_page_002.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_520",
+   "image_path": "yanbaopptmerge_yanbaoPPT_520.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_5940",
+   "image_path": "yanbaopptmerge_yanbaoPPT_5940.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_1685",
+   "image_path": "yanbaopptmerge_yanbaoPPT_1685.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_3395",
+   "image_path": "yanbaopptmerge_yanbaoPPT_3395.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_770",
+   "image_path": "yanbaopptmerge_yanbaoPPT_770.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_ch7_page_035",
+   "image_path": "PPT_ch7_page_035.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_4245",
+   "image_path": "yanbaopptmerge_yanbaoPPT_4245.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_ch7_page_090",
+   "image_path": "PPT_ch7_page_090.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 3
+  },
+  {
+   "id": "omni-PPT_EnglishtoAmericanTransition_page_009",
+   "image_path": "PPT_EnglishtoAmericanTransition_page_009.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_lay_linalg5_01_05_page_009",
+   "image_path": "PPT_lay_linalg5_01_05_page_009.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-PPT_english-guidelines-for-humanities-students.zp199743_page_002",
+   "image_path": "PPT_english-guidelines-for-humanities-students.zp199743_page_002.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_7f386f737cb55cffa10c8321a94bd38d7169cd69b3b253b9e2e502c12a68feea.pdf_15",
+   "image_path": "yanbaor2_7f386f737cb55cffa10c8321a94bd38d7169cd69b3b253b9e2e502c12a68feea.pdf_15.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_Keuk Chan Narith_page_009",
+   "image_path": "PPT_Keuk Chan Narith_page_009.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_4460",
+   "image_path": "yanbaopptmerge_yanbaoPPT_4460.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_Keuk Chan Narith_page_019",
+   "image_path": "PPT_Keuk Chan Narith_page_019.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_LEP power point presentation-English-FINAL-10-31-07_page_010",
+   "image_path": "PPT_LEP power point presentation-English-FINAL-10-31-07_page_010.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "watermark"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_BaharMartonosi_page_006",
+   "image_path": "PPT_BaharMartonosi_page_006.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_13 fallacies LALT2012_page_009",
+   "image_path": "PPT_13 fallacies LALT2012_page_009.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_ch7_page_142",
+   "image_path": "PPT_ch7_page_142.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_805",
+   "image_path": "yanbaopptmerge_yanbaoPPT_805.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_4615",
+   "image_path": "yanbaopptmerge_yanbaoPPT_4615.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_lecture1_page_009",
+   "image_path": "PPT_lecture1_page_009.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 4
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_5245",
+   "image_path": "yanbaopptmerge_yanbaoPPT_5245.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_SE17.pdf_10",
+   "image_path": "yanbaopptmerge_SE17.pdf_10.jpg",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_1820",
+   "image_path": "yanbaopptmerge_yanbaoPPT_1820.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-ba4443e6-f432-435f-89e7-ddf0a571d2cd",
+   "image_path": "page-ba4443e6-f432-435f-89e7-ddf0a571d2cd.png",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 3
+  },
+  {
+   "id": "omni-PPT_lay_linalg5_01_05_page_003",
+   "image_path": "PPT_lay_linalg5_01_05_page_003.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-PPT_BaharMartonosi_page_008",
+   "image_path": "PPT_BaharMartonosi_page_008.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_8076_MEYER_Chapter_2_-_Language_Change_page_017",
+   "image_path": "PPT_8076_MEYER_Chapter_2_-_Language_Change_page_017.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_1235",
+   "image_path": "yanbaopptmerge_yanbaoPPT_1235.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_840",
+   "image_path": "yanbaopptmerge_yanbaoPPT_840.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-48687e49-b9db-4251-96cf-124144aa4d08",
+   "image_path": "page-48687e49-b9db-4251-96cf-124144aa4d08.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_145",
+   "image_path": "yanbaopptmerge_yanbaoPPT_145.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_PresentationSpecification_page_010",
+   "image_path": "PPT_PresentationSpecification_page_010.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_4095",
+   "image_path": "yanbaopptmerge_yanbaoPPT_4095.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_all655920_page_003",
+   "image_path": "PPT_all655920_page_003.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_english-studies-s6-on-the-road-resource-3_page_003",
+   "image_path": "PPT_english-studies-s6-on-the-road-resource-3_page_003.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_4660",
+   "image_path": "yanbaopptmerge_yanbaoPPT_4660.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_d09a006aa02ddc09299bbb9a1b5efa0d77408191f0c1ff1fca8c80bd6150f806.pdf_17",
+   "image_path": "eastmoney_d09a006aa02ddc09299bbb9a1b5efa0d77408191f0c1ff1fca8c80bd6150f806.pdf_17.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "colorful_backgroud",
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_2545",
+   "image_path": "yanbaopptmerge_yanbaoPPT_2545.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_4020",
+   "image_path": "yanbaopptmerge_yanbaoPPT_4020.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_yanbaoPPT_4330",
+   "image_path": "yanbaopptmerge_yanbaoPPT_4330.jpg",
+   "data_source": "PPT2PDF",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-PPT_LEP power point presentation-English-FINAL-10-31-07_page_006",
+   "image_path": "PPT_LEP power point presentation-English-FINAL-10-31-07_page_006.png",
+   "data_source": "PPT2PDF",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-e721a819-6dbf-453a-a7ad-857c24f9aa3e",
+   "image_path": "page-e721a819-6dbf-453a-a7ad-857c24f9aa3e.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 10
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.ergon.2003.12.002.pdf_5",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.ergon.2003.12.002.pdf_5.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-ana.20363.pdf_5",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-ana.20363.pdf_5.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-5cb4b2fe-c14d-450e-9b97-4b6e7c99493b",
+   "image_path": "page-5cb4b2fe-c14d-450e-9b97-4b6e7c99493b.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-dneu.20401.pdf_2",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-dneu.20401.pdf_2.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.chroma.2005.11.024.pdf_7",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.chroma.2005.11.024.pdf_7.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-scihub_j.conbuildmat.2019.117698.pdf_5",
+   "image_path": "scihub_j.conbuildmat.2019.117698.pdf_5.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-s00128-009-9752-2.pdf_5",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-s00128-009-9752-2.pdf_5.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-7050793e-109f-4066-be91-107f94b617b9",
+   "image_path": "page-7050793e-109f-4066-be91-107f94b617b9.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 13
+  },
+  {
+   "id": "omni-page-c1c135ad-427e-482b-b01c-05c0ccbc6e76",
+   "image_path": "page-c1c135ad-427e-482b-b01c-05c0ccbc6e76.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 5
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.jcp.2010.12.006.pdf_14",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.jcp.2010.12.006.pdf_14.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 4
+  },
+  {
+   "id": "omni-scihub_s00381-021-05138-3.pdf_3",
+   "image_path": "scihub_s00381-021-05138-3.pdf_3.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "table_span",
+    "table_veritical",
+    "table_fewer_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.1365-2818.2003.01210.x.pdf_7",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.1365-2818.2003.01210.x.pdf_7.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-c6168ed8-ca6a-4ddd-8bfc-92dec77f1870",
+   "image_path": "page-c6168ed8-ca6a-4ddd-8bfc-92dec77f1870.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 15
+  },
+  {
+   "id": "omni-scihub_ijcac.2012040101.pdf_5",
+   "image_path": "scihub_ijcac.2012040101.pdf_5.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-hup.777.pdf_7",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-hup.777.pdf_7.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-hyp.1092.pdf_1",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-hyp.1092.pdf_1.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-7a7566fd-43d8-46e4-8a4f-0330e1f27a88",
+   "image_path": "page-7a7566fd-43d8-46e4-8a4f-0330e1f27a88.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 14
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.snb.2004.06.022.pdf_2",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.snb.2004.06.022.pdf_2.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-scihub_s00784-003-0233-4.pdf_1",
+   "image_path": "scihub_s00784-003-0233-4.pdf_1.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_fewer_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-8524b54d-6372-4f9e-a662-5254349cfda3",
+   "image_path": "page-8524b54d-6372-4f9e-a662-5254349cfda3.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 18
+  },
+  {
+   "id": "omni-page-268266af-56c0-4b3b-9d07-73c6e50feb58",
+   "image_path": "page-268266af-56c0-4b3b-9d07-73c6e50feb58.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 9
+  },
+  {
+   "id": "omni-page-83a675ab-0021-4979-8293-8af0d36146a0",
+   "image_path": "page-83a675ab-0021-4979-8293-8af0d36146a0.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 4
+  },
+  {
+   "id": "omni-page-cc37a835-903b-4079-88fc-ae04625c9b5d",
+   "image_path": "page-cc37a835-903b-4079-88fc-ae04625c9b5d.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 17
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-chem.200701412.pdf_10",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-chem.200701412.pdf_10.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.apcata.2004.01.008.pdf_6",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.apcata.2004.01.008.pdf_6.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.physletb.2004.11.060.pdf_2",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.physletb.2004.11.060.pdf_2.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 7
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-hup.908.pdf_5",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-hup.908.pdf_5.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-scihub_jgh.13044.pdf_2",
+   "image_path": "scihub_jgh.13044.pdf_2.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_fewer_line",
+    "table_with_formula"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-38fc7c6b-80ed-46be-bb53-29986a63ad3e",
+   "image_path": "page-38fc7c6b-80ed-46be-bb53-29986a63ad3e.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-fb79f57d-9d7e-4129-a08c-6fc189e84a21",
+   "image_path": "page-fb79f57d-9d7e-4129-a08c-6fc189e84a21.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 15
+  },
+  {
+   "id": "omni-page-1ce383cc-63a3-43c9-b6f2-7498a952b65c",
+   "image_path": "page-1ce383cc-63a3-43c9-b6f2-7498a952b65c.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 11
+  },
+  {
+   "id": "omni-scihub_j.physe.2007.10.027.pdf_0",
+   "image_path": "scihub_j.physe.2007.10.027.pdf_0.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-f222e5f3-8628-47cd-a0b6-40f62123228f",
+   "image_path": "page-f222e5f3-8628-47cd-a0b6-40f62123228f.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-ijc.22820.pdf_4",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-ijc.22820.pdf_4.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.jcrimjus.2010.04.003.pdf_8",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.jcrimjus.2010.04.003.pdf_8.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-404e0471-bd71-426a-8e5a-81b8327f88e5",
+   "image_path": "page-404e0471-bd71-426a-8e5a-81b8327f88e5.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 19
+  },
+  {
+   "id": "omni-page-dc728bd5-50a9-41e8-9e5a-d4b01e6664a2",
+   "image_path": "page-dc728bd5-50a9-41e8-9e5a-d4b01e6664a2.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 12
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-s00128-009-9772-y.pdf_1",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-s00128-009-9772-y.pdf_1.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-j.msec.2005.01.019.pdf_4",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-j.msec.2005.01.019.pdf_4.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-s003950050126.pdf_6",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-s003950050126.pdf_6.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-hyp.1040.pdf_9",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-hyp.1040.pdf_9.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-scihub-o.O-s00128-010-0006-0.pdf_5",
+   "image_path": "docstructbench_llm-raw-scihub-o.O-s00128-010-0006-0.pdf_5.jpg",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal",
+    "table_with_formula"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-cdb92c2f-f43f-45ef-ace7-91d4664a7834",
+   "image_path": "page-cdb92c2f-f43f-45ef-ace7-91d4664a7834.png",
+   "data_source": "academic_literature",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 27
+  },
+  {
+   "id": "omni-page-205e4273-5b94-43e5-bfaf-dc882416b067",
+   "image_path": "page-205e4273-5b94-43e5-bfaf-dc882416b067.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "with_watermark",
+    "transparent_pages"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-34e4675f-4b7f-4bc3-8624-c399423d2c66",
+   "image_path": "page-34e4675f-4b7f-4bc3-8624-c399423d2c66.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud",
+    "text_embedded_in_image"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-63711094.pdf_56",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-63711094.pdf_56.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_omission_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_en_国外数学教材-数论-Melvyn B. Nathanson—Elementary Methods in Number Theory_0035",
+   "image_path": "book_en_国外数学教材-数论-Melvyn B. Nathanson—Elementary Methods in Number Theory_0035.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 4
+  },
+  {
+   "id": "omni-page-29ccb4ce-9266-4938-8f2d-b2b69ceb43cd",
+   "image_path": "page-29ccb4ce-9266-4938-8f2d-b2b69ceb43cd.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 9
+  },
+  {
+   "id": "omni-page-a976a26e-4dbb-492a-a380-b923b87ed496",
+   "image_path": "page-a976a26e-4dbb-492a-a380-b923b87ed496.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 4
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-61510621.pdf_161",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-61510621.pdf_161.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_en_搬书匠-3282-Python Web Scraping 2nd Edition-2017-英文版_page_195",
+   "image_path": "book_en_搬书匠-3282-Python Web Scraping 2nd Edition-2017-英文版_page_195.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_en_国外数学教材-数论-Melvyn B. Nathanson—Elementary Methods in Number Theory_0007",
+   "image_path": "book_en_国外数学教材-数论-Melvyn B. Nathanson—Elementary Methods in Number Theory_0007.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-page-b2cc5729-a6b2-49ba-af62-788bf069b617",
+   "image_path": "page-b2cc5729-a6b2-49ba-af62-788bf069b617.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 16
+  },
+  {
+   "id": "omni-page-062fc21c-6b9c-40be-8d0e-7a617509a9bc",
+   "image_path": "page-062fc21c-6b9c-40be-8d0e-7a617509a9bc.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_socialsci-74973.pdf_31",
+   "image_path": "jiaocaineedrop_socialsci-74973.pdf_31.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "table_horizontal",
+    "table_fewer_line"
+   ],
+   "tables": 3,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_en_国外数学教材-非数学专业教材-线性代数-Gilbert Strang—Linear Algebra and Its Applications 4e_0451",
+   "image_path": "book_en_国外数学教材-非数学专业教材-线性代数-Gilbert Strang—Linear Algebra and Its Applications 4e_0451.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 3
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-61523162.pdf_276",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-61523162.pdf_276.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-f6ad0f1c-acb7-43c0-b08d-5606ca82fc1b",
+   "image_path": "page-f6ad0f1c-acb7-43c0-b08d-5606ca82fc1b.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 14
+  },
+  {
+   "id": "omni-book_en_6.Complex.Analysis.-.Elias.M..Stein_page_051",
+   "image_path": "book_en_6.Complex.Analysis.-.Elias.M..Stein_page_051.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-book_en_[搬书匠#893][Pyomo—Optimization Modeling in Python].2012.英文版_page_016",
+   "image_path": "book_en_[搬书匠#893][Pyomo—Optimization Modeling in Python].2012.英文版_page_016.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-63688043.pdf_110",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-63688043.pdf_110.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_3aa9b6677e17fd012b0a7a230b9f18db.pdf_1327",
+   "image_path": "yanbaopptmerge_3aa9b6677e17fd012b0a7a230b9f18db.pdf_1327.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_with_formula"
+   ],
+   "tables": 1,
+   "formulas": 6
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-61518266.pdf_149",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-61518266.pdf_149.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-a32698bb-e3ae-49bc-b3af-203fb77b2bdf",
+   "image_path": "page-a32698bb-e3ae-49bc-b3af-203fb77b2bdf.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 14
+  },
+  {
+   "id": "omni-yanbaopptmerge_293df2702e017fa1e78f6fe9b42d64ce.pdf_928",
+   "image_path": "yanbaopptmerge_293df2702e017fa1e78f6fe9b42d64ce.pdf_928.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-63677793.pdf_332",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-63677793.pdf_332.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-ae356bde-652d-44a9-9e21-76cadf5a9dea",
+   "image_path": "page-ae356bde-652d-44a9-9e21-76cadf5a9dea.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 14
+  },
+  {
+   "id": "omni-page-ddb9d794-5230-4b43-b1ec-273b9e7ebc11",
+   "image_path": "page-ddb9d794-5230-4b43-b1ec-273b9e7ebc11.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_enbook-zlib-o.O-19221575.pdf_1173",
+   "image_path": "docstructbench_enbook-zlib-o.O-19221575.pdf_1173.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_5544",
+   "image_path": "yanbaor2_yanbaoPPT_5544.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_0ef01b835238626f3589faa671abdfb832f2b98987eadad53cb2e35699dcc039.pdf_13",
+   "image_path": "yanbaor2_0ef01b835238626f3589faa671abdfb832f2b98987eadad53cb2e35699dcc039.pdf_13.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "three_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_22297b092df74748ad1cd50ad9045024d5bac9f423854a04cc8dbfb428c4deb7.pdf_5",
+   "image_path": "yanbaor2_22297b092df74748ad1cd50ad9045024d5bac9f423854a04cc8dbfb428c4deb7.pdf_5.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_b5cf8249bdf8eebf7625f4b0e39ad38d684d7797ac7bf1617452cd0565ca28a2.pdf_29",
+   "image_path": "yanbaor2_b5cf8249bdf8eebf7625f4b0e39ad38d684d7797ac7bf1617452cd0565ca28a2.pdf_29.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-ccd77e4e-4f94-45df-8e3d-e054a951f65f",
+   "image_path": "page-ccd77e4e-4f94-45df-8e3d-e054a951f65f.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 11
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-61521600.pdf_210",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-61521600.pdf_210.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_en_国外数学教材-非数学专业教材-线性代数-Gilbert Strang—Linear Algebra and Its Applications 4e_0092",
+   "image_path": "book_en_国外数学教材-非数学专业教材-线性代数-Gilbert Strang—Linear Algebra and Its Applications 4e_0092.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_469",
+   "image_path": "yanbaor2_yanbaoPPT_469.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_zh_CNASGL0092018_extracted_page_69",
+   "image_path": "book_zh_CNASGL0092018_extracted_page_69.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 10
+  },
+  {
+   "id": "omni-yanbaor2_ey-global-fintech-adoption-index.pdf_30",
+   "image_path": "yanbaor2_ey-global-fintech-adoption-index.pdf_30.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-617783f8-bbd6-4faf-bca6-a05222c29314",
+   "image_path": "page-617783f8-bbd6-4faf-bca6-a05222c29314.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 20
+  },
+  {
+   "id": "omni-book_en_搬书匠-3473-Reactive Programming with RxJS-2015-英文版_page_021",
+   "image_path": "book_en_搬书匠-3473-Reactive Programming with RxJS-2015-英文版_page_021.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-7dfc88d8-6d95-446c-b910-2410e8552f76",
+   "image_path": "page-7dfc88d8-6d95-446c-b910-2410e8552f76.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 1
+  },
+  {
+   "id": "omni-book_en_国外数学教材-An Excursion through Elementary Mathematics（初等数学漫游）-An excursion through elementary mathematics, Vol.3 (Caminha Muniz Neto A)_0242",
+   "image_path": "book_en_国外数学教材-An Excursion through Elementary Mathematics（初等数学漫游）-An excursion through elementary mathematics, Vol.3 (Caminha Muniz Neto A)_0242.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 6
+  },
+  {
+   "id": "omni-book_zh_CNASGL0092018_extracted_page_70",
+   "image_path": "book_zh_CNASGL0092018_extracted_page_70.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 7
+  },
+  {
+   "id": "omni-book_en_国外数学教材-数论-Melvyn B. Nathanson—Elementary Methods in Number Theory_0017",
+   "image_path": "book_en_国外数学教材-数论-Melvyn B. Nathanson—Elementary Methods in Number Theory_0017.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 4
+  },
+  {
+   "id": "omni-yanbaor2_ey-drug-device-combination-products-whitepaper.pdf_6",
+   "image_path": "yanbaor2_ey-drug-device-combination-products-whitepaper.pdf_6.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-b2349b51-01db-4dc1-9e4a-58e52f5e4362",
+   "image_path": "page-b2349b51-01db-4dc1-9e4a-58e52f5e4362.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 7
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-61520612.pdf_140",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-61520612.pdf_140.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_omission_line",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_enbook-zlib-o.O-17208435.pdf_105",
+   "image_path": "docstructbench_enbook-zlib-o.O-17208435.pdf_105.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-49776237-a9be-441d-a326-002eb7084385",
+   "image_path": "page-49776237-a9be-441d-a326-002eb7084385.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 5
+  },
+  {
+   "id": "omni-page-c018d221-68b3-4a14-84cd-c9abde2db3a4",
+   "image_path": "page-c018d221-68b3-4a14-84cd-c9abde2db3a4.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "fuzzy_content",
+    "geometric_deformation"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_en_搬书匠-3299-Swift Data Structure and Algorithms-2016-英文版_page_111",
+   "image_path": "book_en_搬书匠-3299-Swift Data Structure and Algorithms-2016-英文版_page_111.png",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_e60b3b61281e87ddf42f9321a9e6ef9d.pdf_159",
+   "image_path": "yanbaopptmerge_e60b3b61281e87ddf42f9321a9e6ef9d.pdf_159.jpg",
+   "data_source": "book",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-63678132.pdf_161",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-63678132.pdf_161.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-book_zh_GBT 50744-2011_extracted_page_67",
+   "image_path": "book_zh_GBT 50744-2011_extracted_page_67.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 3
+  },
+  {
+   "id": "omni-page-0c1be55c-0b1b-4d62-b17d-ed752f9af9f2",
+   "image_path": "page-0c1be55c-0b1b-4d62-b17d-ed752f9af9f2.png",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "geometric_deformation"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_2098",
+   "image_path": "yanbaor2_yanbaoPPT_2098.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud",
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-61323717.pdf_203",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-61323717.pdf_203.jpg",
+   "data_source": "book",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-c32797b5-0a58-40da-82b4-b35dded00f25",
+   "image_path": "page-c32797b5-0a58-40da-82b4-b35dded00f25.png",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_3810",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_3810.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-1c08a4a2-8163-44d3-93f0-9449457dbba3",
+   "image_path": "page-1c08a4a2-8163-44d3-93f0-9449457dbba3.png",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_1118",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_1118.jpg",
+   "data_source": "colorful_textbook",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "colorful_backgroud"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-8f6792bd-b5e4-435e-b1b0-1b2daa3f7234",
+   "image_path": "page-8f6792bd-b5e4-435e-b1b0-1b2daa3f7234.png",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "text_O-shaped_wrap"
+   ],
+   "tables": 0,
+   "formulas": 2
+  },
+  {
+   "id": "omni-jiaocaineedrop_glossary.pdf_7",
+   "image_path": "jiaocaineedrop_glossary.pdf_7.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_enbook-zlib-o.O-19091739.pdf_181",
+   "image_path": "docstructbench_enbook-zlib-o.O-19091739.pdf_181.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 8
+  },
+  {
+   "id": "omni-jiaocaineedrop_chap10.pdf_8",
+   "image_path": "jiaocaineedrop_chap10.pdf_8.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_eng_gls.pdf_6",
+   "image_path": "jiaocaineedrop_eng_gls.pdf_6.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_1449",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_1449.jpg",
+   "data_source": "colorful_textbook",
+   "language": "en_ch_mixed",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-67013be9-58e5-4842-809d-7a3c1fc91fc7",
+   "image_path": "page-67013be9-58e5-4842-809d-7a3c1fc91fc7.png",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 2
+  },
+  {
+   "id": "omni-color_textbook_zhonggaokao_小学_KET听说读写逐项突破_KET听说读写逐项突破之轻松搞定KET写作25分 【10讲 褚连一】_第05讲第五课写作Part7详解_第五课写作Part7详解_page_001",
+   "image_path": "color_textbook_zhonggaokao_小学_KET听说读写逐项突破_KET听说读写逐项突破之轻松搞定KET写作25分 【10讲 褚连一】_第05讲第五课写作Part7详解_第五课写作Part7详解_page_001.png",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_2263",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_2263.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "three_column",
+   "special_issue": [
+    "watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_1253",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_1253.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 2
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_3984",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_3984.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_782",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_782.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_108",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_108.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud",
+    "fuzzy_scan"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_llm-raw-the-eye-o.O-Chapter14.pdf_2",
+   "image_path": "docstructbench_llm-raw-the-eye-o.O-Chapter14.pdf_2.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_1898",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_1898.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "fuzzy_scan",
+    "colorful_backgroud",
+    "table_horizontal",
+    "table_full_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-52875b3d-f4dc-44c2-a9bb-514b0763833d",
+   "image_path": "page-52875b3d-f4dc-44c2-a9bb-514b0763833d.png",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_1303",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_1303.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocai_jiaocai_en_932",
+   "image_path": "jiaocai_jiaocai_en_932.jpg",
+   "data_source": "colorful_textbook",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_geo-12644.pdf_353",
+   "image_path": "jiaocaineedrop_geo-12644.pdf_353.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_ced6f3c05e1dfefa8455fa60aacdd2d76ffd79489b631c2dbde22a74e927544b.pdf_84",
+   "image_path": "jiaocaineedrop_ced6f3c05e1dfefa8455fa60aacdd2d76ffd79489b631c2dbde22a74e927544b.pdf_84.jpg",
+   "data_source": "colorful_textbook",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_full_line",
+    "colorful_backgroud"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-color_textbook_教材全解1+1二年级下册英语上海牛津版_page_066",
+   "image_path": "color_textbook_教材全解1+1二年级下册英语上海牛津版_page_066.png",
+   "data_source": "colorful_textbook",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_1996_Problems_1996_page_001",
+   "image_path": "exam_paper_en-file-putnam-archive_1996_Problems_1996_page_001.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 6
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_14",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_14.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_1993_Problems_1993_page_001",
+   "image_path": "exam_paper_en-file-putnam-archive_1993_Problems_1993_page_001.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 6
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_1995_Solutions_1995s_page_002",
+   "image_path": "exam_paper_en-file-putnam-archive_1995_Solutions_1995s_page_002.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 5
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_2820",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_2820.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_1290",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_1290.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 2
+  },
+  {
+   "id": "omni-jiaocai_jiaocai_en_91",
+   "image_path": "jiaocai_jiaocai_en_91.jpg",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_full_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2014_Problems_2014_page_001",
+   "image_path": "exam_paper_en-file-putnam-archive_2014_Problems_2014_page_001.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 6
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2000_Solutions_2000s_page_001",
+   "image_path": "exam_paper_en-file-putnam-archive_2000_Solutions_2000s_page_001.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 7
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2013_Problems_2013_page_002",
+   "image_path": "exam_paper_en-file-putnam-archive_2013_Problems_2013_page_002.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 2
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2003_Solutions_2003s_page_008",
+   "image_path": "exam_paper_en-file-putnam-archive_2003_Solutions_2003s_page_008.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 7
+  },
+  {
+   "id": "omni-page-014dee5d-dfce-406b-925e-4ec8ffe4ac16",
+   "image_path": "page-014dee5d-dfce-406b-925e-4ec8ffe4ac16.png",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "with_watermark",
+    "geometric_deformation"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_1997_Problems_1997_page_001",
+   "image_path": "exam_paper_en-file-putnam-archive_1997_Problems_1997_page_001.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 7
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2001_Solutions_2001s_page_001",
+   "image_path": "exam_paper_en-file-putnam-archive_2001_Solutions_2001s_page_001.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 3
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_467",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_467.jpg",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "fuzzy_scan"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2006_Solutions_2006s_page_007",
+   "image_path": "exam_paper_en-file-putnam-archive_2006_Solutions_2006s_page_007.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 18
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_443",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_443.jpg",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [
+    "watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_482",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_482.jpg",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "double_column",
+   "special_issue": [
+    "watermark",
+    "table_horizontal",
+    "table_full_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_980",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_980.jpg",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [
+    "watermark"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_2509",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_2509.jpg",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "other_layout",
+   "special_issue": [
+    "watermark",
+    "fuzzy_scan"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_2884",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_2884.jpg",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [
+    "watermark",
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2010_Solutions_2010s_page_001",
+   "image_path": "exam_paper_en-file-putnam-archive_2010_Solutions_2010s_page_001.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 8
+  },
+  {
+   "id": "omni-page-d271a2ab-4523-44c4-94b5-303bf54b69e9",
+   "image_path": "page-d271a2ab-4523-44c4-94b5-303bf54b69e9.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "transparent_pages"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_2211",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_2211.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "watermark",
+    "table_full_line",
+    "table_horizontal",
+    "fuzzy_scan"
+   ],
+   "tables": 1,
+   "formulas": 1
+  },
+  {
+   "id": "omni-jiaocaineedrop_2017.pdf_0",
+   "image_path": "jiaocaineedrop_2017.pdf_0.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2008_Solutions_2008s_page_005",
+   "image_path": "exam_paper_en-file-putnam-archive_2008_Solutions_2008s_page_005.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 5
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_4065",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_4065.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_3114",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_3114.jpg",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "watermark"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_3341",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_3341.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "watermark",
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2009_Solutions_2009s_page_003",
+   "image_path": "exam_paper_en-file-putnam-archive_2009_Solutions_2009s_page_003.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 5
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_2559",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_2559.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocai_71434495.pdf_0",
+   "image_path": "jiaocai_71434495.pdf_0.jpg",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 13
+  },
+  {
+   "id": "omni-page-9e69b0ce-dcd8-4b13-a5fb-a0bd6f85f77d",
+   "image_path": "page-9e69b0ce-dcd8-4b13-a5fb-a0bd6f85f77d.png",
+   "data_source": "exam_paper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_2018年广西北海、钦州、南宁、来宾、崇左、防城港、北部湾经济区中考英语试题（空白卷）_page_001",
+   "image_path": "exam_paper_2018年广西北海、钦州、南宁、来宾、崇左、防城港、北部湾经济区中考英语试题（空白卷）_page_001.png",
+   "data_source": "exam_paper",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-d4fe8fcc-37e2-4ac1-9ae2-7d00ac937937",
+   "image_path": "page-d4fe8fcc-37e2-4ac1-9ae2-7d00ac937937.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2006_Solutions_2006s_page_006",
+   "image_path": "exam_paper_en-file-putnam-archive_2006_Solutions_2006s_page_006.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 10
+  },
+  {
+   "id": "omni-page-21ad32ba-fd62-43e5-964a-f5e95c0e0441",
+   "image_path": "page-21ad32ba-fd62-43e5-964a-f5e95c0e0441.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "handwriting"
+   ],
+   "tables": 0,
+   "formulas": 9
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_2002_Solutions_2002s_page_004",
+   "image_path": "exam_paper_en-file-putnam-archive_2002_Solutions_2002s_page_004.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 6
+  },
+  {
+   "id": "omni-exam_paper_en-file-putnam-archive_1999_Solutions_1999s_page_003",
+   "image_path": "exam_paper_en-file-putnam-archive_1999_Solutions_1999s_page_003.png",
+   "data_source": "exam_paper",
+   "language": "english",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 12
+  },
+  {
+   "id": "omni-page-dad79c54-8125-4927-9988-ee1d2a139d7b",
+   "image_path": "page-dad79c54-8125-4927-9988-ee1d2a139d7b.png",
+   "data_source": "historical_document",
+   "language": "traditional_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "geometric_deformation"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-63687685.pdf_106",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-63687685.pdf_106.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-magazine_TheEconomist.2024.03.02_page_031",
+   "image_path": "magazine_TheEconomist.2024.03.02_page_031.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "table_horizontal",
+    "table_fewer_line"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-0c28f48b-33da-489c-bfc1-1fe82e5be68f",
+   "image_path": "page-0c28f48b-33da-489c-bfc1-1fe82e5be68f.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-magazine_TheEconomist.2023.12.23_page_052",
+   "image_path": "magazine_TheEconomist.2023.12.23_page_052.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-19300c18-7995-4099-a94c-b4c61d7622cb",
+   "image_path": "page-19300c18-7995-4099-a94c-b4c61d7622cb.png",
+   "data_source": "magazine",
+   "language": "other",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-magazine_TheEconomist.2023.12.16_page_062",
+   "image_path": "magazine_TheEconomist.2023.12.16_page_062.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_dianzishu_zhongwenzaixian-o.O-61520814.pdf_185",
+   "image_path": "docstructbench_dianzishu_zhongwenzaixian-o.O-61520814.pdf_185.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "table_omission_line",
+    "table_horizontal",
+    "table_span",
+    "table_with_formula"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_5627",
+   "image_path": "yanbaor2_yanbaoPPT_5627.jpg",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-92062914-ea02-4640-8f54-24623dba4388",
+   "image_path": "page-92062914-ea02-4640-8f54-24623dba4388.png",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "with_watermark"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_4618",
+   "image_path": "yanbaor2_yanbaoPPT_4618.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_2172",
+   "image_path": "yanbaor2_yanbaoPPT_2172.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-magazine_TheEconomist.2024.03.09_page_079",
+   "image_path": "magazine_TheEconomist.2024.03.09_page_079.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-magazine_TheEconomist.2023.11.18_page_082",
+   "image_path": "magazine_TheEconomist.2023.11.18_page_082.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_89c3718f5a45179ef57a5063c6df36fc2c9b7e3ab4275f4905ed89f1c17232ea.pdf_14",
+   "image_path": "yanbaor2_89c3718f5a45179ef57a5063c6df36fc2c9b7e3ab4275f4905ed89f1c17232ea.pdf_14.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "table_horizontal",
+    "colorful_backgroud",
+    "table_omission_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_1332",
+   "image_path": "yanbaor2_yanbaoPPT_1332.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_yanbaoPPT_3282",
+   "image_path": "yanbaor2_yanbaoPPT_3282.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_3e1be78252e2fdfe1adf12bba38ec2a7b30699e152d61269aa6e5827f5adcc35.pdf_13",
+   "image_path": "yanbaor2_3e1be78252e2fdfe1adf12bba38ec2a7b30699e152d61269aa6e5827f5adcc35.pdf_13.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "table_horizontal",
+    "table_span",
+    "colorful_backgroud",
+    "table_with_img",
+    "table_fewer_line"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_Chap11.pdf_10",
+   "image_path": "jiaocaineedrop_Chap11.pdf_10.jpg",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_enbook-zlib-o.O-22206811.pdf_5",
+   "image_path": "docstructbench_enbook-zlib-o.O-22206811.pdf_5.jpg",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_bedda45af71c9703274cf8b2c62a772e6be615c355d2b255d9408b1b40b606de.pdf_3",
+   "image_path": "yanbaor2_bedda45af71c9703274cf8b2c62a772e6be615c355d2b255d9408b1b40b606de.pdf_3.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_37eeaab2c1abfc6443b9781c9bca92468c4a8a9aac837e2523122b1ae632b74e.pdf_13",
+   "image_path": "yanbaor2_37eeaab2c1abfc6443b9781c9bca92468c4a8a9aac837e2523122b1ae632b74e.pdf_13.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-magazine_TheEconomist.2023.12.09_page_048",
+   "image_path": "magazine_TheEconomist.2023.12.09_page_048.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaor2_323ab38d3b3b9a44837779e3c7b4a2f7088d9e0eb6c966d4d596faf6c01011a6.pdf_2",
+   "image_path": "yanbaor2_323ab38d3b3b9a44837779e3c7b4a2f7088d9e0eb6c966d4d596faf6c01011a6.pdf_2.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-6e75aef4-33d0-478a-a3a3-489c782bfa39",
+   "image_path": "page-6e75aef4-33d0-478a-a3a3-489c782bfa39.png",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "double_column",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-0b772bee-71ec-4d4a-a406-d7691b1a6e86",
+   "image_path": "page-0b772bee-71ec-4d4a-a406-d7691b1a6e86.png",
+   "data_source": "magazine",
+   "language": "other",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-jiaocaineedrop_jiaocai_needrop_en_947",
+   "image_path": "jiaocaineedrop_jiaocai_needrop_en_947.jpg",
+   "data_source": "magazine",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [
+    "colorful_backgroud"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-docstructbench_enbook-zlib-o.O-21882649.pdf_3",
+   "image_path": "docstructbench_enbook-zlib-o.O-21882649.pdf_3.jpg",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "single_column",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-magazine_TheEconomist.2023.12.09_page_045",
+   "image_path": "magazine_TheEconomist.2023.12.09_page_045.png",
+   "data_source": "magazine",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [
+    "None"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_baa51a22898f0d534a6c404ba8f12fb1_2",
+   "image_path": "newspaper_baa51a22898f0d534a6c404ba8f12fb1_2.jpg",
+   "data_source": "newspaper",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_bd75af5f4791aa56ef05ce2443e8a7e0_1",
+   "image_path": "newspaper_bd75af5f4791aa56ef05ce2443e8a7e0_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_7746db2ad2ea24c827eac60244375bbf_1",
+   "image_path": "newspaper_7746db2ad2ea24c827eac60244375bbf_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_e3842a5681ef54c62a58804adec06c3f_1",
+   "image_path": "newspaper_e3842a5681ef54c62a58804adec06c3f_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_571a946262006cd89199b67353c408b8_1",
+   "image_path": "newspaper_571a946262006cd89199b67353c408b8_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_01f020903d7bc4b3fc69f500f41eb77e_1",
+   "image_path": "newspaper_01f020903d7bc4b3fc69f500f41eb77e_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 3,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_0cfb8a42b5d4194d8c73dba0cdf6256c_1",
+   "image_path": "newspaper_0cfb8a42b5d4194d8c73dba0cdf6256c_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_2a6b4fa088699701a6fa9ccecfb5c25d_10",
+   "image_path": "newspaper_2a6b4fa088699701a6fa9ccecfb5c25d_10.jpg",
+   "data_source": "newspaper",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_fe2c8b45b2a086cd75984640bb3080e1_1",
+   "image_path": "newspaper_fe2c8b45b2a086cd75984640bb3080e1_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_e6083de4647ef28434cb6a598b073ae4_1",
+   "image_path": "newspaper_e6083de4647ef28434cb6a598b073ae4_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_2a6b4fa088699701a6fa9ccecfb5c25d_18",
+   "image_path": "newspaper_2a6b4fa088699701a6fa9ccecfb5c25d_18.jpg",
+   "data_source": "newspaper",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_0ce88e1e131aef7a59d0533be36870de_1",
+   "image_path": "newspaper_0ce88e1e131aef7a59d0533be36870de_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_2c69e142b52dbb30cac2cb11d3eb25e5_1",
+   "image_path": "newspaper_2c69e142b52dbb30cac2cb11d3eb25e5_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_0b1bb8d03b4287eb95f67b68c2cf9f92_1",
+   "image_path": "newspaper_0b1bb8d03b4287eb95f67b68c2cf9f92_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_ef5c785d9cc21ccf6b73d143f231b5c5_1",
+   "image_path": "newspaper_ef5c785d9cc21ccf6b73d143f231b5c5_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_0b86dae4d8f328a0e79d9ac394000dec_1",
+   "image_path": "newspaper_0b86dae4d8f328a0e79d9ac394000dec_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_d4ed0f39df940849b16439f49873ff5c_1",
+   "image_path": "newspaper_d4ed0f39df940849b16439f49873ff5c_1.jpg",
+   "data_source": "newspaper",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_401c73055b88a62c479edd3d490cea8a_1",
+   "image_path": "newspaper_401c73055b88a62c479edd3d490cea8a_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_14b9d21f7fed39fb42849e9cde233930_1",
+   "image_path": "newspaper_14b9d21f7fed39fb42849e9cde233930_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_95f2062735b213b3d7d471a48d5ec71b_1",
+   "image_path": "newspaper_95f2062735b213b3d7d471a48d5ec71b_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_b615618f3cdb0f2c13ffb5865dea799c_1",
+   "image_path": "newspaper_b615618f3cdb0f2c13ffb5865dea799c_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_c8e8e00e1b1a70aa44afd1fbdaf59430_1",
+   "image_path": "newspaper_c8e8e00e1b1a70aa44afd1fbdaf59430_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_2a6b4fa088699701a6fa9ccecfb5c25d_8",
+   "image_path": "newspaper_2a6b4fa088699701a6fa9ccecfb5c25d_8.jpg",
+   "data_source": "newspaper",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_5e266dfd9c498cab274e12a7b4a75755_1",
+   "image_path": "newspaper_5e266dfd9c498cab274e12a7b4a75755_1.jpg",
+   "data_source": "newspaper",
+   "language": "english",
+   "layout": "three_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_bf784eedb0c377adb9a0f286954af785_2",
+   "image_path": "newspaper_bf784eedb0c377adb9a0f286954af785_2.jpg",
+   "data_source": "newspaper",
+   "language": "english",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-newspaper_5aedf678eff04d8ebac3692d54103e19_1",
+   "image_path": "newspaper_5aedf678eff04d8ebac3692d54103e19_1.jpg",
+   "data_source": "newspaper",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_75",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_75.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_50",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_50.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_69",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_69.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_11",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_11.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_91",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_91.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_14",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_14.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_59",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_59.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_79",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_79.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_25",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_25.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_9",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_9.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_26",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_26.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_8",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_8.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_111",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_111.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_89",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_89.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_16",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_16.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 3
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_96",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_96.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_9e951846094758afac08c620144e3a76_17",
+   "image_path": "notes_9e951846094758afac08c620144e3a76_17.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_31",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_31.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_58",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_58.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_123",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_123.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_46",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_46.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_93",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_93.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_f7f010b78016aeebd76e56d9283eb67f_29",
+   "image_path": "notes_f7f010b78016aeebd76e56d9283eb67f_29.jpg",
+   "data_source": "note",
+   "language": "en_ch_mixed",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_124",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_124.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-notes_1ba14cb325bc448f7201b20502ecf2b5_52",
+   "image_path": "notes_1ba14cb325bc448f7201b20502ecf2b5_52.jpg",
+   "data_source": "note",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_d0313ed730f58180b1f005a3607c2a77dc3672410e8f7ee1de3b814668da9bcb.pdf_5",
+   "image_path": "eastmoney_d0313ed730f58180b1f005a3607c2a77dc3672410e8f7ee1de3b814668da9bcb.pdf_5.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_wireless_line"
+   ],
+   "tables": 0,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-219a47e5-3b78-4fa4-9066-3b95bb342a87",
+   "image_path": "page-219a47e5-3b78-4fa4-9066-3b95bb342a87.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_2d0d871a074b4818b16b4425cafac8dd221d91fbde8deae28efba2af50359c50.pdf_1",
+   "image_path": "yanbaopptmerge_2d0d871a074b4818b16b4425cafac8dd221d91fbde8deae28efba2af50359c50.pdf_1.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-f5b824d0-be81-48a9-aae6-3060d11a6503",
+   "image_path": "page-f5b824d0-be81-48a9-aae6-3060d11a6503.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_2dea7cdb5a3e018ffec3c80eb4435de524f2a14bd32735b78f563adc355272ab.pdf_6",
+   "image_path": "eastmoney_2dea7cdb5a3e018ffec3c80eb4435de524f2a14bd32735b78f563adc355272ab.pdf_6.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 4,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_c894b375daca22d041c8a35946295d0a73d6589ad7c3d1d39d8664a2666372bf.pdf_10",
+   "image_path": "yanbaopptmerge_c894b375daca22d041c8a35946295d0a73d6589ad7c3d1d39d8664a2666372bf.pdf_10.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_aec1bf4ddb8fb4996b0512e90b3bfb31c9b151919f5d7b4a4f658f4b1f762b9e.pdf_2",
+   "image_path": "yanbaopptmerge_aec1bf4ddb8fb4996b0512e90b3bfb31c9b151919f5d7b4a4f658f4b1f762b9e.pdf_2.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_bd6c2b9aa7ca0ebf8672f8f50e3eacab7f67d0ffa15e0d94b1f3c0d1b5f179b8.pdf_19",
+   "image_path": "eastmoney_bd6c2b9aa7ca0ebf8672f8f50e3eacab7f67d0ffa15e0d94b1f3c0d1b5f179b8.pdf_19.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_51e549c0d1a2669ac976409fcf99ce91908b1e0a07f0fc70d92263abf6d07f18.pdf_1",
+   "image_path": "yanbaopptmerge_51e549c0d1a2669ac976409fcf99ce91908b1e0a07f0fc70d92263abf6d07f18.pdf_1.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_dd8f39ced2188b907304224a635ad605689270486020c34636003e57018c01d8.pdf_2",
+   "image_path": "eastmoney_dd8f39ced2188b907304224a635ad605689270486020c34636003e57018c01d8.pdf_2.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-91460e0a-922c-4f9b-9d11-d1a7981c3a05",
+   "image_path": "page-91460e0a-922c-4f9b-9d11-d1a7981c3a05.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_0022ae8eddb0de117978289e16ba7fe995dddd3f64aca9e147bb07c848c84aa6.pdf_8",
+   "image_path": "eastmoney_0022ae8eddb0de117978289e16ba7fe995dddd3f64aca9e147bb07c848c84aa6.pdf_8.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-f46e72b1-865d-43e6-ab94-afae16c5f178",
+   "image_path": "page-f46e72b1-865d-43e6-ab94-afae16c5f178.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "other_layout",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-c7792da7-4167-4f5c-a7ca-ec0f8833f83b",
+   "image_path": "page-c7792da7-4167-4f5c-a7ca-ec0f8833f83b.png",
+   "data_source": "research_report",
+   "language": "traditional_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_e3b48594d5a2a6dc86b51244737f24867a0c1781e9f0e4fb52d96bbc6f9d95c7.pdf_3",
+   "image_path": "yanbaopptmerge_e3b48594d5a2a6dc86b51244737f24867a0c1781e9f0e4fb52d96bbc6f9d95c7.pdf_3.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 3,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-3c690b07-30d7-4e77-bf20-012f0080fb1d",
+   "image_path": "page-3c690b07-30d7-4e77-bf20-012f0080fb1d.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-d5e0cd38-ac0f-422c-b6d5-c8f001720491",
+   "image_path": "page-d5e0cd38-ac0f-422c-b6d5-c8f001720491.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-66aa2b38-32c0-4222-839a-50df648218df",
+   "image_path": "page-66aa2b38-32c0-4222-839a-50df648218df.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_944c06af0b176ef718ee34d3affee40554920f76210dfbf007972fe9c39074fc.pdf_0",
+   "image_path": "eastmoney_944c06af0b176ef718ee34d3affee40554920f76210dfbf007972fe9c39074fc.pdf_0.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "1andmore_column",
+   "special_issue": [
+    "table_fewer_line",
+    "table_horizontal"
+   ],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-74749e1d-5239-4d8e-b89c-6d83f5e59374",
+   "image_path": "page-74749e1d-5239-4d8e-b89c-6d83f5e59374.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-349417c3-e5f4-4dae-b018-7323ef36b04e",
+   "image_path": "page-349417c3-e5f4-4dae-b018-7323ef36b04e.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-2abc2a95-d39a-48db-9b6d-f40410412694",
+   "image_path": "page-2abc2a95-d39a-48db-9b6d-f40410412694.png",
+   "data_source": "research_report",
+   "language": "traditional_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-d627077d-61cd-45c5-936f-a2c306ec3b5b",
+   "image_path": "page-d627077d-61cd-45c5-936f-a2c306ec3b5b.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 2,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-2ff22832-e343-46a7-b94f-47ed864ce486",
+   "image_path": "page-2ff22832-e343-46a7-b94f-47ed864ce486.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 3,
+   "formulas": 0
+  },
+  {
+   "id": "omni-eastmoney_fca0676d8b0c4d3926a2d02229fa3372f87a45dbfbf7472773c6dbe04d35af65.pdf_3",
+   "image_path": "eastmoney_fca0676d8b0c4d3926a2d02229fa3372f87a45dbfbf7472773c6dbe04d35af65.pdf_3.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_horizontal",
+    "table_omission_line",
+    "table_span"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-yanbaopptmerge_2325ef43385f09f3c8539d0f817edf9b39a086325d416958e4b481904f9867db.pdf_12",
+   "image_path": "yanbaopptmerge_2325ef43385f09f3c8539d0f817edf9b39a086325d416958e4b481904f9867db.pdf_12.jpg",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [
+    "table_full_line",
+    "table_horizontal"
+   ],
+   "tables": 1,
+   "formulas": 0
+  },
+  {
+   "id": "omni-page-b527edec-3363-4d38-a390-2f3a307f2392",
+   "image_path": "page-b527edec-3363-4d38-a390-2f3a307f2392.png",
+   "data_source": "research_report",
+   "language": "simplified_chinese",
+   "layout": "single_column",
+   "special_issue": [],
+   "tables": 1,
+   "formulas": 0
+  }
+ ],
+ "documents": [
+  {
+   "id": "marathon-mp3lan_0350-p11-16",
+   "source": "marathon",
+   "doc_id": "mp3lan_0350",
+   "pages": [
+    11,
+    12,
+    13,
+    14,
+    15,
+    16
+   ],
+   "document_pages": 116,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0257-p145-150",
+   "source": "marathon",
+   "doc_id": "mp3lan_0257",
+   "pages": [
+    145,
+    146,
+    147,
+    148,
+    149,
+    150
+   ],
+   "document_pages": 180,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0985-p47-54",
+   "source": "marathon",
+   "doc_id": "mp3lan_0985",
+   "pages": [
+    47,
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54
+   ],
+   "document_pages": 177,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0962-p86-93",
+   "source": "marathon",
+   "doc_id": "mp3lan_0962",
+   "pages": [
+    86,
+    87,
+    88,
+    89,
+    90,
+    91,
+    92,
+    93
+   ],
+   "document_pages": 113,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0530-p206-212",
+   "source": "marathon",
+   "doc_id": "mp3lan_0530",
+   "pages": [
+    206,
+    207,
+    208,
+    209,
+    210,
+    211,
+    212
+   ],
+   "document_pages": 254,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0146-p62-70",
+   "source": "marathon",
+   "doc_id": "mp3lan_0146",
+   "pages": [
+    62,
+    63,
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    70
+   ],
+   "document_pages": 142,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0629-p11-15",
+   "source": "marathon",
+   "doc_id": "mp3lan_0629",
+   "pages": [
+    11,
+    12,
+    13,
+    14,
+    15
+   ],
+   "document_pages": 197,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0128-p41-48",
+   "source": "marathon",
+   "doc_id": "mp3lan_0128",
+   "pages": [
+    41,
+    42,
+    43,
+    44,
+    45,
+    46,
+    47,
+    48
+   ],
+   "document_pages": 169,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0226-p213-222",
+   "source": "marathon",
+   "doc_id": "mp3lan_0226",
+   "pages": [
+    213,
+    214,
+    215,
+    216,
+    217,
+    218,
+    219,
+    220,
+    221,
+    222
+   ],
+   "document_pages": 292,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0265-p275-282",
+   "source": "marathon",
+   "doc_id": "mp3lan_0265",
+   "pages": [
+    275,
+    276,
+    277,
+    278,
+    279,
+    280,
+    281,
+    282
+   ],
+   "document_pages": 298,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0576-p59-65",
+   "source": "marathon",
+   "doc_id": "mp3lan_0576",
+   "pages": [
+    59,
+    60,
+    61,
+    62,
+    63,
+    64,
+    65
+   ],
+   "document_pages": 110,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0249-p50-56",
+   "source": "marathon",
+   "doc_id": "mp3lan_0249",
+   "pages": [
+    50,
+    51,
+    52,
+    53,
+    54,
+    55,
+    56
+   ],
+   "document_pages": 120,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0858-p102-108",
+   "source": "marathon",
+   "doc_id": "mp3lan_0858",
+   "pages": [
+    102,
+    103,
+    104,
+    105,
+    106,
+    107,
+    108
+   ],
+   "document_pages": 160,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0193-p30-36",
+   "source": "marathon",
+   "doc_id": "mp3lan_0193",
+   "pages": [
+    30,
+    31,
+    32,
+    33,
+    34,
+    35,
+    36
+   ],
+   "document_pages": 202,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0165-p165-173",
+   "source": "marathon",
+   "doc_id": "mp3lan_0165",
+   "pages": [
+    165,
+    166,
+    167,
+    168,
+    169,
+    170,
+    171,
+    172,
+    173
+   ],
+   "document_pages": 258,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0996-p48-54",
+   "source": "marathon",
+   "doc_id": "mp3lan_0996",
+   "pages": [
+    48,
+    49,
+    50,
+    51,
+    52,
+    53,
+    54
+   ],
+   "document_pages": 180,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0789-p223-227",
+   "source": "marathon",
+   "doc_id": "mp3lan_0789",
+   "pages": [
+    223,
+    224,
+    225,
+    226,
+    227
+   ],
+   "document_pages": 280,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0792-p74-78",
+   "source": "marathon",
+   "doc_id": "mp3lan_0792",
+   "pages": [
+    74,
+    75,
+    76,
+    77,
+    78
+   ],
+   "document_pages": 187,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0118-p203-210",
+   "source": "marathon",
+   "doc_id": "mp3lan_0118",
+   "pages": [
+    203,
+    204,
+    205,
+    206,
+    207,
+    208,
+    209,
+    210
+   ],
+   "document_pages": 248,
+   "language": "zh+en"
+  },
+  {
+   "id": "marathon-mp3lan_0288-p79-83",
+   "source": "marathon",
+   "doc_id": "mp3lan_0288",
+   "pages": [
+    79,
+    80,
+    81,
+    82,
+    83
+   ],
+   "document_pages": 110,
+   "language": "zh+en"
+  },
+  {
+   "id": "nonbaidu-scotus_22-451-p12-21",
+   "source": "nonbaidu",
+   "name": "scotus_22-451",
+   "url": "https://www.supremecourt.gov/opinions/23pdf/22-451_7m58.pdf",
+   "sha256": "12f5ea075004886774c25e7831ea1608fd0f831f0113e83bb0e85811c0a4bb6e",
+   "licence": "US Supreme Court opinion, public domain",
+   "pages": [
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21
+   ],
+   "document_pages": 114,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-scotus_23-719-p13-17",
+   "source": "nonbaidu",
+   "name": "scotus_23-719",
+   "url": "https://www.supremecourt.gov/opinions/23pdf/23-719_19m2.pdf",
+   "sha256": "f3015ab4890996a0cb1f1cb3e943cf27d2d6a58ced20f8dbdc3d06e79c15d07a",
+   "licence": "US Supreme Court opinion, public domain",
+   "pages": [
+    13,
+    14,
+    15,
+    16,
+    17
+   ],
+   "document_pages": 20,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-scotus_21-476-p6-10",
+   "source": "nonbaidu",
+   "name": "scotus_21-476",
+   "url": "https://www.supremecourt.gov/opinions/22pdf/21-476_c185.pdf",
+   "sha256": "eb177a0fbe75459e489530e9bc75b5aad8e1e45ffb515a3b06ff0573fb3a9676",
+   "licence": "US Supreme Court opinion, public domain",
+   "pages": [
+    6,
+    7,
+    8,
+    9,
+    10
+   ],
+   "document_pages": 70,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-scotus_20-1199-p167-171",
+   "source": "nonbaidu",
+   "name": "scotus_20-1199",
+   "url": "https://www.supremecourt.gov/opinions/22pdf/20-1199_hgdj.pdf",
+   "sha256": "23f5bdc9eed69c1ed5f76097a9f3abda0df5f6b4d5fd08e0dcc4ba5d4cc1dbd1",
+   "licence": "US Supreme Court opinion, public domain",
+   "pages": [
+    167,
+    168,
+    169,
+    170,
+    171
+   ],
+   "document_pages": 237,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-scotus_19-1392-p71-76",
+   "source": "nonbaidu",
+   "name": "scotus_19-1392",
+   "url": "https://www.supremecourt.gov/opinions/21pdf/19-1392_6j37.pdf",
+   "sha256": "24e1b14e521fd6cc653ddbe1fbb0c41bcdd7fda6c8f32d0867d23b4415a1e8b0",
+   "licence": "US Supreme Court opinion, public domain",
+   "pages": [
+    71,
+    72,
+    73,
+    74,
+    75,
+    76
+   ],
+   "document_pages": 213,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-scotus_17-1618-p33-39",
+   "source": "nonbaidu",
+   "name": "scotus_17-1618",
+   "url": "https://www.supremecourt.gov/opinions/19pdf/17-1618_hfci.pdf",
+   "sha256": "7ed4ed6f1919e99b728b8612626a0f37cb713a023c1734e88b938592e6a3b1b8",
+   "licence": "US Supreme Court opinion, public domain",
+   "pages": [
+    33,
+    34,
+    35,
+    36,
+    37,
+    38,
+    39
+   ],
+   "document_pages": 172,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-nist_fips197upd1-p29-34",
+   "source": "nonbaidu",
+   "name": "nist_fips197upd1",
+   "url": "https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.197-upd1.pdf",
+   "sha256": "62c86eb567f13edb8f71826e985da870b04ef6381634f303cdb16e84d47becd1",
+   "licence": "NIST publication, US government work, public domain",
+   "pages": [
+    29,
+    30,
+    31,
+    32,
+    33,
+    34
+   ],
+   "document_pages": 46,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-nist_ir7298r2-p214-222",
+   "source": "nonbaidu",
+   "name": "nist_ir7298r2",
+   "url": "https://nvlpubs.nist.gov/nistpubs/ir/2013/NIST.IR.7298r2.pdf",
+   "sha256": "5b8c8fde0e534d4568f9dd4c6b9c6a36ac6539e5c4296af5a27de55c69f1a393",
+   "licence": "NIST publication, US government work, public domain",
+   "pages": [
+    214,
+    215,
+    216,
+    217,
+    218,
+    219,
+    220,
+    221,
+    222
+   ],
+   "document_pages": 223,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-arxiv_1706.03762v7-p2-9",
+   "source": "nonbaidu",
+   "name": "arxiv_1706.03762v7",
+   "url": "https://arxiv.org/pdf/1706.03762v7",
+   "sha256": "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+   "licence": "arXiv paper; local evaluation only, not redistributed",
+   "pages": [
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9
+   ],
+   "document_pages": 15,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-wiki_en_ocr-p1-6",
+   "source": "nonbaidu",
+   "name": "wiki_en_ocr",
+   "url": "https://en.wikipedia.org/api/rest_v1/page/pdf/Optical_character_recognition",
+   "sha256": "5e90c384a43ee804b82b51444f31aba1834187415ede686db16c3d492115ee03",
+   "licence": "Wikipedia PDF render, CC BY-SA 4.0; local evaluation only",
+   "pages": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6
+   ],
+   "document_pages": 13,
+   "language": "en"
+  },
+  {
+   "id": "nonbaidu-wiki_zh_printing-p1-7",
+   "source": "nonbaidu",
+   "name": "wiki_zh_printing",
+   "url": "https://zh.wikipedia.org/api/rest_v1/page/pdf/%E5%8D%B0%E5%88%B7%E6%9C%AF",
+   "sha256": "07bb287fe537b9c2fcf7b5c27a880ee0a7fd9a9d9926065866006ee45e7bd38e",
+   "licence": "Wikipedia PDF render, CC BY-SA 4.0; local evaluation only",
+   "pages": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7
+   ],
+   "document_pages": 9,
+   "language": "zh"
+  },
+  {
+   "id": "nonbaidu-wiki_zh_papermaking-p1-8",
+   "source": "nonbaidu",
+   "name": "wiki_zh_papermaking",
+   "url": "https://zh.wikipedia.org/api/rest_v1/page/pdf/%E9%80%A0%E7%BA%B8%E6%9C%AF",
+   "sha256": "597590fbeb489fc6dbc9b154aaf45ceb7853e689fe3bcdf5aee93cdc9248108f",
+   "licence": "Wikipedia PDF render, CC BY-SA 4.0; local evaluation only",
+   "pages": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+   ],
+   "document_pages": 8,
+   "language": "zh"
+  }
+ ]
+}

@@ -1,0 +1,12 @@
+{
+    "title": "Widget output",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "A": "10",
+        "B": "2",
+        "C": "7",
+        "D": "11"
+    }
+}

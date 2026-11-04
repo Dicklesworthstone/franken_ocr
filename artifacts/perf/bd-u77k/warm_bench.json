@@ -1,0 +1,149 @@
+{
+ "focr": "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/target_mapo/release-perf/focr",
+ "model": "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/v2_model_dir/unlimited-ocr-2.v0.1.0.int8.focrq",
+ "page": "/Users/jemanuel/.cache/franken_ocr/corpus/pages/page_0009.png",
+ "uptime_start": "14:59  up 7 days, 17:48, 14 users, load averages: 60.39 64.77 68.15",
+ "cold": {
+  "seconds": 12.869308124994859,
+  "peak_bytes": 31129600,
+  "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+ },
+ "pairs": [
+  {
+   "first": "inline",
+   "inline": {
+    "seconds": 13.054806291940622,
+    "peak_bytes": 8703541248,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "warm": {
+    "seconds": 10.421883790986612,
+    "peak_bytes": 30867456,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "warm",
+   "warm": {
+    "seconds": 10.34179195901379,
+    "peak_bytes": 31211520,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "inline": {
+    "seconds": 12.00416562508326,
+    "peak_bytes": 8766078976,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "inline",
+   "inline": {
+    "seconds": 14.16317037504632,
+    "peak_bytes": 8590213120,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "warm": {
+    "seconds": 12.278576332959346,
+    "peak_bytes": 31424512,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "warm",
+   "warm": {
+    "seconds": 11.30088962498121,
+    "peak_bytes": 31064064,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "inline": {
+    "seconds": 18.19813829206396,
+    "peak_bytes": 8240578560,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "inline",
+   "inline": {
+    "seconds": 12.43225325003732,
+    "peak_bytes": 8623865856,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "warm": {
+    "seconds": 13.235820458969101,
+    "peak_bytes": 31113216,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "warm",
+   "warm": {
+    "seconds": 10.120876207947731,
+    "peak_bytes": 30998528,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "inline": {
+    "seconds": 20.237774249981157,
+    "peak_bytes": 7758364672,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "inline",
+   "inline": {
+    "seconds": 12.768209457979538,
+    "peak_bytes": 8674394112,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "warm": {
+    "seconds": 12.863430624944158,
+    "peak_bytes": 30818304,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "warm",
+   "warm": {
+    "seconds": 10.975179707980715,
+    "peak_bytes": 30916608,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "inline": {
+    "seconds": 17.817729666945525,
+    "peak_bytes": 8927117312,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  },
+  {
+   "first": "inline",
+   "inline": {
+    "seconds": 12.021405041916296,
+    "peak_bytes": 8641576960,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   },
+   "warm": {
+    "seconds": 13.277268040925264,
+    "peak_bytes": 31555584,
+    "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+   }
+  }
+ ],
+ "load_ms": [
+  515,
+  564,
+  549
+ ],
+ "uptime_end": "15:04  up 7 days, 17:53, 14 users, load averages: 75.54 73.78 71.53",
+ "summary": {
+  "pairs": 9,
+  "inline_median_s": 13.054806291940622,
+  "warm_median_s": 11.30088962498121,
+  "ratio_median": 1.1607432902013237,
+  "ratio_min": 0.90541254457333,
+  "ratio_max": 1.9996069346336653,
+  "saved_median_s": 1.8845940420869738,
+  "load_ms_median": 549,
+  "warm_peak_max_bytes": 31555584,
+  "inline_peak_min_bytes": 7758364672,
+  "stdout_sha256": "8c113e8a35aa022032550880836e7b52cd153503ecebdb8d0256c6979b53041a"
+ }
+}

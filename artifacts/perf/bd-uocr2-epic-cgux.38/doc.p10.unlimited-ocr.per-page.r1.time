@@ -1,0 +1,381 @@
+[focr-timing] pagesource page 1: rasterized 1182x1837, 6514002 bytes, 13.4 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.14s
+[focr-timing]       sam.block attn(win) 0.037s
+[focr-timing]       sam.block mlp 0.090s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(GLOBAL) 0.138s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.078s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.038s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]     sam.blocks 1.84s
+[focr-timing]   vision.sam 1.94s
+[focr-timing]     clip.hydrate(cached) 0.20s
+[focr-timing]     clip.blocks 0.34s
+[focr-timing]   vision.clip 0.54s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.68s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.08s
+[focr-timing] prefill 0.67s (277 tokens)
+[focr-timing] decode 1.89s (98 tokens, 0.019s/tok)
+[focr-timing] pagesource page 2: rasterized 1182x1837, 6514002 bytes, 8.9 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(GLOBAL) 0.118s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(win) 0.036s
+[focr-timing]       sam.block mlp 0.078s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(win) 0.036s
+[focr-timing]       sam.block mlp 0.077s
+[focr-timing]       sam.block attn(win) 0.038s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(GLOBAL) 0.118s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]     sam.blocks 1.78s
+[focr-timing]   vision.sam 1.86s
+[focr-timing]     clip.blocks 0.34s
+[focr-timing]   vision.clip 0.35s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.22s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.84s (277 tokens)
+[focr-timing] decode 11.40s (495 tokens, 0.023s/tok)
+[focr-timing] pagesource page 3: rasterized 1182x1837, 6514002 bytes, 9.1 ms
+[focr-timing] preprocess 0.01s
+[focr-timing]       sam.block attn(win) 0.037s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.077s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]     sam.blocks 1.63s
+[focr-timing]   vision.sam 1.70s
+[focr-timing]     clip.blocks 0.33s
+[focr-timing]   vision.clip 0.33s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.03s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.85s (277 tokens)
+[focr-timing] decode 33.64s (1690 tokens, 0.020s/tok)
+[focr-timing] pagesource page 4: rasterized 1182x1837, 6514002 bytes, 10.3 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.067s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.037s
+[focr-timing]       sam.block mlp 0.081s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]     sam.blocks 1.63s
+[focr-timing]   vision.sam 1.70s
+[focr-timing]     clip.blocks 0.31s
+[focr-timing]   vision.clip 0.31s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.03s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.62s (277 tokens)
+[focr-timing] decode 17.13s (821 tokens, 0.021s/tok)
+[focr-timing] pagesource page 5: rasterized 1182x1837, 6514002 bytes, 10.0 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]       sam.block attn(win) 0.038s
+[focr-timing]       sam.block mlp 0.077s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.144s
+[focr-timing]       sam.block mlp 0.093s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.083s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(GLOBAL) 0.227s
+[focr-timing]       sam.block mlp 0.136s
+[focr-timing]       sam.block attn(win) 0.038s
+[focr-timing]       sam.block mlp 0.081s
+[focr-timing]       sam.block attn(win) 0.040s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]     sam.blocks 1.90s
+[focr-timing]   vision.sam 1.97s
+[focr-timing]     clip.blocks 0.31s
+[focr-timing]   vision.clip 0.31s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.29s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.64s (277 tokens)
+[focr-timing] decode 14.20s (773 tokens, 0.018s/tok)
+[focr-timing] pagesource page 6: rasterized 1182x1837, 6514002 bytes, 9.7 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.111s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.076s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(win) 0.036s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]     sam.blocks 1.64s
+[focr-timing]   vision.sam 1.71s
+[focr-timing]     clip.blocks 0.31s
+[focr-timing]   vision.clip 0.31s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.03s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.64s (277 tokens)
+[focr-timing] decode 14.07s (779 tokens, 0.018s/tok)
+[focr-timing] pagesource page 7: rasterized 1182x1837, 6514002 bytes, 10.8 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.113s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(GLOBAL) 0.113s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.077s
+[focr-timing]       sam.block attn(win) 0.038s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.067s
+[focr-timing]     sam.blocks 1.63s
+[focr-timing]   vision.sam 1.69s
+[focr-timing]     clip.blocks 0.32s
+[focr-timing]   vision.clip 0.32s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.02s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.66s (277 tokens)
+[focr-timing] decode 10.38s (594 tokens, 0.017s/tok)
+[focr-timing] pagesource page 8: rasterized 1182x1837, 6514002 bytes, 9.7 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.111s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.036s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.113s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.091s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]     sam.blocks 1.67s
+[focr-timing]   vision.sam 1.75s
+[focr-timing]     clip.blocks 0.31s
+[focr-timing]   vision.clip 0.31s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.06s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.64s (277 tokens)
+[focr-timing] decode 12.28s (699 tokens, 0.018s/tok)
+[focr-timing] pagesource page 9: rasterized 1182x1837, 6514002 bytes, 10.0 ms
+[focr-timing] preprocess 0.02s
+[focr-timing]       sam.block attn(win) 0.036s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.121s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.036s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.113s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.087s
+[focr-timing]       sam.block attn(win) 0.046s
+[focr-timing]       sam.block mlp 0.078s
+[focr-timing]       sam.block attn(GLOBAL) 0.121s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]     sam.blocks 1.67s
+[focr-timing]   vision.sam 1.75s
+[focr-timing]     clip.blocks 0.33s
+[focr-timing]   vision.clip 0.33s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.08s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.63s (277 tokens)
+[focr-timing] decode 11.77s (651 tokens, 0.018s/tok)
+[focr-timing] pagesource page 10: rasterized 1182x1837, 6514002 bytes, 11.9 ms
+[focr-timing] preprocess 0.01s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.111s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(GLOBAL) 0.113s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]     sam.blocks 1.64s
+[focr-timing]   vision.sam 1.71s
+[focr-timing]     clip.blocks 0.32s
+[focr-timing]   vision.clip 0.32s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.03s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.00s
+[focr-timing] prefill 0.63s (277 tokens)
+[focr-timing] decode 13.13s (729 tokens, 0.018s/tok)
+[focr] wrote /private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/u2f1/doc.p10.unlimited-ocr.per-page.r1.md (markdown)
+      169.71 real       878.01 user       493.19 sys
+          9818718208  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              729796  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 673  voluntary context switches
+            23059558  involuntary context switches
+      18026746877381  instructions retired
+       5888850221429  cycles elapsed
+          9814318640  peak memory footprint

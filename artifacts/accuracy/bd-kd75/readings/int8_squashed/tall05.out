@@ -1,0 +1,12 @@
+{
+    "title": "Team budget",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "A": "7",
+        "B": "10",
+        "C": "8",
+        "D": "12"
+    }
+}

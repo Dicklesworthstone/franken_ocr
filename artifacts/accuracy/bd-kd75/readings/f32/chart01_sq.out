@@ -1,0 +1,12 @@
+{
+    "title": "Quarterly sales",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "units",
+    "values": {
+        "2021": "1",
+        "2022": "4",
+        "2023": "10",
+        "2024": "9",
+        "2025": "2",
+        "2026": "4",

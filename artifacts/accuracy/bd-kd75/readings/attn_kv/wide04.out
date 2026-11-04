@@ -1,0 +1,14 @@
+{
+    "title": "None",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "Error counts": {
+            "A": "8",
+            "B": "2",
+            "C": "3",
+            "D": "10"
+        }
+    }
+}

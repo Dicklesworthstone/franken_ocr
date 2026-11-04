@@ -1,0 +1,57 @@
+[focr] note: unlimited-ocr-2 is experimental: not yet certified against its reference
+[focr-timing] preprocess 0.04s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.14s
+[focr-timing]       sam.block attn(win) 0.039s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(GLOBAL) 0.132s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.122s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(GLOBAL) 0.112s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]     sam.blocks 1.63s
+[focr-timing]   vision.sam 1.70s
+[focr-timing]     clip.hydrate(cached) 0.20s
+[focr-timing]     clip.blocks 0.32s
+[focr-timing]   vision.clip 0.52s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.36s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] prefill 0.75s (279 tokens)
+[focr-timing] decode 8.76s (441 tokens, 0.020s/tok)
+[focr-timing] document 1 pages: 441 tokens, finish stop, pages ["eos"], forced 0, hf-id-0 0, retired 108 blocks, peak kv 57946824 bytes, retire fallbacks 0
+[focr] wrote /private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/u2f1/single.page_0014.unlimited-ocr-2.base.r2.md (markdown)
+       12.65 real        63.26 user        33.62 sys
+          9751461888  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              596386  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   6  voluntary context switches
+             1544238  involuntary context switches
+       1236778316166  instructions retired
+        416201265786  cycles elapsed
+          9746718208  peak memory footprint

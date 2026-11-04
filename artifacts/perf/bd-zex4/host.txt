@@ -1,0 +1,9 @@
+binary /Users/jemanuel/.local/state/dsr/siblings/franken_ocr-lock-pinned/franken_ocr/target/release-perf/focr
+sha256 b6c5b571b162b8544aae4df36b24a281703d1e64f5d3bbe70566f541552de2a3
+hw.ncpu: 36
+hw.physicalcpu: 36
+hw.perflevel0.physicalcpu: 12
+hw.perflevel1.physicalcpu: 24
+2026-11-01T14:22:26-0500
+14:22  up 8 days, 18:11, 14 users, load averages: 28.93 38.48 39.93
+done

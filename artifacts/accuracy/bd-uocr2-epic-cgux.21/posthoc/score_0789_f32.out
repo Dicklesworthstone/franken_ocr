@@ -1,0 +1,9 @@
+doc marathon-mp3lan_0789-p223-227: scored ED_all v2_doc(int8) 0.8554  v1_pp 0.1585  v1_multi 0.5839
+  int8 as run  ED_all 0.8554  finish_reason None  pages: p1 marker 5499ch; p2 marker 5785ch; p3 page_cap 33404ch; p4 marker 464ch; p5 eos 327ch
+  f32          ED_all 0.0467  finish_reason None  pages: p1 marker 5859ch; p2 marker 5978ch; p3 marker 5789ch; p4 marker 71ch; p5 eos 327ch
+  page 1: differ after 85 common chars
+  page 2: differ after 47 common chars
+  page 3: differ after 75 common chars
+  page 4: differ after 0 common chars
+  page 5: identical
+  f32 page 3 tail: '44.</td><td>46</td><td>1973</td><td>5165.</td><td>93.83</td><td></td></tr><tr><td>10</td><td>-1</td><td>1976</td><td>965.</td><td>47</td><td>1972</td><td>6111.</td><td>97.92</td><td></td></tr></table>'

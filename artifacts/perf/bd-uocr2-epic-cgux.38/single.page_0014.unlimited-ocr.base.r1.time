@@ -1,0 +1,56 @@
+[focr-timing] preprocess 0.03s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.13s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.073s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(GLOBAL) 0.146s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.067s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.076s
+[focr-timing]       sam.block attn(GLOBAL) 0.136s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]     sam.blocks 1.65s
+[focr-timing]   vision.sam 1.72s
+[focr-timing]     clip.hydrate(cached) 0.21s
+[focr-timing]     clip.blocks 0.33s
+[focr-timing]   vision.clip 0.54s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.40s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.09s
+[focr-timing] prefill 0.67s (277 tokens)
+[focr-timing] decode 8.53s (495 tokens, 0.017s/tok)
+[focr] wrote /private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/u2f1/single.page_0014.unlimited-ocr.base.r1.md (markdown)
+       12.40 real        66.87 user        35.12 sys
+          9769828352  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              599680  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   5  voluntary context switches
+             1483600  involuntary context switches
+       1325867473525  instructions retired
+        438118013459  cycles elapsed
+          9765363224  peak memory footprint

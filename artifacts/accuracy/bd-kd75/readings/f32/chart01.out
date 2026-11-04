@@ -1,0 +1,16 @@
+{
+    "title": "Quarterly sales",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "Q1": {
+            "A": "2",
+            "B": "1",
+            "C": "3",
+            "D": "4"
+        },
+        "B": {
+            "A": "4",
+            "B": "6",
+            "C": "5",

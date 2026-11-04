@@ -1,0 +1,14 @@
+{
+    "title": "Site visits",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "Site visits": {
+            "A": "6",
+            "B": "1",
+            "C": "3",
+            "D": "4"
+        }
+    }
+}

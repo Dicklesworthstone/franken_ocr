@@ -1,0 +1,15 @@
+page                                             tokens  abort   wall @abort  CER none / reject / prefix / prefix-w
+scihub_s00381-021-05138-3.pdf_3                   32722   8704   1584    421  0.549 / 1.000 / 0.549 / 0.549
+newspaper_e3842a5681ef54c62a58804adec06c3f_1      31018   8704   1606    451  0.964 / 1.000 / 0.912 / 0.907
+newspaper_01f020903d7bc4b3fc69f500f41eb77e_1      32221   8704   1582    427  0.978 / 1.000 / 0.910 / 0.878
+newspaper_0b1bb8d03b4287eb95f67b68c2cf9f92_1      13543   8704   1167    750  0.999 / 1.000 / 0.998 / 0.998
+newspaper_ef5c785d9cc21ccf6b73d143f231b5c5_1      25516   8704   1444    493  0.980 / 1.000 / 0.950 / 0.949
+page-dc728bd5-50a9-41e8-9e5a-d4b01e6664a2         31680  12800   1662    672  0.990 / 1.000 / 0.945 / 0.891
+page-b2cc5729-a6b2-49ba-af62-788bf069b617         32208  14592   1597    724  0.953 / 1.000 / 0.873 / 0.851
+wall on these pages: 10644 s; at abort about 3938 s (saves about 6706 s)
+
+v2 - v1 CER_text over all single pages (registered reruns substituted), paired bootstrap:
+  none      v1 mean 0.1663; delta -0.0166 [-0.0325, +0.0003] (n=315)
+  reject    v1 mean 0.1681; delta -0.0184 [-0.0352, -0.0011] (n=315)
+  prefix    v1 mean 0.1654; delta -0.0157 [-0.0314, +0.0010] (n=315)
+  prefix-w  v1 mean 0.1650; delta -0.0153 [-0.0309, +0.0012] (n=315)

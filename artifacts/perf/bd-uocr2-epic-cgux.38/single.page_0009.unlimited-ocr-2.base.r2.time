@@ -1,0 +1,58 @@
+[focr] note: unlimited-ocr-2 is experimental: not yet certified against its reference
+[focr-timing] preprocess 0.03s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.13s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.067s
+[focr-timing]       sam.block attn(GLOBAL) 0.132s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(GLOBAL) 0.113s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.039s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(GLOBAL) 0.115s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.070s
+[focr-timing]       sam.block attn(win) 0.032s
+[focr-timing]       sam.block mlp 0.074s
+[focr-timing]       sam.block attn(GLOBAL) 0.116s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]     sam.blocks 1.63s
+[focr-timing]   vision.sam 1.70s
+[focr-timing]     clip.hydrate(cached) 0.20s
+[focr-timing]     clip.blocks 0.31s
+[focr-timing]   vision.clip 0.51s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.35s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] prefill 0.75s (279 tokens)
+[focr-timing] decode 1.05s (50 tokens, 0.021s/tok)
+[focr-timing] document 1 pages: 50 tokens, finish stop, pages ["eos"], forced 0, hf-id-0 0, retired 0 blocks, peak kv 45485352 bytes, retire fallbacks 0
+[focr] warning: low yield — 2.17 MP input produced only 76 character(s) of recognized text. If this is a full-page capture, re-capture at higher resolution: very tall images are tiled automatically, but glyphs below ~12px are unrecoverable by any OCR engine.
+[focr] wrote /private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/u2f1/single.page_0009.unlimited-ocr-2.base.r2.md (markdown)
+        4.90 real        24.56 user         7.73 sys
+          9759817728  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              596852  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   7  voluntary context switches
+              331971  involuntary context switches
+        417582667457  instructions retired
+        138525685330  cycles elapsed
+          9755090432  peak memory footprint

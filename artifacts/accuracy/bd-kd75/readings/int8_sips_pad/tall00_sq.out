@@ -1,0 +1,14 @@
+{
+    "title": "Budget output",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "2021": {
+            "A": "10",
+            "B": "2",
+            "C": "7",
+            "D": "11"
+        }
+    }
+}

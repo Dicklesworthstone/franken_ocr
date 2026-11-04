@@ -1,0 +1,4 @@
+notes_f7f010b78016aeebd76e56d9283eb67f_50.jpg    f32 CER 0.909 (17715 ch) 1704s | int8 v2 0.909 (9210 ch) | v1 0.047 (1104 ch) | gt 1140 ch
+notes_f7f010b78016aeebd76e56d9283eb67f_69.jpg    f32 CER 0.732 (679 ch) 72s | int8 v2 0.732 (679 ch) | v1 0.024 (675 ch) | gt 670 ch
+jiaocaineedrop_jiaocai_needrop_en_1118.jpg       f32 CER 0.367 (228 ch) 25s | int8 v2 0.367 (228 ch) | v1 0.000 (216 ch) | gt 217 ch
+jiaocaineedrop_jiaocai_needrop_en_443.jpg        f32 CER 0.147 (617 ch) 76s | int8 v2 0.147 (617 ch) | v1 0.016 (507 ch) | gt 512 ch

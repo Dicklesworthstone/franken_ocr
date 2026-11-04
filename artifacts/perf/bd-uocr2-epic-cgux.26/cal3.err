@@ -1,0 +1,129 @@
+[focr] note: unlimited-ocr-2 is experimental: not yet certified against its reference
+[focr-timing] memory: weights loaded: peak RSS 4253859840 bytes
+[focr-timing] pagesource page 1: rasterized 1182x1837, 6514002 bytes, 10.3 ms
+[focr-timing] pagesource page 2: rasterized 1182x1837, 6514002 bytes, 6.7 ms
+[focr-timing] pagesource page 3: rasterized 1182x1837, 6514002 bytes, 7.9 ms
+[focr-timing]     unlimited_vision.hydrate(cached) 0.21s
+[focr-timing] memory: vision statics: peak RSS 4752064512 bytes
+[focr-timing]       sam.block attn(win) 0.065s
+[focr-timing]       sam.block mlp 0.107s
+[focr-timing]       sam.block attn(win) 0.062s
+[focr-timing]       sam.block mlp 0.105s
+[focr-timing]       sam.block attn(GLOBAL) 0.235s
+[focr-timing]       sam.block mlp 0.093s
+[focr-timing]       sam.block attn(win) 0.059s
+[focr-timing]       sam.block mlp 0.097s
+[focr-timing]       sam.block attn(win) 0.078s
+[focr-timing]       sam.block mlp 0.099s
+[focr-timing]       sam.block attn(GLOBAL) 0.204s
+[focr-timing]       sam.block mlp 0.135s
+[focr-timing]       sam.block attn(win) 0.087s
+[focr-timing]       sam.block mlp 0.111s
+[focr-timing]       sam.block attn(win) 0.066s
+[focr-timing]       sam.block mlp 0.140s
+[focr-timing]       sam.block attn(GLOBAL) 0.227s
+[focr-timing]       sam.block mlp 0.102s
+[focr-timing]       sam.block attn(win) 0.072s
+[focr-timing]       sam.block mlp 0.132s
+[focr-timing]       sam.block attn(win) 0.081s
+[focr-timing]       sam.block mlp 0.102s
+[focr-timing]       sam.block attn(GLOBAL) 0.171s
+[focr-timing]       sam.block mlp 0.100s
+[focr-timing]     sam.blocks 2.84s
+[focr-timing]   vision.sam 2.95s
+[focr-timing] memory: sam forward: peak RSS 6769426432 bytes
+[focr-timing]     clip.hydrate(cached) 0.36s
+[focr-timing] memory: clip weights: peak RSS 8513437696 bytes
+[focr-timing]     clip.blocks 0.88s
+[focr-timing]   vision.clip 1.24s
+[focr-timing] memory: clip forward: peak RSS 8513437696 bytes
+[focr-timing]   vision.bridge 0.01s
+[focr-timing]       sam.block attn(win) 0.076s
+[focr-timing]       sam.block mlp 0.115s
+[focr-timing]       sam.block attn(win) 0.083s
+[focr-timing]       sam.block mlp 0.111s
+[focr-timing]       sam.block attn(GLOBAL) 0.259s
+[focr-timing]       sam.block mlp 0.124s
+[focr-timing]       sam.block attn(win) 0.070s
+[focr-timing]       sam.block mlp 0.115s
+[focr-timing]       sam.block attn(win) 0.070s
+[focr-timing]       sam.block mlp 0.115s
+[focr-timing]       sam.block attn(GLOBAL) 0.205s
+[focr-timing]       sam.block mlp 0.101s
+[focr-timing]       sam.block attn(win) 0.058s
+[focr-timing]       sam.block mlp 0.112s
+[focr-timing]       sam.block attn(win) 0.072s
+[focr-timing]       sam.block mlp 0.127s
+[focr-timing]       sam.block attn(GLOBAL) 0.429s
+[focr-timing]       sam.block mlp 0.169s
+[focr-timing]       sam.block attn(win) 0.130s
+[focr-timing]       sam.block mlp 0.187s
+[focr-timing]       sam.block attn(win) 0.116s
+[focr-timing]       sam.block mlp 0.136s
+[focr-timing]       sam.block attn(GLOBAL) 0.226s
+[focr-timing]       sam.block mlp 0.132s
+[focr-timing]     sam.blocks 3.45s
+[focr-timing]   vision.sam 3.60s
+[focr-timing] memory: sam forward: peak RSS 8513437696 bytes
+[focr-timing]     clip.blocks 1.05s
+[focr-timing]   vision.clip 1.05s
+[focr-timing] memory: clip forward: peak RSS 8513437696 bytes
+[focr-timing]   vision.bridge 0.00s
+[focr-timing]       sam.block attn(win) 0.087s
+[focr-timing]       sam.block mlp 0.131s
+[focr-timing]       sam.block attn(win) 0.074s
+[focr-timing]       sam.block mlp 0.119s
+[focr-timing]       sam.block attn(GLOBAL) 0.238s
+[focr-timing]       sam.block mlp 0.163s
+[focr-timing]       sam.block attn(win) 0.079s
+[focr-timing]       sam.block mlp 0.124s
+[focr-timing]       sam.block attn(win) 0.068s
+[focr-timing]       sam.block mlp 0.106s
+[focr-timing]       sam.block attn(GLOBAL) 0.174s
+[focr-timing]       sam.block mlp 0.109s
+[focr-timing]       sam.block attn(win) 0.084s
+[focr-timing]       sam.block mlp 0.115s
+[focr-timing]       sam.block attn(win) 0.065s
+[focr-timing]       sam.block mlp 0.113s
+[focr-timing]       sam.block attn(GLOBAL) 0.171s
+[focr-timing]       sam.block mlp 0.114s
+[focr-timing]       sam.block attn(win) 0.072s
+[focr-timing]       sam.block mlp 0.104s
+[focr-timing]       sam.block attn(win) 0.103s
+[focr-timing]       sam.block mlp 0.116s
+[focr-timing]       sam.block attn(GLOBAL) 0.234s
+[focr-timing]       sam.block mlp 0.105s
+[focr-timing]     sam.blocks 2.97s
+[focr-timing]   vision.sam 3.11s
+[focr-timing] memory: sam forward: peak RSS 8513437696 bytes
+[focr-timing]     clip.blocks 0.96s
+[focr-timing]   vision.clip 0.96s
+[focr-timing] memory: clip forward: peak RSS 8513437696 bytes
+[focr-timing]   vision.bridge 0.01s
+[focr-timing] document.vision (3 pages) 13.15s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] memory: decoder weights: peak RSS 9336832000 bytes
+[focr-timing] prefill 7.07s (827 tokens)
+[focr-timing] decode 154.11s (1232 tokens, 0.125s/tok)
+[focr-timing] document 3 pages: 1232 tokens, finish stop, pages ["marker", "marker", "eos"], forced 0, hf-id-0 0, retired 612 blocks, peak kv 115780896 bytes, retire fallbacks 0
+[focr-timing] document: 3 pages read, 0 skipped, 0 windows, 3 vision encodes, 0 fallback recomputes
+[focr-timing] memory: estimate 10548059341 bytes at window 3, 1000 tokens per page; peak RSS 10050764800 bytes, 0.953 of the estimate
+[focr] wrote /private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/d3_runs/cal3.json (json)
+      176.02 real       201.40 user       304.91 sys
+         10050764800  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              714974  page reclaims
+                   3  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  39  voluntary context switches
+            14084908  involuntary context switches
+       3882280774534  instructions retired
+       2180868516170  cycles elapsed
+         10045120384  peak memory footprint

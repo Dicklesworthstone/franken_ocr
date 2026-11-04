@@ -1,0 +1,6 @@
+binary /Users/jemanuel/.local/state/dsr/siblings/franken_ocr-lock-pinned/franken_ocr/target/release-perf/focr
+sha256 b6c5b571b162b8544aae4df36b24a281703d1e64f5d3bbe70566f541552de2a3
+FOCR_THREADS 12
+2026-11-01T16:12:48-0500
+16:12  up 8 days, 20:01, 14 users, load averages: 25.20 30.79 36.04
+done

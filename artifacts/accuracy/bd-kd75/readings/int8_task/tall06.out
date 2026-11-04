@@ -1,0 +1,12 @@
+{
+    "title": "Budget output",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "A": "6",
+        "B": "4",
+        "C": "9",
+        "D": "11"
+    }
+}

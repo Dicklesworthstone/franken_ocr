@@ -1,0 +1,39 @@
+marathon-mp3lan_0350-p11-16              f32 0.1224  int8 0.1222  v1_pp 0.1222  v1_multi 0.3027
+marathon-mp3lan_0257-p145-150            f32 0.0768  int8 0.0762  v1_pp 0.1070  v1_multi 0.9507
+marathon-mp3lan_0985-p47-54              f32 0.0129  int8 0.0146  v1_pp 0.0076  v1_multi 0.6239
+marathon-mp3lan_0962-p86-93              f32 0.0000  int8 0.0000  v1_pp 0.0000  v1_multi 0.9768
+marathon-mp3lan_0530-p206-212            f32 0.0612  int8 0.0612  v1_pp 0.0516  v1_multi 0.3836
+marathon-mp3lan_0146-p62-70              f32 0.0003  int8 0.0003  v1_pp 0.0003  v1_multi 0.3834
+marathon-mp3lan_0629-p11-15              f32 0.0023  int8 0.0023  v1_pp 0.0000  v1_multi 0.0015
+marathon-mp3lan_0128-p41-48              f32 0.0026  int8 0.0026  v1_pp 0.0027  v1_multi 0.3645
+marathon-mp3lan_0226-p213-222            f32 0.2106  int8 0.2106  v1_pp 0.2753  v1_multi 0.8294
+marathon-mp3lan_0265-p275-282            f32 0.0060  int8 0.0059  v1_pp 0.0008  v1_multi 0.8022
+marathon-mp3lan_0576-p59-65              f32 0.8185  int8 0.8185  v1_pp 0.8195  v1_multi 0.8188
+marathon-mp3lan_0249-p50-56              f32 0.0522  int8 0.0522  v1_pp 0.0537  v1_multi 0.8860
+marathon-mp3lan_0858-p102-108            f32 0.0005  int8 0.0005  v1_pp 0.0014  v1_multi 0.0005
+marathon-mp3lan_0193-p30-36              f32 0.0071  int8 0.0075  v1_pp 0.0089  v1_multi 0.0244
+marathon-mp3lan_0165-p165-173            f32 0.0610  int8 0.0549  v1_pp 0.1009  v1_multi 0.8047
+marathon-mp3lan_0996-p48-54              f32 0.3118  int8 0.3118  v1_pp 0.3120  v1_multi 0.8628
+marathon-mp3lan_0789-p223-227            f32 0.0467  int8 0.8554  v1_pp 0.1585  v1_multi 0.5839
+marathon-mp3lan_0792-p74-78              f32 0.0363  int8 0.0368  v1_pp 0.0443  v1_multi 0.7478
+marathon-mp3lan_0118-p203-210            f32 0.0757  int8 0.0724  v1_pp 0.1737  v1_multi 0.4033
+marathon-mp3lan_0288-p79-83              f32 0.0902  int8 0.0902  v1_pp 0.1129  v1_multi 0.5855
+nonbaidu-scotus_22-451-p12-21            f32 0.0029  int8 0.0029  v1_pp 0.0026  v1_multi 0.7753
+nonbaidu-scotus_23-719-p13-17            f32 0.0037  int8 0.0039  v1_pp 0.0036  v1_multi 0.1635
+nonbaidu-scotus_21-476-p6-10             f32 0.0049  int8 0.0052  v1_pp 0.0048  v1_multi 0.3221
+nonbaidu-scotus_20-1199-p167-171         f32 0.0325  int8 0.0325  v1_pp 0.0336  v1_multi 0.4739
+nonbaidu-scotus_19-1392-p71-76           f32 0.0115  int8 0.0111  v1_pp 0.0107  v1_multi 0.0885
+nonbaidu-scotus_17-1618-p33-39           f32 0.0124  int8 0.0118  v1_pp 0.0116  v1_multi 0.5882
+nonbaidu-nist_fips197upd1-p29-34         f32 0.2157  int8 0.2142  v1_pp 0.1956  v1_multi 0.2708
+nonbaidu-nist_ir7298r2-p214-222          f32 0.0130  int8 0.0131  v1_pp 0.0142  v1_multi 0.5871
+nonbaidu-arxiv_1706.03762v7-p2-9         f32 0.0796  int8 0.0797  v1_pp 0.0833  v1_multi 0.5012
+nonbaidu-wiki_en_ocr-p1-6                f32 0.0270  int8 0.0270  v1_pp 0.0249  v1_multi 0.2482
+nonbaidu-wiki_zh_printing-p1-7           f32 0.0811  int8 0.0818  v1_pp 0.1173  v1_multi 0.7312
+nonbaidu-wiki_zh_papermaking-p1-8        f32 0.0764  int8 0.0741  v1_pp 0.0756  v1_multi 0.5348
+
+32 documents scored; page_cap pages: f32 0, int8 1
+  v2 f32 - v2 int8   mean -0.0249 [-0.0757, +0.0007] (n=32)
+  v2 f32 - v1_pp     mean -0.0117 [-0.0229, -0.0026] (n=32)
+  v2 f32 - v1_multi  mean -0.4395 [-0.5342, -0.3427] (n=32)
+  v2 int8 - v1_pp    mean +0.0132 [-0.0155, +0.0615] (n=32, same documents)
+  v2 int8 - v1_multi mean -0.4146 [-0.5174, -0.3080] (n=32, same documents)

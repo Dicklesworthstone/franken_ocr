@@ -1,0 +1,13 @@
+{
+    "title": "Team budget",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "2019": "2",
+        "2020": "7",
+        "2021": "11",
+        "2022": "12",
+        "2023H1": "2"
+    }
+}

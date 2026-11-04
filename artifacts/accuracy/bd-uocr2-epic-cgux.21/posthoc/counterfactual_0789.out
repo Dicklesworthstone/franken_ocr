@@ -1,0 +1,6 @@
+doc marathon-mp3lan_0789-p223-227: scored ED_all v2_doc 0.8554, v1_pp 0.1585, v1_multi 0.5839
+page 3: 33404 chars, 19770 re-encoded tokens
+  as-run (20,000 cap)          cut at  19770 tokens, page 3 keeps  33404 chars -> ED_all 0.8554
+  masked guard, 8,192 floor    cut at   8192 tokens, page 3 keeps  14238 chars -> ED_all 0.7146
+  masked guard, no floor       cut at   2560 tokens, page 3 keeps   4852 chars -> ED_all 0.4637
+  raw guard, 8,192 floor       never fires

@@ -1,0 +1,13 @@
+{
+ "focr": "/Users/jemanuel/.local/state/dsr/siblings/franken_ocr-lock-pinned/franken_ocr/target/release-perf/focr",
+ "artifacts": {
+  "v1": {
+   "path": "/Users/jemanuel/.cache/franken_ocr_local_models/unlimited-ocr.int8.focrq",
+   "sha256": "573340710167697891bf52dfa4cbb5d0a02a68f3011c01f8ef83fd34622fb592"
+  },
+  "v2": {
+   "path": "/private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/v2_model_dir/unlimited-ocr-2.v0.1.0.int8.focrq",
+   "sha256": "54b8a1ecaf0c1311eab5bb16cf224bca67772056e1d713d5538b5486035b4398"
+  }
+ }
+}

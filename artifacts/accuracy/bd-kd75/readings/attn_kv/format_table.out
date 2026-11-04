@@ -1,0 +1,7 @@
+\begin{tabular}{|c|c|c|}
+\hline Item & Qty & Price \\
+\hline Widget & 4 & 2.50 \\
+\hline Gadget & 17 & 3.75 \\
+\hline Sprocket & 42 & 1.20 \\
+\hline
+\end{tabular}

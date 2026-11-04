@@ -1,0 +1,12 @@
+{
+    "title": "Plant yield",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "A": "11",
+        "B": "4",
+        "C": "5",
+        "D": "6"
+    }
+}

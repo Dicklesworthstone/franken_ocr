@@ -1,0 +1,57 @@
+[focr-timing] preprocess 0.03s
+[focr-timing]     unlimited_vision.hydrate(cached) 0.14s
+[focr-timing]       sam.block attn(win) 0.035s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(win) 0.036s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(GLOBAL) 0.131s
+[focr-timing]       sam.block mlp 0.068s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.072s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.089s
+[focr-timing]       sam.block attn(GLOBAL) 0.120s
+[focr-timing]       sam.block mlp 0.079s
+[focr-timing]       sam.block attn(win) 0.048s
+[focr-timing]       sam.block mlp 0.075s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(win) 0.034s
+[focr-timing]       sam.block mlp 0.071s
+[focr-timing]       sam.block attn(win) 0.033s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]       sam.block attn(GLOBAL) 0.114s
+[focr-timing]       sam.block mlp 0.069s
+[focr-timing]     sam.blocks 1.67s
+[focr-timing]   vision.sam 1.74s
+[focr-timing]     clip.hydrate(cached) 0.19s
+[focr-timing]     clip.blocks 0.32s
+[focr-timing]   vision.clip 0.51s
+[focr-timing]   vision.bridge 0.00s
+[focr-timing] vision_tower 2.39s
+[focr-timing] precision focr-mixed-ffn-int8
+[focr-timing] weight_cache_build 0.07s
+[focr-timing] prefill 0.61s (277 tokens)
+[focr-timing] decode 1.64s (98 tokens, 0.017s/tok)
+[focr] warning: low yield — 2.17 MP input produced only 90 character(s) of recognized text. If this is a full-page capture, re-capture at higher resolution: very tall images are tiled automatically, but glyphs below ~12px are unrecoverable by any OCR engine.
+[focr] wrote /private/tmp/claude-501/-Users-jemanuel-projects-franken-ocr/0e68861b-d16c-4ae1-8786-16748171bc4f/scratchpad/u2f1/single.page_0009.unlimited-ocr.base.r2.md (markdown)
+        5.54 real        28.27 user         9.80 sys
+          9761226752  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              599109  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   9  voluntary context switches
+              421655  involuntary context switches
+        509660436911  instructions retired
+        163451804767  cycles elapsed
+          9756761624  peak memory footprint

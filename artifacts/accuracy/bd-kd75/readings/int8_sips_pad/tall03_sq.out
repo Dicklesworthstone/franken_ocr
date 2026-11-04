@@ -1,0 +1,14 @@
+{
+    "title": "Site visits",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "1Q21": {
+            "A": "9",
+            "B": "10",
+            "C": "8",
+            "D": "4"
+        }
+    }
+}

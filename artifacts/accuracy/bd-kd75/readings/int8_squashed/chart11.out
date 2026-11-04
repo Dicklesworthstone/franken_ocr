@@ -1,0 +1,20 @@
+{
+    "title": "The Percentage of Online Sales of Ali Group Biscuit and Puffed Food in October 2023",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "Biscuit and Puffed Food": {
+            "A": "1.2",
+            "B": "2.5",
+            "C": "3.8",
+            "D": "5.2"
+        },
+        "Frozen Food": {
+            "A": "6",
+            "B": "2",
+            "C": "4",
+            "D": "8"
+        }
+    }
+}

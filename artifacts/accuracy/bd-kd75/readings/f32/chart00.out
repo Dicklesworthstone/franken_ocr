@@ -1,0 +1,15 @@
+{
+    "title": "High proportion of technology exports in the United States",
+    "source": "None",
+    "x_title": "None",
+    "y_title": "Units",
+    "values": {
+        "AI": {
+            "A": "5",
+            "B": "4",
+            "C": "7",
+            "D": "3"
+        },
+        "Budget output": {
+            "A": "7",
+            "B": "12",

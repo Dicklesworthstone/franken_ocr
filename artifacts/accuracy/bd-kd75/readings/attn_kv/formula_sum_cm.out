@@ -1,0 +1,11 @@
+\begin{tikzpicture}
+\path [use as bounding box] (0, -1) rectangle (15, 14);
+\coordinate (N) at (7.0, 5.0);
+\coordinate (I) at (5.0, 5.0);
+\coordinate (N) at (7.0, 8.0);
+\draw (N) -- (I) -- (N);
+\pic [draw,black,thick] {angle = N--I--N};
+\node[label={[text=black,font=\small]above:$N$}] at (7.0, 5.0) {};
+\node[label={[text=black,font=\small]above:$I$}] at (5.0, 5.0) {};
+\node[label={[text=black,font=\Large]above:$N$}] at (7.0, 8.0) {};
+\end{tikzpicture}

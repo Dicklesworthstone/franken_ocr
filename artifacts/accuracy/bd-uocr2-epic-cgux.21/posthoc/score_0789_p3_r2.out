@@ -1,0 +1,6 @@
+page 3: as run 33404 chars (page_cap); alone 5735 chars; f32 doc page 3 5789 chars
+page 3 alone vs f32 doc page 3: NED 0.0313
+doc 0789 ED_all: as run 0.8554, page 3 re-read alone 0.1254
+scored ED_all for doc 0789: {'v1_multi': 0.5838649927968718, 'v1_pp': 0.15846882074500926, 'v2_doc': 0.855364792390461}
+  v2_doc - v1_pp    n=32: as run +0.0132 [-0.0155, +0.0615]  ->  with p3 re-read -0.0096 [-0.0189, -0.0022]
+  v2_doc - v1_multi n=32: as run -0.4146 [-0.5174, -0.3080]  ->  with p3 re-read -0.4374 [-0.5324, -0.3408]
