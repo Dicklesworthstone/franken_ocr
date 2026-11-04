@@ -61,6 +61,8 @@
 | **OQ-V2-16** | OPEN | U2-C5b (`.22`) | Entmax domain for long documents (TopM vs AllCandidates) |
 
 **Disposition:** 11 RESOLVED, 5 OPEN, each OPEN item owned by the bead named.
-Kernel gates: OQ-V2-3/4 block parity sign-off (U2-A6, U2-C1). OQ-V2-11 no longer blocks
-block retirement; `FOCR_SRSWA_RETIRE` stays default-on only if U2-C2's fixtures also agree. The rest gate evaluation or defaults (C4, C5a/b, D2b, G2),
-not the f32 reference forward. Bead ids are children of epic `bd-uocr2-epic-cgux`.
+Kernel gates: none left open. OQ-V2-3/4 (parity sign-off, U2-A6, U2-C1) are resolved,
+and OQ-V2-11 no longer blocks block retirement; `FOCR_SRSWA_RETIRE` stays default-on
+only if U2-C2's fixtures also agree. The five OPEN items gate evaluation or defaults
+(C5a, C5b, G2), not the f32 reference forward. Bead ids are children of epic
+`bd-uocr2-epic-cgux`.
