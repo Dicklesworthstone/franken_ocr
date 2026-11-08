@@ -1491,7 +1491,7 @@ struct TranscriptionFile: Transferable {
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .plainText) { file in
-            let url = try Self.uniqueExportURL(filename: file.filename)
+            let url = try Self.uniqueExportURL(filename: file.filename) // ubs:ignore[taint-source] uniqueExportURL flattens the name to one plain file name
             try file.text.write(to: url, atomically: true, encoding: .utf8)
             return SentTransferredFile(url)
         }
@@ -1524,7 +1524,7 @@ struct HtmlDocumentFile: Transferable {
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .html) { file in
-            let url = try TranscriptionFile.uniqueExportURL(filename: file.filename)
+            let url = try TranscriptionFile.uniqueExportURL(filename: file.filename) // ubs:ignore[taint-source] uniqueExportURL flattens the name to one plain file name
             let html = HtmlExport.document(provenance: file.provenance, sections: file.sections)
             try html.write(to: url, atomically: true, encoding: .utf8)
             return SentTransferredFile(url)
@@ -1538,7 +1538,7 @@ struct FigureImageFile: Transferable {
 
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .png) { file in
-            let url = try TranscriptionFile.uniqueExportURL(filename: file.filename)
+            let url = try TranscriptionFile.uniqueExportURL(filename: file.filename) // ubs:ignore[taint-source] figure export name is built from source and figure numbers
             try file.data.write(to: url, options: .atomic)
             return SentTransferredFile(url)
         }
