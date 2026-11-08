@@ -156,7 +156,7 @@ serde_json = "1"
 def build_consumer(report: Report, crate: Path, target: Path) -> Path | None:
     cargo = os.environ.get("CARGO", "cargo")
     env = {**os.environ, "CARGO_TARGET_DIR": str(target)}
-    resolved = subprocess.run(
+    resolved = subprocess.run(  # ubs:ignore[py.security.command-injection,python.taint.command] - e2e harness runs the cargo/focr binary named by its env by design; argv is not external input
         [cargo, "tree", "--offline", "--edges", "normal", "--prefix", "none"],
         cwd=crate,
         capture_output=True,
@@ -170,7 +170,7 @@ def build_consumer(report: Report, crate: Path, target: Path) -> Path | None:
     report.check("the consumer inherits no forbidden crate", not inherited, ",".join(inherited))
     versions = re.findall(r"^(wide|safe_arch) v(\S+)", resolved.stdout, re.M)
     print(json.dumps({"resolved": sorted(set(versions))}), flush=True)
-    built = subprocess.run(
+    built = subprocess.run(  # ubs:ignore[py.security.command-injection,python.taint.command] - e2e harness runs the cargo/focr binary named by its env by design; argv is not external input
         [cargo, os.environ.get("FOCR_E2E_BUILD", "build"), "--offline", "--release"],
         cwd=crate,
         capture_output=True,
@@ -215,7 +215,7 @@ def read_pages(report: Report, consumer: Path, model: Path, pages: list[Path], r
     dirs = [sandbox / "home", sandbox / "tmp", sandbox / "cwd"]
     for directory in dirs:
         directory.mkdir(parents=True)
-    done = subprocess.run(
+    done = subprocess.run(  # ubs:ignore[python.taint.command] - e2e harness runs the cargo/focr binary named by its env by design; argv is not external input
         [str(consumer), str(model), *map(str, pages)],
         cwd=dirs[2],
         capture_output=True,
@@ -256,7 +256,7 @@ def compare_with_focr(report: Report, focr: str, model: Path, pages: list[Path],
     out = run / "focr.json"
     tmp = run / "focr_tmp"
     tmp.mkdir()
-    done = subprocess.run(
+    done = subprocess.run(  # ubs:ignore[python.taint.command] - e2e harness runs the cargo/focr binary named by its env by design; argv is not external input
         [focr, "ocr", str(pages[0].parent), "--multi-page", "--model", "unlimited-ocr-2", "--json", "-o", str(out)],
         capture_output=True,
         text=True,

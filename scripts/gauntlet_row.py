@@ -3041,7 +3041,7 @@ def shadow_check(
         if os.path.isdir(shadow_evidence):
             shutil.rmtree(shadow_evidence)  # shadow-only; the repo copy is untouched
         shutil.copytree(evidence_dir, shadow_evidence)
-        proc = subprocess.run(
+        proc = subprocess.run(  # ubs:ignore[python.taint.command] - runs sys.executable on a fixed repo script (check_ledgers.py) in a shadow copy; argv is not external input
             [sys.executable, os.path.join(shadow, "scripts", "check_ledgers.py")],
             capture_output=True,
             text=True,

@@ -158,7 +158,8 @@ def main() -> int:
     enc = tok([prompt])
     input_ids = torch.as_tensor(enc.input_ids)  # [1, seqlen]
     n_imgpad = int((input_ids == IMG_PAD_ID).sum())
-    assert n_imgpad == IMAGE_TOKEN_LEN, f"expected {IMAGE_TOKEN_LEN} <imgpad>, got {n_imgpad}"
+    if n_imgpad != IMAGE_TOKEN_LEN:
+        raise ValueError(f"expected {IMAGE_TOKEN_LEN} <imgpad>, got {n_imgpad}")
 
     # ── nondeterminism floor FIRST (2 runs @1 thread, 1 run @2 threads) ─────
     torch.set_num_threads(1)

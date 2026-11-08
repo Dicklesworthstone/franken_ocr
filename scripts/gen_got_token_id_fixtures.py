@@ -103,7 +103,8 @@ def build_encoder(ranks: "dict[bytes, int]") -> tiktoken.Encoding:
         special_tokens=special_tokens,
     )
     # Mirror the source assert — n_vocab == 151860 (config.json vocab_size).
-    assert len(ranks) + len(special_tokens) == enc.n_vocab, "n_vocab mismatch"
+    if len(ranks) + len(special_tokens) != enc.n_vocab:
+        raise ValueError("n_vocab mismatch")
     assert enc.n_vocab == 151860, f"n_vocab {enc.n_vocab} != 151860 (config vocab_size)"
     return enc
 

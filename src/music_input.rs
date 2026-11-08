@@ -4652,7 +4652,7 @@ mod tests {
     use crate::quant::focrq::FocrqBuilder;
 
     fn unique_temp_dir(label: &str) -> PathBuf {
-        let nonce = std::time::SystemTime::now()
+        let nonce = std::time::SystemTime::now() // ubs:ignore[rust.security.non-crypto-random] - uniqueness-only suffix for a #[cfg(test)] temp-dir name (pid+nanos); not a security nonce, never shipped
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after Unix epoch")
             .as_nanos();

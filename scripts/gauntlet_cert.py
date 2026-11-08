@@ -5030,7 +5030,7 @@ def _certificate_signed_claim_sha256(
         "signature_path",
     }
     for signature in signatures:
-        if not isinstance(signature, dict) or set(signature) != signature_keys:
+        if not isinstance(signature, dict) or set(signature) != signature_keys:  # ubs:ignore[python.ctcompare.secret_eq] - structural/provenance compare (keys/path/scheme/roles/signers), not a secret/MAC; no attacker value or timing surface
             return None
         declarations.append(
             {
@@ -7813,7 +7813,7 @@ def certificate_bundle_verdict(
         signature_relative_path = Path(signature_relative)
         if (
             signature_relative_path.is_absolute()
-            or signature_relative_path.as_posix() != signature_relative
+            or signature_relative_path.as_posix() != signature_relative  # ubs:ignore[python.ctcompare.secret_eq] - structural/provenance compare (keys/path/scheme/roles/signers), not a secret/MAC; no attacker value or timing surface
             or any(part in {"", ".", ".."} for part in signature_relative_path.parts)
         ):
             reasons.append(f"detached signature path is noncanonical for {signer}")
@@ -7858,7 +7858,7 @@ def certificate_bundle_verdict(
         signer_roles.add(role)
         signature_fingerprints.add(fingerprint)
         signature_paths.add(str(signature_relative))
-        if signature.get("scheme") != "openpgp-detached":
+        if signature.get("scheme") != "openpgp-detached":  # ubs:ignore[python.ctcompare.secret_eq] - structural/provenance compare (keys/path/scheme/roles/signers), not a secret/MAC; no attacker value or timing surface
             reasons.append(f"detached signature for {signer} has the wrong scheme")
         elif signed_claim_sha256 is None:
             reasons.append(f"detached signature verification failed for {signer}")
@@ -7875,11 +7875,11 @@ def certificate_bundle_verdict(
             reasons.append(f"detached signature verification failed for {signer}")
     if len(signature_signers) != CERTIFICATION_REQUIRED_SIGNERS:
         reasons.append("fewer than three independent detached signatures verified")
-    if signer_roles != CERTIFICATION_REQUIRED_SIGNATURE_ROLES:
+    if signer_roles != CERTIFICATION_REQUIRED_SIGNATURE_ROLES:  # ubs:ignore[python.ctcompare.secret_eq] - structural/provenance compare (keys/path/scheme/roles/signers), not a secret/MAC; no attacker value or timing surface
         reasons.append("detached signatures do not cover the exact required roles")
     if len(signature_fingerprints) != CERTIFICATION_REQUIRED_SIGNERS:
         reasons.append("detached signatures do not cover three trusted fingerprints")
-    if set(signers) != signature_signers:
+    if set(signers) != signature_signers:  # ubs:ignore[python.ctcompare.secret_eq] - structural/provenance compare (keys/path/scheme/roles/signers), not a secret/MAC; no attacker value or timing surface
         reasons.append("certificate signer list does not exactly match signatures")
 
     recorded_max_age = (
@@ -10151,7 +10151,7 @@ def finalize_bundle(
             signer_records.append((role, identity, fingerprint))
         if (
             len(signer_records) != CERTIFICATION_REQUIRED_SIGNERS
-            or {role for role, _identity, _fingerprint in signer_records}
+            or {role for role, _identity, _fingerprint in signer_records}  # ubs:ignore[python.ctcompare.secret_eq] - structural/provenance compare (keys/path/scheme/roles/signers), not a secret/MAC; no attacker value or timing surface
             != CERTIFICATION_REQUIRED_SIGNATURE_ROLES
             or len({identity for _role, identity, _fingerprint in signer_records})
             != CERTIFICATION_REQUIRED_SIGNERS

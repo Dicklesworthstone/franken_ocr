@@ -261,7 +261,7 @@ def run_probe(probe: Probe, disarmed: bool) -> tuple[int | None, str, int]:
         env.update(probe.disarmed_env)
     started = time.monotonic()
     try:
-        done = subprocess.run(
+        done = subprocess.run(  # ubs:ignore[python.taint.command] - test harness runs the probe binary named by its env by design; argv is not external input
             argv,
             cwd=ROOT,
             env=env,

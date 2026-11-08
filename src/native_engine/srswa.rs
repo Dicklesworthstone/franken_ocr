@@ -2081,7 +2081,7 @@ impl SrSwaLayerCache {
 
     fn live_slab(&self, b: usize) -> &Slab {
         self.slabs[b].as_ref().unwrap_or_else(|| {
-            panic!("srswa cache: block {b} was retired and must not be read (OQ-V2-11)")
+            panic!("srswa cache: block {b} was retired and must not be read (OQ-V2-11)") // ubs:ignore[rust.ownership.panic-macro] - unreachable: retirement (set_retire, !dense under the page-count guard) retires only U2-B4 dead blocks; the detector returns a recoverable RetireFallback before any read (OQ-V2-11)
         })
     }
 
