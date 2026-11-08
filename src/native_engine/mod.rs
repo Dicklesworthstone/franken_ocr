@@ -4166,6 +4166,7 @@ fn eager_sidecar_tokenizer(
 /// bounded header probe but without the provenance, census or recipe checks
 /// a load applies: `focr doctor` pairs each installed artifact with the
 /// tokenizer its model pins, whatever else may be wrong with it (U2-E7).
+#[cfg(any(feature = "native", test))]
 fn focrq_declared_arch(path: &Path) -> FocrResult<&'static dyn model_arch::ModelArch> {
     let (mut file, file_len) = open_model_file(path)?;
     let file_len = usize::try_from(file_len).map_err(|_| {
@@ -4186,6 +4187,7 @@ fn focrq_declared_arch(path: &Path) -> FocrResult<&'static dyn model_arch::Model
 
 /// What is wrong with the `tokenizer.json` beside an installed `.focrq`, for
 /// `focr doctor` (U2-E7).
+#[cfg(any(feature = "native", test))]
 #[derive(Debug)]
 pub(crate) struct SidecarFault {
     /// The model the artifact declares.
@@ -4207,6 +4209,7 @@ pub(crate) struct SidecarFault {
 /// load reports that), its model pins no tokenizer, the file cannot be read
 /// (the doctor's unreadable-entry detector reports that), or it is the
 /// pinned file.
+#[cfg(any(feature = "native", test))]
 pub(crate) fn sidecar_tokenizer_fault(model_path: &Path) -> Option<SidecarFault> {
     use sha2::Digest as _;
 
@@ -4246,6 +4249,7 @@ pub(crate) fn sidecar_tokenizer_fault(model_path: &Path) -> Option<SidecarFault>
 
 /// The model whose pinned `tokenizer.json` has SHA-256 `sha256` (lowercase
 /// hex), if any.
+#[cfg(any(feature = "native", test))]
 fn tokenizer_owner(sha256: &str) -> Option<&'static str> {
     model_arch::registry()
         .iter()
@@ -4254,6 +4258,7 @@ fn tokenizer_owner(sha256: &str) -> Option<&'static str> {
 }
 
 /// Why an installed model does not load, for `focr doctor` (U2-E7).
+#[cfg(any(feature = "native", test))]
 #[derive(Debug)]
 pub(crate) struct InstalledModelFault {
     /// The artifact `--model <id>` resolves to; `None` when it finds none.
@@ -4267,6 +4272,7 @@ pub(crate) struct InstalledModelFault {
 /// when `id` names no registered model, or the artifact it resolves to passes
 /// the bounded header checks; the tokenizer beside it is
 /// [`sidecar_tokenizer_fault`]'s to judge.
+#[cfg(any(feature = "native", test))]
 pub(crate) fn installed_model_fault(models: &Path, id: &str) -> Option<InstalledModelFault> {
     let arch = model_arch::arch_by_id(id)?;
     let resolved = match resolve_model_from_search_dirs_with_quant(
