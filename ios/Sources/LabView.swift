@@ -1509,7 +1509,7 @@ extension TranscriptionFile {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent(filename)
+        return dir.appendingPathComponent(safeExportFilename(filename))
     }
 }
 

@@ -708,6 +708,8 @@ sections as they land.
 
 ### Fixed
 
+- iOS: exporting a result whose name came from another app (a shared item or a picked file) could write outside the temporary export folder. Export names are now flattened to one plain file name.
+
 - **v1 `--multi-page` refuses a prompt over the position budget before any vision
   forward** (bead bd-ixl3). It ran the vision tower over every page and only then found
   that the prompt alone left no position to generate, so a document of more than about
