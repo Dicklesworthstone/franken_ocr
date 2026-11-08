@@ -713,7 +713,7 @@ def main() -> int:
         if only is None or case in only:
             run_step(suite, case, body)
 
-    checked = subprocess.run(
+    checked = subprocess.run(  # ubs:ignore[python.taint.command] argv list, shell=False; the only non-constant element is the e2e log path from the --work developer CLI arg, not request input
         [sys.executable, "-I", str(ROOT / "scripts" / "check_test_logs.py"), str(suite.log)],
         capture_output=True,
         text=True,
