@@ -4,12 +4,13 @@ All notable changes to `franken_ocr` are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Scope window: project inception on 2026-06-24 through HEAD on 2026-08-22.
+Scope window: project inception on 2026-06-24 through HEAD on 2026-11-08.
 
 ## Version Timeline
 
 | Version | Kind | Date | Summary |
 |---------|------|------|---------|
+| [`v0.10.0`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.10.0) | Release | 2026-11-08 | Apple-silicon fast-tier default thread budget; `--temperature > 0` refused; v1 runaway guard on by default; x86_64/aarch64 token note (bd-q5jo) |
 | [`v0.9.1`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.9.1) | Release | 2026-09-28 | `--multi-page` keeps text the model emits outside `<PAGE>` markers (GH #17) |
 | [`v0.9.0`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.9.0) | Release | 2026-08-22 | Tall-capture strip routing + low-yield guard (GH #15) |
 | [`v0.8.0`](https://github.com/Dicklesworthstone/franken_ocr/releases/tag/v0.8.0) | Release | 2026-08-19 | Resident daemon, installer repair, machine-parseable `--version` |
@@ -24,9 +25,11 @@ the `0.1.0` history below where it belongs. Going forward, history lives in git 
 in the `.beads/` issue graph, and capability waves are promoted into dated version
 sections as they land.
 
-## [Unreleased]
+## [0.10.0] - 2026-11-08
 
 ### Changed
+
+- Token-level OCR output can differ between x86_64 and aarch64 for the same input. The int8 GEMM kernels match the scalar oracle bit-for-bit (verified with `focr robot selftest`); the difference comes from non-GEMM floating-point paths. x86_64 single-page output is unchanged from 0.9.1. (bd-q5jo)
 
 - **The default thread budget on an Apple-silicon Mac is its fastest core tier**
   (bead bd-zex4). It was every physical core, and the slower tier set the pace of each
