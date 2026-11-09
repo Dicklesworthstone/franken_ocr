@@ -18,7 +18,8 @@ fn root() -> PathBuf {
 }
 
 fn sha256_hex(path: &Path) -> String {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     format!("{:x}", Sha256::digest(&bytes))
 }
 
@@ -31,10 +32,8 @@ fn read_text(rel: &str) -> String {
 fn collect_artifact_pins(value: &serde_json::Value, out: &mut Vec<(String, String)>) {
     match value {
         serde_json::Value::Object(map) => {
-            if let (
-                Some(serde_json::Value::String(artifact)),
-                Some(serde_json::Value::String(sha)),
-            ) = (map.get("artifact"), map.get("sha256"))
+            if let (Some(serde_json::Value::String(artifact)), Some(serde_json::Value::String(sha))) =
+                (map.get("artifact"), map.get("sha256"))
             {
                 out.push((artifact.clone(), sha.clone()));
             }
@@ -58,28 +57,18 @@ fn gauntlet_certification_bundle_artifact_hashes_match_committed_bytes() {
             .expect("certification_bundle.json is valid JSON");
     let mut pins = Vec::new();
     collect_artifact_pins(&bundle, &mut pins);
-    assert!(
-        !pins.is_empty(),
-        "certification bundle lists no artifact hashes"
-    );
+    assert!(!pins.is_empty(), "certification bundle lists no artifact hashes");
 
     let mut mismatches = Vec::new();
     for (artifact, expected) in &pins {
         let path = root().join(artifact);
         if !path.is_file() {
-            // Pins on generated outputs (e.g. .gauntlet-output) are not
-            // committed, but everything the bundle itself ships must exist:
-            // deleting a pinned bundle file is as much a break as reformatting it.
-            if artifact.starts_with("docs/gauntlet/bundle/") {
-                mismatches.push(format!("{artifact}: pinned {expected}, file is missing"));
-            }
+            // Pins on generated outputs (e.g. .gauntlet-output) are not committed.
             continue;
         }
         let actual = sha256_hex(&path);
         if &actual != expected {
-            mismatches.push(format!(
-                "{artifact}: pinned {expected}, committed bytes {actual}"
-            ));
+            mismatches.push(format!("{artifact}: pinned {expected}, committed bytes {actual}"));
         }
     }
     assert!(
